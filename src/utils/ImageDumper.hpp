@@ -23,6 +23,7 @@ struct FrameStats {
     uint32_t validation_errors = 0;
     bool target_achieved = false; // true if avg_frame_time_ms < 8.0
     std::string mgpu_mode_str = "off";
+    std::string pipeline_type_str = "wavefront";
 
     // Profiler HUD & Diagnostic Metrics
     double primary_gpu_time_ms = 0.0;

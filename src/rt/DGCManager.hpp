@@ -22,7 +22,8 @@ public:
     VkIndirectCommandsLayoutEXT getLayout() const { return m_indirectLayout; }
 
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                       VkDeviceSize argumentOffset = 0, uint32_t maxSequenceCount = 1);
+                       VkDeviceSize argumentOffset = 0, uint32_t maxSequenceCount = 1,
+                       Buffer* sequenceCountBuffer = nullptr, VkDeviceSize sequenceCountOffset = 0);
     void recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0);
 
 private:

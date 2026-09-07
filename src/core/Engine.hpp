@@ -36,6 +36,8 @@ private:
     void initVulkan();
     void initScene();
     void initPipelines();
+    void initWavefrontResources();
+    void initWavefrontPipelines();
     void initSyncObjects();
     void initQueryPool();
 
@@ -99,6 +101,32 @@ private:
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_rtPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
+
+    // Wavefront Compaction Queues & Buffers
+    std::unique_ptr<Buffer> m_rayQueueA;
+    std::unique_ptr<Buffer> m_rayQueueB;
+    std::unique_ptr<Buffer> m_wavefrontCounters;
+    std::unique_ptr<Buffer> m_wavefrontIndirectCmd;
+    std::unique_ptr<Buffer> m_wavefrontDgcStream;
+    std::unique_ptr<Buffer> m_wavefrontDgcCount;
+
+    // Wavefront Pipelines & Descriptors
+    VkDescriptorSetLayout m_wfClassifyDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_wfResolveDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_wfShadeDescLayout = VK_NULL_HANDLE;
+
+    VkDescriptorSet m_wfClassifyDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_wfResolveDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_wfShadeDescSetA = VK_NULL_HANDLE; // Reads A, writes B
+    VkDescriptorSet m_wfShadeDescSetB = VK_NULL_HANDLE; // Reads B, writes A
+
+    VkPipelineLayout m_wfClassifyPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_wfResolvePipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_wfShadePipelineLayout = VK_NULL_HANDLE;
+
+    VkPipeline m_wfClassifyPipeline = VK_NULL_HANDLE;
+    VkPipeline m_wfResolvePipeline = VK_NULL_HANDLE;
+    VkPipeline m_wfShadePipeline = VK_NULL_HANDLE;
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;

@@ -55,7 +55,8 @@ void DGCManager::loadFunctionPointers() {
 }
 
 void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                              VkDeviceSize argumentOffset, uint32_t maxSequenceCount) {
+                              VkDeviceSize argumentOffset, uint32_t maxSequenceCount,
+                              Buffer* sequenceCountBuffer, VkDeviceSize sequenceCountOffset) {
     if (!argumentBuffer) return;
 
     if (!m_supported || !pfn_vkCmdExecuteGeneratedCommandsEXT) {
@@ -102,6 +103,9 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
     genInfo.indirectAddress = argAddress;
     genInfo.indirectAddressSize = argSize;
     genInfo.maxSequenceCount = maxSequenceCount;
+    if (sequenceCountBuffer) {
+        genInfo.sequenceCountAddress = sequenceCountBuffer->getDeviceAddress(m_device) + sequenceCountOffset;
+    }
     if (m_preprocessBuffer) {
         genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device);
         genInfo.preprocessSize = m_preprocessBuffer->getSize();

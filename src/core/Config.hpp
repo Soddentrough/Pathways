@@ -13,6 +13,11 @@ enum class MultiGpuMode {
     DynamicWorkQueue
 };
 
+enum class PipelineType {
+    Wavefront,
+    Megakernel
+};
+
 struct Config {
     uint32_t width = 3840;
     uint32_t height = 2160;
@@ -34,6 +39,8 @@ struct Config {
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off;
+    PipelineType pipeline_type = PipelineType::Wavefront;
+    bool enable_morton_order = true;
     uint32_t tile_size = 64;
 
     std::string scene_path = "";

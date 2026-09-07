@@ -105,6 +105,9 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/raytrace_comp.comp
     ${SHADER_DIR}/compute/dgc_compact.comp
     ${SHADER_DIR}/compute/accum_merge.comp
+    ${SHADER_DIR}/compute/wavefront_classify.comp
+    ${SHADER_DIR}/compute/wavefront_resolve.comp
+    ${SHADER_DIR}/compute/wavefront_shade.comp
 )
 
 set(SPV_FILES "")

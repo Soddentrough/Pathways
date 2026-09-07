@@ -72,6 +72,8 @@ Engine::Engine(const Config& config) : m_config(config) {
     initVulkan();
     initScene();
     initPipelines();
+    initWavefrontResources();
+    initWavefrontPipelines();
     initSyncObjects();
     initQueryPool();
 
@@ -122,15 +124,34 @@ Engine::~Engine() {
     if (m_rtPipeline) vkDestroyPipeline(device, m_rtPipeline, nullptr);
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
+    if (m_wfClassifyPipeline) vkDestroyPipeline(device, m_wfClassifyPipeline, nullptr);
+    if (m_wfResolvePipeline) vkDestroyPipeline(device, m_wfResolvePipeline, nullptr);
+    if (m_wfShadePipeline) vkDestroyPipeline(device, m_wfShadePipeline, nullptr);
+
     if (m_rtPipelineLayout) vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
     if (m_mergePipelineLayout) vkDestroyPipelineLayout(device, m_mergePipelineLayout, nullptr);
+    if (m_wfClassifyPipelineLayout) vkDestroyPipelineLayout(device, m_wfClassifyPipelineLayout, nullptr);
+    if (m_wfResolvePipelineLayout) vkDestroyPipelineLayout(device, m_wfResolvePipelineLayout, nullptr);
+    if (m_wfShadePipelineLayout) vkDestroyPipelineLayout(device, m_wfShadePipelineLayout, nullptr);
+
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
+    if (m_wfClassifyDescLayout) vkDestroyDescriptorSetLayout(device, m_wfClassifyDescLayout, nullptr);
+    if (m_wfResolveDescLayout) vkDestroyDescriptorSetLayout(device, m_wfResolveDescLayout, nullptr);
+    if (m_wfShadeDescLayout) vkDestroyDescriptorSetLayout(device, m_wfShadeDescLayout, nullptr);
+
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     if (m_rtFence) vkDestroyFence(device, m_rtFence, nullptr);
     m_secTransferBuffer.reset();
+
+    m_rayQueueA.reset();
+    m_rayQueueB.reset();
+    m_wavefrontCounters.reset();
+    m_wavefrontIndirectCmd.reset();
+    m_wavefrontDgcStream.reset();
+    m_wavefrontDgcCount.reset();
 
     m_gui.reset();
     m_swapchain.reset();
@@ -438,18 +459,18 @@ void Engine::initPipelines() {
 
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 10 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 },
-        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 20 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 20 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 },
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 128 }
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = 10;
+    poolInfo.maxSets = 32;
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
     // 2. Ray Tracing Descriptor Set Layout
@@ -714,6 +735,264 @@ void Engine::initPipelines() {
     }
 }
 
+void Engine::initWavefrontResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    VkDeviceSize maxRays = static_cast<VkDeviceSize>(m_config.width) * m_config.height;
+    VkDeviceSize rayPayloadSize = 96; // 6 * vec4 (24 floats)
+    VkDeviceSize queueSize = maxRays * rayPayloadSize;
+
+    // Ray Queue A
+    m_rayQueueA = std::make_unique<Buffer>(
+        allocator, queueSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // Ray Queue B (ping-pong partner)
+    m_rayQueueB = std::make_unique<Buffer>(
+        allocator, queueSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // Wavefront Counters: [activeRayCount, nextActiveCount, totalProcessed, padding]
+    m_wavefrontCounters = std::make_unique<Buffer>(
+        allocator, sizeof(uint32_t) * 4,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // Indirect Dispatch Command: VkDispatchIndirectCommand { uint x, y, z }
+    m_wavefrontIndirectCmd = std::make_unique<Buffer>(
+        allocator, sizeof(VkDispatchIndirectCommand),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // DGC Sequence Stream: sequence count (uint32) + padding + sequence items
+    m_wavefrontDgcStream = std::make_unique<Buffer>(
+        allocator, 256,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    m_wavefrontDgcCount = std::make_unique<Buffer>(
+        allocator, 16,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    Logger::info("Wavefront Compaction Queues allocated: 2x {:.2f} MB ({:.2f}M ray capacity each).",
+                 (queueSize / (1024.0 * 1024.0)), (maxRays / 1000000.0));
+}
+
+void Engine::initWavefrontPipelines() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Classify Descriptor Set Layout (Bindings 0-8 match RT, 9: OutRayQueue, 10: QueueCounters)
+    std::vector<VkDescriptorSetLayoutBinding> classifyBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo classifyLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    classifyLayoutInfo.bindingCount = static_cast<uint32_t>(classifyBindings.size());
+    classifyLayoutInfo.pBindings = classifyBindings.data();
+    vkCreateDescriptorSetLayout(device, &classifyLayoutInfo, nullptr, &m_wfClassifyDescLayout);
+
+    // 2. Resolve Descriptor Set Layout (Binding 0: QueueCounters, 1: IndirectCommand, 2: DGCStream)
+    std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
+    resolveLayoutInfo.pBindings = resolveBindings.data();
+    vkCreateDescriptorSetLayout(device, &resolveLayoutInfo, nullptr, &m_wfResolveDescLayout);
+
+    // 3. Shade Descriptor Set Layout (Bindings 0-8 match RT, 9: InRayQueue, 10: OutRayQueue, 11: QueueCounters)
+    std::vector<VkDescriptorSetLayoutBinding> shadeBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo shadeLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    shadeLayoutInfo.bindingCount = static_cast<uint32_t>(shadeBindings.size());
+    shadeLayoutInfo.pBindings = shadeBindings.data();
+    vkCreateDescriptorSetLayout(device, &shadeLayoutInfo, nullptr, &m_wfShadeDescLayout);
+
+    // 4. Allocate Descriptor Sets
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_descriptorPool;
+
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_wfClassifyDescLayout;
+    vkAllocateDescriptorSets(device, &allocInfo, &m_wfClassifyDescSet);
+
+    allocInfo.pSetLayouts = &m_wfResolveDescLayout;
+    vkAllocateDescriptorSets(device, &allocInfo, &m_wfResolveDescSet);
+
+    allocInfo.pSetLayouts = &m_wfShadeDescLayout;
+    vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetA);
+    vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetB);
+
+    // 5. Populate and Write Descriptor Sets
+    VkDescriptorImageInfo accumImageInfo{};
+    accumImageInfo.imageView = m_accumImage->getImageView();
+    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
+    VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
+    VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
+    VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
+    VkDescriptorBufferInfo lightBufferInfo{ m_lightBuffer->getBuffer(), 0, m_lightBuffer->getSize() };
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+    asInfo.accelerationStructureCount = 1;
+    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
+    asInfo.pAccelerationStructures = &tlasHandle;
+
+    VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
+
+    std::vector<VkDescriptorImageInfo> texInfos(16);
+    for (size_t i = 0; i < 16; ++i) {
+        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
+            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = m_dummyWhite->getDescriptorInfo();
+        }
+    }
+
+    VkDescriptorBufferInfo queueABufInfo{ m_rayQueueA->getBuffer(), 0, m_rayQueueA->getSize() };
+    VkDescriptorBufferInfo queueBBufInfo{ m_rayQueueB->getBuffer(), 0, m_rayQueueB->getSize() };
+    VkDescriptorBufferInfo counterBufInfo{ m_wavefrontCounters->getBuffer(), 0, m_wavefrontCounters->getSize() };
+    VkDescriptorBufferInfo indirectBufInfo{ m_wavefrontIndirectCmd->getBuffer(), 0, m_wavefrontIndirectCmd->getSize() };
+    VkDescriptorBufferInfo dgcStreamBufInfo{ m_wavefrontDgcStream->getBuffer(), 0, m_wavefrontDgcStream->getSize() };
+
+    std::vector<VkWriteDescriptorSet> writes;
+
+    auto pushCommonBindings = [&](VkDescriptorSet dstSet) {
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, dstSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+    };
+
+    // Classify Set: Common + binding 9 (queue A), binding 10 (counters)
+    pushCommonBindings(m_wfClassifyDescSet);
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+
+    // Resolve Set: binding 0 (counters), binding 1 (indirect), binding 2 (dgc stream)
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indirectBufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dgcStreamBufInfo, nullptr });
+
+    // Shade Set A: Common + binding 9 (in: queue A), binding 10 (out: queue B), binding 11 (counters)
+    pushCommonBindings(m_wfShadeDescSetA);
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+
+    // Shade Set B: Common + binding 9 (in: queue B), binding 10 (out: queue A), binding 11 (counters)
+    pushCommonBindings(m_wfShadeDescSetB);
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+    // 6. Pipeline Layouts
+    VkPushConstantRange wfPushConstant{};
+    wfPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    wfPushConstant.offset = 0;
+    wfPushConstant.size = sizeof(uint32_t) * 12;
+
+    VkPipelineLayoutCreateInfo classifyPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    classifyPipeLayoutInfo.setLayoutCount = 1;
+    classifyPipeLayoutInfo.pSetLayouts = &m_wfClassifyDescLayout;
+    classifyPipeLayoutInfo.pushConstantRangeCount = 1;
+    classifyPipeLayoutInfo.pPushConstantRanges = &wfPushConstant;
+    vkCreatePipelineLayout(device, &classifyPipeLayoutInfo, nullptr, &m_wfClassifyPipelineLayout);
+
+    VkPushConstantRange resolvePushConstant{};
+    resolvePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    resolvePushConstant.offset = 0;
+    resolvePushConstant.size = sizeof(uint32_t) * 4;
+
+    VkPipelineLayoutCreateInfo resolvePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    resolvePipeLayoutInfo.setLayoutCount = 1;
+    resolvePipeLayoutInfo.pSetLayouts = &m_wfResolveDescLayout;
+    resolvePipeLayoutInfo.pushConstantRangeCount = 1;
+    resolvePipeLayoutInfo.pPushConstantRanges = &resolvePushConstant;
+    vkCreatePipelineLayout(device, &resolvePipeLayoutInfo, nullptr, &m_wfResolvePipelineLayout);
+
+    VkPipelineLayoutCreateInfo shadePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    shadePipeLayoutInfo.setLayoutCount = 1;
+    shadePipeLayoutInfo.pSetLayouts = &m_wfShadeDescLayout;
+    shadePipeLayoutInfo.pushConstantRangeCount = 1;
+    shadePipeLayoutInfo.pPushConstantRanges = &wfPushConstant;
+    vkCreatePipelineLayout(device, &shadePipeLayoutInfo, nullptr, &m_wfShadePipelineLayout);
+
+    // 7. Compute Pipelines with Wave32 Subgroup Size
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto createPipeline = [&](const std::string& spvName, VkPipelineLayout layout) -> VkPipeline {
+        auto code = loadShaderSPIRV(spvName);
+        VkShaderModule mod = createShaderModule(code);
+
+        VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeInfo.stage.module = mod;
+        pipeInfo.stage.pName = "main";
+        if (m_context->hasSubgroupSizeControl()) {
+            pipeInfo.stage.pNext = &subgroupSize32;
+        }
+        pipeInfo.layout = layout;
+
+        VkPipeline pipe = VK_NULL_HANDLE;
+        vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe);
+        vkDestroyShaderModule(device, mod, nullptr);
+        return pipe;
+    };
+
+    m_wfClassifyPipeline = createPipeline("wavefront_classify.comp.spv", m_wfClassifyPipelineLayout);
+    m_wfResolvePipeline  = createPipeline("wavefront_resolve.comp.spv", m_wfResolvePipelineLayout);
+    m_wfShadePipeline    = createPipeline("wavefront_shade.comp.spv", m_wfShadePipelineLayout);
+
+    Logger::info("Wavefront Compaction compute pipelines (Classify, Resolve, Shade - Wave32) created successfully.");
+}
+
 void Engine::initSyncObjects() {
     VkDevice device = m_context->getDevice();
 
@@ -945,31 +1224,149 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(m_commandBuffer, m_queryPool, 0, 4);
         vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
 
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSet, 0, nullptr);
-
         uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
-        uint32_t rtPushConstants[12] = {
-            m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-            0, 0, m_config.width, m_config.height,
-            useHwRT,
-            hasEnvMap,
-            envIntensityBits,
-            1u // accumulateHistory
-        };
-        vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-        if (m_dgc && m_dgcArgumentBuffer) {
-            VkDispatchIndirectCommand dgcCmd{};
-            dgcCmd.x = groupsX;
-            dgcCmd.y = groupsY;
-            dgcCmd.z = 1;
-            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
-            m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
+
+        if (m_config.pipeline_type == PipelineType::Wavefront) {
+            // === WAVEFRONT COMPACTION PIPELINE ===
+            uint32_t maxCapacity = m_config.width * m_config.height;
+
+            for (uint32_t s = 0; s < m_config.spp; ++s) {
+                // 1. Clear Wavefront Counters
+                vkCmdFillBuffer(m_commandBuffer, m_wavefrontCounters->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
+
+                VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                clearDep.memoryBarrierCount = 1;
+                clearDep.pMemoryBarriers = &clearBarrier;
+                vkCmdPipelineBarrier2(m_commandBuffer, &clearDep);
+
+                // 2. Classify Pass: Primary Ray Generation & Wave Compaction
+                vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipeline);
+                vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipelineLayout, 0, 1, &m_wfClassifyDescSet, 0, nullptr);
+
+                uint32_t classifyPC[12] = {
+                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                    m_config.width, m_config.height,
+                    m_config.enable_morton_order ? 1u : 0u,
+                    hasEnvMap,
+                    envIntensityBits,
+                    maxCapacity,
+                    s,
+                    0u
+                };
+                vkCmdPushConstants(m_commandBuffer, m_wfClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
+
+                uint32_t classifyGroupsX = (m_config.width + 7) / 8;
+                uint32_t classifyGroupsY = (m_config.height + 3) / 4;
+                vkCmdDispatch(m_commandBuffer, classifyGroupsX, classifyGroupsY, 1);
+
+                // Barrier: Classify writes queue A & counters -> Resolve reads counters
+                VkMemoryBarrier2 classifyToResolveBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                classifyToResolveBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                classifyToResolveBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                classifyToResolveBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                classifyToResolveBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+                VkDependencyInfo classifyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                classifyDep.memoryBarrierCount = 1;
+                classifyDep.pMemoryBarriers = &classifyToResolveBarrier;
+                vkCmdPipelineBarrier2(m_commandBuffer, &classifyDep);
+
+                // 3. Bounce Loop: Resolve -> Shade (DGC / Indirect)
+                for (uint32_t bounce = 0; bounce < m_config.max_bounces; ++bounce) {
+                    // A. Resolve Pass (1 Wave32 workgroup)
+                    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipeline);
+                    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipelineLayout, 0, 1, &m_wfResolveDescSet, 0, nullptr);
+
+                    uint32_t resolveMode = (bounce == 0) ? 0u : 1u;
+                    uint32_t resolvePC[4] = { resolveMode, 0, 0, 0 };
+                    vkCmdPushConstants(m_commandBuffer, m_wfResolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolvePC), resolvePC);
+                    vkCmdDispatch(m_commandBuffer, 1, 1, 1);
+
+                    // Barrier: Resolve writes indirect cmd & resets counters -> Shade reads indirect cmd & queues
+                    VkMemoryBarrier2 resolveToShadeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    resolveToShadeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    resolveToShadeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    resolveToShadeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    resolveToShadeBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+                    VkDependencyInfo resolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    resolveDep.memoryBarrierCount = 1;
+                    resolveDep.pMemoryBarriers = &resolveToShadeBarrier;
+                    vkCmdPipelineBarrier2(m_commandBuffer, &resolveDep);
+
+                    // B. Shade Pass (Ping-Pong: even bounce reads A writes B; odd bounce reads B writes A)
+                    VkDescriptorSet shadeSet = (bounce % 2 == 0) ? m_wfShadeDescSetA : m_wfShadeDescSetB;
+                    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipeline);
+                    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipelineLayout, 0, 1, &shadeSet, 0, nullptr);
+
+                    uint32_t shadePC[12] = {
+                        m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                        m_config.width, m_config.height,
+                        bounce,
+                        m_config.max_bounces,
+                        maxCapacity,
+                        s,
+                        hasEnvMap,
+                        envIntensityBits
+                    };
+                    vkCmdPushConstants(m_commandBuffer, m_wfShadePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
+
+                    if (m_dgc && m_dgc->isSupported()) {
+                        m_dgc->recordExecute(m_commandBuffer, m_wfShadePipeline, m_wavefrontIndirectCmd.get(), 0, 1, m_wavefrontDgcStream.get(), 0);
+                    } else {
+                        vkCmdDispatchIndirect(m_commandBuffer, m_wavefrontIndirectCmd->getBuffer(), 0);
+                    }
+
+                    // Barrier: Shade writes downstream queue / accum image -> next Resolve or Tonemap
+                    VkMemoryBarrier2 shadeToNextBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    shadeToNextBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    shadeToNextBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    shadeToNextBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    shadeToNextBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+                    VkDependencyInfo shadeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    shadeDep.memoryBarrierCount = 1;
+                    shadeDep.pMemoryBarriers = &shadeToNextBarrier;
+                    vkCmdPipelineBarrier2(m_commandBuffer, &shadeDep);
+                }
+            }
         } else {
-            vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
+            // === MONOLITHIC MEGAKERNEL PIPELINE ===
+            vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
+            vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSet, 0, nullptr);
+
+            uint32_t rtPushConstants[12] = {
+                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                0, 0, m_config.width, m_config.height,
+                useHwRT,
+                hasEnvMap,
+                envIntensityBits,
+                1u // accumulateHistory
+            };
+            vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+
+            uint32_t megaGroupsX = (m_config.width + 7) / 8;
+            uint32_t megaGroupsY = (m_config.height + 3) / 4;
+
+            if (m_dgc && m_dgcArgumentBuffer) {
+                VkDispatchIndirectCommand dgcCmd{};
+                dgcCmd.x = megaGroupsX;
+                dgcCmd.y = megaGroupsY;
+                dgcCmd.z = 1;
+                m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
+                m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
+            } else {
+                vkCmdDispatch(m_commandBuffer, megaGroupsX, megaGroupsY, 1);
+            }
         }
 
         VkMemoryBarrier2 memBarrier{};
@@ -1648,6 +2045,8 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
+    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "megakernel";
+
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
     stats.tonemap_time_ms = m_lastTonemapMs;
@@ -1838,6 +2237,64 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
             mw1.pBufferInfo = &secBufInfo;
             writes.push_back(mw1);
         }
+    }
+
+    // Wavefront descriptor sets update with new m_accumImage view
+    if (m_wfClassifyDescSet != VK_NULL_HANDLE) {
+        VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        cw0.dstSet = m_wfClassifyDescSet;
+        cw0.dstBinding = 0;
+        cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        cw0.descriptorCount = 1;
+        cw0.pImageInfo = &accumImageInfo;
+        writes.push_back(cw0);
+    }
+    if (m_wfShadeDescSetA != VK_NULL_HANDLE) {
+        VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        swA.dstSet = m_wfShadeDescSetA;
+        swA.dstBinding = 0;
+        swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        swA.descriptorCount = 1;
+        swA.pImageInfo = &accumImageInfo;
+        writes.push_back(swA);
+    }
+    if (m_wfShadeDescSetB != VK_NULL_HANDLE) {
+        VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        swB.dstSet = m_wfShadeDescSetB;
+        swB.dstBinding = 0;
+        swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        swB.descriptorCount = 1;
+        swB.pImageInfo = &accumImageInfo;
+        writes.push_back(swB);
+    }
+
+    // Reallocate wavefront ray queues if new resolution exceeds capacity
+    VkDeviceSize requiredQueueSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * 96;
+    VkDescriptorBufferInfo qAInfo{};
+    VkDescriptorBufferInfo qBInfo{};
+    if (m_rayQueueA && requiredQueueSize > m_rayQueueA->getSize()) {
+        m_rayQueueA = std::make_unique<Buffer>(
+            allocator, requiredQueueSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+        m_rayQueueB = std::make_unique<Buffer>(
+            allocator, requiredQueueSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+
+        qAInfo = { m_rayQueueA->getBuffer(), 0, requiredQueueSize };
+        qBInfo = { m_rayQueueB->getBuffer(), 0, requiredQueueSize };
+
+        // Classify binding 9 (queue A)
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+        // Shade A binding 9 (in: A), 10 (out: B)
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+        // Shade B binding 9 (in: B), 10 (out: A)
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
     }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);

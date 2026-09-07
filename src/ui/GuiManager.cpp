@@ -296,9 +296,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("SPIR-V: GL_EXT_ray_query (Native Wave32)");
             } else {
                 ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "RT Pipeline: Software ALU Loop (Compute Fallback)");
-                ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.5f, 1.0f), "  HW RT Extensions: BYPASSED / INACTIVE");
                 ImGui::BulletText("Active: ALU Möller-Trumbore + 32KB LDS Cache");
             }
+            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Compaction (3-Stage)" : "Monolithic Megakernel");
+            ImGui::Text("Ray Order:          %s", config.enable_morton_order ? "Morton Z-Curve (8x4)" : "Linear Scanline");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
             ImGui::Text("Validation Errors:  %u", stats.validation_errors);
@@ -526,6 +527,24 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("Moller-Trumbore ray-triangle intersection loop");
                 ImGui::BulletText("32KB Local Data Share (LDS) tile cache per Dual-CU");
                 ImGui::BulletText("Global memory SSBO primitive storage arrays");
+            }
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Scheduling Architecture:");
+            const char* pipelineModes[] = {
+                "Wavefront Compaction (Decomposed 3-Stage)",
+                "Monolithic Megakernel (Wave32 8x4)"
+            };
+            int curPipeline = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
+            if (ImGui::Combo("Pipeline Mode", &curPipeline, pipelineModes, IM_ARRAYSIZE(pipelineModes))) {
+                config.pipeline_type = (curPipeline == 0) ? PipelineType::Wavefront : PipelineType::Megakernel;
+                settingsChanged = true;
+                Logger::info("Switched pipeline architecture to: {}", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Compaction" : "Megakernel");
+            }
+
+            if (ImGui::Checkbox("Morton Z-Curve Ray Indexing (8x4)", &config.enable_morton_order)) {
+                settingsChanged = true;
+                Logger::info("Morton Z-Curve pixel indexing: {}", config.enable_morton_order ? "ENABLED" : "DISABLED");
             }
             ImGui::Separator();
         }

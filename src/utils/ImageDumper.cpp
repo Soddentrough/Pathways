@@ -94,6 +94,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("  \"vram_used_mb\": {:.2f},\n", stats.vram_used_mb)
         << std::format("  \"validation_errors\": {},\n", stats.validation_errors)
         << std::format("  \"mgpu_mode\": \"{}\",\n", stats.mgpu_mode_str)
+        << std::format("  \"pipeline_type\": \"{}\",\n", stats.pipeline_type_str)
         << std::format("  \"primary_gpu_time_ms\": {:.3f},\n", stats.primary_gpu_time_ms)
         << std::format("  \"secondary_gpu_time_ms\": {:.3f},\n", stats.secondary_gpu_time_ms)
         << std::format("  \"hardware_rt\": {},\n", stats.has_hw_rt ? "true" : "false")

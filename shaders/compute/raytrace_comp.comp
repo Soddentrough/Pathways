@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_ray_query : enable
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 8, local_size_y = 4) in;
 
 // Output linear accumulation buffer
 layout(binding = 0, rgba32f) uniform image2D uAccumImage;
@@ -810,16 +810,32 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
     return radiance;
 }
 
+ivec2 getPixelCoordsMorton8x4(uint linearIdx, uint width, uint height) {
+    uint tilesX = (width + 7u) / 8u;
+    uint tileIdx = linearIdx / 32u;
+    uint inTile = linearIdx % 32u;
+    uint tileX = tileIdx % tilesX;
+    uint tileY = tileIdx / tilesX;
+
+    uint mx = ((inTile >> 0u) & 1u) | (((inTile >> 2u) & 1u) << 1u) | (((inTile >> 4u) & 1u) << 2u);
+    uint my = ((inTile >> 1u) & 1u) | (((inTile >> 3u) & 1u) << 1u);
+
+    return ivec2(int(tileX * 8u + mx), int(tileY * 4u + my));
+}
+
 void main() {
     loadSceneToLDS();
 
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 imageSize = imageSize(uAccumImage);
+    ivec2 pixelCoord;
 
-    // Support sub-region / tile rendering for multi-GPU
     if (pc.tileWidth > 0 && pc.tileHeight > 0) {
+        pixelCoord = ivec2(gl_GlobalInvocationID.xy);
         if (pixelCoord.x >= pc.tileWidth || pixelCoord.y >= pc.tileHeight) return;
         pixelCoord += ivec2(pc.tileOffsetX, pc.tileOffsetY);
+    } else {
+        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
+        pixelCoord = getPixelCoordsMorton8x4(linearIdx, uint(imageSize.x), uint(imageSize.y));
     }
 
     if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {

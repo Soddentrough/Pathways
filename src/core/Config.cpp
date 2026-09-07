@@ -21,7 +21,9 @@ void Config::printUsage(const char* progName) {
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --dump-stats <path.json>Save benchmark & profiling statistics to JSON\n"
               << "  --gpu <int>             Physical GPU device index (default: 0)\n"
-              << "  --mgpu-mode <mode>      Multi-GPU mode: 'off', 'sample', 'tile', 'dynamic' (default: off)\n"
+              << "  --pipeline <mode>       Pipeline: 'wavefront' (decomposed DGC compaction, default) or 'megakernel'\n"
+              << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
+              << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --hw-rt                 Enable Hardware Ray Tracing (VK_KHR_ray_query, VK_KHR_acceleration_structure) [default]\n"
               << "  --no-hw-rt              Disable Hardware RT; fallback to compute ALU software loop (LDS/SSBO)\n"
@@ -66,6 +68,17 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_stats_path = argv[++i];
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--pipeline" && i + 1 < argc) {
+            std::string p = argv[++i];
+            if (p == "megakernel" || p == "mega") {
+                cfg.pipeline_type = PipelineType::Megakernel;
+            } else {
+                cfg.pipeline_type = PipelineType::Wavefront;
+            }
+        } else if (arg == "--morton") {
+            cfg.enable_morton_order = true;
+        } else if (arg == "--no-morton") {
+            cfg.enable_morton_order = false;
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off") cfg.mgpu_mode = MultiGpuMode::Off;

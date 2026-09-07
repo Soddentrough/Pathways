@@ -1,0 +1,67 @@
+#version 460
+
+layout(local_size_x = 32) in;
+
+struct VkDispatchIndirectCommand {
+    uint x;
+    uint y;
+    uint z;
+};
+
+struct DGCSequenceItem {
+    uint pipelineIndex;
+    uint pc[8];
+    VkDispatchIndirectCommand dispatch;
+};
+
+layout(std430, binding = 0) buffer QueueCounters {
+    uint activeRayCount;
+    uint nextActiveCount;
+    uint totalProcessed;
+    uint padding;
+} queueCounters;
+
+layout(std430, binding = 1) buffer IndirectCommand {
+    VkDispatchIndirectCommand dispatchCmd;
+} indirect;
+
+layout(std430, binding = 2) buffer DGCStream {
+    uint dynamicSequenceCount;
+    uint pad[3];
+    DGCSequenceItem sequence;
+} dgcStream;
+
+layout(push_constant) uniform PushConstants {
+    uint mode; // 0: initial resolve (classify -> shade), 1: bounce ping-pong swap
+} pc;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        uint count = (pc.mode == 0u) ? queueCounters.activeRayCount : queueCounters.nextActiveCount;
+        queueCounters.activeRayCount = count;
+        uint groups = (count + 31u) / 32u;
+
+        // Populate indirect dispatch command
+        indirect.dispatchCmd.x = groups;
+        indirect.dispatchCmd.y = 1u;
+        indirect.dispatchCmd.z = 1u;
+
+        // Populate DGC sequence with dynamic sequence count
+        if (count > 0u) {
+            dgcStream.dynamicSequenceCount = 1u;
+            dgcStream.sequence.pipelineIndex = 0u;
+            dgcStream.sequence.dispatch.x = groups;
+            dgcStream.sequence.dispatch.y = 1u;
+            dgcStream.sequence.dispatch.z = 1u;
+        } else {
+            dgcStream.dynamicSequenceCount = 0u;
+            dgcStream.sequence.dispatch.x = 0u;
+            dgcStream.sequence.dispatch.y = 0u;
+            dgcStream.sequence.dispatch.z = 0u;
+        }
+
+        // Reset downstream counter for the upcoming pass
+        queueCounters.nextActiveCount = 0u;
+        queueCounters.totalProcessed += count;
+    }
+}
