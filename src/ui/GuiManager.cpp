@@ -92,6 +92,14 @@ bool GuiManager::wantCaptureKeyboard() const {
     return ImGui::GetIO().WantCaptureKeyboard;
 }
 
+void GuiManager::resetHistory() {
+    for (size_t i = 0; i < HISTORY_SIZE; ++i) {
+        m_frameTimeHistory[i] = 0.0f;
+    }
+    m_historyOffset = 0;
+    m_smoothedFrameTime = 0.0f;
+}
+
 bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t width, uint32_t height,
                         Config& config, const FrameStats& stats, bool& cameraMode, Camera* camera,
                         const DisplayInfo* displayInfo, bool isFullscreen,
@@ -100,14 +108,24 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
     bool settingsChanged = false;
 
-    // Record frame time into rolling history
-    float currentFrameTime = static_cast<float>(stats.avg_frame_time_ms > 0.01 ? stats.avg_frame_time_ms : (stats.primary_gpu_time_ms + stats.tonemap_time_ms));
+    // Record true instantaneous frame time from GPU execution
+    float currentFrameTime = static_cast<float>(
+        stats.current_frame_time_ms > 0.001 ? stats.current_frame_time_ms :
+        ((stats.primary_gpu_time_ms + stats.tonemap_time_ms > 0.001) ?
+         (stats.primary_gpu_time_ms + stats.tonemap_time_ms) : stats.avg_frame_time_ms));
     if (currentFrameTime <= 0.001f) currentFrameTime = 0.5f;
+
+    // Fast-adapting exponential moving average (alpha = 0.25) for responsive yet rock-solid, flicker-free HUD readout
+    if (m_smoothedFrameTime <= 0.001f) {
+        m_smoothedFrameTime = currentFrameTime;
+    } else {
+        m_smoothedFrameTime = m_smoothedFrameTime * 0.75f + currentFrameTime * 0.25f;
+    }
 
     m_frameTimeHistory[m_historyOffset] = currentFrameTime;
     m_historyOffset = (m_historyOffset + 1) % HISTORY_SIZE;
 
-    // Compute min, max, avg across rolling history
+    // Compute min, max, avg across recent rolling history (last 60 frames)
     float historyMin = 1e9f, historyMax = 0.0f, historySum = 0.0f;
     int validCount = 0;
     for (size_t i = 0; i < HISTORY_SIZE; ++i) {
@@ -174,7 +192,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     // =========================================================================
     // WINDOW 1: Pathways Live Profiler & Telemetry HUD
     // =========================================================================
-    float fps = (currentFrameTime > 0.0001f) ? (1000.0f / currentFrameTime) : 0.0f;
+    float fps = (m_smoothedFrameTime > 0.0001f) ? (1000.0f / m_smoothedFrameTime) : 0.0f;
     float avgFps = (historyAvg > 0.0001f) ? (1000.0f / historyAvg) : 0.0f;
 
     char hudTitle[128];
@@ -215,7 +233,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::SameLine(hudW * 0.46f);
             ImGui::BeginGroup();
             ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Latency: %.2f ms", currentFrameTime);
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Average: %.1f FPS", avgFps);
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Rolling Avg: %.1f FPS", avgFps);
             ImGui::EndGroup();
         }
         ImGui::EndChild();
@@ -603,6 +621,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     vkCmdBeginRendering(cmd, &renderInfo);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     vkCmdEndRendering(cmd);
+
+    if (settingsChanged || (actions && actions->resetAccumulation)) {
+        resetHistory();
+    }
 
     return settingsChanged;
 }

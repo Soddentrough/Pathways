@@ -12,6 +12,8 @@ struct FrameStats {
     uint32_t height = 0;
     uint32_t spp = 0;
     uint32_t total_frames = 0;
+    double current_frame_time_ms = 0.0;
+    double current_fps = 0.0;
     double avg_frame_time_ms = 0.0;
     double min_frame_time_ms = 0.0;
     double max_frame_time_ms = 0.0;

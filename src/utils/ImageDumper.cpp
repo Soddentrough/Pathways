@@ -84,6 +84,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("  \"resolution\": [{}, {}],\n", stats.width, stats.height)
         << std::format("  \"spp\": {},\n", stats.spp)
         << std::format("  \"total_frames\": {},\n", stats.total_frames)
+        << std::format("  \"current_frame_time_ms\": {:.3f},\n", stats.current_frame_time_ms)
+        << std::format("  \"current_fps\": {:.1f},\n", stats.current_fps)
         << std::format("  \"avg_frame_time_ms\": {:.3f},\n", stats.avg_frame_time_ms)
         << std::format("  \"min_frame_time_ms\": {:.3f},\n", stats.min_frame_time_ms)
         << std::format("  \"max_frame_time_ms\": {:.3f},\n", stats.max_frame_time_ms)

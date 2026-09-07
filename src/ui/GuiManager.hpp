@@ -33,6 +33,7 @@ public:
 
     bool wantCaptureMouse() const;
     bool wantCaptureKeyboard() const;
+    void resetHistory();
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
@@ -40,10 +41,11 @@ private:
     bool m_layoutInitialized = false;
     bool m_lastWasPortrait = false;
 
-    // Rolling latency history for live profiler HUD
-    static constexpr size_t HISTORY_SIZE = 120;
+    // Rolling latency history for live profiler HUD (60-frame rolling window)
+    static constexpr size_t HISTORY_SIZE = 60;
     float m_frameTimeHistory[HISTORY_SIZE] = {0};
     int m_historyOffset = 0;
+    float m_smoothedFrameTime = 0.0f;
 };
 
 } // namespace pathways

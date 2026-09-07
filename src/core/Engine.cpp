@@ -1265,9 +1265,11 @@ void Engine::renderFrame() {
                               m_config, getStats(), m_cameraMode, m_camera.get(),
                               &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions)) {
                 m_resetAccumulation = true;
+                if (!m_config.headless) m_frameTimesMs.clear();
             }
             if (guiActions.resetAccumulation) {
                 m_resetAccumulation = true;
+                if (!m_config.headless) m_frameTimesMs.clear();
             }
             if (guiActions.toggleFullscreen) {
                 m_pendingToggleFullscreen = true;
@@ -1415,8 +1417,12 @@ void Engine::renderFrame() {
     m_lastGpuRtMs = gpuRtMs;
     m_lastSecGpuMs = secGpuMs;
     m_lastTonemapMs = gpuTonemapMs;
+    m_lastFrameTimeMs = totalGpuMs > 0.01 ? totalGpuMs : frameDurationMs;
 
-    m_frameTimesMs.push_back(totalGpuMs > 0.01 ? totalGpuMs : frameDurationMs);
+    m_frameTimesMs.push_back(m_lastFrameTimeMs);
+    if (!m_config.headless && m_frameTimesMs.size() > 60) {
+        m_frameTimesMs.erase(m_frameTimesMs.begin());
+    }
     m_frameIndex++;
     m_totalFramesRendered++;
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -1573,6 +1579,9 @@ FrameStats Engine::getStats() const {
     stats.total_frames = m_totalFramesRendered;
     stats.validation_errors = m_context->getValidationErrors();
 
+    stats.current_frame_time_ms = m_lastFrameTimeMs;
+    stats.current_fps = m_lastFrameTimeMs > 0.0001 ? (1000.0 / m_lastFrameTimeMs) : 0.0;
+
     if (!m_frameTimesMs.empty()) {
         double sum = std::accumulate(m_frameTimesMs.begin(), m_frameTimesMs.end(), 0.0);
         stats.avg_frame_time_ms = sum / m_frameTimesMs.size();
@@ -1581,9 +1590,10 @@ FrameStats Engine::getStats() const {
         stats.avg_fps = stats.avg_frame_time_ms > 0.0 ? 1000.0 / stats.avg_frame_time_ms : 0.0;
         stats.target_achieved = (stats.avg_frame_time_ms < 8.0);
 
-        // Rays per second = (width * height * spp * maxBounces) / (avg_frame_time_ms / 1000.0)
+        // Rays per second based on active throughput
+        double frameTimeForThroughput = stats.current_frame_time_ms > 0.001 ? stats.current_frame_time_ms : stats.avg_frame_time_ms;
         double raysPerFrame = static_cast<double>(m_config.width) * m_config.height * m_config.spp * m_config.max_bounces;
-        stats.rays_per_second = raysPerFrame / (stats.avg_frame_time_ms / 1000.0);
+        stats.rays_per_second = (frameTimeForThroughput > 0.0) ? (raysPerFrame / (frameTimeForThroughput / 1000.0)) : 0.0;
     }
 
     switch (m_config.mgpu_mode) {

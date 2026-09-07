@@ -133,6 +133,7 @@ private:
     uint32_t m_frameIndex = 0;
     uint32_t m_totalFramesRendered = 0;
     std::vector<double> m_frameTimesMs;
+    double m_lastFrameTimeMs = 0.0;
     double m_lastGpuRtMs = 0.0;
     double m_lastSecGpuMs = 0.0;
     double m_lastTonemapMs = 0.0;
