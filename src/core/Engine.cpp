@@ -962,6 +962,11 @@ void Engine::renderFrame() {
         };
         vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
         if (m_dgc && m_dgcArgumentBuffer) {
+            VkDispatchIndirectCommand dgcCmd{};
+            dgcCmd.x = groupsX;
+            dgcCmd.y = groupsY;
+            dgcCmd.z = 1;
+            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
             m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
         } else {
             vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
@@ -1036,6 +1041,11 @@ void Engine::renderFrame() {
         };
         vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
         if (m_dgc && m_dgcArgumentBuffer) {
+            VkDispatchIndirectCommand dgcCmd{};
+            dgcCmd.x = groupsX;
+            dgcCmd.y = groupsY;
+            dgcCmd.z = 1;
+            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
             m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
         } else {
             vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
@@ -1245,14 +1255,26 @@ void Engine::renderFrame() {
         depToDst.pImageMemoryBarriers = &toDst;
         vkCmdPipelineBarrier2(m_commandBuffer, &depToDst);
 
-        // Copy output image to swapchain image
-        VkImageCopy copyRegion{};
-        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.extent = { std::min(m_config.width, m_swapchain->getExtent().width),
-                              std::min(m_config.height, m_swapchain->getExtent().height), 1 };
-        vkCmdCopyImage(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+        // Copy or blit output image to swapchain image
+        if (m_config.width == m_swapchain->getExtent().width &&
+            m_config.height == m_swapchain->getExtent().height) {
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.extent = { m_config.width, m_config.height, 1 };
+            vkCmdCopyImage(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+        } else {
+            VkImageBlit blitRegion{};
+            blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitRegion.srcOffsets[0] = { 0, 0, 0 };
+            blitRegion.srcOffsets[1] = { static_cast<int32_t>(m_config.width), static_cast<int32_t>(m_config.height), 1 };
+            blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitRegion.dstOffsets[0] = { 0, 0, 0 };
+            blitRegion.dstOffsets[1] = { static_cast<int32_t>(m_swapchain->getExtent().width), static_cast<int32_t>(m_swapchain->getExtent().height), 1 };
+            vkCmdBlitImage(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_LINEAR);
+        }
 
         // Transition m_outputImage back to GENERAL
         m_outputImage->transitionLayout(
@@ -1655,6 +1677,14 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
 
     if (newWidth == m_config.width && newHeight == m_config.height &&
         m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
+        m_resetAccumulation = true;
+        if (m_dgc && m_dgcArgumentBuffer) {
+            VkDispatchIndirectCommand dgcCmd{};
+            dgcCmd.x = (m_config.width + 15) / 16;
+            dgcCmd.y = (m_config.height + 15) / 16;
+            dgcCmd.z = 1;
+            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
+        }
         return;
     }
 
@@ -1679,6 +1709,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
         m_config.height,
         m_context->getGraphicsQueueFamily()
     );
+    m_config.width = m_swapchain->getExtent().width;
+    m_config.height = m_swapchain->getExtent().height;
 
     // 2. Recreate render finish semaphores for new swapchain image count
     for (auto sem : m_renderFinishedSemaphores) {
@@ -1815,18 +1847,29 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
         m_uiDumpBuffer.reset();
     }
 
-    // 6. Resize secondary GPU if active
+    // 6. Update DGC argument buffer with new dispatch dimensions
+    if (m_dgc && m_dgcArgumentBuffer) {
+        VkDispatchIndirectCommand dgcCmd{};
+        dgcCmd.x = (m_config.width + 15) / 16;
+        dgcCmd.y = (m_config.height + 15) / 16;
+        dgcCmd.z = 1;
+        m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
+        Logger::info("DGC indirect dispatch buffer updated: {}x{} workgroups ({}x{} pixels).",
+                     dgcCmd.x, dgcCmd.y, m_config.width, m_config.height);
+    }
+
+    // 7. Resize secondary GPU if active
     if (m_mgpu && m_mgpu->isMultiGpuActive()) {
         m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    // 7. Adapt Camera aspect ratio & FOV
+    // 8. Adapt Camera aspect ratio & FOV
     if (m_camera) {
         float aspect = static_cast<float>(m_config.width) / static_cast<float>(m_config.height);
         m_camera->adaptFovForAspect(aspect);
     }
 
-    // 8. Invalidate accumulation
+    // 9. Invalidate accumulation
     m_frameIndex = 0;
     m_resetAccumulation = true;
 

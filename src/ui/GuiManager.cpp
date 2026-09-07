@@ -146,10 +146,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     bool isPortrait = (aspect < 1.05f);
 
     ImGuiCond layoutCond = ImGuiCond_FirstUseEver;
-    if (!m_layoutInitialized || m_lastWasPortrait != isPortrait) {
+    if (!m_layoutInitialized || m_lastWasPortrait != isPortrait || m_lastWidth != width || m_lastHeight != height) {
         layoutCond = ImGuiCond_Always;
         m_layoutInitialized = true;
         m_lastWasPortrait = isPortrait;
+        m_lastWidth = width;
+        m_lastHeight = height;
     }
 
     float hudX = 20.0f;

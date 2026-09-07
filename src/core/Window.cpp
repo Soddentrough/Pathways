@@ -236,14 +236,13 @@ void Window::toggleFullscreen() {
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {
-        if (static_cast<uint32_t>(actualW) != m_width || static_cast<uint32_t>(actualH) != m_height) {
-            m_width = static_cast<uint32_t>(actualW);
-            m_height = static_cast<uint32_t>(actualH);
-            m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-            if (m_resizeCallback) {
-                m_resizeCallback(m_width, m_height);
-            }
-        }
+        m_width = static_cast<uint32_t>(actualW);
+        m_height = static_cast<uint32_t>(actualH);
+        m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+    }
+
+    if (m_resizeCallback) {
+        m_resizeCallback(m_width, m_height);
     }
 }
 

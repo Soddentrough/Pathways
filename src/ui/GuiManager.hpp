@@ -40,6 +40,8 @@ private:
     bool m_initialized = false;
     bool m_layoutInitialized = false;
     bool m_lastWasPortrait = false;
+    uint32_t m_lastWidth = 0;
+    uint32_t m_lastHeight = 0;
 
     // Rolling latency history for live profiler HUD (60-frame rolling window)
     static constexpr size_t HISTORY_SIZE = 60;
