@@ -182,7 +182,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->p2pStagingBuffer = std::make_unique<Buffer>(
         secAlloc, bufferSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_MEMORY_USAGE_AUTO,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
     );
 
@@ -275,7 +275,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
         geom.vertexStride = sizeof(Vertex);
         geom.indexType = VK_INDEX_TYPE_NONE_KHR;
-        geom.isOpaque = true;
+        bool hasAlphaMask = false;
+        for (const auto& mat : scene.materials) {
+            if (mat.alphaMode == ALPHA_MODE_MASK) {
+                hasAlphaMask = true;
+                break;
+            }
+        }
+        geom.isOpaque = !hasAlphaMask;
 
         secNode->blas = secNode->asManager->buildBLAS({ geom });
 
@@ -313,10 +320,11 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->sceneTextures.clear();
     for (const auto& texData : scene.textures) {
         if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+            VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             auto tex = Texture::createFromPixels(
                 secDevice, secAlloc, secQueue, secPool,
                 texData.width, texData.height,
-                VK_FORMAT_R8G8B8A8_UNORM, texData.pixels.data(),
+                fmt, texData.pixels.data(),
                 texData.pixels.size(), false
             );
             secNode->sceneTextures.push_back(std::move(tex));
@@ -331,7 +339,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32 }
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo{};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -349,7 +357,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -383,8 +391,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
 
-    std::vector<VkDescriptorImageInfo> texInfos(16);
-    for (size_t i = 0; i < 16; ++i) {
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
         if (i < secNode->sceneTextures.size() && secNode->sceneTextures[i]) {
             texInfos[i] = secNode->sceneTextures[i]->getDescriptorInfo();
         } else {
@@ -401,7 +409,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
     };
     vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -474,13 +482,16 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t useHardwareRT,
                                          uint32_t hasEnvMap,
                                          float envMapIntensity,
-                                         uint32_t accumulateHistory) {
+                                         uint32_t accumulateHistory,
+                                         void* dstHostPtr,
+                                         size_t transferBytes) {
     if (!m_active || m_devices.empty()) return;
 
     m_asyncTask = std::async(std::launch::async, [this, cameraUniform,
                                                  tileOffsetX, tileOffsetY, tileWidth, tileHeight,
                                                  numTriangles, numSpheres, numMaterials, numLights,
-                                                 useHardwareRT, hasEnvMap, envMapIntensity, accumulateHistory]() {
+                                                 useHardwareRT, hasEnvMap, envMapIntensity, accumulateHistory,
+                                                 dstHostPtr, transferBytes]() {
         GpuDeviceNode* node = m_devices[0].get();
         VkDevice device = node->context->getDevice();
         VkQueue queue = node->context->getGraphicsQueue();
@@ -516,8 +527,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         };
         vkCmdPushConstants(node->commandBuffer, node->rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
-        uint32_t groupsX = (tileWidth + 15) / 16;
-        uint32_t groupsY = (tileHeight + 15) / 16;
+        uint32_t groupsX = (tileWidth + 7) / 8;
+        uint32_t groupsY = (tileHeight + 3) / 4;
         vkCmdDispatch(node->commandBuffer, groupsX, groupsY, 1);
 
         vkCmdWriteTimestamp2(node->commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, node->queryPool, 1);
@@ -565,6 +576,13 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         uint64_t timestamps[2] = {0, 0};
         vkGetQueryPoolResults(device, node->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         node->lastFrameTimeMs = (timestamps[1] - timestamps[0]) * node->timestampPeriod * 1e-6;
+
+        // 6. Asynchronous PCIe transfer into host-mapped destination buffer
+        if (dstHostPtr != nullptr && transferBytes > 0) {
+            void* srcPtr = node->p2pStagingBuffer->map();
+            std::memcpy(dstHostPtr, srcPtr, transferBytes);
+            node->p2pStagingBuffer->unmap();
+        }
     });
 }
 
@@ -575,10 +593,12 @@ void MultiGpuManager::syncAndTransfer(void* dstHostPtr, size_t byteSize) {
         m_asyncTask.get();
     }
 
-    GpuDeviceNode* node = m_devices[0].get();
-    void* srcPtr = node->p2pStagingBuffer->map();
-    std::memcpy(dstHostPtr, srcPtr, byteSize);
-    node->p2pStagingBuffer->unmap();
+    if (dstHostPtr != nullptr && byteSize > 0) {
+        GpuDeviceNode* node = m_devices[0].get();
+        void* srcPtr = node->p2pStagingBuffer->map();
+        std::memcpy(dstHostPtr, srcPtr, byteSize);
+        node->p2pStagingBuffer->unmap();
+    }
 }
 
 void MultiGpuManager::resize(uint32_t width, uint32_t height) {
@@ -628,7 +648,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->p2pStagingBuffer = std::make_unique<Buffer>(
             secAlloc, bufferSize,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_MEMORY_USAGE_AUTO,
             VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
         );
 

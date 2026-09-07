@@ -36,17 +36,42 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
 
     outScene.assetName = std::filesystem::path(filepath).stem().string();
 
+    // Determine sRGB status for textures (baseColor and emissive textures are sRGB in glTF 2.0)
+    std::vector<bool> textureIsSrgb(data->textures_count, false);
+    for (size_t i = 0; i < data->materials_count; ++i) {
+        const auto& mat = data->materials[i];
+        if (mat.has_pbr_metallic_roughness && mat.pbr_metallic_roughness.base_color_texture.texture) {
+            size_t idx = cgltf_texture_index(data, mat.pbr_metallic_roughness.base_color_texture.texture);
+            if (idx < textureIsSrgb.size()) textureIsSrgb[idx] = true;
+        }
+        if (mat.has_pbr_specular_glossiness && mat.pbr_specular_glossiness.diffuse_texture.texture) {
+            size_t idx = cgltf_texture_index(data, mat.pbr_specular_glossiness.diffuse_texture.texture);
+            if (idx < textureIsSrgb.size()) textureIsSrgb[idx] = true;
+        }
+        if (mat.emissive_texture.texture) {
+            size_t idx = cgltf_texture_index(data, mat.emissive_texture.texture);
+            if (idx < textureIsSrgb.size()) textureIsSrgb[idx] = true;
+        }
+        if (mat.has_specular && mat.specular.specular_color_texture.texture) {
+            size_t idx = cgltf_texture_index(data, mat.specular.specular_color_texture.texture);
+            if (idx < textureIsSrgb.size()) textureIsSrgb[idx] = true;
+        }
+    }
+
     // 0. Parse Images and Textures
     std::filesystem::path sceneDir = std::filesystem::path(filepath).parent_path();
     for (size_t t = 0; t < data->textures_count; ++t) {
         const auto& tex = data->textures[t];
         TextureData texData{};
+        texData.isSrgb = (t < textureIsSrgb.size()) ? textureIsSrgb[t] : false;
         if (tex.image) {
             int w = 0, h = 0, comp = 0;
             stbi_uc* rawPixels = nullptr;
-            if (tex.image->buffer_view && tex.image->buffer_view->buffer && tex.image->buffer_view->buffer->data) {
-                const uint8_t* bufPtr = reinterpret_cast<const uint8_t*>(tex.image->buffer_view->buffer->data) + tex.image->buffer_view->offset;
-                rawPixels = stbi_load_from_memory(bufPtr, static_cast<int>(tex.image->buffer_view->size), &w, &h, &comp, 4);
+            if (tex.image->buffer_view) {
+                const uint8_t* bufPtr = cgltf_buffer_view_data(tex.image->buffer_view);
+                if (bufPtr) {
+                    rawPixels = stbi_load_from_memory(bufPtr, static_cast<int>(tex.image->buffer_view->size), &w, &h, &comp, 4);
+                }
             } else if (tex.image->uri) {
                 std::filesystem::path imagePath = sceneDir / tex.image->uri;
                 rawPixels = stbi_load(imagePath.string().c_str(), &w, &h, &comp, 4);
@@ -75,7 +100,15 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
         gpuMat.type = MATERIAL_DIFFUSE;
         gpuMat.albedoTex = 0;
         gpuMat.normalTex = 0;
-        gpuMat.padding = 0;
+        gpuMat.mrTex = 0;
+        gpuMat.emissiveTex = 0;
+        gpuMat.occlusionTex = 0;
+        gpuMat.transmissionTex = 0;
+        gpuMat.alphaCutoff = mat.alpha_cutoff > 0.0f ? mat.alpha_cutoff : 0.5f;
+        gpuMat.alphaMode = static_cast<uint32_t>(mat.alpha_mode);
+        gpuMat.occlusionStrength = 1.0f;
+        gpuMat.normalScale = 1.0f;
+        gpuMat.thicknessTex = 0;
 
         if (mat.has_pbr_metallic_roughness) {
             const auto& pbr = mat.pbr_metallic_roughness;
@@ -87,6 +120,9 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             }
             if (pbr.base_color_texture.texture) {
                 gpuMat.albedoTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.base_color_texture.texture)) + 1;
+            }
+            if (pbr.metallic_roughness_texture.texture) {
+                gpuMat.mrTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.metallic_roughness_texture.texture)) + 1;
             }
         } else if (mat.has_pbr_specular_glossiness) {
             const auto& pbr = mat.pbr_specular_glossiness;
@@ -104,6 +140,20 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
 
         if (mat.normal_texture.texture) {
             gpuMat.normalTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.normal_texture.texture)) + 1;
+            if (mat.normal_texture.scale != 0.0f) {
+                gpuMat.normalScale = mat.normal_texture.scale;
+            }
+        }
+
+        if (mat.occlusion_texture.texture) {
+            gpuMat.occlusionTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.occlusion_texture.texture)) + 1;
+            if (mat.occlusion_texture.scale != 0.0f) {
+                gpuMat.occlusionStrength = mat.occlusion_texture.scale;
+            }
+        }
+
+        if (mat.emissive_texture.texture) {
+            gpuMat.emissiveTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.emissive_texture.texture)) + 1;
         }
 
         if (mat.has_ior) {
@@ -112,6 +162,9 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
 
         if (mat.has_transmission) {
             gpuMat.transmission = mat.transmission.transmission_factor;
+            if (mat.transmission.transmission_texture.texture) {
+                gpuMat.transmissionTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.transmission.transmission_texture.texture)) + 1;
+            }
             if (gpuMat.transmission > 0.1f) {
                 gpuMat.type = MATERIAL_DIELECTRIC;
             }
@@ -125,9 +178,6 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 mat.emissive_factor[2] * strength,
                 1.0f
             );
-            if (strength > 0.1f) {
-                gpuMat.type = MATERIAL_EMISSIVE;
-            }
         } else {
             gpuMat.emissive = glm::vec4(
                 mat.emissive_factor[0],
@@ -135,9 +185,48 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 mat.emissive_factor[2],
                 1.0f
             );
-            if (gpuMat.emissive.r > 0.1f || gpuMat.emissive.g > 0.1f || gpuMat.emissive.b > 0.1f) {
-                gpuMat.type = MATERIAL_EMISSIVE;
+        }
+
+        if (mat.has_clearcoat) {
+            gpuMat.clearcoat = mat.clearcoat.clearcoat_factor;
+            gpuMat.clearcoatRoughness = mat.clearcoat.clearcoat_roughness_factor;
+            if (mat.clearcoat.clearcoat_texture.texture) {
+                gpuMat.clearcoatTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.clearcoat.clearcoat_texture.texture)) + 1;
             }
+            if (mat.clearcoat.clearcoat_roughness_texture.texture) {
+                gpuMat.clearcoatRoughnessTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.clearcoat.clearcoat_roughness_texture.texture)) + 1;
+            }
+            if (mat.clearcoat.clearcoat_normal_texture.texture) {
+                gpuMat.clearcoatNormalTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.clearcoat.clearcoat_normal_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_volume) {
+            gpuMat.thickness = mat.volume.thickness_factor;
+            gpuMat.attenuationColor = glm::vec4(
+                mat.volume.attenuation_color[0],
+                mat.volume.attenuation_color[1],
+                mat.volume.attenuation_color[2],
+                mat.volume.attenuation_distance
+            );
+            if (mat.volume.thickness_texture.texture) {
+                gpuMat.thicknessTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.volume.thickness_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_specular) {
+            gpuMat.specularFactor = mat.specular.specular_factor;
+            if (mat.specular.specular_texture.texture) {
+                gpuMat.specularTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.specular.specular_texture.texture)) + 1;
+            }
+        }
+
+        bool hasTextures = (gpuMat.albedoTex > 0 || gpuMat.mrTex > 0 || gpuMat.normalTex > 0 ||
+                            gpuMat.occlusionTex > 0 || gpuMat.emissiveTex > 0 || gpuMat.transmissionTex > 0 ||
+                            gpuMat.clearcoatTex > 0 || gpuMat.clearcoatRoughnessTex > 0 || gpuMat.clearcoatNormalTex > 0 ||
+                            gpuMat.thicknessTex > 0 || gpuMat.specularTex > 0);
+        if (!hasTextures && (gpuMat.emissive.r > 0.1f || gpuMat.emissive.g > 0.1f || gpuMat.emissive.b > 0.1f)) {
+            gpuMat.type = MATERIAL_EMISSIVE;
         }
 
         outScene.materials.push_back(gpuMat);
@@ -339,6 +428,44 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
             uint32_t matId = prim.materialIndex;
             if (matId >= data.materials.size()) matId = 0;
 
+            auto computeTangents = [&](TriangleGPU& tri, const GltfVertex& v0_in, const GltfVertex& v1_in, const GltfVertex& v2_in, const glm::vec3& geoNormal) {
+                glm::vec3 p0 = glm::vec3(tri.v0.position);
+                glm::vec3 p1 = glm::vec3(tri.v1.position);
+                glm::vec3 p2 = glm::vec3(tri.v2.position);
+                glm::vec3 e1 = p1 - p0;
+                glm::vec3 e2 = p2 - p0;
+                glm::vec2 uv0 = glm::vec2(v0_in.position.w, v0_in.normal.w);
+                glm::vec2 uv1 = glm::vec2(v1_in.position.w, v1_in.normal.w);
+                glm::vec2 uv2 = glm::vec2(v2_in.position.w, v2_in.normal.w);
+                glm::vec2 duv1 = uv1 - uv0;
+                glm::vec2 duv2 = uv2 - uv0;
+                float det = duv1.x * duv2.y - duv2.x * duv1.y;
+                glm::vec3 defaultTan;
+                if (std::abs(det) > 1e-6f) {
+                    defaultTan = glm::normalize((e1 * duv2.y - e2 * duv1.y) / det);
+                } else {
+                    glm::vec3 up = std::abs(geoNormal.z) < 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+                    defaultTan = glm::normalize(glm::cross(up, geoNormal));
+                }
+
+                auto getVertTangent = [&](const GltfVertex& vert, const glm::vec3& norm) -> glm::vec4 {
+                    glm::vec3 t = glm::vec3(vert.tangent);
+                    if (glm::length(t) > 1e-4f) {
+                        glm::vec3 worldT = glm::normalize(glm::mat3(M) * t);
+                        worldT = glm::normalize(worldT - norm * glm::dot(worldT, norm));
+                        float sign = vert.tangent.w != 0.0f ? vert.tangent.w : 1.0f;
+                        return glm::vec4(worldT, sign);
+                    } else {
+                        glm::vec3 worldT = glm::normalize(defaultTan - norm * glm::dot(defaultTan, norm));
+                        return glm::vec4(worldT, 1.0f);
+                    }
+                };
+
+                tri.v0.tangent = getVertTangent(v0_in, glm::vec3(tri.v0.normal));
+                tri.v1.tangent = getVertTangent(v1_in, glm::vec3(tri.v1.normal));
+                tri.v2.tangent = getVertTangent(v2_in, glm::vec3(tri.v2.normal));
+            };
+
             if (!prim.indices.empty()) {
                 for (size_t i = 0; i + 2 < prim.indices.size(); i += 3) {
                     const auto& v0_in = prim.vertices[prim.indices[i]];
@@ -370,6 +497,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
                     tri.v0.normal = glm::vec4(glm::length(n0) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n0), v0_in.normal.w);
                     tri.v1.normal = glm::vec4(glm::length(n1) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n1), v1_in.normal.w);
                     tri.v2.normal = glm::vec4(glm::length(n2) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n2), v2_in.normal.w);
+
+                    computeTangents(tri, v0_in, v1_in, v2_in, geoNormal);
 
                     tri.materialId = matId;
                     data.triangles.push_back(tri);
@@ -405,6 +534,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
                     tri.v0.normal = glm::vec4(glm::length(n0) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n0), v0_in.normal.w);
                     tri.v1.normal = glm::vec4(glm::length(n1) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n1), v1_in.normal.w);
                     tri.v2.normal = glm::vec4(glm::length(n2) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n2), v2_in.normal.w);
+
+                    computeTangents(tri, v0_in, v1_in, v2_in, geoNormal);
 
                     tri.materialId = matId;
                     data.triangles.push_back(tri);

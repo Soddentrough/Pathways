@@ -22,6 +22,7 @@ layout(binding = 1) uniform CameraUBO {
 struct Vertex {
     vec4 position; // xyz: pos, w: u
     vec4 normal;   // xyz: norm, w: v
+    vec4 tangent;  // xyz: tangent, w: sign
 };
 
 struct Triangle {
@@ -48,7 +49,26 @@ struct Material {
     uint type; // 0: diffuse, 1: metallic, 2: dielectric, 3: emissive
     uint albedoTex;
     uint normalTex;
-    uint padding;
+    uint mrTex;
+    uint emissiveTex;
+    uint occlusionTex;
+    uint transmissionTex;
+    float alphaCutoff;
+    uint alphaMode;
+    float occlusionStrength;
+    float normalScale;
+    uint thicknessTex;
+
+    // Extended glTF 2.0 PBR Properties (offsets 96-144)
+    vec4 attenuationColor;
+    float clearcoat;
+    float clearcoatRoughness;
+    uint clearcoatTex;
+    uint clearcoatRoughnessTex;
+    uint clearcoatNormalTex;
+    float thickness;
+    float specularFactor;
+    uint specularTex;
 };
 
 struct Light {
@@ -77,7 +97,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[16];
+layout(binding = 8) uniform sampler2D sceneTextures[64];
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -348,10 +368,10 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
     int closestSphere = -1;
 
     if (pc.useHardwareRT == 1) {
-        // Hardware BVH Traversal on AMD RDNA4 Ray Accelerators
+        // Hardware BVH Traversal on AMD RDNA4 Ray Accelerators with Alpha Mask Testing
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
-                             gl_RayFlagsOpaqueEXT,
+                             gl_RayFlagsNoneEXT,
                              0xFF,
                              ray.origin,
                              tMin,
@@ -359,6 +379,26 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
                              closestT);
 
         while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                Material candMat = materials[triangles[triIdx].materialId];
+                if (candMat.alphaMode == 1u /* MASK */) {
+                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
+                    Triangle ctri = triangles[triIdx];
+                    vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
+                               cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
+                               cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                    float calpha = candMat.albedo.a;
+                    if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                        calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+                    }
+                    if (calpha < candMat.alphaCutoff) {
+                        continue; // Skip transparent pixel
+                    }
+                }
+                rayQueryConfirmIntersectionEXT(rq);
+            }
         }
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
@@ -397,13 +437,32 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
             vec3 normal = normalize(w * n0 + u * n1 + v * n2);
 
             closestHit.frontFace = dot(ray.direction, normal) < 0.0;
-            closestHit.normal = closestHit.frontFace ? normal : -normal;
+            normal = closestHit.frontFace ? normal : -normal;
 
             vec2 uv0 = vec2(tri.v0.position.w, tri.v0.normal.w);
             vec2 uv1 = vec2(tri.v1.position.w, tri.v1.normal.w);
             vec2 uv2 = vec2(tri.v2.position.w, tri.v2.normal.w);
             closestHit.uv = w * uv0 + u * uv1 + v * uv2;
             closestHit.materialId = tri.materialId;
+
+            Material hitMat = materials[tri.materialId];
+            if (hitMat.normalTex > 0u && hitMat.normalTex <= 64u) {
+                vec4 tan0 = tri.v0.tangent;
+                vec4 tan1 = tri.v1.tangent;
+                vec4 tan2 = tri.v2.tangent;
+                vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
+                float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
+
+                vec3 normalMap = texture(sceneTextures[hitMat.normalTex - 1u], closestHit.uv).rgb * 2.0 - 1.0;
+                normalMap.xy *= hitMat.normalScale;
+                normalMap = normalize(normalMap);
+
+                geomTan = normalize(geomTan - dot(geomTan, normal) * normal);
+                vec3 geomBitangent = cross(normal, geomTan) * tanSign;
+                mat3 tbn = mat3(geomTan, geomBitangent, normal);
+                normal = normalize(tbn * normalMap);
+            }
+            closestHit.normal = normal;
             return true;
         } else if (closestSphere >= 0) {
             closestHit.hit = true;
@@ -522,8 +581,27 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
                              tMax);
 
         while (rayQueryProceedEXT(rq)) {
-            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-            if (materials[triangles[triIdx].materialId].type != 3 /* EMISSIVE */) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                Material mat = materials[triangles[triIdx].materialId];
+                if (mat.type == 3 /* EMISSIVE */) {
+                    continue;
+                }
+                if (mat.alphaMode == 1u /* MASK */) {
+                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    float u = bary.x, v = bary.y, w = 1.0 - u - v;
+                    Triangle tri = triangles[triIdx];
+                    vec2 uv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
+                              u * vec2(tri.v1.position.w, tri.v1.normal.w) +
+                              v * vec2(tri.v2.position.w, tri.v2.normal.w);
+                    float alpha = mat.albedo.a;
+                    if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                        alpha *= texture(sceneTextures[mat.albedoTex - 1u], uv).a;
+                    }
+                    if (alpha < mat.alphaCutoff) {
+                        continue; // Skip transparent pixel
+                    }
+                }
                 rayQueryConfirmIntersectionEXT(rq);
                 rayQueryTerminateEXT(rq);
             }
@@ -624,7 +702,44 @@ vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
 float fresnelSchlick(float cosTheta, float refIdx) {
     float r0 = (1.0 - refIdx) / (1.0 + refIdx);
     r0 = r0 * r0;
-    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
+    return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Fresnel-Schlick approximation with vector F0 (Cook-Torrance PBR)
+vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
+    return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// GGX / Trowbridge-Reitz Normal Distribution Function D
+float distributionGGX(float NdotH, float alpha) {
+    float a2 = max(alpha * alpha, 1e-6);
+    float d = (NdotH * NdotH * (a2 - 1.0) + 1.0);
+    return a2 / (PI * d * d);
+}
+
+// Smith Joint Correlated Visibility Function V = G / (4 * NdotL * NdotV)
+float visibilitySmithGGXCorrelated(float NdotL, float NdotV, float alpha) {
+    float a2 = max(alpha * alpha, 1e-6);
+    float gv = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float gl = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-6);
+}
+
+// Importance sample GGX microfacet distribution for half-vector H in world space
+vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
+    vec2 xi = randVec2(seed);
+    float a2 = max(alpha * alpha, 1e-6);
+    float phi = TWO_PI * xi.x;
+    float cosTheta = sqrt(clamp((1.0 - xi.y) / max(1.0 + (a2 - 1.0) * xi.y, 1e-7), 0.0, 1.0));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
 }
 
 // Path tracing integrator
@@ -632,6 +747,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     Ray currentRay = primaryRay;
+    float currentAo = 1.0;
 
     bool enableDirect = (ubo.flags & (1 << 0)) != 0;
     bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
@@ -652,38 +768,106 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                 float t = 0.5 * (unitDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            radiance += throughput * skyColor;
+            radiance += throughput * skyColor * currentAo;
             break;
         }
 
         Material mat = s_useLds ? s_materials[hit.materialId] : materials[hit.materialId];
 
-        // Sample material textures (Albedo & Normal Map)
-        vec4 matAlbedo = mat.albedo;
-        if (mat.albedoTex > 0 && mat.albedoTex <= 16) {
-            matAlbedo *= texture(sceneTextures[mat.albedoTex - 1], hit.uv);
+        // 1. Sample Material Textures & Factors
+        vec4 baseColor = mat.albedo;
+        if (mat.albedoTex > 0 && mat.albedoTex <= 64) {
+            baseColor *= texture(sceneTextures[mat.albedoTex - 1], hit.uv);
+        }
+
+        float roughness = mat.roughness;
+        float metallic = mat.metallic;
+        if (mat.mrTex > 0 && mat.mrTex <= 64) {
+            vec4 mrSample = texture(sceneTextures[mat.mrTex - 1], hit.uv);
+            roughness *= mrSample.g;
+            metallic *= mrSample.b;
+        }
+        roughness = clamp(roughness, 0.04, 1.0);
+        metallic = clamp(metallic, 0.0, 1.0);
+        float alphaRoughness = roughness * roughness;
+
+        float ao = 1.0;
+        if (mat.occlusionTex > 0 && mat.occlusionTex <= 64) {
+            float occSample = texture(sceneTextures[mat.occlusionTex - 1], hit.uv).r;
+            ao = 1.0 + mat.occlusionStrength * (occSample - 1.0);
+        }
+        currentAo = ao;
+
+        float transmission = mat.transmission;
+        if (mat.transmissionTex > 0 && mat.transmissionTex <= 64) {
+            transmission *= texture(sceneTextures[mat.transmissionTex - 1], hit.uv).r;
+        }
+
+        vec3 emissive = mat.emissive.rgb;
+        if (mat.emissiveTex > 0 && mat.emissiveTex <= 64) {
+            emissive *= texture(sceneTextures[mat.emissiveTex - 1], hit.uv).rgb;
         }
 
         vec3 hitNormal = hit.normal;
-        if (mat.normalTex > 0 && mat.normalTex <= 16) {
-            vec3 normalMap = texture(sceneTextures[mat.normalTex - 1], hit.uv).rgb * 2.0 - 1.0;
-            vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-            vec3 tangent = normalize(cross(up, hitNormal));
-            vec3 bitangent = cross(hitNormal, tangent);
-            mat3 tbn = mat3(tangent, bitangent, hitNormal);
-            hitNormal = normalize(tbn * normalMap);
-        }
 
         // 1. Emissive
-        if (mat.type == 3 /* EMISSIVE */) {
+        if (length(emissive) > 1e-3) {
             if (bounce == 0 || enableIndirect) {
-                radiance += throughput * mat.emissive.rgb;
+                radiance += throughput * emissive;
             }
+            if (mat.type == 3 /* Pure EMISSIVE light source */) {
+                break;
+            }
+        } else if (mat.type == 3) {
             break;
         }
 
-        // 2. Next Event Estimation (Direct Lighting on Area & Spot Lights)
-        if (enableDirect && (mat.type == 0 || mat.type == 1)) {
+        float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+        float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
+        float specFactor = mat.specularFactor;
+        if (mat.specularTex > 0 && mat.specularTex <= 64) {
+            specFactor *= texture(sceneTextures[mat.specularTex - 1], hit.uv).a;
+        }
+        vec3 dielectricF0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
+        vec3 F0 = mix(dielectricF0, baseColor.rgb, metallic);
+        vec3 diffuseColor = baseColor.rgb * (1.0 - metallic);
+        vec3 V = -currentRay.direction;
+
+        // Clearcoat properties
+        float clearcoat = mat.clearcoat;
+        if (mat.clearcoatTex > 0 && mat.clearcoatTex <= 64) {
+            clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1], hit.uv).r;
+        }
+        float clearcoatRoughness = mat.clearcoatRoughness;
+        if (mat.clearcoatRoughnessTex > 0 && mat.clearcoatRoughnessTex <= 64) {
+            clearcoatRoughness *= texture(sceneTextures[mat.clearcoatRoughnessTex - 1], hit.uv).g;
+        }
+        clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
+        float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
+
+        vec3 clearcoatNormal = hitNormal;
+        if (mat.clearcoatNormalTex > 0 && mat.clearcoatNormalTex <= 64) {
+            vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+            vec3 cTan = normalize(cross(up, hitNormal));
+            vec3 cBitan = cross(hitNormal, cTan);
+            vec3 cNormMap = texture(sceneTextures[mat.clearcoatNormalTex - 1], hit.uv).rgb * 2.0 - 1.0;
+            clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
+        }
+
+        // Volumetric Beer-Lambert absorption
+        float thickness = mat.thickness;
+        if (mat.thicknessTex > 0 && mat.thicknessTex <= 64) {
+            thickness *= texture(sceneTextures[mat.thicknessTex - 1], hit.uv).g;
+        }
+        float mediumDist = !hit.frontFace ? hit.t : (thickness > 0.0 ? thickness / max(abs(dot(currentRay.direction, hitNormal)), 0.01) : 0.0);
+        if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
+            vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+            vec3 transmittance = exp(-sigma_a * mediumDist);
+            throughput *= transmittance;
+        }
+
+        // 2. Next Event Estimation (Direct Lighting with Cook-Torrance GGX Microfacet Model)
+        if (enableDirect && transmission < 0.1 && mat.type != 2) {
             for (uint l = 0; l < pc.numLights; ++l) {
                 Light light = s_useLds ? s_lights[l] : lights[l];
                 vec3 lightPoint;
@@ -697,7 +881,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                     lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
                     vec3 toLight = lightPoint - hit.point;
                     lightDist = length(toLight);
-                    lightDir = toLight / lightDist;
+                    lightDir = toLight / max(lightDist, 1e-4);
 
                     float cosLight = dot(-lightDir, light.normal.xyz);
                     if (cosLight <= 0.0) continue;
@@ -707,23 +891,22 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                 } else if (uint(light.position.w) == 1 /* SPOT */) {
                     vec3 toLight = light.position.xyz - hit.point;
                     lightDist = length(toLight);
-                    lightDir = toLight / lightDist;
+                    lightDir = toLight / max(lightDist, 1e-4);
 
                     float cosSpot = dot(-lightDir, light.normal.xyz);
                     float innerCos = light.u.w;
                     float outerCos = light.v.w;
                     if (cosSpot < outerCos) continue;
 
-                    float spotFactor = clamp((cosSpot - outerCos) / (innerCos - outerCos), 0.0, 1.0);
-                    lightEmission *= spotFactor / (lightDist * lightDist);
+                    float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                    lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
                     lightPdf = 1.0;
                 } else {
                     continue;
                 }
 
-                float cosTheta = dot(hitNormal, lightDir);
-                if (cosTheta > 0.0) {
-                    // Optimized Any-Hit Shadow ray occlusion test
+                float NdotL = dot(hitNormal, lightDir);
+                if (NdotL > 0.0) {
                     bool inShadow = false;
                     if (enableShadows) {
                         Ray shadowRay;
@@ -733,8 +916,36 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                     }
 
                     if (!inShadow) {
-                        vec3 brdf = matAlbedo.rgb * INV_PI;
-                        radiance += throughput * lightEmission * brdf * cosTheta / max(lightPdf, 1e-4);
+                        vec3 H = normalize(V + lightDir);
+                        float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                        float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                        float D = distributionGGX(NdotH, alphaRoughness);
+                        float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                        vec3 F = fresnelSchlickVec(VdotH, F0);
+
+                        vec3 specBRDF = enableSpecular ? (D * Vis * F) : vec3(0.0);
+                        vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+
+                        // Clearcoat layer evaluation
+                        float Fc = 0.0;
+                        vec3 clearcoatBRDF = vec3(0.0);
+                        if (clearcoat > 0.001 && enableSpecular) {
+                            vec3 Hc = normalize(V + lightDir);
+                            float NcDotL = clamp(dot(clearcoatNormal, lightDir), 0.0, 1.0);
+                            float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
+                            float NcDotH = clamp(dot(clearcoatNormal, Hc), 0.0, 1.0);
+                            float VDotHc = clamp(dot(V, Hc), 0.0, 1.0);
+
+                            Fc = fresnelSchlick(VDotHc, 1.5) * clearcoat;
+                            float Dc = distributionGGX(NcDotH, clearcoatAlpha);
+                            float VisC = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
+                            clearcoatBRDF = vec3(clearcoat * Dc * VisC * fresnelSchlick(VDotHc, 1.5));
+                        }
+
+                        vec3 brdf = (diffBRDF + specBRDF) * (1.0 - Fc) + clearcoatBRDF;
+                        radiance += throughput * lightEmission * brdf * NdotL / max(lightPdf, 1e-4);
                     }
                 }
             }
@@ -748,13 +959,12 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         // 3. BSDF Sampling for Next Bounce
         vec3 nextDirection;
 
-        if (mat.type == 2 /* DIELECTRIC / REFRACTION */) {
+        if (transmission > 0.01 || mat.type == 2 /* DIELECTRIC / REFRACTION */) {
             if (!enableRefraction) {
-                // Fallback to diffuse if refraction disabled
                 nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                throughput *= matAlbedo.rgb;
+                throughput *= baseColor.rgb;
             } else {
-                float refractionRatio = hit.frontFace ? (1.0 / mat.ior) : mat.ior;
+                float refractionRatio = hit.frontFace ? (1.0 / iorVal) : iorVal;
                 vec3 unitDir = normalize(currentRay.direction);
                 float cosTheta = min(dot(-unitDir, hitNormal), 1.0);
                 float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
@@ -763,40 +973,85 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                 float reflectProb = fresnelSchlick(cosTheta, refractionRatio);
 
                 if (cannotRefract || reflectProb > randFloat(seed)) {
-                    // Total Internal Reflection or Fresnel reflection
                     nextDirection = reflect(unitDir, hitNormal);
                     currentRay.origin = hit.point + hitNormal * EPSILON;
                 } else {
-                    // Refraction (Snell's Law)
                     nextDirection = refract(unitDir, hitNormal, refractionRatio);
                     currentRay.origin = hit.point - hitNormal * EPSILON;
                 }
                 currentRay.direction = normalize(nextDirection);
-                throughput *= matAlbedo.rgb;
+                throughput *= baseColor.rgb;
                 continue;
             }
-        } else if (mat.type == 1 /* METALLIC / SPECULAR */) {
-            if (!enableSpecular) {
-                nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                throughput *= matAlbedo.rgb;
-            } else {
-                vec3 reflected = reflect(normalize(currentRay.direction), hitNormal);
-                if (mat.roughness > 0.001) {
-                    reflected += mat.roughness * randVec3(seed);
-                }
-                nextDirection = normalize(reflected);
-                throughput *= matAlbedo.rgb;
-            }
         } else {
-            // Diffuse Lambertian
-            nextDirection = sampleCosineHemisphere(hitNormal, seed);
-            throughput *= matAlbedo.rgb;
+            // Clearcoat + Cook-Torrance GGX importance sampling
+            float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
+            float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
+            float xi = randFloat(seed);
+
+            if (xi < clearcoatProb) {
+                // Clearcoat specular lobe: GGX microfacet sampling with clearcoatNormal
+                vec3 Hc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
+                vec3 L = reflect(-V, Hc);
+                float NcDotL = dot(clearcoatNormal, L);
+
+                if (NcDotL > 0.0) {
+                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
+                    float NcDotH = clamp(dot(clearcoatNormal, Hc), 0.001, 1.0);
+                    float VDotHc = clamp(dot(V, Hc), 0.0, 1.0);
+
+                    float VisC = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
+                    float Fc = fresnelSchlick(VDotHc, 1.5) * clearcoat;
+
+                    vec3 specWeight = vec3((4.0 * VisC * Fc * NcDotL * VDotHc) / max(NcDotH * clearcoatProb, 1e-4));
+                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
+                    nextDirection = L;
+                } else {
+                    // Fallback to diffuse
+                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                    vec3 H_diff = normalize(V + nextDirection);
+                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
+                    throughput *= (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                }
+            } else if (xi < clearcoatProb + baseSpecProb) {
+                // Base Specular lobe: GGX microfacet sampling
+                vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
+                vec3 L = reflect(-V, H);
+                float NdotL = dot(hitNormal, L);
+
+                if (NdotL > 0.0) {
+                    float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                    float NdotH = clamp(dot(hitNormal, H), 0.001, 1.0);
+                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                    vec3 F = fresnelSchlickVec(VdotH, F0);
+                    float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
+
+                    vec3 specWeight = (4.0 * Vis * F * NdotL * VdotH * (1.0 - Fc)) / max(NdotH * baseSpecProb, 1e-4);
+                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
+                    nextDirection = L;
+                } else {
+                    // Fallback to diffuse
+                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                    vec3 H_diff = normalize(V + nextDirection);
+                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
+                    float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
+                    throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                }
+            } else {
+                // Diffuse lobe: Cosine-weighted hemisphere sampling
+                nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                vec3 H_diff = normalize(V + nextDirection);
+                vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
+                float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
+                throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+            }
         }
 
         currentRay.origin = hit.point + hitNormal * EPSILON;
         currentRay.direction = nextDirection;
 
-        // 4. Russian Roulette Path Termination (after bounce 2)
         // 4. Russian Roulette Path Termination (after bounce 1)
         if (bounce >= 1) {
             float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);

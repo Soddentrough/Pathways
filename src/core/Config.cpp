@@ -18,13 +18,18 @@ void Config::printUsage(const char* progName) {
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --dump-frame <path.png> Save tonemapped LDR frame to PNG\n"
+              << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --dump-stats <path.json>Save benchmark & profiling statistics to JSON\n"
               << "  --gpu <int>             Physical GPU device index (default: 0)\n"
+              << "  --mgpu-mode <mode>      Multi-GPU mode: 'sample' (Sample Parallelism across Dual GPUs),\n"
+              << "                          'tile' (Split-Frame Tiling), 'dynamic' (Work Queue), or 'off'\n"
+              << "  --single-gpu            Force single GPU mode (alias for --mgpu-mode off)\n"
               << "  --pipeline <mode>       Pipeline: 'wavefront' (decomposed DGC compaction, default) or 'megakernel'\n"
               << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
               << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
+              << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --hw-rt                 Enable Hardware Ray Tracing (VK_KHR_ray_query, VK_KHR_acceleration_structure) [default]\n"
               << "  --no-hw-rt              Disable Hardware RT; fallback to compute ALU software loop (LDS/SSBO)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
@@ -79,6 +84,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_morton_order = true;
         } else if (arg == "--no-morton") {
             cfg.enable_morton_order = false;
+        } else if (arg == "--single-gpu") {
+            cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off") cfg.mgpu_mode = MultiGpuMode::Off;
@@ -86,6 +93,12 @@ Config Config::parse(int argc, char* argv[]) {
             else if (mode == "tile") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             else if (mode == "dynamic") cfg.mgpu_mode = MultiGpuMode::DynamicWorkQueue;
             else cfg.mgpu_mode = MultiGpuMode::Off;
+        } else if (arg == "--log-interval") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg.log_interval_sec = std::stof(argv[++i]);
+            } else {
+                cfg.log_interval_sec = 10.0f;
+            }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
         } else if (arg == "--hw-rt") {

@@ -42,6 +42,7 @@ struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront;
     bool enable_morton_order = true;
     uint32_t tile_size = 64;
+    float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
 
     std::string scene_path = "";
     std::string hdri_path = "";

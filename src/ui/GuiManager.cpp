@@ -613,6 +613,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
+        // 6. Diagnostics & Console Logging
+        if (ImGui::CollapsingHeader("Diagnostics & Logging")) {
+            bool loggingEnabled = (config.log_interval_sec > 0.0f);
+            if (ImGui::Checkbox("Console Telemetry Output", &loggingEnabled)) {
+                config.log_interval_sec = loggingEnabled ? 10.0f : 0.0f;
+            }
+            if (loggingEnabled) {
+                ImGui::SliderFloat("Log Interval (sec)", &config.log_interval_sec, 1.0f, 60.0f, "%.1f s");
+            } else {
+                ImGui::TextDisabled("Console logging disabled (clean terminal)");
+            }
+        }
+
         // 6. Interactive Actions
         ImGui::Separator();
         if (ImGui::Button("Reset Accumulation", ImVec2(180.0f, 30.0f))) {

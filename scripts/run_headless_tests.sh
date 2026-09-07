@@ -88,6 +88,7 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --spp 16 \
     --max-bounces 4 \
     --frames 10 \
+    --pipeline megakernel \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -98,6 +99,7 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --spp 16 \
     --max-bounces 4 \
     --frames 10 \
+    --pipeline megakernel \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 
@@ -132,6 +134,23 @@ python3 scripts/verify_frame.py output/test_gltf_cornell.png output/stats_gltf_c
     --dump-stats output/stats_gltf_shapes.json
 
 python3 scripts/verify_frame.py output/test_gltf_shapes.png output/stats_gltf_shapes.json 1920 1080 15.0
+
+# 8. Test Suite 6: glTF 2.0 Full PBR Pipeline (MR, Normal, AO, Emissive, Alpha Mask, Glass)
+echo ""
+echo "[7/7] Running Test Suite 6: Full glTF 2.0 PBR Pipeline Verification (Showcase Scene)..."
+python3 scripts/generate_pbr_test_scene.py
+
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 16 \
+    --max-bounces 4 \
+    --scene scenes/pbr_showcase.gltf \
+    --dump-frame output/test_pbr_showcase.png \
+    --dump-stats output/stats_pbr_showcase.json
+
+python3 scripts/verify_frame.py output/test_pbr_showcase.png output/stats_pbr_showcase.json 1920 1080 35.0
 
 echo ""
 echo "=========================================================="

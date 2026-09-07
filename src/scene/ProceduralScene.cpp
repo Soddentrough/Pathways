@@ -6,22 +6,32 @@ namespace pathways {
 static void addQuad(std::vector<TriangleGPU>& triangles,
                     glm::vec3 p0, glm::vec3 p1, glm::vec3 p2, glm::vec3 p3,
                     glm::vec3 normal, uint32_t matId) {
+    glm::vec3 up = std::abs(normal.z) < 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+    glm::vec3 tanDir = glm::normalize(glm::cross(up, normal));
+    glm::vec4 tangentVec = glm::vec4(tanDir, 1.0f);
+
     TriangleGPU t1{};
     t1.v0.position = glm::vec4(p0, 0.0f);
     t1.v0.normal = glm::vec4(normal, 0.0f);
+    t1.v0.tangent = tangentVec;
     t1.v1.position = glm::vec4(p1, 1.0f);
     t1.v1.normal = glm::vec4(normal, 0.0f);
+    t1.v1.tangent = tangentVec;
     t1.v2.position = glm::vec4(p2, 1.0f);
     t1.v2.normal = glm::vec4(normal, 1.0f);
+    t1.v2.tangent = tangentVec;
     t1.materialId = matId;
 
     TriangleGPU t2{};
     t2.v0.position = glm::vec4(p0, 0.0f);
     t2.v0.normal = glm::vec4(normal, 0.0f);
+    t2.v0.tangent = tangentVec;
     t2.v1.position = glm::vec4(p2, 1.0f);
     t2.v1.normal = glm::vec4(normal, 1.0f);
+    t2.v1.tangent = tangentVec;
     t2.v2.position = glm::vec4(p3, 0.0f);
     t2.v2.normal = glm::vec4(normal, 1.0f);
+    t2.v2.tangent = tangentVec;
     t2.materialId = matId;
 
     triangles.push_back(t1);

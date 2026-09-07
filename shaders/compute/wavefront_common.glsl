@@ -14,6 +14,7 @@
 struct Vertex {
     vec4 position; // xyz: pos, w: u
     vec4 normal;   // xyz: norm, w: v
+    vec4 tangent;  // xyz: tangent, w: sign
 };
 
 struct Triangle {
@@ -40,7 +41,26 @@ struct Material {
     uint type; // 0: diffuse, 1: metallic, 2: dielectric, 3: emissive
     uint albedoTex;
     uint normalTex;
-    uint padding;
+    uint mrTex;
+    uint emissiveTex;
+    uint occlusionTex;
+    uint transmissionTex;
+    float alphaCutoff;
+    uint alphaMode;
+    float occlusionStrength;
+    float normalScale;
+    uint thicknessTex;
+
+    // Extended glTF 2.0 PBR Properties (offsets 96-144)
+    vec4 attenuationColor;
+    float clearcoat;
+    float clearcoatRoughness;
+    uint clearcoatTex;
+    uint clearcoatRoughnessTex;
+    uint clearcoatNormalTex;
+    float thickness;
+    float specularFactor;
+    uint specularTex;
 };
 
 struct Light {
@@ -127,6 +147,43 @@ float fresnelSchlick(float cosTheta, float refIdx) {
     float r0 = (1.0 - refIdx) / (1.0 + refIdx);
     r0 = r0 * r0;
     return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Fresnel-Schlick approximation with vector F0 (Cook-Torrance PBR)
+vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
+    return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// GGX / Trowbridge-Reitz Normal Distribution Function D
+float distributionGGX(float NdotH, float alpha) {
+    float a2 = max(alpha * alpha, 1e-6);
+    float d = (NdotH * NdotH * (a2 - 1.0) + 1.0);
+    return a2 / (PI * d * d);
+}
+
+// Smith Joint Correlated Visibility Function V = G / (4 * NdotL * NdotV)
+float visibilitySmithGGXCorrelated(float NdotL, float NdotV, float alpha) {
+    float a2 = max(alpha * alpha, 1e-6);
+    float gv = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float gl = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-6);
+}
+
+// Importance sample GGX microfacet distribution for half-vector H in world space
+vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
+    vec2 xi = randVec2(seed);
+    float a2 = max(alpha * alpha, 1e-6);
+    float phi = TWO_PI * xi.x;
+    float cosTheta = sqrt(clamp((1.0 - xi.y) / max(1.0 + (a2 - 1.0) * xi.y, 1e-7), 0.0, 1.0));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
 }
 
 // Procedural sphere ray intersection

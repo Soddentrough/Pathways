@@ -89,34 +89,16 @@ Window::Window(const Config& config)
     }
 
     // 2. Select Sensible Window Bounds if user did not pass explicit --width or --height
+    SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+
     if (!config.custom_resolution) {
-        if (m_displayInfo.isPortrait) {
-            // Portrait display (e.g. LG DualUp 1280x2160):
-            // Use maximum width (aligned to 16) and a height that fits comfortably
-            uint32_t w = (m_displayInfo.usableWidth / 16) * 16;
-            uint32_t h = (m_displayInfo.usableHeight / 16) * 16;
-            if (h >= 2160) {
-                h = 2048; // Leave margin for window decorations / Wayland bar, while keeping exact 16-pixel tile alignment
-            } else if (h > 64) {
-                h = ((h - 48) / 16) * 16;
-            }
-            m_width = w > 0 ? w : 1280;
-            m_height = h > 0 ? h : 2048;
-        } else {
-            // Landscape or square display:
-            // Default to sensible dimensions fitting desktop
-            if (m_displayInfo.usableWidth >= 3840 && m_displayInfo.usableHeight >= 2160) {
-                m_width = 2560;
-                m_height = 1440;
-            } else if (m_displayInfo.usableWidth <= 1920 || m_displayInfo.usableHeight <= 1080) {
-                m_width = (static_cast<uint32_t>(m_displayInfo.usableWidth * 0.9f) / 16) * 16;
-                m_height = (static_cast<uint32_t>(m_displayInfo.usableHeight * 0.9f) / 16) * 16;
-            } else {
-                m_width = 1920;
-                m_height = 1080;
-            }
-        }
-        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Sensible default window: {}x{}",
+        uint32_t w = (m_displayInfo.usableWidth / 16) * 16;
+        uint32_t h = (m_displayInfo.usableHeight / 16) * 16;
+        m_width = w > 0 ? w : 1280;
+        m_height = h > 0 ? h : 1080;
+        windowFlags |= SDL_WINDOW_MAXIMIZED;
+
+        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to full usable display (Maximized): {}x{}",
                      m_displayInfo.displayName, m_displayInfo.nativeWidth, m_displayInfo.nativeHeight,
                      m_displayInfo.refreshRate, m_displayInfo.contentScale, m_displayInfo.displayAspect,
                      m_width, m_height);
@@ -132,12 +114,17 @@ Window::Window(const Config& config)
         "Pathways - Vulkan 1.4 Path Tracer",
         static_cast<int>(m_width),
         static_cast<int>(m_height),
-        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
+        windowFlags
     );
 
     if (!m_window) {
         throw std::runtime_error(std::string("Failed to create SDL3 window: ") + SDL_GetError());
     }
+
+    SDL_ShowWindow(m_window);
+    SDL_RaiseWindow(m_window);
+    SDL_SyncWindow(m_window);
+    SDL_PumpEvents();
 
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
@@ -146,10 +133,6 @@ Window::Window(const Config& config)
         m_height = static_cast<uint32_t>(actualH);
         m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     }
-
-    SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    SDL_ShowWindow(m_window);
-    SDL_RaiseWindow(m_window);
 
     Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{}.", m_width, m_height);
 }
@@ -173,7 +156,17 @@ VkSurfaceKHR Window::createSurface(VkInstance instance) {
     if (!SDL_Vulkan_CreateSurface(m_window, instance, nullptr, &surface)) {
         throw std::runtime_error(std::string("Failed to create Vulkan surface: ") + SDL_GetError());
     }
-    Logger::info("Vulkan WSI Surface created successfully.");
+
+    SDL_PumpEvents();
+    int actualW = 0, actualH = 0;
+    SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
+    if (actualW > 0 && actualH > 0) {
+        m_width = static_cast<uint32_t>(actualW);
+        m_height = static_cast<uint32_t>(actualH);
+        m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+    }
+
+    Logger::info("Vulkan WSI Surface created successfully. Current window pixel size: {}x{}", m_width, m_height);
     return surface;
 }
 

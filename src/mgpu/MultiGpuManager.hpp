@@ -44,6 +44,7 @@ struct GpuDeviceNode {
     std::unique_ptr<AccelerationStructure> tlas;
 
     // Secondary Textures & Environment Map (Bindings 7 & 8)
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
     std::unique_ptr<Texture> dummyWhite;
     std::unique_ptr<Texture> dummyNormal;
     std::unique_ptr<Texture> environmentMap;
@@ -61,6 +62,7 @@ struct GpuDeviceNode {
 
 class MultiGpuManager {
 public:
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
     MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene);
     ~MultiGpuManager();
 
@@ -82,7 +84,9 @@ public:
                              uint32_t useHardwareRT = 0,
                              uint32_t hasEnvMap = 0,
                              float envMapIntensity = 1.0f,
-                             uint32_t accumulateHistory = 1);
+                             uint32_t accumulateHistory = 1,
+                             void* dstHostPtr = nullptr,
+                             size_t transferBytes = 0);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(void* dstHostPtr, size_t byteSize);

@@ -81,6 +81,7 @@ private:
     std::unique_ptr<Buffer> m_dgcArgumentBuffer;
 
     // Textures & Environment Map (Bindings 7 & 8)
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
     std::unique_ptr<Texture> m_dummyWhite;
     std::unique_ptr<Texture> m_dummyNormal;
     std::unique_ptr<Texture> m_environmentMap;
@@ -167,6 +168,7 @@ private:
     double m_lastTonemapMs = 0.0;
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
+    std::chrono::steady_clock::time_point m_lastLogTime;
 };
 
 } // namespace pathways

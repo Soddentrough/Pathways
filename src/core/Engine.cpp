@@ -23,6 +23,7 @@ namespace pathways {
 Engine::Engine(const Config& config) : m_config(config) {
     m_startTime = std::chrono::high_resolution_clock::now();
     m_lastFrameTime = m_startTime;
+    m_lastLogTime = std::chrono::steady_clock::now();
 
     Logger::info("Initializing Pathways Engine...");
     m_window = std::make_unique<Window>(m_config);
@@ -58,6 +59,8 @@ Engine::Engine(const Config& config) : m_config(config) {
             m_window->getHeight(),
             m_context->getGraphicsQueueFamily()
         );
+        m_config.width = m_swapchain->getExtent().width;
+        m_config.height = m_swapchain->getExtent().height;
     }
 
     float aspect = static_cast<float>(m_config.width) / static_cast<float>(m_config.height);
@@ -343,7 +346,14 @@ void Engine::initScene() {
         geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
         geom.vertexStride = sizeof(Vertex);
         geom.indexType = VK_INDEX_TYPE_NONE_KHR;
-        geom.isOpaque = true;
+        bool hasAlphaMask = false;
+        for (const auto& mat : m_sceneData.materials) {
+            if (mat.alphaMode == ALPHA_MODE_MASK) {
+                hasAlphaMask = true;
+                break;
+            }
+        }
+        geom.isOpaque = !hasAlphaMask;
 
         m_blas = m_asManager->buildBLAS({ geom });
 
@@ -383,10 +393,11 @@ void Engine::initScene() {
     m_sceneTextures.clear();
     for (const auto& texData : m_sceneData.textures) {
         if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+            VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             auto tex = Texture::createFromPixels(
                 device, allocator, queue, pool,
                 texData.width, texData.height,
-                VK_FORMAT_R8G8B8A8_UNORM, texData.pixels.data(),
+                fmt, texData.pixels.data(),
                 texData.pixels.size(), false
             );
             m_sceneTextures.push_back(std::move(tex));
@@ -463,7 +474,7 @@ void Engine::initPipelines() {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 20 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 128 }
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 }
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -483,7 +494,7 @@ void Engine::initPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -542,8 +553,8 @@ void Engine::initPipelines() {
 
     VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
 
-    std::vector<VkDescriptorImageInfo> texInfos(16);
-    for (size_t i = 0; i < 16; ++i) {
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
         if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
             texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
         } else {
@@ -561,7 +572,7 @@ void Engine::initPipelines() {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 8, 0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
         // Tonemap set
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputImageInfo, nullptr, nullptr }
@@ -648,8 +659,8 @@ void Engine::initPipelines() {
                     256
                 );
                 VkDispatchIndirectCommand defaultCmd{};
-                defaultCmd.x = (m_config.width + 15) / 16;
-                defaultCmd.y = (m_config.height + 15) / 16;
+                defaultCmd.x = (m_config.width + 7) / 8;
+                defaultCmd.y = (m_config.height + 3) / 4;
                 defaultCmd.z = 1;
                 m_dgcArgumentBuffer->copyFrom(&defaultCmd, sizeof(VkDispatchIndirectCommand));
                 Logger::info("Device-Generated Commands (DGC) initialized successfully.");
@@ -665,7 +676,7 @@ void Engine::initPipelines() {
         m_secTransferBuffer = std::make_unique<Buffer>(
             allocator, bufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_MEMORY_USAGE_AUTO,
             VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
         );
 
@@ -801,7 +812,7 @@ void Engine::initWavefrontPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
@@ -833,7 +844,7 @@ void Engine::initWavefrontPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
@@ -877,8 +888,8 @@ void Engine::initWavefrontPipelines() {
 
     VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
 
-    std::vector<VkDescriptorImageInfo> texInfos(16);
-    for (size_t i = 0; i < 16; ++i) {
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
         if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
             texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
         } else {
@@ -903,7 +914,7 @@ void Engine::initWavefrontPipelines() {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, dstSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
     };
 
     // Classify Set: Common + binding 9 (queue A), binding 10 (counters)
@@ -1199,14 +1210,18 @@ void Engine::renderFrame() {
     uint32_t imageIndex = 0;
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->acquireNextImage(m_imageAvailableSemaphores[m_currentFrame], &imageIndex);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
-            onResize(m_window->getWidth(), m_window->getHeight());
+        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR ||
+            m_config.width != m_swapchain->getExtent().width ||
+            m_config.height != m_swapchain->getExtent().height) {
+            onResize(m_swapchain->getExtent().width, m_swapchain->getExtent().height);
             return;
         }
     }
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
+    uint32_t rtGroupsX = (m_config.width + 7) / 8;
+    uint32_t rtGroupsY = (m_config.height + 3) / 4;
 
     struct {
         float exposure = 1.0f;
@@ -1362,18 +1377,15 @@ void Engine::renderFrame() {
             };
             vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
-            uint32_t megaGroupsX = (m_config.width + 7) / 8;
-            uint32_t megaGroupsY = (m_config.height + 3) / 4;
-
             if (m_dgc && m_dgcArgumentBuffer) {
                 VkDispatchIndirectCommand dgcCmd{};
-                dgcCmd.x = megaGroupsX;
-                dgcCmd.y = megaGroupsY;
+                dgcCmd.x = rtGroupsX;
+                dgcCmd.y = rtGroupsY;
                 dgcCmd.z = 1;
                 m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
                 m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
             } else {
-                vkCmdDispatch(m_commandBuffer, megaGroupsX, megaGroupsY, 1);
+                vkCmdDispatch(m_commandBuffer, rtGroupsX, rtGroupsY, 1);
             }
         }
 
@@ -1416,10 +1428,13 @@ void Engine::renderFrame() {
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
-        // 1. Launch secondary GPU asynchronously in dedicated worker thread (accumulateHistory = 0: no history accumulation on secondary)
+        size_t transferBytes = static_cast<size_t>(m_config.width) * m_config.height * 4 * sizeof(float);
+        void* dstHost = m_secTransferBuffer->map();
+
+        // 1. Launch secondary GPU asynchronously in dedicated worker thread (with overlapped PCIe transfer)
         m_mgpu->launchSecondaryWork(ubo1, m_frameIndex * 2 + 1, 0, 0, m_config.width, m_config.height,
                                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, 0u);
+                                   hasEnvMap, envIntensity, 0u, dstHost, transferBytes);
 
         // 2. Concurrently record and execute primary GPU raytracing
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
@@ -1447,13 +1462,13 @@ void Engine::renderFrame() {
         vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
         if (m_dgc && m_dgcArgumentBuffer) {
             VkDispatchIndirectCommand dgcCmd{};
-            dgcCmd.x = groupsX;
-            dgcCmd.y = groupsY;
+            dgcCmd.x = rtGroupsX;
+            dgcCmd.y = rtGroupsY;
             dgcCmd.z = 1;
             m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
             m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
         } else {
-            vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
+            vkCmdDispatch(m_commandBuffer, rtGroupsX, rtGroupsY, 1);
         }
 
         vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
@@ -1467,10 +1482,7 @@ void Engine::renderFrame() {
 
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-
-        size_t transferBytes = static_cast<size_t>(m_config.width) * m_config.height * 4 * sizeof(float);
-        void* dstHost = m_secTransferBuffer->map();
-        m_mgpu->syncAndTransfer(dstHost, transferBytes);
+        m_mgpu->syncAndTransfer(nullptr, 0);
         m_secTransferBuffer->unmap();
 
         // 4. Record Merge & Tonemapping commands on primary GPU
@@ -1537,10 +1549,13 @@ void Engine::renderFrame() {
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
+        size_t tileBytes = static_cast<size_t>(m_config.width) * h1 * 4 * sizeof(float);
+        void* dstHost = m_secTransferBuffer->map();
+
         // 1. Launch secondary GPU on bottom half asynchronously (accumulateHistory = 1: secondary retains bottom-half temporal accumulation)
         m_mgpu->launchSecondaryWork(ubo, m_frameIndex, 0, h0, m_config.width, h1,
                                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, 1u);
+                                   hasEnvMap, envIntensity, 1u, dstHost, tileBytes);
 
         // 2. Concurrently record and execute primary GPU on top half
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
@@ -1567,8 +1582,8 @@ void Engine::renderFrame() {
         };
         vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
-        uint32_t groupsY0 = (h0 + 15) / 16;
-        vkCmdDispatch(m_commandBuffer, groupsX, groupsY0, 1);
+        uint32_t groupsY0 = (h0 + 3) / 4;
+        vkCmdDispatch(m_commandBuffer, rtGroupsX, groupsY0, 1);
 
         vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
         vkEndCommandBuffer(m_commandBuffer);
@@ -1581,10 +1596,7 @@ void Engine::renderFrame() {
 
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-
-        size_t tileBytes = static_cast<size_t>(m_config.width) * h1 * 4 * sizeof(float);
-        void* dstHost = m_secTransferBuffer->map();
-        m_mgpu->syncAndTransfer(dstHost, tileBytes);
+        m_mgpu->syncAndTransfer(nullptr, 0);
         m_secTransferBuffer->unmap();
 
         // 4. Record Buffer-to-Image Copy for bottom half & Tonemapping commands
@@ -1877,7 +1889,19 @@ void Engine::renderFrame() {
     m_totalFramesRendered++;
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 
-    if (m_config.benchmark || (m_totalFramesRendered % 100 == 0)) {
+    bool shouldLog = false;
+    if (m_config.benchmark) {
+        shouldLog = true;
+    } else if (m_config.log_interval_sec > 0.0f) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsedSec = std::chrono::duration<double>(now - m_lastLogTime).count();
+        if (elapsedSec >= m_config.log_interval_sec) {
+            shouldLog = true;
+            m_lastLogTime = now;
+        }
+    }
+
+    if (shouldLog) {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs,
@@ -2078,17 +2102,16 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     if (m_config.headless || !m_swapchain) return;
     if (newWidth == 0 || newHeight == 0) return;
 
-    // Align to 16 for compute workgroup tiling
-    newWidth = std::max(64u, (newWidth / 16) * 16);
-    newHeight = std::max(64u, (newHeight / 16) * 16);
+    newWidth = std::max(64u, newWidth);
+    newHeight = std::max(64u, newHeight);
 
     if (newWidth == m_config.width && newHeight == m_config.height &&
         m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
         m_resetAccumulation = true;
         if (m_dgc && m_dgcArgumentBuffer) {
             VkDispatchIndirectCommand dgcCmd{};
-            dgcCmd.x = (m_config.width + 15) / 16;
-            dgcCmd.y = (m_config.height + 15) / 16;
+            dgcCmd.x = (m_config.width + 7) / 8;
+            dgcCmd.y = (m_config.height + 3) / 4;
             dgcCmd.z = 1;
             m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
         }
@@ -2221,7 +2244,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
         m_secTransferBuffer = std::make_unique<Buffer>(
             allocator, bufferSize,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_MEMORY_USAGE_AUTO,
             VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
         );
         secBufInfo = { m_secTransferBuffer->getBuffer(), 0, bufferSize };
@@ -2315,8 +2338,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     // 6. Update DGC argument buffer with new dispatch dimensions
     if (m_dgc && m_dgcArgumentBuffer) {
         VkDispatchIndirectCommand dgcCmd{};
-        dgcCmd.x = (m_config.width + 15) / 16;
-        dgcCmd.y = (m_config.height + 15) / 16;
+        dgcCmd.x = (m_config.width + 7) / 8;
+        dgcCmd.y = (m_config.height + 3) / 4;
         dgcCmd.z = 1;
         m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
         Logger::info("DGC indirect dispatch buffer updated: {}x{} workgroups ({}x{} pixels).",
