@@ -87,7 +87,8 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
             m_preprocessBuffer = std::make_unique<Buffer>(
                 m_allocator, memReqs.memoryRequirements.size + align,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, align
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, align,
+                VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT
             );
         }
     }

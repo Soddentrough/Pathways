@@ -6,7 +6,8 @@
 namespace pathways {
 
 Buffer::Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage,
-               VmaMemoryUsage memoryUsage, VmaAllocationCreateFlags flags, VkDeviceSize minAlignment)
+               VmaMemoryUsage memoryUsage, VmaAllocationCreateFlags flags, VkDeviceSize minAlignment,
+               VkBufferUsageFlags2KHR usage2)
     : m_allocator(allocator), m_size(size) {
 
     VkBufferCreateInfo bufferInfo{};
@@ -14,6 +15,13 @@ Buffer::Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usa
     bufferInfo.size = size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBufferUsageFlags2CreateInfoKHR usage2Info{};
+    if (usage2 != 0) {
+        usage2Info.sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR;
+        usage2Info.usage = static_cast<VkBufferUsageFlags2KHR>(usage) | usage2;
+        bufferInfo.pNext = &usage2Info;
+    }
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = memoryUsage;

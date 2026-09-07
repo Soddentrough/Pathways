@@ -990,6 +990,14 @@ void Engine::initWavefrontPipelines() {
     m_wfResolvePipeline  = createPipeline("wavefront_resolve.comp.spv", m_wfResolvePipelineLayout);
     m_wfShadePipeline    = createPipeline("wavefront_shade.comp.spv", m_wfShadePipelineLayout);
 
+    if (m_context->hasDGC()) {
+        try {
+            m_dgc = std::make_unique<DGCManager>(device, m_context->getAllocator(), m_wfShadePipelineLayout);
+        } catch (...) {
+            Logger::warn("Failed to create DGCManager for wavefront shade pipeline.");
+        }
+    }
+
     Logger::info("Wavefront Compaction compute pipelines (Classify, Resolve, Shade - Wave32) created successfully.");
 }
 

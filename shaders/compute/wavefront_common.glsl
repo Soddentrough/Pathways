@@ -129,4 +129,27 @@ float fresnelSchlick(float cosTheta, float refIdx) {
     return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// Procedural sphere ray intersection
+bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMax, out float outT, out vec3 outNormal) {
+    vec3 oc = origin - sphere.centerRadius.xyz;
+    float radius = sphere.centerRadius.w;
+    float a = dot(dir, dir);
+    float halfB = dot(oc, dir);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = halfB * halfB - a * c;
+
+    if (discriminant < 0.0) return false;
+    float sqrtd = sqrt(discriminant);
+
+    float root = (-halfB - sqrtd) / a;
+    if (root < tMin || root > tMax) {
+        root = (-halfB + sqrtd) / a;
+        if (root < tMin || root > tMax) return false;
+    }
+
+    outT = root;
+    outNormal = (origin + root * dir - sphere.centerRadius.xyz) / radius;
+    return true;
+}
+
 #endif // WAVEFRONT_COMMON_GLSL
