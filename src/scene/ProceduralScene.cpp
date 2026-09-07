@@ -74,6 +74,80 @@ static void addBox(std::vector<TriangleGPU>& triangles,
     addQuad(triangles, p[5], p[1], p[2], p[6], rot(glm::vec3(1, 0, 0)), matId);
 }
 
+static void addSphere(std::vector<TriangleGPU>& triangles,
+                      glm::vec3 center, float radius, uint32_t matId,
+                      int rings = 24, int sectors = 24) {
+    float const R = 1.0f / static_cast<float>(rings - 1);
+    float const S = 1.0f / static_cast<float>(sectors - 1);
+    float const PI = 3.14159265358979323846f;
+
+    auto makeTri = [matId](glm::vec3 pA, glm::vec3 nA, glm::vec2 uvA,
+                           glm::vec3 pB, glm::vec3 nB, glm::vec2 uvB,
+                           glm::vec3 pC, glm::vec3 nC, glm::vec2 uvC) {
+        TriangleGPU tri{};
+        glm::vec3 up = std::abs(nA.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v0.position = glm::vec4(pA, uvA.x);
+        tri.v0.normal = glm::vec4(nA, uvA.y);
+        tri.v0.tangent = glm::vec4(glm::normalize(glm::cross(up, nA)), 1.0f);
+
+        up = std::abs(nB.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v1.position = glm::vec4(pB, uvB.x);
+        tri.v1.normal = glm::vec4(nB, uvB.y);
+        tri.v1.tangent = glm::vec4(glm::normalize(glm::cross(up, nB)), 1.0f);
+
+        up = std::abs(nC.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v2.position = glm::vec4(pC, uvC.x);
+        tri.v2.normal = glm::vec4(nC, uvC.y);
+        tri.v2.tangent = glm::vec4(glm::normalize(glm::cross(up, nC)), 1.0f);
+
+        tri.materialId = matId;
+        return tri;
+    };
+
+    for (int r = 0; r < rings - 1; ++r) {
+        for (int s = 0; s < sectors - 1; ++s) {
+            float y0 = std::cos(PI * r * R);
+            float y1 = std::cos(PI * (r + 1) * R);
+            float r0 = std::sin(PI * r * R);
+            float r1 = std::sin(PI * (r + 1) * R);
+
+            float x00 = r0 * std::sin(2.0f * PI * s * S);
+            float z00 = r0 * std::cos(2.0f * PI * s * S);
+
+            float x10 = r1 * std::sin(2.0f * PI * s * S);
+            float z10 = r1 * std::cos(2.0f * PI * s * S);
+
+            float x01 = r0 * std::sin(2.0f * PI * (s + 1) * S);
+            float z01 = r0 * std::cos(2.0f * PI * (s + 1) * S);
+
+            float x11 = r1 * std::sin(2.0f * PI * (s + 1) * S);
+            float z11 = r1 * std::cos(2.0f * PI * (s + 1) * S);
+
+            glm::vec3 n00 = glm::normalize(glm::vec3(x00, y0, z00));
+            glm::vec3 n10 = glm::normalize(glm::vec3(x10, y1, z10));
+            glm::vec3 n01 = glm::normalize(glm::vec3(x01, y0, z01));
+            glm::vec3 n11 = glm::normalize(glm::vec3(x11, y1, z11));
+
+            glm::vec3 p00 = center + n00 * radius;
+            glm::vec3 p10 = center + n10 * radius;
+            glm::vec3 p01 = center + n01 * radius;
+            glm::vec3 p11 = center + n11 * radius;
+
+            glm::vec2 uv00 = glm::vec2(s * S, r * R);
+            glm::vec2 uv10 = glm::vec2(s * S, (r + 1) * R);
+            glm::vec2 uv01 = glm::vec2((s + 1) * S, r * R);
+            glm::vec2 uv11 = glm::vec2((s + 1) * S, (r + 1) * R);
+
+            if (r != 0) {
+                triangles.push_back(makeTri(p00, n00, uv00, p01, n01, uv01, p10, n10, uv10));
+            }
+            if (r != rings - 2) {
+                triangles.push_back(makeTri(p01, n01, uv01, p11, n11, uv11, p10, n10, uv10));
+            }
+        }
+    }
+}
+
 SceneData ProceduralScene::createCornellBox() {
     SceneData scene;
 
@@ -208,16 +282,10 @@ SceneData ProceduralScene::createCornellBox() {
     addBox(scene.triangles, glm::vec3(0.35f, 0.6f, -0.3f), glm::vec3(0.55f, 1.2f, 0.55f), 22.0f, 6);
 
     // 2. Glass Sphere (Dielectric Refraction) on the left
-    SphereGPU glassSphere{};
-    glassSphere.centerRadius = glm::vec4(-0.4f, 0.35f, -0.35f, 0.35f);
-    glassSphere.materialId = 4;
-    scene.spheres.push_back(glassSphere);
+    addSphere(scene.triangles, glm::vec3(-0.4f, 0.35f, -0.35f), 0.35f, 4);
 
     // 3. Metallic / Mirror Sphere in the foreground
-    SphereGPU metalSphere{};
-    metalSphere.centerRadius = glm::vec4(0.1f, 0.25f, 0.35f, 0.25f);
-    metalSphere.materialId = 5;
-    scene.spheres.push_back(metalSphere);
+    addSphere(scene.triangles, glm::vec3(0.1f, 0.25f, 0.35f), 0.25f, 5);
 
     scene.hasCamera = true;
     scene.cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);

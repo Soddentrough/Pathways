@@ -298,7 +298,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "RT Pipeline: Software ALU Loop (Compute Fallback)");
                 ImGui::BulletText("Active: ALU Möller-Trumbore + 32KB LDS Cache");
             }
-            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Compaction (3-Stage)" : "Monolithic Megakernel");
+            const char* pipeName = "Wavefront Compaction (3-Stage)";
+            if (config.pipeline_type == PipelineType::Megakernel) pipeName = "Monolithic Megakernel";
+            else if (config.pipeline_type == PipelineType::Persistent) pipeName = "Persistent Wavefront Work Queue";
+            else if (config.pipeline_type == PipelineType::RTP) pipeName = "Ray Tracing Pipeline (KHR)";
+            ImGui::Text("Pipeline:           %s", pipeName);
             ImGui::Text("Ray Order:          %s", config.enable_morton_order ? "Morton Z-Curve (8x4)" : "Linear Scanline");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
@@ -533,13 +537,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Scheduling Architecture:");
             const char* pipelineModes[] = {
                 "Wavefront Compaction (Decomposed 3-Stage)",
-                "Monolithic Megakernel (Wave32 8x4)"
+                "Monolithic Megakernel (Wave32 8x4)",
+                "Persistent Wavefront Work Queue",
+                "Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)"
             };
-            int curPipeline = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
+            int curPipeline = 0;
+            if (config.pipeline_type == PipelineType::Megakernel) curPipeline = 1;
+            else if (config.pipeline_type == PipelineType::Persistent) curPipeline = 2;
+            else if (config.pipeline_type == PipelineType::RTP) curPipeline = 3;
+
             if (ImGui::Combo("Pipeline Mode", &curPipeline, pipelineModes, IM_ARRAYSIZE(pipelineModes))) {
-                config.pipeline_type = (curPipeline == 0) ? PipelineType::Wavefront : PipelineType::Megakernel;
+                if (curPipeline == 0) config.pipeline_type = PipelineType::Wavefront;
+                else if (curPipeline == 1) config.pipeline_type = PipelineType::Megakernel;
+                else if (curPipeline == 2) config.pipeline_type = PipelineType::Persistent;
+                else if (curPipeline == 3) config.pipeline_type = PipelineType::RTP;
                 settingsChanged = true;
-                Logger::info("Switched pipeline architecture to: {}", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Compaction" : "Megakernel");
+                Logger::info("Switched pipeline architecture to: {}", pipelineModes[curPipeline]);
             }
 
             if (ImGui::Checkbox("Morton Z-Curve Ray Indexing (8x4)", &config.enable_morton_order)) {

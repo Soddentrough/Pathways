@@ -58,6 +58,7 @@ public:
     bool hasDGC() const { return m_hasDGC; }
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
+    const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
     uint32_t getValidationErrors() const { return s_validationErrors; }
 
     // Physical devices enumeration (for multi-GPU)
@@ -81,6 +82,7 @@ private:
     QueueFamilyIndices m_queueIndices;
 
     VkPhysicalDeviceProperties m_deviceProperties{};
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtPipelineProperties{};
     std::string m_deviceName;
     GpuArchitecture m_architecture = GpuArchitecture::Generic;
     bool m_isRDNA4 = false;

@@ -11,6 +11,7 @@
 #include "utils/ImageDumper.hpp"
 #include "rt/AccelerationStructure.hpp"
 #include "rt/DGCManager.hpp"
+#include "rt/RTPipeline.hpp"
 #include "vulkan/Texture.hpp"
 
 #include <memory>
@@ -101,10 +102,12 @@ private:
     VkDescriptorSet m_tonemapDescSet = VK_NULL_HANDLE;
 
     VkPipelineLayout m_rtPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_rtpPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_rtPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     VkPipeline m_wfPersistentPipeline = VK_NULL_HANDLE;
+    std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
 
     // Persistent Wavefront Work Queue Buffer
     std::unique_ptr<Buffer> m_workQueueBuffer;

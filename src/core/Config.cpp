@@ -79,6 +79,8 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.pipeline_type = PipelineType::Megakernel;
             } else if (p == "persistent" || p == "pwf") {
                 cfg.pipeline_type = PipelineType::Persistent;
+            } else if (p == "rtp" || p == "raygen" || p == "khr") {
+                cfg.pipeline_type = PipelineType::RTP;
             } else {
                 cfg.pipeline_type = PipelineType::Wavefront;
             }

@@ -109,6 +109,10 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/wavefront_shade.comp
     ${SHADER_DIR}/compute/wavefront_persistent.comp
+    ${SHADER_DIR}/rt/raytrace.rgen
+    ${SHADER_DIR}/rt/raytrace.rmiss
+    ${SHADER_DIR}/rt/shadow.rmiss
+    ${SHADER_DIR}/rt/raytrace.rchit
 )
 
 set(SPV_FILES "")

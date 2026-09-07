@@ -137,6 +137,7 @@ Engine::~Engine() {
     if (m_wfPersistentPipeline) vkDestroyPipeline(device, m_wfPersistentPipeline, nullptr);
 
     if (m_rtPipelineLayout) vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
+    if (m_rtpPipelineLayout) vkDestroyPipelineLayout(device, m_rtpPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
     if (m_mergePipelineLayout) vkDestroyPipelineLayout(device, m_mergePipelineLayout, nullptr);
     if (m_wfClassifyPipelineLayout) vkDestroyPipelineLayout(device, m_wfClassifyPipelineLayout, nullptr);
@@ -499,17 +500,22 @@ void Engine::initPipelines() {
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
     // 2. Ray Tracing Descriptor Set Layout
+    VkShaderStageFlags rtStages = VK_SHADER_STAGE_COMPUTE_BIT;
+    if (m_context->hasRayTracing()) {
+        rtStages |= VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+    }
+
     std::vector<VkDescriptorSetLayoutBinding> rtBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, rtStages, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
+        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -612,6 +618,23 @@ void Engine::initPipelines() {
     rtPipeLayoutInfo.pPushConstantRanges = &rtPushConstant;
     vkCreatePipelineLayout(device, &rtPipeLayoutInfo, nullptr, &m_rtPipelineLayout);
 
+    if (m_context->hasRayTracing()) {
+        VkPushConstantRange rtpPushConstant{};
+        rtpPushConstant.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                                     VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                                     VK_SHADER_STAGE_MISS_BIT_KHR;
+        rtpPushConstant.offset = 0;
+        rtpPushConstant.size = sizeof(uint32_t) * 12;
+
+        VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
+        rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        rtpPipeLayoutInfo.setLayoutCount = 1;
+        rtpPipeLayoutInfo.pSetLayouts = &m_rtDescLayout;
+        rtpPipeLayoutInfo.pushConstantRangeCount = 1;
+        rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
+        vkCreatePipelineLayout(device, &rtpPipeLayoutInfo, nullptr, &m_rtpPipelineLayout);
+    }
+
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     tonemapPushConstant.offset = 0;
@@ -680,8 +703,29 @@ void Engine::initPipelines() {
 
     Logger::info("Compute pipelines (Path Tracer & ACES Tonemapping - Wave32) created successfully.");
 
-    // Initialize Device-Generated Commands (VK_EXT_device_generated_commands) if supported
     VmaAllocator allocator = m_context->getAllocator();
+
+    // Initialize Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) if supported
+    if (m_context->hasRayTracing()) {
+        try {
+            auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
+            auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
+            auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
+            auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
+
+            m_rtpKhrPipeline = std::make_unique<RTPipeline>(
+                device, allocator,
+                m_context->getRayTracingPipelineProperties(),
+                m_rtpPipelineLayout,
+                rgenCode, rmissCode, shadowMissCode, rchitCode
+            );
+            Logger::info("Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to initialize RTPipeline: {}", e.what());
+        }
+    }
+
+    // Initialize Device-Generated Commands (VK_EXT_device_generated_commands) if supported
     if (m_context->hasDGC()) {
         try {
             m_dgc = std::make_unique<DGCManager>(device, allocator, m_rtPipelineLayout);
@@ -1504,6 +1548,23 @@ void Engine::renderFrame() {
 
             // 3. Dispatch Persistent Waves (384 workgroups: 96 CUs * 4 waves/CU to saturate Navi 31)
             vkCmdDispatch(cmd, 384, 1, 1);
+        } else if (m_config.pipeline_type == PipelineType::RTP && m_rtpKhrPipeline) {
+            // === HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+
+            uint32_t rtPushConstants[12] = {
+                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                0, 0, m_config.width, m_config.height,
+                useHwRT,
+                hasEnvMap,
+                envIntensityBits,
+                1u // accumulateHistory
+            };
+            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+
+            m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
         } else {
             // === MONOLITHIC MEGAKERNEL PIPELINE ===
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
@@ -1533,7 +1594,7 @@ void Engine::renderFrame() {
 
         VkMemoryBarrier2 memBarrier{};
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
         memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
@@ -2222,7 +2283,7 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
-    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : ((m_config.pipeline_type == PipelineType::Persistent) ? "persistent" : "megakernel");
+    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : ((m_config.pipeline_type == PipelineType::Persistent) ? "persistent" : ((m_config.pipeline_type == PipelineType::RTP) ? "rtp" : "megakernel"));
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;

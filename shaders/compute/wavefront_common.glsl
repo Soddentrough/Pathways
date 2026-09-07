@@ -186,6 +186,36 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
     return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
 }
 
+// Evaluate combined BSDF PDF for Multiple Importance Sampling (MIS)
+float evalBSDFPdf(vec3 V, vec3 L, vec3 N, vec3 Nc, float alphaRoughness, float clearcoatAlpha, float clearcoatProb, float baseSpecProb, float clearcoat) {
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0) return 0.0;
+
+    vec3 H = normalize(V + L);
+    float NdotH = clamp(dot(N, H), 0.0, 1.0);
+    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+    float diffPdf = NdotL * INV_PI;
+
+    float D = distributionGGX(NdotH, alphaRoughness);
+    float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
+
+    float clearcoatPdf = 0.0;
+    if (clearcoat > 0.001) {
+        float NcDotL = dot(Nc, L);
+        if (NcDotL > 0.0) {
+            float NcDotH = clamp(dot(Nc, H), 0.0, 1.0);
+            float VDotHc = clamp(dot(V, H), 0.0, 1.0);
+            float Dc = distributionGGX(NcDotH, clearcoatAlpha);
+            clearcoatPdf = (Dc * NcDotH) / max(4.0 * VDotHc, 1e-4);
+        }
+    }
+
+    float diffProb = max(1.0 - clearcoatProb - baseSpecProb, 0.0);
+    return diffProb * diffPdf + baseSpecProb * specPdf + clearcoatProb * clearcoatPdf;
+}
+
+
 // Procedural sphere ray intersection
 bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMax, out float outT, out vec3 outNormal) {
     vec3 oc = origin - sphere.centerRadius.xyz;

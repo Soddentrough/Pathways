@@ -1,0 +1,177 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct HitPayload {
+    vec3 radiance;
+    vec3 throughputMod;
+    vec3 nextOrigin;
+    vec3 nextDirection;
+    vec3 shadowOrigin;
+    vec3 shadowDir;
+    float shadowDist;
+    vec3 shadowLightRad;
+    uint seed;
+    float lastBsdfPdf;
+    bool hasShadowRay;
+    bool hit;
+    bool isDelta;
+};
+
+layout(location = 0) rayPayloadEXT HitPayload prd;
+layout(location = 1) rayPayloadEXT bool isShadowVisible;
+
+layout(binding = 0, rgba32f) uniform image2D uAccumImage;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+} ubo;
+
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
+layout(push_constant) uniform PushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint tileOffsetX;
+    uint tileOffsetY;
+    uint tileWidth;
+    uint tileHeight;
+    uint useHardwareRT;
+    uint hasEnvMap;
+    float envMapIntensity;
+    uint accumulateHistory;
+} pc;
+
+uint pcg_hash(inout uint seed) {
+    seed = seed * 747796405u + 2891336453u;
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randFloat(inout uint seed) {
+    return float(pcg_hash(seed)) / 4294967296.0;
+}
+
+vec2 randVec2(inout uint seed) {
+    return vec2(randFloat(seed), randFloat(seed));
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 imageSize = ivec2(gl_LaunchSizeEXT.xy);
+
+    if (pc.tileWidth > 0u && pc.tileHeight > 0u) {
+        if (pixelCoord.x >= pc.tileWidth || pixelCoord.y >= pc.tileHeight) return;
+        pixelCoord += ivec2(pc.tileOffsetX, pc.tileOffsetY);
+    }
+
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+
+    uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + ubo.frameIndex * 26699) | 1u;
+    vec3 pixelRadiance = vec3(0.0);
+
+    for (uint s = 0; s < ubo.spp; ++s) {
+        vec2 jitter = randVec2(seed) - vec2(0.5);
+        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(imageSize);
+        vec2 d = uv * 2.0 - 1.0;
+
+        vec4 target = ubo.projInverse * vec4(d.x, d.y, 1.0, 1.0);
+        vec4 rayDirWorld = ubo.viewInverse * vec4(normalize(target.xyz / target.w), 0.0);
+
+        vec3 rayOrigin = ubo.position.xyz;
+        vec3 rayDir = normalize(rayDirWorld.xyz);
+        vec3 throughput = vec3(1.0);
+        vec3 radiance = vec3(0.0);
+        float lastBsdfPdf = 0.0;
+        bool isDelta = true;
+
+        for (uint bounce = 0; bounce < ubo.maxBounces; ++bounce) {
+            prd.hit = false;
+            prd.radiance = vec3(0.0);
+            prd.throughputMod = vec3(0.0);
+            prd.hasShadowRay = false;
+            prd.seed = seed;
+            prd.lastBsdfPdf = lastBsdfPdf;
+            prd.isDelta = isDelta;
+
+            traceRayEXT(topLevelAS,
+                        gl_RayFlagsOpaqueEXT,
+                        0xFF,
+                        0 /* sbtRecordOffset */,
+                        0 /* sbtRecordStride */,
+                        0 /* missIndex 0 */,
+                        rayOrigin,
+                        0.001,
+                        rayDir,
+                        10000.0,
+                        0 /* payload location 0 */);
+
+            seed = prd.seed;
+            lastBsdfPdf = prd.lastBsdfPdf;
+            isDelta = prd.isDelta;
+
+            if (!prd.hit) {
+                radiance += throughput * prd.radiance;
+                break;
+            }
+
+            // Direct emissive
+            radiance += throughput * prd.radiance;
+
+            // Direct light shadow ray
+            if (prd.hasShadowRay) {
+                isShadowVisible = false;
+                traceRayEXT(topLevelAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                            0xFF,
+                            0,
+                            0,
+                            1 /* missIndex 1: shadow.rmiss */,
+                            prd.shadowOrigin,
+                            0.001,
+                            prd.shadowDir,
+                            prd.shadowDist,
+                            1 /* payload location 1 */);
+
+                if (isShadowVisible) {
+                    radiance += throughput * prd.shadowLightRad;
+                }
+            }
+
+            throughput *= prd.throughputMod;
+
+            if (bounce >= 1u) {
+                float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+                if (randFloat(seed) > p) {
+                    break;
+                }
+                throughput /= p;
+            }
+
+            rayOrigin = prd.nextOrigin;
+            rayDir = prd.nextDirection;
+        }
+
+        pixelRadiance += radiance;
+    }
+
+    vec4 newAccum;
+    if (pc.accumulateHistory == 0u || ubo.frameIndex == 0u) {
+        newAccum = vec4(pixelRadiance, float(ubo.spp));
+    } else {
+        vec4 prevAccum = imageLoad(uAccumImage, pixelCoord);
+        newAccum = prevAccum + vec4(pixelRadiance, float(ubo.spp));
+    }
+
+    imageStore(uAccumImage, pixelCoord, newAccum);
+}
