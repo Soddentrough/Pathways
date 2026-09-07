@@ -283,9 +283,13 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         }
     }
 
-    // Check Subgroup Size Control (Wave32 support)
+    // Check Subgroup Size Control (Wave32 support) and DGC Properties
     VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps{};
     subgroupProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT dgcProps{};
+    dgcProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT;
+    subgroupProps.pNext = &dgcProps;
+
     VkPhysicalDeviceProperties2 props2{};
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &subgroupProps;
@@ -300,6 +304,13 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                  m_hasDGC ? "SUPPORTED" : "NOT FOUND",
                  m_hasRayTracing ? "SUPPORTED" : "NOT FOUND",
                  m_hasSubgroupSizeControl ? "SUPPORTED" : "NOT FOUND");
+    if (m_hasDGC) {
+        Logger::info("DGC Hardware Limits -> MaxTokens: {}, MaxSequences: {}, MaxStride: {} B, Stages: 0x{:x}",
+                     dgcProps.maxIndirectCommandsTokenCount,
+                     dgcProps.maxIndirectSequenceCount,
+                     dgcProps.maxIndirectCommandsIndirectStride,
+                     dgcProps.supportedIndirectCommandsShaderStages);
+    }
 }
 
 void VulkanContext::createLogicalDevice(const Config& config) {

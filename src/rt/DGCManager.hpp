@@ -15,10 +15,13 @@ struct DGCDispatchCmd {
 
 class DGCManager {
 public:
-    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout);
+    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout,
+               uint32_t pushConstantSize = 0, VkShaderStageFlags pushConstantStages = VK_SHADER_STAGE_COMPUTE_BIT);
     ~DGCManager();
 
     bool isSupported() const { return m_supported; }
+    bool isMultiToken() const { return m_pushConstantSize > 0; }
+    uint32_t getPushConstantSize() const { return m_pushConstantSize; }
     VkIndirectCommandsLayoutEXT getLayout() const { return m_indirectLayout; }
 
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
@@ -35,6 +38,7 @@ private:
     VkIndirectCommandsLayoutEXT m_indirectLayout = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> m_preprocessBuffer;
     bool m_supported = false;
+    uint32_t m_pushConstantSize = 0;
 
     PFN_vkCreateIndirectCommandsLayoutEXT pfn_vkCreateIndirectCommandsLayoutEXT = nullptr;
     PFN_vkDestroyIndirectCommandsLayoutEXT pfn_vkDestroyIndirectCommandsLayoutEXT = nullptr;

@@ -15,7 +15,8 @@ enum class MultiGpuMode {
 
 enum class PipelineType {
     Wavefront,
-    Megakernel
+    Megakernel,
+    Persistent
 };
 
 struct Config {

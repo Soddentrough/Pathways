@@ -5,8 +5,10 @@
 
 namespace pathways {
 
-DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout)
-    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout) {
+DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout,
+                       uint32_t pushConstantSize, VkShaderStageFlags pushConstantStages)
+    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout),
+      m_pushConstantSize(pushConstantSize) {
 
     loadFunctionPointers();
     if (!m_supported) {
@@ -14,23 +16,65 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         return;
     }
 
-    // Token for indirect dispatch
-    VkIndirectCommandsLayoutTokenEXT token{};
-    token.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT;
-    token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
-    token.offset = 0;
+    std::vector<VkIndirectCommandsLayoutTokenEXT> tokens;
+    VkIndirectCommandsPushConstantTokenEXT pushToken{};
+
+    if (pushConstantSize > 0) {
+        pushToken.updateRange.stageFlags = pushConstantStages;
+        pushToken.updateRange.offset = 0;
+        pushToken.updateRange.size = pushConstantSize;
+
+        VkIndirectCommandsLayoutTokenEXT t0{};
+        t0.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT;
+        t0.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT;
+        t0.data.pPushConstant = &pushToken;
+        t0.offset = 0;
+        tokens.push_back(t0);
+
+        VkIndirectCommandsLayoutTokenEXT t1{};
+        t1.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT;
+        t1.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
+        t1.offset = pushConstantSize;
+        tokens.push_back(t1);
+    } else {
+        VkIndirectCommandsLayoutTokenEXT token{};
+        token.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT;
+        token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
+        token.offset = 0;
+        tokens.push_back(token);
+    }
 
     VkIndirectCommandsLayoutCreateInfoEXT createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT;
     createInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    createInfo.indirectStride = sizeof(VkDispatchIndirectCommand);
+    createInfo.indirectStride = pushConstantSize + sizeof(VkDispatchIndirectCommand);
     createInfo.pipelineLayout = m_pipelineLayout;
-    createInfo.tokenCount = 1;
-    createInfo.pTokens = &token;
+    createInfo.tokenCount = static_cast<uint32_t>(tokens.size());
+    createInfo.pTokens = tokens.data();
 
     VkResult res = pfn_vkCreateIndirectCommandsLayoutEXT(m_device, &createInfo, nullptr, &m_indirectLayout);
     if (res == VK_SUCCESS) {
-        Logger::info("Created DGC indirect commands layout (stride: {} bytes).", createInfo.indirectStride);
+        Logger::info("Created DGC indirect commands layout (tokens: {}, stride: {} bytes).",
+                     createInfo.tokenCount, createInfo.indirectStride);
+    } else if (pushConstantSize > 0) {
+        Logger::warn("Multi-token DGC layout creation failed (code: {}). Falling back to single-token dispatch layout.", (int)res);
+        m_pushConstantSize = 0;
+        tokens.clear();
+        VkIndirectCommandsLayoutTokenEXT token{};
+        token.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT;
+        token.type = VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT;
+        token.offset = 0;
+        tokens.push_back(token);
+        createInfo.indirectStride = sizeof(VkDispatchIndirectCommand);
+        createInfo.tokenCount = 1;
+        createInfo.pTokens = tokens.data();
+        res = pfn_vkCreateIndirectCommandsLayoutEXT(m_device, &createInfo, nullptr, &m_indirectLayout);
+        if (res == VK_SUCCESS) {
+            Logger::info("Created fallback single-token DGC layout (stride: {} bytes).", createInfo.indirectStride);
+        } else {
+            Logger::warn("Failed to create fallback DGC layout (code: {}). DGC disabled.", (int)res);
+            m_supported = false;
+        }
     } else {
         Logger::warn("Failed to create DGC indirect commands layout (code: {}). DGC disabled.", (int)res);
         m_supported = false;

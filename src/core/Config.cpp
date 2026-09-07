@@ -25,7 +25,7 @@ void Config::printUsage(const char* progName) {
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'sample' (Sample Parallelism across Dual GPUs),\n"
               << "                          'tile' (Split-Frame Tiling), 'dynamic' (Work Queue), or 'off'\n"
               << "  --single-gpu            Force single GPU mode (alias for --mgpu-mode off)\n"
-              << "  --pipeline <mode>       Pipeline: 'wavefront' (decomposed DGC compaction, default) or 'megakernel'\n"
+              << "  --pipeline <mode>       Pipeline: 'wavefront' (decomposed DGC compaction, default), 'persistent' (Persistent Wavefront Work Queue), or 'megakernel'\n"
               << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
               << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
@@ -77,6 +77,8 @@ Config Config::parse(int argc, char* argv[]) {
             std::string p = argv[++i];
             if (p == "megakernel" || p == "mega") {
                 cfg.pipeline_type = PipelineType::Megakernel;
+            } else if (p == "persistent" || p == "pwf") {
+                cfg.pipeline_type = PipelineType::Persistent;
             } else {
                 cfg.pipeline_type = PipelineType::Wavefront;
             }

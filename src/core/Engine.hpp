@@ -62,12 +62,14 @@ private:
     std::unique_ptr<class GuiManager> m_gui;
     std::unique_ptr<class MultiGpuManager> m_mgpu;
 
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+
     // GPU Buffers
     std::unique_ptr<Buffer> m_triangleBuffer;
     std::unique_ptr<Buffer> m_sphereBuffer;
     std::unique_ptr<Buffer> m_materialBuffer;
     std::unique_ptr<Buffer> m_lightBuffer;
-    std::unique_ptr<Buffer> m_cameraUBO;
+    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
@@ -95,13 +97,17 @@ private:
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_rtDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_tonemapDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_rtDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSet m_tonemapDescSet = VK_NULL_HANDLE;
 
     VkPipelineLayout m_rtPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_rtPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
+    VkPipeline m_wfPersistentPipeline = VK_NULL_HANDLE;
+
+    // Persistent Wavefront Work Queue Buffer
+    std::unique_ptr<Buffer> m_workQueueBuffer;
 
     // Wavefront Compaction Queues & Buffers
     std::unique_ptr<Buffer> m_rayQueueA;
@@ -116,10 +122,10 @@ private:
     VkDescriptorSetLayout m_wfResolveDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_wfShadeDescLayout = VK_NULL_HANDLE;
 
-    VkDescriptorSet m_wfClassifyDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfClassifyDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSet m_wfResolveDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet m_wfShadeDescSetA = VK_NULL_HANDLE; // Reads A, writes B
-    VkDescriptorSet m_wfShadeDescSetB = VK_NULL_HANDLE; // Reads B, writes A
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfShadeDescSetsA = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // Reads A, writes B
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfShadeDescSetsB = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // Reads B, writes A
 
     VkPipelineLayout m_wfClassifyPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_wfResolvePipelineLayout = VK_NULL_HANDLE;
@@ -131,10 +137,9 @@ private:
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+    std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_commandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkSurfaceKHR m_surface = VK_NULL_HANDLE;
-    VkFence m_inFlightFence = VK_NULL_HANDLE;
-    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+    std::array<VkFence, MAX_FRAMES_IN_FLIGHT> m_inFlightFences = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     uint32_t m_currentFrame = 0;
     std::vector<VkSemaphore> m_imageAvailableSemaphores;
     std::vector<VkSemaphore> m_renderFinishedSemaphores;

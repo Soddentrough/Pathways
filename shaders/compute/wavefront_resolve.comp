@@ -8,9 +8,24 @@ struct VkDispatchIndirectCommand {
     uint z;
 };
 
+struct ShadePushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint width;
+    uint height;
+    uint currentBounce;
+    uint maxBounces;
+    uint maxQueueCapacity;
+    uint sppSampleIndex;
+    uint hasEnvMap;
+    float envMapIntensity;
+    uint useHardwareRT;
+};
+
 struct DGCSequenceItem {
-    uint pipelineIndex;
-    uint pc[8];
+    ShadePushConstants pc;
     VkDispatchIndirectCommand dispatch;
 };
 
@@ -27,12 +42,25 @@ layout(std430, binding = 1) buffer IndirectCommand {
 
 layout(std430, binding = 2) buffer DGCStream {
     uint dynamicSequenceCount;
-    uint pad[3];
+    uint pad[15]; // 60 bytes pad -> offset 64 for sequence item
     DGCSequenceItem sequence;
 } dgcStream;
 
 layout(push_constant) uniform PushConstants {
     uint mode; // 0: initial resolve (classify -> shade), 1: bounce ping-pong swap
+    uint bounce;
+    uint maxBounces;
+    uint width;
+    uint height;
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint hasEnvMap;
+    float envIntensity;
+    uint useHwRT;
+    uint maxCapacity;
+    uint sppSampleIndex;
 } pc;
 
 void main() {
@@ -41,15 +69,28 @@ void main() {
         queueCounters.activeRayCount = count;
         uint groups = (count + 31u) / 32u;
 
-        // Populate indirect dispatch command
+        // Populate indirect dispatch command (fallback)
         indirect.dispatchCmd.x = groups;
         indirect.dispatchCmd.y = 1u;
         indirect.dispatchCmd.z = 1u;
 
-        // Populate DGC sequence with dynamic sequence count
+        // Populate multi-token DGC sequence with push constants + dispatch
         if (count > 0u) {
             dgcStream.dynamicSequenceCount = 1u;
-            dgcStream.sequence.pipelineIndex = 0u;
+            dgcStream.sequence.pc.numTriangles = pc.numTriangles;
+            dgcStream.sequence.pc.numSpheres = pc.numSpheres;
+            dgcStream.sequence.pc.numMaterials = pc.numMaterials;
+            dgcStream.sequence.pc.numLights = pc.numLights;
+            dgcStream.sequence.pc.width = pc.width;
+            dgcStream.sequence.pc.height = pc.height;
+            dgcStream.sequence.pc.currentBounce = pc.bounce;
+            dgcStream.sequence.pc.maxBounces = pc.maxBounces;
+            dgcStream.sequence.pc.maxQueueCapacity = pc.maxCapacity;
+            dgcStream.sequence.pc.sppSampleIndex = pc.sppSampleIndex;
+            dgcStream.sequence.pc.hasEnvMap = pc.hasEnvMap;
+            dgcStream.sequence.pc.envMapIntensity = pc.envIntensity;
+            dgcStream.sequence.pc.useHardwareRT = pc.useHwRT;
+
             dgcStream.sequence.dispatch.x = groups;
             dgcStream.sequence.dispatch.y = 1u;
             dgcStream.sequence.dispatch.z = 1u;

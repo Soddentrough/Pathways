@@ -110,9 +110,13 @@ Engine::~Engine() {
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
 
-    if (m_queryPool) vkDestroyQueryPool(device, m_queryPool, nullptr);
-    if (m_inFlightFence) vkDestroyFence(device, m_inFlightFence, nullptr);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_inFlightFences[i]) vkDestroyFence(device, m_inFlightFences[i], nullptr);
+    }
+    if (m_rtFence) vkDestroyFence(device, m_rtFence, nullptr);
     if (m_commandPool) vkDestroyCommandPool(device, m_commandPool, nullptr);
+
+    if (m_queryPool) vkDestroyQueryPool(device, m_queryPool, nullptr);
 
     for (auto sem : m_imageAvailableSemaphores) {
         if (sem) vkDestroySemaphore(device, sem, nullptr);
@@ -130,6 +134,7 @@ Engine::~Engine() {
     if (m_wfClassifyPipeline) vkDestroyPipeline(device, m_wfClassifyPipeline, nullptr);
     if (m_wfResolvePipeline) vkDestroyPipeline(device, m_wfResolvePipeline, nullptr);
     if (m_wfShadePipeline) vkDestroyPipeline(device, m_wfShadePipeline, nullptr);
+    if (m_wfPersistentPipeline) vkDestroyPipeline(device, m_wfPersistentPipeline, nullptr);
 
     if (m_rtPipelineLayout) vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
@@ -146,8 +151,8 @@ Engine::~Engine() {
     if (m_wfShadeDescLayout) vkDestroyDescriptorSetLayout(device, m_wfShadeDescLayout, nullptr);
 
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
-    if (m_rtFence) vkDestroyFence(device, m_rtFence, nullptr);
     m_secTransferBuffer.reset();
+    m_workQueueBuffer.reset();
 
     m_rayQueueA.reset();
     m_rayQueueB.reset();
@@ -175,13 +180,13 @@ void Engine::initVulkan() {
     poolInfo.queueFamilyIndex = m_context->getGraphicsQueueFamily();
     vkCreateCommandPool(device, &poolInfo, nullptr, &m_commandPool);
 
-    // Command buffer
+    // Command buffers (Double-buffered)
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = m_commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device, &allocInfo, &m_commandBuffer);
+    allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+    vkAllocateCommandBuffers(device, &allocInfo, m_commandBuffers.data());
 
     // Create Render Target Images
     m_accumImage = std::make_unique<Image>(
@@ -200,26 +205,26 @@ void Engine::initVulkan() {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
 
     m_accumImage->transitionLayout(
-        m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
     m_outputImage->transitionLayout(
-        m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
-    vkEndCommandBuffer(m_commandBuffer);
+    vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffer;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 }
@@ -301,13 +306,22 @@ void Engine::initScene() {
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
-    // Camera UBO
+    // Camera UBOs (Double-buffered)
     VkDeviceSize uboSize = sizeof(CameraUniform);
-    m_cameraUBO = std::make_unique<Buffer>(
-        allocator, uboSize,
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_cameraUBOs[i] = std::make_unique<Buffer>(
+            allocator, uboSize,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+    }
+
+    // Persistent Wavefront Work Queue Buffer
+    m_workQueueBuffer = std::make_unique<Buffer>(
+        allocator, sizeof(uint32_t) * 16,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
     );
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
@@ -470,18 +484,18 @@ void Engine::initPipelines() {
 
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 20 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 20 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 },
-        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128 },
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 }
     };
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = 32;
+    poolInfo.maxSets = 64;
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
     // 2. Ray Tracing Descriptor Set Layout
@@ -494,7 +508,8 @@ void Engine::initPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -516,12 +531,14 @@ void Engine::initPipelines() {
     vkCreateDescriptorSetLayout(device, &tonemapLayoutInfo, nullptr, &m_tonemapDescLayout);
 
     // 4. Allocate Descriptor Sets
-    VkDescriptorSetAllocateInfo rtAllocInfo{};
-    rtAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    rtAllocInfo.descriptorPool = m_descriptorPool;
-    rtAllocInfo.descriptorSetCount = 1;
-    rtAllocInfo.pSetLayouts = &m_rtDescLayout;
-    vkAllocateDescriptorSets(device, &rtAllocInfo, &m_rtDescSet);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        VkDescriptorSetAllocateInfo rtAllocInfo{};
+        rtAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        rtAllocInfo.descriptorPool = m_descriptorPool;
+        rtAllocInfo.descriptorSetCount = 1;
+        rtAllocInfo.pSetLayouts = &m_rtDescLayout;
+        vkAllocateDescriptorSets(device, &rtAllocInfo, &m_rtDescSets[i]);
+    }
 
     VkDescriptorSetAllocateInfo tonemapAllocInfo{};
     tonemapAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -539,7 +556,6 @@ void Engine::initPipelines() {
     outputImageInfo.imageView = m_outputImage->getImageView();
     outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
     VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
     VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
@@ -562,21 +578,24 @@ void Engine::initPipelines() {
         }
     }
 
-    std::vector<VkWriteDescriptorSet> writes = {
-        // RT set
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
-        // Tonemap set
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputImageInfo, nullptr, nullptr }
-    };
+    std::vector<VkWriteDescriptorSet> writes;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+        VkDescriptorBufferInfo workQueueInfo{ m_workQueueBuffer->getBuffer(), 0, m_workQueueBuffer->getSize() };
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &workQueueInfo, nullptr });
+    }
+    // Tonemap set
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputImageInfo, nullptr, nullptr });
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
     // 6. Pipeline Layouts
@@ -626,6 +645,22 @@ void Engine::initPipelines() {
     rtPipelineInfo.layout = m_rtPipelineLayout;
     vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
     vkDestroyShaderModule(device, rtModule, nullptr);
+
+    auto wfPersistentCode = loadShaderSPIRV("wavefront_persistent.comp.spv");
+    VkShaderModule wfPersistentModule = createShaderModule(wfPersistentCode);
+
+    VkComputePipelineCreateInfo wfPersistentPipelineInfo{};
+    wfPersistentPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    wfPersistentPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    wfPersistentPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    wfPersistentPipelineInfo.stage.module = wfPersistentModule;
+    wfPersistentPipelineInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        wfPersistentPipelineInfo.stage.pNext = &subgroupSize32;
+    }
+    wfPersistentPipelineInfo.layout = m_rtPipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &wfPersistentPipelineInfo, nullptr, &m_wfPersistentPipeline);
+    vkDestroyShaderModule(device, wfPersistentModule, nullptr);
 
     auto tonemapCode = loadShaderSPIRV("tonemap_aces.comp.spv");
     VkShaderModule tonemapModule = createShaderModule(tonemapCode);
@@ -860,22 +895,23 @@ void Engine::initWavefrontPipelines() {
     allocInfo.descriptorPool = m_descriptorPool;
 
     allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_wfClassifyDescLayout;
-    vkAllocateDescriptorSets(device, &allocInfo, &m_wfClassifyDescSet);
-
     allocInfo.pSetLayouts = &m_wfResolveDescLayout;
     vkAllocateDescriptorSets(device, &allocInfo, &m_wfResolveDescSet);
 
-    allocInfo.pSetLayouts = &m_wfShadeDescLayout;
-    vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetA);
-    vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetB);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        allocInfo.pSetLayouts = &m_wfClassifyDescLayout;
+        vkAllocateDescriptorSets(device, &allocInfo, &m_wfClassifyDescSets[i]);
+
+        allocInfo.pSetLayouts = &m_wfShadeDescLayout;
+        vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetsA[i]);
+        vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetsB[i]);
+    }
 
     // 5. Populate and Write Descriptor Sets
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = m_accumImage->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
     VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
     VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
@@ -905,39 +941,43 @@ void Engine::initWavefrontPipelines() {
 
     std::vector<VkWriteDescriptorSet> writes;
 
-    auto pushCommonBindings = [&](VkDescriptorSet dstSet) {
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, dstSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-    };
-
-    // Classify Set: Common + binding 9 (queue A), binding 10 (counters)
-    pushCommonBindings(m_wfClassifyDescSet);
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
-
     // Resolve Set: binding 0 (counters), binding 1 (indirect), binding 2 (dgc stream)
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indirectBufInfo, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dgcStreamBufInfo, nullptr });
 
-    // Shade Set A: Common + binding 9 (in: queue A), binding 10 (out: queue B), binding 11 (counters)
-    pushCommonBindings(m_wfShadeDescSetA);
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
 
-    // Shade Set B: Common + binding 9 (in: queue B), binding 10 (out: queue A), binding 11 (counters)
-    pushCommonBindings(m_wfShadeDescSetB);
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+        auto pushCommonBindings = [&](VkDescriptorSet dstSet) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, dstSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+        };
+
+        // Classify Set: Common + binding 9 (queue A), binding 10 (counters)
+        pushCommonBindings(m_wfClassifyDescSets[i]);
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+
+        // Shade Set A: Common + binding 9 (in: queue A), binding 10 (out: queue B), binding 11 (counters)
+        pushCommonBindings(m_wfShadeDescSetsA[i]);
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+
+        // Shade Set B: Common + binding 9 (in: queue B), binding 10 (out: queue A), binding 11 (counters)
+        pushCommonBindings(m_wfShadeDescSetsB[i]);
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
+    }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -945,7 +985,7 @@ void Engine::initWavefrontPipelines() {
     VkPushConstantRange wfPushConstant{};
     wfPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     wfPushConstant.offset = 0;
-    wfPushConstant.size = sizeof(uint32_t) * 12;
+    wfPushConstant.size = sizeof(uint32_t) * 16;
 
     VkPipelineLayoutCreateInfo classifyPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     classifyPipeLayoutInfo.setLayoutCount = 1;
@@ -957,7 +997,7 @@ void Engine::initWavefrontPipelines() {
     VkPushConstantRange resolvePushConstant{};
     resolvePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     resolvePushConstant.offset = 0;
-    resolvePushConstant.size = sizeof(uint32_t) * 4;
+    resolvePushConstant.size = sizeof(uint32_t) * 16;
 
     VkPipelineLayoutCreateInfo resolvePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     resolvePipeLayoutInfo.setLayoutCount = 1;
@@ -1003,7 +1043,7 @@ void Engine::initWavefrontPipelines() {
 
     if (m_context->hasDGC()) {
         try {
-            m_dgc = std::make_unique<DGCManager>(device, m_context->getAllocator(), m_wfShadePipelineLayout);
+            m_dgc = std::make_unique<DGCManager>(device, m_context->getAllocator(), m_wfShadePipelineLayout, sizeof(uint32_t) * 13);
         } catch (...) {
             Logger::warn("Failed to create DGCManager for wavefront shade pipeline.");
         }
@@ -1018,7 +1058,9 @@ void Engine::initSyncObjects() {
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFence);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFences[i]);
+    }
     vkCreateFence(device, &fenceInfo, nullptr, &m_rtFence);
 
     VkSemaphoreCreateInfo semInfo{};
@@ -1041,7 +1083,7 @@ void Engine::initQueryPool() {
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 4; // 0: Start, 1: RT End, 2: Tonemap End
+    queryInfo.queryCount = 4 * MAX_FRAMES_IN_FLIGHT; // 4 timestamps per frame in flight
     vkCreateQueryPool(device, &queryInfo, nullptr, &m_queryPool);
 
     m_timestampPeriod = m_context->getDeviceProperties().limits.timestampPeriod;
@@ -1181,8 +1223,42 @@ void Engine::renderFrame() {
     VkDevice device = m_context->getDevice();
     VkQueue queue = m_context->getGraphicsQueue();
 
-    vkWaitForFences(device, 1, &m_inFlightFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &m_inFlightFence);
+    vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+    vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
+
+    // Read back GPU query timestamps from slot m_currentFrame's completed frame
+    if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
+        uint32_t qBase = m_currentFrame * 4;
+        uint64_t timestamps[4] = {0, 0, 0, 0};
+        vkGetQueryPoolResults(device, m_queryPool, qBase, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        double gpuRtMs = 0.0;
+        if (timestamps[1] > timestamps[0]) {
+            gpuRtMs = (timestamps[1] - timestamps[0]) * m_timestampPeriod * 1e-6;
+        }
+        double gpuTonemapMs = 0.0;
+        if (timestamps[3] > timestamps[2]) {
+            gpuTonemapMs = (timestamps[3] - timestamps[2]) * m_timestampPeriod * 1e-6;
+        }
+        if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
+        if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
+
+        double secGpuMs = 0.0;
+        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
+        }
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+
+        m_lastGpuRtMs = gpuRtMs;
+        m_lastSecGpuMs = secGpuMs;
+        m_lastTonemapMs = gpuTonemapMs;
+        if (totalGpuMs > 0.01) {
+            m_lastFrameTimeMs = totalGpuMs;
+            m_frameTimesMs.push_back(m_lastFrameTimeMs);
+            if (!m_config.headless && m_frameTimesMs.size() > 60) {
+                m_frameTimesMs.erase(m_frameTimesMs.begin());
+            }
+        }
+    }
 
     auto frameStartTime = std::chrono::high_resolution_clock::now();
 
@@ -1205,7 +1281,7 @@ void Engine::renderFrame() {
     if (m_config.enable_shadows)        flags |= (1 << 4);
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
-    m_cameraUBO->copyFrom(&ubo, sizeof(CameraUniform));
+    m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
     uint32_t imageIndex = 0;
     if (!m_config.headless && m_swapchain) {
@@ -1234,18 +1310,30 @@ void Engine::renderFrame() {
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive());
 
+    VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
+
     if (!isMgpu) {
         // --- Single GPU Execution Path ---
-        CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
-        m_cameraUBO->copyFrom(&ubo, sizeof(CameraUniform));
-
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+        vkBeginCommandBuffer(cmd, &beginInfo);
 
-        vkCmdResetQueryPool(m_commandBuffer, m_queryPool, 0, 4);
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
+        // Frame-start pipeline barrier to synchronize compute and transfer writes across frames
+        VkMemoryBarrier2 frameStartBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        frameStartBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT;
+        frameStartBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        frameStartBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        frameStartBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+
+        VkDependencyInfo frameStartDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        frameStartDep.memoryBarrierCount = 1;
+        frameStartDep.pMemoryBarriers = &frameStartBarrier;
+        vkCmdPipelineBarrier2(cmd, &frameStartDep);
+
+        uint32_t qBase = m_currentFrame * 4;
+        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
@@ -1258,7 +1346,7 @@ void Engine::renderFrame() {
 
             for (uint32_t s = 0; s < m_config.spp; ++s) {
                 // 1. Clear Wavefront Counters
-                vkCmdFillBuffer(m_commandBuffer, m_wavefrontCounters->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
+                vkCmdFillBuffer(cmd, m_wavefrontCounters->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
 
                 VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
                 clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1269,11 +1357,11 @@ void Engine::renderFrame() {
                 VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                 clearDep.memoryBarrierCount = 1;
                 clearDep.pMemoryBarriers = &clearBarrier;
-                vkCmdPipelineBarrier2(m_commandBuffer, &clearDep);
+                vkCmdPipelineBarrier2(cmd, &clearDep);
 
                 // 2. Classify Pass: Primary Ray Generation & Wave Compaction
-                vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipeline);
-                vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipelineLayout, 0, 1, &m_wfClassifyDescSet, 0, nullptr);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipelineLayout, 0, 1, &m_wfClassifyDescSets[m_currentFrame], 0, nullptr);
 
                 uint32_t classifyPC[12] = {
                     m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
@@ -1283,13 +1371,13 @@ void Engine::renderFrame() {
                     envIntensityBits,
                     maxCapacity,
                     s,
-                    0u
+                    useHwRT
                 };
-                vkCmdPushConstants(m_commandBuffer, m_wfClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
+                vkCmdPushConstants(cmd, m_wfClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
 
                 uint32_t classifyGroupsX = (m_config.width + 7) / 8;
                 uint32_t classifyGroupsY = (m_config.height + 3) / 4;
-                vkCmdDispatch(m_commandBuffer, classifyGroupsX, classifyGroupsY, 1);
+                vkCmdDispatch(cmd, classifyGroupsX, classifyGroupsY, 1);
 
                 // Barrier: Classify writes queue A & counters -> Resolve reads counters
                 VkMemoryBarrier2 classifyToResolveBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -1301,18 +1389,34 @@ void Engine::renderFrame() {
                 VkDependencyInfo classifyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                 classifyDep.memoryBarrierCount = 1;
                 classifyDep.pMemoryBarriers = &classifyToResolveBarrier;
-                vkCmdPipelineBarrier2(m_commandBuffer, &classifyDep);
+                vkCmdPipelineBarrier2(cmd, &classifyDep);
 
                 // 3. Bounce Loop: Resolve -> Shade (DGC / Indirect)
                 for (uint32_t bounce = 0; bounce < m_config.max_bounces; ++bounce) {
                     // A. Resolve Pass (1 Wave32 workgroup)
-                    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipeline);
-                    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipelineLayout, 0, 1, &m_wfResolveDescSet, 0, nullptr);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipeline);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipelineLayout, 0, 1, &m_wfResolveDescSet, 0, nullptr);
 
                     uint32_t resolveMode = (bounce == 0) ? 0u : 1u;
-                    uint32_t resolvePC[4] = { resolveMode, 0, 0, 0 };
-                    vkCmdPushConstants(m_commandBuffer, m_wfResolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolvePC), resolvePC);
-                    vkCmdDispatch(m_commandBuffer, 1, 1, 1);
+                    uint32_t resolvePC[16] = {
+                        resolveMode,
+                        bounce,
+                        m_config.max_bounces,
+                        m_config.width,
+                        m_config.height,
+                        m_numTriangles,
+                        m_numSpheres,
+                        m_numMaterials,
+                        m_numLights,
+                        hasEnvMap,
+                        envIntensityBits,
+                        useHwRT,
+                        maxCapacity,
+                        s,
+                        0, 0
+                    };
+                    vkCmdPushConstants(cmd, m_wfResolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolvePC), resolvePC);
+                    vkCmdDispatch(cmd, 1, 1, 1);
 
                     // Barrier: Resolve writes indirect cmd & resets counters -> Shade reads indirect cmd & queues
                     VkMemoryBarrier2 resolveToShadeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -1324,14 +1428,14 @@ void Engine::renderFrame() {
                     VkDependencyInfo resolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     resolveDep.memoryBarrierCount = 1;
                     resolveDep.pMemoryBarriers = &resolveToShadeBarrier;
-                    vkCmdPipelineBarrier2(m_commandBuffer, &resolveDep);
+                    vkCmdPipelineBarrier2(cmd, &resolveDep);
 
                     // B. Shade Pass (Ping-Pong: even bounce reads A writes B; odd bounce reads B writes A)
-                    VkDescriptorSet shadeSet = (bounce % 2 == 0) ? m_wfShadeDescSetA : m_wfShadeDescSetB;
-                    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipeline);
-                    vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipelineLayout, 0, 1, &shadeSet, 0, nullptr);
+                    VkDescriptorSet shadeSet = (bounce % 2 == 0) ? m_wfShadeDescSetsA[m_currentFrame] : m_wfShadeDescSetsB[m_currentFrame];
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipeline);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipelineLayout, 0, 1, &shadeSet, 0, nullptr);
 
-                    uint32_t shadePC[12] = {
+                    uint32_t shadePC[13] = {
                         m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
                         m_config.width, m_config.height,
                         bounce,
@@ -1339,14 +1443,20 @@ void Engine::renderFrame() {
                         maxCapacity,
                         s,
                         hasEnvMap,
-                        envIntensityBits
+                        envIntensityBits,
+                        useHwRT
                     };
-                    vkCmdPushConstants(m_commandBuffer, m_wfShadePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
+                    vkCmdPushConstants(cmd, m_wfShadePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
                     if (m_dgc && m_dgc->isSupported()) {
-                        m_dgc->recordExecute(m_commandBuffer, m_wfShadePipeline, m_wavefrontIndirectCmd.get(), 0, 1, m_wavefrontDgcStream.get(), 0);
+                        if (m_dgc->isMultiToken()) {
+                            // Multi-token DGC: Push constants and indirect dispatch generated on-device
+                            m_dgc->recordExecute(cmd, m_wfShadePipeline, m_wavefrontDgcStream.get(), 64, 1, m_wavefrontDgcStream.get(), 0);
+                        } else {
+                            m_dgc->recordExecute(cmd, m_wfShadePipeline, m_wavefrontIndirectCmd.get(), 0, 1, m_wavefrontDgcStream.get(), 0);
+                        }
                     } else {
-                        vkCmdDispatchIndirect(m_commandBuffer, m_wavefrontIndirectCmd->getBuffer(), 0);
+                        vkCmdDispatchIndirect(cmd, m_wavefrontIndirectCmd->getBuffer(), 0);
                     }
 
                     // Barrier: Shade writes downstream queue / accum image -> next Resolve or Tonemap
@@ -1359,13 +1469,28 @@ void Engine::renderFrame() {
                     VkDependencyInfo shadeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     shadeDep.memoryBarrierCount = 1;
                     shadeDep.pMemoryBarriers = &shadeToNextBarrier;
-                    vkCmdPipelineBarrier2(m_commandBuffer, &shadeDep);
+                    vkCmdPipelineBarrier2(cmd, &shadeDep);
                 }
             }
-        } else {
-            // === MONOLITHIC MEGAKERNEL PIPELINE ===
-            vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-            vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSet, 0, nullptr);
+        } else if (m_config.pipeline_type == PipelineType::Persistent) {
+            // === PERSISTENT WAVEFRONT WORK QUEUE PIPELINE ===
+            // 1. Reset dynamic tile work counter
+            vkCmdFillBuffer(cmd, m_workQueueBuffer->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
+
+            VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+            VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            clearDep.memoryBarrierCount = 1;
+            clearDep.pMemoryBarriers = &clearBarrier;
+            vkCmdPipelineBarrier2(cmd, &clearDep);
+
+            // 2. Bind Persistent Wavefront Pipeline & Descriptors
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfPersistentPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
             uint32_t rtPushConstants[12] = {
                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
@@ -1375,7 +1500,24 @@ void Engine::renderFrame() {
                 envIntensityBits,
                 1u // accumulateHistory
             };
-            vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+
+            // 3. Dispatch Persistent Waves (384 workgroups: 96 CUs * 4 waves/CU to saturate Navi 31)
+            vkCmdDispatch(cmd, 384, 1, 1);
+        } else {
+            // === MONOLITHIC MEGAKERNEL PIPELINE ===
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+
+            uint32_t rtPushConstants[12] = {
+                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                0, 0, m_config.width, m_config.height,
+                useHwRT,
+                hasEnvMap,
+                envIntensityBits,
+                1u // accumulateHistory
+            };
+            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
             if (m_dgc && m_dgcArgumentBuffer) {
                 VkDispatchIndirectCommand dgcCmd{};
@@ -1383,9 +1525,9 @@ void Engine::renderFrame() {
                 dgcCmd.y = rtGroupsY;
                 dgcCmd.z = 1;
                 m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
-                m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
+                m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
             } else {
-                vkCmdDispatch(m_commandBuffer, rtGroupsX, rtGroupsY, 1);
+                vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
             }
         }
 
@@ -1400,26 +1542,26 @@ void Engine::renderFrame() {
         depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depInfo.memoryBarrierCount = 1;
         depInfo.pMemoryBarriers = &memBarrier;
-        vkCmdPipelineBarrier2(m_commandBuffer, &depInfo);
+        vkCmdPipelineBarrier2(cmd, &depInfo);
 
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 1);
 
         // Tonemapping
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
-        vkCmdPushConstants(m_commandBuffer, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else if (m_config.mgpu_mode == MultiGpuMode::SampleParallel) {
         // --- Multi-GPU Sample Parallelism Path ---
         uint32_t spp0 = (m_config.spp > 1) ? (m_config.spp / 2) : 1;
         uint32_t spp1 = (m_config.spp > 1) ? (m_config.spp - spp0) : 1;
 
         CameraUniform ubo0 = m_camera->getUniformData(m_frameIndex * 2, spp0, m_config.max_bounces, flags);
-        m_cameraUBO->copyFrom(&ubo0, sizeof(CameraUniform));
+        m_cameraUBOs[m_currentFrame]->copyFrom(&ubo0, sizeof(CameraUniform));
 
         CameraUniform ubo1 = m_camera->getUniformData(m_frameIndex * 2 + 1, spp1, m_config.max_bounces, flags);
 
@@ -1440,16 +1582,16 @@ void Engine::renderFrame() {
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &m_rtFence);
 
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo rtBeginInfo{};
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &rtBeginInfo);
+        vkBeginCommandBuffer(cmd, &rtBeginInfo);
 
-        vkCmdResetQueryPool(m_commandBuffer, m_queryPool, 0, 4);
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
+        vkCmdResetQueryPool(cmd, m_queryPool, 0, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
 
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
         uint32_t rtPushConstants[12] = {
             m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
@@ -1459,25 +1601,25 @@ void Engine::renderFrame() {
             envIntensityBits,
             1u // accumulateHistory: primary GPU maintains temporal master accumulation
         };
-        vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+        vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
         if (m_dgc && m_dgcArgumentBuffer) {
             VkDispatchIndirectCommand dgcCmd{};
             dgcCmd.x = rtGroupsX;
             dgcCmd.y = rtGroupsY;
             dgcCmd.z = 1;
             m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
-            m_dgc->recordIndirectDispatch(m_commandBuffer, m_dgcArgumentBuffer.get(), 0);
+            m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
         } else {
-            vkCmdDispatch(m_commandBuffer, rtGroupsX, rtGroupsY, 1);
+            vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
         }
 
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
-        vkEndCommandBuffer(m_commandBuffer);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
+        vkEndCommandBuffer(cmd);
 
         VkSubmitInfo rtSubmit{};
         rtSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         rtSubmit.commandBufferCount = 1;
-        rtSubmit.pCommandBuffers = &m_commandBuffer;
+        rtSubmit.pCommandBuffers = &cmd;
         vkQueueSubmit(queue, 1, &rtSubmit, m_rtFence);
 
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
@@ -1486,10 +1628,10 @@ void Engine::renderFrame() {
         m_secTransferBuffer->unmap();
 
         // 4. Record Merge & Tonemapping commands on primary GPU
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
         postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &postBeginInfo);
+        vkBeginCommandBuffer(cmd, &postBeginInfo);
 
         // Barrier: Ensure primary RT writes to m_accumImage are visible before merge compute reads/writes
         VkMemoryBarrier2 rtToMergeBarrier{};
@@ -1503,15 +1645,15 @@ void Engine::renderFrame() {
         rtToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         rtToMergeDep.memoryBarrierCount = 1;
         rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
-        vkCmdPipelineBarrier2(m_commandBuffer, &rtToMergeDep);
+        vkCmdPipelineBarrier2(cmd, &rtToMergeDep);
 
         // Merge Pass
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSet, 0, nullptr);
 
         uint32_t mergePC[4] = { m_config.width, m_config.height, spp1, 0 };
-        vkCmdPushConstants(m_commandBuffer, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
-        vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
+        vkCmdPushConstants(cmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
         VkMemoryBarrier2 mergeBarrier{};
         mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -1524,25 +1666,25 @@ void Engine::renderFrame() {
         mergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         mergeDep.memoryBarrierCount = 1;
         mergeDep.pMemoryBarriers = &mergeBarrier;
-        vkCmdPipelineBarrier2(m_commandBuffer, &mergeDep);
+        vkCmdPipelineBarrier2(cmd, &mergeDep);
 
         // Tonemapping
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.totalSamples = (m_frameIndex + 1) * (spp0 + spp1);
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
-        vkCmdPushConstants(m_commandBuffer, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
+        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
     } else {
         // --- Multi-GPU Split-Frame Tiling / Dynamic Work Queue Path ---
         uint32_t h0 = m_config.height / 2;
         uint32_t h1 = m_config.height - h0;
 
         CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
-        m_cameraUBO->copyFrom(&ubo, sizeof(CameraUniform));
+        m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
         uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
@@ -1561,16 +1703,16 @@ void Engine::renderFrame() {
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &m_rtFence);
 
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo rtBeginInfo{};
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &rtBeginInfo);
+        vkBeginCommandBuffer(cmd, &rtBeginInfo);
 
-        vkCmdResetQueryPool(m_commandBuffer, m_queryPool, 0, 4);
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
+        vkCmdResetQueryPool(cmd, m_queryPool, 0, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
 
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
         uint32_t rtPushConstants[12] = {
             m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
@@ -1580,18 +1722,18 @@ void Engine::renderFrame() {
             envIntensityBits,
             1u // accumulateHistory
         };
-        vkCmdPushConstants(m_commandBuffer, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+        vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
         uint32_t groupsY0 = (h0 + 3) / 4;
-        vkCmdDispatch(m_commandBuffer, rtGroupsX, groupsY0, 1);
+        vkCmdDispatch(cmd, rtGroupsX, groupsY0, 1);
 
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
-        vkEndCommandBuffer(m_commandBuffer);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
+        vkEndCommandBuffer(cmd);
 
         VkSubmitInfo rtSubmit{};
         rtSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         rtSubmit.commandBufferCount = 1;
-        rtSubmit.pCommandBuffers = &m_commandBuffer;
+        rtSubmit.pCommandBuffers = &cmd;
         vkQueueSubmit(queue, 1, &rtSubmit, m_rtFence);
 
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
@@ -1600,14 +1742,14 @@ void Engine::renderFrame() {
         m_secTransferBuffer->unmap();
 
         // 4. Record Buffer-to-Image Copy for bottom half & Tonemapping commands
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
         postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &postBeginInfo);
+        vkBeginCommandBuffer(cmd, &postBeginInfo);
 
         // Copy secondary tile to accumImage bottom half
         m_accumImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
         );
@@ -1621,25 +1763,25 @@ void Engine::renderFrame() {
         copyRegion.imageOffset = { 0, static_cast<int32_t>(h0), 0 };
         copyRegion.imageExtent = { m_config.width, h1, 1 };
 
-        vkCmdCopyBufferToImage(m_commandBuffer, m_secTransferBuffer->getBuffer(),
+        vkCmdCopyBufferToImage(cmd, m_secTransferBuffer->getBuffer(),
                                m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
         m_accumImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
         // Tonemapping
-        vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        vkCmdBindDescriptorSets(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
-        vkCmdPushConstants(m_commandBuffer, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(m_commandBuffer, groupsX, groupsY, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
+        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-        vkCmdWriteTimestamp2(m_commandBuffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay
@@ -1649,7 +1791,7 @@ void Engine::renderFrame() {
 
         // Transition m_outputImage to TRANSFER_SRC_OPTIMAL
         m_outputImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
@@ -1670,7 +1812,7 @@ void Engine::renderFrame() {
         depToDst.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depToDst.imageMemoryBarrierCount = 1;
         depToDst.pImageMemoryBarriers = &toDst;
-        vkCmdPipelineBarrier2(m_commandBuffer, &depToDst);
+            vkCmdPipelineBarrier2(cmd, &depToDst);
 
         // Copy or blit output image to swapchain image
         if (m_config.width == m_swapchain->getExtent().width &&
@@ -1679,7 +1821,7 @@ void Engine::renderFrame() {
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.extent = { m_config.width, m_config.height, 1 };
-            vkCmdCopyImage(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vkCmdCopyImage(cmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
         } else {
             VkImageBlit blitRegion{};
@@ -1689,13 +1831,13 @@ void Engine::renderFrame() {
             blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             blitRegion.dstOffsets[0] = { 0, 0, 0 };
             blitRegion.dstOffsets[1] = { static_cast<int32_t>(m_swapchain->getExtent().width), static_cast<int32_t>(m_swapchain->getExtent().height), 1 };
-            vkCmdBlitImage(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vkCmdBlitImage(cmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_LINEAR);
         }
 
         // Transition m_outputImage back to GENERAL
         m_outputImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
         );
@@ -1716,14 +1858,14 @@ void Engine::renderFrame() {
         depToColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depToColor.imageMemoryBarrierCount = 1;
         depToColor.pImageMemoryBarriers = &toColor;
-        vkCmdPipelineBarrier2(m_commandBuffer, &depToColor);
+        vkCmdPipelineBarrier2(cmd, &depToColor);
 
         // Render ImGui overlay
         if (m_gui) {
             m_gui->newFrame();
             bool prevMode = m_cameraMode;
             GuiActions guiActions{};
-            if (m_gui->render(m_commandBuffer, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
+            if (m_gui->render(cmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
                               m_config, getStats(), m_cameraMode, m_camera.get(),
                               &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions)) {
                 m_resetAccumulation = true;
@@ -1762,7 +1904,7 @@ void Engine::renderFrame() {
             depToSrc.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToSrc.imageMemoryBarrierCount = 1;
             depToSrc.pImageMemoryBarriers = &toSrc;
-            vkCmdPipelineBarrier2(m_commandBuffer, &depToSrc);
+            vkCmdPipelineBarrier2(cmd, &depToSrc);
 
             if (!m_uiDumpBuffer) {
                 VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * 4;
@@ -1774,7 +1916,7 @@ void Engine::renderFrame() {
             copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copyRegion.imageSubresource.layerCount = 1;
             copyRegion.imageExtent = { m_swapchain->getExtent().width, m_swapchain->getExtent().height, 1 };
-            vkCmdCopyImageToBuffer(m_commandBuffer, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_uiDumpBuffer->getBuffer(), 1, &copyRegion);
+            vkCmdCopyImageToBuffer(cmd, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_uiDumpBuffer->getBuffer(), 1, &copyRegion);
 
             VkImageMemoryBarrier2 toPresent{};
             toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1791,7 +1933,7 @@ void Engine::renderFrame() {
             depToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToPresent.imageMemoryBarrierCount = 1;
             depToPresent.pImageMemoryBarriers = &toPresent;
-            vkCmdPipelineBarrier2(m_commandBuffer, &depToPresent);
+            vkCmdPipelineBarrier2(cmd, &depToPresent);
         } else {
             VkImageMemoryBarrier2 toPresent{};
             toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1808,17 +1950,17 @@ void Engine::renderFrame() {
             depToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToPresent.imageMemoryBarrierCount = 1;
             depToPresent.pImageMemoryBarriers = &toPresent;
-            vkCmdPipelineBarrier2(m_commandBuffer, &depToPresent);
+            vkCmdPipelineBarrier2(cmd, &depToPresent);
         }
     }
 
-    vkEndCommandBuffer(m_commandBuffer);
+    vkEndCommandBuffer(cmd);
 
     // Submit Work
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffer;
+    submitInfo.pCommandBuffers = &cmd;
 
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
     if (!m_config.headless && m_swapchain) {
@@ -1829,15 +1971,13 @@ void Engine::renderFrame() {
         submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
     }
 
-    vkQueueSubmit(queue, 1, &submitInfo, m_inFlightFence);
+    vkQueueSubmit(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
 
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
         if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
             onResize(m_window->getWidth(), m_window->getHeight());
         }
-    } else {
-        vkWaitForFences(device, 1, &m_inFlightFence, VK_TRUE, UINT64_MAX);
     }
 
     // Execute pending window resolution / fullscreen actions outside of command buffer recording
@@ -1853,38 +1993,6 @@ void Engine::renderFrame() {
         m_window->setWindowResolution(w, h);
     }
 
-    auto frameEndTime = std::chrono::high_resolution_clock::now();
-    double frameDurationMs = std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count();
-
-    // Query GPU Timestamps with underflow guards
-    uint64_t timestamps[4] = {0, 0, 0, 0};
-    vkGetQueryPoolResults(device, m_queryPool, 0, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-    double gpuRtMs = 0.0;
-    if (timestamps[1] > timestamps[0]) {
-        gpuRtMs = (timestamps[1] - timestamps[0]) * m_timestampPeriod * 1e-6;
-    }
-    double gpuTonemapMs = 0.0;
-    if (timestamps[3] > timestamps[2]) {
-        gpuTonemapMs = (timestamps[3] - timestamps[2]) * m_timestampPeriod * 1e-6;
-    }
-    if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
-    if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
-
-    double secGpuMs = 0.0;
-    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
-        secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
-    }
-    double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
-
-    m_lastGpuRtMs = gpuRtMs;
-    m_lastSecGpuMs = secGpuMs;
-    m_lastTonemapMs = gpuTonemapMs;
-    m_lastFrameTimeMs = totalGpuMs > 0.01 ? totalGpuMs : frameDurationMs;
-
-    m_frameTimesMs.push_back(m_lastFrameTimeMs);
-    if (!m_config.headless && m_frameTimesMs.size() > 60) {
-        m_frameTimesMs.erase(m_frameTimesMs.begin());
-    }
     m_frameIndex++;
     m_totalFramesRendered++;
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -1902,6 +2010,10 @@ void Engine::renderFrame() {
     }
 
     if (shouldLog) {
+        double gpuRtMs = m_lastGpuRtMs;
+        double secGpuMs = m_lastSecGpuMs;
+        double gpuTonemapMs = m_lastTonemapMs;
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs,
@@ -1921,19 +2033,52 @@ void Engine::dumpOutputFiles() {
 
     vkDeviceWaitIdle(device);
 
+    // Drain remaining in-flight queries after vkDeviceWaitIdle
+    uint32_t drainCount = std::min(m_totalFramesRendered, MAX_FRAMES_IN_FLIGHT);
+    for (uint32_t d = 0; d < drainCount; ++d) {
+        uint32_t slot = (m_totalFramesRendered - drainCount + d) % MAX_FRAMES_IN_FLIGHT;
+        uint32_t qBase = slot * 4;
+        uint64_t timestamps[4] = {0, 0, 0, 0};
+        vkGetQueryPoolResults(device, m_queryPool, qBase, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        double gpuRtMs = 0.0;
+        if (timestamps[1] > timestamps[0]) {
+            gpuRtMs = (timestamps[1] - timestamps[0]) * m_timestampPeriod * 1e-6;
+        }
+        double gpuTonemapMs = 0.0;
+        if (timestamps[3] > timestamps[2]) {
+            gpuTonemapMs = (timestamps[3] - timestamps[2]) * m_timestampPeriod * 1e-6;
+        }
+        if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
+        if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
+
+        double secGpuMs = 0.0;
+        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
+        }
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+
+        if (totalGpuMs > 0.01) {
+            m_lastGpuRtMs = gpuRtMs;
+            m_lastSecGpuMs = secGpuMs;
+            m_lastTonemapMs = gpuTonemapMs;
+            m_lastFrameTimeMs = totalGpuMs;
+            m_frameTimesMs.push_back(m_lastFrameTimeMs);
+        }
+    }
+
     // 1. Dump LDR PNG
     if (!m_config.dump_frame_path.empty()) {
         VkDeviceSize bufferSize = m_config.width * m_config.height * 4;
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(m_commandBuffers[0], 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+        vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
 
         m_outputImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
@@ -1943,20 +2088,20 @@ void Engine::dumpOutputFiles() {
         copyRegion.imageSubresource.layerCount = 1;
         copyRegion.imageExtent = { m_config.width, m_config.height, 1 };
 
-        vkCmdCopyImageToBuffer(m_commandBuffer, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
+        vkCmdCopyImageToBuffer(m_commandBuffers[0], m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
 
         m_outputImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
         );
 
-        vkEndCommandBuffer(m_commandBuffer);
+        vkEndCommandBuffer(m_commandBuffers[0]);
 
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_commandBuffer;
+        submitInfo.pCommandBuffers = &m_commandBuffers[0];
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
@@ -1971,13 +2116,13 @@ void Engine::dumpOutputFiles() {
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-        vkResetCommandBuffer(m_commandBuffer, 0);
+        vkResetCommandBuffer(m_commandBuffers[0], 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+        vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
 
         m_accumImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
@@ -1987,20 +2132,20 @@ void Engine::dumpOutputFiles() {
         copyRegion.imageSubresource.layerCount = 1;
         copyRegion.imageExtent = { m_config.width, m_config.height, 1 };
 
-        vkCmdCopyImageToBuffer(m_commandBuffer, m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
+        vkCmdCopyImageToBuffer(m_commandBuffers[0], m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
 
         m_accumImage->transitionLayout(
-            m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
         );
 
-        vkEndCommandBuffer(m_commandBuffer);
+        vkEndCommandBuffer(m_commandBuffers[0]);
 
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_commandBuffer;
+        submitInfo.pCommandBuffers = &m_commandBuffers[0];
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
@@ -2077,7 +2222,7 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
-    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "megakernel";
+    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : ((m_config.pipeline_type == PipelineType::Persistent) ? "persistent" : "megakernel");
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
@@ -2171,30 +2316,30 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     );
 
     // Transition images to GENERAL layout
-    vkResetCommandBuffer(m_commandBuffer, 0);
+    vkResetCommandBuffer(m_commandBuffers[0], 0);
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
 
     m_accumImage->transitionLayout(
-        m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
     m_outputImage->transitionLayout(
-        m_commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
-    vkEndCommandBuffer(m_commandBuffer);
+    vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffer;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
@@ -2208,15 +2353,19 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     std::vector<VkWriteDescriptorSet> writes;
-    // Update m_rtDescSet: binding 0 is m_accumImage (storage image)
-    VkWriteDescriptorSet w0{};
-    w0.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w0.dstSet = m_rtDescSet;
-    w0.dstBinding = 0;
-    w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w0.descriptorCount = 1;
-    w0.pImageInfo = &accumImageInfo;
-    writes.push_back(w0);
+    // Update m_rtDescSets: binding 0 is m_accumImage (storage image)
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_rtDescSets[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet w0{};
+            w0.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w0.dstSet = m_rtDescSets[i];
+            w0.dstBinding = 0;
+            w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w0.descriptorCount = 1;
+            w0.pImageInfo = &accumImageInfo;
+            writes.push_back(w0);
+        }
+    }
 
     // Update m_tonemapDescSet: binding 0 is m_accumImage, binding 1 is m_outputImage
     VkWriteDescriptorSet w1{};
@@ -2271,32 +2420,34 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     }
 
     // Wavefront descriptor sets update with new m_accumImage view
-    if (m_wfClassifyDescSet != VK_NULL_HANDLE) {
-        VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        cw0.dstSet = m_wfClassifyDescSet;
-        cw0.dstBinding = 0;
-        cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        cw0.descriptorCount = 1;
-        cw0.pImageInfo = &accumImageInfo;
-        writes.push_back(cw0);
-    }
-    if (m_wfShadeDescSetA != VK_NULL_HANDLE) {
-        VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        swA.dstSet = m_wfShadeDescSetA;
-        swA.dstBinding = 0;
-        swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        swA.descriptorCount = 1;
-        swA.pImageInfo = &accumImageInfo;
-        writes.push_back(swA);
-    }
-    if (m_wfShadeDescSetB != VK_NULL_HANDLE) {
-        VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        swB.dstSet = m_wfShadeDescSetB;
-        swB.dstBinding = 0;
-        swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        swB.descriptorCount = 1;
-        swB.pImageInfo = &accumImageInfo;
-        writes.push_back(swB);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_wfClassifyDescSets[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw0.dstSet = m_wfClassifyDescSets[i];
+            cw0.dstBinding = 0;
+            cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            cw0.descriptorCount = 1;
+            cw0.pImageInfo = &accumImageInfo;
+            writes.push_back(cw0);
+        }
+        if (m_wfShadeDescSetsA[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            swA.dstSet = m_wfShadeDescSetsA[i];
+            swA.dstBinding = 0;
+            swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            swA.descriptorCount = 1;
+            swA.pImageInfo = &accumImageInfo;
+            writes.push_back(swA);
+        }
+        if (m_wfShadeDescSetsB[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            swB.dstSet = m_wfShadeDescSetsB[i];
+            swB.dstBinding = 0;
+            swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            swB.descriptorCount = 1;
+            swB.pImageInfo = &accumImageInfo;
+            writes.push_back(swB);
+        }
     }
 
     // Reallocate wavefront ray queues if new resolution exceeds capacity
@@ -2318,14 +2469,16 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
         qAInfo = { m_rayQueueA->getBuffer(), 0, requiredQueueSize };
         qBInfo = { m_rayQueueB->getBuffer(), 0, requiredQueueSize };
 
-        // Classify binding 9 (queue A)
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-        // Shade A binding 9 (in: A), 10 (out: B)
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetA, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
-        // Shade B binding 9 (in: B), 10 (out: A)
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetB, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            // Classify binding 9 (queue A)
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+            // Shade A binding 9 (in: A), 10 (out: B)
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+            // Shade B binding 9 (in: B), 10 (out: A)
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+        }
     }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);

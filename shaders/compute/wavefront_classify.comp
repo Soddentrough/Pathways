@@ -64,7 +64,7 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint maxQueueCapacity;
     uint sppSampleIndex;
-    uint pad;
+    uint useHardwareRT;
 } pc;
 
 void main() {
@@ -99,36 +99,64 @@ void main() {
         int closestSphere = -1;
         vec3 sphereNormal = vec3(0.0);
 
-        // Hardware BVH Traversal with Any-Hit Alpha Mask cutout testing
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, EPSILON, direction, closestT);
-        while (rayQueryProceedEXT(rq)) {
-            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                Material candMat = materials[triangles[triIdx].materialId];
-                if (candMat.alphaMode == 1u /* MASK */) {
-                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                    float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
-                    Triangle ctri = triangles[triIdx];
-                    vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
-                               cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
-                               cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
-                    float calpha = candMat.albedo.a;
-                    if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
-                        calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+        if (pc.useHardwareRT != 0u) {
+            // Hardware BVH Traversal with Any-Hit Alpha Mask cutout testing
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, EPSILON, direction, closestT);
+            while (rayQueryProceedEXT(rq)) {
+                if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                    uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                    Material candMat = materials[triangles[triIdx].materialId];
+                    if (candMat.alphaMode == 1u /* MASK */) {
+                        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                        float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
+                        Triangle ctri = triangles[triIdx];
+                        vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
+                                   cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
+                                   cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                        float calpha = candMat.albedo.a;
+                        if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                            calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+                        }
+                        if (calpha < candMat.alphaCutoff) {
+                            continue; // Pass through alpha cutout
+                        }
                     }
-                    if (calpha < candMat.alphaCutoff) {
-                        continue; // Pass through alpha cutout
-                    }
+                    rayQueryConfirmIntersectionEXT(rq);
                 }
-                rayQueryConfirmIntersectionEXT(rq);
             }
-        }
 
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-            closestT = rayQueryGetIntersectionTEXT(rq, true);
-            closestTri = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-            closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                closestT = rayQueryGetIntersectionTEXT(rq, true);
+                closestTri = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+                closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            }
+        } else {
+            // Software BVH / Triangle fallback
+            for (uint i = 0; i < pc.numTriangles; ++i) {
+                float t;
+                vec2 bary;
+                if (intersectTriangle(origin, direction, triangles[i], EPSILON, closestT, t, bary)) {
+                    Material candMat = materials[triangles[i].materialId];
+                    if (candMat.alphaMode == 1u /* MASK */) {
+                        float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
+                        Triangle ctri = triangles[i];
+                        vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
+                                   cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
+                                   cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                        float calpha = candMat.albedo.a;
+                        if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                            calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+                        }
+                        if (calpha < candMat.alphaCutoff) {
+                            continue; // Pass through alpha cutout
+                        }
+                    }
+                    closestT = t;
+                    closestTri = int(i);
+                    closestBary = bary;
+                }
+            }
         }
 
         // Test procedural spheres

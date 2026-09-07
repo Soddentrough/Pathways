@@ -69,41 +69,66 @@ layout(push_constant) uniform PushConstants {
     uint sppSampleIndex;
     uint hasEnvMap;
     float envMapIntensity;
+    uint useHardwareRT;
 } pc;
 
 bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, tMin, dir, tMax);
-    while (rayQueryProceedEXT(rq)) {
-        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-            Material mat = materials[triangles[triIdx].materialId];
-            if (mat.type == 3u /* Skip EMISSIVE */) {
-                continue;
-            }
-            if (mat.alphaMode == 1u /* MASK */) {
-                vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                float u = bary.x, v = bary.y, w = 1.0 - u - v;
-                Triangle tri = triangles[triIdx];
-                vec2 uv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
-                          u * vec2(tri.v1.position.w, tri.v1.normal.w) +
-                          v * vec2(tri.v2.position.w, tri.v2.normal.w);
-                float alpha = mat.albedo.a;
-                if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
-                    alpha *= texture(sceneTextures[mat.albedoTex - 1u], uv).a;
+    if (pc.useHardwareRT != 0u) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, tMin, dir, tMax);
+        while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                Material mat = materials[triangles[triIdx].materialId];
+                if (mat.type == 3u /* Skip EMISSIVE */) {
+                    continue;
                 }
-                if (alpha < mat.alphaCutoff) {
-                    continue; // Skip transparent pixel
+                if (mat.alphaMode == 1u /* MASK */) {
+                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    float u = bary.x, v = bary.y, w = 1.0 - u - v;
+                    Triangle tri = triangles[triIdx];
+                    vec2 uv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
+                              u * vec2(tri.v1.position.w, tri.v1.normal.w) +
+                              v * vec2(tri.v2.position.w, tri.v2.normal.w);
+                    float alpha = mat.albedo.a;
+                    if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                        alpha *= texture(sceneTextures[mat.albedoTex - 1u], uv).a;
+                    }
+                    if (alpha < mat.alphaCutoff) {
+                        continue; // Skip transparent pixel
+                    }
                 }
+                rayQueryConfirmIntersectionEXT(rq);
+                rayQueryTerminateEXT(rq);
             }
-            rayQueryConfirmIntersectionEXT(rq);
-            rayQueryTerminateEXT(rq);
         }
-    }
-    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-        if (materials[triangles[triIdx].materialId].type != 3u) {
-            return true;
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            if (materials[triangles[triIdx].materialId].type != 3u) {
+                return true;
+            }
+        }
+    } else {
+        for (uint i = 0; i < pc.numTriangles; ++i) {
+            Material mat = materials[triangles[i].materialId];
+            if (mat.type == 3u /* Skip EMISSIVE */) continue;
+            float t;
+            vec2 bary;
+            if (intersectTriangle(origin, dir, triangles[i], tMin, tMax, t, bary)) {
+                if (mat.alphaMode == 1u /* MASK */) {
+                    float u = bary.x, v = bary.y, w = 1.0 - u - v;
+                    Triangle tri = triangles[i];
+                    vec2 uv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
+                              u * vec2(tri.v1.position.w, tri.v1.normal.w) +
+                              v * vec2(tri.v2.position.w, tri.v2.normal.w);
+                    float alpha = mat.albedo.a;
+                    if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                        alpha *= texture(sceneTextures[mat.albedoTex - 1u], uv).a;
+                    }
+                    if (alpha < mat.alphaCutoff) continue;
+                }
+                return true;
+            }
         }
     }
     for (uint i = 0; i < pc.numSpheres; ++i) {
@@ -417,35 +442,62 @@ void main() {
             int closestTri = -1;
             vec2 closestBary = vec2(0.0);
 
-            rayQueryEXT rq;
-            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, nextOrigin, EPSILON, nextDirection, closestT);
-            while (rayQueryProceedEXT(rq)) {
-                if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                    uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                    Material candMat = materials[triangles[triIdx].materialId];
-                    if (candMat.alphaMode == 1u /* MASK */) {
-                        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                        float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
-                        Triangle ctri = triangles[triIdx];
-                        vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
-                                   cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
-                                   cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
-                        float calpha = candMat.albedo.a;
-                        if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
-                            calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+            if (pc.useHardwareRT != 0u) {
+                rayQueryEXT rq;
+                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, nextOrigin, EPSILON, nextDirection, closestT);
+                while (rayQueryProceedEXT(rq)) {
+                    if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                        uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                        Material candMat = materials[triangles[triIdx].materialId];
+                        if (candMat.alphaMode == 1u /* MASK */) {
+                            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                            float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
+                            Triangle ctri = triangles[triIdx];
+                            vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
+                                       cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
+                                       cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                            float calpha = candMat.albedo.a;
+                            if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                                calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+                            }
+                            if (calpha < candMat.alphaCutoff) {
+                                continue; // Skip transparent pixel
+                            }
                         }
-                        if (calpha < candMat.alphaCutoff) {
-                            continue; // Skip transparent pixel
-                        }
+                        rayQueryConfirmIntersectionEXT(rq);
                     }
-                    rayQueryConfirmIntersectionEXT(rq);
                 }
-            }
 
-            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-                closestT = rayQueryGetIntersectionTEXT(rq, true);
-                closestTri = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-                closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                    closestT = rayQueryGetIntersectionTEXT(rq, true);
+                    closestTri = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+                    closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                }
+            } else {
+                for (uint i = 0; i < pc.numTriangles; ++i) {
+                    float t;
+                    vec2 bary;
+                    if (intersectTriangle(nextOrigin, nextDirection, triangles[i], EPSILON, closestT, t, bary)) {
+                        Material candMat = materials[triangles[i].materialId];
+                        if (candMat.alphaMode == 1u /* MASK */) {
+                            float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
+                            Triangle ctri = triangles[i];
+                            vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
+                                       cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
+                                       cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                            float calpha = candMat.albedo.a;
+                            if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                                calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
+                            }
+                            if (calpha < candMat.alphaCutoff) {
+                                continue;
+                            }
+                        }
+                        closestT = t;
+                        closestTri = int(i);
+                        closestBary = bary;
+                    }
+                }
             }
 
             int closestSphere = -1;

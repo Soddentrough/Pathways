@@ -108,6 +108,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_classify.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/wavefront_shade.comp
+    ${SHADER_DIR}/compute/wavefront_persistent.comp
 )
 
 set(SPV_FILES "")

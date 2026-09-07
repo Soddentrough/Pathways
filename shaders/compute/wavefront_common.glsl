@@ -209,4 +209,34 @@ bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMa
     return true;
 }
 
+// Möller-Trumbore ray-triangle intersection
+bool intersectTriangle(vec3 origin, vec3 dir, Triangle tri, float tMin, float tMax, out float outT, out vec2 outBary) {
+    vec3 v0 = tri.v0.position.xyz;
+    vec3 v1 = tri.v1.position.xyz;
+    vec3 v2 = tri.v2.position.xyz;
+
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 pvec = cross(dir, edge2);
+    float det = dot(edge1, pvec);
+
+    if (abs(det) < 1e-7) return false;
+    float invDet = 1.0 / det;
+
+    vec3 tvec = origin - v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, edge1);
+    float v = dot(dir, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(edge2, qvec) * invDet;
+    if (t < tMin || t > tMax) return false;
+
+    outT = t;
+    outBary = vec2(u, v);
+    return true;
+}
+
 #endif // WAVEFRONT_COMMON_GLSL
