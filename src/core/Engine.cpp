@@ -584,11 +584,16 @@ void Engine::initPipelines() {
         }
     }
 
+    std::vector<VkDescriptorBufferInfo> uboBufferInfos(MAX_FRAMES_IN_FLIGHT);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        uboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
+    }
+    VkDescriptorBufferInfo workQueueInfo{ m_workQueueBuffer->getBuffer(), 0, m_workQueueBuffer->getSize() };
+
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfos[i], nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
@@ -596,7 +601,6 @@ void Engine::initPipelines() {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        VkDescriptorBufferInfo workQueueInfo{ m_workQueueBuffer->getBuffer(), 0, m_workQueueBuffer->getSize() };
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &workQueueInfo, nullptr });
     }
     // Tonemap set
@@ -990,12 +994,15 @@ void Engine::initWavefrontPipelines() {
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indirectBufInfo, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dgcStreamBufInfo, nullptr });
 
+    std::vector<VkDescriptorBufferInfo> wfUboBufferInfos(MAX_FRAMES_IN_FLIGHT);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        VkDescriptorBufferInfo uboBufferInfo{ m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
+        wfUboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
+    }
 
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         auto pushCommonBindings = [&](VkDescriptorSet dstSet) {
             writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfo, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wfUboBufferInfos[i], nullptr });
             writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
             writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
             writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
@@ -1304,8 +1311,6 @@ void Engine::renderFrame() {
         }
     }
 
-    auto frameStartTime = std::chrono::high_resolution_clock::now();
-
     // Update smooth continuous FPS keyboard navigation
     updateInput();
 
@@ -1581,11 +1586,6 @@ void Engine::renderFrame() {
             vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
 
             if (m_dgc && m_dgcArgumentBuffer) {
-                VkDispatchIndirectCommand dgcCmd{};
-                dgcCmd.x = rtGroupsX;
-                dgcCmd.y = rtGroupsY;
-                dgcCmd.z = 1;
-                m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
                 m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
             } else {
                 vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
@@ -1648,8 +1648,9 @@ void Engine::renderFrame() {
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &rtBeginInfo);
 
-        vkCmdResetQueryPool(cmd, m_queryPool, 0, 4);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
+        uint32_t qBase = m_currentFrame * 4;
+        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
@@ -1664,17 +1665,12 @@ void Engine::renderFrame() {
         };
         vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
         if (m_dgc && m_dgcArgumentBuffer) {
-            VkDispatchIndirectCommand dgcCmd{};
-            dgcCmd.x = rtGroupsX;
-            dgcCmd.y = rtGroupsY;
-            dgcCmd.z = 1;
-            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
             m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
         } else {
             vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
         }
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
 
         VkSubmitInfo rtSubmit{};
@@ -1686,8 +1682,6 @@ void Engine::renderFrame() {
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         m_mgpu->syncAndTransfer(nullptr, 0);
-        m_secTransferBuffer->unmap();
-
         // 4. Record Merge & Tonemapping commands on primary GPU
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
@@ -1734,11 +1728,11 @@ void Engine::renderFrame() {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.totalSamples = (m_frameIndex + 1) * (spp0 + spp1);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else {
         // --- Multi-GPU Split-Frame Tiling / Dynamic Work Queue Path ---
         uint32_t h0 = m_config.height / 2;
@@ -1769,8 +1763,9 @@ void Engine::renderFrame() {
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &rtBeginInfo);
 
-        vkCmdResetQueryPool(cmd, m_queryPool, 0, 4);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 0);
+        uint32_t qBase = m_currentFrame * 4;
+        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
@@ -1788,7 +1783,7 @@ void Engine::renderFrame() {
         uint32_t groupsY0 = (h0 + 3) / 4;
         vkCmdDispatch(cmd, rtGroupsX, groupsY0, 1);
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
 
         VkSubmitInfo rtSubmit{};
@@ -1800,8 +1795,6 @@ void Engine::renderFrame() {
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         m_mgpu->syncAndTransfer(nullptr, 0);
-        m_secTransferBuffer->unmap();
-
         // 4. Record Buffer-to-Image Copy for bottom half & Tonemapping commands
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
@@ -1838,11 +1831,11 @@ void Engine::renderFrame() {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, 2);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay

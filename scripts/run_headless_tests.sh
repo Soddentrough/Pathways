@@ -14,9 +14,12 @@ echo "=========================================================="
 echo "[1/4] Checking AMD GPU metrics via amd-smi..."
 if command -v amd-smi &> /dev/null; then
     amd-smi
+elif [ -x /opt/rocm/core-10.0/bin/amd-smi ]; then
+    /opt/rocm/core-10.0/bin/amd-smi
+elif [ -x /opt/rocm/bin/amd-smi ]; then
+    /opt/rocm/bin/amd-smi
 else
-    echo "amd-smi not found in PATH, checking /opt/rocm/bin or ~/.local/bin..."
-    /home/naoki/.local/bin/amd-smi || true
+    echo "amd-smi not found in known paths, continuing..."
 fi
 
 # 2. Build / ensure binaries are up to date (limiting threads for Threadripper 3750X)

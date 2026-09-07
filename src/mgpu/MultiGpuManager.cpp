@@ -581,7 +581,6 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         if (dstHostPtr != nullptr && transferBytes > 0) {
             void* srcPtr = node->p2pStagingBuffer->map();
             std::memcpy(dstHostPtr, srcPtr, transferBytes);
-            node->p2pStagingBuffer->unmap();
         }
     });
 }
@@ -597,7 +596,6 @@ void MultiGpuManager::syncAndTransfer(void* dstHostPtr, size_t byteSize) {
         GpuDeviceNode* node = m_devices[0].get();
         void* srcPtr = node->p2pStagingBuffer->map();
         std::memcpy(dstHostPtr, srcPtr, byteSize);
-        node->p2pStagingBuffer->unmap();
     }
 }
 
