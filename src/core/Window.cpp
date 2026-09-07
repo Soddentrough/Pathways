@@ -186,10 +186,18 @@ void Window::setRelativeMouseMode(bool enabled) {
 void Window::setWindowResolution(uint32_t width, uint32_t height) {
     if (m_headless || !m_window) return;
 
+    if (m_isFullscreen || (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN)) {
+        m_isFullscreen = false;
+        SDL_SetWindowFullscreen(m_window, false);
+        SDL_SyncWindow(m_window);
+    }
+
     width = std::max(64u, (width / 16) * 16);
     height = std::max(64u, (height / 16) * 16);
 
     SDL_SetWindowSize(m_window, static_cast<int>(width), static_cast<int>(height));
+    SDL_SyncWindow(m_window);
+
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {
@@ -215,19 +223,27 @@ void Window::setTitle(const std::string& title) {
 void Window::toggleFullscreen() {
     if (m_headless || !m_window) return;
 
-    m_isFullscreen = !m_isFullscreen;
-    SDL_SetWindowFullscreen(m_window, m_isFullscreen);
+    bool currentlyFullscreen = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
+    bool targetFullscreen = !currentlyFullscreen;
+    m_isFullscreen = targetFullscreen;
+
+    Logger::info("Toggling fullscreen -> {}", targetFullscreen ? "Fullscreen" : "Windowed");
+    if (!SDL_SetWindowFullscreen(m_window, targetFullscreen)) {
+        Logger::error("Failed to set window fullscreen state: {}", SDL_GetError());
+    }
+    SDL_SyncWindow(m_window);
 
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {
-        m_width = static_cast<uint32_t>(actualW);
-        m_height = static_cast<uint32_t>(actualH);
-        m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-    }
-
-    if (m_resizeCallback) {
-        m_resizeCallback(m_width, m_height);
+        if (static_cast<uint32_t>(actualW) != m_width || static_cast<uint32_t>(actualH) != m_height) {
+            m_width = static_cast<uint32_t>(actualW);
+            m_height = static_cast<uint32_t>(actualH);
+            m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+            if (m_resizeCallback) {
+                m_resizeCallback(m_width, m_height);
+            }
+        }
     }
 }
 
@@ -250,12 +266,20 @@ void Window::pollEvents() {
                 Logger::info("Received SDL_EVENT_WINDOW_CLOSE_REQUESTED -> closing window.");
                 m_shouldClose = true;
                 break;
+            case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+                Logger::info("Window entered fullscreen mode.");
+                m_isFullscreen = true;
+                break;
+            case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+                Logger::info("Window left fullscreen mode.");
+                m_isFullscreen = false;
+                break;
             case SDL_EVENT_KEY_DOWN:
                 if (event.key.key == SDLK_ESCAPE) {
                     Logger::info("Received SDLK_ESCAPE -> closing window.");
                     m_shouldClose = true;
                 }
-                if (event.key.key == SDLK_F11) {
+                if (event.key.key == SDLK_F11 && !event.key.repeat) {
                     toggleFullscreen();
                 }
                 if (m_keyCallback) {
@@ -274,14 +298,19 @@ void Window::pollEvents() {
                 break;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             case SDL_EVENT_WINDOW_RESIZED: {
-                uint32_t newW = static_cast<uint32_t>(event.window.data1);
-                uint32_t newH = static_cast<uint32_t>(event.window.data2);
-                if (newW > 0 && newH > 0 && (newW != m_width || newH != m_height)) {
-                    m_width = newW;
-                    m_height = newH;
-                    m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-                    if (m_resizeCallback) {
-                        m_resizeCallback(m_width, m_height);
+                int actualW = 0, actualH = 0;
+                SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
+                if (actualW > 0 && actualH > 0) {
+                    uint32_t newW = static_cast<uint32_t>(actualW);
+                    uint32_t newH = static_cast<uint32_t>(actualH);
+                    if (newW != m_width || newH != m_height) {
+                        Logger::info("Window pixel size changed: {}x{} -> {}x{}", m_width, m_height, newW, newH);
+                        m_width = newW;
+                        m_height = newH;
+                        m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+                        if (m_resizeCallback) {
+                            m_resizeCallback(m_width, m_height);
+                        }
                     }
                 }
                 break;

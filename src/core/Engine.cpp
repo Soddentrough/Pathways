@@ -764,13 +764,36 @@ bool Engine::handleEvent(const SDL_Event& e) {
         return false; // Allow default Window handling to set shouldClose
     }
 
-    // 1. TAB key toggles between UI control panel and FPS scene navigation
+    // 1. F11 key: toggle fullscreen (intercepted first so ImGui never swallows F11)
+    if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F11 && !e.key.repeat) {
+        Logger::info("Received SDLK_F11 -> queueing fullscreen toggle.");
+        m_pendingToggleFullscreen = true;
+        return true;
+    }
+    if (e.type == SDL_EVENT_KEY_UP && e.key.key == SDLK_F11) {
+        return true;
+    }
+
+    // 2. Window-level events: allow ImGui to track focus/cursor, then forward to Window handler
+    if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) {
+        if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            if (m_cameraMode) {
+                setCameraMode(false);
+            }
+        }
+        if (m_gui) {
+            m_gui->processEvent(e);
+        }
+        return false;
+    }
+
+    // 3. TAB key toggles between UI control panel and FPS scene navigation
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_TAB) {
         setCameraMode(!m_cameraMode);
         return true; // Consume event so ImGui navigation does not swallow TAB
     }
 
-    // 2. Release mouse if window focus is lost while in camera mode
+    // 4. Release mouse if window focus is lost while in camera mode
     if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
         if (m_cameraMode) {
             setCameraMode(false);
@@ -778,7 +801,7 @@ bool Engine::handleEvent(const SDL_Event& e) {
         return false;
     }
 
-    // 3. ESC key: if in camera mode, return to UI mode; if in UI mode, close window
+    // 5. ESC key: if in camera mode, return to UI mode; if in UI mode, close window
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
         if (m_cameraMode) {
             setCameraMode(false);
@@ -1815,6 +1838,20 @@ void Engine::run() {
 
     while (!m_window->shouldClose()) {
         m_window->pollEvents();
+
+        // Execute pending window resolution / fullscreen actions outside of command buffer recording
+        if (m_pendingToggleFullscreen) {
+            m_pendingToggleFullscreen = false;
+            m_window->toggleFullscreen();
+        }
+        if (m_pendingResizeW > 0 && m_pendingResizeH > 0) {
+            uint32_t w = m_pendingResizeW;
+            uint32_t h = m_pendingResizeH;
+            m_pendingResizeW = 0;
+            m_pendingResizeH = 0;
+            m_window->setWindowResolution(w, h);
+        }
+
         renderFrame();
 
         if (m_config.frame_limit > 0 && m_totalFramesRendered >= m_config.frame_limit) {
