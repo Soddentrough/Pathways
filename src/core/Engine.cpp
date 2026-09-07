@@ -40,7 +40,8 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     m_context = std::make_unique<VulkanContext>(m_config);
 
-    if (!m_config.headless) {
+    if (!m_config.headless && m_window) {
+        m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
         m_surface = m_window->createSurface(m_context->getInstance());
         m_swapchain = std::make_unique<Swapchain>(
             m_context->getDevice(),
@@ -1395,7 +1396,7 @@ void Engine::renderFrame() {
     m_totalFramesRendered++;
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 
-    if (m_config.benchmark || (m_totalFramesRendered % 10 == 0)) {
+    if (m_config.benchmark || (m_totalFramesRendered % 100 == 0)) {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs,
@@ -1577,7 +1578,11 @@ FrameStats Engine::getStats() const {
     stats.num_textures = static_cast<uint32_t>(m_sceneTextures.size());
     stats.has_hw_rt = (m_tlas != nullptr && m_config.enable_hardware_rt);
     stats.has_dgc = (m_dgc != nullptr);
+    stats.is_rdna3 = m_context->isRDNA3();
     stats.is_rdna4 = m_context->isRDNA4();
+    stats.arch_name = m_context->getArchitectureName();
+    stats.short_arch = m_context->getShortArchName();
+    stats.ray_accelerator_name = m_context->getRayAcceleratorName();
 
     return stats;
 }

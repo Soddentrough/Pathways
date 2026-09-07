@@ -1,0 +1,124 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "environment": {
+        "PATH": "C:/msys64/ucrt64/bin;$penv{PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_PREFIX_PATH": "C:/msys64/ucrt64",
+        "CMAKE_MAKE_PROGRAM": "C:/msys64/ucrt64/bin/ninja.exe"
+      }
+    },
+    {
+      "name": "windows-clang-release",
+      "displayName": "Windows 11 Clang Release (Optimized)",
+      "description": "High-performance release build using Clang 20, LLD linker, and -O3 -march=native",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/clang.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/clang++.exe",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
+        "ENABLE_NATIVE_OPTIMIZATION": "ON"
+      }
+    },
+    {
+      "name": "windows-clang-debug",
+      "displayName": "Windows 11 Clang Debug",
+      "description": "Debug build using Clang 20, LLD linker, and full debug symbols",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/clang.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/clang++.exe",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
+        "ENABLE_NATIVE_OPTIMIZATION": "OFF"
+      }
+    },
+    {
+      "name": "windows-gcc-release",
+      "displayName": "Windows 11 GCC Release",
+      "description": "High-performance release build using GCC 15 and -O3 -march=native",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/g++.exe",
+        "ENABLE_NATIVE_OPTIMIZATION": "ON"
+      }
+    },
+    {
+      "name": "windows-gcc-debug",
+      "displayName": "Windows 11 GCC Debug",
+      "description": "Debug build using GCC 15 and full debug symbols",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/g++.exe",
+        "ENABLE_NATIVE_OPTIMIZATION": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-release",
+      "displayName": "Build Windows Clang Release",
+      "configurePreset": "windows-clang-release"
+    },
+    {
+      "name": "windows-debug",
+      "displayName": "Build Windows Clang Debug",
+      "configurePreset": "windows-clang-debug"
+    },
+    {
+      "name": "windows-gcc-release",
+      "displayName": "Build Windows GCC Release",
+      "configurePreset": "windows-gcc-release"
+    },
+    {
+      "name": "windows-gcc-debug",
+      "displayName": "Build Windows GCC Debug",
+      "configurePreset": "windows-gcc-debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-test",
+      "displayName": "Windows Unit Tests",
+      "configurePreset": "windows-clang-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    },
+    {
+      "name": "windows-gcc-test",
+      "displayName": "Windows GCC Unit Tests",
+      "configurePreset": "windows-gcc-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    }
+  ]
+}

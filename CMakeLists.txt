@@ -6,10 +6,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to Release build if none specified
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose build type: Debug Release RelWithDebInfo MinSizeRel" FORCE)
+endif()
+
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# Compiler warnings and options
+# Compiler options and warnings
+option(ENABLE_NATIVE_OPTIMIZATION "Enable CPU native architecture instruction optimizations (-march=native)" ON)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(
         -Wall
@@ -19,24 +26,47 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wno-missing-field-initializers
         -Wno-unused-variable
         -Wno-array-bounds
-        -Wno-stringop-overflow
     )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        add_compile_options(-Wno-stringop-overflow)
+    endif()
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        add_compile_options(
+            -Wno-nullability-extension
+            -Wno-unused-private-field
+        )
+    endif()
+
+    if(ENABLE_NATIVE_OPTIMIZATION)
+        add_compile_options(-march=native)
+    endif()
+
+    # Release optimizations
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        add_compile_options(-O3)
+    endif()
 endif()
 
-# Find system packages (Fedora 44)
+# Static runtime linking for MinGW / Clang Windows GNU toolchains
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_link_options(-static-libgcc -static-libstdc++)
+endif()
+
+# Find system packages
 find_package(Vulkan REQUIRED)
 find_package(SDL3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
-# Check Vulkan version (baseline 1.4.341)
 message(STATUS "Vulkan Include Dir: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "Vulkan Libraries: ${Vulkan_LIBRARIES}")
 message(STATUS "SDL3 Include Dir: ${SDL3_INCLUDE_DIRS}")
 
-# Third-party include directories
+# Third-party include directories (marked as SYSTEM to avoid external warnings)
 set(THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-include_directories(
+include_directories(SYSTEM
     ${THIRD_PARTY_DIR}
     ${THIRD_PARTY_DIR}/glm
     ${THIRD_PARTY_DIR}/vma
@@ -45,6 +75,8 @@ include_directories(
     ${THIRD_PARTY_DIR}/tinyexr
     ${THIRD_PARTY_DIR}/imgui
     ${THIRD_PARTY_DIR}/imgui/backends
+)
+include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
@@ -64,7 +96,9 @@ message(STATUS "Found glslc: ${GLSLC}")
 
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(SPV_OUTPUT_DIR ${CMAKE_BINARY_DIR}/shaders)
+set(BIN_SPV_DIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders)
 file(MAKE_DIRECTORY ${SPV_OUTPUT_DIR})
+file(MAKE_DIRECTORY ${BIN_SPV_DIR})
 
 set(SHADER_FILES
     ${SHADER_DIR}/compute/tonemap_aces.comp
@@ -78,9 +112,11 @@ foreach(SHADER ${SHADER_FILES})
     if(EXISTS ${SHADER})
         get_filename_component(SHADER_NAME ${SHADER} NAME)
         set(SPV_FILE ${SPV_OUTPUT_DIR}/${SHADER_NAME}.spv)
+        set(BIN_SPV_FILE ${BIN_SPV_DIR}/${SHADER_NAME}.spv)
         add_custom_command(
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
             DEPENDS ${SHADER}
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
@@ -109,13 +145,17 @@ target_link_libraries(pathways
     SDL3::SDL3
     Threads::Threads
     ZLIB::ZLIB
-    m
 )
+
+if(UNIX)
+    target_link_libraries(pathways PRIVATE m)
+endif()
 
 target_include_directories(pathways PRIVATE
     ${Vulkan_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${SPV_OUTPUT_DIR}
+    ${BIN_SPV_DIR}
 )
 
 # Definitions
@@ -123,6 +163,30 @@ target_compile_definitions(pathways PRIVATE
     SHADER_DIR="${SPV_OUTPUT_DIR}"
     VK_ENABLE_BETA_EXTENSIONS=0
 )
+
+# Windows runtime DLL deployment
+if(WIN32)
+    # Collect extra runtime DLLs (e.g. zlib1.dll, libwinpthread-1.dll) from toolchain directory
+    get_filename_component(COMPILER_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(EXTRA_RUNTIME_DLLS "")
+    foreach(DLL_NAME zlib1.dll libwinpthread-1.dll)
+        if(EXISTS "${COMPILER_DIR}/${DLL_NAME}")
+            list(APPEND EXTRA_RUNTIME_DLLS "${COMPILER_DIR}/${DLL_NAME}")
+        endif()
+    endforeach()
+
+    add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:pathways>
+            ${EXTRA_RUNTIME_DLLS}
+            $<TARGET_FILE_DIR:pathways>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Deploying runtime DLL dependencies to target directory"
+    )
+endif()
+
+# Testing
+enable_testing()
 
 # Camera & FPS Controls Unit Test Target
 add_executable(test_camera_controls
@@ -133,4 +197,9 @@ target_include_directories(test_camera_controls PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${THIRD_PARTY_DIR}/glm
 )
-target_link_libraries(test_camera_controls PRIVATE m)
+
+if(UNIX)
+    target_link_libraries(test_camera_controls PRIVATE m)
+endif()
+
+add_test(NAME CameraControls COMMAND test_camera_controls)

@@ -184,7 +184,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
 
     if (ImGui::Begin(hudTitle, nullptr)) {
-        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "Dual AMD RDNA4 (GFX1201) Pure Vulkan 1.4 Path Tracer");
+        if (stats.mgpu_mode_str != "off" && stats.secondary_gpu_time_ms > 0.001) {
+            ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "Dual %s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
+        } else {
+            ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
+        }
         if (cameraMode) {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Scene Navigation (WASD + Mouse Look)");
         } else {
@@ -261,7 +265,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 4. Hardware Pipeline & Architecture Telemetry
         if (ImGui::CollapsingHeader("Hardware Architecture & Execution Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Subgroup Execution: Native Wave32 SIMD (AMD RDNA4)");
+            ImGui::Text("Subgroup Execution: Native Wave32 SIMD (%s)", stats.short_arch.c_str());
             if (config.enable_hardware_rt) {
                 ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "RT Pipeline: Hardware BVH Accelerated");
                 ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.0f), "  Active Pipeline Extensions:");
@@ -451,7 +455,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             ImGui::Spacing();
             if (config.enable_hardware_rt) {
-                ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "[ACTIVE] HARDWARE ACCELERATED (AMD RDNA4 Ray Accelerators)");
+                ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "[ACTIVE] HARDWARE ACCELERATED (%s)", stats.ray_accelerator_name.c_str());
                 ImGui::Spacing();
 
                 ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Vulkan Pipeline Extensions in Use:");

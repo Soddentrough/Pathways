@@ -11,7 +11,7 @@ int main(int argc, char* argv[]) {
 
         pathways::Logger::info("==========================================================");
         pathways::Logger::info("  Pathways: Pure Vulkan 1.4 Real-Time Path Tracer Engine");
-        pathways::Logger::info("  Target Hardware: AMD RDNA4 (Dual Radeon AI PRO R9700)");
+        pathways::Logger::info("  Hardware-Accelerated Ray Tracing & Multi-GPU Viewport");
         pathways::Logger::info("  Resolution: {}x{} | SPP: {} | Max Bounces: {}",
                                config.width, config.height, config.spp, config.max_bounces);
         pathways::Logger::info("  Mode: {} | Target Frame Budget: <8.0 ms",

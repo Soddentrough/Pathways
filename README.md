@@ -24,7 +24,28 @@ They should notice realistic reflections, refreaction, and shadows.
 
 /opt/RadeonDeveloperToolSuite-2026-05-28-1806/
 
-# Installed Packages
+# Windows 11 Build & Run
+
+Pathways features full Windows 11 support using modern C++23 tooling, Clang 20 + LLD / GCC 15 (MSYS2 UCRT64), Ninja, and Vulkan SDK 1.4+.
+
+To build and run:
+```powershell
+# Launch interactive GUI (auto-builds if needed)
+.\run.ps1
+# Or from cmd / double click: run.bat
+
+# Build in Release mode using Clang 20 + LLD + Ninja
+.\build.ps1
+
+# Run unit tests
+.\build.ps1 -Test
+
+# Run full automated test suite
+.\scripts\run_headless_tests.ps1
+```
+For complete details on presets, controls, and dependencies, see [BUILD_WINDOWS.md](BUILD_WINDOWS.md).
+
+# Installed Packages (Linux Reference)
 
 glslc-2026.1-1.fc44.x86_64
 vulkan-loader-1.4.341.0-1.fc44.x86_64

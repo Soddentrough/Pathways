@@ -18,6 +18,20 @@ struct QueueFamilyIndices {
     }
 };
 
+enum class GpuArchitecture {
+    Generic,
+    AmdRDNA1,
+    AmdRDNA2,
+    AmdRDNA3,
+    AmdRDNA3_5,
+    AmdRDNA4,
+    NvidiaTuring,
+    NvidiaAmpere,
+    NvidiaAda,
+    NvidiaBlackwell,
+    IntelArc
+};
+
 class VulkanContext {
 public:
     VulkanContext(const Config& config, VkSurfaceKHR surface = VK_NULL_HANDLE);
@@ -34,7 +48,13 @@ public:
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
-    bool isRDNA4() const { return m_isRDNA4; }
+    GpuArchitecture getArchitecture() const { return m_architecture; }
+    std::string getArchitectureName() const;
+    std::string getShortArchName() const;
+    std::string getRayAcceleratorName() const;
+    bool isRDNA() const;
+    bool isRDNA3() const { return m_architecture == GpuArchitecture::AmdRDNA3; }
+    bool isRDNA4() const { return m_architecture == GpuArchitecture::AmdRDNA4; }
     bool hasDGC() const { return m_hasDGC; }
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
@@ -62,6 +82,7 @@ private:
 
     VkPhysicalDeviceProperties m_deviceProperties{};
     std::string m_deviceName;
+    GpuArchitecture m_architecture = GpuArchitecture::Generic;
     bool m_isRDNA4 = false;
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;

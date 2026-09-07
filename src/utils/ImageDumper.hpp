@@ -34,7 +34,11 @@ struct FrameStats {
     uint32_t num_textures = 0;
     bool has_hw_rt = true;
     bool has_dgc = true;
-    bool is_rdna4 = true;
+    bool is_rdna3 = true;
+    bool is_rdna4 = false;
+    std::string arch_name = "AMD RDNA3 (Navi 3x)";
+    std::string short_arch = "RDNA3";
+    std::string ray_accelerator_name = "AMD RDNA3 2nd Gen Ray Accelerators";
 };
 
 class ImageDumper {

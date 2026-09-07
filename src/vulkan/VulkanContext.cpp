@@ -85,6 +85,7 @@ void VulkanContext::createInstance(const Config& config) {
     std::vector<const char*> instanceExtensions;
     if (!config.headless) {
         instanceExtensions.push_back("VK_KHR_surface");
+        instanceExtensions.push_back("VK_KHR_win32_surface");
         instanceExtensions.push_back("VK_KHR_wayland_surface");
         instanceExtensions.push_back("VK_KHR_xcb_surface");
         instanceExtensions.push_back("VK_KHR_xlib_surface");
@@ -177,10 +178,50 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     vkGetPhysicalDeviceProperties(m_physicalDevice, &m_deviceProperties);
     m_deviceName = m_deviceProperties.deviceName;
 
-    if (m_deviceName.find("R9700") != std::string::npos || m_deviceName.find("GFX1201") != std::string::npos) {
-        m_isRDNA4 = true;
-        Logger::info("Identified target hardware: AMD RDNA4 Architecture (GFX1201)");
+    std::string nameLower = m_deviceName;
+    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+
+    if (m_deviceProperties.vendorID == 0x1002 || nameLower.find("amd") != std::string::npos || nameLower.find("radeon") != std::string::npos) {
+        if (nameLower.find("rdna4") != std::string::npos || nameLower.find("gfx12") != std::string::npos ||
+            nameLower.find("r9700") != std::string::npos) {
+            m_architecture = GpuArchitecture::AmdRDNA4;
+            m_isRDNA4 = true;
+        } else if (nameLower.find("rdna3.5") != std::string::npos || nameLower.find("gfx115") != std::string::npos ||
+                   nameLower.find("890m") != std::string::npos || nameLower.find("880m") != std::string::npos) {
+            m_architecture = GpuArchitecture::AmdRDNA3_5;
+        } else if (nameLower.find("rdna3") != std::string::npos || nameLower.find("gfx11") != std::string::npos ||
+                   nameLower.find("7900") != std::string::npos || nameLower.find("7800") != std::string::npos ||
+                   nameLower.find("7700") != std::string::npos || nameLower.find("7600") != std::string::npos ||
+                   nameLower.find("w7900") != std::string::npos || nameLower.find("w7800") != std::string::npos) {
+            m_architecture = GpuArchitecture::AmdRDNA3;
+        } else if (nameLower.find("rdna2") != std::string::npos || nameLower.find("gfx103") != std::string::npos ||
+                   nameLower.find("6950") != std::string::npos || nameLower.find("6900") != std::string::npos ||
+                   nameLower.find("6800") != std::string::npos || nameLower.find("6700") != std::string::npos ||
+                   nameLower.find("6600") != std::string::npos || nameLower.find("6500") != std::string::npos) {
+            m_architecture = GpuArchitecture::AmdRDNA2;
+        } else if (nameLower.find("rdna1") != std::string::npos || nameLower.find("gfx101") != std::string::npos ||
+                   nameLower.find("5700") != std::string::npos || nameLower.find("5600") != std::string::npos) {
+            m_architecture = GpuArchitecture::AmdRDNA1;
+        } else {
+            m_architecture = GpuArchitecture::AmdRDNA3;
+        }
+    } else if (m_deviceProperties.vendorID == 0x10DE || nameLower.find("nvidia") != std::string::npos || nameLower.find("geforce") != std::string::npos) {
+        if (nameLower.find("5090") != std::string::npos || nameLower.find("5080") != std::string::npos || nameLower.find("blackwell") != std::string::npos) {
+            m_architecture = GpuArchitecture::NvidiaBlackwell;
+        } else if (nameLower.find("4090") != std::string::npos || nameLower.find("4080") != std::string::npos || nameLower.find("4070") != std::string::npos || nameLower.find("ada") != std::string::npos) {
+            m_architecture = GpuArchitecture::NvidiaAda;
+        } else if (nameLower.find("3090") != std::string::npos || nameLower.find("3080") != std::string::npos || nameLower.find("ampere") != std::string::npos) {
+            m_architecture = GpuArchitecture::NvidiaAmpere;
+        } else {
+            m_architecture = GpuArchitecture::NvidiaTuring;
+        }
+    } else if (m_deviceProperties.vendorID == 0x8086 || nameLower.find("intel") != std::string::npos || nameLower.find("arc") != std::string::npos) {
+        m_architecture = GpuArchitecture::IntelArc;
+    } else {
+        m_architecture = GpuArchitecture::Generic;
     }
+
+    Logger::info("Identified target hardware: {} ({})", m_deviceName, getArchitectureName());
 
     // Query Queue Families
     uint32_t queueFamilyCount = 0;
@@ -374,6 +415,61 @@ void VulkanContext::initVMA() {
         throw std::runtime_error("Failed to initialize Vulkan Memory Allocator (VMA)!");
     }
     Logger::info("VMA Allocator initialized successfully.");
+}
+
+std::string VulkanContext::getArchitectureName() const {
+    switch (m_architecture) {
+        case GpuArchitecture::AmdRDNA4:        return "AMD RDNA4 (GFX1201)";
+        case GpuArchitecture::AmdRDNA3_5:      return "AMD RDNA3.5 (GFX1150)";
+        case GpuArchitecture::AmdRDNA3:        return "AMD RDNA3 (Navi 3x)";
+        case GpuArchitecture::AmdRDNA2:        return "AMD RDNA2 (Navi 2x)";
+        case GpuArchitecture::AmdRDNA1:        return "AMD RDNA1 (Navi 1x)";
+        case GpuArchitecture::NvidiaBlackwell: return "NVIDIA Blackwell";
+        case GpuArchitecture::NvidiaAda:       return "NVIDIA Ada Lovelace";
+        case GpuArchitecture::NvidiaAmpere:    return "NVIDIA Ampere";
+        case GpuArchitecture::NvidiaTuring:    return "NVIDIA Turing";
+        case GpuArchitecture::IntelArc:        return "Intel Arc Xe-HPG";
+        default:                               return "Vulkan 1.4 Native GPU";
+    }
+}
+
+std::string VulkanContext::getShortArchName() const {
+    switch (m_architecture) {
+        case GpuArchitecture::AmdRDNA4:        return "RDNA4";
+        case GpuArchitecture::AmdRDNA3_5:      return "RDNA3.5";
+        case GpuArchitecture::AmdRDNA3:        return "RDNA3";
+        case GpuArchitecture::AmdRDNA2:        return "RDNA2";
+        case GpuArchitecture::AmdRDNA1:        return "RDNA1";
+        case GpuArchitecture::NvidiaBlackwell: return "Blackwell";
+        case GpuArchitecture::NvidiaAda:       return "Ada";
+        case GpuArchitecture::NvidiaAmpere:    return "Ampere";
+        case GpuArchitecture::NvidiaTuring:    return "Turing";
+        case GpuArchitecture::IntelArc:        return "Intel Arc";
+        default:                               return "Vulkan";
+    }
+}
+
+std::string VulkanContext::getRayAcceleratorName() const {
+    switch (m_architecture) {
+        case GpuArchitecture::AmdRDNA4:        return "AMD RDNA4 3rd Gen Ray Accelerators";
+        case GpuArchitecture::AmdRDNA3_5:
+        case GpuArchitecture::AmdRDNA3:        return "AMD RDNA3 2nd Gen Ray Accelerators";
+        case GpuArchitecture::AmdRDNA2:        return "AMD RDNA2 1st Gen Ray Accelerators";
+        case GpuArchitecture::NvidiaBlackwell: return "NVIDIA 5th Gen RT Cores";
+        case GpuArchitecture::NvidiaAda:       return "NVIDIA 4th Gen RT Cores";
+        case GpuArchitecture::NvidiaAmpere:    return "NVIDIA 3rd Gen RT Cores";
+        case GpuArchitecture::NvidiaTuring:    return "NVIDIA 2nd Gen RT Cores";
+        case GpuArchitecture::IntelArc:        return "Intel Xe Ray Tracing Units";
+        default:                               return "Hardware Ray Queries (VK_KHR_ray_query)";
+    }
+}
+
+bool VulkanContext::isRDNA() const {
+    return m_architecture == GpuArchitecture::AmdRDNA1 ||
+           m_architecture == GpuArchitecture::AmdRDNA2 ||
+           m_architecture == GpuArchitecture::AmdRDNA3 ||
+           m_architecture == GpuArchitecture::AmdRDNA3_5 ||
+           m_architecture == GpuArchitecture::AmdRDNA4;
 }
 
 } // namespace pathways

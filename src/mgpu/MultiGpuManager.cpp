@@ -452,7 +452,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t accumulateHistory) {
     if (!m_active || m_devices.empty()) return;
 
-    m_asyncTask = std::async(std::launch::async, [this, cameraUniform, frameIndex,
+    m_asyncTask = std::async(std::launch::async, [this, cameraUniform,
                                                  tileOffsetX, tileOffsetY, tileWidth, tileHeight,
                                                  numTriangles, numSpheres, numMaterials, numLights,
                                                  useHardwareRT, hasEnvMap, envMapIntensity, accumulateHistory]() {

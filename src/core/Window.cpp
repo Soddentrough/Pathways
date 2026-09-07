@@ -3,6 +3,13 @@
 #include <stdexcept>
 #include <algorithm>
 
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
+
 namespace pathways {
 
 Window::Window(const Config& config)
@@ -20,6 +27,27 @@ Window::Window(const Config& config)
         m_displayInfo.isUltraWide = (m_displayInfo.displayAspect > 2.0f);
         return;
     }
+
+#ifdef _WIN32
+    // If launched in a virtual or non-interactive desktop (e.g. agent sandbox),
+    // attach the window thread to "Default" desktop so the GUI window is visible on the user's monitor.
+    HDESK hCurrentDesk = GetThreadDesktop(GetCurrentThreadId());
+    char deskName[256] = {0};
+    DWORD deskLen = 0;
+    if (GetUserObjectInformationA(hCurrentDesk, UOI_NAME, deskName, sizeof(deskName), &deskLen)) {
+        if (std::string(deskName) != "Default") {
+            HDESK hUserDesk = OpenDesktopA("Default", 0, FALSE,
+                DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE |
+                DESKTOP_HOOKCONTROL | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP |
+                DESKTOP_WRITEOBJECTS);
+            if (hUserDesk) {
+                if (SetThreadDesktop(hUserDesk)) {
+                    Logger::info("Attached Window thread to interactive desktop 'Default'.");
+                }
+            }
+        }
+    }
+#endif
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         throw std::runtime_error(std::string("Failed to initialize SDL3: ") + SDL_GetError());
@@ -99,7 +127,7 @@ Window::Window(const Config& config)
     Logger::info("Initializing SDL3 window ({}x{})...", m_width, m_height);
 
     m_window = SDL_CreateWindow(
-        "Pathways - Vulkan 1.4 Path Tracer (RDNA4)",
+        "Pathways - Vulkan 1.4 Path Tracer",
         static_cast<int>(m_width),
         static_cast<int>(m_height),
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE
@@ -117,7 +145,11 @@ Window::Window(const Config& config)
         m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     }
 
-    Logger::info("SDL3 Window created successfully with pixel size {}x{}.", m_width, m_height);
+    SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    SDL_ShowWindow(m_window);
+    SDL_RaiseWindow(m_window);
+
+    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{}.", m_width, m_height);
 }
 
 Window::~Window() {
@@ -172,6 +204,12 @@ void Window::setWindowResolution(uint32_t width, uint32_t height) {
     }
 }
 
+void Window::setTitle(const std::string& title) {
+    if (m_window) {
+        SDL_SetWindowTitle(m_window, title.c_str());
+    }
+}
+
 void Window::toggleFullscreen() {
     if (m_headless || !m_window) return;
 
@@ -203,10 +241,16 @@ void Window::pollEvents() {
         }
         switch (event.type) {
             case SDL_EVENT_QUIT:
+                Logger::info("Received SDL_EVENT_QUIT -> closing window.");
+                m_shouldClose = true;
+                break;
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                Logger::info("Received SDL_EVENT_WINDOW_CLOSE_REQUESTED -> closing window.");
                 m_shouldClose = true;
                 break;
             case SDL_EVENT_KEY_DOWN:
                 if (event.key.key == SDLK_ESCAPE) {
+                    Logger::info("Received SDLK_ESCAPE -> closing window.");
                     m_shouldClose = true;
                 }
                 if (event.key.key == SDLK_F11) {

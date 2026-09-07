@@ -11,6 +11,8 @@ output/
 /*.png
 /*.exr
 /*.json
+!CMakePresets.json
+CMakeUserPresets.json
 *.spv
 !scenes/**
 

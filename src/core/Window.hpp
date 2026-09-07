@@ -41,6 +41,7 @@ public:
     void pollEvents();
 
     void setWindowResolution(uint32_t width, uint32_t height);
+    void setTitle(const std::string& title);
     void toggleFullscreen();
     bool isFullscreen() const { return m_isFullscreen; }
 
