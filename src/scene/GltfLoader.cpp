@@ -1,0 +1,469 @@
+#include "scene/GltfLoader.hpp"
+#include "core/Logger.hpp"
+
+#define CGLTF_IMPLEMENTATION
+#include "cgltf.h"
+#include "stb_image.h"
+
+#include <glm/gtc/type_ptr.hpp>
+#include <filesystem>
+#include <cstring>
+
+namespace pathways {
+
+bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
+    if (!std::filesystem::exists(filepath)) {
+        Logger::error("glTF file not found: {}", filepath);
+        return false;
+    }
+
+    Logger::info("Loading glTF scene: {}", filepath);
+
+    cgltf_options options{};
+    cgltf_data* data = nullptr;
+    cgltf_result result = cgltf_parse_file(&options, filepath.c_str(), &data);
+    if (result != cgltf_result_success) {
+        Logger::error("Failed to parse glTF file: {} (code: {})", filepath, (int)result);
+        return false;
+    }
+
+    result = cgltf_load_buffers(&options, data, filepath.c_str());
+    if (result != cgltf_result_success) {
+        Logger::error("Failed to load glTF buffers: {} (code: {})", filepath, (int)result);
+        cgltf_free(data);
+        return false;
+    }
+
+    outScene.assetName = std::filesystem::path(filepath).stem().string();
+
+    // 0. Parse Images and Textures
+    std::filesystem::path sceneDir = std::filesystem::path(filepath).parent_path();
+    for (size_t t = 0; t < data->textures_count; ++t) {
+        const auto& tex = data->textures[t];
+        TextureData texData{};
+        if (tex.image) {
+            int w = 0, h = 0, comp = 0;
+            stbi_uc* rawPixels = nullptr;
+            if (tex.image->buffer_view && tex.image->buffer_view->buffer && tex.image->buffer_view->buffer->data) {
+                const uint8_t* bufPtr = reinterpret_cast<const uint8_t*>(tex.image->buffer_view->buffer->data) + tex.image->buffer_view->offset;
+                rawPixels = stbi_load_from_memory(bufPtr, static_cast<int>(tex.image->buffer_view->size), &w, &h, &comp, 4);
+            } else if (tex.image->uri) {
+                std::filesystem::path imagePath = sceneDir / tex.image->uri;
+                rawPixels = stbi_load(imagePath.string().c_str(), &w, &h, &comp, 4);
+            }
+
+            if (rawPixels && w > 0 && h > 0) {
+                texData.width = static_cast<uint32_t>(w);
+                texData.height = static_cast<uint32_t>(h);
+                texData.pixels.assign(rawPixels, rawPixels + (w * h * 4));
+                stbi_image_free(rawPixels);
+            }
+        }
+        outScene.textures.push_back(std::move(texData));
+    }
+
+    // 1. Parse Materials
+    for (size_t i = 0; i < data->materials_count; ++i) {
+        const auto& mat = data->materials[i];
+        MaterialGPU gpuMat{};
+        gpuMat.albedo = glm::vec4(1.0f);
+        gpuMat.emissive = glm::vec4(0.0f);
+        gpuMat.roughness = 1.0f;
+        gpuMat.metallic = 0.0f;
+        gpuMat.ior = 1.5f;
+        gpuMat.transmission = 0.0f;
+        gpuMat.type = MATERIAL_DIFFUSE;
+        gpuMat.albedoTex = 0;
+        gpuMat.normalTex = 0;
+        gpuMat.padding = 0;
+
+        if (mat.has_pbr_metallic_roughness) {
+            const auto& pbr = mat.pbr_metallic_roughness;
+            gpuMat.albedo = glm::make_vec4(pbr.base_color_factor);
+            gpuMat.metallic = pbr.metallic_factor;
+            gpuMat.roughness = pbr.roughness_factor;
+            if (gpuMat.metallic > 0.5f) {
+                gpuMat.type = MATERIAL_METALLIC;
+            }
+            if (pbr.base_color_texture.texture) {
+                gpuMat.albedoTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.base_color_texture.texture)) + 1;
+            }
+        } else if (mat.has_pbr_specular_glossiness) {
+            const auto& pbr = mat.pbr_specular_glossiness;
+            gpuMat.albedo = glm::make_vec4(pbr.diffuse_factor);
+            gpuMat.roughness = 1.0f - pbr.glossiness_factor;
+            float specLum = 0.299f * pbr.specular_factor[0] + 0.587f * pbr.specular_factor[1] + 0.114f * pbr.specular_factor[2];
+            gpuMat.metallic = specLum;
+            if (gpuMat.metallic > 0.5f) {
+                gpuMat.type = MATERIAL_METALLIC;
+            }
+            if (pbr.diffuse_texture.texture) {
+                gpuMat.albedoTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.diffuse_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.normal_texture.texture) {
+            gpuMat.normalTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.normal_texture.texture)) + 1;
+        }
+
+        if (mat.has_ior) {
+            gpuMat.ior = mat.ior.ior;
+        }
+
+        if (mat.has_transmission) {
+            gpuMat.transmission = mat.transmission.transmission_factor;
+            if (gpuMat.transmission > 0.1f) {
+                gpuMat.type = MATERIAL_DIELECTRIC;
+            }
+        }
+
+        if (mat.has_emissive_strength) {
+            float strength = mat.emissive_strength.emissive_strength;
+            gpuMat.emissive = glm::vec4(
+                mat.emissive_factor[0] * strength,
+                mat.emissive_factor[1] * strength,
+                mat.emissive_factor[2] * strength,
+                1.0f
+            );
+            if (strength > 0.1f) {
+                gpuMat.type = MATERIAL_EMISSIVE;
+            }
+        } else {
+            gpuMat.emissive = glm::vec4(
+                mat.emissive_factor[0],
+                mat.emissive_factor[1],
+                mat.emissive_factor[2],
+                1.0f
+            );
+            if (gpuMat.emissive.r > 0.1f || gpuMat.emissive.g > 0.1f || gpuMat.emissive.b > 0.1f) {
+                gpuMat.type = MATERIAL_EMISSIVE;
+            }
+        }
+
+        outScene.materials.push_back(gpuMat);
+    }
+
+    if (outScene.materials.empty()) {
+        // Default white diffuse material
+        MaterialGPU defMat{};
+        defMat.albedo = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+        defMat.roughness = 0.8f;
+        defMat.metallic = 0.0f;
+        defMat.type = MATERIAL_DIFFUSE;
+        outScene.materials.push_back(defMat);
+    }
+
+    // 2. Parse Meshes
+    for (size_t m = 0; m < data->meshes_count; ++m) {
+        const auto& mesh = data->meshes[m];
+        GltfMesh outMesh;
+        outMesh.name = mesh.name ? mesh.name : ("Mesh_" + std::to_string(m));
+
+        for (size_t p = 0; p < mesh.primitives_count; ++p) {
+            const auto& prim = mesh.primitives[p];
+            if (prim.type != cgltf_primitive_type_triangles) continue;
+
+            GltfMeshPrimitive outPrim;
+            if (prim.material) {
+                outPrim.materialIndex = static_cast<uint32_t>(prim.material - data->materials);
+            } else {
+                outPrim.materialIndex = 0;
+            }
+
+            const cgltf_accessor* posAccessor = nullptr;
+            const cgltf_accessor* normAccessor = nullptr;
+            const cgltf_accessor* texAccessor = nullptr;
+            const cgltf_accessor* tanAccessor = nullptr;
+
+            for (size_t a = 0; a < prim.attributes_count; ++a) {
+                const auto& attr = prim.attributes[a];
+                if (attr.type == cgltf_attribute_type_position) posAccessor = attr.data;
+                else if (attr.type == cgltf_attribute_type_normal) normAccessor = attr.data;
+                else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) texAccessor = attr.data;
+                else if (attr.type == cgltf_attribute_type_tangent) tanAccessor = attr.data;
+            }
+
+            if (!posAccessor) continue;
+
+            size_t vertexCount = posAccessor->count;
+            outPrim.vertices.resize(vertexCount);
+
+            for (size_t v = 0; v < vertexCount; ++v) {
+                float pos[3] = {0, 0, 0};
+                cgltf_accessor_read_float(posAccessor, v, pos, 3);
+                outPrim.vertices[v].position = glm::vec4(pos[0], pos[1], pos[2], 0.0f);
+
+                if (normAccessor) {
+                    float norm[3] = {0, 1, 0};
+                    cgltf_accessor_read_float(normAccessor, v, norm, 3);
+                    outPrim.vertices[v].normal = glm::vec4(norm[0], norm[1], norm[2], 0.0f);
+                } else {
+                    outPrim.vertices[v].normal = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+
+                if (texAccessor) {
+                    float uv[2] = {0, 0};
+                    cgltf_accessor_read_float(texAccessor, v, uv, 2);
+                    outPrim.vertices[v].position.w = uv[0];
+                    outPrim.vertices[v].normal.w = uv[1];
+                }
+
+                if (tanAccessor) {
+                    float tan[4] = {1, 0, 0, 1};
+                    cgltf_accessor_read_float(tanAccessor, v, tan, 4);
+                    outPrim.vertices[v].tangent = glm::vec4(tan[0], tan[1], tan[2], tan[3]);
+                }
+            }
+
+            // Indices
+            if (prim.indices) {
+                outPrim.indices.resize(prim.indices->count);
+                for (size_t idx = 0; idx < prim.indices->count; ++idx) {
+                    outPrim.indices[idx] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, idx));
+                }
+            } else {
+                outPrim.indices.resize(vertexCount);
+                for (size_t idx = 0; idx < vertexCount; ++idx) {
+                    outPrim.indices[idx] = static_cast<uint32_t>(idx);
+                }
+            }
+
+            outMesh.primitives.push_back(std::move(outPrim));
+        }
+
+        outScene.meshes.push_back(std::move(outMesh));
+    }
+
+    // 3. Parse Nodes & Hierarchy
+    for (size_t n = 0; n < data->nodes_count; ++n) {
+        const auto& node = data->nodes[n];
+        GltfNode outNode;
+        outNode.name = node.name ? node.name : ("Node_" + std::to_string(n));
+
+        if (node.mesh) {
+            outNode.meshIndex = static_cast<int32_t>(node.mesh - data->meshes);
+        }
+
+        float worldMat[16];
+        cgltf_node_transform_world(&node, worldMat);
+        outNode.worldTransform = glm::make_mat4(worldMat);
+
+        for (size_t c = 0; c < node.children_count; ++c) {
+            outNode.children.push_back(static_cast<uint32_t>(node.children[c] - data->nodes));
+        }
+
+        outScene.nodes.push_back(std::move(outNode));
+    }
+
+    // 4. Parse Punctual Lights (KHR_lights_punctual)
+    for (size_t l = 0; l < data->lights_count; ++l) {
+        const auto& light = data->lights[l];
+        LightGPU gpuLight{};
+        gpuLight.emission = glm::vec4(
+            light.color[0] * light.intensity,
+            light.color[1] * light.intensity,
+            light.color[2] * light.intensity,
+            1.0f
+        );
+
+        if (light.type == cgltf_light_type_spot) {
+            gpuLight.position.w = LIGHT_SPOT;
+            gpuLight.u.w = std::cos(light.spot_inner_cone_angle);
+            gpuLight.v.w = std::cos(light.spot_outer_cone_angle);
+        } else if (light.type == cgltf_light_type_directional) {
+            gpuLight.position.w = LIGHT_DIRECTIONAL;
+        } else {
+            gpuLight.position.w = LIGHT_AREA_QUAD;
+        }
+
+        outScene.lights.push_back(gpuLight);
+    }
+
+    // 5. Parse Cameras
+    for (size_t n = 0; n < data->nodes_count; ++n) {
+        const auto& node = data->nodes[n];
+        if (node.camera) {
+            float worldMat[16];
+            cgltf_node_transform_world(&node, worldMat);
+            glm::mat4 M = glm::make_mat4(worldMat);
+            glm::vec3 pos = glm::vec3(M[3]);
+            glm::vec3 forward = -glm::normalize(glm::vec3(M[2]));
+            float fov = 45.0f;
+            if (node.camera->type == cgltf_camera_type_perspective && node.camera->data.perspective.yfov > 0.0f) {
+                fov = glm::degrees(node.camera->data.perspective.yfov);
+            }
+            outScene.cameras.emplace_back(pos, pos + forward * 5.0f, fov);
+        }
+    }
+
+    Logger::info("glTF loaded: {} meshes, {} nodes, {} materials, {} lights, {} cameras",
+                 outScene.meshes.size(), outScene.nodes.size(), outScene.materials.size(),
+                 outScene.lights.size(), outScene.cameras.size());
+
+    cgltf_free(data);
+    return true;
+}
+
+SceneData GltfLoader::loadSceneData(const std::string& filepath) {
+    GltfScene gltfScene;
+    if (!load(filepath, gltfScene)) {
+        Logger::warn("GltfLoader: Failed to load '{}', falling back to Cornell Box.", filepath);
+        return ProceduralScene::createCornellBox();
+    }
+
+    SceneData data;
+    data.materials = gltfScene.materials;
+    if (data.materials.empty()) {
+        MaterialGPU defaultMat{};
+        defaultMat.albedo = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+        defaultMat.roughness = 0.5f;
+        defaultMat.metallic = 0.0f;
+        defaultMat.type = MATERIAL_DIFFUSE;
+        data.materials.push_back(defaultMat);
+    }
+
+    data.lights = gltfScene.lights;
+    data.textures = std::move(gltfScene.textures);
+
+    // Traverse nodes and bake world-space transformed triangles
+    for (const auto& node : gltfScene.nodes) {
+        if (node.meshIndex < 0 || static_cast<size_t>(node.meshIndex) >= gltfScene.meshes.size()) {
+            continue;
+        }
+
+        const auto& mesh = gltfScene.meshes[node.meshIndex];
+        const glm::mat4& M = node.worldTransform;
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(M)));
+
+        for (const auto& prim : mesh.primitives) {
+            uint32_t matId = prim.materialIndex;
+            if (matId >= data.materials.size()) matId = 0;
+
+            if (!prim.indices.empty()) {
+                for (size_t i = 0; i + 2 < prim.indices.size(); i += 3) {
+                    const auto& v0_in = prim.vertices[prim.indices[i]];
+                    const auto& v1_in = prim.vertices[prim.indices[i + 1]];
+                    const auto& v2_in = prim.vertices[prim.indices[i + 2]];
+
+                    TriangleGPU tri{};
+                    glm::vec4 p0 = M * glm::vec4(glm::vec3(v0_in.position), 1.0f);
+                    glm::vec4 p1 = M * glm::vec4(glm::vec3(v1_in.position), 1.0f);
+                    glm::vec4 p2 = M * glm::vec4(glm::vec3(v2_in.position), 1.0f);
+
+                    tri.v0.position = glm::vec4(glm::vec3(p0), v0_in.position.w);
+                    tri.v1.position = glm::vec4(glm::vec3(p1), v1_in.position.w);
+                    tri.v2.position = glm::vec4(glm::vec3(p2), v2_in.position.w);
+
+                    glm::vec3 p0_3 = glm::vec3(p0);
+                    glm::vec3 p1_3 = glm::vec3(p1);
+                    glm::vec3 p2_3 = glm::vec3(p2);
+                    glm::vec3 geoNormal = glm::cross(p1_3 - p0_3, p2_3 - p0_3);
+                    if (glm::length(geoNormal) > 1e-7f) {
+                        geoNormal = glm::normalize(geoNormal);
+                    } else {
+                        geoNormal = glm::vec3(0.0f, 1.0f, 0.0f);
+                    }
+
+                    glm::vec3 n0 = glm::vec3(v0_in.normal);
+                    glm::vec3 n1 = glm::vec3(v1_in.normal);
+                    glm::vec3 n2 = glm::vec3(v2_in.normal);
+                    tri.v0.normal = glm::vec4(glm::length(n0) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n0), v0_in.normal.w);
+                    tri.v1.normal = glm::vec4(glm::length(n1) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n1), v1_in.normal.w);
+                    tri.v2.normal = glm::vec4(glm::length(n2) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n2), v2_in.normal.w);
+
+                    tri.materialId = matId;
+                    data.triangles.push_back(tri);
+                }
+            } else {
+                for (size_t i = 0; i + 2 < prim.vertices.size(); i += 3) {
+                    const auto& v0_in = prim.vertices[i];
+                    const auto& v1_in = prim.vertices[i + 1];
+                    const auto& v2_in = prim.vertices[i + 2];
+
+                    TriangleGPU tri{};
+                    glm::vec4 p0 = M * glm::vec4(glm::vec3(v0_in.position), 1.0f);
+                    glm::vec4 p1 = M * glm::vec4(glm::vec3(v1_in.position), 1.0f);
+                    glm::vec4 p2 = M * glm::vec4(glm::vec3(v2_in.position), 1.0f);
+
+                    tri.v0.position = glm::vec4(glm::vec3(p0), v0_in.position.w);
+                    tri.v1.position = glm::vec4(glm::vec3(p1), v1_in.position.w);
+                    tri.v2.position = glm::vec4(glm::vec3(p2), v2_in.position.w);
+
+                    glm::vec3 p0_3 = glm::vec3(p0);
+                    glm::vec3 p1_3 = glm::vec3(p1);
+                    glm::vec3 p2_3 = glm::vec3(p2);
+                    glm::vec3 geoNormal = glm::cross(p1_3 - p0_3, p2_3 - p0_3);
+                    if (glm::length(geoNormal) > 1e-7f) {
+                        geoNormal = glm::normalize(geoNormal);
+                    } else {
+                        geoNormal = glm::vec3(0.0f, 1.0f, 0.0f);
+                    }
+
+                    glm::vec3 n0 = glm::vec3(v0_in.normal);
+                    glm::vec3 n1 = glm::vec3(v1_in.normal);
+                    glm::vec3 n2 = glm::vec3(v2_in.normal);
+                    tri.v0.normal = glm::vec4(glm::length(n0) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n0), v0_in.normal.w);
+                    tri.v1.normal = glm::vec4(glm::length(n1) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n1), v1_in.normal.w);
+                    tri.v2.normal = glm::vec4(glm::length(n2) < 1e-4f ? geoNormal : glm::normalize(normalMatrix * n2), v2_in.normal.w);
+
+                    tri.materialId = matId;
+                    data.triangles.push_back(tri);
+                }
+            }
+        }
+    }
+
+    // Compute AABB for framing and lighting
+    glm::vec3 minBound(1e30f);
+    glm::vec3 maxBound(-1e30f);
+    for (const auto& tri : data.triangles) {
+        minBound = glm::min(minBound, glm::vec3(tri.v0.position));
+        minBound = glm::min(minBound, glm::vec3(tri.v1.position));
+        minBound = glm::min(minBound, glm::vec3(tri.v2.position));
+        maxBound = glm::max(maxBound, glm::vec3(tri.v0.position));
+        maxBound = glm::max(maxBound, glm::vec3(tri.v1.position));
+        maxBound = glm::max(maxBound, glm::vec3(tri.v2.position));
+    }
+
+    glm::vec3 center = (minBound + maxBound) * 0.5f;
+    glm::vec3 extent = maxBound - minBound;
+    float maxDim = std::max({extent.x, extent.y, extent.z});
+    if (maxDim < 1e-4f) maxDim = 2.0f;
+
+    // Camera setup
+    if (!gltfScene.cameras.empty()) {
+        data.hasCamera = true;
+        data.cameraPosition = gltfScene.cameras[0].getPosition();
+        data.cameraTarget = gltfScene.cameras[0].getPosition() + gltfScene.cameras[0].getFront() * 5.0f;
+        data.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        data.cameraFov = 45.0f;
+    } else if (!data.triangles.empty()) {
+        float dist = (maxDim * 0.5f) / std::tan(glm::radians(22.5f));
+        data.hasCamera = true;
+        data.cameraPosition = center + glm::vec3(0.0f, maxDim * 0.12f, dist * 1.3f);
+        data.cameraTarget = center;
+        data.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        data.cameraFov = 45.0f;
+    }
+
+    // If the glTF had no lights, add an overhead area light scaled to the model dimensions
+    if (data.lights.empty()) {
+        float lightSide = maxDim * 0.6f;
+        float lightY = maxBound.y + maxDim * 0.5f;
+        LightGPU defaultLight{};
+        defaultLight.position = glm::vec4(center.x - lightSide * 0.5f, lightY, center.z - lightSide * 0.5f, LIGHT_AREA_QUAD);
+        defaultLight.u = glm::vec4(lightSide, 0.0f, 0.0f, 0.0f);
+        defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
+        defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+        float area = lightSide * lightSide;
+        defaultLight.emission = glm::vec4(25.0f, 25.0f, 25.0f, area);
+        data.lights.push_back(defaultLight);
+    }
+
+    Logger::info("GltfLoader generated SceneData: {} Triangles, {} Spheres, {} Materials, {} Lights",
+                 data.triangles.size(), data.spheres.size(), data.materials.size(), data.lights.size());
+
+    return data;
+}
+
+} // namespace pathways

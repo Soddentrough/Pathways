@@ -1,0 +1,22 @@
+# Build directories
+build/
+bin/
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Output directories
+output/
+/*.png
+/*.exr
+/*.json
+*.spv
+!scenes/**
+
+# IDE / Editor / UI state
+.vscode/
+.idea/
+*.swp
+*~
+imgui.ini

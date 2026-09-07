@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Output linear accumulation buffer on primary GPU
+layout(binding = 0, rgba32f) uniform image2D uPrimaryAccum;
+
+// Secondary GPU accumulated radiance data transferred via PCIe
+layout(std430, binding = 1) readonly buffer SecondaryAccumBuffer {
+    vec4 secondaryRadiance[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint secondarySpp;
+    uint padding;
+} pc;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
+        return;
+    }
+
+    uint linearIndex = pixelCoord.y * pc.width + pixelCoord.x;
+    vec4 secVal = secondaryRadiance[linearIndex];
+
+    vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);
+    vec4 combinedVal = primVal + secVal;
+
+    imageStore(uPrimaryAccum, pixelCoord, combinedVal);
+}

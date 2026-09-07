@@ -1,0 +1,67 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 64) in;
+
+struct RayPayload {
+    vec4 origin;     // xyz: origin, w: active (1.0 = alive, 0.0 = dead)
+    vec4 direction;  // xyz: direction, w: bounce
+    vec4 throughput; // rgb: throughput, w: pdf
+    vec4 radiance;   // rgb: accumulated radiance, w: pixelIndex
+};
+
+layout(std430, binding = 0) readonly buffer InputRays {
+    RayPayload inRays[];
+};
+
+layout(std430, binding = 1) writeonly buffer CompactedRays {
+    RayPayload outRays[];
+};
+
+layout(std430, binding = 2) buffer IndirectDispatch {
+    uint x; // Dispatch size X (activeCount + 63) / 64
+    uint y; // 1
+    uint z; // 1
+    uint activeCount;
+} dispatchCmd;
+
+layout(push_constant) uniform PushConstants {
+    uint totalRays;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    bool isActive = false;
+    RayPayload ray;
+
+    if (idx < pc.totalRays) {
+        ray = inRays[idx];
+        isActive = (ray.origin.w > 0.5);
+    }
+
+    // Subgroup balloting for wave compaction
+    uvec4 ballot = subgroupBallot(isActive);
+    uint localIndex = subgroupBallotExclusiveBitCount(ballot);
+    uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+    uint waveGlobalOffset = 0;
+    if (subgroupElect()) {
+        waveGlobalOffset = atomicAdd(dispatchCmd.activeCount, waveActiveCount);
+    }
+    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+    if (isActive) {
+        uint targetIdx = waveGlobalOffset + localIndex;
+        outRays[targetIdx] = ray;
+    }
+
+    // Thread 0 updates indirect dispatch parameters
+    if (gl_GlobalInvocationID.x == 0) {
+        // Compute workgroups needed for next bounce
+        uint totalActive = dispatchCmd.activeCount;
+        dispatchCmd.x = (totalActive + 63u) / 64u;
+        dispatchCmd.y = 1;
+        dispatchCmd.z = 1;
+    }
+}

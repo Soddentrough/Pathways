@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba32f) readonly uniform image2D uAccumImage;
+layout(binding = 1, rgba8) writeonly uniform image2D uOutputImage;
+
+layout(push_constant) uniform PushConstants {
+    float exposure;
+    uint totalSamples;
+    uint applyACES;
+    uint padding;
+} pc;
+
+// ACES Filmic Tone Mapping Curve (Narkowicz / Stephen Hill fit)
+vec3 ACESFilm(vec3 x) {
+    float a = 2.51f;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(uAccumImage);
+
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+
+    vec4 accumColor = imageLoad(uAccumImage, pixelCoord);
+    vec3 linearColor = accumColor.rgb;
+
+    if (pc.totalSamples > 0) {
+        linearColor /= float(pc.totalSamples);
+    }
+
+    // Apply exposure compensation
+    linearColor *= pc.exposure;
+
+    // Apply ACES Tonemapping
+    vec3 mappedColor = linearColor;
+    if (pc.applyACES != 0) {
+        mappedColor = ACESFilm(linearColor);
+    } else {
+        // Fallback Reinhard
+        mappedColor = linearColor / (linearColor + vec3(1.0));
+    }
+
+    // Gamma correction (sRGB ~2.2)
+    vec3 finalColor = pow(mappedColor, vec3(1.0 / 2.2));
+
+    imageStore(uOutputImage, pixelCoord, vec4(finalColor, 1.0));
+}

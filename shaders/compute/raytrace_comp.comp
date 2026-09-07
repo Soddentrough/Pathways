@@ -1,0 +1,861 @@
+#version 460
+#extension GL_EXT_ray_query : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Output linear accumulation buffer
+layout(binding = 0, rgba32f) uniform image2D uAccumImage;
+
+// Uniform buffer for camera & rendering settings
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec4 position;
+    vec4 viewParams; // x: fov, y: aspect, z: near, w: far
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;      // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows
+} ubo;
+
+// Scene structures
+struct Vertex {
+    vec4 position; // xyz: pos, w: u
+    vec4 normal;   // xyz: norm, w: v
+};
+
+struct Triangle {
+    Vertex v0;
+    Vertex v1;
+    Vertex v2;
+    uint materialId;
+    uint padding[3];
+};
+
+struct Sphere {
+    vec4 centerRadius; // xyz: center, w: radius
+    uint materialId;
+    uint padding[3];
+};
+
+struct Material {
+    vec4 albedo;
+    vec4 emissive;
+    float roughness;
+    float metallic;
+    float ior;
+    float transmission;
+    uint type; // 0: diffuse, 1: metallic, 2: dielectric, 3: emissive
+    uint albedoTex;
+    uint normalTex;
+    uint padding;
+};
+
+struct Light {
+    vec4 position; // xyz: pos/corner, w: type (0: area, 1: spot)
+    vec4 emission; // rgb: color, w: area
+    vec4 u;        // xyz: edge1, w: spot inner cos
+    vec4 v;        // xyz: edge2, w: spot outer cos
+    vec4 normal;   // xyz: normal/dir, w: padding
+};
+
+layout(std430, binding = 2) readonly buffer TrianglesBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 3) readonly buffer SpheresBuffer {
+    Sphere spheres[];
+};
+
+layout(std430, binding = 4) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 5) readonly buffer LightsBuffer {
+    Light lights[];
+};
+
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 7) uniform sampler2D environmentMap;
+layout(binding = 8) uniform sampler2D sceneTextures[16];
+
+layout(push_constant) uniform PushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint tileOffsetX;
+    uint tileOffsetY;
+    uint tileWidth;
+    uint tileHeight;
+    uint useHardwareRT; // 1: hardware RT via VK_KHR_ray_query, 0: software/LDS
+    uint hasEnvMap;
+    float envMapIntensity;
+    uint accumulateHistory; // 1: accumulate with history, 0: overwrite accum buffer (per-frame fresh)
+} pc;
+
+#define PI 3.14159265358979323846
+#define TWO_PI 6.28318530717958647692
+#define INV_PI 0.31830988618379067154
+#define EPSILON 0.0005
+
+vec2 directionToEquirectangular(vec3 dir) {
+    float phi = atan(dir.z, dir.x);
+    float theta = acos(clamp(dir.y, -1.0, 1.0));
+    return vec2((phi + PI) / TWO_PI, theta / PI);
+}
+
+// PCG Random Number Generator
+uint pcg_hash(inout uint seed) {
+    seed = seed * 747796405u + 2891336453u;
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randFloat(inout uint seed) {
+    return float(pcg_hash(seed)) / 4294967296.0;
+}
+
+vec2 randVec2(inout uint seed) {
+    return vec2(randFloat(seed), randFloat(seed));
+}
+
+vec3 randVec3(inout uint seed) {
+    return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+// Ray structure
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct HitInfo {
+    bool hit;
+    float t;
+    vec3 point;
+    vec3 normal;
+    vec2 uv;
+    uint materialId;
+    bool frontFace;
+};
+
+// LDS Structure-of-Arrays for ultra-low latency & zero bank conflict broadcast on RDNA4
+#define MAX_LDS_TRIANGLES 32
+#define MAX_LDS_SPHERES 8
+#define MAX_LDS_MATERIALS 16
+#define MAX_LDS_LIGHTS 8
+
+shared vec3 s_v0[MAX_LDS_TRIANGLES];
+shared vec3 s_edge1[MAX_LDS_TRIANGLES];
+shared vec3 s_edge2[MAX_LDS_TRIANGLES];
+shared vec3 s_normal[MAX_LDS_TRIANGLES];
+shared uint s_triMatId[MAX_LDS_TRIANGLES];
+
+shared vec4 s_sphereCenterRadius[MAX_LDS_SPHERES];
+shared float s_sphereRadiusSq[MAX_LDS_SPHERES];
+shared uint s_sphereMatId[MAX_LDS_SPHERES];
+
+shared Material s_materials[MAX_LDS_MATERIALS];
+shared Light s_lights[MAX_LDS_LIGHTS];
+shared bool s_useLds;
+
+// Cooperative Workgroup LDS Pre-load (Single-cycle broadcast on RDNA4)
+void loadSceneToLDS() {
+    uint idx = gl_LocalInvocationIndex;
+    if (idx == 0) {
+        s_useLds = (pc.useHardwareRT == 0 &&
+                    pc.numTriangles <= MAX_LDS_TRIANGLES && pc.numSpheres <= MAX_LDS_SPHERES &&
+                    pc.numMaterials <= MAX_LDS_MATERIALS && pc.numLights <= MAX_LDS_LIGHTS);
+    }
+    barrier();
+
+    if (s_useLds) {
+        if (idx < pc.numTriangles) {
+            Triangle tri = triangles[idx];
+            vec3 p0 = tri.v0.position.xyz;
+            vec3 p1 = tri.v1.position.xyz;
+            vec3 p2 = tri.v2.position.xyz;
+            s_v0[idx] = p0;
+            s_edge1[idx] = p1 - p0;
+            s_edge2[idx] = p2 - p0;
+            s_normal[idx] = tri.v0.normal.xyz;
+            s_triMatId[idx] = tri.materialId;
+        }
+        if (idx < pc.numSpheres) {
+            Sphere sp = spheres[idx];
+            s_sphereCenterRadius[idx] = sp.centerRadius;
+            s_sphereRadiusSq[idx] = sp.centerRadius.w * sp.centerRadius.w;
+            s_sphereMatId[idx] = sp.materialId;
+        }
+        if (idx < pc.numMaterials) {
+            s_materials[idx] = materials[idx];
+        }
+        if (idx < pc.numLights) {
+            s_lights[idx] = lights[idx];
+        }
+    }
+    barrier();
+}
+
+// Fast LDS Triangle Intersection with precomputed edges and SoA broadcast
+bool intersectTriangleLDS(Ray ray, uint i, float tMin, float tMax, out HitInfo hit) {
+    vec3 edge1 = s_edge1[i];
+    vec3 edge2 = s_edge2[i];
+    vec3 pvec = cross(ray.direction, edge2);
+    float det = dot(edge1, pvec);
+
+    if (abs(det) < 1e-7) return false;
+    float invDet = 1.0 / det;
+
+    vec3 tvec = ray.origin - s_v0[i];
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, edge1);
+    float v = dot(ray.direction, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(edge2, qvec) * invDet;
+    if (t < tMin || t > tMax) return false;
+
+    hit.hit = true;
+    hit.t = t;
+    hit.point = ray.origin + t * ray.direction;
+    vec3 normal = s_normal[i];
+    hit.frontFace = dot(ray.direction, normal) < 0.0;
+    hit.normal = hit.frontFace ? normal : -normal;
+    hit.uv = vec2(u, v);
+    hit.materialId = s_triMatId[i];
+
+    return true;
+}
+
+// Fallback Global Memory Triangle Intersection
+bool intersectTriangle(Ray ray, Triangle tri, float tMin, float tMax, out HitInfo hit) {
+    vec3 v0 = tri.v0.position.xyz;
+    vec3 v1 = tri.v1.position.xyz;
+    vec3 v2 = tri.v2.position.xyz;
+
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    vec3 pvec = cross(ray.direction, edge2);
+    float det = dot(edge1, pvec);
+
+    if (abs(det) < 1e-7) return false;
+    float invDet = 1.0 / det;
+
+    vec3 tvec = ray.origin - v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, edge1);
+    float v = dot(ray.direction, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(edge2, qvec) * invDet;
+    if (t < tMin || t > tMax) return false;
+
+    hit.hit = true;
+    hit.t = t;
+    hit.point = ray.origin + t * ray.direction;
+
+    vec3 n0 = tri.v0.normal.xyz;
+    vec3 n1 = tri.v1.normal.xyz;
+    vec3 n2 = tri.v2.normal.xyz;
+    vec3 normal = normalize((1.0 - u - v) * n0 + u * n1 + v * n2);
+
+    hit.frontFace = dot(ray.direction, normal) < 0.0;
+    hit.normal = hit.frontFace ? normal : -normal;
+    vec2 uv0 = vec2(tri.v0.position.w, tri.v0.normal.w);
+    vec2 uv1 = vec2(tri.v1.position.w, tri.v1.normal.w);
+    vec2 uv2 = vec2(tri.v2.position.w, tri.v2.normal.w);
+    hit.uv = (1.0 - u - v) * uv0 + u * uv1 + v * uv2;
+    hit.materialId = tri.materialId;
+
+    return true;
+}
+
+// Fast LDS Sphere Intersection with precomputed radiusSq
+bool intersectSphereLDS(Ray ray, uint i, float tMin, float tMax, out HitInfo hit) {
+    vec4 cr = s_sphereCenterRadius[i];
+    vec3 oc = ray.origin - cr.xyz;
+    float radius = cr.w;
+    float radiusSq = s_sphereRadiusSq[i];
+    float a = dot(ray.direction, ray.direction);
+    float halfB = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radiusSq;
+    float discriminant = halfB * halfB - a * c;
+
+    if (discriminant < 0.0) return false;
+    float sqrtd = sqrt(discriminant);
+
+    float root = (-halfB - sqrtd) / a;
+    if (root < tMin || root > tMax) {
+        root = (-halfB + sqrtd) / a;
+        if (root < tMin || root > tMax) return false;
+    }
+
+    hit.hit = true;
+    hit.t = root;
+    hit.point = ray.origin + root * ray.direction;
+    vec3 outwardNormal = (hit.point - cr.xyz) / radius;
+    hit.frontFace = dot(ray.direction, outwardNormal) < 0.0;
+    hit.normal = hit.frontFace ? outwardNormal : -outwardNormal;
+    hit.materialId = s_sphereMatId[i];
+    hit.uv = vec2(0.0);
+
+    return true;
+}
+
+// Fallback Global Memory Sphere Intersection
+bool intersectSphere(Ray ray, Sphere sphere, float tMin, float tMax, out HitInfo hit) {
+    vec3 oc = ray.origin - sphere.centerRadius.xyz;
+    float radius = sphere.centerRadius.w;
+    float a = dot(ray.direction, ray.direction);
+    float halfB = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = halfB * halfB - a * c;
+
+    if (discriminant < 0.0) return false;
+    float sqrtd = sqrt(discriminant);
+
+    float root = (-halfB - sqrtd) / a;
+    if (root < tMin || root > tMax) {
+        root = (-halfB + sqrtd) / a;
+        if (root < tMin || root > tMax) return false;
+    }
+
+    hit.hit = true;
+    hit.t = root;
+    hit.point = ray.origin + root * ray.direction;
+    vec3 outwardNormal = (hit.point - sphere.centerRadius.xyz) / radius;
+    hit.frontFace = dot(ray.direction, outwardNormal) < 0.0;
+    hit.normal = hit.frontFace ? outwardNormal : -outwardNormal;
+    hit.materialId = sphere.materialId;
+    hit.uv = vec2(0.0);
+
+    return true;
+}
+
+// Scene ray traversal (closest hit) - Scalarly optimized for minimal VGPR register pressure
+bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
+    closestHit.hit = false;
+    closestHit.t = tMax;
+    float closestT = tMax;
+    int closestTri = -1;
+    vec2 closestUv = vec2(0.0);
+    int closestSphere = -1;
+
+    if (pc.useHardwareRT == 1) {
+        // Hardware BVH Traversal on AMD RDNA4 Ray Accelerators
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS,
+                             gl_RayFlagsOpaqueEXT,
+                             0xFF,
+                             ray.origin,
+                             tMin,
+                             ray.direction,
+                             closestT);
+
+        while (rayQueryProceedEXT(rq)) {
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            float t = rayQueryGetIntersectionTEXT(rq, true);
+            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+
+            closestT = t;
+            closestTri = int(triIdx);
+            closestUv = bary;
+        }
+
+        // Test procedural spheres if any exist
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            HitInfo spHit;
+            if (intersectSphere(ray, spheres[i], tMin, closestT, spHit)) {
+                closestT = spHit.t;
+                closestSphere = int(i);
+                closestTri = -1;
+            }
+        }
+
+        if (closestTri >= 0) {
+            closestHit.hit = true;
+            closestHit.t = closestT;
+            closestHit.point = ray.origin + closestT * ray.direction;
+
+            Triangle tri = triangles[closestTri];
+            float u = closestUv.x;
+            float v = closestUv.y;
+            float w = 1.0 - u - v;
+
+            vec3 n0 = tri.v0.normal.xyz;
+            vec3 n1 = tri.v1.normal.xyz;
+            vec3 n2 = tri.v2.normal.xyz;
+            vec3 normal = normalize(w * n0 + u * n1 + v * n2);
+
+            closestHit.frontFace = dot(ray.direction, normal) < 0.0;
+            closestHit.normal = closestHit.frontFace ? normal : -normal;
+
+            vec2 uv0 = vec2(tri.v0.position.w, tri.v0.normal.w);
+            vec2 uv1 = vec2(tri.v1.position.w, tri.v1.normal.w);
+            vec2 uv2 = vec2(tri.v2.position.w, tri.v2.normal.w);
+            closestHit.uv = w * uv0 + u * uv1 + v * uv2;
+            closestHit.materialId = tri.materialId;
+            return true;
+        } else if (closestSphere >= 0) {
+            closestHit.hit = true;
+            closestHit.t = closestT;
+            closestHit.point = ray.origin + closestT * ray.direction;
+            vec4 cr = spheres[closestSphere].centerRadius;
+            vec3 outwardNormal = (closestHit.point - cr.xyz) / cr.w;
+            closestHit.frontFace = dot(ray.direction, outwardNormal) < 0.0;
+            closestHit.normal = closestHit.frontFace ? outwardNormal : -outwardNormal;
+            closestHit.uv = vec2(0.0);
+            closestHit.materialId = spheres[closestSphere].materialId;
+            return true;
+        }
+        return false;
+    }
+
+    if (s_useLds) {
+        // 1. Triangles in LDS
+        for (uint i = 0; i < pc.numTriangles; ++i) {
+            vec3 edge1 = s_edge1[i];
+            vec3 edge2 = s_edge2[i];
+            vec3 pvec = cross(ray.direction, edge2);
+            float det = dot(edge1, pvec);
+            if (abs(det) < 1e-7) continue;
+            float invDet = 1.0 / det;
+
+            vec3 tvec = ray.origin - s_v0[i];
+            float u = dot(tvec, pvec) * invDet;
+            if (u < 0.0 || u > 1.0) continue;
+
+            vec3 qvec = cross(tvec, edge1);
+            float v = dot(ray.direction, qvec) * invDet;
+            if (v < 0.0 || u + v > 1.0) continue;
+
+            float t = dot(edge2, qvec) * invDet;
+            if (t >= tMin && t < closestT) {
+                closestT = t;
+                closestTri = int(i);
+                closestUv = vec2(u, v);
+            }
+        }
+
+        // 2. Spheres in LDS
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            vec4 cr = s_sphereCenterRadius[i];
+            vec3 oc = ray.origin - cr.xyz;
+            float halfB = dot(oc, ray.direction);
+            float c = dot(oc, oc) - s_sphereRadiusSq[i];
+            float disc = halfB * halfB - c;
+            if (disc < 0.0) continue;
+            float sqrtd = sqrt(disc);
+            float root = -halfB - sqrtd;
+            if (root < tMin || root >= closestT) {
+                root = -halfB + sqrtd;
+                if (root < tMin || root >= closestT) continue;
+            }
+            closestT = root;
+            closestSphere = int(i);
+            closestTri = -1;
+        }
+
+        // Construct HitInfo ONCE after loop finishes
+        if (closestTri >= 0) {
+            closestHit.hit = true;
+            closestHit.t = closestT;
+            closestHit.point = ray.origin + closestT * ray.direction;
+            vec3 normal = s_normal[closestTri];
+            closestHit.frontFace = dot(ray.direction, normal) < 0.0;
+            closestHit.normal = closestHit.frontFace ? normal : -normal;
+            closestHit.uv = closestUv;
+            closestHit.materialId = s_triMatId[closestTri];
+            return true;
+        } else if (closestSphere >= 0) {
+            closestHit.hit = true;
+            closestHit.t = closestT;
+            closestHit.point = ray.origin + closestT * ray.direction;
+            vec4 cr = s_sphereCenterRadius[closestSphere];
+            vec3 outwardNormal = (closestHit.point - cr.xyz) / cr.w;
+            closestHit.frontFace = dot(ray.direction, outwardNormal) < 0.0;
+            closestHit.normal = closestHit.frontFace ? outwardNormal : -outwardNormal;
+            closestHit.uv = vec2(0.0);
+            closestHit.materialId = s_sphereMatId[closestSphere];
+            return true;
+        }
+    } else {
+        // Global memory fallback with monotonic closestT tracking
+        for (uint i = 0; i < pc.numTriangles; ++i) {
+            HitInfo tempHit;
+            if (intersectTriangle(ray, triangles[i], tMin, closestT, tempHit)) {
+                closestT = tempHit.t;
+                closestHit = tempHit;
+            }
+        }
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            HitInfo tempHit;
+            if (intersectSphere(ray, spheres[i], tMin, closestT, tempHit)) {
+                closestT = tempHit.t;
+                closestHit = tempHit;
+            }
+        }
+    }
+
+    return closestHit.hit;
+}
+
+// Any-Hit Occlusion Shadow Ray Test (Early Exit on first non-emissive intersection)
+bool isShadowOccluded(Ray ray, float tMin, float tMax) {
+    if (pc.useHardwareRT == 1) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS,
+                             gl_RayFlagsNoneEXT,
+                             0xFF,
+                             ray.origin,
+                             tMin,
+                             ray.direction,
+                             tMax);
+
+        while (rayQueryProceedEXT(rq)) {
+            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            if (materials[triangles[triIdx].materialId].type != 3 /* EMISSIVE */) {
+                rayQueryConfirmIntersectionEXT(rq);
+                rayQueryTerminateEXT(rq);
+            }
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            if (materials[triangles[triIdx].materialId].type != 3) {
+                return true;
+            }
+        }
+
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            if (materials[spheres[i].materialId].type == 3) continue;
+            HitInfo tempHit;
+            if (intersectSphere(ray, spheres[i], tMin, tMax, tempHit)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (s_useLds) {
+        for (uint i = 0; i < pc.numTriangles; ++i) {
+            if (s_materials[s_triMatId[i]].type == 3) continue; // Skip emissive light source
+            vec3 edge1 = s_edge1[i];
+            vec3 edge2 = s_edge2[i];
+            vec3 pvec = cross(ray.direction, edge2);
+            float det = dot(edge1, pvec);
+            if (abs(det) < 1e-7) continue;
+            float invDet = 1.0 / det;
+
+            vec3 tvec = ray.origin - s_v0[i];
+            float u = dot(tvec, pvec) * invDet;
+            if (u < 0.0 || u > 1.0) continue;
+
+            vec3 qvec = cross(tvec, edge1);
+            float v = dot(ray.direction, qvec) * invDet;
+            if (v < 0.0 || u + v > 1.0) continue;
+
+            float t = dot(edge2, qvec) * invDet;
+            if (t >= tMin && t < tMax) {
+                return true;
+            }
+        }
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            if (s_materials[s_sphereMatId[i]].type == 3) continue;
+            vec4 cr = s_sphereCenterRadius[i];
+            vec3 oc = ray.origin - cr.xyz;
+            float halfB = dot(oc, ray.direction);
+            float c = dot(oc, oc) - s_sphereRadiusSq[i];
+            float disc = halfB * halfB - c;
+            if (disc < 0.0) continue;
+            float sqrtd = sqrt(disc);
+            float root = -halfB - sqrtd;
+            if (root < tMin || root >= tMax) {
+                root = -halfB + sqrtd;
+                if (root < tMin || root >= tMax) continue;
+            }
+            return true;
+        }
+    } else {
+        for (uint i = 0; i < pc.numTriangles; ++i) {
+            if (materials[triangles[i].materialId].type == 3) continue; // Skip emissive light source early
+            HitInfo tempHit;
+            if (intersectTriangle(ray, triangles[i], tMin, tMax, tempHit)) {
+                return true;
+            }
+        }
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            if (materials[spheres[i].materialId].type == 3) continue; // Skip emissive light source early
+            HitInfo tempHit;
+            if (intersectSphere(ray, spheres[i], tMin, tMax, tempHit)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Cosine-weighted hemisphere sampling
+vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
+    vec2 r = randVec2(seed);
+    float phi = TWO_PI * r.x;
+    float cosTheta = sqrt(r.y);
+    float sinTheta = sqrt(1.0 - r.y);
+
+    vec3 tangent = abs(normal.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    tangent = normalize(cross(normal, tangent));
+    vec3 bitangent = cross(normal, tangent);
+
+    return normalize(tangent * (cos(phi) * sinTheta) +
+                     bitangent * (sin(phi) * sinTheta) +
+                     normal * cosTheta);
+}
+
+// Schlick's approximation for Fresnel reflectance
+float fresnelSchlick(float cosTheta, float refIdx) {
+    float r0 = (1.0 - refIdx) / (1.0 + refIdx);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
+}
+
+// Path tracing integrator
+vec3 tracePath(Ray primaryRay, inout uint seed) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    Ray currentRay = primaryRay;
+
+    bool enableDirect = (ubo.flags & (1 << 0)) != 0;
+    bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
+    bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
+    bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
+    bool enableShadows = (ubo.flags & (1 << 4)) != 0;
+
+    for (uint bounce = 0; bounce < ubo.maxBounces; ++bounce) {
+        HitInfo hit;
+        if (!traceScene(currentRay, EPSILON, 1e4, hit)) {
+            // Miss: Sky / ambient radiance
+            vec3 unitDir = normalize(currentRay.direction);
+            vec3 skyColor;
+            if (pc.hasEnvMap == 1) {
+                vec2 envUv = directionToEquirectangular(unitDir);
+                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+            } else {
+                float t = 0.5 * (unitDir.y + 1.0);
+                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+            }
+            radiance += throughput * skyColor;
+            break;
+        }
+
+        Material mat = s_useLds ? s_materials[hit.materialId] : materials[hit.materialId];
+
+        // Sample material textures (Albedo & Normal Map)
+        vec4 matAlbedo = mat.albedo;
+        if (mat.albedoTex > 0 && mat.albedoTex <= 16) {
+            matAlbedo *= texture(sceneTextures[mat.albedoTex - 1], hit.uv);
+        }
+
+        vec3 hitNormal = hit.normal;
+        if (mat.normalTex > 0 && mat.normalTex <= 16) {
+            vec3 normalMap = texture(sceneTextures[mat.normalTex - 1], hit.uv).rgb * 2.0 - 1.0;
+            vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+            vec3 tangent = normalize(cross(up, hitNormal));
+            vec3 bitangent = cross(hitNormal, tangent);
+            mat3 tbn = mat3(tangent, bitangent, hitNormal);
+            hitNormal = normalize(tbn * normalMap);
+        }
+
+        // 1. Emissive
+        if (mat.type == 3 /* EMISSIVE */) {
+            if (bounce == 0 || enableIndirect) {
+                radiance += throughput * mat.emissive.rgb;
+            }
+            break;
+        }
+
+        // 2. Next Event Estimation (Direct Lighting on Area & Spot Lights)
+        if (enableDirect && (mat.type == 0 || mat.type == 1)) {
+            for (uint l = 0; l < pc.numLights; ++l) {
+                Light light = s_useLds ? s_lights[l] : lights[l];
+                vec3 lightPoint;
+                vec3 lightDir;
+                float lightDist;
+                float lightPdf = 1.0;
+                vec3 lightEmission = light.emission.rgb;
+
+                if (uint(light.position.w) == 0 /* AREA QUAD */) {
+                    vec2 uv = randVec2(seed);
+                    lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
+                    vec3 toLight = lightPoint - hit.point;
+                    lightDist = length(toLight);
+                    lightDir = toLight / lightDist;
+
+                    float cosLight = dot(-lightDir, light.normal.xyz);
+                    if (cosLight <= 0.0) continue;
+
+                    float area = light.emission.w;
+                    lightPdf = (lightDist * lightDist) / (area * cosLight);
+                } else if (uint(light.position.w) == 1 /* SPOT */) {
+                    vec3 toLight = light.position.xyz - hit.point;
+                    lightDist = length(toLight);
+                    lightDir = toLight / lightDist;
+
+                    float cosSpot = dot(-lightDir, light.normal.xyz);
+                    float innerCos = light.u.w;
+                    float outerCos = light.v.w;
+                    if (cosSpot < outerCos) continue;
+
+                    float spotFactor = clamp((cosSpot - outerCos) / (innerCos - outerCos), 0.0, 1.0);
+                    lightEmission *= spotFactor / (lightDist * lightDist);
+                    lightPdf = 1.0;
+                } else {
+                    continue;
+                }
+
+                float cosTheta = dot(hitNormal, lightDir);
+                if (cosTheta > 0.0) {
+                    // Optimized Any-Hit Shadow ray occlusion test
+                    bool inShadow = false;
+                    if (enableShadows) {
+                        Ray shadowRay;
+                        shadowRay.origin = hit.point + hitNormal * EPSILON;
+                        shadowRay.direction = lightDir;
+                        inShadow = isShadowOccluded(shadowRay, EPSILON, lightDist - EPSILON);
+                    }
+
+                    if (!inShadow) {
+                        vec3 brdf = matAlbedo.rgb * INV_PI;
+                        radiance += throughput * lightEmission * brdf * cosTheta / max(lightPdf, 1e-4);
+                    }
+                }
+            }
+        }
+
+        // Check if indirect lighting enabled for secondary bounces
+        if (bounce > 0 && !enableIndirect) {
+            break;
+        }
+
+        // 3. BSDF Sampling for Next Bounce
+        vec3 nextDirection;
+
+        if (mat.type == 2 /* DIELECTRIC / REFRACTION */) {
+            if (!enableRefraction) {
+                // Fallback to diffuse if refraction disabled
+                nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                throughput *= matAlbedo.rgb;
+            } else {
+                float refractionRatio = hit.frontFace ? (1.0 / mat.ior) : mat.ior;
+                vec3 unitDir = normalize(currentRay.direction);
+                float cosTheta = min(dot(-unitDir, hitNormal), 1.0);
+                float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+                bool cannotRefract = refractionRatio * sinTheta > 1.0;
+                float reflectProb = fresnelSchlick(cosTheta, refractionRatio);
+
+                if (cannotRefract || reflectProb > randFloat(seed)) {
+                    // Total Internal Reflection or Fresnel reflection
+                    nextDirection = reflect(unitDir, hitNormal);
+                    currentRay.origin = hit.point + hitNormal * EPSILON;
+                } else {
+                    // Refraction (Snell's Law)
+                    nextDirection = refract(unitDir, hitNormal, refractionRatio);
+                    currentRay.origin = hit.point - hitNormal * EPSILON;
+                }
+                currentRay.direction = normalize(nextDirection);
+                throughput *= matAlbedo.rgb;
+                continue;
+            }
+        } else if (mat.type == 1 /* METALLIC / SPECULAR */) {
+            if (!enableSpecular) {
+                nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                throughput *= matAlbedo.rgb;
+            } else {
+                vec3 reflected = reflect(normalize(currentRay.direction), hitNormal);
+                if (mat.roughness > 0.001) {
+                    reflected += mat.roughness * randVec3(seed);
+                }
+                nextDirection = normalize(reflected);
+                throughput *= matAlbedo.rgb;
+            }
+        } else {
+            // Diffuse Lambertian
+            nextDirection = sampleCosineHemisphere(hitNormal, seed);
+            throughput *= matAlbedo.rgb;
+        }
+
+        currentRay.origin = hit.point + hitNormal * EPSILON;
+        currentRay.direction = nextDirection;
+
+        // 4. Russian Roulette Path Termination (after bounce 2)
+        // 4. Russian Roulette Path Termination (after bounce 1)
+        if (bounce >= 1) {
+            float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            if (randFloat(seed) > p) {
+                break;
+            }
+            throughput /= p;
+        }
+    }
+
+    return radiance;
+}
+
+void main() {
+    loadSceneToLDS();
+
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(uAccumImage);
+
+    // Support sub-region / tile rendering for multi-GPU
+    if (pc.tileWidth > 0 && pc.tileHeight > 0) {
+        if (pixelCoord.x >= pc.tileWidth || pixelCoord.y >= pc.tileHeight) return;
+        pixelCoord += ivec2(pc.tileOffsetX, pc.tileOffsetY);
+    }
+
+    if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
+        return;
+    }
+
+    // Initialize per-pixel random seed
+    uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + ubo.frameIndex * 26699) | 1u;
+
+    vec3 pixelRadiance = vec3(0.0);
+
+    for (uint s = 0; s < ubo.spp; ++s) {
+        // Subpixel jitter for anti-aliasing
+        vec2 jitter = randVec2(seed) - vec2(0.5);
+        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(imageSize);
+        vec2 d = uv * 2.0 - 1.0;
+
+        // Camera ray generation via inverse projection and view matrices
+        vec4 target = ubo.projInverse * vec4(d.x, d.y, 1.0, 1.0);
+        vec4 rayDirWorld = ubo.viewInverse * vec4(normalize(target.xyz / target.w), 0.0);
+
+        Ray primaryRay;
+        primaryRay.origin = ubo.position.xyz;
+        primaryRay.direction = normalize(rayDirWorld.xyz);
+
+        pixelRadiance += tracePath(primaryRay, seed);
+    }
+
+    // Load previous accumulated radiance
+    vec4 newAccum;
+    if (pc.accumulateHistory == 0u || ubo.frameIndex == 0u) {
+        newAccum = vec4(pixelRadiance, float(ubo.spp));
+    } else {
+        vec4 prevAccum = imageLoad(uAccumImage, pixelCoord);
+        newAccum = prevAccum + vec4(pixelRadiance, float(ubo.spp));
+    }
+
+    imageStore(uAccumImage, pixelCoord, newAccum);
+}
