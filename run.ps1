@@ -1,26 +1,50 @@
 <#
 .SYNOPSIS
     Convenience launcher for the Pathways Vulkan 1.4 Path Tracer.
+.PARAMETER Toolchain
+    Compiler toolchain: "clang", "gcc", or "auto" (default, detects existing build).
 .EXAMPLE
     .\run.ps1
-    .\run.ps1 -Scene assets/models/cornell_box.gltf
+    .\run.ps1 -Scene scenes/cornell_box.gltf
+    .\run.ps1 -Toolchain gcc
 #>
 param(
+    [ValidateSet("clang", "gcc", "auto")]
+    [string]$Toolchain = "auto",
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$EngineArgs
 )
 
 Set-Location $PSScriptRoot
-$exe = Join-Path $PSScriptRoot "build\windows-clang-release\bin\pathways.exe"
+
+$clangExe = Join-Path $PSScriptRoot "build\windows-clang-release\bin\pathways.exe"
+$gccExe = Join-Path $PSScriptRoot "build\windows-gcc-release\bin\pathways.exe"
+
+$exe = $null
+if ($Toolchain -eq "clang") {
+    $exe = $clangExe
+} elseif ($Toolchain -eq "gcc") {
+    $exe = $gccExe
+} else {
+    if (Test-Path $clangExe) {
+        $exe = $clangExe
+    } elseif (Test-Path $gccExe) {
+        $exe = $gccExe
+    } else {
+        $exe = $clangExe
+    }
+}
 
 if (-not (Test-Path $exe)) {
-    Write-Host "[INFO] Executable not found. Building project..." -ForegroundColor Cyan
-    & "$PSScriptRoot\build.ps1" -Config Release
+    $targetToolchain = if ($Toolchain -eq "gcc") { "gcc" } else { "clang" }
+    Write-Host "[INFO] Executable not found. Building project with $targetToolchain..." -ForegroundColor Cyan
+    & "$PSScriptRoot\build.ps1" -Toolchain $targetToolchain -Config Release
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build failed!"
         exit $LASTEXITCODE
     }
 }
 
-Write-Host "[INFO] Launching Pathways..." -ForegroundColor Green
+Write-Host "[INFO] Launching Pathways ($exe)..." -ForegroundColor Green
 Start-Process -FilePath $exe -ArgumentList $EngineArgs -WorkingDirectory $PSScriptRoot

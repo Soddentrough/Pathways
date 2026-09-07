@@ -85,10 +85,13 @@ void VulkanContext::createInstance(const Config& config) {
     std::vector<const char*> instanceExtensions;
     if (!config.headless) {
         instanceExtensions.push_back("VK_KHR_surface");
+#ifdef _WIN32
         instanceExtensions.push_back("VK_KHR_win32_surface");
+#else
         instanceExtensions.push_back("VK_KHR_wayland_surface");
         instanceExtensions.push_back("VK_KHR_xcb_surface");
         instanceExtensions.push_back("VK_KHR_xlib_surface");
+#endif
     }
     if (config.validation_layers) {
         instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -154,14 +157,15 @@ void VulkanContext::setupDebugMessenger() {
 void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surface) {
     auto devices = enumeratePhysicalDevices(m_instance);
     if (devices.empty()) {
-        throw std::runtime_error("Failed to find GPUs with Vulkan support!");
+        throw std::runtime_error("No Vulkan physical devices found!");
     }
 
-    Logger::info("Found {} Vulkan physical device(s):", devices.size());
+    Logger::info("Enumerated {} physical Vulkan device(s):", devices.size());
     for (size_t i = 0; i < devices.size(); ++i) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
-        Logger::info("  [{}] {} (Vulkan {}.{}.{})", i, props.deviceName,
+        Logger::info("  [{}] {} (Driver: {}.{}.{})",
+                     i, props.deviceName,
                      VK_VERSION_MAJOR(props.apiVersion),
                      VK_VERSION_MINOR(props.apiVersion),
                      VK_VERSION_PATCH(props.apiVersion));
@@ -183,7 +187,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 
     if (m_deviceProperties.vendorID == 0x1002 || nameLower.find("amd") != std::string::npos || nameLower.find("radeon") != std::string::npos) {
         if (nameLower.find("rdna4") != std::string::npos || nameLower.find("gfx12") != std::string::npos ||
-            nameLower.find("r9700") != std::string::npos) {
+            nameLower.find("r9700") != std::string::npos || nameLower.find("9070") != std::string::npos ||
+            nameLower.find("9080") != std::string::npos || nameLower.find("9060") != std::string::npos ||
+            nameLower.find("rx 9") != std::string::npos || nameLower.find("rx9") != std::string::npos) {
             m_architecture = GpuArchitecture::AmdRDNA4;
             m_isRDNA4 = true;
         } else if (nameLower.find("rdna3.5") != std::string::npos || nameLower.find("gfx115") != std::string::npos ||
@@ -192,28 +198,46 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         } else if (nameLower.find("rdna3") != std::string::npos || nameLower.find("gfx11") != std::string::npos ||
                    nameLower.find("7900") != std::string::npos || nameLower.find("7800") != std::string::npos ||
                    nameLower.find("7700") != std::string::npos || nameLower.find("7600") != std::string::npos ||
-                   nameLower.find("w7900") != std::string::npos || nameLower.find("w7800") != std::string::npos) {
+                   nameLower.find("w7900") != std::string::npos || nameLower.find("w7800") != std::string::npos ||
+                   nameLower.find("rx 7") != std::string::npos || nameLower.find("rx7") != std::string::npos) {
             m_architecture = GpuArchitecture::AmdRDNA3;
         } else if (nameLower.find("rdna2") != std::string::npos || nameLower.find("gfx103") != std::string::npos ||
                    nameLower.find("6950") != std::string::npos || nameLower.find("6900") != std::string::npos ||
                    nameLower.find("6800") != std::string::npos || nameLower.find("6700") != std::string::npos ||
-                   nameLower.find("6600") != std::string::npos || nameLower.find("6500") != std::string::npos) {
+                   nameLower.find("6600") != std::string::npos || nameLower.find("6500") != std::string::npos ||
+                   nameLower.find("rx 6") != std::string::npos || nameLower.find("rx6") != std::string::npos) {
             m_architecture = GpuArchitecture::AmdRDNA2;
         } else if (nameLower.find("rdna1") != std::string::npos || nameLower.find("gfx101") != std::string::npos ||
-                   nameLower.find("5700") != std::string::npos || nameLower.find("5600") != std::string::npos) {
+                   nameLower.find("5700") != std::string::npos || nameLower.find("5600") != std::string::npos ||
+                   nameLower.find("5500") != std::string::npos || nameLower.find("rx 57") != std::string::npos ||
+                   nameLower.find("rx 56") != std::string::npos) {
             m_architecture = GpuArchitecture::AmdRDNA1;
         } else {
-            m_architecture = GpuArchitecture::AmdRDNA3;
+            m_architecture = GpuArchitecture::Generic;
         }
     } else if (m_deviceProperties.vendorID == 0x10DE || nameLower.find("nvidia") != std::string::npos || nameLower.find("geforce") != std::string::npos) {
-        if (nameLower.find("5090") != std::string::npos || nameLower.find("5080") != std::string::npos || nameLower.find("blackwell") != std::string::npos) {
+        if (nameLower.find("blackwell") != std::string::npos || nameLower.find("5090") != std::string::npos ||
+            nameLower.find("5080") != std::string::npos || nameLower.find("5070") != std::string::npos ||
+            nameLower.find("5060") != std::string::npos || nameLower.find("rtx 50") != std::string::npos ||
+            nameLower.find("rtx50") != std::string::npos) {
             m_architecture = GpuArchitecture::NvidiaBlackwell;
-        } else if (nameLower.find("4090") != std::string::npos || nameLower.find("4080") != std::string::npos || nameLower.find("4070") != std::string::npos || nameLower.find("ada") != std::string::npos) {
+        } else if (nameLower.find("ada") != std::string::npos || nameLower.find("4090") != std::string::npos ||
+                   nameLower.find("4080") != std::string::npos || nameLower.find("4070") != std::string::npos ||
+                   nameLower.find("4060") != std::string::npos || nameLower.find("4050") != std::string::npos ||
+                   nameLower.find("rtx 40") != std::string::npos || nameLower.find("rtx40") != std::string::npos) {
             m_architecture = GpuArchitecture::NvidiaAda;
-        } else if (nameLower.find("3090") != std::string::npos || nameLower.find("3080") != std::string::npos || nameLower.find("ampere") != std::string::npos) {
+        } else if (nameLower.find("ampere") != std::string::npos || nameLower.find("3090") != std::string::npos ||
+                   nameLower.find("3080") != std::string::npos || nameLower.find("3070") != std::string::npos ||
+                   nameLower.find("3060") != std::string::npos || nameLower.find("3050") != std::string::npos ||
+                   nameLower.find("rtx 30") != std::string::npos || nameLower.find("rtx30") != std::string::npos) {
             m_architecture = GpuArchitecture::NvidiaAmpere;
-        } else {
+        } else if (nameLower.find("turing") != std::string::npos || nameLower.find("2080") != std::string::npos ||
+                   nameLower.find("2070") != std::string::npos || nameLower.find("2060") != std::string::npos ||
+                   nameLower.find("rtx 20") != std::string::npos || nameLower.find("rtx20") != std::string::npos ||
+                   nameLower.find("titan rtx") != std::string::npos) {
             m_architecture = GpuArchitecture::NvidiaTuring;
+        } else {
+            m_architecture = GpuArchitecture::Generic;
         }
     } else if (m_deviceProperties.vendorID == 0x8086 || nameLower.find("intel") != std::string::npos || nameLower.find("arc") != std::string::npos) {
         m_architecture = GpuArchitecture::IntelArc;

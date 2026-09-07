@@ -11,6 +11,13 @@
 #include <thread>
 #include <bit>
 
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
+
 namespace pathways {
 
 Engine::Engine(const Config& config) : m_config(config) {
@@ -370,13 +377,31 @@ void Engine::initScene() {
 }
 
 std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
+    std::filesystem::path exeDir;
+#ifdef _WIN32
+    char exePathBuf[MAX_PATH] = {0};
+    if (GetModuleFileNameA(NULL, exePathBuf, MAX_PATH)) {
+        exeDir = std::filesystem::path(exePathBuf).parent_path();
+    }
+#elif defined(__linux__)
+    std::error_code ec;
+    auto p = std::filesystem::canonical("/proc/self/exe", ec);
+    if (!ec) exeDir = p.parent_path();
+#endif
+
     std::vector<std::string> searchPaths = {
         filename,
         std::string("shaders/") + filename,
-        std::string(SHADER_DIR) + "/" + filename,
-        std::string("build/shaders/") + filename,
-        std::string("../build/shaders/") + filename
     };
+
+    if (!exeDir.empty()) {
+        searchPaths.push_back((exeDir / "shaders" / filename).string());
+        searchPaths.push_back((exeDir / filename).string());
+    }
+
+    searchPaths.push_back(std::string(SHADER_DIR) + "/" + filename);
+    searchPaths.push_back(std::string("build/shaders/") + filename);
+    searchPaths.push_back(std::string("../build/shaders/") + filename);
 
     for (const auto& path : searchPaths) {
         if (std::filesystem::exists(path)) {

@@ -76,6 +76,11 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
 
     out << "{\n"
         << std::format("  \"gpu_name\": \"{}\",\n", stats.gpu_name)
+        << std::format("  \"architecture\": \"{}\",\n", stats.arch_name)
+        << std::format("  \"short_arch\": \"{}\",\n", stats.short_arch)
+        << std::format("  \"ray_accelerator\": \"{}\",\n", stats.ray_accelerator_name)
+        << std::format("  \"is_rdna3\": {},\n", stats.is_rdna3 ? "true" : "false")
+        << std::format("  \"is_rdna4\": {},\n", stats.is_rdna4 ? "true" : "false")
         << std::format("  \"resolution\": [{}, {}],\n", stats.width, stats.height)
         << std::format("  \"spp\": {},\n", stats.spp)
         << std::format("  \"total_frames\": {},\n", stats.total_frames)

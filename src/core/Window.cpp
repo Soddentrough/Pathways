@@ -43,6 +43,8 @@ Window::Window(const Config& config)
             if (hUserDesk) {
                 if (SetThreadDesktop(hUserDesk)) {
                     Logger::info("Attached Window thread to interactive desktop 'Default'.");
+                } else {
+                    CloseDesktop(hUserDesk);
                 }
             }
         }
@@ -130,7 +132,7 @@ Window::Window(const Config& config)
         "Pathways - Vulkan 1.4 Path Tracer",
         static_cast<int>(m_width),
         static_cast<int>(m_height),
-        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE
+        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
     );
 
     if (!m_window) {

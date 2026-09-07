@@ -87,9 +87,11 @@ if (Test-Path $UcrtBin) {
 
 # 2. Ensure Vulkan SDK is located
 if (-not $env:VULKAN_SDK) {
-    $VulkanSDKDefault = "C:\VulkanSDK\1.4.357.0"
-    if (Test-Path $VulkanSDKDefault) {
-        $env:VULKAN_SDK = $VulkanSDKDefault
+    if (Test-Path "C:\VulkanSDK") {
+        $latestSdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($latestSdk) {
+            $env:VULKAN_SDK = $latestSdk.FullName
+        }
     }
 }
 
@@ -185,8 +187,13 @@ if ($Run) {
     }
 
     if ($EngineArgs) {
-        $argList = [System.Management.Automation.Language.Parser]::ParseInput("echo $EngineArgs", [ref]$null, [ref]$null)
-        Invoke-Expression "& `"$PathwaysExe`" $EngineArgs"
+        $argList = @()
+        $tokens = [System.Management.Automation.Language.Parser]::Tokenize("fake_cmd $EngineArgs", [ref]$null, [ref]$null) |
+                  Where-Object { $_.Kind -ne 'EndOfInput' }
+        for ($i = 1; $i -lt $tokens.Count; $i++) {
+            $argList += $tokens[$i].Text.Trim('"', "'")
+        }
+        & $PathwaysExe @argList
     } else {
         & $PathwaysExe
     }

@@ -175,14 +175,24 @@ if(WIN32)
         endif()
     endforeach()
 
+    # Guard deployment: copy runtime DLLs if any exist, avoid empty argument errors
     add_custom_command(TARGET pathways POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        COMMAND ${CMAKE_COMMAND} -E
+            $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:pathways>>,copy_if_different,echo>
             $<TARGET_RUNTIME_DLLS:pathways>
-            ${EXTRA_RUNTIME_DLLS}
-            $<TARGET_FILE_DIR:pathways>
+            $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:pathways>>,$<TARGET_FILE_DIR:pathways>,"No target runtime DLLs to deploy">
         COMMAND_EXPAND_LISTS
-        COMMENT "Deploying runtime DLL dependencies to target directory"
+        COMMENT "Deploying target runtime DLL dependencies"
     )
+
+    if(EXTRA_RUNTIME_DLLS)
+        add_custom_command(TARGET pathways POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${EXTRA_RUNTIME_DLLS}
+                $<TARGET_FILE_DIR:pathways>
+            COMMENT "Deploying extra toolchain runtime DLLs"
+        )
+    endif()
 endif()
 
 # Testing
