@@ -68,6 +68,9 @@ if(WIN32)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
+    set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
+    set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
+    set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
 endif()
 
 # Find system packages

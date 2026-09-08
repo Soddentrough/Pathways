@@ -102,6 +102,7 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CONFIGURATION_TYPES=Release \
             -DENABLE_NATIVE_OPTIMIZATION=OFF \
             -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }};C:/vcpkg/installed/x64-windows" \
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
