@@ -121,14 +121,20 @@ int main() {
     // Small scene (e.g. coffee maker, radius 0.25m)
     cam.setSceneScale(0.25f);
     assert_near(cam.getSceneScale(), 0.25f, 0.001f, "Small scene radius");
-    assert_near(cam.getSpeed(), 0.25f * 0.25f, 0.001f, "Small scene base speed");
-    assert(cam.getSpeed() < 0.1f); // Ensures camera won't fly away in small scenes
+    assert_near(cam.getSpeed(), 0.25f * 1.75f, 0.001f, "Small scene base speed");
+    assert(cam.getSpeed() < 0.5f); // Ensures camera won't fly away in small scenes
     std::cout << "[PASS] Small scene scale adaptivity verified (radius: 0.25m -> speed: " << cam.getSpeed() << " m/s)." << std::endl;
+
+    // Cornell Box reference scene (radius 2.0m -> 3.5 m/s responsive real-time speed)
+    cam.setSceneScale(2.0f);
+    assert_near(cam.getSceneScale(), 2.0f, 0.001f, "Cornell box scene radius");
+    assert_near(cam.getSpeed(), 3.5f, 0.01f, "Cornell box base speed (3.5 m/s)");
+    std::cout << "[PASS] Cornell Box scene scale adaptivity verified (radius: 2.0m -> speed: " << cam.getSpeed() << " m/s)." << std::endl;
 
     // Large scene (e.g. living room / house, radius 20.0m)
     cam.setSceneScale(20.0f);
     assert_near(cam.getSceneScale(), 20.0f, 0.001f, "Large scene radius");
-    assert_near(cam.getSpeed(), 5.0f, 0.01f, "Large scene base speed"); // 20 * 0.25 = 5.0 m/s
+    assert_near(cam.getSpeed(), 35.0f, 0.01f, "Large scene base speed (35.0 m/s)"); // 20 * 1.75 = 35.0 m/s
     std::cout << "[PASS] Large scene scale adaptivity verified (radius: 20m -> speed: " << cam.getSpeed() << " m/s)." << std::endl;
 
     // 12. Mouse wheel speed adjustment (multiplicative)

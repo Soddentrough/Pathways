@@ -55,8 +55,9 @@ void Camera::setFov(float fov) {
 
 void Camera::setSceneScale(float sceneRadius) {
     m_sceneScale = std::max(sceneRadius, 0.05f);
-    // Move across ~25% of the scene radius per second by default
-    m_baseSpeed = std::clamp(m_sceneScale * 0.25f, 0.01f, 500.0f);
+    // Move across scene diameter in ~1.1 seconds (1.75x scene radius per second)
+    // For Cornell Box (r=2.0m), base speed is 3.5 m/s, matching responsive real-time traversal
+    m_baseSpeed = std::clamp(m_sceneScale * 1.75f, 0.1f, 500.0f);
     m_speed = m_baseSpeed;
     m_minSpeed = std::max(m_baseSpeed * 0.01f, 0.001f);
     m_maxSpeed = std::min(m_baseSpeed * 50.0f, 2000.0f);

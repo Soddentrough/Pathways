@@ -220,9 +220,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
         }
         if (cameraMode) {
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Scene Navigation (WASD + Mouse Look)");
+            float camSpeed = camera ? camera->getSpeed() : 3.5f;
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Navigation (Speed: %.2f m/s | Scroll to Adjust)", camSpeed);
         } else {
-            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "[MODE] UI Control Panel Active (Mouse Free)");
+            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "[MODE] UI Control Panel Active (Click Viewport or TAB for FPS)");
         }
         ImGui::Separator();
 
@@ -710,6 +711,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (ImGui::SmallButton("Reset Speed")) {
                     camera->setSpeed(camera->getBaseSpeed());
                 }
+
+                ImGui::Text("Speed Presets:");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0.25x")) camera->setSpeed(camera->getBaseSpeed() * 0.25f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0.5x"))  camera->setSpeed(camera->getBaseSpeed() * 0.50f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("1.0x (Default)")) camera->setSpeed(camera->getBaseSpeed());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("2.0x (Fast)"))   camera->setSpeed(camera->getBaseSpeed() * 2.0f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("5.0x (Turbo)"))  camera->setSpeed(camera->getBaseSpeed() * 5.0f);
+
                 ImGui::TextDisabled("Scene radius: %.2f m | Base speed: %.2f m/s (Scroll wheel scales speed)", camera->getSceneScale(), camera->getBaseSpeed());
 
                 float sens = camera->getSensitivity();
@@ -737,7 +751,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
             ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
             ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
-            ImGui::BulletText("Left Shift: Sprint Boost (3x Speed)");
+            ImGui::BulletText("Left Shift: Sprint Boost (2.5x Speed)");
             ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
             ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
         }

@@ -1307,6 +1307,14 @@ bool Engine::handleEvent(const SDL_Event& e) {
 
     // 5. In UI Mode: route events to ImGui
     if (m_gui) {
+        // If mouse wheel happened outside ImGui windows, adjust camera speed
+        if (e.type == SDL_EVENT_MOUSE_WHEEL && !m_gui->wantCaptureMouse()) {
+            if (m_camera) {
+                m_camera->adjustSpeedByWheel(e.wheel.y);
+            }
+            return true;
+        }
+
         bool handled = m_gui->processEvent(e);
         if (handled) {
             return true;
