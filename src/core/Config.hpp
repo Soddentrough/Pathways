@@ -37,10 +37,10 @@ struct Config {
     bool enable_shadows = true;
     bool enable_direct_light = true;
     bool enable_indirect_light = true;
-    bool enable_hardware_rt = true; // Auto-enabled when VK_KHR_ray_query is supported
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off;
+    bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     PipelineType pipeline_type = PipelineType::Wavefront;
     bool enable_morton_order = true;
     uint32_t tile_size = 64;

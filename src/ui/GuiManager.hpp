@@ -15,6 +15,9 @@ struct GuiActions {
     bool toggleFullscreen = false;
     uint32_t requestedWidth = 0;
     uint32_t requestedHeight = 0;
+    bool exportTelemetry = false;
+    std::string exportTelemetryPath = "";
+    bool refreshPciStatus = false;
 };
 
 class GuiManager {
@@ -48,6 +51,10 @@ private:
     float m_frameTimeHistory[HISTORY_SIZE] = {0};
     int m_historyOffset = 0;
     float m_smoothedFrameTime = 0.0f;
+
+    // Telemetry export user notification banner
+    std::string m_lastExportNotification;
+    float m_exportNotificationTimer = 0.0f;
 };
 
 } // namespace pathways

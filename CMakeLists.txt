@@ -49,9 +49,25 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 endif()
 
-# Static runtime linking for MinGW / Clang Windows GNU toolchains
-if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_link_options(-static-libgcc -static-libstdc++)
+if(MSVC)
+    add_compile_options(
+        /W3
+        /permissive-
+        /utf-8
+        /MP
+        /EHsc
+    )
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        add_compile_options(/O2)
+    endif()
+endif()
+
+# Windows definitions and toolchain options
+if(WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_link_options(-static-libgcc -static-libstdc++)
+    endif()
 endif()
 
 # Find system packages

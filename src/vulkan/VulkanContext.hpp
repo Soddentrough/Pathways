@@ -32,6 +32,24 @@ enum class GpuArchitecture {
     IntelArc
 };
 
+struct PciLinkInfo {
+    bool valid = false;
+    uint32_t domain = 0;
+    uint32_t bus = 0;
+    uint32_t device = 0;
+    uint32_t function = 0;
+    std::string bdfString = "";
+    std::string currentSpeed = "";
+    uint32_t currentWidth = 0;
+    std::string maxSpeed = "";
+    uint32_t maxWidth = 0;
+    std::string generationName = "";
+    std::string formattedLink = "PCIe N/A";
+    std::string hwmonPath = "";
+    bool isDegraded = false;
+    std::string degradationReason = "";
+};
+
 class VulkanContext {
 public:
     VulkanContext(const Config& config, VkSurfaceKHR surface = VK_NULL_HANDLE);
@@ -48,6 +66,13 @@ public:
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
+    uint32_t getVendorID() const { return m_deviceProperties.vendorID; }
+    uint32_t getDeviceID() const { return m_deviceProperties.deviceID; }
+    uint32_t getDriverVersion() const { return m_deviceProperties.driverVersion; }
+    uint32_t getApiVersion() const { return m_deviceProperties.apiVersion; }
+    VkPhysicalDeviceType getDeviceType() const { return m_deviceProperties.deviceType; }
+    uint64_t getTotalVramBytes() const;
+    uint64_t getAllocatedVramBytes() const;
     GpuArchitecture getArchitecture() const { return m_architecture; }
     std::string getArchitectureName() const;
     std::string getShortArchName() const;
@@ -60,6 +85,10 @@ public:
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
     const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
     uint32_t getValidationErrors() const { return s_validationErrors; }
+    const PciLinkInfo& getPciLinkInfo() const { return m_pciLinkInfo; }
+    const std::string& getPciLinkString() const { return m_pciLinkInfo.formattedLink; }
+    bool isPciLinkDegraded() const { return m_pciLinkInfo.isDegraded; }
+    void refreshPciLinkInfo();
 
     // Physical devices enumeration (for multi-GPU)
     static std::vector<VkPhysicalDevice> enumeratePhysicalDevices(VkInstance instance);
@@ -89,6 +118,7 @@ private:
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;
+    PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(

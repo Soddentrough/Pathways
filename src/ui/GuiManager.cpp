@@ -253,10 +253,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
         }
 
-        // 2. Real-Time Latency Histogram / Graph
+        float displayFps = m_smoothedFrameTime > 0.0001f ? (1000.0f / m_smoothedFrameTime) : 0.0f;
+        ImGui::Text("Frame Time: %6.2f ms  |  FPS: %6.1f", m_smoothedFrameTime, displayFps);
+        ImGui::Text("Min: %5.2f ms | Max: %5.2f ms | Avg: %5.2f ms (%4.0f FPS)",
+                    historyMin, historyMax, historyAvg, historyAvg > 0.0f ? 1000.0f / historyAvg : 0.0f);
+
+        ImGui::Separator();
+
+        // 2. Latency Rolling Graph with 8.0ms Target Budget Line
         char overlayBuf[64];
-        std::snprintf(overlayBuf, sizeof(overlayBuf), "Avg: %.2f ms (Min: %.2f, Max: %.2f)", historyAvg, historyMin, historyMax);
-        float graphMax = std::max(16.0f, historyMax * 1.25f);
+        std::snprintf(overlayBuf, sizeof(overlayBuf), "Current: %.2f ms", currentFrameTime);
+        float graphMax = std::max(16.0f, historyMax * 1.2f);
         ImGui::PlotLines("Latency", m_frameTimeHistory, static_cast<int>(HISTORY_SIZE), m_historyOffset,
                          overlayBuf, 0.0f, graphMax, ImVec2(hudW - 60.0f, 75.0f));
         ImGui::TextDisabled("8.0ms Budget Line (120 FPS Target)");
@@ -265,9 +272,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 3. Multi-GPU Subsystem Telemetry
         if (ImGui::CollapsingHeader("Multi-GPU Subsystem Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Active Topology: %s", stats.gpu_name.c_str());
-            ImGui::Text("Interconnect: PCIe 5.0 x16 (32 GT/s / ~64 GB/s Full-Duplex)");
-            ImGui::Text("Multi-GPU Mode: %s", stats.mgpu_mode_str.c_str());
+            ImGui::Text("Active Topology: %s", stats.topology_name.c_str());
+            ImGui::Text("Multi-GPU Mode:  %s", stats.mgpu_mode_str.c_str());
+
+            // Hardware PCIe Link & Live Telemetry
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "GPU 0 (Primary):");
+            ImGui::Text("  PCIe:    %s", stats.primary_pci_link.c_str());
+            if (stats.primary_pci_degraded) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  [WARNING: GPU 0 PCIe Link Degraded]");
+            }
+            if (stats.primary_gpu_clock_mhz > 0 || stats.primary_gpu_temp_c > 0) {
+                ImGui::Text("  Sensors: %u MHz | %u C", stats.primary_gpu_clock_mhz, stats.primary_gpu_temp_c);
+            }
+
+            if (stats.is_mgpu_active || !stats.secondary_gpu_name.empty()) {
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "GPU 1 (Secondary):");
+                if (!stats.secondary_pci_link.empty()) {
+                    ImGui::Text("  PCIe:    %s", stats.secondary_pci_link.c_str());
+                    if (stats.secondary_pci_degraded) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  [WARNING: GPU 1 PCIe Link Degraded]");
+                    }
+                }
+                if (stats.secondary_gpu_clock_mhz > 0 || stats.secondary_gpu_temp_c > 0) {
+                    ImGui::Text("  Sensors: %u MHz | %u C", stats.secondary_gpu_clock_mhz, stats.secondary_gpu_temp_c);
+                }
+            }
+
+            if (ImGui::SmallButton("Re-check PCIe Status")) {
+                if (actions) actions->refreshPciStatus = true;
+            }
+            ImGui::Separator();
+
+            if (config.visualize_mgpu_split && config.mgpu_mode != MultiGpuMode::Off) {
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.5f, 1.0f), "Load Split Visualizer: ACTIVE");
+            }
 
             if (stats.secondary_gpu_time_ms > 0.001) {
                 ImGui::Text("  GPU 0 (Primary RT):    %.3f ms", stats.primary_gpu_time_ms);
@@ -276,28 +315,29 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
                 float totalWork = static_cast<float>(stats.primary_gpu_time_ms + stats.secondary_gpu_time_ms);
                 float primaryFraction = totalWork > 0.001f ? (static_cast<float>(stats.primary_gpu_time_ms) / totalWork) : 0.5f;
-                ImGui::ProgressBar(primaryFraction, ImVec2(hudW - 60.0f, 14.0f), "Load Balance: GPU 0 vs GPU 1");
+                char loadBuf[64];
+                std::snprintf(loadBuf, sizeof(loadBuf), "GPU 0: %.1f%% | GPU 1: %.1f%%", primaryFraction * 100.0f, (1.0f - primaryFraction) * 100.0f);
+                ImGui::ProgressBar(primaryFraction, ImVec2(hudW - 60.0f, 16.0f), loadBuf);
             } else {
                 ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms > 0.0 ? stats.primary_gpu_time_ms : currentFrameTime);
                 ImGui::Text("  ACES Filmic Tonemap:   %.3f ms", stats.tonemap_time_ms);
+            }
+
+            if (stats.total_vram_mb > 0.0) {
+                ImGui::Text("  VRAM Allocated: %.0f MB / %.0f MB", stats.vram_used_mb, stats.total_vram_mb);
             }
         }
 
         // 4. Hardware Pipeline & Architecture Telemetry
         if (ImGui::CollapsingHeader("Hardware Architecture & Execution Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Text("Subgroup Execution: Native Wave32 SIMD (%s)", stats.short_arch.c_str());
-            if (config.enable_hardware_rt) {
-                ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "RT Pipeline: Hardware BVH Accelerated");
-                ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.0f), "  Active Pipeline Extensions:");
-                ImGui::BulletText("VK_KHR_ray_query (In-Shader Ray Queries)");
-                ImGui::BulletText("VK_KHR_acceleration_structure (BLAS + TLAS)");
-                ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
-                ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
-                ImGui::BulletText("SPIR-V: GL_EXT_ray_query (Native Wave32)");
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "RT Pipeline: Software ALU Loop (Compute Fallback)");
-                ImGui::BulletText("Active: ALU Möller-Trumbore + 32KB LDS Cache");
-            }
+            ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "RT Pipeline: Hardware BVH Accelerated");
+            ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.0f), "  Active Pipeline Extensions:");
+            ImGui::BulletText("VK_KHR_ray_query (In-Shader Ray Queries)");
+            ImGui::BulletText("VK_KHR_acceleration_structure (BLAS + TLAS)");
+            ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
+            ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
+            ImGui::BulletText("SPIR-V: GL_EXT_ray_query (Native Wave32)");
             const char* pipeName = "Wavefront Compaction (3-Stage)";
             if (config.pipeline_type == PipelineType::Megakernel) pipeName = "Monolithic Megakernel";
             else if (config.pipeline_type == PipelineType::Persistent) pipeName = "Persistent Wavefront Work Queue";
@@ -316,6 +356,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
             ImGui::Text("Viewport:     %u x %u (Aspect: %.3f, %s)", stats.width, stats.height, aspect, isPortrait ? "Portrait" : "Landscape");
             ImGui::Text("Accumulation: Frame %u (%u samples accumulated)", stats.total_frames, stats.total_frames * config.spp);
+        }
+
+        // 6. Offline Telemetry Export
+        if (ImGui::CollapsingHeader("Offline Telemetry Comparison", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("Save hardware, driver, support & performance data:");
+            if (ImGui::Button("Export Telemetry Data (.json)", ImVec2(hudW - 40.0f, 28.0f))) {
+                std::string path = ImageDumper::generateDefaultTelemetryPath();
+                if (actions) {
+                    actions->exportTelemetry = true;
+                    actions->exportTelemetryPath = path;
+                }
+                m_lastExportNotification = "Saved: " + path;
+                m_exportNotificationTimer = 4.0f;
+            }
+            if (m_exportNotificationTimer > 0.0f) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", m_lastExportNotification.c_str());
+            }
         }
     }
     ImGui::End();
@@ -339,79 +396,90 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::PopStyleColor(2);
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.58f, 0.28f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.72f, 0.36f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.28f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.68f, 0.35f, 1.0f));
             if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click or press TAB to capture mouse]", ImVec2(-1, 38.0f))) {
                 cameraMode = true;
             }
             ImGui::PopStyleColor(2);
         }
 
-        // 0. Display & Viewport Architecture
-        if (ImGui::CollapsingHeader("Display & Viewport Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (displayInfo) {
-                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Physical Display:");
-                ImGui::Text("  Device:  %s", displayInfo->displayName.c_str());
-                ImGui::Text("  Native:  %u x %u @ %.2f Hz", displayInfo->nativeWidth, displayInfo->nativeHeight, displayInfo->refreshRate);
-                ImGui::Text("  Usable:  %u x %u (Scale: %.2f)", displayInfo->usableWidth, displayInfo->usableHeight, displayInfo->contentScale);
-                ImGui::Text("  Aspect:  %.3f (%s)", displayInfo->displayAspect,
-                            displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : (displayInfo->isUltraWide ? "Ultra-Wide (>2:1)" : "Landscape (16:9)"));
+        // 0. Display & Viewport Configuration (Fullscreen, Resolution Presets, Adaptive FOV)
+        if (displayInfo && ImGui::CollapsingHeader("Display & Viewport Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("Physical Display:");
+            ImGui::BulletText("Device:   %s", displayInfo->displayName.c_str());
+            ImGui::BulletText("Native:   %u x %u @ %.2f Hz", displayInfo->nativeWidth, displayInfo->nativeHeight, displayInfo->refreshRate);
+            ImGui::BulletText("Usable:   %u x %u (Scale: %.2f)", displayInfo->usableWidth, displayInfo->usableHeight, displayInfo->contentScale);
+            ImGui::BulletText("Aspect:   %.3f (%s)", displayInfo->displayAspect, displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : "Landscape (16:9/16:10)");
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Active Viewport:");
+            ImGui::BulletText("Resolution: %u x %u (Aspect: %.3f)", width, height, aspect);
+            ImGui::BulletText("Layout:     %s", isPortrait ? "Vertical Stacked (Scene Left Unobstructed)" : "Landscape Edge-Docked");
+
+            if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f, 26.0f))) {
+                if (actions) actions->toggleFullscreen = true;
             }
 
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Active Viewport:");
-            ImGui::Text("  Resolution: %u x %u (Aspect: %.3f)", width, height, aspect);
-            ImGui::Text("  Layout:     %s", isPortrait ? "Portrait Sidebar Stack" : "Landscape Edge-Docked");
+            ImGui::TextDisabled("Resolution Presets:");
 
-            if (actions) {
-                if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f, 26.0f))) {
-                    actions->toggleFullscreen = true;
-                }
-
-                ImGui::Spacing();
-                ImGui::Text("Resolution Presets:");
-                if (displayInfo && ImGui::Button("Native Full Display", ImVec2(160.0f, 24.0f))) {
+            // Preset 1: Native Full Display
+            if (ImGui::Button("Native Full Display", ImVec2(160.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = displayInfo->usableWidth;
                     actions->requestedHeight = displayInfo->usableHeight;
                 }
-                if (ImGui::Button("DualUp (1280x2048)", ImVec2(160.0f, 24.0f))) {
+            }
+
+            // Preset 2: Portrait / DualUp Square Mode
+            ImGui::SameLine();
+            if (ImGui::Button("DualUp (1280x2048)", ImVec2(150.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = 1280;
                     actions->requestedHeight = 2048;
                 }
-                ImGui::SameLine();
-                if (ImGui::Button("1:1 (1440x1440)", ImVec2(140.0f, 24.0f))) {
+            }
+
+            // Preset 3: 1:1 Square
+            ImGui::SameLine();
+            if (ImGui::Button("1:1 (1440x1440)", ImVec2(130.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = 1440;
                     actions->requestedHeight = 1440;
                 }
+            }
 
-                if (ImGui::Button("FHD (1920x1080)", ImVec2(130.0f, 24.0f))) {
+            // Standard aspect presets
+            if (ImGui::Button("FHD (1920x1080)", ImVec2(130.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = 1920;
                     actions->requestedHeight = 1080;
                 }
-                ImGui::SameLine();
-                if (ImGui::Button("QHD (2560x1440)", ImVec2(130.0f, 24.0f))) {
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("QHD (2560x1440)", ImVec2(130.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = 2560;
                     actions->requestedHeight = 1440;
                 }
-                ImGui::SameLine();
-                if (ImGui::Button("4K (3840x2160)", ImVec2(130.0f, 24.0f))) {
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("4K (3840x2160)", ImVec2(130.0f, 26.0f))) {
+                if (actions) {
                     actions->requestedWidth = 3840;
                     actions->requestedHeight = 2160;
                 }
             }
 
             if (camera) {
-                ImGui::Spacing();
                 bool adaptive = camera->isAdaptiveFov();
                 if (ImGui::Checkbox("Adaptive Aspect FOV (Auto-frame scene)", &adaptive)) {
                     camera->setAdaptiveFov(adaptive);
-                    if (adaptive) {
-                        camera->adaptFovForAspect(aspect);
-                    }
+                    camera->adaptFovForAspect(aspect);
                     settingsChanged = true;
                 }
-                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(190.0f, 24.0f))) {
-                    camera->setAdaptiveFov(true);
+                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(180.0f, 26.0f))) {
                     camera->adaptFovForAspect(aspect);
                     settingsChanged = true;
                 }
@@ -419,20 +487,21 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Separator();
         }
 
-        // Camera & FPS Navigation Controls
+        // 0. Camera & Scene Navigation
         if (ImGui::CollapsingHeader("Camera & Scene Navigation", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (camera) {
                 float speed = camera->getSpeed();
-                if (ImGui::SliderFloat("Move Speed", &speed, 0.2f, 25.0f, "%.1f m/s")) {
+                if (ImGui::SliderFloat("Move Speed", &speed, 0.5f, 20.0f, "%.1f m/s")) {
                     camera->setSpeed(speed);
                 }
+
                 float sens = camera->getSensitivity();
                 if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.02f, 0.5f, "%.2f")) {
                     camera->setSensitivity(sens);
                 }
+
                 float fov = camera->getFov();
-                if (ImGui::SliderFloat("Field of View", &fov, 20.0f, 120.0f, "%.1f deg")) {
-                    camera->setAdaptiveFov(false);
+                if (ImGui::SliderFloat("Field of View", &fov, 20.0f, 100.0f, "%.1f deg")) {
                     camera->setFov(fov);
                     settingsChanged = true;
                 }
@@ -441,104 +510,55 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
                 ImGui::Text("Look Angles: Yaw: %.1f deg, Pitch: %.1f deg", camera->getYaw(), camera->getPitch());
 
-                if (ImGui::Button("Reset Camera to Default", ImVec2(200.0f, 26.0f))) {
+                if (ImGui::Button("Reset Camera to Default", ImVec2(200.0f, 28.0f))) {
                     camera->resetToDefault();
-                    camera->adaptFovForAspect(aspect);
                     settingsChanged = true;
                 }
             }
-
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "FPS Input Reference:");
+            ImGui::TextDisabled("FPS Input Reference:");
             ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
             ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
             ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
-            ImGui::BulletText("Left Shift: Sprint Boost (2.5x speed)");
-            ImGui::BulletText("Mouse: Rotate Camera (Pitch & Yaw)");
-            ImGui::BulletText("Mouse Wheel: Adjust Movement Speed");
+            ImGui::BulletText("Left Shift: Sprint Boost (3x Speed)");
+            ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
             ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
         }
 
-        // 1. Hardware Acceleration Toggles & Pipeline Extensions
+        // 1. Hardware Acceleration Pipeline Extensions
         if (ImGui::CollapsingHeader("Hardware Acceleration & Ray Tracing Pipeline", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::Checkbox("Enable Hardware Ray Tracing", &config.enable_hardware_rt)) {
-                settingsChanged = true;
-                if (config.enable_hardware_rt) {
-                    Logger::info("Hardware Ray Tracing toggled: ENABLED");
-                    Logger::info("  Active Vulkan Pipeline Extensions:");
-                    Logger::info("    - VK_KHR_ray_query (in-shader ray queries / rayQueryEXT)");
-                    Logger::info("    - VK_KHR_acceleration_structure (hardware two-level BVH: BLAS + TLAS)");
-                    Logger::info("    - VK_KHR_buffer_device_address (64-bit GPU virtual addresses for geometry & AS)");
-                    Logger::info("    - VK_KHR_deferred_host_operations (driver AS build host multi-threading)");
-                    Logger::info("  Active SPIR-V Extension: GL_EXT_ray_query (Native Wave32 SIMD)");
-                } else {
-                    Logger::info("Hardware Ray Tracing toggled: DISABLED");
-                    Logger::info("  HW RT Pipeline Extensions: BYPASSED / INACTIVE");
-                    Logger::info("  Active Traversal: Compute shader ALU Möller-Trumbore loop with 32KB LDS cache");
-                }
-            }
+            ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "[ACTIVE] HARDWARE ACCELERATED (%s)", stats.ray_accelerator_name.c_str());
+            ImGui::Spacing();
+
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Vulkan Pipeline Extensions in Use:");
+            ImGui::BulletText("VK_KHR_ray_query");
+            ImGui::SameLine();
+            ImGui::TextDisabled("-> In-shader ray queries (rayQueryEXT)");
+
+            ImGui::BulletText("VK_KHR_acceleration_structure");
+            ImGui::SameLine();
+            ImGui::TextDisabled("-> Hardware BVH (BLAS + TLAS)");
+
+            ImGui::BulletText("VK_KHR_buffer_device_address");
+            ImGui::SameLine();
+            ImGui::TextDisabled("-> 64-bit BDA vertex/index & AS pointers");
+
+            ImGui::BulletText("VK_KHR_deferred_host_operations");
+            ImGui::SameLine();
+            ImGui::TextDisabled("-> Driver host AS build threads");
 
             ImGui::Spacing();
-            if (config.enable_hardware_rt) {
-                ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "[ACTIVE] HARDWARE ACCELERATED (%s)", stats.ray_accelerator_name.c_str());
-                ImGui::Spacing();
-
-                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Vulkan Pipeline Extensions in Use:");
-                ImGui::BulletText("VK_KHR_ray_query");
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> In-shader ray queries (rayQueryEXT)");
-
-                ImGui::BulletText("VK_KHR_acceleration_structure");
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> Hardware BVH (BLAS + TLAS)");
-
-                ImGui::BulletText("VK_KHR_buffer_device_address");
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> 64-bit BDA vertex/index & AS pointers");
-
-                ImGui::BulletText("VK_KHR_deferred_host_operations");
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> Driver host AS build threads");
-
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "SPIR-V / Shading Extension:");
-                ImGui::BulletText("GL_EXT_ray_query / SPV_KHR_ray_query");
-                ImGui::SameLine();
-                ImGui::TextDisabled("-> Native Wave32 SIMD");
-            } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "[ACTIVE] SOFTWARE FALLBACK (Compute ALU Emulation)");
-                ImGui::Spacing();
-
-                ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.5f, 1.0f), "Vulkan HW RT Extensions Status:");
-                ImGui::BulletText("VK_KHR_ray_query:");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "BYPASSED / INACTIVE");
-                ImGui::SameLine();
-                ImGui::TextDisabled("(Zero RT core invocations)");
-
-                ImGui::BulletText("VK_KHR_acceleration_structure:");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "BYPASSED");
-                ImGui::SameLine();
-                ImGui::TextDisabled("(TLAS/BLAS traversal skipped)");
-
-                ImGui::BulletText("VK_KHR_deferred_host_operations:");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "INACTIVE");
-
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Active Compute Pipeline:");
-                ImGui::BulletText("Moller-Trumbore ray-triangle intersection loop");
-                ImGui::BulletText("32KB Local Data Share (LDS) tile cache per Dual-CU");
-                ImGui::BulletText("Global memory SSBO primitive storage arrays");
-            }
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "SPIR-V / Shading Extension:");
+            ImGui::BulletText("GL_EXT_ray_query / SPV_KHR_ray_query");
+            ImGui::SameLine();
+            ImGui::TextDisabled("-> Native Wave32 SIMD");
 
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Scheduling Architecture:");
             const char* pipelineModes[] = {
-                "Wavefront Compaction (Decomposed 3-Stage)",
-                "Monolithic Megakernel (Wave32 8x4)",
-                "Persistent Wavefront Work Queue",
+                "Wavefront Compaction (3-Stage: Classify -> Resolve -> Shade)",
+                "Monolithic Megakernel (Single-Pass)",
+                "Persistent Wavefront Work Queue (Dynamic)",
                 "Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)"
             };
             int curPipeline = 0;
@@ -581,6 +601,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 else if (currentMode == 2) config.mgpu_mode = MultiGpuMode::CheckerboardTile;
                 else if (currentMode == 3) config.mgpu_mode = MultiGpuMode::DynamicWorkQueue;
                 settingsChanged = true;
+            }
+
+            if (config.mgpu_mode != MultiGpuMode::Off) {
+                if (ImGui::Checkbox("Visualize GPU Load Split", &config.visualize_mgpu_split)) {
+                    // Changing visualization immediately updates shader push constants
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) or checkerboard patterns to visually display multi-GPU work distribution.");
+                }
             }
         }
 
@@ -639,14 +668,66 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 6. Interactive Actions
+        // 7. Interactive Actions & Telemetry Export
         ImGui::Separator();
-        if (ImGui::Button("Reset Accumulation", ImVec2(180.0f, 30.0f))) {
+        if (ImGui::Button("Reset Accumulation", ImVec2(160.0f, 30.0f))) {
             settingsChanged = true;
             if (actions) actions->resetAccumulation = true;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Export Telemetry (.json)", ImVec2(200.0f, 30.0f))) {
+            std::string path = ImageDumper::generateDefaultTelemetryPath();
+            if (actions) {
+                actions->exportTelemetry = true;
+                actions->exportTelemetryPath = path;
+            }
+            m_lastExportNotification = "Saved: " + path;
+            m_exportNotificationTimer = 4.0f;
+        }
+        if (m_exportNotificationTimer > 0.0f) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", m_lastExportNotification.c_str());
+        }
     }
     ImGui::End();
+
+    // On-screen load split visualization overlay badges
+    if (config.visualize_mgpu_split && config.mgpu_mode != MultiGpuMode::Off) {
+        ImGuiWindowFlags overlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+        ImGui::SetNextWindowBgAlpha(0.70f);
+
+        float midX = isPortrait ? (width * 0.5f) : ((hudX + hudW + ctrlX) * 0.5f);
+
+        if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
+            float badgeW = 320.0f;
+            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
+            if (ImGui::Begin("##MgpuSampleSplitBadge", nullptr, overlayFlags)) {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Cyan]");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[GPU 1: Amber]");
+                ImGui::SameLine();
+                ImGui::TextDisabled("| Sample Parallel");
+            }
+            ImGui::End();
+        } else {
+            // Split-frame tiling badges centered between left HUD and right Control Panel
+            float midY = static_cast<float>(height) * 0.5f;
+            // Primary (top half)
+            ImGui::SetNextWindowPos(ImVec2(midX - 100.0f, midY - 45.0f), ImGuiCond_Always);
+            if (ImGui::Begin("##MgpuTileTopBadge", nullptr, overlayFlags)) {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Primary (Top Tile)]");
+            }
+            ImGui::End();
+
+            // Secondary (bottom half)
+            ImGui::SetNextWindowPos(ImVec2(midX - 110.0f, midY + 12.0f), ImGuiCond_Always);
+            if (ImGui::Begin("##MgpuTileBottomBadge", nullptr, overlayFlags)) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[GPU 1: Secondary (Bottom Tile)]");
+            }
+            ImGui::End();
+        }
+    }
 
     ImGui::Render();
 

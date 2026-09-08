@@ -17,6 +17,10 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace pathways {
 
@@ -29,6 +33,7 @@ public:
     void renderFrame();
     void dumpOutputFiles();
     FrameStats getStats() const;
+    std::string exportTelemetry(const std::string& customPath = "");
 
     void setCameraMode(bool active);
     bool isCameraMode() const { return m_cameraMode; }
@@ -177,6 +182,21 @@ private:
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastLogTime;
+
+    // Hardware Sensors & Telemetry (Infrequent background sampler)
+    void startHwMonThread();
+    void stopHwMonThread();
+    void sampleHwSensors();
+    void refreshPciStatus();
+
+    std::atomic<bool> m_hwMonRunning{false};
+    std::thread m_hwMonThread;
+    std::mutex m_hwMonMutex;
+    std::condition_variable m_hwMonCv;
+    std::atomic<uint32_t> m_gpu0ClockMhz{0};
+    std::atomic<uint32_t> m_gpu0TempC{0};
+    std::atomic<uint32_t> m_gpu1ClockMhz{0};
+    std::atomic<uint32_t> m_gpu1TempC{0};
 };
 
 } // namespace pathways

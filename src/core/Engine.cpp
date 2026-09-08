@@ -17,8 +17,87 @@
     #endif
     #include <windows.h>
 #endif
+#ifdef __linux__
+    #include <sys/utsname.h>
+#endif
 
 namespace pathways {
+
+namespace {
+std::string queryOperatingSystem() {
+    std::ifstream osRelease("/etc/os-release");
+    if (osRelease.is_open()) {
+        std::string line;
+        while (std::getline(osRelease, line)) {
+            if (line.starts_with("PRETTY_NAME=")) {
+                std::string val = line.substr(12);
+                if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                    val = val.substr(1, val.size() - 2);
+                }
+                return val;
+            }
+        }
+    }
+#ifdef __linux__
+    struct utsname uts{};
+    if (uname(&uts) == 0) {
+        return std::string(uts.sysname) + " " + uts.release + " (" + uts.machine + ")";
+    }
+#endif
+    return "Linux";
+}
+
+std::string queryCpuModel() {
+    std::ifstream cpuInfo("/proc/cpuinfo");
+    if (cpuInfo.is_open()) {
+        std::string line;
+        while (std::getline(cpuInfo, line)) {
+            if (line.starts_with("model name")) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    size_t first = line.find_first_not_of(" \t", colon + 1);
+                    if (first != std::string::npos) {
+                        return line.substr(first);
+                    }
+                }
+            }
+        }
+    }
+    return "AMD Threadripper Processor";
+}
+
+uint64_t queryTotalRamMB() {
+    std::ifstream memInfo("/proc/meminfo");
+    if (memInfo.is_open()) {
+        std::string line;
+        while (std::getline(memInfo, line)) {
+            if (line.starts_with("MemTotal:")) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    uint64_t kb = std::strtoull(line.c_str() + colon + 1, nullptr, 10);
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    return 65536;
+}
+
+const std::string& getCachedOS() {
+    static const std::string s_os = queryOperatingSystem();
+    return s_os;
+}
+
+const std::string& getCachedCPU() {
+    static const std::string s_cpu = queryCpuModel();
+    return s_cpu;
+}
+
+uint64_t getCachedRAM() {
+    static const uint64_t s_ram = queryTotalRamMB();
+    return s_ram;
+}
+} // namespace
 
 Engine::Engine(const Config& config) : m_config(config) {
     m_startTime = std::chrono::high_resolution_clock::now();
@@ -102,11 +181,14 @@ Engine::Engine(const Config& config) : m_config(config) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
 
+    startHwMonThread();
+
     Logger::info("Pathways Engine initialization complete. Ready to render.");
 }
 
 Engine::~Engine() {
     Logger::info("Shutting down Pathways Engine...");
+    stopHwMonThread();
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
 
@@ -168,6 +250,83 @@ Engine::~Engine() {
         vkDestroySurfaceKHR(m_context->getInstance(), m_surface, nullptr);
         m_surface = VK_NULL_HANDLE;
     }
+}
+
+static uint64_t readSysfsUint64(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return 0;
+    uint64_t val = 0;
+    if (file >> val) return val;
+    return 0;
+}
+
+void Engine::startHwMonThread() {
+    m_hwMonRunning = true;
+    m_hwMonThread = std::thread([this]() {
+        // Initial sample immediately on startup
+        sampleHwSensors();
+
+        while (m_hwMonRunning) {
+            std::unique_lock<std::mutex> lock(m_hwMonMutex);
+            if (m_hwMonCv.wait_for(lock, std::chrono::milliseconds(2000), [this] { return !m_hwMonRunning.load(); })) {
+                break;
+            }
+            sampleHwSensors();
+        }
+    });
+}
+
+void Engine::stopHwMonThread() {
+    if (m_hwMonRunning) {
+        m_hwMonRunning = false;
+        m_hwMonCv.notify_all();
+        if (m_hwMonThread.joinable()) {
+            m_hwMonThread.join();
+        }
+    }
+}
+
+void Engine::sampleHwSensors() {
+    // GPU 0
+    if (m_context) {
+        const auto& pciInfo = m_context->getPciLinkInfo();
+        if (!pciInfo.hwmonPath.empty()) {
+            uint64_t rawFreq = readSysfsUint64(pciInfo.hwmonPath + "/freq1_input");
+            uint64_t rawTemp = readSysfsUint64(pciInfo.hwmonPath + "/temp1_input");
+            if (rawFreq > 0) {
+                m_gpu0ClockMhz.store(static_cast<uint32_t>(rawFreq / 1000000ULL), std::memory_order_relaxed);
+            }
+            if (rawTemp > 0) {
+                m_gpu0TempC.store(static_cast<uint32_t>(rawTemp / 1000ULL), std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // GPU 1
+    if (m_mgpu && m_mgpu->getSecondaryContext()) {
+        const auto& secPciInfo = m_mgpu->getSecondaryContext()->getPciLinkInfo();
+        if (!secPciInfo.hwmonPath.empty()) {
+            uint64_t rawFreq = readSysfsUint64(secPciInfo.hwmonPath + "/freq1_input");
+            uint64_t rawTemp = readSysfsUint64(secPciInfo.hwmonPath + "/temp1_input");
+            if (rawFreq > 0) {
+                m_gpu1ClockMhz.store(static_cast<uint32_t>(rawFreq / 1000000ULL), std::memory_order_relaxed);
+            }
+            if (rawTemp > 0) {
+                m_gpu1TempC.store(static_cast<uint32_t>(rawTemp / 1000ULL), std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+void Engine::refreshPciStatus() {
+    if (m_context) {
+        m_context->refreshPciLinkInfo();
+    }
+    if (m_mgpu && m_mgpu->getSecondaryContext()) {
+        m_mgpu->getSecondaryContext()->refreshPciLinkInfo();
+    }
+    sampleHwSensors();
+    Logger::info("Manually refreshed PCIe status.");
 }
 
 void Engine::initVulkan() {
@@ -381,12 +540,11 @@ void Engine::initScene() {
         inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 
         m_tlas = m_asManager->buildTLAS({ inst });
-        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (BLAS & TLAS).");
-        if (m_config.enable_hardware_rt) {
-            Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
-        } else {
-            Logger::info("Hardware Ray Tracing is DISABLED via config. Running Software Primitive Traversal (LDS/SSBO). HW RT extensions bypassed.");
+        if (!m_tlas) {
+            throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
         }
+        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (BLAS & TLAS).");
+        Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
     }
 
     // Textures & HDRI Environment Map Initialization
@@ -642,7 +800,7 @@ void Engine::initPipelines() {
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     tonemapPushConstant.offset = 0;
-    tonemapPushConstant.size = sizeof(float) + sizeof(uint32_t) * 3; // exposure, totalSamples, applyACES, padding
+    tonemapPushConstant.size = sizeof(float) + sizeof(uint32_t) * 7; // exposure, totalSamples, applyACES, visualizeSplit, splitY, padding[3] (32 bytes)
 
     VkPipelineLayoutCreateInfo tonemapPipeLayoutInfo{};
     tonemapPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1348,14 +1506,18 @@ void Engine::renderFrame() {
     uint32_t rtGroupsX = (m_config.width + 7) / 8;
     uint32_t rtGroupsY = (m_config.height + 3) / 4;
 
-    struct {
+    struct TonemapPushConstants {
         float exposure = 1.0f;
         uint32_t totalSamples = 1;
         uint32_t applyACES = 1;
-        uint32_t padding = 0;
+        uint32_t visualizeSplit = 0;
+        uint32_t splitY = 0;
+        uint32_t padding[3] = {0, 0, 0};
     } tonemapConstants;
     tonemapConstants.exposure = 1.0f;
     tonemapConstants.applyACES = m_config.aces_tonemap ? 1 : 0;
+    tonemapConstants.visualizeSplit = 0;
+    tonemapConstants.splitY = 0;
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive());
 
@@ -1384,7 +1546,7 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
-        uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
+        uint32_t useHwRT = 1;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
@@ -1611,6 +1773,8 @@ void Engine::renderFrame() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
+        tonemapConstants.visualizeSplit = 0;
+        tonemapConstants.splitY = 0;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
@@ -1626,7 +1790,7 @@ void Engine::renderFrame() {
 
         CameraUniform ubo1 = m_camera->getUniformData(m_frameIndex * 2 + 1, spp1, m_config.max_bounces, flags);
 
-        uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
+        uint32_t useHwRT = 1;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
@@ -1727,6 +1891,8 @@ void Engine::renderFrame() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
+        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 2 : 0;
+        tonemapConstants.splitY = 0;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * (spp0 + spp1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
@@ -1741,7 +1907,7 @@ void Engine::renderFrame() {
         CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
         m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
-        uint32_t useHwRT = (m_tlas != nullptr && m_config.enable_hardware_rt) ? 1 : 0;
+        uint32_t useHwRT = 1;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
@@ -1830,6 +1996,8 @@ void Engine::renderFrame() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
+        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1 : 0;
+        tonemapConstants.splitY = h0;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
@@ -1928,6 +2096,12 @@ void Engine::renderFrame() {
             if (guiActions.resetAccumulation) {
                 m_resetAccumulation = true;
                 if (!m_config.headless) m_frameTimesMs.clear();
+            }
+            if (guiActions.exportTelemetry) {
+                exportTelemetry(guiActions.exportTelemetryPath);
+            }
+            if (guiActions.refreshPciStatus) {
+                refreshPciStatus();
             }
             if (guiActions.toggleFullscreen) {
                 m_pendingToggleFullscreen = true;
@@ -2241,10 +2415,11 @@ void Engine::dumpOutputFiles() {
 
 FrameStats Engine::getStats() const {
     FrameStats stats;
+    stats.gpu_name = m_context->getDeviceName();
     if (m_mgpu && m_mgpu->isMultiGpuActive()) {
-        stats.gpu_name = m_context->getDeviceName() + " + " + m_mgpu->getSecondaryDeviceName();
+        stats.topology_name = stats.gpu_name + " + " + m_mgpu->getSecondaryDeviceName();
     } else {
-        stats.gpu_name = m_context->getDeviceName();
+        stats.topology_name = stats.gpu_name;
     }
     stats.width = m_config.width;
     stats.height = m_config.height;
@@ -2286,7 +2461,7 @@ FrameStats Engine::getStats() const {
     stats.num_materials = m_numMaterials;
     stats.num_lights = m_numLights;
     stats.num_textures = static_cast<uint32_t>(m_sceneTextures.size());
-    stats.has_hw_rt = (m_tlas != nullptr && m_config.enable_hardware_rt);
+    stats.has_hw_rt = (m_tlas != nullptr);
     stats.has_dgc = (m_dgc != nullptr);
     stats.is_rdna3 = m_context->isRDNA3();
     stats.is_rdna4 = m_context->isRDNA4();
@@ -2294,7 +2469,107 @@ FrameStats Engine::getStats() const {
     stats.short_arch = m_context->getShortArchName();
     stats.ray_accelerator_name = m_context->getRayAcceleratorName();
 
+    // 1. Session & Host Platform Metadata
+    stats.os_name = getCachedOS();
+#ifdef __linux__
+    struct utsname uts{};
+    if (uname(&uts) == 0) {
+        stats.kernel_version = std::string(uts.sysname) + " " + uts.release;
+    }
+#endif
+    stats.cpu_model = getCachedCPU();
+    stats.ram_total_gb = static_cast<double>(getCachedRAM()) / 1024.0;
+
+    // 2. Primary GPU Hardware & Driver
+    stats.vendor_id = m_context->getVendorID();
+    stats.device_id = m_context->getDeviceID();
+    uint32_t drvVer = m_context->getDriverVersion();
+    stats.driver_version_str = std::format("{}.{}.{}", (drvVer >> 22) & 0x3FF, (drvVer >> 12) & 0x3FF, drvVer & 0xFFF);
+    uint32_t apiVer = m_context->getApiVersion();
+    stats.vulkan_api_str = std::format("{}.{}.{}", VK_API_VERSION_MAJOR(apiVer), VK_API_VERSION_MINOR(apiVer), VK_API_VERSION_PATCH(apiVer));
+    stats.device_type_str = (m_context->getDeviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ? "Discrete GPU" : "Integrated GPU";
+    stats.total_vram_mb = static_cast<double>(m_context->getTotalVramBytes()) / (1024.0 * 1024.0);
+    stats.vram_used_mb = static_cast<double>(m_context->getAllocatedVramBytes()) / (1024.0 * 1024.0);
+    stats.vram_budget_mb = stats.total_vram_mb;
+
+    // Primary GPU PCIe and Sensors
+    stats.primary_pci_link = m_context->getPciLinkString();
+    stats.primary_pci_degraded = m_context->isPciLinkDegraded();
+    stats.primary_gpu_clock_mhz = m_gpu0ClockMhz.load(std::memory_order_relaxed);
+    stats.primary_gpu_temp_c = m_gpu0TempC.load(std::memory_order_relaxed);
+
+    // 3. Secondary GPU Hardware & Driver
+    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+        stats.is_mgpu_active = true;
+        stats.secondary_gpu_name = m_mgpu->getSecondaryDeviceName();
+        if (m_mgpu->getSecondaryContext()) {
+            stats.secondary_arch_name = m_mgpu->getSecondaryContext()->getArchitectureName();
+            stats.secondary_pci_link = m_mgpu->getSecondaryContext()->getPciLinkString();
+            stats.secondary_pci_degraded = m_mgpu->getSecondaryContext()->isPciLinkDegraded();
+            stats.secondary_gpu_clock_mhz = m_gpu1ClockMhz.load(std::memory_order_relaxed);
+            stats.secondary_gpu_temp_c = m_gpu1TempC.load(std::memory_order_relaxed);
+        }
+    } else {
+        stats.is_mgpu_active = false;
+        stats.secondary_gpu_name = "";
+        stats.secondary_arch_name = "";
+        stats.secondary_pci_link = "";
+        stats.secondary_pci_degraded = false;
+        stats.secondary_gpu_clock_mhz = 0;
+        stats.secondary_gpu_temp_c = 0;
+    }
+
+    // 4. Hardware Support Levels
+    stats.has_hw_rt = (m_tlas != nullptr);
+    stats.has_ray_query = true;
+    stats.has_as = (m_tlas != nullptr);
+    stats.has_bda = true;
+    stats.has_dho = true;
+    stats.has_rt_pipeline = (m_rtpKhrPipeline != nullptr);
+    stats.has_dgc = (m_dgc != nullptr);
+    stats.has_subgroup_control = m_context->hasSubgroupSizeControl();
+    stats.subgroup_size = 32;
+    stats.has_dynamic_rendering = true;
+    stats.has_timeline_semaphores = true;
+    stats.has_sync2 = true;
+
+    // 5. Engine Settings & State
+    stats.visualize_mgpu_split = m_config.visualize_mgpu_split;
+    stats.render_scale = m_config.render_scale;
+    stats.max_bounces = m_config.max_bounces;
+    stats.enable_morton = m_config.enable_morton_order;
+    stats.enable_direct_light = m_config.enable_direct_light;
+    stats.enable_indirect_light = m_config.enable_indirect_light;
+    stats.enable_refraction = m_config.enable_refraction;
+    stats.enable_shadows = m_config.enable_shadows;
+    stats.aces_tonemap = m_config.aces_tonemap;
+    stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
+    stats.hdri_path = m_config.hdri_path;
+
+    // 6. Active Camera Framing
+    if (m_camera) {
+        glm::vec3 pos = m_camera->getPosition();
+        stats.cam_pos[0] = pos.x;
+        stats.cam_pos[1] = pos.y;
+        stats.cam_pos[2] = pos.z;
+        stats.cam_yaw = m_camera->getYaw();
+        stats.cam_pitch = m_camera->getPitch();
+        stats.cam_fov = m_camera->getFov();
+    }
+
     return stats;
+}
+
+std::string Engine::exportTelemetry(const std::string& customPath) {
+    std::string path = customPath.empty() ? ImageDumper::generateDefaultTelemetryPath() : customPath;
+    FrameStats stats = getStats();
+    if (ImageDumper::saveStatsJSON(path, stats)) {
+        Logger::info("Exported comprehensive telemetry dataset to: {}", path);
+        return path;
+    } else {
+        Logger::error("Failed to export telemetry dataset to: {}", path);
+        return "";
+    }
 }
 
 void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {

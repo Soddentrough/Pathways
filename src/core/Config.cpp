@@ -24,14 +24,16 @@ void Config::printUsage(const char* progName) {
               << "  --gpu <int>             Physical GPU device index (default: 0)\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'sample' (Sample Parallelism across Dual GPUs),\n"
               << "                          'tile' (Split-Frame Tiling), 'dynamic' (Work Queue), or 'off'\n"
+              << "  --visualize-split       Visualize real-time workload split between Dual GPUs (colored overlay)\n"
+              << "  --no-visualize-split    Disable GPU load split visualization overlay [default]\n"
               << "  --single-gpu            Force single GPU mode (alias for --mgpu-mode off)\n"
               << "  --pipeline <mode>       Pipeline: 'wavefront' (decomposed DGC compaction, default), 'persistent' (Persistent Wavefront Work Queue), or 'megakernel'\n"
               << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
               << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
-              << "  --hw-rt                 Enable Hardware Ray Tracing (VK_KHR_ray_query, VK_KHR_acceleration_structure) [default]\n"
-              << "  --no-hw-rt              Disable Hardware RT; fallback to compute ALU software loop (LDS/SSBO)\n"
+              << "  --hw-rt                 Hardware Ray Tracing is mandatory [default]\n"
+              << "  --no-hw-rt              (Deprecated) Software fallback has been removed; ignored\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -97,6 +99,10 @@ Config Config::parse(int argc, char* argv[]) {
             else if (mode == "tile") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             else if (mode == "dynamic") cfg.mgpu_mode = MultiGpuMode::DynamicWorkQueue;
             else cfg.mgpu_mode = MultiGpuMode::Off;
+        } else if (arg == "--visualize-split" || arg == "--show-split") {
+            cfg.visualize_mgpu_split = true;
+        } else if (arg == "--no-visualize-split") {
+            cfg.visualize_mgpu_split = false;
         } else if (arg == "--log-interval") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cfg.log_interval_sec = std::stof(argv[++i]);
@@ -106,11 +112,9 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
         } else if (arg == "--hw-rt") {
-            cfg.enable_hardware_rt = true;
-            Logger::info("Command line: Hardware RT requested (VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations)");
+            Logger::info("Command line: Hardware RT is permanently active.");
         } else if (arg == "--no-hw-rt" || arg == "--software-rt") {
-            cfg.enable_hardware_rt = false;
-            Logger::info("Command line: Software RT requested. Hardware ray tracing extensions will be bypassed.");
+            Logger::warn("Command line: Software RT fallback has been removed. Hardware ray tracing is mandatory.");
         } else if (arg == "--no-validation") {
             cfg.validation_layers = false;
         } else if (arg == "--debug") {

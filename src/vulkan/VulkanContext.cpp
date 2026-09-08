@@ -8,6 +8,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
+#include <format>
 
 namespace pathways {
 
@@ -274,12 +277,16 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     std::vector<VkExtensionProperties> availableExtensions(extCount);
     vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extCount, availableExtensions.data());
 
+    bool hasPciBusInfo = false;
     for (const auto& ext : availableExtensions) {
         if (std::strcmp(ext.extensionName, VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME) == 0) {
             m_hasDGC = true;
         }
         if (std::strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) {
             m_hasRayTracing = true;
+        }
+        if (std::strcmp(ext.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0) {
+            hasPciBusInfo = true;
         }
     }
 
@@ -293,10 +300,31 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     m_rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
     dgcProps.pNext = &m_rtPipelineProperties;
 
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps{};
+    pciBusProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    if (hasPciBusInfo) {
+        m_rtPipelineProperties.pNext = &pciBusProps;
+    }
+
     VkPhysicalDeviceProperties2 props2{};
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &subgroupProps;
     vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+
+    if (hasPciBusInfo) {
+        m_pciLinkInfo.domain = pciBusProps.pciDomain;
+        m_pciLinkInfo.bus = pciBusProps.pciBus;
+        m_pciLinkInfo.device = pciBusProps.pciDevice;
+        m_pciLinkInfo.function = pciBusProps.pciFunction;
+        m_pciLinkInfo.bdfString = std::format("{:04x}:{:02x}:{:02x}.{:x}",
+                                              m_pciLinkInfo.domain,
+                                              m_pciLinkInfo.bus,
+                                              m_pciLinkInfo.device,
+                                              m_pciLinkInfo.function);
+        m_pciLinkInfo.valid = true;
+        refreshPciLinkInfo();
+        Logger::info("PCI Bus Info: {} | Link: {}", m_pciLinkInfo.bdfString, m_pciLinkInfo.formattedLink);
+    }
 
     if (subgroupProps.minSubgroupSize <= 32 && subgroupProps.maxSubgroupSize >= 32 &&
         (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
@@ -321,6 +349,107 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                      dgcProps.maxIndirectCommandsIndirectStride,
                      dgcProps.supportedIndirectCommandsShaderStages);
     }
+}
+
+void VulkanContext::refreshPciLinkInfo() {
+    if (!m_pciLinkInfo.valid || m_pciLinkInfo.bdfString.empty()) {
+        m_pciLinkInfo.formattedLink = "PCIe N/A";
+        return;
+    }
+
+#ifdef __linux__
+    std::string pciDir = "/sys/bus/pci/devices/" + m_pciLinkInfo.bdfString;
+    std::error_code ec;
+    if (!std::filesystem::exists(pciDir, ec)) {
+        m_pciLinkInfo.formattedLink = "PCIe (Sysfs N/A)";
+        return;
+    }
+
+    auto readFileTrim = [](const std::string& path) -> std::string {
+        std::ifstream file(path);
+        if (!file.is_open()) return "";
+        std::string line;
+        if (std::getline(file, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) {
+                line.pop_back();
+            }
+            if (line.size() > 5 && line.substr(line.size() - 5) == " PCIe") {
+                line.resize(line.size() - 5);
+            }
+            return line;
+        }
+        return "";
+    };
+
+    m_pciLinkInfo.currentSpeed = readFileTrim(pciDir + "/current_link_speed");
+    std::string curWidthStr = readFileTrim(pciDir + "/current_link_width");
+    m_pciLinkInfo.maxSpeed = readFileTrim(pciDir + "/max_link_speed");
+    std::string maxWidthStr = readFileTrim(pciDir + "/max_link_width");
+
+    try {
+        if (!curWidthStr.empty()) m_pciLinkInfo.currentWidth = std::stoul(curWidthStr);
+        if (!maxWidthStr.empty()) m_pciLinkInfo.maxWidth = std::stoul(maxWidthStr);
+    } catch (...) {}
+
+    // Identify generation
+    if (m_pciLinkInfo.currentSpeed.find("32.0 GT/s") != std::string::npos) {
+        m_pciLinkInfo.generationName = "PCIe 5.0";
+    } else if (m_pciLinkInfo.currentSpeed.find("16.0 GT/s") != std::string::npos) {
+        m_pciLinkInfo.generationName = "PCIe 4.0";
+    } else if (m_pciLinkInfo.currentSpeed.find("8.0 GT/s") != std::string::npos) {
+        m_pciLinkInfo.generationName = "PCIe 3.0";
+    } else if (m_pciLinkInfo.currentSpeed.find("5.0 GT/s") != std::string::npos) {
+        m_pciLinkInfo.generationName = "PCIe 2.0";
+    } else if (m_pciLinkInfo.currentSpeed.find("2.5 GT/s") != std::string::npos) {
+        m_pciLinkInfo.generationName = "PCIe 1.0";
+    } else {
+        m_pciLinkInfo.generationName = "PCIe";
+    }
+
+    // Check degraded link
+    bool degraded = false;
+    std::string reason;
+    if (m_pciLinkInfo.maxWidth > 0 && m_pciLinkInfo.currentWidth < m_pciLinkInfo.maxWidth) {
+        degraded = true;
+        reason = std::format("Width degraded to x{} (Slot/Device supports x{})", m_pciLinkInfo.currentWidth, m_pciLinkInfo.maxWidth);
+    } else if (!m_pciLinkInfo.maxSpeed.empty() && !m_pciLinkInfo.currentSpeed.empty() && m_pciLinkInfo.currentSpeed != m_pciLinkInfo.maxSpeed) {
+        if (m_pciLinkInfo.maxSpeed.find("32.0") != std::string::npos && m_pciLinkInfo.currentSpeed.find("32.0") == std::string::npos) {
+            degraded = true;
+            reason = std::format("Speed down-negotiated to {} (Max: {})", m_pciLinkInfo.currentSpeed, m_pciLinkInfo.maxSpeed);
+        } else if (m_pciLinkInfo.maxSpeed.find("16.0") != std::string::npos && m_pciLinkInfo.currentSpeed.find("16.0") == std::string::npos && m_pciLinkInfo.currentSpeed.find("32.0") == std::string::npos) {
+            degraded = true;
+            reason = std::format("Speed down-negotiated to {} (Max: {})", m_pciLinkInfo.currentSpeed, m_pciLinkInfo.maxSpeed);
+        }
+    }
+    m_pciLinkInfo.isDegraded = degraded;
+    m_pciLinkInfo.degradationReason = reason;
+
+    if (m_pciLinkInfo.currentWidth > 0 && !m_pciLinkInfo.currentSpeed.empty()) {
+        m_pciLinkInfo.formattedLink = std::format("{} x{} ({}, x{})",
+            m_pciLinkInfo.generationName,
+            m_pciLinkInfo.currentWidth,
+            m_pciLinkInfo.currentSpeed,
+            m_pciLinkInfo.currentWidth);
+        if (m_pciLinkInfo.isDegraded) {
+            m_pciLinkInfo.formattedLink += " [DEGRADED]";
+        }
+    } else {
+        m_pciLinkInfo.formattedLink = "PCIe Unknown";
+    }
+
+    // Locate hwmon directory under pciDir/hwmon
+    std::string hwmonBase = pciDir + "/hwmon";
+    if (std::filesystem::exists(hwmonBase, ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(hwmonBase, ec)) {
+            if (entry.is_directory() && entry.path().filename().string().rfind("hwmon", 0) == 0) {
+                m_pciLinkInfo.hwmonPath = entry.path().string();
+                break;
+            }
+        }
+    }
+#else
+    m_pciLinkInfo.formattedLink = "PCIe (Non-Linux)";
+#endif
 }
 
 void VulkanContext::createLogicalDevice(const Config& config) {
@@ -515,6 +644,33 @@ bool VulkanContext::isRDNA() const {
            m_architecture == GpuArchitecture::AmdRDNA3 ||
            m_architecture == GpuArchitecture::AmdRDNA3_5 ||
            m_architecture == GpuArchitecture::AmdRDNA4;
+}
+
+uint64_t VulkanContext::getTotalVramBytes() const {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
+    uint64_t totalDeviceLocal = 0;
+    for (uint32_t i = 0; i < memProperties.memoryHeapCount; ++i) {
+        if (memProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            totalDeviceLocal += memProperties.memoryHeaps[i].size;
+        }
+    }
+    return totalDeviceLocal;
+}
+
+uint64_t VulkanContext::getAllocatedVramBytes() const {
+    if (!m_allocator) return 0;
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
+    std::vector<VmaBudget> budgets(memProperties.memoryHeapCount);
+    vmaGetHeapBudgets(m_allocator, budgets.data());
+    uint64_t allocated = 0;
+    for (uint32_t i = 0; i < memProperties.memoryHeapCount; ++i) {
+        if (memProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            allocated += budgets[i].usage;
+        }
+    }
+    return allocated;
 }
 
 } // namespace pathways

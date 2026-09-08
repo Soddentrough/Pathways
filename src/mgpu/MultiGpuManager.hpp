@@ -72,6 +72,7 @@ public:
     void setMode(MultiGpuMode mode) { m_mode = mode; }
     double getSecondaryGpuTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
+    VulkanContext* getSecondaryContext() const { return m_devices.empty() ? nullptr : m_devices[0]->context.get(); }
     void resize(uint32_t width, uint32_t height);
 
     // Launch secondary GPU raytracing asynchronously in background thread

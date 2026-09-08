@@ -9,7 +9,9 @@ layout(push_constant) uniform PushConstants {
     float exposure;
     uint totalSamples;
     uint applyACES;
-    uint padding;
+    uint visualizeSplit; // 0 = off, 1 = tile split, 2 = sample parallel
+    uint splitY;         // horizontal seam Y for tiling
+    uint padding[3];     // total 32 bytes (8 x 4 bytes)
 } pc;
 
 // ACES Filmic Tone Mapping Curve (Narkowicz / Stephen Hill fit)
@@ -51,6 +53,32 @@ void main() {
 
     // Gamma correction (sRGB ~2.2)
     vec3 finalColor = pow(mappedColor, vec3(1.0 / 2.2));
+
+    // Multi-GPU Load Split Visualization Overlay
+    if (pc.visualizeSplit == 1u) {
+        // Mode 1: Split-Frame Tiling Overlay
+        if (abs(int(pixelCoord.y) - int(pc.splitY)) <= 1) {
+            // Bright high-visibility gold dividing line at the tile boundary seam
+            finalColor = vec3(1.0, 0.9, 0.15);
+        } else if (pixelCoord.y < pc.splitY) {
+            // GPU 0 (Primary) - subtle cool cyan tint
+            finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0), 0.16);
+        } else {
+            // GPU 1 (Secondary) - subtle warm amber/orange tint
+            finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1), 0.16);
+        }
+    } else if (pc.visualizeSplit == 2u) {
+        // Mode 2: Sample Parallelism Overlay (Checkerboard 32x32 tiles to distinguish GPU workload)
+        uint check = ((pixelCoord.x / 32u) ^ (pixelCoord.y / 32u)) & 1u;
+        bool isBorder = (pixelCoord.x % 32u == 0u) || (pixelCoord.y % 32u == 0u);
+        if (isBorder) {
+            finalColor = mix(finalColor, vec3(0.0, 0.0, 0.0), 0.4);
+        } else if (check == 0u) {
+            finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0), 0.15); // GPU 0
+        } else {
+            finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1), 0.15); // GPU 1
+        }
+    }
 
     imageStore(uOutputImage, pixelCoord, vec4(finalColor, 1.0));
 }

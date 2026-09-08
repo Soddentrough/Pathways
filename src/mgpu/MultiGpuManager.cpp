@@ -296,11 +296,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
         secNode->tlas = secNode->asManager->buildTLAS({ inst });
         Logger::info("Secondary GPU Acceleration Structures initialized successfully (BLAS & TLAS).");
-        if (m_config.enable_hardware_rt) {
-            Logger::info("Secondary GPU RT Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations");
-        } else {
-            Logger::info("Secondary GPU Hardware RT is DISABLED via config. Running Software Primitive Traversal (LDS/SSBO). HW RT extensions bypassed.");
-        }
+        Logger::info("Secondary GPU RT Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations");
     }
 
     // Textures & HDRI Environment Map on secondary device
