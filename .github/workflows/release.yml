@@ -87,9 +87,8 @@ jobs:
           vcpkg install zlib:x64-windows
 
       - name: Setup Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.1.1
+        uses: jakoch/install-vulkan-sdk-action@v1
         with:
-          version: latest
           cache: true
 
       - name: Setup SDL3
@@ -128,10 +127,10 @@ jobs:
           # Copy zlib1.dll from vcpkg
           find "C:/vcpkg/installed/x64-windows/bin" -name "*.dll" -exec cp {} package/ \; 2>/dev/null || true
           # Copy compiled shaders
-          cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || cp build/bin/Release/shaders/*.spv package/shaders/ 2>/dev/null || cp build/shaders/*.spv package/shaders/ 2>/dev/null || true
+          cp build/shaders/*.spv package/shaders/ 2>/dev/null || cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || true
           cp -r scenes/* package/scenes/ 2>/dev/null || true
           cp README.md package/ 2>/dev/null || true
-          7z a -tzip pathways-windows-x64.zip ./package/*
+          (cd package && 7z a -tzip ../pathways-windows-x64.zip *)
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
