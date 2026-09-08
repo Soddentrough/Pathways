@@ -12,85 +12,93 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build (${{ matrix.os_name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            os_name: linux
-            artifact_name: pathways-linux-x86_64
-            archive_name: pathways-linux-x86_64.tar.gz
-          - os: windows-latest
-            os_name: windows
-            artifact_name: pathways-windows-x64
-            archive_name: pathways-windows-x64.zip
+  # -----------------------------------------------------------------
+  # Linux: Native Fedora RPM Package (Primary) & Portable Tarball
+  # -----------------------------------------------------------------
+  build-linux-fedora:
+    name: Build Linux (Fedora RPM & Tarball)
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install Fedora build dependencies
+        run: |
+          dnf install -y \
+            git \
+            gcc-c++ \
+            cmake \
+            ninja-build \
+            rpm-build \
+            vulkan-loader-devel \
+            vulkan-headers \
+            glslc \
+            SDL3-devel \
+            zlib-ng-compat-devel \
+            tar \
+            gzip
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: |
+          cmake --build build --parallel
+
+      - name: Run unit tests
+        run: |
+          ctest --test-dir build --output-on-failure
+
+      - name: Package RPM & Tarball with CPack
+        run: |
+          cd build && cpack -G "RPM;TGZ"
+          mkdir -p ../dist
+          cp *.rpm *.tar.gz ../dist/
+
+      - name: Upload Linux RPM & Tarball Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathways-linux-packages
+          path: dist/*
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # Windows: MSVC x64 Standalone Zip Package
+  # -----------------------------------------------------------------
+  build-windows:
+    name: Build Windows (MSVC x64)
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # -------------------------------------------------------------
-      # Dependencies: Linux
-      # -------------------------------------------------------------
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build build-essential pkg-config libz-dev
-
-      # -------------------------------------------------------------
-      # Dependencies: Windows (ZLIB via vcpkg)
-      # -------------------------------------------------------------
       - name: Install Windows dependencies (vcpkg)
-        if: runner.os == 'Windows'
         run: |
           vcpkg install zlib:x64-windows
 
-      # -------------------------------------------------------------
-      # Vulkan SDK 1.4 Setup (Cross-Platform)
-      # -------------------------------------------------------------
       - name: Setup Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.1.1
         with:
           version: latest
           cache: true
 
-      # -------------------------------------------------------------
-      # SDL3 Setup (Cross-Platform)
-      # -------------------------------------------------------------
       - name: Setup SDL3
         uses: libsdl-org/setup-sdl@main
         id: sdl
         with:
           version: 3-latest
-          install-linux-dependencies: true
 
-      # -------------------------------------------------------------
-      # Configure & Build: Linux
-      # -------------------------------------------------------------
-      - name: Configure CMake (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_NATIVE_OPTIMIZATION=OFF \
-            -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }}"
-
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cmake --build build --config Release --parallel
-
-      # -------------------------------------------------------------
-      # Configure & Build: Windows
-      # -------------------------------------------------------------
       - name: Configure CMake (Windows)
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           cmake -B build \
@@ -100,29 +108,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build (Windows)
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           cmake --build build --config Release --parallel
 
-      # -------------------------------------------------------------
-      # Package Release Bundle: Linux
-      # -------------------------------------------------------------
-      - name: Package Release (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p package/shaders package/scenes
-          cp build/bin/pathways package/
-          cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || cp build/shaders/*.spv package/shaders/
-          cp -r scenes/* package/scenes/ 2>/dev/null || true
-          cp README.md package/ 2>/dev/null || true
-          tar -czvf ${{ matrix.archive_name }} -C package .
-
-      # -------------------------------------------------------------
-      # Package Release Bundle: Windows
-      # -------------------------------------------------------------
       - name: Package Release (Windows)
-        if: runner.os == 'Windows'
         shell: bash
         run: |
           mkdir -p package/shaders package/scenes
@@ -141,16 +131,13 @@ jobs:
           cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || cp build/bin/Release/shaders/*.spv package/shaders/ 2>/dev/null || cp build/shaders/*.spv package/shaders/ 2>/dev/null || true
           cp -r scenes/* package/scenes/ 2>/dev/null || true
           cp README.md package/ 2>/dev/null || true
-          7z a -tzip ${{ matrix.archive_name }} ./package/*
+          7z a -tzip pathways-windows-x64.zip ./package/*
 
-      # -------------------------------------------------------------
-      # Upload Artifacts (Always uploaded for CI & verification)
-      # -------------------------------------------------------------
-      - name: Upload Build Artifact
+      - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.archive_name }}
+          name: pathways-windows-x64
+          path: pathways-windows-x64.zip
           if-no-files-found: error
 
   # -----------------------------------------------------------------
@@ -158,7 +145,7 @@ jobs:
   # -----------------------------------------------------------------
   release:
     name: Publish Release
-    needs: build
+    needs: [build-linux-fedora, build-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -176,7 +163,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/pathways-linux-x86_64/pathways-linux-x86_64.tar.gz
+            artifacts/pathways-linux-packages/*.rpm
+            artifacts/pathways-linux-packages/*.tar.gz
             artifacts/pathways-windows-x64/pathways-windows-x64.zip
           draft: false
           prerelease: false

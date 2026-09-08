@@ -237,3 +237,44 @@ if(UNIX)
 endif()
 
 add_test(NAME CameraControls COMMAND test_camera_controls)
+
+# ==============================================================================
+# Installation & CPack Packaging Configuration
+# ==============================================================================
+include(GNUInstallDirs)
+
+install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes")
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/scenes/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop")
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+endif()
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION ${CMAKE_INSTALL_DOCDIR} OPTIONAL)
+
+set(CPACK_PACKAGE_NAME "pathways")
+set(CPACK_PACKAGE_VENDOR "Soddentrough")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Pure Vulkan 1.4 Real-Time Path Tracer with Multi-GPU & Hardware RT")
+set(CPACK_PACKAGE_VERSION_MAJOR "1")
+set(CPACK_PACKAGE_VERSION_MINOR "4")
+set(CPACK_PACKAGE_VERSION_PATCH "0")
+set(CPACK_PACKAGE_CONTACT "https://github.com/Soddentrough/Pathways")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+
+# RPM Generator options (Fedora / RHEL)
+set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+set(CPACK_RPM_PACKAGE_GROUP "Amusements/Graphics")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/Soddentrough/Pathways")
+set(CPACK_RPM_PACKAGE_AUTOREQ "yes")
+set(CPACK_RPM_PACKAGE_AUTOPROV "yes")
+set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
+if(NOT CPACK_RPM_PACKAGE_RELEASE)
+    set(CPACK_RPM_PACKAGE_RELEASE "1.fc44")
+endif()
+set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
+
+# Default generators
+set(CPACK_GENERATOR "RPM;TGZ")
+
+include(CPack)

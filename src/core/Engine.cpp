@@ -602,9 +602,12 @@ std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
     if (!exeDir.empty()) {
         searchPaths.push_back((exeDir / "shaders" / filename).string());
         searchPaths.push_back((exeDir / filename).string());
+        searchPaths.push_back((exeDir / ".." / "share" / "pathways" / "shaders" / filename).string());
     }
 
     searchPaths.push_back(std::string(SHADER_DIR) + "/" + filename);
+    searchPaths.push_back(std::string("/usr/share/pathways/shaders/") + filename);
+    searchPaths.push_back(std::string("/usr/local/share/pathways/shaders/") + filename);
     searchPaths.push_back(std::string("build/shaders/") + filename);
     searchPaths.push_back(std::string("../build/shaders/") + filename);
 
