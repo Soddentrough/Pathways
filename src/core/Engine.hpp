@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <vector>
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <thread>
