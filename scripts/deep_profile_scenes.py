@@ -18,19 +18,19 @@ SCENES = [
     },
     {
         "name": "Classroom (Interior Arch)",
-        "path": "scenes/classroom/classroom_core.glb"
+        "path": "scenes/classroom/classroom_extended.glb"
     },
     {
         "name": "Veach MIS (Direct Lighting)",
-        "path": "scenes/veach-mis/veach_mis_core.glb"
+        "path": "scenes/veach-mis/veach_mis_extended.glb"
     },
     {
-        "name": "Dragon (High Polygon Density)",
-        "path": "scenes/dragon/dragon_core.glb"
+        "name": "Dragon (High Polygon Density & Attenuation)",
+        "path": "scenes/DragonAttenuation.glb"
     },
     {
         "name": "Living Room (Complex Materials)",
-        "path": "scenes/living-room/living_room_core.glb"
+        "path": "scenes/living-room/living_room_extended.glb"
     }
 ]
 

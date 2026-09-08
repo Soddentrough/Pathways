@@ -463,7 +463,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PopStyleColor(2);
                 };
 
-                drawFilterTab("All (60)", 0);
+                char allBuf[32];
+                std::snprintf(allBuf, sizeof(allBuf), "All (%zu)", availableScenes.size());
+                drawFilterTab(allBuf, 0);
                 ImGui::SameLine();
                 drawFilterTab("Showcase", 1);
                 ImGui::SameLine();

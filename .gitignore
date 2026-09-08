@@ -17,10 +17,34 @@ scratch/
 CMakeUserPresets.json
 *.spv
 *.zip
+
+# Scene assets
+# Generated test artifacts and loose debug textures
+scenes/pbr_*
+scenes/textured_quad.gltf
+scenes/checker.png
+scenes/ripples_normal.png
+
+# Research scenes: ignore untracked subdirectories by default
 scenes/*/
-!scenes/**.glb
-!scenes/**.gltf
-!scenes/**.png
+
+# Re-include Tier 1 shipped research scenes
+!scenes/cornell-box/
+!scenes/cornell-box/**
+!scenes/veach-mis/
+!scenes/veach-mis/**
+!scenes/veach-bidir/
+!scenes/veach-bidir/**
+!scenes/coffee-maker/
+!scenes/coffee-maker/**
+!scenes/classroom/
+!scenes/classroom/**
+!scenes/living-room/
+!scenes/living-room/**
+
+# Inside shipped scene subdirectories, exclude duplicate core models and reference PNG renders
+scenes/*/*_core.glb
+scenes/*/*.png
 
 # IDE / Editor / UI state
 .vscode/
