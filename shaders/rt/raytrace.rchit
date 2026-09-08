@@ -183,12 +183,35 @@ bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMa
 
 // In-shader hardware ray query shadow occluder test
 bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
+    bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
+    if (!hasNonOpaque) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS,
+                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                               0xFF, origin, tMin, dir, tMax);
+        rayQueryProceedEXT(rq);
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            return true;
+        }
+        for (uint i = 0; i < pc.numSpheres; ++i) {
+            if (materials[spheres[i].materialId].type == 3u) continue;
+            float spT;
+            vec3 spNorm;
+            if (intersectSphere(origin, dir, spheres[i], tMin, tMax, spT, spNorm)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Fallback for scenes with alpha masks or transmission
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT, 0xFF, origin, tMin, dir, tMax);
     while (rayQueryProceedEXT(rq)) {
         if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
             uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-            Material mat = materials[triangles[triIdx].materialId];
+            uint matId = triangles[triIdx].materialId;
+            Material mat = materials[matId];
             if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
                 continue;
             }
@@ -249,11 +272,15 @@ vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
 float fresnelSchlick(float cosTheta, float refIdx) {
     float r0 = (1.0 - refIdx) / (1.0 + refIdx);
     r0 = r0 * r0;
-    return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    float x = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    return r0 + (1.0 - r0) * (x2 * x2 * x);
 }
 
 vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
-    return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    float x = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    return F0 + (vec3(1.0) - F0) * (x2 * x2 * x);
 }
 
 float distributionGGX(float NdotH, float alpha) {
@@ -534,12 +561,14 @@ void main() {
                 float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                 float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
-                float D = distributionGGX(NdotH, alphaRoughness);
-                float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
                 vec3 F = fresnelSchlickVec(VdotH, F0);
-
-                vec3 specBRDF = enableSpecular ? (D * Vis * F) : vec3(0.0);
                 vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                vec3 specBRDF = vec3(0.0);
+                if (enableSpecular) {
+                    float D = distributionGGX(NdotH, alphaRoughness);
+                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                    specBRDF = D * Vis * F;
+                }
 
                 vec3 brdf = diffBRDF + specBRDF;
 
@@ -591,6 +620,7 @@ void main() {
     } else {
         float xi = randFloat(prd.seed);
 
+        bool sampleSpecular = false;
         if (xi < clearcoatProb) {
             vec3 Hc = sampleGGX(clearcoatNormal, clearcoatAlpha, prd.seed);
             vec3 L = reflect(-V, Hc);
@@ -607,11 +637,7 @@ void main() {
                 vec3 specWeight = vec3((4.0 * VisC * Fc * NcDotL * VDotHc) / max(NcDotH * clearcoatProb, 1e-4));
                 throughputFactor = clamp(specWeight, vec3(0.0), vec3(10.0));
                 nextDirection = L;
-            } else {
-                nextDirection = sampleCosineHemisphere(hitNormal, prd.seed);
-                vec3 H_diff = normalize(V + nextDirection);
-                vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                throughputFactor = (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                sampleSpecular = true;
             }
         } else if (xi < clearcoatProb + baseSpecProb) {
             vec3 H = sampleGGX(hitNormal, alphaRoughness, prd.seed);
@@ -630,18 +656,16 @@ void main() {
                 vec3 specWeight = (4.0 * Vis * F * NdotL * VdotH * (1.0 - Fc)) / max(NdotH * baseSpecProb, 1e-4);
                 throughputFactor = clamp(specWeight, vec3(0.0), vec3(10.0));
                 nextDirection = L;
-            } else {
-                nextDirection = sampleCosineHemisphere(hitNormal, prd.seed);
-                vec3 H_diff = normalize(V + nextDirection);
-                vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                throughputFactor = (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                sampleSpecular = true;
             }
-        } else {
+        }
+
+        if (!sampleSpecular) {
             nextDirection = sampleCosineHemisphere(hitNormal, prd.seed);
             vec3 H_diff = normalize(V + nextDirection);
-            vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-            float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
+            float VdotH_diff = clamp(dot(V, H_diff), 0.0, 1.0);
+            vec3 F_diff = fresnelSchlickVec(VdotH_diff, F0);
+            float Fc = fresnelSchlick(VdotH_diff, 1.5) * clearcoat;
             throughputFactor = (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
         }
     }

@@ -165,6 +165,8 @@ private:
     uint32_t m_numSpheres = 0;
     uint32_t m_numMaterials = 0;
     uint32_t m_numLights = 0;
+    bool m_sceneHasNonOpaque = false;
+    void updateSceneTransparencyFlag();
 
     // Frame tracking
     uint32_t m_frameIndex = 0;

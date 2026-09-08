@@ -404,9 +404,10 @@ void Engine::initScene() {
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
     m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
+    updateSceneTransparencyFlag();
 
-    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights",
-                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights);
+    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
 
     if (m_camera) {
         m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
@@ -598,9 +599,10 @@ bool Engine::loadScene(const std::string& filepath) {
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
     m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
+    updateSceneTransparencyFlag();
 
-    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights",
-                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights);
+    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
 
     // Recreate primary buffers
     VmaAllocator allocator = m_context->getAllocator();
@@ -775,6 +777,16 @@ bool Engine::loadScene(const std::string& filepath) {
 
     Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
     return true;
+}
+
+void Engine::updateSceneTransparencyFlag() {
+    m_sceneHasNonOpaque = false;
+    for (const auto& mat : m_sceneData.materials) {
+        if (mat.alphaMode != 0 || mat.transmission > 0.05f || mat.type == 2) {
+            m_sceneHasNonOpaque = true;
+            break;
+        }
+    }
 }
 
 std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
@@ -1546,6 +1558,7 @@ void Engine::renderFrame() {
     flags |= (1 << 2); // Specular
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
+    if (m_sceneHasNonOpaque)            flags |= (1 << 5);
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));

@@ -13,7 +13,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque
 };
 
 class Camera {
