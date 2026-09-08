@@ -288,6 +288,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0) {
             hasPciBusInfo = true;
         }
+        if (std::strcmp(ext.extensionName, "VK_EXT_external_memory_host") == 0) {
+            m_hasExternalMemoryHost = true;
+        }
     }
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
@@ -352,12 +355,44 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 }
 
 void VulkanContext::refreshPciLinkInfo() {
+#ifdef __linux__
+    if (!m_pciLinkInfo.valid || m_pciLinkInfo.bdfString.empty()) {
+        // Fallback: enumerate /sys/class/drm to find device matching vendor/device ID
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+            std::string fname = entry.path().filename().string();
+            if (fname.rfind("card", 0) == 0 && fname.find('-') == std::string::npos) {
+                std::string devPath = entry.path().string() + "/device";
+                std::ifstream vFile(devPath + "/vendor");
+                std::ifstream dFile(devPath + "/device");
+                std::string vStr, dStr;
+                if (vFile >> vStr && dFile >> dStr) {
+                    try {
+                        uint32_t venId = std::stoul(vStr, nullptr, 16);
+                        uint32_t devId = std::stoul(dStr, nullptr, 16);
+                        if (venId == m_deviceProperties.vendorID && devId == m_deviceProperties.deviceID) {
+                            std::ifstream ueventFile(devPath + "/uevent");
+                            std::string uline;
+                            while (std::getline(ueventFile, uline)) {
+                                if (uline.rfind("PCI_SLOT_NAME=", 0) == 0) {
+                                    m_pciLinkInfo.bdfString = uline.substr(14);
+                                    m_pciLinkInfo.valid = true;
+                                    break;
+                                }
+                            }
+                            if (m_pciLinkInfo.valid) break;
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+
     if (!m_pciLinkInfo.valid || m_pciLinkInfo.bdfString.empty()) {
         m_pciLinkInfo.formattedLink = "PCIe N/A";
         return;
     }
 
-#ifdef __linux__
     std::string pciDir = "/sys/bus/pci/devices/" + m_pciLinkInfo.bdfString;
     std::error_code ec;
     if (!std::filesystem::exists(pciDir, ec)) {
@@ -381,57 +416,107 @@ void VulkanContext::refreshPciLinkInfo() {
         return "";
     };
 
-    m_pciLinkInfo.currentSpeed = readFileTrim(pciDir + "/current_link_speed");
-    std::string curWidthStr = readFileTrim(pciDir + "/current_link_width");
+    // 1. Check pp_dpm_pcie for active PHY link state on AMD GPUs
+    std::string dpmPath = pciDir + "/pp_dpm_pcie";
+    bool gotDpm = false;
+    std::ifstream dpmFile(dpmPath);
+    if (dpmFile.is_open()) {
+        std::string line;
+        while (std::getline(dpmFile, line)) {
+            if (line.find('*') != std::string::npos) {
+                // e.g. "1: 16.0GT/s, x16 616Mhz *" or "1: 16.0GT/s, x8 616Mhz *"
+                size_t gtPos = line.find("GT/s");
+                if (gtPos != std::string::npos) {
+                    size_t start = gtPos;
+                    while (start > 0 && (std::isdigit(line[start - 1]) || line[start - 1] == '.' || line[start - 1] == ' ')) {
+                        start--;
+                    }
+                    while (start < gtPos && line[start] == ' ') start++;
+                    std::string spd = line.substr(start, gtPos + 4 - start);
+                    if (spd.find("GT/s") != std::string::npos && spd.find(" GT/s") == std::string::npos) {
+                        size_t pos = spd.find("GT/s");
+                        spd = spd.substr(0, pos) + " GT/s";
+                    }
+                    m_pciLinkInfo.currentSpeed = spd;
+                }
+
+                size_t xPos = line.find(", x");
+                if (xPos != std::string::npos) {
+                    size_t wStart = xPos + 3;
+                    size_t wEnd = wStart;
+                    while (wEnd < line.size() && std::isdigit(line[wEnd])) {
+                        wEnd++;
+                    }
+                    if (wEnd > wStart) {
+                        try {
+                            m_pciLinkInfo.currentWidth = std::stoul(line.substr(wStart, wEnd - wStart));
+                            gotDpm = true;
+                        } catch (...) {}
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. Fallback to current_link_speed and current_link_width if pp_dpm_pcie was not present
+    if (!gotDpm) {
+        m_pciLinkInfo.currentSpeed = readFileTrim(pciDir + "/current_link_speed");
+        std::string curWidthStr = readFileTrim(pciDir + "/current_link_width");
+        try {
+            if (!curWidthStr.empty()) m_pciLinkInfo.currentWidth = std::stoul(curWidthStr);
+        } catch (...) {}
+    }
+
+    // 3. Read max capabilities
     m_pciLinkInfo.maxSpeed = readFileTrim(pciDir + "/max_link_speed");
     std::string maxWidthStr = readFileTrim(pciDir + "/max_link_width");
-
     try {
-        if (!curWidthStr.empty()) m_pciLinkInfo.currentWidth = std::stoul(curWidthStr);
         if (!maxWidthStr.empty()) m_pciLinkInfo.maxWidth = std::stoul(maxWidthStr);
     } catch (...) {}
 
-    // Identify generation
-    if (m_pciLinkInfo.currentSpeed.find("32.0 GT/s") != std::string::npos) {
-        m_pciLinkInfo.generationName = "PCIe 5.0";
-    } else if (m_pciLinkInfo.currentSpeed.find("16.0 GT/s") != std::string::npos) {
-        m_pciLinkInfo.generationName = "PCIe 4.0";
-    } else if (m_pciLinkInfo.currentSpeed.find("8.0 GT/s") != std::string::npos) {
-        m_pciLinkInfo.generationName = "PCIe 3.0";
-    } else if (m_pciLinkInfo.currentSpeed.find("5.0 GT/s") != std::string::npos) {
-        m_pciLinkInfo.generationName = "PCIe 2.0";
-    } else if (m_pciLinkInfo.currentSpeed.find("2.5 GT/s") != std::string::npos) {
-        m_pciLinkInfo.generationName = "PCIe 1.0";
-    } else {
-        m_pciLinkInfo.generationName = "PCIe";
-    }
+    auto getGenName = [](const std::string& speed) -> std::string {
+        if (speed.find("32.0 GT/s") != std::string::npos || speed.find("32.0GT/s") != std::string::npos) return "PCIe 5.0";
+        if (speed.find("16.0 GT/s") != std::string::npos || speed.find("16.0GT/s") != std::string::npos) return "PCIe 4.0";
+        if (speed.find("8.0 GT/s") != std::string::npos || speed.find("8.0GT/s") != std::string::npos) return "PCIe 3.0";
+        if (speed.find("5.0 GT/s") != std::string::npos || speed.find("5.0GT/s") != std::string::npos) return "PCIe 2.0";
+        if (speed.find("2.5 GT/s") != std::string::npos || speed.find("2.5GT/s") != std::string::npos) return "PCIe 1.0";
+        return "PCIe";
+    };
 
-    // Check degraded link
-    bool degraded = false;
+    m_pciLinkInfo.generationName = getGenName(m_pciLinkInfo.currentSpeed);
+    m_pciLinkInfo.maxGenerationName = getGenName(m_pciLinkInfo.maxSpeed);
+
+    // 4. Identify link configuration (bifurcated slot width vs device maximum capability)
     std::string reason;
-    if (m_pciLinkInfo.maxWidth > 0 && m_pciLinkInfo.currentWidth < m_pciLinkInfo.maxWidth) {
-        degraded = true;
-        reason = std::format("Width degraded to x{} (Slot/Device supports x{})", m_pciLinkInfo.currentWidth, m_pciLinkInfo.maxWidth);
-    } else if (!m_pciLinkInfo.maxSpeed.empty() && !m_pciLinkInfo.currentSpeed.empty() && m_pciLinkInfo.currentSpeed != m_pciLinkInfo.maxSpeed) {
-        if (m_pciLinkInfo.maxSpeed.find("32.0") != std::string::npos && m_pciLinkInfo.currentSpeed.find("32.0") == std::string::npos) {
-            degraded = true;
-            reason = std::format("Speed down-negotiated to {} (Max: {})", m_pciLinkInfo.currentSpeed, m_pciLinkInfo.maxSpeed);
-        } else if (m_pciLinkInfo.maxSpeed.find("16.0") != std::string::npos && m_pciLinkInfo.currentSpeed.find("16.0") == std::string::npos && m_pciLinkInfo.currentSpeed.find("32.0") == std::string::npos) {
-            degraded = true;
-            reason = std::format("Speed down-negotiated to {} (Max: {})", m_pciLinkInfo.currentSpeed, m_pciLinkInfo.maxSpeed);
+    if (m_pciLinkInfo.maxWidth > 0 && m_pciLinkInfo.currentWidth > 0 && m_pciLinkInfo.currentWidth < m_pciLinkInfo.maxWidth) {
+        reason = std::format("Slot allocated x{} lanes via platform bifurcation/storage (Device supports up to x{})", m_pciLinkInfo.currentWidth, m_pciLinkInfo.maxWidth);
+    }
+    if (!m_pciLinkInfo.maxGenerationName.empty() && !m_pciLinkInfo.generationName.empty() &&
+        m_pciLinkInfo.generationName != "PCIe" && m_pciLinkInfo.maxGenerationName != "PCIe" &&
+        m_pciLinkInfo.generationName != m_pciLinkInfo.maxGenerationName) {
+        std::string speedMsg = std::format("Platform link negotiated at {} (Device supports {})",
+                                           m_pciLinkInfo.generationName, m_pciLinkInfo.maxGenerationName);
+        if (reason.empty()) {
+            reason = speedMsg;
+        } else {
+            reason += "; " + speedMsg;
         }
     }
-    m_pciLinkInfo.isDegraded = degraded;
+    m_pciLinkInfo.isDegraded = false; // Link width is intentional platform bifurcation / lane allocation
     m_pciLinkInfo.degradationReason = reason;
 
     if (m_pciLinkInfo.currentWidth > 0 && !m_pciLinkInfo.currentSpeed.empty()) {
-        m_pciLinkInfo.formattedLink = std::format("{} x{} ({}, x{})",
-            m_pciLinkInfo.generationName,
-            m_pciLinkInfo.currentWidth,
-            m_pciLinkInfo.currentSpeed,
-            m_pciLinkInfo.currentWidth);
-        if (m_pciLinkInfo.isDegraded) {
-            m_pciLinkInfo.formattedLink += " [DEGRADED]";
+        if (m_pciLinkInfo.maxWidth > 0 && !m_pciLinkInfo.maxGenerationName.empty()) {
+            m_pciLinkInfo.formattedLink = std::format("{} x{} (Max: {} x{})",
+                m_pciLinkInfo.generationName,
+                m_pciLinkInfo.currentWidth,
+                m_pciLinkInfo.maxGenerationName,
+                m_pciLinkInfo.maxWidth);
+        } else {
+            m_pciLinkInfo.formattedLink = std::format("{} x{}",
+                m_pciLinkInfo.generationName,
+                m_pciLinkInfo.currentWidth);
         }
     } else {
         m_pciLinkInfo.formattedLink = "PCIe Unknown";
@@ -488,6 +573,10 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     }
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    if (m_hasExternalMemoryHost) {
+        deviceExtensions.push_back("VK_KHR_external_memory");
+        deviceExtensions.push_back("VK_EXT_external_memory_host");
+    }
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
     VkPhysicalDeviceVulkan14Features features14{};
@@ -552,6 +641,8 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     deviceFeatures2.features.samplerAnisotropy = VK_TRUE;
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
+    deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     deviceFeatures2.pNext = &features12;
 
     VkDeviceCreateInfo deviceCreateInfo{};

@@ -160,10 +160,22 @@ private:
     // Multi-GPU Transfer & Merge Resources
     std::unique_ptr<Buffer> m_secTransferBuffer;
     VkDescriptorSetLayout m_mergeDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_mergeDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_mergeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout m_mergePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_mergePipeline = VK_NULL_HANDLE;
     VkFence m_rtFence = VK_NULL_HANDLE;
+    void updateMergeDescriptors();
+    void updateAllImageDescriptors();
+
+    // Deferred GUI configuration actions
+    bool m_pendingMgpuModeChange = false;
+    MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
+    bool m_pendingAccumFormatChange = false;
+    AccumFormat m_newAccumFormat = AccumFormat::RGBA16_SFLOAT;
+    bool m_pendingDoubleBufferChange = false;
+    bool m_newDoubleBuffer = true;
+    bool m_pendingTileSizeChange = false;
+    uint32_t m_newTileSize = 64;
 
     // Scene metadata
     SceneData m_sceneData;

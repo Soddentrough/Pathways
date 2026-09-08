@@ -18,6 +18,14 @@ struct GuiActions {
     bool exportTelemetry = false;
     std::string exportTelemetryPath = "";
     bool refreshPciStatus = false;
+    bool mgpuModeChanged = false;
+    MultiGpuMode newMgpuMode = MultiGpuMode::Off;
+    bool accumFormatChanged = false;
+    AccumFormat newAccumFormat = AccumFormat::RGBA16_SFLOAT;
+    bool doubleBufferChanged = false;
+    bool newDoubleBuffer = true;
+    bool tileSizeChanged = false;
+    uint32_t newTileSize = 64;
 };
 
 class GuiManager {
@@ -45,6 +53,8 @@ private:
     bool m_lastWasPortrait = false;
     uint32_t m_lastWidth = 0;
     uint32_t m_lastHeight = 0;
+    float m_lastDispW = 0.0f;
+    float m_lastDispH = 0.0f;
 
     // Rolling latency history for live profiler HUD (60-frame rolling window)
     static constexpr size_t HISTORY_SIZE = 60;

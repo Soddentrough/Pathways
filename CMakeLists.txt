@@ -40,7 +40,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 
     if(ENABLE_NATIVE_OPTIMIZATION)
-        add_compile_options(-march=native)
+        add_compile_options(-march=native -mtune=native)
     endif()
 
     # Release optimizations
@@ -57,8 +57,11 @@ if(MSVC)
         /MP
         /EHsc
     )
+    if(ENABLE_NATIVE_OPTIMIZATION)
+        add_compile_options(/arch:AVX2)
+    endif()
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-        add_compile_options(/O2)
+        add_compile_options(/O2 /Oi /Ot)
     endif()
 endif()
 

@@ -23,6 +23,7 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr; // Ensure dynamic responsive docking without stale ini overrides
     ImGui::StyleColorsDark();
 
     // Dark style customization
@@ -140,55 +141,63 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     if (historyMin > 1e8f) historyMin = currentFrameTime;
 
     // =========================================================================
-    // Responsive Layout Calculation
+    // Responsive Layout Calculation (Using ImGui Virtual Canvas DisplaySize)
     // =========================================================================
+    ImGuiIO& io = ImGui::GetIO();
+    float dispW = (io.DisplaySize.x > 0.0f) ? io.DisplaySize.x : static_cast<float>(width);
+    float dispH = (io.DisplaySize.y > 0.0f) ? io.DisplaySize.y : static_cast<float>(height);
+
     float aspect = (height > 0) ? (static_cast<float>(width) / static_cast<float>(height)) : 1.0f;
     bool isPortrait = (aspect < 1.05f);
 
     ImGuiCond layoutCond = ImGuiCond_FirstUseEver;
-    if (!m_layoutInitialized || m_lastWasPortrait != isPortrait || m_lastWidth != width || m_lastHeight != height) {
+    if (!m_layoutInitialized || m_lastWasPortrait != isPortrait ||
+        m_lastWidth != width || m_lastHeight != height ||
+        m_lastDispW != dispW || m_lastDispH != dispH) {
         layoutCond = ImGuiCond_Always;
         m_layoutInitialized = true;
         m_lastWasPortrait = isPortrait;
         m_lastWidth = width;
         m_lastHeight = height;
+        m_lastDispW = dispW;
+        m_lastDispH = dispH;
     }
 
     float hudX = 20.0f;
     float hudY = 20.0f;
-    float hudW = 440.0f;
-    float hudH = 540.0f;
+    float hudW = std::min(440.0f, dispW - 40.0f);
+    float hudH = std::min(dispH - 40.0f, 660.0f);
 
-    float ctrlX = 480.0f;
+    float ctrlW = std::min(440.0f, dispW - 40.0f);
+    float ctrlX = std::max(20.0f, dispW - ctrlW - 20.0f);
     float ctrlY = 20.0f;
-    float ctrlW = 440.0f;
-    float ctrlH = std::min(static_cast<float>(height) - 40.0f, 780.0f);
+    float ctrlH = std::min(dispH - 40.0f, 850.0f);
 
     if (isPortrait) {
         // Vertical stacked layout on the left: leaves the right side unobstructed for the 3D scene
-        float sidebarW = std::min(400.0f, static_cast<float>(width) * 0.38f);
-        if (sidebarW < 350.0f) sidebarW = std::max(280.0f, static_cast<float>(width) - 24.0f);
+        float sidebarW = std::min(400.0f, dispW * 0.45f);
+        if (sidebarW < 320.0f) sidebarW = std::max(260.0f, dispW - 24.0f);
 
         hudX = 12.0f;
         hudY = 12.0f;
         hudW = sidebarW;
-        hudH = 640.0f;
+        hudH = std::min(dispH * 0.5f, 560.0f);
 
         ctrlX = 12.0f;
         ctrlY = hudY + hudH + 12.0f;
         ctrlW = sidebarW;
-        ctrlH = std::max(220.0f, static_cast<float>(height) - ctrlY - 12.0f);
+        ctrlH = std::max(200.0f, dispH - ctrlY - 12.0f);
     } else {
-        // Landscape layout: HUD on left, Control panel docked on right edge
+        // Landscape layout: HUD on left, Control panel docked safely on right edge
         hudX = 20.0f;
         hudY = 20.0f;
-        hudW = 440.0f;
-        hudH = std::min(static_cast<float>(height) - 40.0f, 660.0f);
+        hudW = std::min(440.0f, (dispW - 60.0f) * 0.5f);
+        hudH = std::min(dispH - 40.0f, 660.0f);
 
-        ctrlW = 440.0f;
-        ctrlX = static_cast<float>(width) - ctrlW - 20.0f;
+        ctrlW = std::min(440.0f, (dispW - 60.0f) * 0.5f);
+        ctrlX = std::max(hudX + hudW + 20.0f, dispW - ctrlW - 20.0f);
         ctrlY = 20.0f;
-        ctrlH = static_cast<float>(height) - 40.0f;
+        ctrlH = std::min(dispH - 40.0f, 850.0f);
     }
 
     // =========================================================================
@@ -586,21 +595,76 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (ImGui::CollapsingHeader("Multi-GPU Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char* mgpuModes[] = {
                 "Single GPU (Off)",
-                "Sample Parallelism (Dual GPU)",
-                "Split-Frame Tiling (Dual GPU)",
-                "Dynamic Work Queue (Dual GPU)"
+                "Checkerboard Tiling (Dual GPU - 2x FPS)"
             };
-            int currentMode = 0;
-            if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 1;
-            else if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) currentMode = 2;
-            else if (config.mgpu_mode == MultiGpuMode::DynamicWorkQueue) currentMode = 3;
+            int currentMode = (config.mgpu_mode == MultiGpuMode::CheckerboardTile) ? 1 : 0;
 
             if (ImGui::Combo("Execution Mode", &currentMode, mgpuModes, IM_ARRAYSIZE(mgpuModes))) {
-                if (currentMode == 0) config.mgpu_mode = MultiGpuMode::Off;
-                else if (currentMode == 1) config.mgpu_mode = MultiGpuMode::SampleParallel;
-                else if (currentMode == 2) config.mgpu_mode = MultiGpuMode::CheckerboardTile;
-                else if (currentMode == 3) config.mgpu_mode = MultiGpuMode::DynamicWorkQueue;
+                MultiGpuMode selectedMode = (currentMode == 1) ? MultiGpuMode::CheckerboardTile : MultiGpuMode::Off;
+
+                if (actions && selectedMode != config.mgpu_mode) {
+                    actions->mgpuModeChanged = true;
+                    actions->newMgpuMode = selectedMode;
+                }
+                config.mgpu_mode = selectedMode;
                 settingsChanged = true;
+            }
+
+            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) {
+                const char* tileSizes[] = {
+                    "16x16 (Finest Interleaving)",
+                    "32x32 (Balanced Cache)",
+                    "64x64 (Optimal RDNA4 Default)",
+                    "128x128 (Maximum Ray Coherence)"
+                };
+                int currentTileIdx = 2; // default 64
+                if (config.tile_size == 16) currentTileIdx = 0;
+                else if (config.tile_size == 32) currentTileIdx = 1;
+                else if (config.tile_size == 64) currentTileIdx = 2;
+                else if (config.tile_size == 128) currentTileIdx = 3;
+
+                if (ImGui::Combo("Tile Size", &currentTileIdx, tileSizes, IM_ARRAYSIZE(tileSizes))) {
+                    uint32_t chosenSize = 64;
+                    if (currentTileIdx == 0) chosenSize = 16;
+                    else if (currentTileIdx == 1) chosenSize = 32;
+                    else if (currentTileIdx == 2) chosenSize = 64;
+                    else if (currentTileIdx == 3) chosenSize = 128;
+
+                    if (actions && chosenSize != config.tile_size) {
+                        actions->tileSizeChanged = true;
+                        actions->newTileSize = chosenSize;
+                    }
+                    config.tile_size = chosenSize;
+                    settingsChanged = true;
+                }
+            }
+
+            // Accumulation format selection
+            const char* accumFormats[] = {
+                "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
+                "RGBA32_SFLOAT (128-bit Full Float HDR)"
+            };
+            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 : 0;
+            if (ImGui::Combo("Accumulation Format", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
+                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT : AccumFormat::RGBA16_SFLOAT;
+                if (actions && selectedFormat != config.accum_format) {
+                    actions->accumFormatChanged = true;
+                    actions->newAccumFormat = selectedFormat;
+                }
+                config.accum_format = selectedFormat;
+                settingsChanged = true;
+            }
+
+            // Double buffering toggle
+            if (ImGui::Checkbox("Double-Buffered Shared Memory", &config.double_buffered_shared_mem)) {
+                if (actions) {
+                    actions->doubleBufferChanged = true;
+                    actions->newDoubleBuffer = config.double_buffered_shared_mem;
+                }
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Pipelined zero-copy DMA buffers to overlap Secondary GPU execution with Primary GPU present.");
             }
 
             if (config.mgpu_mode != MultiGpuMode::Off) {
@@ -608,7 +672,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     // Changing visualization immediately updates shader push constants
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) or checkerboard patterns to visually display multi-GPU work distribution.");
+                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) to visually display work distribution.");
                 }
             }
         }
@@ -697,33 +761,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
         ImGui::SetNextWindowBgAlpha(0.70f);
 
-        float midX = isPortrait ? (width * 0.5f) : ((hudX + hudW + ctrlX) * 0.5f);
+        float midX = isPortrait ? (dispW * 0.5f) : ((hudX + hudW + ctrlX) * 0.5f);
 
-        if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-            float badgeW = 320.0f;
+        if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) {
+            float badgeW = 420.0f;
             ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
-            if (ImGui::Begin("##MgpuSampleSplitBadge", nullptr, overlayFlags)) {
-                ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Cyan]");
+            if (ImGui::Begin("##MgpuCheckerboardBadge", nullptr, overlayFlags)) {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Cyan (Even)]");
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[GPU 1: Amber]");
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[GPU 1: Amber (Odd)]");
                 ImGui::SameLine();
-                ImGui::TextDisabled("| Sample Parallel");
-            }
-            ImGui::End();
-        } else {
-            // Split-frame tiling badges centered between left HUD and right Control Panel
-            float midY = static_cast<float>(height) * 0.5f;
-            // Primary (top half)
-            ImGui::SetNextWindowPos(ImVec2(midX - 100.0f, midY - 45.0f), ImGuiCond_Always);
-            if (ImGui::Begin("##MgpuTileTopBadge", nullptr, overlayFlags)) {
-                ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Primary (Top Tile)]");
-            }
-            ImGui::End();
-
-            // Secondary (bottom half)
-            ImGui::SetNextWindowPos(ImVec2(midX - 110.0f, midY + 12.0f), ImGuiCond_Always);
-            if (ImGui::Begin("##MgpuTileBottomBadge", nullptr, overlayFlags)) {
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[GPU 1: Secondary (Bottom Tile)]");
+                ImGui::TextDisabled("| %ux%u Tiling", config.tile_size, config.tile_size);
             }
             ImGui::End();
         }

@@ -1,10 +1,11 @@
 #version 460
 #extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_image_load_formatted : require
 
 layout(local_size_x = 8, local_size_y = 4) in;
 
 // Output linear accumulation buffer
-layout(binding = 0, rgba32f) uniform image2D uAccumImage;
+layout(binding = 0) uniform image2D uAccumImage;
 
 // Uniform buffer for camera & rendering settings
 layout(binding = 1) uniform CameraUBO {
@@ -830,13 +831,28 @@ ivec2 getPixelCoordsMorton8x4(uint linearIdx, uint width, uint height) {
 }
 
 void main() {
-    ivec2 imageSize = imageSize(uAccumImage);
+    ivec2 globalID = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = ivec2(pc.tileWidth > 0u ? pc.tileWidth : imageSize(uAccumImage).x,
+                            pc.tileHeight > 0u ? pc.tileHeight : imageSize(uAccumImage).y);
     ivec2 pixelCoord;
 
-    if (pc.tileWidth > 0 && pc.tileHeight > 0) {
-        pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-        if (pixelCoord.x >= pc.tileWidth || pixelCoord.y >= pc.tileHeight) return;
-        pixelCoord += ivec2(pc.tileOffsetX, pc.tileOffsetY);
+    // Multi-GPU Checkerboard Tiling (tileOffsetX: 0 = full frame, 1 = even tiles, 2 = odd tiles)
+    // tileOffsetY: Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
+    uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+    if (pc.tileOffsetX == 1u) {
+        // GPU 0 (Primary): Even tiles
+        uint ty = uint(globalID.y) / tileSize;
+        uint tx_half = uint(globalID.x) / tileSize;
+        uint localX = uint(globalID.x) % tileSize;
+        uint tx = tx_half * 2u + (ty & 1u);
+        pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
+    } else if (pc.tileOffsetX == 2u) {
+        // GPU 1 (Secondary): Odd tiles
+        uint ty = uint(globalID.y) / tileSize;
+        uint tx_half = uint(globalID.x) / tileSize;
+        uint localX = uint(globalID.x) % tileSize;
+        uint tx = tx_half * 2u + (1u - (ty & 1u));
+        pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
     } else {
         uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
         pixelCoord = getPixelCoordsMorton8x4(linearIdx, uint(imageSize.x), uint(imageSize.y));
@@ -869,13 +885,15 @@ void main() {
     }
 
     // Load previous accumulated radiance
+    ivec2 storeCoord = (pc.tileOffsetX == 2u) ? ivec2(gl_GlobalInvocationID.xy) : pixelCoord;
+
     vec4 newAccum;
     if (pc.accumulateHistory == 0u || ubo.frameIndex == 0u) {
         newAccum = vec4(pixelRadiance, float(ubo.spp));
     } else {
-        vec4 prevAccum = imageLoad(uAccumImage, pixelCoord);
+        vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
         newAccum = prevAccum + vec4(pixelRadiance, float(ubo.spp));
     }
 
-    imageStore(uAccumImage, pixelCoord, newAccum);
+    imageStore(uAccumImage, storeCoord, newAccum);
 }

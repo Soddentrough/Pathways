@@ -130,7 +130,12 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"is_rdna4\": {},\n", stats.is_rdna4 ? "true" : "false")
         << "    \"pcie\": {\n"
         << std::format("      \"link_status\": \"{}\",\n", stats.primary_pci_link)
-        << std::format("      \"is_degraded\": {}\n", stats.primary_pci_degraded ? "true" : "false")
+        << std::format("      \"active_speed\": \"{}\",\n", stats.primary_pci_speed)
+        << std::format("      \"active_width\": {},\n", stats.primary_pci_width)
+        << std::format("      \"max_speed\": \"{}\",\n", stats.primary_pci_max_speed)
+        << std::format("      \"max_width\": {},\n", stats.primary_pci_max_width)
+        << std::format("      \"is_degraded\": {},\n", stats.primary_pci_degraded ? "true" : "false")
+        << std::format("      \"degradation_reason\": \"{}\"\n", stats.primary_pci_degraded_reason)
         << "    },\n"
         << "    \"telemetry\": {\n"
         << std::format("      \"clock_mhz\": {},\n", stats.primary_gpu_clock_mhz)
@@ -151,7 +156,12 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"visualize_load_split\": {},\n", stats.visualize_mgpu_split ? "true" : "false")
         << "    \"pcie\": {\n"
         << std::format("      \"link_status\": \"{}\",\n", stats.secondary_pci_link)
-        << std::format("      \"is_degraded\": {}\n", stats.secondary_pci_degraded ? "true" : "false")
+        << std::format("      \"active_speed\": \"{}\",\n", stats.secondary_pci_speed)
+        << std::format("      \"active_width\": {},\n", stats.secondary_pci_width)
+        << std::format("      \"max_speed\": \"{}\",\n", stats.secondary_pci_max_speed)
+        << std::format("      \"max_width\": {},\n", stats.secondary_pci_max_width)
+        << std::format("      \"is_degraded\": {},\n", stats.secondary_pci_degraded ? "true" : "false")
+        << std::format("      \"degradation_reason\": \"{}\"\n", stats.secondary_pci_degraded_reason)
         << "    },\n"
         << "    \"telemetry\": {\n"
         << std::format("      \"clock_mhz\": {},\n", stats.secondary_gpu_clock_mhz)
@@ -196,6 +206,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"spp\": {},\n", stats.spp)
         << std::format("    \"max_bounces\": {},\n", stats.max_bounces)
         << std::format("    \"morton_order\": {},\n", stats.enable_morton ? "true" : "false")
+        << std::format("    \"checkerboard_tile_size\": {},\n", stats.checkerboard_tile_size)
         << "    \"shading\": {\n"
         << std::format("      \"direct_lighting\": {},\n", stats.enable_direct_light ? "true" : "false")
         << std::format("      \"indirect_diffuse_gi\": {},\n", stats.enable_indirect_light ? "true" : "false")

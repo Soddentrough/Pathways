@@ -8,9 +8,12 @@ namespace pathways {
 
 enum class MultiGpuMode {
     Off,
-    SampleParallel,
-    CheckerboardTile,
-    DynamicWorkQueue
+    CheckerboardTile
+};
+
+enum class AccumFormat {
+    RGBA16_SFLOAT, // 64-bit Half Float HDR (Industry standard for real-time graphics, 50% VRAM/PCIe footprint) [Default]
+    RGBA32_SFLOAT  // 128-bit Full Float HDR
 };
 
 enum class PipelineType {
@@ -39,9 +42,11 @@ struct Config {
     bool enable_indirect_light = true;
 
     uint32_t gpu_index = 0;
-    MultiGpuMode mgpu_mode = MultiGpuMode::Off;
+    MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
+    AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
+    bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
-    PipelineType pipeline_type = PipelineType::Wavefront;
+    PipelineType pipeline_type = PipelineType::RTP;
     bool enable_morton_order = true;
     uint32_t tile_size = 64;
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds

@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_image_load_formatted : require
 
 struct HitPayload {
     vec3 radiance;
@@ -20,7 +21,7 @@ struct HitPayload {
 layout(location = 0) rayPayloadEXT HitPayload prd;
 layout(location = 1) rayPayloadEXT bool isShadowVisible;
 
-layout(binding = 0, rgba32f) uniform image2D uAccumImage;
+layout(binding = 0) uniform image2D uAccumImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -65,12 +66,31 @@ vec2 randVec2(inout uint seed) {
 }
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
-    ivec2 imageSize = ivec2(gl_LaunchSizeEXT.xy);
+    ivec2 launchID = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 imageSize = ivec2(pc.tileWidth > 0u ? pc.tileWidth : gl_LaunchSizeEXT.x,
+                            pc.tileHeight > 0u ? pc.tileHeight : gl_LaunchSizeEXT.y);
+    ivec2 pixelCoord;
 
-    if (pc.tileWidth > 0u && pc.tileHeight > 0u) {
-        if (pixelCoord.x >= pc.tileWidth || pixelCoord.y >= pc.tileHeight) return;
-        pixelCoord += ivec2(pc.tileOffsetX, pc.tileOffsetY);
+    // Multi-GPU Checkerboard Tiling & Dynamic Work Queue
+    // tileOffsetX: 0 = full frame (Single GPU), 1 = even tiles (GPU 0), 2 = odd tiles (GPU 1)
+    // tileOffsetY: Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
+    uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+    if (pc.tileOffsetX == 1u) {
+        // GPU 0 (Primary): Even tiles (Checkerboard)
+        uint ty = uint(launchID.y) / tileSize;
+        uint tx_half = uint(launchID.x) / tileSize;
+        uint localX = uint(launchID.x) % tileSize;
+        uint tx = tx_half * 2u + (ty & 1u);
+        pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
+    } else if (pc.tileOffsetX == 2u) {
+        // GPU 1 (Secondary): Odd tiles (Checkerboard)
+        uint ty = uint(launchID.y) / tileSize;
+        uint tx_half = uint(launchID.x) / tileSize;
+        uint localX = uint(launchID.x) % tileSize;
+        uint tx = tx_half * 2u + (1u - (ty & 1u));
+        pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
+    } else {
+        pixelCoord = launchID;
     }
 
     if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
@@ -165,13 +185,15 @@ void main() {
         pixelRadiance += radiance;
     }
 
+    ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+
     vec4 newAccum;
     if (pc.accumulateHistory == 0u || ubo.frameIndex == 0u) {
         newAccum = vec4(pixelRadiance, float(ubo.spp));
     } else {
-        vec4 prevAccum = imageLoad(uAccumImage, pixelCoord);
+        vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
         newAccum = prevAccum + vec4(pixelRadiance, float(ubo.spp));
     }
 
-    imageStore(uAccumImage, pixelCoord, newAccum);
+    imageStore(uAccumImage, storeCoord, newAccum);
 }

@@ -3,12 +3,13 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_image_load_formatted : require
 
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 8, local_size_y = 4) in;
 
-layout(binding = 0, rgba32f) uniform image2D uAccumImage;
+layout(binding = 0) uniform image2D uAccumImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;

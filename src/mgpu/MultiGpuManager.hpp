@@ -7,6 +7,7 @@
 #include "scene/Camera.hpp"
 #include "core/Config.hpp"
 #include "rt/AccelerationStructure.hpp"
+#include "rt/RTPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -56,6 +57,8 @@ struct GpuDeviceNode {
     VkDescriptorSet rtDescSet = VK_NULL_HANDLE;
     VkPipelineLayout rtPipelineLayout = VK_NULL_HANDLE;
     VkPipeline rtPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout rtpPipelineLayout = VK_NULL_HANDLE;
+    std::unique_ptr<RTPipeline> rtpKhrPipeline;
 
     ~GpuDeviceNode();
 };
@@ -69,7 +72,8 @@ public:
     bool isMultiGpuActive() const { return m_active; }
     uint32_t getDeviceCount() const { return static_cast<uint32_t>(m_devices.size() + 1); }
     MultiGpuMode getMode() const { return m_mode; }
-    void setMode(MultiGpuMode mode) { m_mode = mode; }
+    void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
+    void setFormat(AccumFormat format) { m_config.accum_format = format; }
     double getSecondaryGpuTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
     VulkanContext* getSecondaryContext() const { return m_devices.empty() ? nullptr : m_devices[0]->context.get(); }
@@ -92,8 +96,17 @@ public:
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(void* dstHostPtr, size_t byteSize);
 
+    bool isZeroCopyActive() const { return m_useZeroCopyHost; }
+    static constexpr uint32_t NUM_SHARED_BUFFERS = 2;
+    VkBuffer getPrimarySharedBuffer(uint32_t slot = 0) const { return m_sharedBufferPrimary[slot % NUM_SHARED_BUFFERS]; }
+    VkBuffer getSecondarySharedBuffer(uint32_t slot = 0) const { return m_sharedBufferSecondary[slot % NUM_SHARED_BUFFERS]; }
+    void* getSharedHostPointer(uint32_t slot = 0) const { return m_sharedHostPtr[slot % NUM_SHARED_BUFFERS]; }
+    size_t getSharedBufferSize() const { return m_sharedBufferSize; }
+
 private:
     void initSecondaryDevice(const Config& config, const SceneData& scene);
+    void initSharedHostBuffer(VkDeviceSize bufferSize);
+    void destroySharedHostBuffer();
     std::vector<char> loadShaderSPIRV(const std::string& filename);
     VkShaderModule createShaderModule(VkDevice device, const std::vector<char>& code);
 
@@ -103,6 +116,15 @@ private:
     bool m_active = false;
     std::future<void> m_asyncTask;
     Config m_config;
+
+    // Zero-copy host allocation imported into both GPUs via VK_EXT_external_memory_host (Double-buffered)
+    std::array<void*, NUM_SHARED_BUFFERS> m_sharedHostPtr = { nullptr, nullptr };
+    size_t m_sharedBufferSize = 0;
+    std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_sharedMemPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, NUM_SHARED_BUFFERS> m_sharedBufferPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_sharedMemSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, NUM_SHARED_BUFFERS> m_sharedBufferSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool m_useZeroCopyHost = false;
 };
 
 } // namespace pathways

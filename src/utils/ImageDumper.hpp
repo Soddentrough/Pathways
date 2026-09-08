@@ -40,12 +40,22 @@ struct FrameStats {
 
     // Live Hardware Telemetry
     std::string primary_pci_link = "PCIe N/A";
+    std::string primary_pci_speed = "";
+    uint32_t primary_pci_width = 0;
+    std::string primary_pci_max_speed = "";
+    uint32_t primary_pci_max_width = 0;
     bool primary_pci_degraded = false;
+    std::string primary_pci_degraded_reason = "";
     uint32_t primary_gpu_clock_mhz = 0;
     uint32_t primary_gpu_temp_c = 0;
 
     std::string secondary_pci_link = "";
+    std::string secondary_pci_speed = "";
+    uint32_t secondary_pci_width = 0;
+    std::string secondary_pci_max_speed = "";
+    uint32_t secondary_pci_max_width = 0;
     bool secondary_pci_degraded = false;
+    std::string secondary_pci_degraded_reason = "";
     uint32_t secondary_gpu_clock_mhz = 0;
     uint32_t secondary_gpu_temp_c = 0;
 
@@ -78,6 +88,7 @@ struct FrameStats {
     uint32_t spp = 0;
     uint32_t max_bounces = 0;
     bool enable_morton = true;
+    uint32_t checkerboard_tile_size = 64;
     bool enable_direct_light = true;
     bool enable_indirect_light = true;
     bool enable_refraction = true;

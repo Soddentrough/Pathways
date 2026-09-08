@@ -153,6 +153,9 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     initVulkan();
     initScene();
+    if (m_config.mgpu_mode != MultiGpuMode::Off) {
+        m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
+    }
     initPipelines();
     initWavefrontResources();
     initWavefrontPipelines();
@@ -175,10 +178,6 @@ Engine::Engine(const Config& config) : m_config(config) {
         m_window->setEventCallback([this](const SDL_Event& e) -> bool {
             return handleEvent(e);
         });
-    }
-
-    if (m_config.mgpu_mode != MultiGpuMode::Off) {
-        m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
 
     startHwMonThread();
@@ -349,9 +348,10 @@ void Engine::initVulkan() {
     vkAllocateCommandBuffers(device, &allocInfo, m_commandBuffers.data());
 
     // Create Render Target Images
+    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R32G32B32A32_SFLOAT,
+        accumFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -914,79 +914,177 @@ void Engine::initPipelines() {
         }
     }
 
-    if (m_config.mgpu_mode != MultiGpuMode::Off) {
-        VmaAllocator allocator = m_context->getAllocator();
-        VkDeviceSize bufferSize = m_config.width * m_config.height * 4 * sizeof(float);
-        m_secTransferBuffer = std::make_unique<Buffer>(
-            allocator, bufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
+    // Multi-GPU Merge Pipeline & Descriptors (Created unconditionally so mode switches never fault)
+    std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{};
+    mergeLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    mergeLayoutInfo.bindingCount = static_cast<uint32_t>(mergeBindings.size());
+    mergeLayoutInfo.pBindings = mergeBindings.data();
+    vkCreateDescriptorSetLayout(device, &mergeLayoutInfo, nullptr, &m_mergeDescLayout);
 
-        // Descriptor Set Layout for accum_merge
-        std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
-            { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-        };
-        VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{};
-        mergeLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        mergeLayoutInfo.bindingCount = static_cast<uint32_t>(mergeBindings.size());
-        mergeLayoutInfo.pBindings = mergeBindings.data();
-        vkCreateDescriptorSetLayout(device, &mergeLayoutInfo, nullptr, &m_mergeDescLayout);
+    std::array<VkDescriptorSetLayout, 2> mergeLayouts = { m_mergeDescLayout, m_mergeDescLayout };
+    VkDescriptorSetAllocateInfo mergeAllocInfo{};
+    mergeAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    mergeAllocInfo.descriptorPool = m_descriptorPool;
+    mergeAllocInfo.descriptorSetCount = 2;
+    mergeAllocInfo.pSetLayouts = mergeLayouts.data();
+    vkAllocateDescriptorSets(device, &mergeAllocInfo, m_mergeDescSets.data());
 
-        // Allocate Descriptor Set
-        VkDescriptorSetAllocateInfo mergeAllocInfo{};
-        mergeAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        mergeAllocInfo.descriptorPool = m_descriptorPool;
-        mergeAllocInfo.descriptorSetCount = 1;
-        mergeAllocInfo.pSetLayouts = &m_mergeDescLayout;
-        vkAllocateDescriptorSets(device, &mergeAllocInfo, &m_mergeDescSet);
+    updateMergeDescriptors();
 
-        // Update Descriptor Set
-        VkDescriptorImageInfo accumImageInfo{};
-        accumImageInfo.imageView = m_accumImage->getImageView();
-        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkPushConstantRange mergePushConstant{};
+    mergePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    mergePushConstant.offset = 0;
+    mergePushConstant.size = sizeof(uint32_t) * 6; // width, height, spp, mode, formatMode, dynamicRatioPermille
 
-        VkDescriptorBufferInfo secBufInfo{ m_secTransferBuffer->getBuffer(), 0, bufferSize };
+    VkPipelineLayoutCreateInfo mergePipeLayoutInfo{};
+    mergePipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    mergePipeLayoutInfo.setLayoutCount = 1;
+    mergePipeLayoutInfo.pSetLayouts = &m_mergeDescLayout;
+    mergePipeLayoutInfo.pushConstantRangeCount = 1;
+    mergePipeLayoutInfo.pPushConstantRanges = &mergePushConstant;
+    vkCreatePipelineLayout(device, &mergePipeLayoutInfo, nullptr, &m_mergePipelineLayout);
+
+    auto mergeCode = loadShaderSPIRV("accum_merge.comp.spv");
+    VkShaderModule mergeModule = createShaderModule(mergeCode);
+
+    VkComputePipelineCreateInfo mergePipelineInfo{};
+    mergePipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    mergePipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    mergePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    mergePipelineInfo.stage.module = mergeModule;
+    mergePipelineInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        mergePipelineInfo.stage.pNext = &subgroupSize32;
+    }
+    mergePipelineInfo.layout = m_mergePipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &mergePipelineInfo, nullptr, &m_mergePipeline);
+    vkDestroyShaderModule(device, mergeModule, nullptr);
+
+    Logger::info("Multi-GPU merge compute pipeline (Wave32) created successfully.");
+}
+
+void Engine::updateAllImageDescriptors() {
+    VkDevice device = m_context->getDevice();
+    VkDescriptorImageInfo accumImageInfo{};
+    accumImageInfo.imageView = m_accumImage->getImageView();
+    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo outputImageInfo{};
+    outputImageInfo.imageView = m_outputImage->getImageView();
+    outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    std::vector<VkWriteDescriptorSet> writes;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_rtDescSets[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet w0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            w0.dstSet = m_rtDescSets[i];
+            w0.dstBinding = 0;
+            w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w0.descriptorCount = 1;
+            w0.pImageInfo = &accumImageInfo;
+            writes.push_back(w0);
+        }
+    }
+
+    if (m_tonemapDescSet != VK_NULL_HANDLE) {
+        VkWriteDescriptorSet w1{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w1.dstSet = m_tonemapDescSet;
+        w1.dstBinding = 0;
+        w1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w1.descriptorCount = 1;
+        w1.pImageInfo = &accumImageInfo;
+        writes.push_back(w1);
+
+        VkWriteDescriptorSet w2{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w2.dstSet = m_tonemapDescSet;
+        w2.dstBinding = 1;
+        w2.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w2.descriptorCount = 1;
+        w2.pImageInfo = &outputImageInfo;
+        writes.push_back(w2);
+    }
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_wfClassifyDescSets[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            cw0.dstSet = m_wfClassifyDescSets[i];
+            cw0.dstBinding = 0;
+            cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            cw0.descriptorCount = 1;
+            cw0.pImageInfo = &accumImageInfo;
+            writes.push_back(cw0);
+        }
+        if (m_wfShadeDescSetsA[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            swA.dstSet = m_wfShadeDescSetsA[i];
+            swA.dstBinding = 0;
+            swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            swA.descriptorCount = 1;
+            swA.pImageInfo = &accumImageInfo;
+            writes.push_back(swA);
+        }
+        if (m_wfShadeDescSetsB[i] != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            swB.dstSet = m_wfShadeDescSetsB[i];
+            swB.dstBinding = 0;
+            swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            swB.descriptorCount = 1;
+            swB.pImageInfo = &accumImageInfo;
+            writes.push_back(swB);
+        }
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::updateMergeDescriptors() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+    VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bytesPerPixel;
+
+    VkDescriptorImageInfo accumImageInfo{};
+    accumImageInfo.imageView = m_accumImage->getImageView();
+    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        if (m_mergeDescSets[slot] == VK_NULL_HANDLE) continue;
+
+        VkBuffer secBuffer = VK_NULL_HANDLE;
+        VkDeviceSize curSize = bufferSize;
+
+        if (m_mgpu && m_mgpu->isZeroCopyActive()) {
+            secBuffer = m_mgpu->getPrimarySharedBuffer(slot);
+            curSize = m_mgpu->getSharedBufferSize();
+        } else {
+            if (!m_secTransferBuffer || m_secTransferBuffer->getSize() < bufferSize) {
+                m_secTransferBuffer = std::make_unique<Buffer>(
+                    allocator, bufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                );
+            }
+            secBuffer = m_secTransferBuffer->getBuffer();
+            curSize = m_secTransferBuffer->getSize();
+        }
+
+        VkDescriptorBufferInfo secBufInfo{ secBuffer, 0, curSize };
 
         std::vector<VkWriteDescriptorSet> mergeWrites = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr }
         };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
-
-        // Pipeline Layout
-        VkPushConstantRange mergePushConstant{};
-        mergePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        mergePushConstant.offset = 0;
-        mergePushConstant.size = sizeof(uint32_t) * 4; // width, height, secondarySpp, padding
-
-        VkPipelineLayoutCreateInfo mergePipeLayoutInfo{};
-        mergePipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        mergePipeLayoutInfo.setLayoutCount = 1;
-        mergePipeLayoutInfo.pSetLayouts = &m_mergeDescLayout;
-        mergePipeLayoutInfo.pushConstantRangeCount = 1;
-        mergePipeLayoutInfo.pPushConstantRanges = &mergePushConstant;
-        vkCreatePipelineLayout(device, &mergePipeLayoutInfo, nullptr, &m_mergePipelineLayout);
-
-        auto mergeCode = loadShaderSPIRV("accum_merge.comp.spv");
-        VkShaderModule mergeModule = createShaderModule(mergeCode);
-
-        VkComputePipelineCreateInfo mergePipelineInfo{};
-        mergePipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        mergePipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        mergePipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        mergePipelineInfo.stage.module = mergeModule;
-        mergePipelineInfo.stage.pName = "main";
-        if (m_context->hasSubgroupSizeControl()) {
-            mergePipelineInfo.stage.pNext = &subgroupSize32;
-        }
-        mergePipelineInfo.layout = m_mergePipelineLayout;
-        vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &mergePipelineInfo, nullptr, &m_mergePipeline);
-        vkDestroyShaderModule(device, mergeModule, nullptr);
-
-        Logger::info("Multi-GPU merge compute pipeline (Wave32) created successfully.");
     }
 }
 
@@ -1472,6 +1570,82 @@ void Engine::renderFrame() {
         }
     }
 
+    // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
+    if (m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
+        VkDevice dev = m_context->getDevice();
+        VmaAllocator alloc = m_context->getAllocator();
+        vkDeviceWaitIdle(dev);
+
+        if (m_pendingAccumFormatChange) {
+            m_config.accum_format = m_newAccumFormat;
+            m_pendingAccumFormatChange = false;
+
+            VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+            m_accumImage = std::make_unique<Image>(
+                dev, alloc, m_config.width, m_config.height,
+                accumFmt,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+
+            // Transition m_accumImage to GENERAL
+            vkResetCommandBuffer(m_commandBuffers[0], 0);
+            VkCommandBufferBeginInfo transBegin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            transBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(m_commandBuffers[0], &transBegin);
+            m_accumImage->transitionLayout(
+                m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+            vkEndCommandBuffer(m_commandBuffers[0]);
+            VkSubmitInfo transSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            transSubmit.commandBufferCount = 1;
+            transSubmit.pCommandBuffers = &m_commandBuffers[0];
+            vkQueueSubmit(m_context->getGraphicsQueue(), 1, &transSubmit, VK_NULL_HANDLE);
+            vkQueueWaitIdle(m_context->getGraphicsQueue());
+
+            updateAllImageDescriptors();
+            if (m_mgpu) {
+                m_mgpu->setFormat(m_config.accum_format);
+                if (m_mgpu->isMultiGpuActive()) {
+                    m_mgpu->resize(m_config.width, m_config.height);
+                }
+            }
+        }
+
+        if (m_pendingMgpuModeChange) {
+            m_config.mgpu_mode = m_newMgpuMode;
+            m_pendingMgpuModeChange = false;
+
+            if (m_config.mgpu_mode != MultiGpuMode::Off) {
+                if (!m_mgpu) {
+                    m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
+                } else {
+                    m_mgpu->setMode(m_config.mgpu_mode);
+                    m_mgpu->setFormat(m_config.accum_format);
+                    m_mgpu->resize(m_config.width, m_config.height);
+                }
+            } else if (m_mgpu) {
+                m_mgpu->setMode(MultiGpuMode::Off);
+            }
+        }
+
+        if (m_pendingDoubleBufferChange) {
+            m_config.double_buffered_shared_mem = m_newDoubleBuffer;
+            m_pendingDoubleBufferChange = false;
+        }
+
+        if (m_pendingTileSizeChange) {
+            m_config.tile_size = m_newTileSize;
+            m_pendingTileSizeChange = false;
+        }
+
+        updateMergeDescriptors();
+        m_resetAccumulation = true;
+        m_frameTimesMs.clear();
+    }
+
     // Update smooth continuous FPS keyboard navigation
     updateInput();
 
@@ -1514,13 +1688,13 @@ void Engine::renderFrame() {
         uint32_t totalSamples = 1;
         uint32_t applyACES = 1;
         uint32_t visualizeSplit = 0;
-        uint32_t splitY = 0;
+        uint32_t tileSize = 64;
         uint32_t padding[3] = {0, 0, 0};
     } tonemapConstants;
     tonemapConstants.exposure = 1.0f;
     tonemapConstants.applyACES = m_config.aces_tonemap ? 1 : 0;
     tonemapConstants.visualizeSplit = 0;
-    tonemapConstants.splitY = 0;
+    tonemapConstants.tileSize = m_config.tile_size;
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive());
 
@@ -1777,36 +1951,39 @@ void Engine::renderFrame() {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.visualizeSplit = 0;
-        tonemapConstants.splitY = 0;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
-    } else if (m_config.mgpu_mode == MultiGpuMode::SampleParallel) {
-        // --- Multi-GPU Sample Parallelism Path ---
-        uint32_t spp0 = (m_config.spp > 1) ? (m_config.spp / 2) : 1;
-        uint32_t spp1 = (m_config.spp > 1) ? (m_config.spp - spp0) : 1;
-
-        CameraUniform ubo0 = m_camera->getUniformData(m_frameIndex * 2, spp0, m_config.max_bounces, flags);
-        m_cameraUBOs[m_currentFrame]->copyFrom(&ubo0, sizeof(CameraUniform));
-
-        CameraUniform ubo1 = m_camera->getUniformData(m_frameIndex * 2 + 1, spp1, m_config.max_bounces, flags);
-
+    } else {
+        // --- Multi-GPU Path (64x64 Checkerboard Tiling or Dynamic Work Queue) ---
         uint32_t useHwRT = 1;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
-        size_t transferBytes = static_cast<size_t>(m_config.width) * m_config.height * 4 * sizeof(float);
-        void* dstHost = m_secTransferBuffer->map();
+        uint32_t formatMode = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 0u : 1u;
+        uint32_t bytesPerPixel = (formatMode == 0u) ? 8 : 16;
+        size_t frameBytes = 0;
+        void* dstHost = nullptr;
+        if (!m_mgpu->isZeroCopyActive()) {
+            frameBytes = static_cast<size_t>(m_config.width) * m_config.height * bytesPerPixel;
+            dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
+        }
 
-        // 1. Launch secondary GPU asynchronously in dedicated worker thread (with overlapped PCIe transfer)
-        m_mgpu->launchSecondaryWork(ubo1, m_frameIndex * 2 + 1, 0, 0, m_config.width, m_config.height,
+        uint32_t tileOffsetX_sec = 2u;
+        uint32_t tileOffsetY_sec = m_config.tile_size;
+        uint32_t tileOffsetX_prim = 1u;
+        uint32_t tileOffsetY_prim = m_config.tile_size;
+        uint32_t dispatchWidth = (m_config.width + 1) / 2;
+
+        // 1. Launch secondary GPU asynchronously
+        m_mgpu->launchSecondaryWork(ubo, m_frameIndex, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
                                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, 0u, dstHost, transferBytes);
+                                   hasEnvMap, envIntensity, 1u, dstHost, frameBytes);
 
-        // 2. Concurrently record and execute primary GPU raytracing
+        // 2. Concurrently record and execute primary GPU
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &m_rtFence);
 
@@ -1819,25 +1996,38 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-
         uint32_t rtPushConstants[12] = {
             m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-            0, 0, m_config.width, m_config.height,
+            tileOffsetX_prim,
+            tileOffsetY_prim,
+            m_config.width, m_config.height,
             useHwRT,
             hasEnvMap,
             envIntensityBits,
-            1u // accumulateHistory: primary GPU maintains temporal master accumulation
+            1u // accumulateHistory
         };
-        vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-        if (m_dgc && m_dgcArgumentBuffer) {
-            m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
+
+        if (m_rtpKhrPipeline && m_rtpKhrPipeline->isSupported() && m_config.pipeline_type != PipelineType::Megakernel) {
+            // Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+            m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, m_config.height, 1);
         } else {
-            vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
+            // Fallback Compute Pipeline
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
+            if (m_dgc && m_dgcArgumentBuffer) {
+                m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
+            } else {
+                uint32_t primGroupsX = (dispatchWidth + 7) / 8;
+                vkCmdDispatch(cmd, primGroupsX, rtGroupsY, 1);
+            }
         }
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 1);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
 
         VkSubmitInfo rtSubmit{};
@@ -1849,6 +2039,7 @@ void Engine::renderFrame() {
         // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
         m_mgpu->syncAndTransfer(nullptr, 0);
+
         // 4. Record Merge & Tonemapping commands on primary GPU
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
@@ -1858,7 +2049,7 @@ void Engine::renderFrame() {
         // Barrier: Ensure primary RT writes to m_accumImage are visible before merge compute reads/writes
         VkMemoryBarrier2 rtToMergeBarrier{};
         rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -1870,10 +2061,11 @@ void Engine::renderFrame() {
         vkCmdPipelineBarrier2(cmd, &rtToMergeDep);
 
         // Merge Pass
+        uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-        uint32_t mergePC[4] = { m_config.width, m_config.height, spp1, 0 };
+        uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, 0u };
         vkCmdPushConstants(cmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
@@ -1894,113 +2086,8 @@ void Engine::renderFrame() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
-        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 2 : 0;
-        tonemapConstants.splitY = 0;
-        tonemapConstants.totalSamples = (m_frameIndex + 1) * (spp0 + spp1);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
-        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
-
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
-    } else {
-        // --- Multi-GPU Split-Frame Tiling / Dynamic Work Queue Path ---
-        uint32_t h0 = m_config.height / 2;
-        uint32_t h1 = m_config.height - h0;
-
-        CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
-        m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
-
-        uint32_t useHwRT = 1;
-        uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-        float envIntensity = 1.0f;
-        uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
-
-        size_t tileBytes = static_cast<size_t>(m_config.width) * h1 * 4 * sizeof(float);
-        void* dstHost = m_secTransferBuffer->map();
-
-        // 1. Launch secondary GPU on bottom half asynchronously (accumulateHistory = 1: secondary retains bottom-half temporal accumulation)
-        m_mgpu->launchSecondaryWork(ubo, m_frameIndex, 0, h0, m_config.width, h1,
-                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, 1u, dstHost, tileBytes);
-
-        // 2. Concurrently record and execute primary GPU on top half
-        vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &m_rtFence);
-
-        vkResetCommandBuffer(cmd, 0);
-        VkCommandBufferBeginInfo rtBeginInfo{};
-        rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(cmd, &rtBeginInfo);
-
-        uint32_t qBase = m_currentFrame * 4;
-        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-
-        uint32_t rtPushConstants[12] = {
-            m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-            0, 0, m_config.width, h0,
-            useHwRT,
-            hasEnvMap,
-            envIntensityBits,
-            1u // accumulateHistory
-        };
-        vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-
-        uint32_t groupsY0 = (h0 + 3) / 4;
-        vkCmdDispatch(cmd, rtGroupsX, groupsY0, 1);
-
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 1);
-        vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo rtSubmit{};
-        rtSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        rtSubmit.commandBufferCount = 1;
-        rtSubmit.pCommandBuffers = &cmd;
-        vkQueueSubmit(queue, 1, &rtSubmit, m_rtFence);
-
-        // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
-        vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-        m_mgpu->syncAndTransfer(nullptr, 0);
-        // 4. Record Buffer-to-Image Copy for bottom half & Tonemapping commands
-        vkResetCommandBuffer(cmd, 0);
-        VkCommandBufferBeginInfo postBeginInfo{};
-        postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(cmd, &postBeginInfo);
-
-        // Copy secondary tile to accumImage bottom half
-        m_accumImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
-        );
-
-        VkBufferImageCopy copyRegion{};
-        copyRegion.bufferOffset = 0;
-        copyRegion.bufferRowLength = 0;
-        copyRegion.bufferImageHeight = 0;
-        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.imageSubresource.layerCount = 1;
-        copyRegion.imageOffset = { 0, static_cast<int32_t>(h0), 0 };
-        copyRegion.imageExtent = { m_config.width, h1, 1 };
-
-        vkCmdCopyBufferToImage(cmd, m_secTransferBuffer->getBuffer(),
-                               m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-
-        m_accumImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-
-        // Tonemapping
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
-
-        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1 : 0;
-        tonemapConstants.splitY = h0;
+        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
+        tonemapConstants.tileSize = m_config.tile_size;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
@@ -2089,12 +2176,29 @@ void Engine::renderFrame() {
         if (m_gui) {
             m_gui->newFrame();
             bool prevMode = m_cameraMode;
+            MultiGpuMode prevMgpuMode = m_config.mgpu_mode;
             GuiActions guiActions{};
             if (m_gui->render(cmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
                               m_config, getStats(), m_cameraMode, m_camera.get(),
                               &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions)) {
                 m_resetAccumulation = true;
                 if (!m_config.headless) m_frameTimesMs.clear();
+            }
+            if (guiActions.mgpuModeChanged) {
+                m_pendingMgpuModeChange = true;
+                m_newMgpuMode = guiActions.newMgpuMode;
+            }
+            if (guiActions.accumFormatChanged) {
+                m_pendingAccumFormatChange = true;
+                m_newAccumFormat = guiActions.newAccumFormat;
+            }
+            if (guiActions.doubleBufferChanged) {
+                m_pendingDoubleBufferChange = true;
+                m_newDoubleBuffer = guiActions.newDoubleBuffer;
+            }
+            if (guiActions.tileSizeChanged) {
+                m_pendingTileSizeChange = true;
+                m_newTileSize = guiActions.newTileSize;
             }
             if (guiActions.resetAccumulation) {
                 m_resetAccumulation = true;
@@ -2448,9 +2552,7 @@ FrameStats Engine::getStats() const {
     }
 
     switch (m_config.mgpu_mode) {
-        case MultiGpuMode::SampleParallel: stats.mgpu_mode_str = "sample_parallel"; break;
         case MultiGpuMode::CheckerboardTile: stats.mgpu_mode_str = "checkerboard_tile"; break;
-        case MultiGpuMode::DynamicWorkQueue: stats.mgpu_mode_str = "dynamic_work_queue"; break;
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
@@ -2464,14 +2566,14 @@ FrameStats Engine::getStats() const {
     stats.num_materials = m_numMaterials;
     stats.num_lights = m_numLights;
     stats.num_textures = static_cast<uint32_t>(m_sceneTextures.size());
-    stats.has_hw_rt = (m_tlas != nullptr);
-    stats.has_dgc = (m_dgc != nullptr);
-    stats.is_rdna3 = m_context->isRDNA3();
-    stats.is_rdna4 = m_context->isRDNA4();
-    stats.arch_name = m_context->getArchitectureName();
-    stats.short_arch = m_context->getShortArchName();
-    stats.ray_accelerator_name = m_context->getRayAcceleratorName();
-
+    stats.width = m_config.width;
+    stats.height = m_config.height;
+    stats.spp = m_config.spp;
+    stats.max_bounces = m_config.max_bounces;
+    stats.render_scale = m_config.render_scale;
+    stats.enable_morton = m_config.enable_morton_order;
+    stats.total_frames = m_totalFramesRendered;
+    stats.validation_errors = m_context->getValidationErrors();
     // 1. Session & Host Platform Metadata
     stats.os_name = getCachedOS();
 #ifdef __linux__
@@ -2483,9 +2585,15 @@ FrameStats Engine::getStats() const {
     stats.cpu_model = getCachedCPU();
     stats.ram_total_gb = static_cast<double>(getCachedRAM()) / 1024.0;
 
-    // 2. Primary GPU Hardware & Driver
+    // 2. Physical & Driver Device Information
+    stats.gpu_name = m_context->getDeviceName();
     stats.vendor_id = m_context->getVendorID();
     stats.device_id = m_context->getDeviceID();
+    stats.arch_name = m_context->getArchitectureName();
+    stats.short_arch = m_context->getShortArchName();
+    stats.ray_accelerator_name = m_context->getRayAcceleratorName();
+    stats.is_rdna3 = m_context->isRDNA3();
+    stats.is_rdna4 = m_context->isRDNA4();
     uint32_t drvVer = m_context->getDriverVersion();
     stats.driver_version_str = std::format("{}.{}.{}", (drvVer >> 22) & 0x3FF, (drvVer >> 12) & 0x3FF, drvVer & 0xFFF);
     uint32_t apiVer = m_context->getApiVersion();
@@ -2496,8 +2604,14 @@ FrameStats Engine::getStats() const {
     stats.vram_budget_mb = stats.total_vram_mb;
 
     // Primary GPU PCIe and Sensors
-    stats.primary_pci_link = m_context->getPciLinkString();
-    stats.primary_pci_degraded = m_context->isPciLinkDegraded();
+    const auto& primPci = m_context->getPciLinkInfo();
+    stats.primary_pci_link = primPci.formattedLink;
+    stats.primary_pci_speed = primPci.currentSpeed;
+    stats.primary_pci_width = primPci.currentWidth;
+    stats.primary_pci_max_speed = primPci.maxSpeed;
+    stats.primary_pci_max_width = primPci.maxWidth;
+    stats.primary_pci_degraded = primPci.isDegraded;
+    stats.primary_pci_degraded_reason = primPci.degradationReason;
     stats.primary_gpu_clock_mhz = m_gpu0ClockMhz.load(std::memory_order_relaxed);
     stats.primary_gpu_temp_c = m_gpu0TempC.load(std::memory_order_relaxed);
 
@@ -2506,9 +2620,15 @@ FrameStats Engine::getStats() const {
         stats.is_mgpu_active = true;
         stats.secondary_gpu_name = m_mgpu->getSecondaryDeviceName();
         if (m_mgpu->getSecondaryContext()) {
+            const auto& secPci = m_mgpu->getSecondaryContext()->getPciLinkInfo();
             stats.secondary_arch_name = m_mgpu->getSecondaryContext()->getArchitectureName();
-            stats.secondary_pci_link = m_mgpu->getSecondaryContext()->getPciLinkString();
-            stats.secondary_pci_degraded = m_mgpu->getSecondaryContext()->isPciLinkDegraded();
+            stats.secondary_pci_link = secPci.formattedLink;
+            stats.secondary_pci_speed = secPci.currentSpeed;
+            stats.secondary_pci_width = secPci.currentWidth;
+            stats.secondary_pci_max_speed = secPci.maxSpeed;
+            stats.secondary_pci_max_width = secPci.maxWidth;
+            stats.secondary_pci_degraded = secPci.isDegraded;
+            stats.secondary_pci_degraded_reason = secPci.degradationReason;
             stats.secondary_gpu_clock_mhz = m_gpu1ClockMhz.load(std::memory_order_relaxed);
             stats.secondary_gpu_temp_c = m_gpu1TempC.load(std::memory_order_relaxed);
         }
@@ -2517,7 +2637,12 @@ FrameStats Engine::getStats() const {
         stats.secondary_gpu_name = "";
         stats.secondary_arch_name = "";
         stats.secondary_pci_link = "";
+        stats.secondary_pci_speed = "";
+        stats.secondary_pci_width = 0;
+        stats.secondary_pci_max_speed = "";
+        stats.secondary_pci_max_width = 0;
         stats.secondary_pci_degraded = false;
+        stats.secondary_pci_degraded_reason = "";
         stats.secondary_gpu_clock_mhz = 0;
         stats.secondary_gpu_temp_c = 0;
     }
@@ -2541,6 +2666,7 @@ FrameStats Engine::getStats() const {
     stats.render_scale = m_config.render_scale;
     stats.max_bounces = m_config.max_bounces;
     stats.enable_morton = m_config.enable_morton_order;
+    stats.checkerboard_tile_size = m_config.tile_size;
     stats.enable_direct_light = m_config.enable_direct_light;
     stats.enable_indirect_light = m_config.enable_indirect_light;
     stats.enable_refraction = m_config.enable_refraction;
@@ -2635,9 +2761,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     }
 
     // 3. Recreate Accumulation & Output Images
+    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R32G32B32A32_SFLOAT,
+        accumFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -2675,112 +2802,14 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
-    // 4. Update descriptor sets with new image views
-    VkDescriptorImageInfo accumImageInfo{};
-    accumImageInfo.imageView = m_accumImage->getImageView();
-    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkDescriptorImageInfo outputImageInfo{};
-    outputImageInfo.imageView = m_outputImage->getImageView();
-    outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    std::vector<VkWriteDescriptorSet> writes;
-    // Update m_rtDescSets: binding 0 is m_accumImage (storage image)
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        if (m_rtDescSets[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet w0{};
-            w0.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w0.dstSet = m_rtDescSets[i];
-            w0.dstBinding = 0;
-            w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            w0.descriptorCount = 1;
-            w0.pImageInfo = &accumImageInfo;
-            writes.push_back(w0);
-        }
+    // 4. Resize secondary GPU if active before updating merge descriptor set
+    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+        m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    // Update m_tonemapDescSet: binding 0 is m_accumImage, binding 1 is m_outputImage
-    VkWriteDescriptorSet w1{};
-    w1.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w1.dstSet = m_tonemapDescSet;
-    w1.dstBinding = 0;
-    w1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w1.descriptorCount = 1;
-    w1.pImageInfo = &accumImageInfo;
-    writes.push_back(w1);
-
-    VkWriteDescriptorSet w2{};
-    w2.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w2.dstSet = m_tonemapDescSet;
-    w2.dstBinding = 1;
-    w2.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w2.descriptorCount = 1;
-    w2.pImageInfo = &outputImageInfo;
-    writes.push_back(w2);
-
-    // Multi-GPU merge descriptor set
-    VkDescriptorBufferInfo secBufInfo{};
-    if (m_secTransferBuffer) {
-        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * 4 * sizeof(float);
-        m_secTransferBuffer = std::make_unique<Buffer>(
-            allocator, bufferSize,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_AUTO,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-        secBufInfo = { m_secTransferBuffer->getBuffer(), 0, bufferSize };
-
-        if (m_mergeDescSet != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet mw0{};
-            mw0.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            mw0.dstSet = m_mergeDescSet;
-            mw0.dstBinding = 0;
-            mw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            mw0.descriptorCount = 1;
-            mw0.pImageInfo = &accumImageInfo;
-            writes.push_back(mw0);
-
-            VkWriteDescriptorSet mw1{};
-            mw1.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            mw1.dstSet = m_mergeDescSet;
-            mw1.dstBinding = 1;
-            mw1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            mw1.descriptorCount = 1;
-            mw1.pBufferInfo = &secBufInfo;
-            writes.push_back(mw1);
-        }
-    }
-
-    // Wavefront descriptor sets update with new m_accumImage view
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        if (m_wfClassifyDescSets[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw0.dstSet = m_wfClassifyDescSets[i];
-            cw0.dstBinding = 0;
-            cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            cw0.descriptorCount = 1;
-            cw0.pImageInfo = &accumImageInfo;
-            writes.push_back(cw0);
-        }
-        if (m_wfShadeDescSetsA[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            swA.dstSet = m_wfShadeDescSetsA[i];
-            swA.dstBinding = 0;
-            swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            swA.descriptorCount = 1;
-            swA.pImageInfo = &accumImageInfo;
-            writes.push_back(swA);
-        }
-        if (m_wfShadeDescSetsB[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            swB.dstSet = m_wfShadeDescSetsB[i];
-            swB.dstBinding = 0;
-            swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            swB.descriptorCount = 1;
-            swB.pImageInfo = &accumImageInfo;
-            writes.push_back(swB);
-        }
-    }
+    // 5. Update all image descriptors and multi-GPU merge descriptors
+    updateAllImageDescriptors();
+    updateMergeDescriptors();
 
     // Reallocate wavefront ray queues if new resolution exceeds capacity
     VkDeviceSize requiredQueueSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * 96;
@@ -2801,19 +2830,19 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
         qAInfo = { m_rayQueueA->getBuffer(), 0, requiredQueueSize };
         qBInfo = { m_rayQueueB->getBuffer(), 0, requiredQueueSize };
 
+        std::vector<VkWriteDescriptorSet> queueWrites;
         for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
             // Classify binding 9 (queue A)
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
             // Shade A binding 9 (in: A), 10 (out: B)
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
             // Shade B binding 9 (in: B), 10 (out: A)
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
+            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
+            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
         }
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(queueWrites.size()), queueWrites.data(), 0, nullptr);
     }
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
     // 5. Reset UI dump buffer if allocated
     if (m_uiDumpBuffer) {
@@ -2831,12 +2860,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
                      dgcCmd.x, dgcCmd.y, m_config.width, m_config.height);
     }
 
-    // 7. Resize secondary GPU if active
-    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
-        m_mgpu->resize(m_config.width, m_config.height);
-    }
-
-    // 8. Adapt Camera aspect ratio & FOV
+    // 7. Adapt Camera aspect ratio & FOV
     if (m_camera) {
         float aspect = static_cast<float>(m_config.width) / static_cast<float>(m_config.height);
         m_camera->adaptFovForAspect(aspect);

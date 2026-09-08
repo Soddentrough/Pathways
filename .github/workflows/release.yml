@@ -46,7 +46,7 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DENABLE_NATIVE_OPTIMIZATION=ON \
             -DCMAKE_INSTALL_PREFIX=/usr
 
       - name: Build
@@ -103,7 +103,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CONFIGURATION_TYPES=Release \
-            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DENABLE_NATIVE_OPTIMIZATION=ON \
             -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }};C:/vcpkg/installed/x64-windows" \
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
 

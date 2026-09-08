@@ -44,6 +44,7 @@ struct PciLinkInfo {
     std::string maxSpeed = "";
     uint32_t maxWidth = 0;
     std::string generationName = "";
+    std::string maxGenerationName = "";
     std::string formattedLink = "PCIe N/A";
     std::string hwmonPath = "";
     bool isDegraded = false;
@@ -83,6 +84,7 @@ public:
     bool hasDGC() const { return m_hasDGC; }
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
+    bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
     const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
     uint32_t getValidationErrors() const { return s_validationErrors; }
     const PciLinkInfo& getPciLinkInfo() const { return m_pciLinkInfo; }
@@ -118,6 +120,7 @@ private:
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;
+    bool m_hasExternalMemoryHost = false;
     PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;

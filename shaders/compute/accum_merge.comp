@@ -1,34 +1,61 @@
 #version 450
+#extension GL_EXT_shader_image_load_formatted : require
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
 // Output linear accumulation buffer on primary GPU
-layout(binding = 0, rgba32f) uniform image2D uPrimaryAccum;
+layout(binding = 0) uniform image2D uPrimaryAccum;
 
 // Secondary GPU accumulated radiance data transferred via PCIe
-layout(std430, binding = 1) readonly buffer SecondaryAccumBuffer {
-    vec4 secondaryRadiance[];
+// Binding 1: 16-bit half float packed (uvec2 = 8 bytes per pixel, 50% bandwidth)
+layout(std430, binding = 1) readonly buffer SecondaryAccumBuffer16 {
+    uvec2 secondaryRadiance16[];
+};
+
+// Binding 2: 32-bit full float (vec4 = 16 bytes per pixel)
+layout(std430, binding = 2) readonly buffer SecondaryAccumBuffer32 {
+    vec4 secondaryRadiance32[];
 };
 
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
     uint secondarySpp;
-    uint padding;
+    uint tileSize;             // Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
+    uint formatMode;           // 0 = RGBA16_SFLOAT (default), 1 = RGBA32_SFLOAT
+    uint reserved;
 } pc;
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    uint tileSize = (pc.tileSize == 0u) ? 64u : pc.tileSize;
+    uint workgroupsPerTile = max(1u, tileSize / 16u);
+    uint tileX = gl_WorkGroupID.x / workgroupsPerTile;
+    uint tileY = gl_WorkGroupID.y / workgroupsPerTile;
 
+    // Checkerboard Tiling: Even tiles were rendered by Primary GPU (GPU 0)
+    // 16x16 workgroups on even tiles early exit with zero wave divergence
+    uint wgParity = (tileX + tileY) & 1u;
+    if (wgParity == 0u) return;
+
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
     if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
         return;
     }
 
-    uint linearIndex = pixelCoord.y * pc.width + pixelCoord.x;
-    vec4 secVal = secondaryRadiance[linearIndex];
+    // Packed half-grid index from secondary GPU
+    uint tx = uint(pixelCoord.x) / tileSize;
+    uint tx_half = tx / 2u;
+    uint localX = uint(pixelCoord.x) % tileSize;
+    uint secX = tx_half * tileSize + localX;
+    uint linearIndex = uint(pixelCoord.y) * ((pc.width + 1u) / 2u) + secX;
 
-    vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);
-    vec4 combinedVal = primVal + secVal;
+    vec4 secVal;
+    if (pc.formatMode == 0u) {
+        uvec2 raw = secondaryRadiance16[linearIndex];
+        secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
+    } else {
+        secVal = secondaryRadiance32[linearIndex];
+    }
 
-    imageStore(uPrimaryAccum, pixelCoord, combinedVal);
+    imageStore(uPrimaryAccum, pixelCoord, secVal);
 }
