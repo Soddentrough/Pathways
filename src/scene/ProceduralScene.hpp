@@ -50,6 +50,10 @@ struct SceneData {
     glm::vec3 cameraTarget = glm::vec3(0.0f, 1.0f, 0.0f);
     glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
     float cameraFov = 45.0f;
+
+    glm::vec3 boundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+    glm::vec3 boundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
+    float sceneRadius = 2.0f;
 };
 
 class ProceduralScene {

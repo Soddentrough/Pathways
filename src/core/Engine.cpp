@@ -153,12 +153,11 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     initVulkan();
     initScene();
-    if (m_config.mgpu_mode != MultiGpuMode::Off) {
+    auto physicalDevices = VulkanContext::enumeratePhysicalDevices(m_context->getInstance());
+    if (physicalDevices.size() >= 2) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
     initPipelines();
-    initWavefrontResources();
-    initWavefrontPipelines();
     initSyncObjects();
     initQueryPool();
 
@@ -209,39 +208,20 @@ Engine::~Engine() {
     }
     m_renderFinishedSemaphores.clear();
 
-    if (m_rtPipeline) vkDestroyPipeline(device, m_rtPipeline, nullptr);
+    m_rtpKhrPipeline.reset();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
-    if (m_wfClassifyPipeline) vkDestroyPipeline(device, m_wfClassifyPipeline, nullptr);
-    if (m_wfResolvePipeline) vkDestroyPipeline(device, m_wfResolvePipeline, nullptr);
-    if (m_wfShadePipeline) vkDestroyPipeline(device, m_wfShadePipeline, nullptr);
-    if (m_wfPersistentPipeline) vkDestroyPipeline(device, m_wfPersistentPipeline, nullptr);
 
-    if (m_rtPipelineLayout) vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
     if (m_rtpPipelineLayout) vkDestroyPipelineLayout(device, m_rtpPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
     if (m_mergePipelineLayout) vkDestroyPipelineLayout(device, m_mergePipelineLayout, nullptr);
-    if (m_wfClassifyPipelineLayout) vkDestroyPipelineLayout(device, m_wfClassifyPipelineLayout, nullptr);
-    if (m_wfResolvePipelineLayout) vkDestroyPipelineLayout(device, m_wfResolvePipelineLayout, nullptr);
-    if (m_wfShadePipelineLayout) vkDestroyPipelineLayout(device, m_wfShadePipelineLayout, nullptr);
 
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
-    if (m_wfClassifyDescLayout) vkDestroyDescriptorSetLayout(device, m_wfClassifyDescLayout, nullptr);
-    if (m_wfResolveDescLayout) vkDestroyDescriptorSetLayout(device, m_wfResolveDescLayout, nullptr);
-    if (m_wfShadeDescLayout) vkDestroyDescriptorSetLayout(device, m_wfShadeDescLayout, nullptr);
 
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     m_secTransferBuffer.reset();
-    m_workQueueBuffer.reset();
-
-    m_rayQueueA.reset();
-    m_rayQueueB.reset();
-    m_wavefrontCounters.reset();
-    m_wavefrontIndirectCmd.reset();
-    m_wavefrontDgcStream.reset();
-    m_wavefrontDgcCount.reset();
 
     m_gui.reset();
     m_swapchain.reset();
@@ -392,11 +372,27 @@ void Engine::initVulkan() {
 void Engine::initScene() {
     VmaAllocator allocator = m_context->getAllocator();
 
+    m_availableScenes = SceneRegistry::scan("scenes");
+    m_currentSceneIndex = 0;
+
     if (!m_config.scene_path.empty()) {
         Logger::info("Loading user specified scene: {}", m_config.scene_path);
         m_sceneData = GltfLoader::loadSceneData(m_config.scene_path);
+        m_currentSceneIndex = -1;
+        for (size_t i = 0; i < m_availableScenes.size(); ++i) {
+            std::error_code ec;
+            if (m_availableScenes[i].filepath == m_config.scene_path ||
+                (!m_availableScenes[i].filepath.empty() &&
+                 std::filesystem::exists(m_availableScenes[i].filepath) &&
+                 std::filesystem::exists(m_config.scene_path) &&
+                 std::filesystem::equivalent(m_availableScenes[i].filepath, m_config.scene_path, ec))) {
+                m_currentSceneIndex = static_cast<int>(i);
+                break;
+            }
+        }
     } else {
         m_sceneData = ProceduralScene::createCornellBox();
+        m_currentSceneIndex = 0;
     }
 
     if (m_sceneData.triangles.empty() && m_sceneData.spheres.empty()) {
@@ -412,10 +408,13 @@ void Engine::initScene() {
     Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights",
                  m_numTriangles, m_numSpheres, m_numMaterials, m_numLights);
 
-    if (m_sceneData.hasCamera && m_camera) {
-        m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
-        m_camera->setFov(m_sceneData.cameraFov);
-        m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
+    if (m_camera) {
+        m_camera->setSceneScale(m_sceneData.sceneRadius);
+        if (m_sceneData.hasCamera) {
+            m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
+            m_camera->setFov(m_sceneData.cameraFov);
+            m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
+        }
     }
 
     // Triangle buffer
@@ -476,13 +475,6 @@ void Engine::initScene() {
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
         );
     }
-
-    // Persistent Wavefront Work Queue Buffer
-    m_workQueueBuffer = std::make_unique<Buffer>(
-        allocator, sizeof(uint32_t) * 16,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     if (m_context->hasRayTracing()) {
@@ -581,6 +573,210 @@ void Engine::initScene() {
     Logger::info("Scene textures loaded: {} texture(s).", m_sceneTextures.size());
 }
 
+bool Engine::loadScene(const std::string& filepath) {
+    VkDevice device = m_context->getDevice();
+    vkDeviceWaitIdle(device);
+    if (m_mgpu && m_mgpu->getSecondaryContext()) {
+        vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
+    }
+
+    SceneData newScene;
+    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+        Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
+        newScene = ProceduralScene::createCornellBox();
+    } else {
+        Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
+        newScene = GltfLoader::loadSceneData(filepath);
+    }
+    if (newScene.triangles.empty() && newScene.spheres.empty()) {
+        Logger::warn("Loaded scene '{}' contains no renderable geometry! Keeping current scene.", filepath);
+        return false;
+    }
+
+    m_sceneData = std::move(newScene);
+    m_numTriangles = static_cast<uint32_t>(m_sceneData.triangles.size());
+    m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
+    m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
+    m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
+
+    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights",
+                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights);
+
+    // Recreate primary buffers
+    VmaAllocator allocator = m_context->getAllocator();
+
+    VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * m_sceneData.triangles.size(), sizeof(TriangleGPU));
+    m_triangleBuffer = std::make_unique<Buffer>(
+        allocator, triSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.triangles.empty()) {
+        m_triangleBuffer->copyFrom(m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
+    }
+
+    VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * m_sceneData.spheres.size(), sizeof(SphereGPU));
+    m_sphereBuffer = std::make_unique<Buffer>(
+        allocator, sphereSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.spheres.empty()) {
+        m_sphereBuffer->copyFrom(m_sceneData.spheres.data(), sizeof(SphereGPU) * m_sceneData.spheres.size());
+    }
+
+    VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * m_sceneData.materials.size(), sizeof(MaterialGPU));
+    m_materialBuffer = std::make_unique<Buffer>(
+        allocator, matSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.materials.empty()) {
+        m_materialBuffer->copyFrom(m_sceneData.materials.data(), sizeof(MaterialGPU) * m_sceneData.materials.size());
+    }
+
+    VkDeviceSize lightSize = std::max(sizeof(LightGPU) * m_sceneData.lights.size(), sizeof(LightGPU));
+    m_lightBuffer = std::make_unique<Buffer>(
+        allocator, lightSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.lights.empty()) {
+        m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
+    }
+
+    // Rebuild Acceleration Structures (BLAS & TLAS)
+    if (m_context->hasRayTracing()) {
+        m_tlas.reset();
+        m_blas.reset();
+        m_asVertexBuffer.reset();
+        m_asManager.reset();
+
+        std::vector<Vertex> asVertices;
+        if (!m_sceneData.triangles.empty()) {
+            asVertices.reserve(m_sceneData.triangles.size() * 3);
+            for (const auto& tri : m_sceneData.triangles) {
+                asVertices.push_back(tri.v0);
+                asVertices.push_back(tri.v1);
+                asVertices.push_back(tri.v2);
+            }
+        } else {
+            Vertex v{};
+            asVertices.assign(3, v);
+        }
+
+        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
+        m_asVertexBuffer = std::make_unique<Buffer>(
+            allocator, vertexBufferSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+        m_asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
+
+        m_asManager = std::make_unique<AccelerationStructureManager>(
+            device, allocator,
+            m_context->getGraphicsQueue(), m_context->getGraphicsQueueFamily()
+        );
+
+        ASGeometryInput geom{};
+        geom.vertexBufferAddress = m_asVertexBuffer->getDeviceAddress(device);
+        geom.indexBufferAddress = 0;
+        geom.vertexCount = static_cast<uint32_t>(asVertices.size());
+        geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
+        geom.vertexStride = sizeof(Vertex);
+        geom.indexType = VK_INDEX_TYPE_NONE_KHR;
+        bool hasAlphaMask = false;
+        for (const auto& mat : m_sceneData.materials) {
+            if (mat.alphaMode == ALPHA_MODE_MASK) {
+                hasAlphaMask = true;
+                break;
+            }
+        }
+        geom.isOpaque = !hasAlphaMask;
+
+        m_blas = m_asManager->buildBLAS({ geom });
+
+        ASInstanceInput inst{};
+        inst.blasAddress = m_blas->getDeviceAddress();
+        inst.transform = glm::mat4(1.0f);
+        inst.customIndex = 0;
+        inst.mask = 0xFF;
+        inst.hitGroupId = 0;
+        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+        m_tlas = m_asManager->buildTLAS({ inst });
+        if (!m_tlas) {
+            throw std::runtime_error("Hardware Ray Tracing TLAS rebuild failed.");
+        }
+    }
+
+    // Reload scene textures
+    VkQueue queue = m_context->getGraphicsQueue();
+    VkCommandPool pool = m_commandPool;
+
+    m_sceneTextures.clear();
+    for (const auto& texData : m_sceneData.textures) {
+        if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+            VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            auto tex = Texture::createFromPixels(
+                device, allocator, queue, pool,
+                texData.width, texData.height,
+                fmt, texData.pixels.data(),
+                texData.pixels.size(), false
+            );
+            m_sceneTextures.push_back(std::move(tex));
+        } else {
+            m_sceneTextures.push_back(Texture::createDummyWhite(device, allocator, queue, pool));
+        }
+    }
+
+    // Update primary descriptor sets
+    updateSceneDescriptors();
+
+    // Secondary GPU reload
+    if (m_mgpu && m_mgpu->isSecondaryInitialized()) {
+        m_mgpu->loadScene(m_sceneData);
+    }
+
+    // Update camera framing
+    if (m_camera) {
+        m_camera->setSceneScale(m_sceneData.sceneRadius);
+        m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
+        m_camera->setFov(m_sceneData.cameraFov);
+        m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
+    }
+
+    // Update scene path and current index
+    m_config.scene_path = filepath;
+    m_currentSceneIndex = 0;
+    if (!filepath.empty()) {
+        for (size_t i = 0; i < m_availableScenes.size(); ++i) {
+            std::error_code ec;
+            if (m_availableScenes[i].filepath == filepath ||
+                (!m_availableScenes[i].filepath.empty() &&
+                 std::filesystem::exists(m_availableScenes[i].filepath) &&
+                 std::filesystem::exists(filepath) &&
+                 std::filesystem::equivalent(m_availableScenes[i].filepath, filepath, ec))) {
+                m_currentSceneIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    // Reset frame accumulation
+    m_frameIndex = 0;
+    m_resetAccumulation = true;
+    m_frameTimesMs.clear();
+
+    Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
+    return true;
+}
+
 std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
     std::filesystem::path exeDir;
 #ifdef _WIN32
@@ -661,10 +857,8 @@ void Engine::initPipelines() {
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
     // 2. Ray Tracing Descriptor Set Layout
-    VkShaderStageFlags rtStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    if (m_context->hasRayTracing()) {
-        rtStages |= VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-    }
+    // 2. Ray Tracing Descriptor Set Layout (VK_KHR_ray_tracing_pipeline)
+    VkShaderStageFlags rtStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
 
     std::vector<VkDescriptorSetLayoutBinding> rtBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
@@ -675,8 +869,7 @@ void Engine::initPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -723,83 +916,53 @@ void Engine::initPipelines() {
     outputImageInfo.imageView = m_outputImage->getImageView();
     outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
-    VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
-    VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
-    VkDescriptorBufferInfo lightBufferInfo{ m_lightBuffer->getBuffer(), 0, m_lightBuffer->getSize() };
-
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
-    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asInfo.accelerationStructureCount = 1;
-    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
-    asInfo.pAccelerationStructures = &tlasHandle;
-
-    VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
-
-    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
-    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
-        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
-            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
-        } else {
-            texInfos[i] = m_dummyWhite->getDescriptorInfo();
-        }
-    }
-
     std::vector<VkDescriptorBufferInfo> uboBufferInfos(MAX_FRAMES_IN_FLIGHT);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         uboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
     }
-    VkDescriptorBufferInfo workQueueInfo{ m_workQueueBuffer->getBuffer(), 0, m_workQueueBuffer->getSize() };
 
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfos[i], nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &workQueueInfo, nullptr });
     }
     // Tonemap set
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputImageInfo, nullptr, nullptr });
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-    // 6. Pipeline Layouts
-    VkPushConstantRange rtPushConstant{};
-    rtPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    rtPushConstant.offset = 0;
-    rtPushConstant.size = sizeof(uint32_t) * 12;
+    updateSceneDescriptors();
 
-    VkPipelineLayoutCreateInfo rtPipeLayoutInfo{};
-    rtPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    rtPipeLayoutInfo.setLayoutCount = 1;
-    rtPipeLayoutInfo.pSetLayouts = &m_rtDescLayout;
-    rtPipeLayoutInfo.pushConstantRangeCount = 1;
-    rtPipeLayoutInfo.pPushConstantRanges = &rtPushConstant;
-    vkCreatePipelineLayout(device, &rtPipeLayoutInfo, nullptr, &m_rtPipelineLayout);
+    // 6. Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+    VkPushConstantRange rtpPushConstant{};
+    rtpPushConstant.stageFlags = rtStages;
+    rtpPushConstant.offset = 0;
+    rtpPushConstant.size = sizeof(uint32_t) * 12;
 
-    if (m_context->hasRayTracing()) {
-        VkPushConstantRange rtpPushConstant{};
-        rtpPushConstant.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-                                     VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                                     VK_SHADER_STAGE_MISS_BIT_KHR;
-        rtpPushConstant.offset = 0;
-        rtpPushConstant.size = sizeof(uint32_t) * 12;
+    VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
+    rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    rtpPipeLayoutInfo.setLayoutCount = 1;
+    rtpPipeLayoutInfo.pSetLayouts = &m_rtDescLayout;
+    rtpPipeLayoutInfo.pushConstantRangeCount = 1;
+    rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
+    vkCreatePipelineLayout(device, &rtpPipeLayoutInfo, nullptr, &m_rtpPipelineLayout);
 
-        VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
-        rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        rtpPipeLayoutInfo.setLayoutCount = 1;
-        rtpPipeLayoutInfo.pSetLayouts = &m_rtDescLayout;
-        rtpPipeLayoutInfo.pushConstantRangeCount = 1;
-        rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
-        vkCreatePipelineLayout(device, &rtpPipeLayoutInfo, nullptr, &m_rtpPipelineLayout);
-    }
+    VmaAllocator allocator = m_context->getAllocator();
 
+    auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
+    auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
+    auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
+    auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
+
+    m_rtpKhrPipeline = std::make_unique<RTPipeline>(
+        device, allocator,
+        m_context->getRayTracingPipelineProperties(),
+        m_rtpPipelineLayout,
+        rgenCode, rmissCode, shadowMissCode, rchitCode
+    );
+    Logger::info("Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
+
+    // 7. ACES Tonemapping Compute Pipeline (Wave32 execution mode on RDNA4)
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     tonemapPushConstant.offset = 0;
@@ -813,42 +976,9 @@ void Engine::initPipelines() {
     tonemapPipeLayoutInfo.pPushConstantRanges = &tonemapPushConstant;
     vkCreatePipelineLayout(device, &tonemapPipeLayoutInfo, nullptr, &m_tonemapPipelineLayout);
 
-    // 7. Compute Pipelines (Wave32 execution mode on RDNA4)
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
     subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
     subgroupSize32.requiredSubgroupSize = 32;
-
-    auto rtCode = loadShaderSPIRV("raytrace_comp.comp.spv");
-    VkShaderModule rtModule = createShaderModule(rtCode);
-
-    VkComputePipelineCreateInfo rtPipelineInfo{};
-    rtPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    rtPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    rtPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    rtPipelineInfo.stage.module = rtModule;
-    rtPipelineInfo.stage.pName = "main";
-    if (m_context->hasSubgroupSizeControl()) {
-        rtPipelineInfo.stage.pNext = &subgroupSize32;
-    }
-    rtPipelineInfo.layout = m_rtPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
-    vkDestroyShaderModule(device, rtModule, nullptr);
-
-    auto wfPersistentCode = loadShaderSPIRV("wavefront_persistent.comp.spv");
-    VkShaderModule wfPersistentModule = createShaderModule(wfPersistentCode);
-
-    VkComputePipelineCreateInfo wfPersistentPipelineInfo{};
-    wfPersistentPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    wfPersistentPipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    wfPersistentPipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    wfPersistentPipelineInfo.stage.module = wfPersistentModule;
-    wfPersistentPipelineInfo.stage.pName = "main";
-    if (m_context->hasSubgroupSizeControl()) {
-        wfPersistentPipelineInfo.stage.pNext = &subgroupSize32;
-    }
-    wfPersistentPipelineInfo.layout = m_rtPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &wfPersistentPipelineInfo, nullptr, &m_wfPersistentPipeline);
-    vkDestroyShaderModule(device, wfPersistentModule, nullptr);
 
     auto tonemapCode = loadShaderSPIRV("tonemap_aces.comp.spv");
     VkShaderModule tonemapModule = createShaderModule(tonemapCode);
@@ -866,53 +996,7 @@ void Engine::initPipelines() {
     vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &tonemapPipelineInfo, nullptr, &m_tonemapPipeline);
     vkDestroyShaderModule(device, tonemapModule, nullptr);
 
-    Logger::info("Compute pipelines (Path Tracer & ACES Tonemapping - Wave32) created successfully.");
-
-    VmaAllocator allocator = m_context->getAllocator();
-
-    // Initialize Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) if supported
-    if (m_context->hasRayTracing()) {
-        try {
-            auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
-            auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
-            auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
-            auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
-
-            m_rtpKhrPipeline = std::make_unique<RTPipeline>(
-                device, allocator,
-                m_context->getRayTracingPipelineProperties(),
-                m_rtpPipelineLayout,
-                rgenCode, rmissCode, shadowMissCode, rchitCode
-            );
-            Logger::info("Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
-        } catch (const std::exception& e) {
-            Logger::warn("Failed to initialize RTPipeline: {}", e.what());
-        }
-    }
-
-    // Initialize Device-Generated Commands (VK_EXT_device_generated_commands) if supported
-    if (m_context->hasDGC()) {
-        try {
-            m_dgc = std::make_unique<DGCManager>(device, allocator, m_rtPipelineLayout);
-            if (m_dgc->isSupported()) {
-                m_dgcArgumentBuffer = std::make_unique<Buffer>(
-                    allocator, sizeof(VkDispatchIndirectCommand),
-                    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-                    256
-                );
-                VkDispatchIndirectCommand defaultCmd{};
-                defaultCmd.x = (m_config.width + 7) / 8;
-                defaultCmd.y = (m_config.height + 3) / 4;
-                defaultCmd.z = 1;
-                m_dgcArgumentBuffer->copyFrom(&defaultCmd, sizeof(VkDispatchIndirectCommand));
-                Logger::info("Device-Generated Commands (DGC) initialized successfully.");
-            }
-        } catch (const std::exception& e) {
-            Logger::warn("DGC initialization exception: {}", e.what());
-        }
-    }
+    Logger::info("ACES Tonemapping Pipeline (Wave32) created successfully.");
 
     // Multi-GPU Merge Pipeline & Descriptors (Created unconditionally so mode switches never fault)
     std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
@@ -1009,36 +1093,48 @@ void Engine::updateAllImageDescriptors() {
         writes.push_back(w2);
     }
 
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        if (m_wfClassifyDescSets[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet cw0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            cw0.dstSet = m_wfClassifyDescSets[i];
-            cw0.dstBinding = 0;
-            cw0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            cw0.descriptorCount = 1;
-            cw0.pImageInfo = &accumImageInfo;
-            writes.push_back(cw0);
-        }
-        if (m_wfShadeDescSetsA[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet swA{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            swA.dstSet = m_wfShadeDescSetsA[i];
-            swA.dstBinding = 0;
-            swA.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            swA.descriptorCount = 1;
-            swA.pImageInfo = &accumImageInfo;
-            writes.push_back(swA);
-        }
-        if (m_wfShadeDescSetsB[i] != VK_NULL_HANDLE) {
-            VkWriteDescriptorSet swB{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            swB.dstSet = m_wfShadeDescSetsB[i];
-            swB.dstBinding = 0;
-            swB.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            swB.descriptorCount = 1;
-            swB.pImageInfo = &accumImageInfo;
-            writes.push_back(swB);
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::updateSceneDescriptors() {
+    VkDevice device = m_context->getDevice();
+
+    VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
+    VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
+    VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
+    VkDescriptorBufferInfo lightBufferInfo{ m_lightBuffer->getBuffer(), 0, m_lightBuffer->getSize() };
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
+    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    asInfo.accelerationStructureCount = 1;
+    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
+    asInfo.pAccelerationStructures = &tlasHandle;
+
+    VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
+
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
+        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
+            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = m_dummyWhite->getDescriptorInfo();
         }
     }
 
+    std::vector<VkWriteDescriptorSet> writes;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_rtDescSets[i] == VK_NULL_HANDLE) continue;
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+    }
     if (!writes.empty()) {
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -1088,279 +1184,7 @@ void Engine::updateMergeDescriptors() {
     }
 }
 
-void Engine::initWavefrontResources() {
-    VkDevice device = m_context->getDevice();
-    VmaAllocator allocator = m_context->getAllocator();
 
-    VkDeviceSize maxRays = static_cast<VkDeviceSize>(m_config.width) * m_config.height;
-    VkDeviceSize rayPayloadSize = 96; // 6 * vec4 (24 floats)
-    VkDeviceSize queueSize = maxRays * rayPayloadSize;
-
-    // Ray Queue A
-    m_rayQueueA = std::make_unique<Buffer>(
-        allocator, queueSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    // Ray Queue B (ping-pong partner)
-    m_rayQueueB = std::make_unique<Buffer>(
-        allocator, queueSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    // Wavefront Counters: [activeRayCount, nextActiveCount, totalProcessed, padding]
-    m_wavefrontCounters = std::make_unique<Buffer>(
-        allocator, sizeof(uint32_t) * 4,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    // Indirect Dispatch Command: VkDispatchIndirectCommand { uint x, y, z }
-    m_wavefrontIndirectCmd = std::make_unique<Buffer>(
-        allocator, sizeof(VkDispatchIndirectCommand),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    // DGC Sequence Stream: sequence count (uint32) + padding + sequence items
-    m_wavefrontDgcStream = std::make_unique<Buffer>(
-        allocator, 256,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    m_wavefrontDgcCount = std::make_unique<Buffer>(
-        allocator, 16,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-
-    Logger::info("Wavefront Compaction Queues allocated: 2x {:.2f} MB ({:.2f}M ray capacity each).",
-                 (queueSize / (1024.0 * 1024.0)), (maxRays / 1000000.0));
-}
-
-void Engine::initWavefrontPipelines() {
-    VkDevice device = m_context->getDevice();
-
-    // 1. Classify Descriptor Set Layout (Bindings 0-8 match RT, 9: OutRayQueue, 10: QueueCounters)
-    std::vector<VkDescriptorSetLayoutBinding> classifyBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo classifyLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    classifyLayoutInfo.bindingCount = static_cast<uint32_t>(classifyBindings.size());
-    classifyLayoutInfo.pBindings = classifyBindings.data();
-    vkCreateDescriptorSetLayout(device, &classifyLayoutInfo, nullptr, &m_wfClassifyDescLayout);
-
-    // 2. Resolve Descriptor Set Layout (Binding 0: QueueCounters, 1: IndirectCommand, 2: DGCStream)
-    std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
-    resolveLayoutInfo.pBindings = resolveBindings.data();
-    vkCreateDescriptorSetLayout(device, &resolveLayoutInfo, nullptr, &m_wfResolveDescLayout);
-
-    // 3. Shade Descriptor Set Layout (Bindings 0-8 match RT, 9: InRayQueue, 10: OutRayQueue, 11: QueueCounters)
-    std::vector<VkDescriptorSetLayoutBinding> shadeBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo shadeLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    shadeLayoutInfo.bindingCount = static_cast<uint32_t>(shadeBindings.size());
-    shadeLayoutInfo.pBindings = shadeBindings.data();
-    vkCreateDescriptorSetLayout(device, &shadeLayoutInfo, nullptr, &m_wfShadeDescLayout);
-
-    // 4. Allocate Descriptor Sets
-    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_descriptorPool;
-
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_wfResolveDescLayout;
-    vkAllocateDescriptorSets(device, &allocInfo, &m_wfResolveDescSet);
-
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        allocInfo.pSetLayouts = &m_wfClassifyDescLayout;
-        vkAllocateDescriptorSets(device, &allocInfo, &m_wfClassifyDescSets[i]);
-
-        allocInfo.pSetLayouts = &m_wfShadeDescLayout;
-        vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetsA[i]);
-        vkAllocateDescriptorSets(device, &allocInfo, &m_wfShadeDescSetsB[i]);
-    }
-
-    // 5. Populate and Write Descriptor Sets
-    VkDescriptorImageInfo accumImageInfo{};
-    accumImageInfo.imageView = m_accumImage->getImageView();
-    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkDescriptorBufferInfo triBufferInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
-    VkDescriptorBufferInfo sphereBufferInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
-    VkDescriptorBufferInfo matBufferInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
-    VkDescriptorBufferInfo lightBufferInfo{ m_lightBuffer->getBuffer(), 0, m_lightBuffer->getSize() };
-
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-    asInfo.accelerationStructureCount = 1;
-    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
-    asInfo.pAccelerationStructures = &tlasHandle;
-
-    VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
-
-    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
-    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
-        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
-            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
-        } else {
-            texInfos[i] = m_dummyWhite->getDescriptorInfo();
-        }
-    }
-
-    VkDescriptorBufferInfo queueABufInfo{ m_rayQueueA->getBuffer(), 0, m_rayQueueA->getSize() };
-    VkDescriptorBufferInfo queueBBufInfo{ m_rayQueueB->getBuffer(), 0, m_rayQueueB->getSize() };
-    VkDescriptorBufferInfo counterBufInfo{ m_wavefrontCounters->getBuffer(), 0, m_wavefrontCounters->getSize() };
-    VkDescriptorBufferInfo indirectBufInfo{ m_wavefrontIndirectCmd->getBuffer(), 0, m_wavefrontIndirectCmd->getSize() };
-    VkDescriptorBufferInfo dgcStreamBufInfo{ m_wavefrontDgcStream->getBuffer(), 0, m_wavefrontDgcStream->getSize() };
-
-    std::vector<VkWriteDescriptorSet> writes;
-
-    // Resolve Set: binding 0 (counters), binding 1 (indirect), binding 2 (dgc stream)
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &indirectBufInfo, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfResolveDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dgcStreamBufInfo, nullptr });
-
-    std::vector<VkDescriptorBufferInfo> wfUboBufferInfos(MAX_FRAMES_IN_FLIGHT);
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        wfUboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
-    }
-
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        auto pushCommonBindings = [&](VkDescriptorSet dstSet) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &wfUboBufferInfos[i], nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triBufferInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereBufferInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matBufferInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightBufferInfo, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, dstSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        };
-
-        // Classify Set: Common + binding 9 (queue A), binding 10 (counters)
-        pushCommonBindings(m_wfClassifyDescSets[i]);
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
-
-        // Shade Set A: Common + binding 9 (in: queue A), binding 10 (out: queue B), binding 11 (counters)
-        pushCommonBindings(m_wfShadeDescSetsA[i]);
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
-
-        // Shade Set B: Common + binding 9 (in: queue B), binding 10 (out: queue A), binding 11 (counters)
-        pushCommonBindings(m_wfShadeDescSetsB[i]);
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueBBufInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queueABufInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &counterBufInfo, nullptr });
-    }
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-
-    // 6. Pipeline Layouts
-    VkPushConstantRange wfPushConstant{};
-    wfPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    wfPushConstant.offset = 0;
-    wfPushConstant.size = sizeof(uint32_t) * 16;
-
-    VkPipelineLayoutCreateInfo classifyPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    classifyPipeLayoutInfo.setLayoutCount = 1;
-    classifyPipeLayoutInfo.pSetLayouts = &m_wfClassifyDescLayout;
-    classifyPipeLayoutInfo.pushConstantRangeCount = 1;
-    classifyPipeLayoutInfo.pPushConstantRanges = &wfPushConstant;
-    vkCreatePipelineLayout(device, &classifyPipeLayoutInfo, nullptr, &m_wfClassifyPipelineLayout);
-
-    VkPushConstantRange resolvePushConstant{};
-    resolvePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    resolvePushConstant.offset = 0;
-    resolvePushConstant.size = sizeof(uint32_t) * 16;
-
-    VkPipelineLayoutCreateInfo resolvePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    resolvePipeLayoutInfo.setLayoutCount = 1;
-    resolvePipeLayoutInfo.pSetLayouts = &m_wfResolveDescLayout;
-    resolvePipeLayoutInfo.pushConstantRangeCount = 1;
-    resolvePipeLayoutInfo.pPushConstantRanges = &resolvePushConstant;
-    vkCreatePipelineLayout(device, &resolvePipeLayoutInfo, nullptr, &m_wfResolvePipelineLayout);
-
-    VkPipelineLayoutCreateInfo shadePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    shadePipeLayoutInfo.setLayoutCount = 1;
-    shadePipeLayoutInfo.pSetLayouts = &m_wfShadeDescLayout;
-    shadePipeLayoutInfo.pushConstantRangeCount = 1;
-    shadePipeLayoutInfo.pPushConstantRanges = &wfPushConstant;
-    vkCreatePipelineLayout(device, &shadePipeLayoutInfo, nullptr, &m_wfShadePipelineLayout);
-
-    // 7. Compute Pipelines with Wave32 Subgroup Size
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    auto createPipeline = [&](const std::string& spvName, VkPipelineLayout layout) -> VkPipeline {
-        auto code = loadShaderSPIRV(spvName);
-        VkShaderModule mod = createShaderModule(code);
-
-        VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeInfo.stage.module = mod;
-        pipeInfo.stage.pName = "main";
-        if (m_context->hasSubgroupSizeControl()) {
-            pipeInfo.stage.pNext = &subgroupSize32;
-        }
-        pipeInfo.layout = layout;
-
-        VkPipeline pipe = VK_NULL_HANDLE;
-        vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe);
-        vkDestroyShaderModule(device, mod, nullptr);
-        return pipe;
-    };
-
-    m_wfClassifyPipeline = createPipeline("wavefront_classify.comp.spv", m_wfClassifyPipelineLayout);
-    m_wfResolvePipeline  = createPipeline("wavefront_resolve.comp.spv", m_wfResolvePipelineLayout);
-    m_wfShadePipeline    = createPipeline("wavefront_shade.comp.spv", m_wfShadePipelineLayout);
-
-    if (m_context->hasDGC()) {
-        try {
-            m_dgc = std::make_unique<DGCManager>(device, m_context->getAllocator(), m_wfShadePipelineLayout, sizeof(uint32_t) * 13);
-        } catch (...) {
-            Logger::warn("Failed to create DGCManager for wavefront shade pipeline.");
-        }
-    }
-
-    Logger::info("Wavefront Compaction compute pipelines (Classify, Resolve, Shade - Wave32) created successfully.");
-}
 
 void Engine::initSyncObjects() {
     VkDevice device = m_context->getDevice();
@@ -1470,8 +1294,7 @@ bool Engine::handleEvent(const SDL_Event& e) {
         }
         if (e.type == SDL_EVENT_MOUSE_WHEEL) {
             if (m_camera) {
-                float newSpeed = std::clamp(m_camera->getSpeed() + e.wheel.y * 0.5f, 0.2f, 25.0f);
-                m_camera->setSpeed(newSpeed);
+                m_camera->adjustSpeedByWheel(e.wheel.y);
             }
             return true;
         }
@@ -1567,14 +1390,23 @@ void Engine::renderFrame() {
             if (!m_config.headless && m_frameTimesMs.size() > 60) {
                 m_frameTimesMs.erase(m_frameTimesMs.begin());
             }
+            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
         }
     }
 
     // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
-    if (m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
+    if (m_pendingSceneChange || m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
         VkDevice dev = m_context->getDevice();
         VmaAllocator alloc = m_context->getAllocator();
         vkDeviceWaitIdle(dev);
+        if (m_mgpu && m_mgpu->getSecondaryContext()) {
+            vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
+        }
+
+        if (m_pendingSceneChange) {
+            loadScene(m_pendingScenePath);
+            m_pendingSceneChange = false;
+        }
 
         if (m_pendingAccumFormatChange) {
             m_config.accum_format = m_newAccumFormat;
@@ -1615,6 +1447,10 @@ void Engine::renderFrame() {
         }
 
         if (m_pendingMgpuModeChange) {
+            vkDeviceWaitIdle(device);
+            if (m_mgpu && m_mgpu->getSecondaryContext()) {
+                vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
+            }
             m_config.mgpu_mode = m_newMgpuMode;
             m_pendingMgpuModeChange = false;
 
@@ -1629,6 +1465,7 @@ void Engine::renderFrame() {
             } else if (m_mgpu) {
                 m_mgpu->setMode(MultiGpuMode::Off);
             }
+            m_resetAccumulation = true;
         }
 
         if (m_pendingDoubleBufferChange) {
@@ -1648,6 +1485,10 @@ void Engine::renderFrame() {
 
     // Update smooth continuous FPS keyboard navigation
     updateInput();
+
+    if (m_config.camera_motion && m_camera) {
+        m_camera->processMouseMovement(2.0f, 0.0f);
+    }
 
     // Reset accumulation if camera moved or UI settings changed
     if (m_camera->hasMoved() || m_resetAccumulation) {
@@ -1696,7 +1537,7 @@ void Engine::renderFrame() {
     tonemapConstants.visualizeSplit = 0;
     tonemapConstants.tileSize = m_config.tile_size;
 
-    bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive());
+    bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
 
@@ -1728,208 +1569,22 @@ void Engine::renderFrame() {
         float envIntensity = 1.0f;
         uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
-        if (m_config.pipeline_type == PipelineType::Wavefront) {
-            // === WAVEFRONT COMPACTION PIPELINE ===
-            uint32_t maxCapacity = m_config.width * m_config.height;
+        // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
-            for (uint32_t s = 0; s < m_config.spp; ++s) {
-                // 1. Clear Wavefront Counters
-                vkCmdFillBuffer(cmd, m_wavefrontCounters->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
+        uint32_t rtPushConstants[12] = {
+            m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+            0, 0, m_config.width, m_config.height,
+            useHwRT,
+            hasEnvMap,
+            envIntensityBits,
+            1u // accumulateHistory
+        };
+        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+        vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
 
-                VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-                clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                clearDep.memoryBarrierCount = 1;
-                clearDep.pMemoryBarriers = &clearBarrier;
-                vkCmdPipelineBarrier2(cmd, &clearDep);
-
-                // 2. Classify Pass: Primary Ray Generation & Wave Compaction
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfClassifyPipelineLayout, 0, 1, &m_wfClassifyDescSets[m_currentFrame], 0, nullptr);
-
-                uint32_t classifyPC[12] = {
-                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                    m_config.width, m_config.height,
-                    m_config.enable_morton_order ? 1u : 0u,
-                    hasEnvMap,
-                    envIntensityBits,
-                    maxCapacity,
-                    s,
-                    useHwRT
-                };
-                vkCmdPushConstants(cmd, m_wfClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
-
-                uint32_t classifyGroupsX = (m_config.width + 7) / 8;
-                uint32_t classifyGroupsY = (m_config.height + 3) / 4;
-                vkCmdDispatch(cmd, classifyGroupsX, classifyGroupsY, 1);
-
-                // Barrier: Classify writes queue A & counters -> Resolve reads counters
-                VkMemoryBarrier2 classifyToResolveBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                classifyToResolveBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                classifyToResolveBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                classifyToResolveBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                classifyToResolveBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-                VkDependencyInfo classifyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                classifyDep.memoryBarrierCount = 1;
-                classifyDep.pMemoryBarriers = &classifyToResolveBarrier;
-                vkCmdPipelineBarrier2(cmd, &classifyDep);
-
-                // 3. Bounce Loop: Resolve -> Shade (DGC / Indirect)
-                for (uint32_t bounce = 0; bounce < m_config.max_bounces; ++bounce) {
-                    // A. Resolve Pass (1 Wave32 workgroup)
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipeline);
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfResolvePipelineLayout, 0, 1, &m_wfResolveDescSet, 0, nullptr);
-
-                    uint32_t resolveMode = (bounce == 0) ? 0u : 1u;
-                    uint32_t resolvePC[16] = {
-                        resolveMode,
-                        bounce,
-                        m_config.max_bounces,
-                        m_config.width,
-                        m_config.height,
-                        m_numTriangles,
-                        m_numSpheres,
-                        m_numMaterials,
-                        m_numLights,
-                        hasEnvMap,
-                        envIntensityBits,
-                        useHwRT,
-                        maxCapacity,
-                        s,
-                        0, 0
-                    };
-                    vkCmdPushConstants(cmd, m_wfResolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolvePC), resolvePC);
-                    vkCmdDispatch(cmd, 1, 1, 1);
-
-                    // Barrier: Resolve writes indirect cmd & resets counters -> Shade reads indirect cmd & queues
-                    VkMemoryBarrier2 resolveToShadeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                    resolveToShadeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    resolveToShadeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    resolveToShadeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    resolveToShadeBarrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-                    VkDependencyInfo resolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                    resolveDep.memoryBarrierCount = 1;
-                    resolveDep.pMemoryBarriers = &resolveToShadeBarrier;
-                    vkCmdPipelineBarrier2(cmd, &resolveDep);
-
-                    // B. Shade Pass (Ping-Pong: even bounce reads A writes B; odd bounce reads B writes A)
-                    VkDescriptorSet shadeSet = (bounce % 2 == 0) ? m_wfShadeDescSetsA[m_currentFrame] : m_wfShadeDescSetsB[m_currentFrame];
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipeline);
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfShadePipelineLayout, 0, 1, &shadeSet, 0, nullptr);
-
-                    uint32_t shadePC[13] = {
-                        m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                        m_config.width, m_config.height,
-                        bounce,
-                        m_config.max_bounces,
-                        maxCapacity,
-                        s,
-                        hasEnvMap,
-                        envIntensityBits,
-                        useHwRT
-                    };
-                    vkCmdPushConstants(cmd, m_wfShadePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
-
-                    if (m_dgc && m_dgc->isSupported()) {
-                        if (m_dgc->isMultiToken()) {
-                            // Multi-token DGC: Push constants and indirect dispatch generated on-device
-                            m_dgc->recordExecute(cmd, m_wfShadePipeline, m_wavefrontDgcStream.get(), 64, 1, m_wavefrontDgcStream.get(), 0);
-                        } else {
-                            m_dgc->recordExecute(cmd, m_wfShadePipeline, m_wavefrontIndirectCmd.get(), 0, 1, m_wavefrontDgcStream.get(), 0);
-                        }
-                    } else {
-                        vkCmdDispatchIndirect(cmd, m_wavefrontIndirectCmd->getBuffer(), 0);
-                    }
-
-                    // Barrier: Shade writes downstream queue / accum image -> next Resolve or Tonemap
-                    VkMemoryBarrier2 shadeToNextBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                    shadeToNextBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    shadeToNextBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    shadeToNextBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    shadeToNextBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-                    VkDependencyInfo shadeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                    shadeDep.memoryBarrierCount = 1;
-                    shadeDep.pMemoryBarriers = &shadeToNextBarrier;
-                    vkCmdPipelineBarrier2(cmd, &shadeDep);
-                }
-            }
-        } else if (m_config.pipeline_type == PipelineType::Persistent) {
-            // === PERSISTENT WAVEFRONT WORK QUEUE PIPELINE ===
-            // 1. Reset dynamic tile work counter
-            vkCmdFillBuffer(cmd, m_workQueueBuffer->getBuffer(), 0, sizeof(uint32_t) * 4, 0);
-
-            VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-            clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            clearDep.memoryBarrierCount = 1;
-            clearDep.pMemoryBarriers = &clearBarrier;
-            vkCmdPipelineBarrier2(cmd, &clearDep);
-
-            // 2. Bind Persistent Wavefront Pipeline & Descriptors
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_wfPersistentPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-
-            uint32_t rtPushConstants[12] = {
-                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, m_config.width, m_config.height,
-                useHwRT,
-                hasEnvMap,
-                envIntensityBits,
-                1u // accumulateHistory
-            };
-            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            // 3. Dispatch Persistent Waves (384 workgroups: 96 CUs * 4 waves/CU to saturate Navi 31)
-            vkCmdDispatch(cmd, 384, 1, 1);
-        } else if (m_config.pipeline_type == PipelineType::RTP && m_rtpKhrPipeline) {
-            // === HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-
-            uint32_t rtPushConstants[12] = {
-                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, m_config.width, m_config.height,
-                useHwRT,
-                hasEnvMap,
-                envIntensityBits,
-                1u // accumulateHistory
-            };
-            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
-        } else {
-            // === MONOLITHIC MEGAKERNEL PIPELINE ===
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-
-            uint32_t rtPushConstants[12] = {
-                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, m_config.width, m_config.height,
-                useHwRT,
-                hasEnvMap,
-                envIntensityBits,
-                1u // accumulateHistory
-            };
-            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            if (m_dgc && m_dgcArgumentBuffer) {
-                m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
-            } else {
-                vkCmdDispatch(cmd, rtGroupsX, rtGroupsY, 1);
-            }
-        }
+        m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
 
         VkMemoryBarrier2 memBarrier{};
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -1957,7 +1612,7 @@ void Engine::renderFrame() {
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else {
-        // --- Multi-GPU Path (64x64 Checkerboard Tiling or Dynamic Work Queue) ---
+        // --- Multi-GPU Path (Checkerboard Tiling or Sample Parallelism) ---
         uint32_t useHwRT = 1;
         uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
         float envIntensity = 1.0f;
@@ -1972,16 +1627,74 @@ void Engine::renderFrame() {
             dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
         }
 
+        MultiGpuMode activeMode = m_config.mgpu_mode;
+        if (activeMode == MultiGpuMode::Auto) {
+            activeMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+        }
+
         uint32_t tileOffsetX_sec = 2u;
-        uint32_t tileOffsetY_sec = m_config.tile_size;
+        uint32_t tileOffsetY_sec = 0u;
         uint32_t tileOffsetX_prim = 1u;
-        uint32_t tileOffsetY_prim = m_config.tile_size;
-        uint32_t dispatchWidth = (m_config.width + 1) / 2;
+        uint32_t tileOffsetY_prim = 0u;
+        uint32_t dispatchWidth = m_config.width;
+        uint32_t dispatchHeight = (m_config.height + 1) / 2;
+        uint32_t secAccumHistory = 1u;
+        uint32_t mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
+
+        CameraUniform uboSec = ubo;
+
+        if (activeMode == MultiGpuMode::InterleavedScanline) {
+            mergeMode = 0u;
+            tileOffsetX_sec = 2u;
+            tileOffsetY_sec = 0u;
+            tileOffsetX_prim = 1u;
+            tileOffsetY_prim = 0u;
+            dispatchWidth = m_config.width;
+            dispatchHeight = (m_config.height + 1) / 2;
+            secAccumHistory = 1u;
+        } else if (activeMode == MultiGpuMode::CheckerboardTile) {
+            mergeMode = 1u;
+            tileOffsetX_sec = 2u;
+            tileOffsetY_sec = m_config.tile_size;
+            tileOffsetX_prim = 1u;
+            tileOffsetY_prim = m_config.tile_size;
+            dispatchWidth = (m_config.width + 1) / 2;
+            dispatchHeight = m_config.height;
+            secAccumHistory = 1u;
+        } else if (activeMode == MultiGpuMode::SampleParallel) {
+            mergeMode = 2u;
+            tileOffsetX_sec = 0u;
+            tileOffsetY_sec = 0u;
+            tileOffsetX_prim = 0u;
+            tileOffsetY_prim = 0u;
+            dispatchWidth = m_config.width;
+            dispatchHeight = m_config.height;
+            secAccumHistory = 0u; // Secondary only renders current frame's delta; Primary accumulates
+
+            // Split SPP: e.g. spp = 2 -> prim: 1, sec: 1; spp = 4 -> prim: 2, sec: 2
+            uint32_t primSpp = (m_config.spp + 1) / 2;
+            uint32_t secSpp = m_config.spp / 2;
+            ubo.spp = primSpp;
+            uboSec.spp = secSpp;
+
+            // De-correlate secondary PRNG seed from primary
+            uboSec.frameIndex = m_frameIndex + 1000003u;
+
+            // Re-upload primary camera UBO with primSpp
+            m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
+        }
+
+        if (!m_mgpu->isZeroCopyActive()) {
+            frameBytes = static_cast<size_t>(dispatchWidth) * dispatchHeight * bytesPerPixel;
+            dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
+        }
+
+        uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
         // 1. Launch secondary GPU asynchronously
-        m_mgpu->launchSecondaryWork(ubo, m_frameIndex, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+        m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
                                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, 1u, dstHost, frameBytes);
+                                   hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
 
         // 2. Concurrently record and execute primary GPU
         vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
@@ -2007,25 +1720,12 @@ void Engine::renderFrame() {
             1u // accumulateHistory
         };
 
-        if (m_rtpKhrPipeline && m_rtpKhrPipeline->isSupported() && m_config.pipeline_type != PipelineType::Megakernel) {
-            // Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-            m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, m_config.height, 1);
-        } else {
-            // Fallback Compute Pipeline
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rtPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-            vkCmdPushConstants(cmd, m_rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-            if (m_dgc && m_dgcArgumentBuffer) {
-                m_dgc->recordIndirectDispatch(cmd, m_dgcArgumentBuffer.get(), 0);
-            } else {
-                uint32_t primGroupsX = (dispatchWidth + 7) / 8;
-                vkCmdDispatch(cmd, primGroupsX, rtGroupsY, 1);
-            }
-        }
+        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+        vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+        m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
@@ -2046,11 +1746,11 @@ void Engine::renderFrame() {
         postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &postBeginInfo);
 
-        // Barrier: Ensure primary RT writes to m_accumImage are visible before merge compute reads/writes
+        // Barrier: Ensure primary RT writes to m_accumImage and secondary DMA host writes are visible before merge compute reads/writes
         VkMemoryBarrier2 rtToMergeBarrier{};
         rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
         rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
@@ -2061,13 +1761,15 @@ void Engine::renderFrame() {
         vkCmdPipelineBarrier2(cmd, &rtToMergeDep);
 
         // Merge Pass
-        uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-        uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, 0u };
+        uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
         vkCmdPushConstants(cmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        uint32_t mergeGroupsX = (m_config.width + 15) / 16;
+        uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
+        vkCmdDispatch(cmd, mergeGroupsX, mergeGroupsY, 1);
 
         VkMemoryBarrier2 mergeBarrier{};
         mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -2087,7 +1789,7 @@ void Engine::renderFrame() {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
-        tonemapConstants.tileSize = m_config.tile_size;
+        tonemapConstants.tileSize = (activeMode == MultiGpuMode::InterleavedScanline) ? 0u : m_config.tile_size;
         tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
@@ -2180,9 +1882,14 @@ void Engine::renderFrame() {
             GuiActions guiActions{};
             if (m_gui->render(cmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
                               m_config, getStats(), m_cameraMode, m_camera.get(),
-                              &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions)) {
+                              &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions,
+                              m_availableScenes, m_currentSceneIndex)) {
                 m_resetAccumulation = true;
                 if (!m_config.headless) m_frameTimesMs.clear();
+            }
+            if (guiActions.sceneChanged && !guiActions.newScenePath.empty()) {
+                m_pendingSceneChange = true;
+                m_pendingScenePath = guiActions.newScenePath;
             }
             if (guiActions.mgpuModeChanged) {
                 m_pendingMgpuModeChange = true;
@@ -2398,6 +2105,7 @@ void Engine::dumpOutputFiles() {
             m_lastTonemapMs = gpuTonemapMs;
             m_lastFrameTimeMs = totalGpuMs;
             m_frameTimesMs.push_back(m_lastFrameTimeMs);
+            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
         }
     }
 
@@ -2552,11 +2260,14 @@ FrameStats Engine::getStats() const {
     }
 
     switch (m_config.mgpu_mode) {
+        case MultiGpuMode::InterleavedScanline: stats.mgpu_mode_str = "interleaved_scanline"; break;
         case MultiGpuMode::CheckerboardTile: stats.mgpu_mode_str = "checkerboard_tile"; break;
+        case MultiGpuMode::SampleParallel: stats.mgpu_mode_str = "sample_parallel"; break;
+        case MultiGpuMode::Auto: stats.mgpu_mode_str = (m_config.spp > 1) ? "auto (sample_parallel)" : "auto (checkerboard_tile)"; break;
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
-    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : ((m_config.pipeline_type == PipelineType::Persistent) ? "persistent" : ((m_config.pipeline_type == PipelineType::RTP) ? "rtp" : "megakernel"));
+    stats.pipeline_type_str = "rtp";
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
@@ -2632,6 +2343,22 @@ FrameStats Engine::getStats() const {
             stats.secondary_gpu_clock_mhz = m_gpu1ClockMhz.load(std::memory_order_relaxed);
             stats.secondary_gpu_temp_c = m_gpu1TempC.load(std::memory_order_relaxed);
         }
+    } else if (m_mgpu && m_mgpu->isSecondaryInitialized()) {
+        stats.is_mgpu_active = false;
+        stats.secondary_gpu_name = m_mgpu->getSecondaryDeviceName();
+        if (m_mgpu->getSecondaryContext()) {
+            const auto& secPci = m_mgpu->getSecondaryContext()->getPciLinkInfo();
+            stats.secondary_arch_name = m_mgpu->getSecondaryContext()->getArchitectureName();
+            stats.secondary_pci_link = secPci.formattedLink;
+            stats.secondary_pci_speed = secPci.currentSpeed;
+            stats.secondary_pci_width = secPci.currentWidth;
+            stats.secondary_pci_max_speed = secPci.maxSpeed;
+            stats.secondary_pci_max_width = secPci.maxWidth;
+            stats.secondary_pci_degraded = secPci.isDegraded;
+            stats.secondary_pci_degraded_reason = secPci.degradationReason;
+        }
+        stats.secondary_gpu_clock_mhz = m_gpu1ClockMhz.load(std::memory_order_relaxed);
+        stats.secondary_gpu_temp_c = m_gpu1TempC.load(std::memory_order_relaxed);
     } else {
         stats.is_mgpu_active = false;
         stats.secondary_gpu_name = "";
@@ -2654,7 +2381,7 @@ FrameStats Engine::getStats() const {
     stats.has_bda = true;
     stats.has_dho = true;
     stats.has_rt_pipeline = (m_rtpKhrPipeline != nullptr);
-    stats.has_dgc = (m_dgc != nullptr);
+    stats.has_dgc = (m_rtpKhrPipeline && m_rtpKhrPipeline->isIndirectSupported());
     stats.has_subgroup_control = m_context->hasSubgroupSizeControl();
     stats.subgroup_size = 32;
     stats.has_dynamic_rendering = true;
@@ -2686,6 +2413,22 @@ FrameStats Engine::getStats() const {
         stats.cam_fov = m_camera->getFov();
     }
 
+    for (const auto& tally : m_configTallies) {
+        FrameStats::ConfigTallySummary s;
+        s.label = tally.label;
+        s.frame_count = tally.frameCount;
+        s.avg_frame_time_ms = tally.getAvgFrameTimeMs();
+        s.min_frame_time_ms = tally.minFrameTimeMs;
+        s.max_frame_time_ms = tally.maxFrameTimeMs;
+        s.avg_fps = tally.getAvgFps();
+        s.primary_gpu_time_ms = tally.getAvgPrimaryRtMs();
+        s.secondary_gpu_time_ms = tally.getAvgSecondaryRtMs();
+        s.tonemap_time_ms = tally.getAvgTonemapMs();
+        s.gigarays_per_second = tally.getRayThroughput() * 1e-9;
+        s.target_achieved = tally.isTargetAchieved();
+        stats.configurations_breakdown.push_back(std::move(s));
+    }
+
     return stats;
 }
 
@@ -2711,13 +2454,6 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     if (newWidth == m_config.width && newHeight == m_config.height &&
         m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
         m_resetAccumulation = true;
-        if (m_dgc && m_dgcArgumentBuffer) {
-            VkDispatchIndirectCommand dgcCmd{};
-            dgcCmd.x = (m_config.width + 7) / 8;
-            dgcCmd.y = (m_config.height + 3) / 4;
-            dgcCmd.z = 1;
-            m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
-        }
         return;
     }
 
@@ -2811,53 +2547,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     updateAllImageDescriptors();
     updateMergeDescriptors();
 
-    // Reallocate wavefront ray queues if new resolution exceeds capacity
-    VkDeviceSize requiredQueueSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * 96;
-    VkDescriptorBufferInfo qAInfo{};
-    VkDescriptorBufferInfo qBInfo{};
-    if (m_rayQueueA && requiredQueueSize > m_rayQueueA->getSize()) {
-        m_rayQueueA = std::make_unique<Buffer>(
-            allocator, requiredQueueSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-        m_rayQueueB = std::make_unique<Buffer>(
-            allocator, requiredQueueSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-
-        qAInfo = { m_rayQueueA->getBuffer(), 0, requiredQueueSize };
-        qBInfo = { m_rayQueueB->getBuffer(), 0, requiredQueueSize };
-
-        std::vector<VkWriteDescriptorSet> queueWrites;
-        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-            // Classify binding 9 (queue A)
-            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfClassifyDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-            // Shade A binding 9 (in: A), 10 (out: B)
-            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsA[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
-            // Shade B binding 9 (in: B), 10 (out: A)
-            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qBInfo, nullptr });
-            queueWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_wfShadeDescSetsB[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qAInfo, nullptr });
-        }
-        vkUpdateDescriptorSets(device, static_cast<uint32_t>(queueWrites.size()), queueWrites.data(), 0, nullptr);
-    }
-
     // 5. Reset UI dump buffer if allocated
     if (m_uiDumpBuffer) {
         m_uiDumpBuffer.reset();
-    }
-
-    // 6. Update DGC argument buffer with new dispatch dimensions
-    if (m_dgc && m_dgcArgumentBuffer) {
-        VkDispatchIndirectCommand dgcCmd{};
-        dgcCmd.x = (m_config.width + 7) / 8;
-        dgcCmd.y = (m_config.height + 3) / 4;
-        dgcCmd.z = 1;
-        m_dgcArgumentBuffer->copyFrom(&dgcCmd, sizeof(VkDispatchIndirectCommand));
-        Logger::info("DGC indirect dispatch buffer updated: {}x{} workgroups ({}x{} pixels).",
-                     dgcCmd.x, dgcCmd.y, m_config.width, m_config.height);
     }
 
     // 7. Adapt Camera aspect ratio & FOV
@@ -2869,8 +2561,79 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     // 9. Invalidate accumulation
     m_frameIndex = 0;
     m_resetAccumulation = true;
+}
 
-    Logger::info("Swapchain & render pipelines successfully recreated for {}x{}", m_config.width, m_config.height);
+void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs) {
+    ConfigKey key;
+    key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
+    key.width = m_config.width;
+    key.height = m_config.height;
+    key.spp = m_config.spp;
+    key.max_bounces = m_config.max_bounces;
+    key.accum_format = m_config.accum_format;
+    key.tile_size = m_config.tile_size;
+
+    for (auto& tally : m_configTallies) {
+        if (tally.key == key) {
+            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+            return;
+        }
+    }
+    ConfigStatsTally newTally(key);
+    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+    m_configTallies.push_back(std::move(newTally));
+}
+
+void Engine::printExecutionSummary() const {
+    Logger::info("========================================================================================");
+    if (m_configTallies.empty()) {
+        Logger::info("  Execution Summary: No frames rendered.");
+        Logger::info("========================================================================================");
+        return;
+    }
+
+    Logger::info("  Execution Summary (Tallied Across {} Unique Configuration{}):",
+                 m_configTallies.size(), m_configTallies.size() == 1 ? "" : "s");
+    Logger::info("----------------------------------------------------------------------------------------");
+
+    double baselineSingleGpuAvgMs = 0.0;
+    for (const auto& tally : m_configTallies) {
+        if (tally.key.mgpu_mode == MultiGpuMode::Off && tally.frameCount > 0) {
+            baselineSingleGpuAvgMs = tally.getAvgFrameTimeMs();
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < m_configTallies.size(); ++i) {
+        const auto& tally = m_configTallies[i];
+        Logger::info("  [Config {}/{}] {}", i + 1, m_configTallies.size(), tally.label);
+        Logger::info("    Rendered Frames:     {}", tally.frameCount);
+        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS) [Min: {:.3f} ms, Max: {:.3f} ms]",
+                     tally.getAvgFrameTimeMs(), tally.getAvgFps(), tally.minFrameTimeMs, tally.maxFrameTimeMs);
+
+        if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.getAvgSecondaryRtMs() > 0.001) {
+            Logger::info("    GPU Breakdown:       GPU 0: {:.3f} ms | GPU 1: {:.3f} ms | Tonemap & Merge: {:.3f} ms",
+                         tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
+            if (baselineSingleGpuAvgMs > 0.001) {
+                double speedup = baselineSingleGpuAvgMs / tally.getAvgFrameTimeMs();
+                double efficiency = (speedup / 2.0) * 100.0;
+                Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
+            }
+        } else {
+            Logger::info("    GPU Breakdown:       GPU 0 (Primary RT): {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
+                         tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+        }
+
+        Logger::info("    Ray Throughput:      {:.2f} GigaRays/sec", tally.getRayThroughput() * 1e-9);
+        Logger::info("    Sub-8ms Budget:      {}", tally.isTargetAchieved() ? "\033[32mACHIEVED\033[0m" : "\033[33mEXCEEDED\033[0m");
+        if (i + 1 < m_configTallies.size()) {
+            Logger::info("  --------------------------------------------------------------------------------------");
+        }
+    }
+
+    Logger::info("----------------------------------------------------------------------------------------");
+    Logger::info("  Total Frames Rendered: {} | Validation Errors: {}", m_totalFramesRendered, m_context->getValidationErrors());
+    Logger::info("========================================================================================");
 }
 
 void Engine::run() {

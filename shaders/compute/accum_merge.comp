@@ -23,39 +23,77 @@ layout(push_constant) uniform PushConstants {
     uint secondarySpp;
     uint tileSize;             // Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
     uint formatMode;           // 0 = RGBA16_SFLOAT (default), 1 = RGBA32_SFLOAT
-    uint reserved;
+    uint mergeMode;            // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
 } pc;
 
 void main() {
-    uint tileSize = (pc.tileSize == 0u) ? 64u : pc.tileSize;
-    uint workgroupsPerTile = max(1u, tileSize / 16u);
-    uint tileX = gl_WorkGroupID.x / workgroupsPerTile;
-    uint tileY = gl_WorkGroupID.y / workgroupsPerTile;
+    if (pc.mergeMode == 0u) {
+        // --- Mode 0: Interleaved Scanlines (100% Linear Scaling) ---
+        ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+        uint secHeight = (pc.height + 1u) / 2u;
+        if (id.x >= pc.width || id.y >= secHeight) {
+            return;
+        }
 
-    // Checkerboard Tiling: Even tiles were rendered by Primary GPU (GPU 0)
-    // 16x16 workgroups on even tiles early exit with zero wave divergence
-    uint wgParity = (tileX + tileY) & 1u;
-    if (wgParity == 0u) return;
+        uint linearIndex = uint(id.y) * pc.width + uint(id.x);
+        vec4 secVal;
+        if (pc.formatMode == 0u) {
+            uvec2 raw = secondaryRadiance16[linearIndex];
+            secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
+        } else {
+            secVal = secondaryRadiance32[linearIndex];
+        }
 
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
-        return;
-    }
+        ivec2 pixelCoord = ivec2(id.x, int(id.y * 2u + 1u));
+        imageStore(uPrimaryAccum, pixelCoord, secVal);
+    } else if (pc.mergeMode == 1u) {
+        // --- Mode 1: Checkerboard Tiling (Spatial Interleaving) ---
+        uint tileSize = (pc.tileSize == 0u) ? 32u : pc.tileSize;
+        uint workgroupsPerTile = max(1u, tileSize / 16u);
+        uint tileX = gl_WorkGroupID.x / workgroupsPerTile;
+        uint tileY = gl_WorkGroupID.y / workgroupsPerTile;
 
-    // Packed half-grid index from secondary GPU
-    uint tx = uint(pixelCoord.x) / tileSize;
-    uint tx_half = tx / 2u;
-    uint localX = uint(pixelCoord.x) % tileSize;
-    uint secX = tx_half * tileSize + localX;
-    uint linearIndex = uint(pixelCoord.y) * ((pc.width + 1u) / 2u) + secX;
+        uint wgParity = (tileX + tileY) & 1u;
+        if (wgParity == 0u) return;
 
-    vec4 secVal;
-    if (pc.formatMode == 0u) {
-        uvec2 raw = secondaryRadiance16[linearIndex];
-        secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
+        ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+        if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
+            return;
+        }
+
+        uint tx = uint(pixelCoord.x) / tileSize;
+        uint tx_half = tx / 2u;
+        uint localX = uint(pixelCoord.x) % tileSize;
+        uint secX = tx_half * tileSize + localX;
+        uint linearIndex = uint(pixelCoord.y) * ((pc.width + 1u) / 2u) + secX;
+
+        vec4 secVal;
+        if (pc.formatMode == 0u) {
+            uvec2 raw = secondaryRadiance16[linearIndex];
+            secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
+        } else {
+            secVal = secondaryRadiance32[linearIndex];
+        }
+
+        imageStore(uPrimaryAccum, pixelCoord, secVal);
     } else {
-        secVal = secondaryRadiance32[linearIndex];
-    }
+        // --- Mode 1: Sample Parallelism (Temporal Sample Accumulation) ---
+        ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+        if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
+            return;
+        }
 
-    imageStore(uPrimaryAccum, pixelCoord, secVal);
+        uint linearIndex = uint(pixelCoord.y) * pc.width + uint(pixelCoord.x);
+
+        vec4 secVal;
+        if (pc.formatMode == 0u) {
+            uvec2 raw = secondaryRadiance16[linearIndex];
+            secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
+        } else {
+            secVal = secondaryRadiance32[linearIndex];
+        }
+
+        vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);
+        imageStore(uPrimaryAccum, pixelCoord, primVal + secVal);
+    }
 }

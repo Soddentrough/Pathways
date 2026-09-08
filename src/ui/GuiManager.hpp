@@ -5,6 +5,8 @@
 #include "core/Config.hpp"
 #include "utils/ImageDumper.hpp"
 
+#include "scene/SceneRegistry.hpp"
+
 namespace pathways {
 
 class Camera;
@@ -26,6 +28,9 @@ struct GuiActions {
     bool newDoubleBuffer = true;
     bool tileSizeChanged = false;
     uint32_t newTileSize = 64;
+    bool sceneChanged = false;
+    std::string newScenePath = "";
+    int newSceneIndex = -1;
 };
 
 class GuiManager {
@@ -40,7 +45,8 @@ public:
     bool render(VkCommandBuffer cmd, VkImageView targetView, uint32_t width, uint32_t height,
                 Config& config, const FrameStats& stats, bool& cameraMode, Camera* camera = nullptr,
                 const DisplayInfo* displayInfo = nullptr, bool isFullscreen = false,
-                GuiActions* actions = nullptr);
+                GuiActions* actions = nullptr,
+                const std::vector<SceneEntry>& availableScenes = {}, int currentSceneIndex = -1);
 
     bool wantCaptureMouse() const;
     bool wantCaptureKeyboard() const;

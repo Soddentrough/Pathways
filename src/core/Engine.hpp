@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Config.hpp"
+#include "core/ConfigTally.hpp"
 #include "core/Window.hpp"
 #include "vulkan/VulkanContext.hpp"
 #include "vulkan/Buffer.hpp"
@@ -13,6 +14,7 @@
 #include "rt/DGCManager.hpp"
 #include "rt/RTPipeline.hpp"
 #include "vulkan/Texture.hpp"
+#include "scene/SceneRegistry.hpp"
 
 #include <memory>
 #include <vector>
@@ -33,18 +35,22 @@ public:
     void run();
     void renderFrame();
     void dumpOutputFiles();
+    void printExecutionSummary() const;
+    const std::vector<ConfigStatsTally>& getConfigTallies() const { return m_configTallies; }
     FrameStats getStats() const;
     std::string exportTelemetry(const std::string& customPath = "");
 
     void setCameraMode(bool active);
     bool isCameraMode() const { return m_cameraMode; }
 
+    bool loadScene(const std::string& filepath);
+    const std::vector<SceneEntry>& getAvailableScenes() const { return m_availableScenes; }
+    int getCurrentSceneIndex() const { return m_currentSceneIndex; }
+
 private:
     void initVulkan();
     void initScene();
     void initPipelines();
-    void initWavefrontResources();
-    void initWavefrontPipelines();
     void initSyncObjects();
     void initQueryPool();
 
@@ -85,9 +91,7 @@ private:
     std::unique_ptr<AccelerationStructure> m_blas;
     std::unique_ptr<AccelerationStructure> m_tlas;
 
-    // Device-Generated Commands (VK_EXT_device_generated_commands)
-    std::unique_ptr<DGCManager> m_dgc;
-    std::unique_ptr<Buffer> m_dgcArgumentBuffer;
+
 
     // Textures & Environment Map (Bindings 7 & 8)
     static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
@@ -107,42 +111,10 @@ private:
     std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSet m_tonemapDescSet = VK_NULL_HANDLE;
 
-    VkPipelineLayout m_rtPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_rtpPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_rtPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
-    VkPipeline m_wfPersistentPipeline = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
-
-    // Persistent Wavefront Work Queue Buffer
-    std::unique_ptr<Buffer> m_workQueueBuffer;
-
-    // Wavefront Compaction Queues & Buffers
-    std::unique_ptr<Buffer> m_rayQueueA;
-    std::unique_ptr<Buffer> m_rayQueueB;
-    std::unique_ptr<Buffer> m_wavefrontCounters;
-    std::unique_ptr<Buffer> m_wavefrontIndirectCmd;
-    std::unique_ptr<Buffer> m_wavefrontDgcStream;
-    std::unique_ptr<Buffer> m_wavefrontDgcCount;
-
-    // Wavefront Pipelines & Descriptors
-    VkDescriptorSetLayout m_wfClassifyDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_wfResolveDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_wfShadeDescLayout = VK_NULL_HANDLE;
-
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfClassifyDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_wfResolveDescSet = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfShadeDescSetsA = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // Reads A, writes B
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_wfShadeDescSetsB = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // Reads B, writes A
-
-    VkPipelineLayout m_wfClassifyPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_wfResolvePipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_wfShadePipelineLayout = VK_NULL_HANDLE;
-
-    VkPipeline m_wfClassifyPipeline = VK_NULL_HANDLE;
-    VkPipeline m_wfResolvePipeline = VK_NULL_HANDLE;
-    VkPipeline m_wfShadePipeline = VK_NULL_HANDLE;
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
@@ -166,8 +138,11 @@ private:
     VkFence m_rtFence = VK_NULL_HANDLE;
     void updateMergeDescriptors();
     void updateAllImageDescriptors();
+    void updateSceneDescriptors();
 
     // Deferred GUI configuration actions
+    bool m_pendingSceneChange = false;
+    std::string m_pendingScenePath = "";
     bool m_pendingMgpuModeChange = false;
     MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
     bool m_pendingAccumFormatChange = false;
@@ -176,6 +151,10 @@ private:
     bool m_newDoubleBuffer = true;
     bool m_pendingTileSizeChange = false;
     uint32_t m_newTileSize = 64;
+
+    // Available scenes and dynamic selection
+    std::vector<SceneEntry> m_availableScenes;
+    int m_currentSceneIndex = -1;
 
     // Scene metadata
     SceneData m_sceneData;
@@ -195,6 +174,10 @@ private:
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastLogTime;
+
+    // Per-configuration tallied statistics
+    std::vector<ConfigStatsTally> m_configTallies;
+    void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs);
 
     // Hardware Sensors & Telemetry (Infrequent background sampler)
     void startHwMonThread();

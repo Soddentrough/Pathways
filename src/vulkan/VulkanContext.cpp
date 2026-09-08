@@ -614,6 +614,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
     rtPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rtPipelineFeatures.rayTracingPipeline = VK_TRUE;
+    rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect = VK_TRUE;
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;

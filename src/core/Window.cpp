@@ -91,14 +91,31 @@ Window::Window(const Config& config)
     // 2. Select Sensible Window Bounds if user did not pass explicit --width or --height
     SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 
-    if (!config.custom_resolution) {
+    m_isFullscreen = config.fullscreen;
+
+    if (config.fullscreen) {
+        windowFlags |= SDL_WINDOW_FULLSCREEN;
+        if (!config.custom_resolution) {
+            if (m_displayInfo.nativeWidth > 0 && m_displayInfo.nativeHeight > 0) {
+                m_width = m_displayInfo.nativeWidth;
+                m_height = m_displayInfo.nativeHeight;
+            } else {
+                m_width = 3840;
+                m_height = 2160;
+            }
+        }
+        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to Fullscreen: {}x{}",
+                     m_displayInfo.displayName, m_displayInfo.nativeWidth, m_displayInfo.nativeHeight,
+                     m_displayInfo.refreshRate, m_displayInfo.contentScale, m_displayInfo.displayAspect,
+                     m_width, m_height);
+    } else if (!config.custom_resolution) {
         uint32_t w = (m_displayInfo.usableWidth / 16) * 16;
         uint32_t h = (m_displayInfo.usableHeight / 16) * 16;
         m_width = w > 0 ? w : 1280;
         m_height = h > 0 ? h : 1080;
         windowFlags |= SDL_WINDOW_MAXIMIZED;
 
-        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to full usable display (Maximized): {}x{}",
+        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to full usable display (Maximized Windowed): {}x{}",
                      m_displayInfo.displayName, m_displayInfo.nativeWidth, m_displayInfo.nativeHeight,
                      m_displayInfo.refreshRate, m_displayInfo.contentScale, m_displayInfo.displayAspect,
                      m_width, m_height);
@@ -119,6 +136,10 @@ Window::Window(const Config& config)
 
     if (!m_window) {
         throw std::runtime_error(std::string("Failed to create SDL3 window: ") + SDL_GetError());
+    }
+
+    if (config.fullscreen) {
+        SDL_SetWindowFullscreen(m_window, true);
     }
 
     SDL_ShowWindow(m_window);

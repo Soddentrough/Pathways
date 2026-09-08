@@ -165,8 +165,57 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             if (mat.transmission.transmission_texture.texture) {
                 gpuMat.transmissionTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.transmission.transmission_texture.texture)) + 1;
             }
-            if (gpuMat.transmission > 0.1f) {
+            if (gpuMat.transmission > 0.05f) {
                 gpuMat.type = MATERIAL_DIELECTRIC;
+            }
+        }
+
+        // Transmission / Glass fallbacks for glTF models without explicit KHR_materials_transmission
+        std::string matNameLower = mat.name ? mat.name : "";
+        for (auto& c : matNameLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (!mat.has_transmission) {
+            // Check alpha mode blend with partial opacity (typical glass encoding in basic glTF)
+            if (mat.alpha_mode == cgltf_alpha_mode_blend && gpuMat.albedo.a < 0.99f) {
+                gpuMat.transmission = 1.0f - gpuMat.albedo.a;
+                if (gpuMat.transmission > 0.05f) {
+                    gpuMat.type = MATERIAL_DIELECTRIC;
+                    if (gpuMat.ior < 1.05f) gpuMat.ior = 1.5f;
+                }
+            }
+            // Check name hints for dielectric glass
+            else if (matNameLower.find("glass") != std::string::npos ||
+                     matNameLower.find("window") != std::string::npos ||
+                     matNameLower.find("bottle") != std::string::npos ||
+                     matNameLower.find("pane") != std::string::npos) {
+                gpuMat.transmission = 1.0f;
+                gpuMat.type = MATERIAL_DIELECTRIC;
+                if (gpuMat.ior < 1.05f) gpuMat.ior = 1.5f;
+                gpuMat.roughness = std::min(gpuMat.roughness, 0.05f);
+            }
+            // Check name hints for metallic conductors (mirror, chrome, stainless)
+            else if (matNameLower.find("mirror") != std::string::npos ||
+                     matNameLower.find("chrome") != std::string::npos ||
+                     matNameLower.find("stainless") != std::string::npos) {
+                gpuMat.metallic = 1.0f;
+                gpuMat.roughness = std::min(gpuMat.roughness, 0.05f);
+                gpuMat.type = MATERIAL_METALLIC;
+            }
+        }
+
+        // Check PBRT extras if available from scene conversion
+        if (mat.extras.data && mat.extras.data[0] != '\0') {
+            std::string_view extrasStr(mat.extras.data);
+            if (extrasStr.find("\"dielectric\"") != std::string_view::npos ||
+                extrasStr.find("\"glass\"") != std::string_view::npos) {
+                gpuMat.type = MATERIAL_DIELECTRIC;
+                gpuMat.transmission = 1.0f;
+                if (gpuMat.ior < 1.05f) gpuMat.ior = 1.5f;
+            } else if (extrasStr.find("\"conductor\"") != std::string_view::npos) {
+                gpuMat.type = MATERIAL_METALLIC;
+                gpuMat.metallic = 1.0f;
+            } else if (extrasStr.find("\"coateddiffuse\"") != std::string_view::npos) {
+                gpuMat.clearcoat = 1.0f;
             }
         }
 
@@ -561,6 +610,10 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     float maxDim = std::max({extent.x, extent.y, extent.z});
     if (maxDim < 1e-4f) maxDim = 2.0f;
 
+    data.boundsMin = minBound;
+    data.boundsMax = maxBound;
+    data.sceneRadius = std::max(glm::length(extent) * 0.5f, 0.1f);
+
     // Camera setup
     if (!gltfScene.cameras.empty()) {
         data.hasCamera = true;
@@ -577,7 +630,59 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         data.cameraFov = 45.0f;
     }
 
-    // If the glTF had no lights, add an overhead area light scaled to the model dimensions
+    // glTF 2.1 physical emissive mesh light extraction
+    // Scan baked world-space triangles for emissive materials (KHR_materials_emissive_strength)
+    // and convert them to physical area lights for direct MIS sampling
+    std::vector<LightGPU> emissiveMeshLights;
+    for (const auto& tri : data.triangles) {
+        if (tri.materialId < data.materials.size()) {
+            const auto& mat = data.materials[tri.materialId];
+            glm::vec3 em = glm::vec3(mat.emissive);
+            float emPower = glm::length(em);
+            // Only extract as a physical area light if explicitly MATERIAL_EMISSIVE
+            // or an untextured emissive source with high radiant flux
+            bool isExplicitLight = (mat.type == MATERIAL_EMISSIVE) ||
+                                   (emPower > 1.0f && mat.albedoTex == 0 && mat.mrTex == 0);
+            if (isExplicitLight) {
+                glm::vec3 p0 = glm::vec3(tri.v0.position);
+                glm::vec3 p1 = glm::vec3(tri.v1.position);
+                glm::vec3 p2 = glm::vec3(tri.v2.position);
+                glm::vec3 u = p1 - p0;
+                glm::vec3 v = p2 - p0;
+                glm::vec3 n = glm::cross(u, v);
+                float lenN = glm::length(n);
+                if (lenN > 1e-6f) {
+                    float triArea = 0.5f * lenN;
+                    LightGPU light{};
+                    light.position = glm::vec4(p0, LIGHT_AREA_QUAD);
+                    light.u = glm::vec4(u, 0.0f);
+                    light.v = glm::vec4(v, 0.0f);
+                    light.normal = glm::vec4(n / lenN, 0.0f);
+                    light.emission = glm::vec4(em, triArea);
+                    emissiveMeshLights.push_back(light);
+                }
+            }
+        }
+    }
+
+    if (!emissiveMeshLights.empty()) {
+        Logger::info("Extracted {} physical emissive mesh lights from scene geometry", emissiveMeshLights.size());
+        // If there are many emissive triangles, sort by total radiant flux and keep top 64
+        if (emissiveMeshLights.size() > 64) {
+            std::sort(emissiveMeshLights.begin(), emissiveMeshLights.end(), [](const LightGPU& a, const LightGPU& b) {
+                float fluxA = (a.emission.r + a.emission.g + a.emission.b) * a.emission.w;
+                float fluxB = (b.emission.r + b.emission.g + b.emission.b) * b.emission.w;
+                return fluxA > fluxB;
+            });
+            emissiveMeshLights.resize(64);
+        }
+        for (const auto& l : emissiveMeshLights) {
+            data.lights.push_back(l);
+        }
+    }
+
+    // If the glTF had neither punctual lights nor physical emissive mesh lights,
+    // add an overhead area light scaled to the model dimensions as fallback
     if (data.lights.empty()) {
         float lightSide = maxDim * 0.6f;
         float lightY = maxBound.y + maxDim * 0.5f;

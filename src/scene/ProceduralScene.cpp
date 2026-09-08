@@ -293,6 +293,10 @@ SceneData ProceduralScene::createCornellBox() {
     scene.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
     scene.cameraFov = 45.0f;
 
+    scene.boundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+    scene.boundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
+    scene.sceneRadius = 2.0f;
+
     return scene;
 }
 

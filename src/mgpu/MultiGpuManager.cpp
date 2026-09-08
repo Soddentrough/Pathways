@@ -47,8 +47,6 @@ GpuDeviceNode::~GpuDeviceNode() {
     rtpKhrPipeline.reset();
     if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
     if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
-    if (rtPipeline) vkDestroyPipeline(device, rtPipeline, nullptr);
-    if (rtPipelineLayout) vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
     if (rtDescLayout) vkDestroyDescriptorSetLayout(device, rtDescLayout, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (renderFence) vkDestroyFence(device, renderFence, nullptr);
@@ -66,19 +64,15 @@ GpuDeviceNode::~GpuDeviceNode() {
 MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene)
     : m_primaryContext(primaryContext), m_mode(config.mgpu_mode), m_config(config) {
 
-    if (m_mode == MultiGpuMode::Off) {
-        Logger::info("Multi-GPU execution disabled (running in Single-GPU mode).");
-        return;
-    }
-
     auto devices = VulkanContext::enumeratePhysicalDevices(primaryContext->getInstance());
     if (devices.size() < 2) {
-        Logger::warn("Multi-GPU requested but only {} physical Vulkan device(s) found. Falling back to single GPU.", devices.size());
+        Logger::info("Multi-GPU: only {} physical Vulkan device(s) found. Multi-GPU unavailable.", devices.size());
         m_mode = MultiGpuMode::Off;
         return;
     }
 
-    Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs...", devices.size());
+    Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs (Initial State: {})...",
+                 devices.size(), m_mode == MultiGpuMode::Off ? "Standby (Single-GPU)" : "Active");
     initSecondaryDevice(config, scene);
 }
 
@@ -91,7 +85,7 @@ MultiGpuManager::~MultiGpuManager() {
 }
 
 double MultiGpuManager::getSecondaryGpuTimeMs() const {
-    if (m_devices.empty()) return 0.0;
+    if (!isMultiGpuActive() || m_devices.empty()) return 0.0;
     return m_devices[0]->lastFrameTimeMs;
 }
 
@@ -204,7 +198,9 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         return;
     }
 
-    m_sharedBufferSize = bufferSize;
+    // Align buffer size to 64KB (satisfies minImportedHostPointerAlignment of 4096 or 65536)
+    VkDeviceSize hostAlignment = 65536;
+    m_sharedBufferSize = (bufferSize + hostAlignment - 1) & ~(hostAlignment - 1);
     VkDevice dev0 = m_primaryContext->getDevice();
     VkPhysicalDevice phys0 = m_primaryContext->getPhysicalDevice();
     VkDevice dev1 = m_devices[0]->context->getDevice();
@@ -225,7 +221,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 
     bool allSucceeded = true;
     for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
-        if (posix_memalign(&m_sharedHostPtr[slot], 4096, m_sharedBufferSize) != 0 || !m_sharedHostPtr[slot]) {
+        if (posix_memalign(&m_sharedHostPtr[slot], hostAlignment, m_sharedBufferSize) != 0 || !m_sharedHostPtr[slot]) {
             Logger::warn("Failed to allocate page-aligned host memory for slot {}.", slot);
             allSucceeded = false;
             break;
@@ -358,8 +354,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     queryInfo.queryCount = 2; // Start, End
     vkCreateQueryPool(secDevice, &queryInfo, nullptr, &secNode->queryPool);
 
-    // 3. Render Targets on secondary device (half-width for CheckerboardTile to cut VRAM and PCIe footprint by 50%)
-    uint32_t secWidth = (config.mgpu_mode == MultiGpuMode::CheckerboardTile) ? ((config.width + 1) / 2) : config.width;
+    // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
+    uint32_t secWidth = config.width;
     VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
     secNode->accumTarget = std::make_unique<Image>(
         secDevice, secAlloc, secWidth, config.height,
@@ -525,10 +521,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descPoolInfo.maxSets = 8;
     vkCreateDescriptorPool(secDevice, &descPoolInfo, nullptr, &secNode->descriptorPool);
 
-    VkShaderStageFlags rtStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    if (secNode->context->hasRayTracing()) {
-        rtStages |= VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-    }
+    VkShaderStageFlags rtStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
 
     std::vector<VkDescriptorSetLayoutBinding> rtBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
@@ -595,74 +588,32 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     };
     vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-    // 6. Pipeline Layout & Compute Pipeline on secondary device
-    VkPushConstantRange pushConstant{};
-    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pushConstant.offset = 0;
-    pushConstant.size = sizeof(uint32_t) * 12;
+    // 6. Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) on Secondary GPU
+    VkPushConstantRange rtpPushConstant{};
+    rtpPushConstant.stageFlags = rtStages;
+    rtpPushConstant.offset = 0;
+    rtpPushConstant.size = sizeof(uint32_t) * 12;
 
-    VkPipelineLayoutCreateInfo pipeLayoutInfo{};
-    pipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeLayoutInfo.setLayoutCount = 1;
-    pipeLayoutInfo.pSetLayouts = &secNode->rtDescLayout;
-    pipeLayoutInfo.pushConstantRangeCount = 1;
-    pipeLayoutInfo.pPushConstantRanges = &pushConstant;
-    vkCreatePipelineLayout(secDevice, &pipeLayoutInfo, nullptr, &secNode->rtPipelineLayout);
+    VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
+    rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    rtpPipeLayoutInfo.setLayoutCount = 1;
+    rtpPipeLayoutInfo.pSetLayouts = &secNode->rtDescLayout;
+    rtpPipeLayoutInfo.pushConstantRangeCount = 1;
+    rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
+    vkCreatePipelineLayout(secDevice, &rtpPipeLayoutInfo, nullptr, &secNode->rtpPipelineLayout);
 
-    auto rtCode = loadShaderSPIRV("raytrace_comp.comp.spv");
-    VkShaderModule rtModule = createShaderModule(secDevice, rtCode);
+    auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
+    auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
+    auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
+    auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
 
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
-    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    VkComputePipelineCreateInfo compPipeInfo{};
-    compPipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    compPipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    compPipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    compPipeInfo.stage.module = rtModule;
-    compPipeInfo.stage.pName = "main";
-    if (secNode->context->hasSubgroupSizeControl()) {
-        compPipeInfo.stage.pNext = &subgroupSize32;
-    }
-    compPipeInfo.layout = secNode->rtPipelineLayout;
-    vkCreateComputePipelines(secDevice, VK_NULL_HANDLE, 1, &compPipeInfo, nullptr, &secNode->rtPipeline);
-    vkDestroyShaderModule(secDevice, rtModule, nullptr);
-
-    // Initialize Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) on Secondary GPU
-    if (secNode->context->hasRayTracing()) {
-        try {
-            VkPushConstantRange rtpPushConstant{};
-            rtpPushConstant.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-                                         VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                                         VK_SHADER_STAGE_MISS_BIT_KHR;
-            rtpPushConstant.offset = 0;
-            rtpPushConstant.size = sizeof(uint32_t) * 12;
-
-            VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
-            rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-            rtpPipeLayoutInfo.setLayoutCount = 1;
-            rtpPipeLayoutInfo.pSetLayouts = &secNode->rtDescLayout;
-            rtpPipeLayoutInfo.pushConstantRangeCount = 1;
-            rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
-            vkCreatePipelineLayout(secDevice, &rtpPipeLayoutInfo, nullptr, &secNode->rtpPipelineLayout);
-
-            auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
-            auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
-            auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
-            auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
-
-            secNode->rtpKhrPipeline = std::make_unique<RTPipeline>(
-                secDevice, secAlloc,
-                secNode->context->getRayTracingPipelineProperties(),
-                secNode->rtpPipelineLayout,
-                rgenCode, rmissCode, shadowMissCode, rchitCode
-            );
-            Logger::info("Secondary GPU: Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
-        } catch (const std::exception& e) {
-            Logger::warn("Failed to initialize secondary GPU RTPipeline: {}", e.what());
-        }
-    }
+    secNode->rtpKhrPipeline = std::make_unique<RTPipeline>(
+        secDevice, secAlloc,
+        secNode->context->getRayTracingPipelineProperties(),
+        secNode->rtpPipelineLayout,
+        rgenCode, rmissCode, shadowMissCode, rchitCode
+    );
+    Logger::info("Secondary GPU: Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) initialized.");
 
     // 7. Transition secondary accumTarget to GENERAL layout
     VkCommandBufferBeginInfo beginInfo{};
@@ -705,7 +656,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 }
 
 void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
-                                         uint32_t frameIndex,
+                                         uint32_t bufferSlot,
                                          uint32_t tileOffsetX, uint32_t tileOffsetY,
                                          uint32_t tileWidth, uint32_t tileHeight,
                                          uint32_t numTriangles, uint32_t numSpheres,
@@ -718,7 +669,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          size_t transferBytes) {
     if (!m_active || m_devices.empty()) return;
 
-    m_asyncTask = std::async(std::launch::async, [this, cameraUniform, frameIndex,
+    m_asyncTask = std::async(std::launch::async, [this, cameraUniform, bufferSlot,
                                                  tileOffsetX, tileOffsetY, tileWidth, tileHeight,
                                                  numTriangles, numSpheres, numMaterials, numLights,
                                                  useHardwareRT, hasEnvMap, envMapIntensity, accumulateHistory,
@@ -753,27 +704,31 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
             accumulateHistory
         };
 
-        uint32_t dispatchWidth = (tileOffsetX == 1u || tileOffsetX == 2u) ? ((tileWidth + 1) / 2) : tileWidth;
+        uint32_t dispatchWidth = tileWidth;
+        uint32_t dispatchHeight = tileHeight;
 
-        if (node->rtpKhrPipeline && node->rtpKhrPipeline->isSupported() && m_config.pipeline_type != PipelineType::Megakernel) {
-            // High-Performance Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-            vkCmdBindPipeline(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
-            vkCmdBindDescriptorSets(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSet, 0, nullptr);
-
-            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-            vkCmdPushConstants(node->commandBuffer, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            node->rtpKhrPipeline->traceRays(node->commandBuffer, dispatchWidth, tileHeight, 1);
+        if (tileOffsetY == 0u) {
+            // Interleaved scanlines: each GPU renders half the total rows
+            if (tileOffsetX == 1u || tileOffsetX == 2u) {
+                dispatchWidth = tileWidth;
+                dispatchHeight = (tileHeight + 1) / 2;
+            }
         } else {
-            // Fallback Compute Pipeline
-            vkCmdBindPipeline(node->commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, node->rtPipeline);
-            vkCmdBindDescriptorSets(node->commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, node->rtPipelineLayout, 0, 1, &node->rtDescSet, 0, nullptr);
-            vkCmdPushConstants(node->commandBuffer, node->rtPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            uint32_t groupsX = (dispatchWidth + 7) / 8;
-            uint32_t groupsY = (tileHeight + 3) / 4;
-            vkCmdDispatch(node->commandBuffer, groupsX, groupsY, 1);
+            // 2D Checkerboard: each GPU renders half the columns
+            if (tileOffsetX == 1u || tileOffsetX == 2u) {
+                dispatchWidth = (tileWidth + 1) / 2;
+                dispatchHeight = tileHeight;
+            }
         }
+
+        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+        vkCmdBindPipeline(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
+        vkCmdBindDescriptorSets(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSet, 0, nullptr);
+
+        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+        vkCmdPushConstants(node->commandBuffer, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+
+        node->rtpKhrPipeline->traceRays(node->commandBuffer, dispatchWidth, dispatchHeight, 1);
 
         vkCmdWriteTimestamp2(node->commandBuffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPool, 1);
 
@@ -793,9 +748,9 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         copyRegion.imageSubresource.baseArrayLayer = 0;
         copyRegion.imageSubresource.layerCount = 1;
         copyRegion.imageOffset = { 0, 0, 0 };
-        copyRegion.imageExtent = { dispatchWidth, tileHeight, 1 };
+        copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
 
-        uint32_t slot = m_config.double_buffered_shared_mem ? (frameIndex % NUM_SHARED_BUFFERS) : 0;
+        uint32_t slot = m_config.double_buffered_shared_mem ? (bufferSlot % NUM_SHARED_BUFFERS) : 0;
         VkBuffer targetBuffer = m_useZeroCopyHost ? m_sharedBufferSecondary[slot] : node->p2pStagingBuffer->getBuffer();
 
         vkCmdCopyImageToBuffer(node->commandBuffer, node->accumTarget->getImage(),
@@ -864,7 +819,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
         VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-        uint32_t secWidth = (m_config.mgpu_mode == MultiGpuMode::CheckerboardTile) ? ((width + 1) / 2) : width;
+        uint32_t secWidth = width;
         node->accumTarget = std::make_unique<Image>(
             secDevice, secAlloc, secWidth, height,
             accumFormat,
@@ -924,4 +879,181 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
     Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);
 }
 
+bool MultiGpuManager::loadScene(const SceneData& scene) {
+    if (m_devices.empty()) return false;
+    auto& secNode = m_devices[0];
+    if (!secNode || !secNode->context) return false;
+
+    VkDevice secDevice = secNode->context->getDevice();
+    VmaAllocator secAlloc = secNode->context->getAllocator();
+    VkQueue secQueue = secNode->context->getGraphicsQueue();
+    VkCommandPool secPool = secNode->commandPool;
+
+    vkQueueWaitIdle(secQueue);
+
+    // 1. Update scene buffers on secondary device
+    VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * scene.triangles.size(), sizeof(TriangleGPU));
+    secNode->triangleBuffer = std::make_unique<Buffer>(
+        secAlloc, triSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.triangles.empty()) {
+        secNode->triangleBuffer->copyFrom(scene.triangles.data(), sizeof(TriangleGPU) * scene.triangles.size());
+    }
+
+    VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * scene.spheres.size(), sizeof(SphereGPU));
+    secNode->sphereBuffer = std::make_unique<Buffer>(
+        secAlloc, sphereSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.spheres.empty()) {
+        secNode->sphereBuffer->copyFrom(scene.spheres.data(), sizeof(SphereGPU) * scene.spheres.size());
+    }
+
+    VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * scene.materials.size(), sizeof(MaterialGPU));
+    secNode->materialBuffer = std::make_unique<Buffer>(
+        secAlloc, matSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.materials.empty()) {
+        secNode->materialBuffer->copyFrom(scene.materials.data(), sizeof(MaterialGPU) * scene.materials.size());
+    }
+
+    VkDeviceSize lightSize = std::max(sizeof(LightGPU) * scene.lights.size(), sizeof(LightGPU));
+    secNode->lightBuffer = std::make_unique<Buffer>(
+        secAlloc, lightSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.lights.empty()) {
+        secNode->lightBuffer->copyFrom(scene.lights.data(), sizeof(LightGPU) * scene.lights.size());
+    }
+
+    // 2. Rebuild secondary AS
+    if (secNode->context->hasRayTracing()) {
+        std::vector<Vertex> asVertices;
+        if (!scene.triangles.empty()) {
+            asVertices.reserve(scene.triangles.size() * 3);
+            for (const auto& tri : scene.triangles) {
+                asVertices.push_back(tri.v0);
+                asVertices.push_back(tri.v1);
+                asVertices.push_back(tri.v2);
+            }
+        } else {
+            Vertex v{};
+            asVertices.assign(3, v);
+        }
+
+        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
+        secNode->asVertexBuffer = std::make_unique<Buffer>(
+            secAlloc, vertexBufferSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+        secNode->asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
+
+        secNode->asManager = std::make_unique<AccelerationStructureManager>(
+            secDevice, secAlloc,
+            secNode->context->getGraphicsQueue(), secNode->context->getGraphicsQueueFamily()
+        );
+
+        ASGeometryInput geom{};
+        geom.vertexBufferAddress = secNode->asVertexBuffer->getDeviceAddress(secDevice);
+        geom.indexBufferAddress = 0;
+        geom.vertexCount = static_cast<uint32_t>(asVertices.size());
+        geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
+        geom.vertexStride = sizeof(Vertex);
+        geom.indexType = VK_INDEX_TYPE_NONE_KHR;
+        bool hasAlphaMask = false;
+        for (const auto& mat : scene.materials) {
+            if (mat.alphaMode == ALPHA_MODE_MASK) {
+                hasAlphaMask = true;
+                break;
+            }
+        }
+        geom.isOpaque = !hasAlphaMask;
+
+        secNode->blas = secNode->asManager->buildBLAS({ geom });
+
+        ASInstanceInput inst{};
+        inst.blasAddress = secNode->blas->getDeviceAddress();
+        inst.transform = glm::mat4(1.0f);
+        inst.customIndex = 0;
+        inst.mask = 0xFF;
+        inst.hitGroupId = 0;
+        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+        secNode->tlas = secNode->asManager->buildTLAS({ inst });
+    }
+
+    // 3. Upload scene textures on secondary device
+    secNode->sceneTextures.clear();
+    for (const auto& texData : scene.textures) {
+        if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+            VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            auto tex = Texture::createFromPixels(
+                secDevice, secAlloc, secQueue, secPool,
+                texData.width, texData.height,
+                fmt, texData.pixels.data(),
+                texData.pixels.size(), false
+            );
+            secNode->sceneTextures.push_back(std::move(tex));
+        } else {
+            secNode->sceneTextures.push_back(Texture::createDummyWhite(secDevice, secAlloc, secQueue, secPool));
+        }
+    }
+
+    // 4. Update secondary descriptors
+    VkDescriptorImageInfo accumImageInfo{};
+    accumImageInfo.imageView = secNode->accumTarget->getImageView();
+    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorBufferInfo uboInfo{ secNode->cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
+    VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
+    VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
+    VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
+    VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
+    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    asInfo.accelerationStructureCount = 1;
+    VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
+    asInfo.pAccelerationStructures = &tlasHandle;
+
+    VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
+
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
+        if (i < secNode->sceneTextures.size() && secNode->sceneTextures[i]) {
+            texInfos[i] = secNode->sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = secNode->dummyWhite->getDescriptorInfo();
+        }
+    }
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
+    };
+    vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());
+    return true;
+}
+
 } // namespace pathways
+

@@ -53,8 +53,29 @@ void Camera::setFov(float fov) {
     }
 }
 
+void Camera::setSceneScale(float sceneRadius) {
+    m_sceneScale = std::max(sceneRadius, 0.05f);
+    // Move across ~25% of the scene radius per second by default
+    m_baseSpeed = std::clamp(m_sceneScale * 0.25f, 0.01f, 500.0f);
+    m_speed = m_baseSpeed;
+    m_minSpeed = std::max(m_baseSpeed * 0.01f, 0.001f);
+    m_maxSpeed = std::min(m_baseSpeed * 50.0f, 2000.0f);
+    // Adapt near and far clipping planes proportionally
+    m_near = std::clamp(m_sceneScale * 0.002f, 0.001f, 0.5f);
+    m_far = std::max(m_sceneScale * 30.0f, 100.0f);
+    m_moved = true;
+}
+
+void Camera::adjustSpeedByWheel(float wheelDelta) {
+    if (wheelDelta > 0.0f) {
+        m_speed = std::min(m_speed * 1.25f, m_maxSpeed);
+    } else if (wheelDelta < 0.0f) {
+        m_speed = std::max(m_speed / 1.25f, m_minSpeed);
+    }
+}
+
 void Camera::setSpeed(float speed) {
-    m_speed = std::clamp(speed, 0.1f, 50.0f);
+    m_speed = std::clamp(speed, m_minSpeed, m_maxSpeed);
 }
 
 void Camera::setSensitivity(float sens) {
@@ -64,6 +85,7 @@ void Camera::setSensitivity(float sens) {
 void Camera::resetToDefault() {
     lookAt(m_defaultPosition, m_defaultTarget);
     setFov(m_defaultFov);
+    m_speed = m_baseSpeed;
 }
 
 void Camera::update(float deltaTime) {

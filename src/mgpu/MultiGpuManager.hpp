@@ -51,12 +51,10 @@ struct GpuDeviceNode {
     std::unique_ptr<Texture> environmentMap;
     std::vector<std::unique_ptr<Texture>> sceneTextures;
 
-    // Secondary pipeline & descriptors
+    // Secondary hardware ray tracing pipeline & descriptors (VK_KHR_ray_tracing_pipeline)
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout rtDescLayout = VK_NULL_HANDLE;
     VkDescriptorSet rtDescSet = VK_NULL_HANDLE;
-    VkPipelineLayout rtPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline rtPipeline = VK_NULL_HANDLE;
     VkPipelineLayout rtpPipelineLayout = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> rtpKhrPipeline;
 
@@ -69,7 +67,8 @@ public:
     MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene);
     ~MultiGpuManager();
 
-    bool isMultiGpuActive() const { return m_active; }
+    bool isMultiGpuActive() const { return m_active && m_mode != MultiGpuMode::Off; }
+    bool isSecondaryInitialized() const { return m_active && !m_devices.empty(); }
     uint32_t getDeviceCount() const { return static_cast<uint32_t>(m_devices.size() + 1); }
     MultiGpuMode getMode() const { return m_mode; }
     void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
@@ -78,10 +77,11 @@ public:
     const std::string& getSecondaryDeviceName() const;
     VulkanContext* getSecondaryContext() const { return m_devices.empty() ? nullptr : m_devices[0]->context.get(); }
     void resize(uint32_t width, uint32_t height);
+    bool loadScene(const SceneData& scene);
 
     // Launch secondary GPU raytracing asynchronously in background thread
     void launchSecondaryWork(const CameraUniform& cameraUniform,
-                             uint32_t frameIndex,
+                             uint32_t bufferSlot,
                              uint32_t tileOffsetX, uint32_t tileOffsetY,
                              uint32_t tileWidth, uint32_t tileHeight,
                              uint32_t numTriangles, uint32_t numSpheres,

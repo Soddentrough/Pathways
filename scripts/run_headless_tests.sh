@@ -14,6 +14,8 @@ echo "=========================================================="
 echo "[1/4] Checking AMD GPU metrics via amd-smi..."
 if command -v amd-smi &> /dev/null; then
     amd-smi
+elif [ -x /home/naoki/.local/bin/amd-smi ]; then
+    /home/naoki/.local/bin/amd-smi
 elif [ -x /opt/rocm/core-10.0/bin/amd-smi ]; then
     /opt/rocm/core-10.0/bin/amd-smi
 elif [ -x /opt/rocm/bin/amd-smi ]; then
@@ -34,6 +36,11 @@ mkdir -p output
 echo ""
 echo "[2b] Running Camera Controls Unit Tests..."
 ./build/bin/test_camera_controls
+
+# 2c. Run Dynamic Scene Switching Tests
+echo ""
+echo "[2c] Running Dynamic Scene Switching Tests..."
+./build/bin/pathways --test-scene-switching
 
 # 3. Test Suite 1: 1080p 16 SPP Full Quality Verification
 echo ""
@@ -66,6 +73,22 @@ echo "[4/5] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)
 
 python3 scripts/verify_frame.py output/test_cornell_4k.png output/stats_4k.json 3840 2160 10.0
 
+# 4b. Test Suite 2b: 4K Native Multi-GPU Interleaved Scanlines (1 SPP, Sub-8ms Target)
+echo ""
+echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1 SPP)..."
+./build/bin/pathways \
+    --headless \
+    --width 3840 \
+    --height 2160 \
+    --spp 1 \
+    --max-bounces 4 \
+    --frames 5 \
+    --mgpu \
+    --dump-frame output/test_cornell_4k_mgpu_interleaved.png \
+    --dump-stats output/stats_4k_mgpu_interleaved.json
+
+python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png output/stats_4k_mgpu_interleaved.json 3840 2160 8.0
+
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""
 echo "[4/5] Running Test Suite 3: Multi-GPU Sample Parallelism (Dual R9700 @ PCIe 5.0 x16)..."
@@ -91,7 +114,6 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --spp 16 \
     --max-bounces 4 \
     --frames 10 \
-    --pipeline megakernel \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -102,7 +124,6 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --spp 16 \
     --max-bounces 4 \
     --frames 10 \
-    --pipeline megakernel \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 

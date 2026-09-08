@@ -9,13 +9,18 @@ compile_commands.json
 # Output directories
 output/
 telemetry/
+scratch/
 /*.png
 /*.exr
 /*.json
 !CMakePresets.json
 CMakeUserPresets.json
 *.spv
-!scenes/**
+*.zip
+scenes/*/
+!scenes/**.glb
+!scenes/**.gltf
+!scenes/**.png
 
 # IDE / Editor / UI state
 .vscode/

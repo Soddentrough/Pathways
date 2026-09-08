@@ -22,9 +22,11 @@ public:
     RTPipeline& operator=(const RTPipeline&) = delete;
 
     void traceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32_t depth = 1);
+    void traceRaysIndirect(VkCommandBuffer cmd, VkDeviceAddress indirectDeviceAddress);
 
     VkPipeline getPipeline() const { return m_pipeline; }
     bool isSupported() const { return m_supported; }
+    bool isIndirectSupported() const { return pfn_vkCmdTraceRaysIndirectKHR != nullptr; }
 
 private:
     void loadFunctionPointers();
@@ -52,6 +54,7 @@ private:
     PFN_vkCreateRayTracingPipelinesKHR pfn_vkCreateRayTracingPipelinesKHR = nullptr;
     PFN_vkGetRayTracingShaderGroupHandlesKHR pfn_vkGetRayTracingShaderGroupHandlesKHR = nullptr;
     PFN_vkCmdTraceRaysKHR pfn_vkCmdTraceRaysKHR = nullptr;
+    PFN_vkCmdTraceRaysIndirectKHR pfn_vkCmdTraceRaysIndirectKHR = nullptr;
 };
 
 } // namespace pathways

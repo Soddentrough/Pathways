@@ -36,9 +36,13 @@ void RTPipeline::loadFunctionPointers() {
     pfn_vkCreateRayTracingPipelinesKHR = (PFN_vkCreateRayTracingPipelinesKHR)vkGetDeviceProcAddr(m_device, "vkCreateRayTracingPipelinesKHR");
     pfn_vkGetRayTracingShaderGroupHandlesKHR = (PFN_vkGetRayTracingShaderGroupHandlesKHR)vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupHandlesKHR");
     pfn_vkCmdTraceRaysKHR = (PFN_vkCmdTraceRaysKHR)vkGetDeviceProcAddr(m_device, "vkCmdTraceRaysKHR");
+    pfn_vkCmdTraceRaysIndirectKHR = (PFN_vkCmdTraceRaysIndirectKHR)vkGetDeviceProcAddr(m_device, "vkCmdTraceRaysIndirectKHR");
 
     if (!pfn_vkCreateRayTracingPipelinesKHR || !pfn_vkGetRayTracingShaderGroupHandlesKHR || !pfn_vkCmdTraceRaysKHR) {
         throw std::runtime_error("Failed to load VK_KHR_ray_tracing_pipeline extension function pointers!");
+    }
+    if (pfn_vkCmdTraceRaysIndirectKHR) {
+        Logger::info("Hardware Indirect Ray Tracing (vkCmdTraceRaysIndirectKHR) available and loaded.");
     }
 }
 
@@ -212,6 +216,14 @@ void RTPipeline::createShaderBindingTable() {
 
 void RTPipeline::traceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32_t depth) {
     pfn_vkCmdTraceRaysKHR(cmd, &m_rgenRegion, &m_missRegion, &m_hitRegion, &m_callableRegion, width, height, depth);
+}
+
+void RTPipeline::traceRaysIndirect(VkCommandBuffer cmd, VkDeviceAddress indirectDeviceAddress) {
+    if (pfn_vkCmdTraceRaysIndirectKHR) {
+        pfn_vkCmdTraceRaysIndirectKHR(cmd, &m_rgenRegion, &m_missRegion, &m_hitRegion, &m_callableRegion, indirectDeviceAddress);
+    } else {
+        Logger::warn("RTPipeline::traceRaysIndirect called but vkCmdTraceRaysIndirectKHR not supported!");
+    }
 }
 
 } // namespace pathways

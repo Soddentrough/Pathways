@@ -3,23 +3,17 @@
 #extension GL_EXT_shader_image_load_formatted : require
 
 struct HitPayload {
-    vec3 radiance;
-    vec3 throughputMod;
-    vec3 nextOrigin;
-    vec3 nextDirection;
-    vec3 shadowOrigin;
-    vec3 shadowDir;
-    float shadowDist;
-    vec3 shadowLightRad;
-    uint seed;
-    float lastBsdfPdf;
-    bool hasShadowRay;
-    bool hit;
-    bool isDelta;
+    vec3 radiance;               // 12 bytes: direct emissive + accumulated direct light
+    uint packedThroughputRG;     //  4 bytes: packHalf2x16(throughputMod.rg)
+    vec3 nextOrigin;             // 12 bytes: next ray origin
+    uint packedThroughputB_Flags;//  4 bytes: lower 16 bits = half(b), upper 16 bits = flags
+    uint packedNextDir;          //  4 bytes: octahedral 32-bit (oct32) unit direction
+    float lastBsdfPdf;           //  4 bytes: BSDF PDF for next bounce MIS evaluation
+    uint seed;                   //  4 bytes: PCG RNG state
+    uint pad;                    //  4 bytes: 48-byte cache-line alignment
 };
 
 layout(location = 0) rayPayloadEXT HitPayload prd;
-layout(location = 1) rayPayloadEXT bool isShadowVisible;
 
 layout(binding = 0) uniform image2D uAccumImage;
 
@@ -65,32 +59,59 @@ vec2 randVec2(inout uint seed) {
     return vec2(randFloat(seed), randFloat(seed));
 }
 
+// 32-bit Octahedral Decoding (Cigolle et al.)
+vec2 octSign(vec2 v) {
+    return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);
+}
+
+vec3 octDecode(vec2 f) {
+    vec3 v = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (v.z < 0.0) {
+        v.xy = (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+    }
+    return normalize(v);
+}
+
+vec3 unpackOct32(uint p) {
+    return octDecode(unpackSnorm2x16(p));
+}
+
 void main() {
     ivec2 launchID = ivec2(gl_LaunchIDEXT.xy);
     ivec2 imageSize = ivec2(pc.tileWidth > 0u ? pc.tileWidth : gl_LaunchSizeEXT.x,
                             pc.tileHeight > 0u ? pc.tileHeight : gl_LaunchSizeEXT.y);
     ivec2 pixelCoord;
 
-    // Multi-GPU Checkerboard Tiling & Dynamic Work Queue
-    // tileOffsetX: 0 = full frame (Single GPU), 1 = even tiles (GPU 0), 2 = odd tiles (GPU 1)
-    // tileOffsetY: Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
-    uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
-    if (pc.tileOffsetX == 1u) {
-        // GPU 0 (Primary): Even tiles (Checkerboard)
-        uint ty = uint(launchID.y) / tileSize;
-        uint tx_half = uint(launchID.x) / tileSize;
-        uint localX = uint(launchID.x) % tileSize;
-        uint tx = tx_half * 2u + (ty & 1u);
-        pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
-    } else if (pc.tileOffsetX == 2u) {
-        // GPU 1 (Secondary): Odd tiles (Checkerboard)
-        uint ty = uint(launchID.y) / tileSize;
-        uint tx_half = uint(launchID.x) / tileSize;
-        uint localX = uint(launchID.x) % tileSize;
-        uint tx = tx_half * 2u + (1u - (ty & 1u));
-        pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
+    // Multi-GPU Work Distribution
+    // tileOffsetX: 0 = full frame (Single GPU / Sample Parallel)
+    //              1 = Primary GPU (GPU 0)
+    //              2 = Secondary GPU (GPU 1)
+    // tileOffsetY: 0 = Interleaved Scanlines (Linearly Scalable 50/50, default)
+    //             >0 = 2D Checkerboard Tile size (16, 32, 64, or 128)
+    if (pc.tileOffsetY == 0u) {
+        // --- Interleaved Scanlines: 100% Horizontal Wave32 Coherence & Perfect 50/50 Balance ---
+        if (pc.tileOffsetX == 1u) {
+            pixelCoord = ivec2(launchID.x, launchID.y * 2);
+        } else if (pc.tileOffsetX == 2u) {
+            pixelCoord = ivec2(launchID.x, launchID.y * 2 + 1);
+        } else {
+            pixelCoord = launchID;
+        }
     } else {
-        pixelCoord = launchID;
+        // --- 2D Checkerboard Tiling ---
+        uint tileSize = pc.tileOffsetY;
+        uint ty = uint(launchID.y) / tileSize;
+        uint tx_half = uint(launchID.x) / tileSize;
+        uint localX = uint(launchID.x) % tileSize;
+        if (pc.tileOffsetX == 1u) {
+            uint tx = tx_half * 2u + (ty & 1u);
+            pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
+        } else if (pc.tileOffsetX == 2u) {
+            uint tx = tx_half * 2u + (1u - (ty & 1u));
+            pixelCoord = ivec2(int(tx * tileSize + localX), launchID.y);
+        } else {
+            pixelCoord = launchID;
+        }
     }
 
     if (pixelCoord.x >= imageSize.x || pixelCoord.y >= imageSize.y) {
@@ -115,14 +136,13 @@ void main() {
         float lastBsdfPdf = 0.0;
         bool isDelta = true;
 
-        for (uint bounce = 0; bounce < ubo.maxBounces; ++bounce) {
-            prd.hit = false;
+        uint maxBounces = ((ubo.flags & (1u << 1)) != 0u) ? ubo.maxBounces : 1u;
+        for (uint bounce = 0; bounce < maxBounces; ++bounce) {
             prd.radiance = vec3(0.0);
-            prd.throughputMod = vec3(0.0);
-            prd.hasShadowRay = false;
+            prd.packedThroughputRG = 0u;
+            prd.packedThroughputB_Flags = isDelta ? (2u << 16u) : 0u;
             prd.seed = seed;
             prd.lastBsdfPdf = lastBsdfPdf;
-            prd.isDelta = isDelta;
 
             traceRayEXT(topLevelAS,
                         gl_RayFlagsOpaqueEXT,
@@ -138,37 +158,22 @@ void main() {
 
             seed = prd.seed;
             lastBsdfPdf = prd.lastBsdfPdf;
-            isDelta = prd.isDelta;
 
-            if (!prd.hit) {
-                radiance += throughput * prd.radiance;
+            uint flags = prd.packedThroughputB_Flags >> 16u;
+            bool hit = (flags & 1u) != 0u;
+            isDelta = (flags & 2u) != 0u;
+
+            // Direct emissive + direct light (accumulated in rchit) or sky (miss)
+            radiance += throughput * prd.radiance;
+
+            if (!hit) {
                 break;
             }
 
-            // Direct emissive
-            radiance += throughput * prd.radiance;
-
-            // Direct light shadow ray
-            if (prd.hasShadowRay) {
-                isShadowVisible = false;
-                traceRayEXT(topLevelAS,
-                            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xFF,
-                            0,
-                            0,
-                            1 /* missIndex 1: shadow.rmiss */,
-                            prd.shadowOrigin,
-                            0.001,
-                            prd.shadowDir,
-                            prd.shadowDist,
-                            1 /* payload location 1 */);
-
-                if (isShadowVisible) {
-                    radiance += throughput * prd.shadowLightRad;
-                }
-            }
-
-            throughput *= prd.throughputMod;
+            vec2 tpRG = unpackHalf2x16(prd.packedThroughputRG);
+            float tpB = unpackHalf2x16(prd.packedThroughputB_Flags & 0xFFFFu).x;
+            vec3 throughputMod = vec3(tpRG, tpB);
+            throughput *= throughputMod;
 
             if (bounce >= 1u) {
                 float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
@@ -179,7 +184,7 @@ void main() {
             }
 
             rayOrigin = prd.nextOrigin;
-            rayDir = prd.nextDirection;
+            rayDir = unpackOct32(prd.packedNextDir);
         }
 
         pixelRadiance += radiance;

@@ -248,7 +248,27 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << "    },\n"
         << std::format("    \"total_frames\": {},\n", stats.total_frames)
         << std::format("    \"total_accumulated_samples\": {},\n", stats.total_samples)
-        << std::format("    \"validation_errors\": {}\n", stats.validation_errors)
+        << std::format("    \"validation_errors\": {},\n", stats.validation_errors)
+        << "    \"configurations_breakdown\": [\n";
+
+    for (size_t i = 0; i < stats.configurations_breakdown.size(); ++i) {
+        const auto& c = stats.configurations_breakdown[i];
+        out << "      {\n"
+             << std::format("        \"label\": \"{}\",\n", c.label)
+             << std::format("        \"frame_count\": {},\n", c.frame_count)
+             << std::format("        \"avg_frame_time_ms\": {:.3f},\n", c.avg_frame_time_ms)
+             << std::format("        \"min_frame_time_ms\": {:.3f},\n", c.min_frame_time_ms)
+             << std::format("        \"max_frame_time_ms\": {:.3f},\n", c.max_frame_time_ms)
+             << std::format("        \"avg_fps\": {:.1f},\n", c.avg_fps)
+             << std::format("        \"primary_gpu_time_ms\": {:.3f},\n", c.primary_gpu_time_ms)
+             << std::format("        \"secondary_gpu_time_ms\": {:.3f},\n", c.secondary_gpu_time_ms)
+             << std::format("        \"tonemap_time_ms\": {:.3f},\n", c.tonemap_time_ms)
+             << std::format("        \"gigarays_per_second\": {:.3f},\n", c.gigarays_per_second)
+             << std::format("        \"target_achieved_sub_8ms\": {}\n", c.target_achieved ? "true" : "false")
+             << (i + 1 < stats.configurations_breakdown.size() ? "      },\n" : "      }\n");
+    }
+
+    out << "    ]\n"
         << "  }\n"
         << "}\n";
 

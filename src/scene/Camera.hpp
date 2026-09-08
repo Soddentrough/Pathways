@@ -35,6 +35,12 @@ public:
 
     void setSpeed(float speed);
     float getSpeed() const { return m_speed; }
+    void setSceneScale(float sceneRadius);
+    float getSceneScale() const { return m_sceneScale; }
+    float getBaseSpeed() const { return m_baseSpeed; }
+    float getMinSpeed() const { return m_minSpeed; }
+    float getMaxSpeed() const { return m_maxSpeed; }
+    void adjustSpeedByWheel(float wheelDelta);
     void setSensitivity(float sens);
     float getSensitivity() const { return m_sensitivity; }
     void resetToDefault();
@@ -77,6 +83,10 @@ private:
 
     float m_yaw = -90.0f;
     float m_pitch = 0.0f;
+    float m_sceneScale = 2.0f;
+    float m_baseSpeed = 3.0f;
+    float m_minSpeed = 0.05f;
+    float m_maxSpeed = 50.0f;
     float m_speed = 3.0f;
     float m_sensitivity = 0.1f;
     float m_fov = 45.0f;

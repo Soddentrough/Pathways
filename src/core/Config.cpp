@@ -9,6 +9,8 @@ void Config::printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
               << "Options:\n"
               << "  --headless              Run in headless offscreen mode (no window)\n"
+              << "  --fullscreen            Run in fullscreen mode [default]\n"
+              << "  --windowed              Run in windowed / non-fullscreen mode\n"
               << "  --width <int>           Viewport width (default: 3840)\n"
               << "  --height <int>          Viewport height (default: 2160)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
@@ -20,17 +22,15 @@ void Config::printUsage(const char* progName) {
               << "  --dump-frame <path.png> Save tonemapped LDR frame to PNG\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
-              << "  --dump-stats <path.json>Save benchmark & profiling statistics to JSON\n"
-              << "  --mgpu                  Enable Multi-GPU mode (default: Checkerboard Tiling)\n"
-              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard) or 'off' [default: off]\n"
-              << "  --tile-size <int>       Checkerboard tile size: 16, 32, 64, or 128 (default: 64)\n"
+              << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
+              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'interleave' (Interleaved Scanlines), 'sample' (Sample Parallel), 'auto', or 'off'\n"
+              << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --double-buffer-shared  Enable double-buffering for inter-GPU shared host memory [default]\n"
               << "  --single-buffer-shared  Disable double-buffering for inter-GPU shared host memory\n"
-              << "  --visualize-split       Visualize real-time workload split between Dual GPUs (checkerboard overlay)\n"
+              << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --no-visualize-split    Disable GPU load split visualization overlay [default]\n"
               << "  --single-gpu            Force single GPU mode (alias for --mgpu-mode off)\n"
-              << "  --pipeline <mode>       Pipeline: 'rtp' (VK_KHR_ray_tracing_pipeline, default), 'wavefront' (decomposed DGC compaction), 'persistent', or 'megakernel'\n"
               << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
               << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
@@ -45,11 +45,19 @@ void Config::printUsage(const char* progName) {
 Config Config::parse(int argc, char* argv[]) {
     Config cfg;
 
+    bool fullscreen_explicit = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
         if (arg == "--headless") {
             cfg.headless = true;
+        } else if (arg == "--fullscreen") {
+            cfg.fullscreen = true;
+            fullscreen_explicit = true;
+        } else if (arg == "--windowed" || arg == "--no-fullscreen") {
+            cfg.fullscreen = false;
+            fullscreen_explicit = true;
         } else if (arg == "--width" && i + 1 < argc) {
             cfg.width = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.custom_resolution = true;
@@ -78,17 +86,6 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_stats_path = argv[++i];
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--pipeline" && i + 1 < argc) {
-            std::string p = argv[++i];
-            if (p == "megakernel" || p == "mega") {
-                cfg.pipeline_type = PipelineType::Megakernel;
-            } else if (p == "persistent" || p == "pwf") {
-                cfg.pipeline_type = PipelineType::Persistent;
-            } else if (p == "rtp" || p == "raygen" || p == "khr") {
-                cfg.pipeline_type = PipelineType::RTP;
-            } else {
-                cfg.pipeline_type = PipelineType::Wavefront;
-            }
         } else if (arg == "--morton") {
             cfg.enable_morton_order = true;
         } else if (arg == "--no-morton") {
@@ -100,7 +97,10 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
+            else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") cfg.mgpu_mode = MultiGpuMode::InterleavedScanline;
             else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -121,6 +121,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.double_buffered_shared_mem = true;
         } else if (arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
+        } else if (arg == "--camera-motion") {
+            cfg.camera_motion = true;
         } else if (arg == "--visualize-split" || arg == "--show-split") {
             cfg.visualize_mgpu_split = true;
         } else if (arg == "--no-visualize-split") {
@@ -133,6 +135,9 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
+        } else if (arg == "--test-scene-switching") {
+            cfg.test_scene_switching = true;
+            cfg.headless = true;
         } else if (arg == "--hw-rt") {
             Logger::info("Command line: Hardware RT is permanently active.");
         } else if (arg == "--no-hw-rt" || arg == "--software-rt") {
@@ -147,6 +152,10 @@ Config Config::parse(int argc, char* argv[]) {
         } else {
             Logger::warn("Unknown command-line argument: {}", arg);
         }
+    }
+
+    if (cfg.custom_resolution && !fullscreen_explicit) {
+        cfg.fullscreen = false;
     }
 
     if (cfg.headless && cfg.frame_limit == 0) {

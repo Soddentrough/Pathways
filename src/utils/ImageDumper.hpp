@@ -81,7 +81,7 @@ struct FrameStats {
     bool has_sync2 = true;
 
     // Engine Settings & Configuration
-    std::string pipeline_type_str = "wavefront";
+    std::string pipeline_type_str = "rtp";
     uint32_t width = 0;
     uint32_t height = 0;
     float render_scale = 1.0f;
@@ -124,6 +124,22 @@ struct FrameStats {
     double secondary_gpu_time_ms = 0.0;
     double tonemap_time_ms = 0.0;
     double pcie_transfer_time_ms = 0.0;
+
+    // Tallied unique configurations breakdown
+    struct ConfigTallySummary {
+        std::string label;
+        uint32_t frame_count = 0;
+        double avg_frame_time_ms = 0.0;
+        double min_frame_time_ms = 0.0;
+        double max_frame_time_ms = 0.0;
+        double avg_fps = 0.0;
+        double primary_gpu_time_ms = 0.0;
+        double secondary_gpu_time_ms = 0.0;
+        double tonemap_time_ms = 0.0;
+        double gigarays_per_second = 0.0;
+        bool target_achieved = false;
+    };
+    std::vector<ConfigTallySummary> configurations_breakdown;
 };
 
 class ImageDumper {

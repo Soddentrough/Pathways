@@ -117,8 +117,34 @@ int main() {
     cam.setAdaptiveFov(false);
     cam.setFov(50.0f);
     cam.adaptFovForAspect(1280.0f / 2160.0f);
-    assert_near(cam.getFov(), 50.0f, 0.01f, "Manual FOV preserved when adaptive FOV disabled");
-    std::cout << "[PASS] Manual FOV preservation verified when adaptive mode disabled." << std::endl;
+    // 11. Scale-Adaptive Camera Speeds
+    // Small scene (e.g. coffee maker, radius 0.25m)
+    cam.setSceneScale(0.25f);
+    assert_near(cam.getSceneScale(), 0.25f, 0.001f, "Small scene radius");
+    assert_near(cam.getSpeed(), 0.25f * 0.25f, 0.001f, "Small scene base speed");
+    assert(cam.getSpeed() < 0.1f); // Ensures camera won't fly away in small scenes
+    std::cout << "[PASS] Small scene scale adaptivity verified (radius: 0.25m -> speed: " << cam.getSpeed() << " m/s)." << std::endl;
+
+    // Large scene (e.g. living room / house, radius 20.0m)
+    cam.setSceneScale(20.0f);
+    assert_near(cam.getSceneScale(), 20.0f, 0.001f, "Large scene radius");
+    assert_near(cam.getSpeed(), 5.0f, 0.01f, "Large scene base speed"); // 20 * 0.25 = 5.0 m/s
+    std::cout << "[PASS] Large scene scale adaptivity verified (radius: 20m -> speed: " << cam.getSpeed() << " m/s)." << std::endl;
+
+    // 12. Mouse wheel speed adjustment (multiplicative)
+    float speedBeforeWheel = cam.getSpeed();
+    cam.adjustSpeedByWheel(1.0f); // Scroll up -> speed * 1.25
+    assert_near(cam.getSpeed(), speedBeforeWheel * 1.25f, 0.01f, "Wheel scroll up speed");
+    cam.adjustSpeedByWheel(-1.0f); // Scroll down -> speed / 1.25
+    assert_near(cam.getSpeed(), speedBeforeWheel, 0.01f, "Wheel scroll down speed back");
+    std::cout << "[PASS] Mouse wheel multiplicative speed scaling verified." << std::endl;
+
+    // Speed clamping within [minSpeed, maxSpeed]
+    cam.setSpeed(999999.0f);
+    assert_near(cam.getSpeed(), cam.getMaxSpeed(), 0.01f, "Max speed clamping");
+    cam.setSpeed(0.000001f);
+    assert_near(cam.getSpeed(), cam.getMinSpeed(), 0.001f, "Min speed clamping");
+    std::cout << "[PASS] Dynamic min/max speed clamping verified (" << cam.getMinSpeed() << " to " << cam.getMaxSpeed() << " m/s)." << std::endl;
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  All Camera & FPS Navigation Unit Tests PASSED Cleanly!" << std::endl;

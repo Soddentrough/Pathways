@@ -57,17 +57,40 @@ void main() {
 
     // Multi-GPU Load Split Visualization Overlay
     if (pc.visualizeSplit == 1u) {
-        uint sz = (pc.tileSize == 0u) ? 64u : pc.tileSize;
-        uint check = ((pixelCoord.x / sz) + (pixelCoord.y / sz)) & 1u;
-        bool isBorder = (pixelCoord.x % sz == 0u) || (pixelCoord.y % sz == 0u);
-        if (isBorder) {
-            finalColor = mix(finalColor, vec3(0.0, 0.0, 0.0), 0.5);
-        } else if (check == 0u) {
-            // GPU 0 (Primary) - cool cyan tint
-            finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0), 0.18);
+        uint check;
+        if (pc.tileSize == 0u) {
+            // Interleaved Scanline mode: alternating scanline tint with CRT-style luminance modulation
+            check = uint(pixelCoord.y) & 1u;
+            // Apply scanline contrast to prevent optical blending at 4K
+            finalColor *= (check == 0u) ? 1.15 : 0.85;
+            if (pixelCoord.y % 16u == 0u) {
+                finalColor *= 0.65; // Horizontal grid demarcation line every 16 scanlines
+            }
+            if (check == 0u) {
+                // GPU 0 (Primary) - Electric Cyan
+                finalColor = mix(finalColor, vec3(0.0, 0.85, 1.0), 0.35);
+            } else {
+                // GPU 1 (Secondary) - Warm Radiant Amber
+                finalColor = mix(finalColor, vec3(1.0, 0.50, 0.0), 0.35);
+            }
+            // Left edge indicator bar
+            if (pixelCoord.x < 14u) {
+                finalColor = (check == 0u) ? vec3(0.0, 0.9, 1.0) : vec3(1.0, 0.5, 0.0);
+            }
         } else {
-            // GPU 1 (Secondary) - warm amber tint
-            finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1), 0.18);
+            uint sz = pc.tileSize;
+            check = ((pixelCoord.x / sz) + (pixelCoord.y / sz)) & 1u;
+            bool isBorder = (pixelCoord.x % sz == 0u) || (pixelCoord.y % sz == 0u);
+            if (isBorder) {
+                finalColor = mix(finalColor, vec3(0.0, 0.0, 0.0), 0.6);
+            }
+            if (check == 0u) {
+                // GPU 0 (Primary) - cool cyan tint
+                finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0), 0.25);
+            } else {
+                // GPU 1 (Secondary) - warm amber tint
+                finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1), 0.25);
+            }
         }
     }
 

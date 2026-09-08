@@ -8,7 +8,10 @@ namespace pathways {
 
 enum class MultiGpuMode {
     Off,
-    CheckerboardTile
+    InterleavedScanline, // Linearly scalable 50/50 scanline work distribution (any SPP) [Default when mGPU active]
+    CheckerboardTile,    // Checkerboard 2D Tiling (16x16, 32x32, 64x64)
+    SampleParallel,      // Temporal Sample Parallelism
+    Auto                 // Adaptive: SampleParallel if SPP > 1, else InterleavedScanline
 };
 
 enum class AccumFormat {
@@ -16,17 +19,11 @@ enum class AccumFormat {
     RGBA32_SFLOAT  // 128-bit Full Float HDR
 };
 
-enum class PipelineType {
-    Wavefront,
-    Megakernel,
-    Persistent,
-    RTP
-};
-
 struct Config {
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
+    bool fullscreen = true;         // Default: true (fullscreen by default, disable with --windowed)
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
@@ -46,10 +43,11 @@ struct Config {
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
-    PipelineType pipeline_type = PipelineType::RTP;
     bool enable_morton_order = true;
     uint32_t tile_size = 64;
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
+    bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
+    bool test_scene_switching = false; // Run headless dynamic scene switching verification test
 
     std::string scene_path = "";
     std::string hdri_path = "";

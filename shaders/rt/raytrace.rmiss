@@ -5,17 +5,14 @@
 #define TWO_PI 6.28318530717958647692
 
 struct HitPayload {
-    vec3 radiance;
-    vec3 throughputMod;
-    vec3 nextOrigin;
-    vec3 nextDirection;
-    vec3 shadowOrigin;
-    vec3 shadowDir;
-    float shadowDist;
-    vec3 shadowLightRad;
-    uint seed;
-    bool hasShadowRay;
-    bool hit;
+    vec3 radiance;               // 12 bytes: direct emissive + accumulated direct light
+    uint packedThroughputRG;     //  4 bytes: packHalf2x16(throughputMod.rg)
+    vec3 nextOrigin;             // 12 bytes: next ray origin
+    uint packedThroughputB_Flags;//  4 bytes: packHalf2x16(vec2(b, 0.0)) & 0xFFFF | (flags << 16)
+    uint packedNextDir;          //  4 bytes: octahedral 32-bit (oct32) unit direction
+    float lastBsdfPdf;           //  4 bytes: BSDF PDF for next bounce MIS evaluation
+    uint seed;                   //  4 bytes: PCG RNG state
+    uint pad;                    //  4 bytes: 48-byte cache-line alignment
 };
 
 layout(location = 0) rayPayloadInEXT HitPayload prd;
@@ -44,7 +41,7 @@ vec2 directionToEquirectangular(vec3 dir) {
 }
 
 void main() {
-    prd.hit = false;
+    prd.packedThroughputB_Flags = 0u; // hit = false
     vec3 unitDir = normalize(gl_WorldRayDirectionEXT);
     if (pc.hasEnvMap == 1u) {
         vec2 envUv = directionToEquirectangular(unitDir);

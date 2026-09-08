@@ -56,11 +56,13 @@ def verify_stats(json_path, max_target_ms=8.0):
         with open(json_path, "r") as f:
             data = json.load(f)
 
-        gpu_name = data.get("gpu_name", "Unknown")
-        avg_ms = data.get("avg_frame_time_ms", 0.0)
-        fps = data.get("avg_fps", 0.0)
-        rays_sec = data.get("rays_per_second", 0.0)
-        val_errors = data.get("validation_errors", -1)
+        perf = data.get("performance", {})
+        gpu_info = data.get("primary_gpu", {})
+        gpu_name = data.get("gpu_name") or gpu_info.get("device_name", "Unknown")
+        avg_ms = perf.get("avg_frame_time_ms") if "avg_frame_time_ms" in perf else data.get("avg_frame_time_ms", 0.0)
+        fps = perf.get("avg_fps") if "avg_fps" in perf else data.get("avg_fps", 0.0)
+        rays_sec = perf.get("rays_per_second") if "rays_per_second" in perf else data.get("rays_per_second", 0.0)
+        val_errors = perf.get("validation_errors") if "validation_errors" in perf else data.get("validation_errors", -1)
 
         print(f"\033[32m[PASS]\033[0m Loaded stats for GPU: {gpu_name}")
         print(f"       Average Frame Time: {avg_ms:.3f} ms ({fps:.1f} FPS)")
