@@ -1,0 +1,183 @@
+name: Release Builds
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            os_name: linux
+            artifact_name: pathways-linux-x86_64
+            archive_name: pathways-linux-x86_64.tar.gz
+          - os: windows-latest
+            os_name: windows
+            artifact_name: pathways-windows-x64
+            archive_name: pathways-windows-x64.zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # -------------------------------------------------------------
+      # Dependencies: Linux
+      # -------------------------------------------------------------
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential pkg-config libz-dev
+
+      # -------------------------------------------------------------
+      # Dependencies: Windows (ZLIB via vcpkg)
+      # -------------------------------------------------------------
+      - name: Install Windows dependencies (vcpkg)
+        if: runner.os == 'Windows'
+        run: |
+          vcpkg install zlib:x64-windows
+
+      # -------------------------------------------------------------
+      # Vulkan SDK 1.4 Setup (Cross-Platform)
+      # -------------------------------------------------------------
+      - name: Setup Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: latest
+          cache: true
+
+      # -------------------------------------------------------------
+      # SDL3 Setup (Cross-Platform)
+      # -------------------------------------------------------------
+      - name: Setup SDL3
+        uses: libsdl-org/setup-sdl@main
+        id: sdl
+        with:
+          version: 3-latest
+          install-linux-dependencies: true
+
+      # -------------------------------------------------------------
+      # Configure & Build: Linux
+      # -------------------------------------------------------------
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }}"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake --build build --config Release --parallel
+
+      # -------------------------------------------------------------
+      # Configure & Build: Windows
+      # -------------------------------------------------------------
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }};C:/vcpkg/installed/x64-windows" \
+            -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake --build build --config Release --parallel
+
+      # -------------------------------------------------------------
+      # Package Release Bundle: Linux
+      # -------------------------------------------------------------
+      - name: Package Release (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p package/shaders package/scenes
+          cp build/bin/pathways package/
+          cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || cp build/shaders/*.spv package/shaders/
+          cp -r scenes/* package/scenes/ 2>/dev/null || true
+          cp README.md package/ 2>/dev/null || true
+          tar -czvf ${{ matrix.archive_name }} -C package .
+
+      # -------------------------------------------------------------
+      # Package Release Bundle: Windows
+      # -------------------------------------------------------------
+      - name: Package Release (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package/shaders package/scenes
+          if [ -f "build/bin/Release/pathways.exe" ]; then
+            cp build/bin/Release/pathways.exe package/
+            cp build/bin/Release/*.dll package/ 2>/dev/null || true
+          elif [ -f "build/bin/pathways.exe" ]; then
+            cp build/bin/pathways.exe package/
+            cp build/bin/*.dll package/ 2>/dev/null || true
+          fi
+          # Copy SDL3.dll from SDL3 prefix
+          find "${{ steps.sdl.outputs.prefix }}" -name "SDL3.dll" -exec cp {} package/ \; 2>/dev/null || true
+          # Copy zlib1.dll from vcpkg
+          find "C:/vcpkg/installed/x64-windows/bin" -name "*.dll" -exec cp {} package/ \; 2>/dev/null || true
+          # Copy compiled shaders
+          cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || cp build/bin/Release/shaders/*.spv package/shaders/ 2>/dev/null || cp build/shaders/*.spv package/shaders/ 2>/dev/null || true
+          cp -r scenes/* package/scenes/ 2>/dev/null || true
+          cp README.md package/ 2>/dev/null || true
+          7z a -tzip ${{ matrix.archive_name }} ./package/*
+
+      # -------------------------------------------------------------
+      # Upload Artifacts (Always uploaded for CI & verification)
+      # -------------------------------------------------------------
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # Publish GitHub Release (Only on version tags, e.g. v1.0.0)
+  # -----------------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display downloaded files
+        run: ls -R artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/pathways-linux-x86_64/pathways-linux-x86_64.tar.gz
+            artifacts/pathways-windows-x64/pathways-windows-x64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
