@@ -305,7 +305,8 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 
     if (allSucceeded) {
         m_useZeroCopyHost = true;
-        Logger::info("Double-Buffered Zero-Copy Inter-GPU Host Buffers initialized via VK_EXT_external_memory_host (2x {:.2f} MB).",
+        Logger::info("{} Zero-Copy Inter-GPU Host Buffers initialized via VK_EXT_external_memory_host (2x {:.2f} MB).",
+                     m_config.double_buffered_shared_mem ? "Double-Buffered" : "Single-Buffered (Double-Buffering Disabled)",
                      static_cast<double>(m_sharedBufferSize) / (1024.0 * 1024.0));
     } else {
         Logger::warn("Failed to bind zero-copy host buffers on both GPUs. Falling back to CPU staging.");
@@ -636,7 +637,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     vkQueueSubmit(secNode->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
 
-    Logger::info("Secondary GPU Node fully initialized: {} (PCIe 5.0 x16)", secNode->deviceName);
+    Logger::info("Secondary GPU Node fully initialized: {} ({})", secNode->deviceName, secNode->context->getPciLinkString());
     m_devices.push_back(std::move(secNode));
     m_active = true;
 

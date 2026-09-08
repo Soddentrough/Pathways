@@ -457,7 +457,25 @@ void main() {
     }
     clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
-    vec3 clearcoatNormal = hitNormal;
+    vec3 clearcoatNormal = geomNormal;
+    if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 64u) {
+        vec4 tan0 = tri.v0.tangent;
+        vec4 tan1 = tri.v1.tangent;
+        vec4 tan2 = tri.v2.tangent;
+        vec3 cGeomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
+        float cTanSign = tan0.w != 0.0 ? tan0.w : 1.0;
+        if (length(cGeomTan) < 0.1) {
+            vec3 up = abs(geomNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+            cGeomTan = normalize(cross(up, geomNormal));
+            cTanSign = 1.0;
+        }
+        vec3 cNormMap = texture(sceneTextures[nonuniformEXT(mat.clearcoatNormalTex - 1u)], hitUv).rgb * 2.0 - 1.0;
+        cNormMap = normalize(cNormMap);
+        cGeomTan = normalize(cGeomTan - dot(cGeomTan, geomNormal) * geomNormal);
+        vec3 cGeomBitangent = cross(geomNormal, cGeomTan) * cTanSign;
+        mat3 cTbn = mat3(cGeomTan, cGeomBitangent, geomNormal);
+        clearcoatNormal = normalize(cTbn * cNormMap);
+    }
 
     float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;

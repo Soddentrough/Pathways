@@ -43,7 +43,6 @@ struct Config {
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
-    bool enable_morton_order = true;
     uint32_t tile_size = 64;
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)

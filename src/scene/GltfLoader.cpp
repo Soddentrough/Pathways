@@ -463,13 +463,24 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     data.lights = gltfScene.lights;
     data.textures = std::move(gltfScene.textures);
 
-    // Traverse nodes and bake world-space transformed triangles
+    struct MeshInfo {
+        std::string name;
+        glm::vec3 minBound{1e30f};
+        glm::vec3 maxBound{-1e30f};
+        uint32_t firstTriangle = 0;
+        uint32_t triCount = 0;
+    };
+    std::vector<MeshInfo> meshInfos;
+
     for (const auto& node : gltfScene.nodes) {
         if (node.meshIndex < 0 || static_cast<size_t>(node.meshIndex) >= gltfScene.meshes.size()) {
             continue;
         }
 
         const auto& mesh = gltfScene.meshes[node.meshIndex];
+        MeshInfo mInfo;
+        mInfo.name = mesh.name;
+        mInfo.firstTriangle = static_cast<uint32_t>(data.triangles.size());
         const glm::mat4& M = node.worldTransform;
         glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(M)));
 
@@ -551,6 +562,14 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
 
                     tri.materialId = matId;
                     data.triangles.push_back(tri);
+
+                    mInfo.minBound = glm::min(mInfo.minBound, p0_3);
+                    mInfo.minBound = glm::min(mInfo.minBound, p1_3);
+                    mInfo.minBound = glm::min(mInfo.minBound, p2_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p0_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p1_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p2_3);
+                    mInfo.triCount++;
                 }
             } else {
                 for (size_t i = 0; i + 2 < prim.vertices.size(); i += 3) {
@@ -588,47 +607,127 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
 
                     tri.materialId = matId;
                     data.triangles.push_back(tri);
+
+                    mInfo.minBound = glm::min(mInfo.minBound, p0_3);
+                    mInfo.minBound = glm::min(mInfo.minBound, p1_3);
+                    mInfo.minBound = glm::min(mInfo.minBound, p2_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p0_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p1_3);
+                    mInfo.maxBound = glm::max(mInfo.maxBound, p2_3);
+                    mInfo.triCount++;
                 }
             }
         }
+
+        if (mInfo.triCount > 0) {
+            meshInfos.push_back(mInfo);
+            MeshRange mr{};
+            mr.name = mInfo.name.empty() ? ("Mesh_" + std::to_string(meshInfos.size())) : mInfo.name;
+            mr.minBound = mInfo.minBound;
+            mr.maxBound = mInfo.maxBound;
+            mr.firstTriangle = mInfo.firstTriangle;
+            mr.triangleCount = mInfo.triCount;
+            data.meshRanges.push_back(mr);
+        }
     }
 
-    // Compute AABB for framing and lighting
+    // Compute AABB for framing, lighting, and camera scaling
     glm::vec3 minBound(1e30f);
     glm::vec3 maxBound(-1e30f);
-    for (const auto& tri : data.triangles) {
-        minBound = glm::min(minBound, glm::vec3(tri.v0.position));
-        minBound = glm::min(minBound, glm::vec3(tri.v1.position));
-        minBound = glm::min(minBound, glm::vec3(tri.v2.position));
-        maxBound = glm::max(maxBound, glm::vec3(tri.v0.position));
-        maxBound = glm::max(maxBound, glm::vec3(tri.v1.position));
-        maxBound = glm::max(maxBound, glm::vec3(tri.v2.position));
+    for (const auto& mi : meshInfos) {
+        minBound = glm::min(minBound, mi.minBound);
+        maxBound = glm::max(maxBound, mi.maxBound);
+    }
+    if (meshInfos.empty()) {
+        minBound = glm::vec3(-1.0f);
+        maxBound = glm::vec3(1.0f);
     }
 
     glm::vec3 center = (minBound + maxBound) * 0.5f;
     glm::vec3 extent = maxBound - minBound;
+    float fullDiag = glm::length(extent);
     float maxDim = std::max({extent.x, extent.y, extent.z});
     if (maxDim < 1e-4f) maxDim = 2.0f;
 
+    // Detect outlier backdrop/ground plane meshes
+    glm::vec3 focalMin(1e30f);
+    glm::vec3 focalMax(-1e30f);
+    size_t nonBackdropCount = 0;
+
+    for (const auto& mi : meshInfos) {
+        glm::vec3 mExt = mi.maxBound - mi.minBound;
+        float mDiag = glm::length(mExt);
+        bool isFlatY = mExt.y < 0.05f * std::max({mExt.x, mExt.z, 0.01f});
+        bool isFlatZ = mExt.z < 0.05f * std::max({mExt.x, mExt.y, 0.01f});
+        bool coversScene = (mExt.x > 0.65f * extent.x && mExt.z > 0.65f * extent.z) || (mDiag > 0.65f * fullDiag);
+
+        std::string nameLower = mi.name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        bool isNamedGround = (nameLower.find("ground") != std::string::npos ||
+                              nameLower.find("floor") != std::string::npos ||
+                              nameLower.find("backdrop") != std::string::npos ||
+                              nameLower.find("bounce") != std::string::npos ||
+                              nameLower.find("mattefloor") != std::string::npos);
+
+        if (meshInfos.size() > 1 && (isNamedGround || isFlatY || isFlatZ) && coversScene) {
+            // Outlier studio ground / backdrop plane excluded from focal calculation
+            continue;
+        }
+
+        focalMin = glm::min(focalMin, mi.minBound);
+        focalMax = glm::max(focalMax, mi.maxBound);
+        nonBackdropCount++;
+    }
+
+    if (nonBackdropCount == 0) {
+        focalMin = minBound;
+        focalMax = maxBound;
+    }
+
+    glm::vec3 focalCenter = (focalMin + focalMax) * 0.5f;
+    glm::vec3 focalExtent = focalMax - focalMin;
+    float focalRadius = std::max(glm::length(focalExtent) * 0.5f, 0.1f);
+
+    // Identify central target point at (0, Y_center, 0) if within focal bounds, or focalCenter
+    glm::vec3 centralTarget = focalCenter;
+    if (focalMin.x <= 0.5f && focalMax.x >= -0.5f && focalMin.z <= 0.5f && focalMax.z >= -0.5f) {
+        centralTarget = glm::vec3(0.0f, focalCenter.y, 0.0f);
+    }
+
     data.boundsMin = minBound;
     data.boundsMax = maxBound;
-    data.sceneRadius = std::max(glm::length(extent) * 0.5f, 0.1f);
+    data.focalBoundsMin = focalMin;
+    data.focalBoundsMax = focalMax;
+    data.focalRadius = focalRadius;
+    data.centralTarget = centralTarget;
 
     // Camera setup
     if (!gltfScene.cameras.empty()) {
         data.hasCamera = true;
         data.cameraPosition = gltfScene.cameras[0].getPosition();
-        data.cameraTarget = gltfScene.cameras[0].getPosition() + gltfScene.cameras[0].getFront() * 5.0f;
+        glm::vec3 camFront = gltfScene.cameras[0].getFront();
+        glm::vec3 toCenter = centralTarget - data.cameraPosition;
+        float projDist = glm::dot(toCenter, camFront);
+        float focalDist = projDist > 0.2f ? projDist : glm::length(toCenter);
+        if (focalDist < 0.1f) focalDist = focalRadius;
+        data.focalDistance = focalDist;
+        data.cameraTarget = data.cameraPosition + camFront * focalDist;
         data.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
-        data.cameraFov = 45.0f;
+        data.cameraFov = gltfScene.cameras[0].getFov();
     } else if (!data.triangles.empty()) {
-        float dist = (maxDim * 0.5f) / std::tan(glm::radians(22.5f));
+        float fMaxDim = std::max({focalExtent.x, focalExtent.y, focalExtent.z});
+        if (fMaxDim < 1e-4f) fMaxDim = 2.0f;
+        float dist = (fMaxDim * 0.5f) / std::tan(glm::radians(22.5f));
         data.hasCamera = true;
-        data.cameraPosition = center + glm::vec3(0.0f, maxDim * 0.12f, dist * 1.3f);
-        data.cameraTarget = center;
+        data.cameraPosition = focalCenter + glm::vec3(0.0f, fMaxDim * 0.12f, dist * 1.3f);
+        data.cameraTarget = focalCenter;
+        data.focalDistance = dist * 1.3f;
         data.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
         data.cameraFov = 45.0f;
     }
+
+    float effectiveScale = std::clamp(focalRadius, 0.25f * data.focalDistance, 2.5f * data.focalDistance);
+    data.sceneRadius = effectiveScale;
 
     // glTF 2.1 physical emissive mesh light extraction
     // Scan baked world-space triangles for emissive materials (KHR_materials_emissive_strength)

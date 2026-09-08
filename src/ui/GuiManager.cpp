@@ -220,8 +220,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
         }
         if (cameraMode) {
-            float camSpeed = camera ? camera->getSpeed() : 3.5f;
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Navigation (Speed: %.2f m/s | Scroll to Adjust)", camSpeed);
+            float camSpeed = camera ? camera->getEffectiveSpeed() : 3.5f;
+            float targetDist = camera ? camera->getCurrentTargetDistance() : 2.0f;
+            if (camera && camera->isOrbiting()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[MODE] CTRL ARC ORBIT (Radius: %.2f m | A/D: Arc | W/S: Dolly | Q/E/Space/C: Elev)", camera->getOrbitRadius());
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Navigation (Speed: %.2f m/s | Target Dist: %.2f m | Ctrl: Orbit | Alt: Crawl | Shift: Sprint)", camSpeed, targetDist);
+            }
         } else {
             ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "[MODE] UI Control Panel Active (Click Viewport or TAB for FPS)");
         }
@@ -625,7 +630,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("Device:   %s", displayInfo->displayName.c_str());
             ImGui::BulletText("Native:   %u x %u @ %.2f Hz", displayInfo->nativeWidth, displayInfo->nativeHeight, displayInfo->refreshRate);
             ImGui::BulletText("Usable:   %u x %u (Scale: %.2f)", displayInfo->usableWidth, displayInfo->usableHeight, displayInfo->contentScale);
-            ImGui::BulletText("Aspect:   %.3f (%s)", displayInfo->displayAspect, displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : "Landscape (16:9/16:10)");
+            ImGui::BulletText("Aspect:   %.3f (%s)", displayInfo->displayAspect, displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : (displayInfo->isUltraWide ? "Ultrawide (21:9 / 32:9)" : "Landscape (16:9 / 16:10)"));
 
             ImGui::Spacing();
             ImGui::TextDisabled("Active Viewport:");
@@ -641,7 +646,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             float presetBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
 
             // Row 1: Native Full Display | DualUp (1280x2048)
-            if (ImGui::Button("Native Full Display", ImVec2(presetBtnW, 26.0f))) {
+            std::string nativeBtnLabel = std::format("Native ({}x{})", displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : 3840,
+                                                                         displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : 2160);
+            if (ImGui::Button(nativeBtnLabel.c_str(), ImVec2(presetBtnW, 26.0f))) {
                 if (actions) {
                     actions->requestedWidth = displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : displayInfo->usableWidth;
                     actions->requestedHeight = displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : displayInfo->usableHeight;
@@ -714,17 +721,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
                 ImGui::Text("Speed Presets:");
                 ImGui::SameLine();
-                if (ImGui::SmallButton("0.25x")) camera->setSpeed(camera->getBaseSpeed() * 0.25f);
+                if (ImGui::SmallButton("0.25x (Fine)")) camera->setSpeed(camera->getBaseSpeed() * 0.25f);
                 ImGui::SameLine();
-                if (ImGui::SmallButton("0.5x"))  camera->setSpeed(camera->getBaseSpeed() * 0.50f);
+                if (ImGui::SmallButton("0.5x"))        camera->setSpeed(camera->getBaseSpeed() * 0.50f);
                 ImGui::SameLine();
                 if (ImGui::SmallButton("1.0x (Default)")) camera->setSpeed(camera->getBaseSpeed());
                 ImGui::SameLine();
-                if (ImGui::SmallButton("2.0x (Fast)"))   camera->setSpeed(camera->getBaseSpeed() * 2.0f);
+                if (ImGui::SmallButton("2.0x (Fast)")) camera->setSpeed(camera->getBaseSpeed() * 2.0f);
                 ImGui::SameLine();
-                if (ImGui::SmallButton("5.0x (Turbo)"))  camera->setSpeed(camera->getBaseSpeed() * 5.0f);
+                if (ImGui::SmallButton("4.0x (Turbo)")) camera->setSpeed(camera->getBaseSpeed() * 4.0f);
 
-                ImGui::TextDisabled("Scene radius: %.2f m | Base speed: %.2f m/s (Scroll wheel scales speed)", camera->getSceneScale(), camera->getBaseSpeed());
+                bool dynScaling = camera->isDynamicScaling();
+                if (ImGui::Checkbox("Distance-Adaptive Speed (Smooth Approach to Focus)", &dynScaling)) {
+                    camera->setDynamicScaling(dynScaling);
+                }
+
+                ImGui::TextDisabled("Focal scale: %.2f m | Target dist: %.2f m | Base speed: %.2f m/s",
+                                    camera->getSceneScale(), camera->getCurrentTargetDistance(), camera->getBaseSpeed());
 
                 float sens = camera->getSensitivity();
                 if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.02f, 0.5f, "%.2f")) {
@@ -741,17 +754,30 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
                 ImGui::Text("Look Angles: Yaw: %.1f deg, Pitch: %.1f deg", camera->getYaw(), camera->getPitch());
 
-                if (ImGui::Button("Reset Camera to Default", ImVec2(200.0f, 28.0f))) {
+                if (ImGui::Button("Focus on Center (F)", ImVec2(180.0f, 26.0f))) {
+                    camera->focusOnTarget(camera->getCentralTarget());
+                    settingsChanged = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset Camera", ImVec2(140.0f, 26.0f))) {
                     camera->resetToDefault();
                     settingsChanged = true;
                 }
             }
             ImGui::Spacing();
-            ImGui::TextDisabled("FPS Input Reference:");
+            ImGui::TextDisabled("FPS Navigation Reference:");
             ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
             ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
             ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
-            ImGui::BulletText("Left Shift: Sprint Boost (2.5x Speed)");
+            ImGui::BulletText("Ctrl (Hold): Arc-Strafe / Turntable Orbit around Targeted Object");
+            ImGui::BulletText("  -> A / D: Arc-Strafe Left / Right around Target");
+            ImGui::BulletText("  -> W / S: Dolly In / Out along Line of Sight");
+            ImGui::BulletText("  -> Space / C (or E / Q): Elevate Up / Down in Arc");
+            ImGui::BulletText("  -> Mouse: Turntable Orbit around Target");
+            ImGui::BulletText("Alt (Hold): Precision Crawl (0.25x Speed for Object Centering)");
+            ImGui::BulletText("Shift (Hold): Sprint Boost (3.0x Speed for Fast Relocation)");
+            ImGui::BulletText("F Key: Focus on Central Object");
+            ImGui::BulletText("Mouse Wheel: Continuously Scale Camera Speed");
             ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
             ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
         }

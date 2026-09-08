@@ -30,19 +30,34 @@ public:
 
     // Movement controls
     void processKeyboard(char direction, float deltaTime);
-    void processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint);
-    void processMouseMovement(float xoffset, float yoffset);
+    void processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl = false, bool arcStrafe = false);
+    void processMouseMovement(float xoffset, float yoffset, bool orbit = false);
+
+    // Arc-strafe / Orbit controls
+    void startOrbit(glm::vec3 pivot);
+    void endOrbit();
+    bool isOrbiting() const { return m_orbiting; }
+    glm::vec3 getOrbitPivot() const { return m_orbitPivot; }
+    float getOrbitRadius() const { return m_orbitRadius; }
+    void setOrbitRadius(float r) { m_orbitRadius = std::max(r, 0.05f); }
 
     void setSpeed(float speed);
     float getSpeed() const { return m_speed; }
-    void setSceneScale(float sceneRadius);
+    void setSceneScale(float sceneRadius, float focalDistance = 0.0f, glm::vec3 centralTarget = glm::vec3(0.0f, 1.0f, 0.0f));
     float getSceneScale() const { return m_sceneScale; }
+    float getFocalDistance() const { return m_focalDistance; }
+    glm::vec3 getCentralTarget() const { return m_centralTarget; }
+    float getCurrentTargetDistance() const;
+    float getEffectiveSpeed(bool sprint = false, bool crawl = false) const;
     float getBaseSpeed() const { return m_baseSpeed; }
     float getMinSpeed() const { return m_minSpeed; }
     float getMaxSpeed() const { return m_maxSpeed; }
     void adjustSpeedByWheel(float wheelDelta);
     void setSensitivity(float sens);
     float getSensitivity() const { return m_sensitivity; }
+    bool isDynamicScaling() const { return m_dynamicScaling; }
+    void setDynamicScaling(bool enable) { m_dynamicScaling = enable; }
+    void focusOnTarget(glm::vec3 target, float targetRadius = 0.0f);
     void resetToDefault();
     void setDefaultFraming(glm::vec3 position, glm::vec3 target, float fov) {
         m_defaultPosition = position;
@@ -84,6 +99,12 @@ private:
     float m_yaw = -90.0f;
     float m_pitch = 0.0f;
     float m_sceneScale = 2.0f;
+    float m_focalDistance = 2.0f;
+    glm::vec3 m_centralTarget{ 0.0f, 1.0f, 0.0f };
+    glm::vec3 m_orbitPivot{ 0.0f, 1.0f, 0.0f };
+    float m_orbitRadius = 2.0f;
+    bool m_orbiting = false;
+    bool m_dynamicScaling = false;
     float m_baseSpeed = 3.0f;
     float m_minSpeed = 0.05f;
     float m_maxSpeed = 50.0f;

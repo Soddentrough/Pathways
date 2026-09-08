@@ -17,14 +17,25 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
 
-    // Prefer B8G8R8A8_UNORM or R8G8B8A8_UNORM
+    // Prefer R8G8B8A8_UNORM to match engine storage output image, fallback to B8G8R8A8_UNORM
     m_imageFormat = formats[0].format;
     m_colorSpace = formats[0].colorSpace;
+    bool foundFormat = false;
     for (const auto& f : formats) {
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+        if (f.format == VK_FORMAT_R8G8B8A8_UNORM) {
             m_imageFormat = f.format;
             m_colorSpace = f.colorSpace;
+            foundFormat = true;
             break;
+        }
+    }
+    if (!foundFormat) {
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_B8G8R8A8_UNORM) {
+                m_imageFormat = f.format;
+                m_colorSpace = f.colorSpace;
+                break;
+            }
         }
     }
 

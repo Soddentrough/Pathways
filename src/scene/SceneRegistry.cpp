@@ -48,15 +48,21 @@ std::string SceneEntry::formatComboPreview() const {
 std::string SceneRegistry::formatSceneName(const std::string& rawName) {
     std::string out;
     bool capitalizeNext = true;
-    for (char c : rawName) {
+    for (size_t i = 0; i < rawName.size(); ++i) {
+        char c = rawName[i];
         if (c == '-' || c == '_') {
             out += ' ';
             capitalizeNext = true;
+        } else if (i > 0 && std::islower(static_cast<unsigned char>(rawName[i - 1])) &&
+                   std::isupper(static_cast<unsigned char>(c))) {
+            out += ' ';
+            out += c;
+            capitalizeNext = false;
         } else if (capitalizeNext) {
             out += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
             capitalizeNext = false;
         } else {
-            out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            out += c;
         }
     }
     return out;

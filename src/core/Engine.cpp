@@ -107,7 +107,7 @@ Engine::Engine(const Config& config) : m_config(config) {
     Logger::info("Initializing Pathways Engine...");
     m_window = std::make_unique<Window>(m_config);
 
-    if (!m_config.custom_resolution && !m_config.headless) {
+    if (!m_config.headless) {
         m_config.width = m_window->getWidth();
         m_config.height = m_window->getHeight();
     }
@@ -409,7 +409,7 @@ void Engine::initScene() {
                  m_numTriangles, m_numSpheres, m_numMaterials, m_numLights);
 
     if (m_camera) {
-        m_camera->setSceneScale(m_sceneData.sceneRadius);
+        m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
         if (m_sceneData.hasCamera) {
             m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
             m_camera->setFov(m_sceneData.cameraFov);
@@ -745,7 +745,7 @@ bool Engine::loadScene(const std::string& filepath) {
 
     // Update camera framing
     if (m_camera) {
-        m_camera->setSceneScale(m_sceneData.sceneRadius);
+        m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
         m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
         m_camera->setFov(m_sceneData.cameraFov);
         m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
@@ -1286,9 +1286,17 @@ bool Engine::handleEvent(const SDL_Event& e) {
 
     // 4. In Camera Mode (FPS navigation)
     if (m_cameraMode) {
+        if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F) {
+            if (m_camera) {
+                m_camera->focusOnTarget(m_sceneData.centralTarget, m_sceneData.focalRadius);
+            }
+            return true;
+        }
         if (e.type == SDL_EVENT_MOUSE_MOTION) {
             if (m_camera) {
-                m_camera->processMouseMovement(e.motion.xrel, e.motion.yrel);
+                const bool* keyState = SDL_GetKeyboardState(nullptr);
+                bool ctrl = keyState && (keyState[SDL_SCANCODE_LCTRL] || keyState[SDL_SCANCODE_RCTRL]);
+                m_camera->processMouseMovement(e.motion.xrel, e.motion.yrel, ctrl);
             }
             return true;
         }
@@ -1353,11 +1361,37 @@ void Engine::updateInput() {
     if (keyState[SDL_SCANCODE_D]) strafe += 1.0f;
     if (keyState[SDL_SCANCODE_A]) strafe -= 1.0f;
     if (keyState[SDL_SCANCODE_SPACE] || keyState[SDL_SCANCODE_E]) vertical += 1.0f;
-    if (keyState[SDL_SCANCODE_LCTRL] || keyState[SDL_SCANCODE_RCTRL] || keyState[SDL_SCANCODE_C] || keyState[SDL_SCANCODE_Q]) vertical -= 1.0f;
+    if (keyState[SDL_SCANCODE_C] || keyState[SDL_SCANCODE_Q]) vertical -= 1.0f;
 
     bool sprint = keyState[SDL_SCANCODE_LSHIFT] || keyState[SDL_SCANCODE_RSHIFT];
+    bool crawl = keyState[SDL_SCANCODE_LALT] || keyState[SDL_SCANCODE_RALT];
+    bool ctrl = keyState[SDL_SCANCODE_LCTRL] || keyState[SDL_SCANCODE_RCTRL];
 
-    m_camera->processFpsInput(forward, strafe, vertical, dt, sprint);
+    if (ctrl) {
+        if (!m_camera->isOrbiting()) {
+            // Find target object along view ray
+            float hitDist = 0.0f;
+            glm::vec3 hitPoint;
+            std::string hitName;
+            glm::vec3 camPos = m_camera->getPosition();
+            glm::vec3 camFront = m_camera->getFront();
+            if (m_sceneData.raycast(camPos, camFront, 5000.0f, hitDist, hitPoint, &hitName)) {
+                m_camera->startOrbit(hitPoint);
+            } else {
+                // Fallback: project centralTarget or use focal distance along view ray
+                glm::vec3 toCenter = m_sceneData.centralTarget - camPos;
+                float proj = glm::dot(toCenter, camFront);
+                float dist = (proj > 0.1f) ? proj : m_camera->getFocalDistance();
+                m_camera->startOrbit(camPos + camFront * dist);
+            }
+        }
+    } else {
+        if (m_camera->isOrbiting()) {
+            m_camera->endOrbit();
+        }
+    }
+
+    m_camera->processFpsInput(forward, strafe, vertical, dt, sprint, crawl, ctrl);
 }
 
 void Engine::renderFrame() {
@@ -1522,7 +1556,11 @@ void Engine::renderFrame() {
         if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR ||
             m_config.width != m_swapchain->getExtent().width ||
             m_config.height != m_swapchain->getExtent().height) {
-            onResize(m_swapchain->getExtent().width, m_swapchain->getExtent().height);
+            int curW = 0, curH = 0;
+            SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
+            uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
+            uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+            onResize(targetW, targetH, /*forceRecreate=*/true);
             return;
         }
     }
@@ -1837,8 +1875,11 @@ void Engine::renderFrame() {
             vkCmdPipelineBarrier2(cmd, &depToDst);
 
         // Copy or blit output image to swapchain image
-        if (m_config.width == m_swapchain->getExtent().width &&
-            m_config.height == m_swapchain->getExtent().height) {
+        bool extentsMatch = (m_config.width == m_swapchain->getExtent().width &&
+                             m_config.height == m_swapchain->getExtent().height);
+        bool formatsMatch = (m_outputImage->getFormat() == m_swapchain->getFormat());
+
+        if (extentsMatch && formatsMatch) {
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -1853,8 +1894,9 @@ void Engine::renderFrame() {
             blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             blitRegion.dstOffsets[0] = { 0, 0, 0 };
             blitRegion.dstOffsets[1] = { static_cast<int32_t>(m_swapchain->getExtent().width), static_cast<int32_t>(m_swapchain->getExtent().height), 1 };
+            VkFilter filter = extentsMatch ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
             vkCmdBlitImage(cmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_LINEAR);
+                           swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, filter);
         }
 
         // Transition m_outputImage back to GENERAL
@@ -2026,7 +2068,11 @@ void Engine::renderFrame() {
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
         if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
-            onResize(m_window->getWidth(), m_window->getHeight());
+            int curW = 0, curH = 0;
+            SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
+            uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
+            uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+            onResize(targetW, targetH, /*forceRecreate=*/true);
         }
     }
 
@@ -2290,7 +2336,6 @@ FrameStats Engine::getStats() const {
     stats.spp = m_config.spp;
     stats.max_bounces = m_config.max_bounces;
     stats.render_scale = m_config.render_scale;
-    stats.enable_morton = m_config.enable_morton_order;
     stats.total_frames = m_totalFramesRendered;
     stats.validation_errors = m_context->getValidationErrors();
     // 1. Session & Host Platform Metadata
@@ -2342,6 +2387,9 @@ FrameStats Engine::getStats() const {
             const auto& secPci = m_mgpu->getSecondaryContext()->getPciLinkInfo();
             stats.secondary_arch_name = m_mgpu->getSecondaryContext()->getArchitectureName();
             stats.secondary_pci_link = secPci.formattedLink;
+            if (!secPci.formattedLink.empty() && secPci.formattedLink != "PCIe N/A") {
+                stats.mgpu_interconnect_str = secPci.formattedLink;
+            }
             stats.secondary_pci_speed = secPci.currentSpeed;
             stats.secondary_pci_width = secPci.currentWidth;
             stats.secondary_pci_max_speed = secPci.maxSpeed;
@@ -2400,7 +2448,6 @@ FrameStats Engine::getStats() const {
     stats.visualize_mgpu_split = m_config.visualize_mgpu_split;
     stats.render_scale = m_config.render_scale;
     stats.max_bounces = m_config.max_bounces;
-    stats.enable_morton = m_config.enable_morton_order;
     stats.checkerboard_tile_size = m_config.tile_size;
     stats.enable_direct_light = m_config.enable_direct_light;
     stats.enable_indirect_light = m_config.enable_indirect_light;
@@ -2452,14 +2499,15 @@ std::string Engine::exportTelemetry(const std::string& customPath) {
     }
 }
 
-void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
+void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate) {
     if (m_config.headless || !m_swapchain) return;
     if (newWidth == 0 || newHeight == 0) return;
 
     newWidth = std::max(64u, newWidth);
     newHeight = std::max(64u, newHeight);
 
-    if (newWidth == m_config.width && newHeight == m_config.height &&
+    if (!forceRecreate &&
+        newWidth == m_config.width && newHeight == m_config.height &&
         m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
         m_resetAccumulation = true;
         return;
@@ -2571,8 +2619,22 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight) {
     m_resetAccumulation = true;
 }
 
+std::string Engine::getActiveSceneName() const {
+    if (m_currentSceneIndex >= 0 && m_currentSceneIndex < static_cast<int>(m_availableScenes.size())) {
+        if (!m_availableScenes[m_currentSceneIndex].label.empty()) {
+            return m_availableScenes[m_currentSceneIndex].label;
+        }
+    }
+    if (m_config.scene_path.empty() || m_config.scene_path == "__procedural_cornell_box__") {
+        return "Procedural Cornell Box";
+    }
+    std::filesystem::path p(m_config.scene_path);
+    return SceneRegistry::formatSceneName(p.stem().string());
+}
+
 void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs) {
     ConfigKey key;
+    key.scene_name = getActiveSceneName();
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
     key.width = m_config.width;
     key.height = m_config.height;
@@ -2604,14 +2666,6 @@ void Engine::printExecutionSummary() const {
                  m_configTallies.size(), m_configTallies.size() == 1 ? "" : "s");
     Logger::info("----------------------------------------------------------------------------------------");
 
-    double baselineSingleGpuAvgMs = 0.0;
-    for (const auto& tally : m_configTallies) {
-        if (tally.key.mgpu_mode == MultiGpuMode::Off && tally.frameCount > 0) {
-            baselineSingleGpuAvgMs = tally.getAvgFrameTimeMs();
-            break;
-        }
-    }
-
     for (size_t i = 0; i < m_configTallies.size(); ++i) {
         const auto& tally = m_configTallies[i];
         Logger::info("  [Config {}/{}] {}", i + 1, m_configTallies.size(), tally.label);
@@ -2622,8 +2676,25 @@ void Engine::printExecutionSummary() const {
         if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.getAvgSecondaryRtMs() > 0.001) {
             Logger::info("    GPU Breakdown:       GPU 0: {:.3f} ms | GPU 1: {:.3f} ms | Tonemap & Merge: {:.3f} ms",
                          tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
-            if (baselineSingleGpuAvgMs > 0.001) {
-                double speedup = baselineSingleGpuAvgMs / tally.getAvgFrameTimeMs();
+
+            // Look up single-GPU baseline for the same scene, resolution, spp, bounces, and format
+            double baselineMs = 0.0;
+            for (const auto& other : m_configTallies) {
+                if (other.key.scene_name == tally.key.scene_name &&
+                    other.key.width == tally.key.width &&
+                    other.key.height == tally.key.height &&
+                    other.key.spp == tally.key.spp &&
+                    other.key.max_bounces == tally.key.max_bounces &&
+                    other.key.accum_format == tally.key.accum_format &&
+                    other.key.mgpu_mode == MultiGpuMode::Off &&
+                    other.frameCount > 0) {
+                    baselineMs = other.getAvgFrameTimeMs();
+                    break;
+                }
+            }
+
+            if (baselineMs > 0.001) {
+                double speedup = baselineMs / tally.getAvgFrameTimeMs();
                 double efficiency = (speedup / 2.0) * 100.0;
                 Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
             }

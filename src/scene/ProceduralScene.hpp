@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 #include <vector>
+#include <string>
 #include <cstdint>
 #include "scene/Material.hpp"
 #include "scene/Light.hpp"
@@ -38,12 +39,21 @@ struct TextureData {
     bool isSrgb = false;
 };
 
+struct MeshRange {
+    std::string name;
+    glm::vec3 minBound{ 1e30f };
+    glm::vec3 maxBound{ -1e30f };
+    uint32_t firstTriangle = 0;
+    uint32_t triangleCount = 0;
+};
+
 struct SceneData {
     std::vector<TriangleGPU> triangles;
     std::vector<SphereGPU> spheres;
     std::vector<MaterialGPU> materials;
     std::vector<LightGPU> lights;
     std::vector<TextureData> textures;
+    std::vector<MeshRange> meshRanges;
 
     bool hasCamera = false;
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);
@@ -54,6 +64,16 @@ struct SceneData {
     glm::vec3 boundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
     glm::vec3 boundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
     float sceneRadius = 2.0f;
+
+    glm::vec3 focalBoundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+    glm::vec3 focalBoundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
+    float focalRadius = 2.0f;
+    float focalDistance = 2.7f;
+    glm::vec3 centralTarget = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    // Fast CPU raycast against scene geometry for camera pivot targeting
+    bool raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDist,
+                 float& outHitDist, glm::vec3& outHitPoint, std::string* outHitName = nullptr) const;
 };
 
 class ProceduralScene {

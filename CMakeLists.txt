@@ -226,6 +226,7 @@ enable_testing()
 add_executable(test_camera_controls
     tests/test_camera_controls.cpp
     src/scene/Camera.cpp
+    src/scene/ProceduralScene.cpp
 )
 target_include_directories(test_camera_controls PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

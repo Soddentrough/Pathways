@@ -205,7 +205,6 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)
         << std::format("    \"max_bounces\": {},\n", stats.max_bounces)
-        << std::format("    \"morton_order\": {},\n", stats.enable_morton ? "true" : "false")
         << std::format("    \"checkerboard_tile_size\": {},\n", stats.checkerboard_tile_size)
         << "    \"shading\": {\n"
         << std::format("      \"direct_lighting\": {},\n", stats.enable_direct_light ? "true" : "false")

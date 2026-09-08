@@ -9,6 +9,10 @@ Camera::Camera(glm::vec3 position, glm::vec3 target, float fov, float aspect)
       m_defaultPosition(position), m_defaultTarget(target), m_defaultFov(fov),
       m_fov(fov), m_aspect(aspect) {
 
+    m_focalDistance = glm::length(target - position);
+    if (m_focalDistance < 0.1f) m_focalDistance = 2.0f;
+    m_centralTarget = target;
+
     glm::vec3 direction = glm::normalize(target - position);
     m_pitch = glm::degrees(std::asin(std::clamp(direction.y, -0.999f, 0.999f)));
     m_yaw = glm::degrees(std::atan2(direction.z, direction.x));
@@ -53,17 +57,62 @@ void Camera::setFov(float fov) {
     }
 }
 
-void Camera::setSceneScale(float sceneRadius) {
+void Camera::setSceneScale(float sceneRadius, float focalDistance, glm::vec3 centralTarget) {
     m_sceneScale = std::max(sceneRadius, 0.05f);
-    // Move across scene diameter in ~1.1 seconds (1.75x scene radius per second)
-    // For Cornell Box (r=2.0m), base speed is 3.5 m/s, matching responsive real-time traversal
-    m_baseSpeed = std::clamp(m_sceneScale * 1.75f, 0.1f, 500.0f);
+    m_focalDistance = (focalDistance > 0.01f) ? focalDistance : m_sceneScale;
+    m_centralTarget = centralTarget;
+
+    // Constant Half-Distance Time Law:
+    // Move half the distance to the central object in T_half = 2.0 seconds:
+    // v_base = D / (2 * T_half) = 0.25 * D
+    // Near a cup (D=0.85m), v_base = ~0.21 m/s (moves 3.4mm/frame, precise centering)
+    // Near a car (D=11-17m), v_base = ~2.7-4.4 m/s (natural vehicle walkthrough)
+    // In vast scenes / distant dragon (D=80m), v_base = ~20 m/s (smooth, prompt relocation)
+    float baseRate = 0.25f; // s^-1 (closes half the distance in 2.0 seconds)
+    m_baseSpeed = std::clamp(m_focalDistance * baseRate, 0.05f, 100.0f);
     m_speed = m_baseSpeed;
-    m_minSpeed = std::max(m_baseSpeed * 0.01f, 0.001f);
-    m_maxSpeed = std::min(m_baseSpeed * 50.0f, 2000.0f);
+    m_minSpeed = std::max(m_baseSpeed * 0.02f, 0.005f);
+    m_maxSpeed = std::min(m_baseSpeed * 30.0f, 500.0f);
+
     // Adapt near and far clipping planes proportionally
-    m_near = std::clamp(m_sceneScale * 0.002f, 0.001f, 0.5f);
-    m_far = std::max(m_sceneScale * 30.0f, 100.0f);
+    m_near = std::clamp(m_sceneScale * 0.001f, 0.001f, 0.1f);
+    m_far = std::max(m_sceneScale * 50.0f, 200.0f);
+    m_moved = true;
+}
+
+float Camera::getCurrentTargetDistance() const {
+    float dist = glm::length(m_centralTarget - m_position);
+    float minD = std::max(0.05f, 0.05f * m_sceneScale);
+    return std::max(dist, minD);
+}
+
+float Camera::getEffectiveSpeed(bool sprint, bool crawl) const {
+    float currentDist = getCurrentTargetDistance();
+    float distRatio = (m_focalDistance > 0.01f) ? (currentDist / m_focalDistance) : 1.0f;
+    float distFactor = m_dynamicScaling ? std::clamp(distRatio, 0.15f, 5.0f) : 1.0f;
+
+    float gearMultiplier = 1.0f;
+    if (crawl) {
+        gearMultiplier = 0.25f; // Precision crawl gear for micro-centering
+    } else if (sprint) {
+        gearMultiplier = 3.0f;  // Sprint relocation gear
+    }
+
+    return std::clamp(m_speed * distFactor * gearMultiplier, m_minSpeed * 0.1f, m_maxSpeed * 3.0f);
+}
+
+void Camera::focusOnTarget(glm::vec3 target, float targetRadius) {
+    glm::vec3 dir = m_position - target;
+    float currentDist = glm::length(dir);
+    if (currentDist < 0.001f) {
+        dir = glm::vec3(0.0f, 0.5f, 1.0f);
+        currentDist = 1.0f;
+    }
+    dir = glm::normalize(dir);
+
+    float desiredDist = (targetRadius > 0.01f) ? (targetRadius * 2.5f) : m_focalDistance;
+    lookAt(target + dir * desiredDist, target);
+    m_speed = m_baseSpeed;
     m_moved = true;
 }
 
@@ -100,6 +149,11 @@ void Camera::lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up) {
     glm::vec3 direction = glm::normalize(target - position);
     m_pitch = glm::degrees(std::asin(std::clamp(direction.y, -0.999f, 0.999f)));
     m_yaw = glm::degrees(std::atan2(direction.z, direction.x));
+    float dist = glm::length(target - position);
+    if (dist > 0.05f) {
+        m_focalDistance = dist;
+    }
+    m_centralTarget = target;
     updateVectors();
     m_moved = true;
 }
@@ -115,23 +169,86 @@ void Camera::updateVectors() {
     m_up = glm::normalize(glm::cross(m_right, m_front));
 }
 
-void Camera::processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint) {
+void Camera::startOrbit(glm::vec3 pivot) {
+    m_orbitPivot = pivot;
+    float dist = glm::length(m_position - pivot);
+    m_orbitRadius = std::max(dist, 0.05f);
+    m_orbiting = true;
+}
+
+void Camera::endOrbit() {
+    m_orbiting = false;
+}
+
+void Camera::processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl, bool arcStrafe) {
     if (std::abs(forward) < 0.001f && std::abs(strafe) < 0.001f && std::abs(vertical) < 0.001f) {
         return;
     }
 
-    // Move in 3D look-direction for forward/back, horizontal for strafe, and world up for vertical
+    if (arcStrafe && m_orbiting) {
+        // Arc-strafe / turntable orbit around m_orbitPivot
+        glm::vec3 r = m_position - m_orbitPivot;
+        float currentDist = glm::length(r);
+        if (currentDist < 0.01f) {
+            r = -m_front * std::max(m_orbitRadius, 0.5f);
+            currentDist = glm::length(r);
+        }
+
+        float speed = getEffectiveSpeed(sprint, crawl);
+        float angularSpeed = speed / currentDist; // Constant angular rate from half-distance law
+
+        // 1. Horizontal arc strafe (A / D) around world up
+        if (std::abs(strafe) > 0.001f) {
+            float angle = strafe * angularSpeed * deltaTime;
+            glm::mat4 rotY = glm::rotate(glm::mat4(1.0f), angle, m_worldUp);
+            r = glm::vec3(rotY * glm::vec4(r, 0.0f));
+        }
+
+        // 2. Vertical elevation arc (Space/E up, C/Q down) around m_right
+        if (std::abs(vertical) > 0.001f) {
+            float vAngle = -vertical * angularSpeed * deltaTime;
+            glm::mat4 rotRight = glm::rotate(glm::mat4(1.0f), vAngle, m_right);
+            glm::vec3 candidateR = glm::vec3(rotRight * glm::vec4(r, 0.0f));
+
+            // Clamp pitch to [-85 deg, +85 deg] to prevent gimbal inversion
+            glm::vec3 candDir = glm::normalize(candidateR);
+            float pitchRad = std::asin(std::clamp(candDir.y, -0.996f, 0.996f));
+            if (std::abs(glm::degrees(pitchRad)) <= 85.0f) {
+                r = candidateR;
+            }
+        }
+
+        // 3. Radial dolly (W forward / S backward)
+        if (std::abs(forward) > 0.001f) {
+            float minDist = std::max(0.05f, 0.02f * m_sceneScale);
+            currentDist = std::max(currentDist - forward * speed * deltaTime, minDist);
+            r = glm::normalize(r) * currentDist;
+            m_orbitRadius = currentDist;
+        }
+
+        m_position = m_orbitPivot + r;
+
+        // Keep camera facing directly at pivot
+        glm::vec3 dir = glm::normalize(m_orbitPivot - m_position);
+        m_pitch = glm::degrees(std::asin(std::clamp(dir.y, -0.999f, 0.999f)));
+        m_yaw = glm::degrees(std::atan2(dir.z, dir.x));
+        updateVectors();
+        m_moved = true;
+        return;
+    }
+
+    // Standard FPS movement
     glm::vec3 moveDir = m_front * forward + m_right * strafe + m_worldUp * vertical;
     if (glm::length(moveDir) > 0.0001f) {
         moveDir = glm::normalize(moveDir);
-        float currentSpeed = m_speed * (sprint ? 2.5f : 1.0f);
+        float currentSpeed = getEffectiveSpeed(sprint, crawl);
         m_position += moveDir * (currentSpeed * deltaTime);
         m_moved = true;
     }
 }
 
 void Camera::processKeyboard(char direction, float deltaTime) {
-    float velocity = m_speed * deltaTime;
+    float velocity = getEffectiveSpeed(false, false) * deltaTime;
     glm::vec3 prevPos = m_position;
 
     if (direction == 'W' || direction == 'w') m_position += m_front * velocity;
@@ -146,13 +263,45 @@ void Camera::processKeyboard(char direction, float deltaTime) {
     }
 }
 
-void Camera::processMouseMovement(float xoffset, float yoffset) {
+void Camera::processMouseMovement(float xoffset, float yoffset, bool orbit) {
     if (std::abs(xoffset) < 0.0001f && std::abs(yoffset) < 0.0001f) {
         return;
     }
 
     xoffset *= m_sensitivity;
     yoffset *= m_sensitivity;
+
+    if (orbit && m_orbiting) {
+        glm::vec3 r = m_position - m_orbitPivot;
+        float currentDist = glm::length(r);
+        if (currentDist < 0.01f) {
+            r = -m_front * std::max(m_orbitRadius, 0.5f);
+        }
+
+        // Orbit horizontally
+        float angleH = -glm::radians(xoffset);
+        glm::mat4 rotY = glm::rotate(glm::mat4(1.0f), angleH, m_worldUp);
+        r = glm::vec3(rotY * glm::vec4(r, 0.0f));
+
+        // Orbit vertically
+        float angleV = glm::radians(yoffset);
+        glm::mat4 rotRight = glm::rotate(glm::mat4(1.0f), angleV, m_right);
+        glm::vec3 candidateR = glm::vec3(rotRight * glm::vec4(r, 0.0f));
+
+        glm::vec3 candDir = glm::normalize(candidateR);
+        float pitchRad = std::asin(std::clamp(candDir.y, -0.996f, 0.996f));
+        if (std::abs(glm::degrees(pitchRad)) <= 85.0f) {
+            r = candidateR;
+        }
+
+        m_position = m_orbitPivot + r;
+        glm::vec3 dir = glm::normalize(m_orbitPivot - m_position);
+        m_pitch = glm::degrees(std::asin(std::clamp(dir.y, -0.999f, 0.999f)));
+        m_yaw = glm::degrees(std::atan2(dir.z, dir.x));
+        updateVectors();
+        m_moved = true;
+        return;
+    }
 
     m_yaw += xoffset;
     m_pitch -= yoffset; // Inverted for standard FPS mouse look

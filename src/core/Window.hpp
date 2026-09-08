@@ -44,6 +44,8 @@ public:
     void setTitle(const std::string& title);
     void toggleFullscreen();
     bool isFullscreen() const { return m_isFullscreen; }
+    float getPixelDensity() const;
+    void getWindowSizeInPoints(int* w, int* h) const;
 
     // Event callbacks
     using KeyCallback = std::function<void(SDL_Keycode key, bool isDown)>;

@@ -46,6 +46,9 @@ public:
     bool loadScene(const std::string& filepath);
     const std::vector<SceneEntry>& getAvailableScenes() const { return m_availableScenes; }
     int getCurrentSceneIndex() const { return m_currentSceneIndex; }
+    std::string getActiveSceneName() const;
+    Window* getWindow() const { return m_window.get(); }
+    Swapchain* getSwapchain() const { return m_swapchain.get(); }
 
 private:
     void initVulkan();
@@ -59,7 +62,7 @@ private:
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
     std::vector<char> loadShaderSPIRV(const std::string& filename);
-    void onResize(uint32_t newWidth, uint32_t newHeight);
+    void onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate = false);
 
     bool m_cameraMode = false;
     bool m_resetAccumulation = false;

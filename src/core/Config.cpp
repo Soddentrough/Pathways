@@ -2,8 +2,76 @@
 #include "core/Logger.hpp"
 #include <iostream>
 #include <cstring>
+#include <cctype>
+#include <string_view>
 
 namespace pathways {
+
+namespace {
+bool parseResolutionString(std::string_view str, uint32_t& outW, uint32_t& outH) {
+    while (!str.empty() && (str.front() == ' ' || str.front() == '\t')) str.remove_prefix(1);
+    while (!str.empty() && (str.back() == ' ' || str.back() == '\t')) str.remove_suffix(1);
+    if (str.empty()) return false;
+
+    std::string s;
+    s.reserve(str.size());
+    for (char c : str) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (s == "720" || s == "720p" || s == "hd") {
+        outW = 1280; outH = 720;
+        return true;
+    }
+    if (s == "1080" || s == "1080p" || s == "fhd") {
+        outW = 1920; outH = 1080;
+        return true;
+    }
+    if (s == "1440" || s == "1440p" || s == "qhd" || s == "2k") {
+        outW = 2560; outH = 1440;
+        return true;
+    }
+    if (s == "4k" || s == "4kp" || s == "uhd" || s == "2160" || s == "2160p") {
+        outW = 3840; outH = 2160;
+        return true;
+    }
+    if (s == "5k" || s == "5kp" || s == "5k2k" || s == "uw5k") {
+        outW = 5120; outH = 2160;
+        return true;
+    }
+    if (s == "8k" || s == "8kp" || s == "4320" || s == "4320p") {
+        outW = 7680; outH = 4320;
+        return true;
+    }
+    if (s == "dualup") {
+        outW = 1280; outH = 2048;
+        return true;
+    }
+    if (s == "square" || s == "1:1") {
+        outW = 1440; outH = 1440;
+        return true;
+    }
+    if (s == "native") {
+        outW = 0; outH = 0;
+        return true;
+    }
+
+    size_t sep = s.find_first_of("x*,");
+    if (sep != std::string::npos && sep > 0 && sep + 1 < s.size()) {
+        try {
+            unsigned long w = std::stoul(s.substr(0, sep));
+            unsigned long h = std::stoul(s.substr(sep + 1));
+            if (w > 0 && h > 0) {
+                outW = static_cast<uint32_t>(w);
+                outH = static_cast<uint32_t>(h);
+                return true;
+            }
+        } catch (...) {
+            return false;
+        }
+    }
+
+    return false;
+}
+} // namespace
 
 void Config::printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
@@ -11,8 +79,9 @@ void Config::printUsage(const char* progName) {
               << "  --headless              Run in headless offscreen mode (no window)\n"
               << "  --fullscreen            Run in fullscreen mode [default]\n"
               << "  --windowed              Run in windowed / non-fullscreen mode\n"
-              << "  --width <int>           Viewport width (default: 3840)\n"
-              << "  --height <int>          Viewport height (default: 2160)\n"
+              << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
+              << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
+              << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces (default: 4)\n"
               << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
@@ -26,17 +95,10 @@ void Config::printUsage(const char* progName) {
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'interleave' (Interleaved Scanlines), 'sample' (Sample Parallel), 'auto', or 'off'\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
-              << "  --double-buffer-shared  Enable double-buffering for inter-GPU shared host memory [default]\n"
-              << "  --single-buffer-shared  Disable double-buffering for inter-GPU shared host memory\n"
+              << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
-              << "  --no-visualize-split    Disable GPU load split visualization overlay [default]\n"
-              << "  --single-gpu            Force single GPU mode (alias for --mgpu-mode off)\n"
-              << "  --morton                Enable 2D Morton Z-curve ray indexing for cache locality [default]\n"
-              << "  --no-morton             Disable 2D Morton ordering (linear scanline order)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
-              << "  --hw-rt                 Hardware Ray Tracing is mandatory [default]\n"
-              << "  --no-hw-rt              (Deprecated) Software fallback has been removed; ignored\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -58,6 +120,35 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--windowed" || arg == "--no-fullscreen") {
             cfg.fullscreen = false;
             fullscreen_explicit = true;
+        } else if ((arg == "-r" || arg == "--res" || arg == "--resolution") && i + 1 < argc) {
+            std::string val = argv[++i];
+            uint32_t rw = 0, rh = 0;
+            if (parseResolutionString(val, rw, rh)) {
+                if (rw == 0 && rh == 0) {
+                    cfg.custom_resolution = false;
+                } else {
+                    cfg.width = rw;
+                    cfg.height = rh;
+                    cfg.custom_resolution = true;
+                }
+            } else {
+                Logger::warn("Unknown resolution preset '{}'. Expected 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>.", val);
+            }
+        } else if (arg.starts_with("--res=") || arg.starts_with("--resolution=") || arg.starts_with("-r=")) {
+            size_t eq = arg.find('=');
+            std::string val = arg.substr(eq + 1);
+            uint32_t rw = 0, rh = 0;
+            if (parseResolutionString(val, rw, rh)) {
+                if (rw == 0 && rh == 0) {
+                    cfg.custom_resolution = false;
+                } else {
+                    cfg.width = rw;
+                    cfg.height = rh;
+                    cfg.custom_resolution = true;
+                }
+            } else {
+                Logger::warn("Unknown resolution preset '{}'. Expected 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>.", val);
+            }
         } else if (arg == "--width" && i + 1 < argc) {
             cfg.width = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.custom_resolution = true;
@@ -86,14 +177,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_stats_path = argv[++i];
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--morton") {
-            cfg.enable_morton_order = true;
-        } else if (arg == "--no-morton") {
-            cfg.enable_morton_order = false;
         } else if (arg == "--mgpu") {
             cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
-        } else if (arg == "--single-gpu") {
-            cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
@@ -117,10 +202,10 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
-        } else if (arg == "--double-buffer-shared") {
-            cfg.double_buffered_shared_mem = true;
-        } else if (arg == "--single-buffer-shared") {
+        } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
+        } else if (arg == "--double-buffer-shared" || arg == "--double-buffer") {
+            cfg.double_buffered_shared_mem = true;
         } else if (arg == "--camera-motion") {
             cfg.camera_motion = true;
         } else if (arg == "--visualize-split" || arg == "--show-split") {
@@ -138,10 +223,6 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;
-        } else if (arg == "--hw-rt") {
-            Logger::info("Command line: Hardware RT is permanently active.");
-        } else if (arg == "--no-hw-rt" || arg == "--software-rt") {
-            Logger::warn("Command line: Software RT fallback has been removed. Hardware ray tracing is mandatory.");
         } else if (arg == "--no-validation") {
             cfg.validation_layers = false;
         } else if (arg == "--debug") {

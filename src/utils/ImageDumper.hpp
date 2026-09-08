@@ -87,7 +87,6 @@ struct FrameStats {
     float render_scale = 1.0f;
     uint32_t spp = 0;
     uint32_t max_bounces = 0;
-    bool enable_morton = true;
     uint32_t checkerboard_tile_size = 64;
     bool enable_direct_light = true;
     bool enable_indirect_light = true;

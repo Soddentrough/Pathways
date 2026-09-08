@@ -2,6 +2,7 @@
 #include "core/Logger.hpp"
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -64,18 +65,28 @@ Window::Window(const Config& config)
         }
 
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(displayID);
+        float density = 1.0f;
         if (mode) {
-            m_displayInfo.nativeWidth = static_cast<uint32_t>(mode->w);
-            m_displayInfo.nativeHeight = static_cast<uint32_t>(mode->h);
+            density = (mode->pixel_density > 0.0f) ? mode->pixel_density : 1.0f;
             m_displayInfo.refreshRate = mode->refresh_rate;
         }
 
-        m_displayInfo.contentScale = SDL_GetDisplayContentScale(displayID);
+        float scale = SDL_GetDisplayContentScale(displayID);
+        if (density <= 1.0f && scale > 1.0f) {
+            density = scale;
+        }
+        m_displayInfo.contentScale = density;
+
+        if (mode) {
+            // mode->w and mode->h are in window coordinates/points in SDL3; multiply by pixel density for true physical pixels
+            m_displayInfo.nativeWidth = static_cast<uint32_t>(std::round(mode->w * density));
+            m_displayInfo.nativeHeight = static_cast<uint32_t>(std::round(mode->h * density));
+        }
 
         SDL_Rect usable{};
         if (SDL_GetDisplayUsableBounds(displayID, &usable)) {
-            m_displayInfo.usableWidth = static_cast<uint32_t>(usable.w);
-            m_displayInfo.usableHeight = static_cast<uint32_t>(usable.h);
+            m_displayInfo.usableWidth = static_cast<uint32_t>(std::round(usable.w * density));
+            m_displayInfo.usableHeight = static_cast<uint32_t>(std::round(usable.h * density));
         } else {
             m_displayInfo.usableWidth = m_displayInfo.nativeWidth;
             m_displayInfo.usableHeight = m_displayInfo.nativeHeight;
@@ -104,18 +115,18 @@ Window::Window(const Config& config)
                 m_height = 2160;
             }
         }
-        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to Fullscreen: {}x{}",
+        Logger::info("Auto-detected display '{}' (Native: {}x{} px @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to Fullscreen: {}x{}",
                      m_displayInfo.displayName, m_displayInfo.nativeWidth, m_displayInfo.nativeHeight,
                      m_displayInfo.refreshRate, m_displayInfo.contentScale, m_displayInfo.displayAspect,
                      m_width, m_height);
     } else if (!config.custom_resolution) {
-        uint32_t w = (m_displayInfo.usableWidth / 16) * 16;
-        uint32_t h = (m_displayInfo.usableHeight / 16) * 16;
+        uint32_t w = m_displayInfo.usableWidth;
+        uint32_t h = m_displayInfo.usableHeight;
         m_width = w > 0 ? w : 1280;
         m_height = h > 0 ? h : 1080;
         windowFlags |= SDL_WINDOW_MAXIMIZED;
 
-        Logger::info("Auto-detected display '{}' ({}x{} @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to full usable display (Maximized Windowed): {}x{}",
+        Logger::info("Auto-detected display '{}' (Native: {}x{} px @ {:.2f}Hz, scale: {:.2f}, aspect: {:.3f}). Defaulting to full usable display (Maximized Windowed): {}x{}",
                      m_displayInfo.displayName, m_displayInfo.nativeWidth, m_displayInfo.nativeHeight,
                      m_displayInfo.refreshRate, m_displayInfo.contentScale, m_displayInfo.displayAspect,
                      m_width, m_height);
@@ -125,12 +136,17 @@ Window::Window(const Config& config)
 
     m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
 
-    Logger::info("Initializing SDL3 window ({}x{})...", m_width, m_height);
+    // SDL_CreateWindow takes window coordinates (points). Convert target physical pixels to points via density.
+    float initDensity = (m_displayInfo.contentScale > 0.0f) ? m_displayInfo.contentScale : 1.0f;
+    int initPointW = static_cast<int>(std::round(static_cast<float>(m_width) / initDensity));
+    int initPointH = static_cast<int>(std::round(static_cast<float>(m_height) / initDensity));
+
+    Logger::info("Initializing SDL3 window (pixel target: {}x{}, window points: {}x{})...", m_width, m_height, initPointW, initPointH);
 
     m_window = SDL_CreateWindow(
         "Pathways - Vulkan 1.4 Path Tracer",
-        static_cast<int>(m_width),
-        static_cast<int>(m_height),
+        initPointW,
+        initPointH,
         windowFlags
     );
 
@@ -147,15 +163,26 @@ Window::Window(const Config& config)
     SDL_SyncWindow(m_window);
     SDL_PumpEvents();
 
+    float actualDensity = SDL_GetWindowPixelDensity(m_window);
+    if (actualDensity > 0.0f) {
+        m_displayInfo.contentScale = actualDensity;
+    }
+
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {
-        m_width = static_cast<uint32_t>(actualW);
-        m_height = static_cast<uint32_t>(actualH);
+        if (!config.fullscreen && config.custom_resolution &&
+            std::abs(actualW - static_cast<int>(m_width)) <= 2 &&
+            std::abs(actualH - static_cast<int>(m_height)) <= 2) {
+            // Keep exact pixel resolution if within fractional rounding tolerance
+        } else {
+            m_width = static_cast<uint32_t>(actualW);
+            m_height = static_cast<uint32_t>(actualH);
+        }
         m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     }
 
-    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{}.", m_width, m_height);
+    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{} (density: {:.2f}).", m_width, m_height, m_displayInfo.contentScale);
 }
 
 Window::~Window() {
@@ -197,6 +224,24 @@ void Window::setRelativeMouseMode(bool enabled) {
     }
 }
 
+float Window::getPixelDensity() const {
+    if (m_window) {
+        float density = SDL_GetWindowPixelDensity(m_window);
+        if (density > 0.0f) return density;
+    }
+    return (m_displayInfo.contentScale > 0.0f) ? m_displayInfo.contentScale : 1.0f;
+}
+
+void Window::getWindowSizeInPoints(int* w, int* h) const {
+    if (m_window) {
+        SDL_GetWindowSize(m_window, w, h);
+    } else {
+        float density = getPixelDensity();
+        if (w) *w = static_cast<int>(std::round(static_cast<float>(m_width) / density));
+        if (h) *h = static_cast<int>(std::round(static_cast<float>(m_height) / density));
+    }
+}
+
 void Window::setWindowResolution(uint32_t width, uint32_t height) {
     if (m_headless || !m_window) return;
 
@@ -204,24 +249,44 @@ void Window::setWindowResolution(uint32_t width, uint32_t height) {
         m_isFullscreen = false;
         SDL_SetWindowFullscreen(m_window, false);
         SDL_SyncWindow(m_window);
+        SDL_PumpEvents();
     }
 
-    width = std::max(64u, (width / 16) * 16);
-    height = std::max(64u, (height / 16) * 16);
+    width = std::max(64u, width);
+    height = std::max(64u, height);
 
-    SDL_SetWindowSize(m_window, static_cast<int>(width), static_cast<int>(height));
+    float density = getPixelDensity();
+    int pointW = static_cast<int>(std::round(static_cast<float>(width) / density));
+    int pointH = static_cast<int>(std::round(static_cast<float>(height) / density));
+
+    Logger::info("Setting window resolution: target {}x{} px (window coordinates: {}x{} pt, density: {:.2f})",
+                 width, height, pointW, pointH, density);
+
+    SDL_SetWindowSize(m_window, pointW, pointH);
     SDL_SyncWindow(m_window);
+    SDL_PumpEvents();
 
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
+
+    // Be accurate to the requested pixel dimensions rather than an inferred window size:
+    // If within 2 pixels (fractional rounding tolerance), keep exact requested target dimensions.
     if (actualW > 0 && actualH > 0) {
-        m_width = static_cast<uint32_t>(actualW);
-        m_height = static_cast<uint32_t>(actualH);
+        if (std::abs(actualW - static_cast<int>(width)) <= 2 &&
+            std::abs(actualH - static_cast<int>(height)) <= 2) {
+            m_width = width;
+            m_height = height;
+        } else {
+            m_width = static_cast<uint32_t>(actualW);
+            m_height = static_cast<uint32_t>(actualH);
+        }
     } else {
         m_width = width;
         m_height = height;
     }
     m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
+
+    Logger::info("Applied window resolution: {}x{} px (framebuffer: {}x{} px)", m_width, m_height, actualW, actualH);
 
     if (m_resizeCallback) {
         m_resizeCallback(m_width, m_height);
@@ -246,6 +311,7 @@ void Window::toggleFullscreen() {
         Logger::error("Failed to set window fullscreen state: {}", SDL_GetError());
     }
     SDL_SyncWindow(m_window);
+    SDL_PumpEvents();
 
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);

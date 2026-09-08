@@ -11,6 +11,7 @@
 namespace pathways {
 
 struct ConfigKey {
+    std::string scene_name = "Cornell Box";
     MultiGpuMode mgpu_mode = MultiGpuMode::Off;
     uint32_t width = 3840;
     uint32_t height = 2160;
@@ -20,6 +21,7 @@ struct ConfigKey {
     uint32_t tile_size = 64;
 
     bool operator==(const ConfigKey& o) const {
+        if (scene_name != o.scene_name) return false;
         if (mgpu_mode != o.mgpu_mode) return false;
         if (width != o.width || height != o.height) return false;
         if (spp != o.spp || max_bounces != o.max_bounces) return false;
@@ -48,7 +50,7 @@ struct ConfigKey {
                 break;
         }
         std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";
-        return std::format("[{}] {}x{} | {} SPP | {} Bounces | {}", modeStr, width, height, spp, max_bounces, fmtStr);
+        return std::format("[{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, modeStr, width, height, spp, max_bounces, fmtStr);
     }
 };
 

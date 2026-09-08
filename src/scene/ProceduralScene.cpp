@@ -209,55 +209,84 @@ SceneData ProceduralScene::createCornellBox() {
     matBlue.type = MATERIAL_DIFFUSE;
     scene.materials.push_back(matBlue);
 
+    auto recordRange = [&](const std::string& name, uint32_t startTri) {
+        if (scene.triangles.size() <= startTri) return;
+        MeshRange mr{};
+        mr.name = name;
+        mr.firstTriangle = startTri;
+        mr.triangleCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
+        for (uint32_t i = startTri; i < scene.triangles.size(); ++i) {
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
+        }
+        scene.meshRanges.push_back(mr);
+    };
+
     // Geometry: Box dimensions -1.0 to 1.0
     // Floor (y = 0.0)
+    uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3(-1.0f, 0.0f,  1.0f),
             glm::vec3( 1.0f, 0.0f,  1.0f),
             glm::vec3( 1.0f, 0.0f, -1.0f),
             glm::vec3(-1.0f, 0.0f, -1.0f),
             glm::vec3(0.0f, 1.0f, 0.0f), 0);
+    recordRange("Floor", tStart);
 
     // Ceiling (y = 2.0)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3(-1.0f, 2.0f, -1.0f),
             glm::vec3( 1.0f, 2.0f, -1.0f),
             glm::vec3( 1.0f, 2.0f,  1.0f),
             glm::vec3(-1.0f, 2.0f,  1.0f),
             glm::vec3(0.0f, -1.0f, 0.0f), 0);
+    recordRange("Ceiling", tStart);
 
     // Back wall (z = -1.0)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3(-1.0f, 0.0f, -1.0f),
             glm::vec3( 1.0f, 0.0f, -1.0f),
             glm::vec3( 1.0f, 2.0f, -1.0f),
             glm::vec3(-1.0f, 2.0f, -1.0f),
             glm::vec3(0.0f, 0.0f, 1.0f), 0);
+    recordRange("Back Wall", tStart);
 
     // Left wall (x = -1.0, Red)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3(-1.0f, 0.0f,  1.0f),
             glm::vec3(-1.0f, 0.0f, -1.0f),
             glm::vec3(-1.0f, 2.0f, -1.0f),
             glm::vec3(-1.0f, 2.0f,  1.0f),
             glm::vec3(1.0f, 0.0f, 0.0f), 1);
+    recordRange("Left Wall (Red)", tStart);
 
     // Right wall (x = 1.0, Green)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3( 1.0f, 0.0f, -1.0f),
             glm::vec3( 1.0f, 0.0f,  1.0f),
             glm::vec3( 1.0f, 2.0f,  1.0f),
             glm::vec3( 1.0f, 2.0f, -1.0f),
             glm::vec3(-1.0f, 0.0f, 0.0f), 2);
+    recordRange("Right Wall (Green)", tStart);
 
     // Ceiling Area Light Quad (centered at y = 1.99, size 0.6 x 0.6)
     float lw = 0.35f;
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addQuad(scene.triangles,
             glm::vec3(-lw, 1.99f, -lw),
             glm::vec3( lw, 1.99f, -lw),
             glm::vec3( lw, 1.99f,  lw),
             glm::vec3(-lw, 1.99f,  lw),
             glm::vec3(0.0f, -1.0f, 0.0f), 3);
+    recordRange("Ceiling Light", tStart);
 
     // Add Area Light structure for Next Event Estimation
     LightGPU areaLight{};
@@ -279,13 +308,19 @@ SceneData ProceduralScene::createCornellBox() {
 
     // Interior objects:
     // 1. Tall diffuse blue box on the right
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addBox(scene.triangles, glm::vec3(0.35f, 0.6f, -0.3f), glm::vec3(0.55f, 1.2f, 0.55f), 22.0f, 6);
+    recordRange("Tall Blue Box", tStart);
 
     // 2. Glass Sphere (Dielectric Refraction) on the left
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addSphere(scene.triangles, glm::vec3(-0.4f, 0.35f, -0.35f), 0.35f, 4);
+    recordRange("Glass Sphere", tStart);
 
     // 3. Metallic / Mirror Sphere in the foreground
+    tStart = static_cast<uint32_t>(scene.triangles.size());
     addSphere(scene.triangles, glm::vec3(0.1f, 0.25f, 0.35f), 0.25f, 5);
+    recordRange("Mirror Sphere", tStart);
 
     scene.hasCamera = true;
     scene.cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);
@@ -296,8 +331,147 @@ SceneData ProceduralScene::createCornellBox() {
     scene.boundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
     scene.boundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
     scene.sceneRadius = 2.0f;
+    scene.focalBoundsMin = scene.boundsMin;
+    scene.focalBoundsMax = scene.boundsMax;
+    scene.focalRadius = scene.sceneRadius;
+    scene.focalDistance = glm::length(scene.cameraPosition - scene.cameraTarget);
+    scene.centralTarget = scene.cameraTarget;
 
     return scene;
+}
+
+static inline bool intersectRayAABB(const glm::vec3& orig, const glm::vec3& invDir,
+                                    const glm::vec3& bmin, const glm::vec3& bmax,
+                                    float& tmin, float& tmax) {
+    glm::vec3 t0 = (bmin - orig) * invDir;
+    glm::vec3 t1 = (bmax - orig) * invDir;
+    glm::vec3 tsmall = glm::min(t0, t1);
+    glm::vec3 tbig = glm::max(t0, t1);
+
+    tmin = std::max(std::max(tsmall.x, tsmall.y), tsmall.z);
+    tmax = std::min(std::min(tbig.x, tbig.y), tbig.z);
+
+    return tmax >= std::max(0.0f, tmin);
+}
+
+static inline bool intersectRayTriangle(const glm::vec3& orig, const glm::vec3& dir,
+                                       const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
+                                       float& t) {
+    const float EPSILON = 1e-7f;
+    glm::vec3 edge1 = v1 - v0;
+    glm::vec3 edge2 = v2 - v0;
+    glm::vec3 h = glm::cross(dir, edge2);
+    float a = glm::dot(edge1, h);
+    if (a > -EPSILON && a < EPSILON) return false;
+
+    float f = 1.0f / a;
+    glm::vec3 s = orig - v0;
+    float u = f * glm::dot(s, h);
+    if (u < 0.0f || u > 1.0f) return false;
+
+    glm::vec3 q = glm::cross(s, edge1);
+    float v = f * glm::dot(dir, q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    float dist = f * glm::dot(edge2, q);
+    if (dist > 0.01f) {
+        t = dist;
+        return true;
+    }
+    return false;
+}
+
+static inline bool intersectRaySphere(const glm::vec3& orig, const glm::vec3& dir,
+                                     const glm::vec3& center, float radius, float& t) {
+    glm::vec3 oc = orig - center;
+    float b = glm::dot(oc, dir);
+    float c = glm::dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return false;
+    float sqrtDisc = std::sqrt(discriminant);
+    float t0 = -b - sqrtDisc;
+    float t1 = -b + sqrtDisc;
+    if (t0 > 0.01f) {
+        t = t0;
+        return true;
+    }
+    if (t1 > 0.01f) {
+        t = t1;
+        return true;
+    }
+    return false;
+}
+
+bool SceneData::raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDist,
+                        float& outHitDist, glm::vec3& outHitPoint, std::string* outHitName) const {
+    float closestT = maxDist;
+    bool hit = false;
+    std::string hitName = "";
+
+    // Test GPU spheres
+    for (size_t i = 0; i < spheres.size(); ++i) {
+        glm::vec3 center = glm::vec3(spheres[i].centerRadius);
+        float radius = spheres[i].centerRadius.w;
+        float t = 0.0f;
+        if (intersectRaySphere(rayOrigin, rayDir, center, radius, t) && t < closestT) {
+            closestT = t;
+            hit = true;
+            hitName = "Sphere_" + std::to_string(i);
+        }
+    }
+
+    // Safe inverse direction avoiding division by 0
+    glm::vec3 safeDir = rayDir;
+    for (int k = 0; k < 3; ++k) {
+        if (std::abs(safeDir[k]) < 1e-8f) safeDir[k] = (safeDir[k] < 0.0f ? -1e-8f : 1e-8f);
+    }
+    glm::vec3 invDir = 1.0f / safeDir;
+
+    // Test mesh ranges if available
+    if (!meshRanges.empty()) {
+        for (const auto& mr : meshRanges) {
+            float tmin, tmax;
+            if (intersectRayAABB(rayOrigin, invDir, mr.minBound, mr.maxBound, tmin, tmax) && tmin < closestT) {
+                uint32_t endTri = std::min<uint32_t>(mr.firstTriangle + mr.triangleCount, static_cast<uint32_t>(triangles.size()));
+                for (uint32_t i = mr.firstTriangle; i < endTri; ++i) {
+                    float t = 0.0f;
+                    if (intersectRayTriangle(rayOrigin, rayDir,
+                                             glm::vec3(triangles[i].v0.position),
+                                             glm::vec3(triangles[i].v1.position),
+                                             glm::vec3(triangles[i].v2.position), t)) {
+                        if (t < closestT) {
+                            closestT = t;
+                            hit = true;
+                            hitName = mr.name;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: test all triangles
+        for (size_t i = 0; i < triangles.size(); ++i) {
+            float t = 0.0f;
+            if (intersectRayTriangle(rayOrigin, rayDir,
+                                     glm::vec3(triangles[i].v0.position),
+                                     glm::vec3(triangles[i].v1.position),
+                                     glm::vec3(triangles[i].v2.position), t)) {
+                if (t < closestT) {
+                    closestT = t;
+                    hit = true;
+                    hitName = "Triangle_" + std::to_string(i);
+                }
+            }
+        }
+    }
+
+    if (hit) {
+        outHitDist = closestT;
+        outHitPoint = rayOrigin + rayDir * closestT;
+        if (outHitName) *outHitName = hitName;
+        return true;
+    }
+    return false;
 }
 
 } // namespace pathways
