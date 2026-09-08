@@ -98,6 +98,7 @@ void Config::printUsage(const char* progName) {
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
+              << "  --restir-di, --restir   Enable ReSTIR Direct Illumination reservoir resampling\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
@@ -220,6 +221,10 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
+        } else if (arg == "--restir-di" || arg == "--restir") {
+            cfg.enable_restir_di = true;
+        } else if (arg == "--no-restir-di" || arg == "--no-restir") {
+            cfg.enable_restir_di = false;
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;

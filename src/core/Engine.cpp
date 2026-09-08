@@ -852,6 +852,9 @@ VkShaderModule Engine::createShaderModule(const std::vector<char>& code) {
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
+    // 0. Initialize ReSTIR DI Buffers
+    initReSTIRBuffers();
+
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 },
@@ -868,7 +871,6 @@ void Engine::initPipelines() {
     poolInfo.maxSets = 64;
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
-    // 2. Ray Tracing Descriptor Set Layout
     // 2. Ray Tracing Descriptor Set Layout (VK_KHR_ray_tracing_pipeline)
     VkShaderStageFlags rtStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
 
@@ -881,7 +883,9 @@ void Engine::initPipelines() {
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1136,6 +1140,13 @@ void Engine::updateSceneDescriptors() {
         }
     }
 
+    VkDescriptorBufferInfo res0Info{};
+    VkDescriptorBufferInfo res1Info{};
+    if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
+        res0Info = { m_restirReservoirs[0]->getBuffer(), 0, m_restirReservoirs[0]->getSize() };
+        res1Info = { m_restirReservoirs[1]->getBuffer(), 0, m_restirReservoirs[1]->getSize() };
+    }
+
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_rtDescSets[i] == VK_NULL_HANDLE) continue;
@@ -1146,10 +1157,61 @@ void Engine::updateSceneDescriptors() {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+        if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
+        }
     }
     if (!writes.empty()) {
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
+}
+
+void Engine::initReSTIRBuffers() {
+    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
+    VmaAllocator allocator = m_context->getAllocator();
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        m_restirReservoirs[i] = std::make_unique<Buffer>(
+            allocator, resSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+    }
+    m_restirPingPongIndex = 0;
+
+    // Clear reservoir buffers to 0 using a one-time command
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[0]->getBuffer(), 0, resSize, 0);
+    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[1]->getBuffer(), 0, resSize, 0);
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
+    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+}
+
+void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
+    if (m_rtDescSets[frameSlot] == VK_NULL_HANDLE || !m_restirReservoirs[0] || !m_restirReservoirs[1]) {
+        return;
+    }
+    VkDevice device = m_context->getDevice();
+    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
+
+    VkDescriptorBufferInfo curInfo{ m_restirReservoirs[m_restirPingPongIndex]->getBuffer(), 0, resSize };
+    VkDescriptorBufferInfo histInfo{ m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(), 0, resSize };
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+    };
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void Engine::updateMergeDescriptors() {
@@ -1559,6 +1621,7 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
+    if (m_config.enable_restir_di)      flags |= (1 << 6);
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
@@ -1577,6 +1640,12 @@ void Engine::renderFrame() {
             return;
         }
     }
+
+    // Ping-pong ReSTIR DI reservoir buffers if enabled
+    if (m_config.enable_restir_di) {
+        m_restirPingPongIndex = 1 - m_restirPingPongIndex;
+    }
+    updateReSTIRDescriptors(m_currentFrame);
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -2607,12 +2676,18 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
-    // 4. Resize secondary GPU if active before updating merge descriptor set
+    // 4. Recreate ReSTIR DI Buffers
+    initReSTIRBuffers();
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        updateReSTIRDescriptors(i);
+    }
+
+    // 5. Resize secondary GPU if active before updating merge descriptor set
     if (m_mgpu && m_mgpu->isMultiGpuActive()) {
         m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    // 5. Update all image descriptors and multi-GPU merge descriptors
+    // 6. Update all image descriptors and multi-GPU merge descriptors
     updateAllImageDescriptors();
     updateMergeDescriptors();
 

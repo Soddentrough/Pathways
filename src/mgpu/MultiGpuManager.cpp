@@ -533,7 +533,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr }
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
+        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -549,6 +551,17 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descAllocInfo.pSetLayouts = &secNode->rtDescLayout;
     vkAllocateDescriptorSets(secDevice, &descAllocInfo, &secNode->rtDescSet);
 
+    // Allocate secondary ReSTIR reservoir ping-pong buffers
+    VkDeviceSize resSize = static_cast<VkDeviceSize>(config.width) * config.height * sizeof(ReservoirGPU);
+    for (uint32_t i = 0; i < 2; ++i) {
+        secNode->restirReservoirs[i] = std::make_unique<Buffer>(
+            secAlloc, resSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+    }
+    secNode->restirPingPongIndex = 0;
+
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -558,6 +571,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
     VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
+    VkDescriptorBufferInfo res0Info{ secNode->restirReservoirs[0]->getBuffer(), 0, resSize };
+    VkDescriptorBufferInfo res1Info{ secNode->restirReservoirs[1]->getBuffer(), 0, resSize };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -585,7 +600,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
     };
     vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -627,6 +644,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
+
+    vkCmdFillBuffer(secNode->commandBuffer, secNode->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
+    vkCmdFillBuffer(secNode->commandBuffer, secNode->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
     vkEndCommandBuffer(secNode->commandBuffer);
 
@@ -685,6 +705,19 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         // 2. Wait for previous execution to complete
         vkWaitForFences(device, 1, &node->renderFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &node->renderFence);
+
+        // Ping-pong ReSTIR DI reservoir buffers on secondary GPU if enabled
+        if ((cameraUniform.flags & (1 << 6)) && node->restirReservoirs[0] && node->restirReservoirs[1]) {
+            node->restirPingPongIndex = 1 - node->restirPingPongIndex;
+            VkDeviceSize resSize = static_cast<VkDeviceSize>(tileWidth) * tileHeight * sizeof(ReservoirGPU);
+            VkDescriptorBufferInfo curInfo{ node->restirReservoirs[node->restirPingPongIndex]->getBuffer(), 0, resSize };
+            VkDescriptorBufferInfo histInfo{ node->restirReservoirs[1 - node->restirPingPongIndex]->getBuffer(), 0, resSize };
+            VkWriteDescriptorSet resWrites[2] = {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+            };
+            vkUpdateDescriptorSets(device, 2, resWrites, 0, nullptr);
+        }
 
         // 3. Record secondary GPU commands
         vkResetCommandBuffer(node->commandBuffer, 0);
@@ -834,12 +867,25 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(node->commandBuffer, &beginInfo);
 
+        VkDeviceSize resSize = static_cast<VkDeviceSize>(width) * height * sizeof(ReservoirGPU);
+        for (uint32_t i = 0; i < 2; ++i) {
+            node->restirReservoirs[i] = std::make_unique<Buffer>(
+                secAlloc, resSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+            );
+        }
+        node->restirPingPongIndex = 0;
+
         node->accumTarget->transitionLayout(
             node->commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
+
+        vkCmdFillBuffer(node->commandBuffer, node->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
+        vkCmdFillBuffer(node->commandBuffer, node->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
         vkEndCommandBuffer(node->commandBuffer);
 
@@ -866,15 +912,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         accumImageInfo.imageView = node->accumTarget->getImageView();
         accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = node->rtDescSet;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        write.pImageInfo = &accumImageInfo;
+        VkDescriptorBufferInfo res0Info{ node->restirReservoirs[0]->getBuffer(), 0, resSize };
+        VkDescriptorBufferInfo res1Info{ node->restirReservoirs[1]->getBuffer(), 0, resSize };
 
-        vkUpdateDescriptorSets(secDevice, 1, &write, 0, nullptr);
+        std::vector<VkWriteDescriptorSet> writes = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
+        };
+
+        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
     Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);
@@ -1040,6 +1087,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
         }
     }
 
+    VkDescriptorBufferInfo res0Info{};
+    VkDescriptorBufferInfo res1Info{};
+    if (secNode->restirReservoirs[0] && secNode->restirReservoirs[1]) {
+        res0Info = { secNode->restirReservoirs[0]->getBuffer(), 0, secNode->restirReservoirs[0]->getSize() };
+        res1Info = { secNode->restirReservoirs[1]->getBuffer(), 0, secNode->restirReservoirs[1]->getSize() };
+    }
+
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
@@ -1051,6 +1105,10 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
     };
+    if (secNode->restirReservoirs[0] && secNode->restirReservoirs[1]) {
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
+    }
     vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());
     return true;

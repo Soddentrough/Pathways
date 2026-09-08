@@ -946,6 +946,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("Direct Lighting (Area Lights)", &config.enable_direct_light)) {
                 settingsChanged = true;
             }
+            if (ImGui::Checkbox("ReSTIR DI (Reservoir Resampling)", &config.enable_restir_di)) {
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spatiotemporal Reservoir Resampling for Direct Illumination (1 shadow ray/pixel with M=4 candidates).");
+            }
             if (ImGui::Checkbox("Indirect Diffuse GI", &config.enable_indirect_light)) {
                 settingsChanged = true;
             }

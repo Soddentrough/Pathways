@@ -5,15 +5,27 @@
 
 namespace pathways {
 
+struct ReservoirGPU {
+    uint32_t lightIdx = 0;
+    float    uvX = 0.0f;
+    float    uvY = 0.0f;
+    float    wSum = 0.0f;
+    float    M = 0.0f;
+    float    W = 0.0f;
+    float    targetPdf = 0.0f;
+    uint32_t pad = 0;
+};
+
 struct CameraUniform {
     glm::mat4 viewInverse;
     glm::mat4 projInverse;
+    glm::mat4 prevViewProj;
     glm::vec4 position;
     glm::vec4 viewParams; // x: fov, y: aspect, z: near, w: far
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI
 };
 
 class Camera {
@@ -82,6 +94,7 @@ public:
 
     bool hasMoved() const { return m_moved; }
     void resetMoved() { m_moved = false; }
+    void resetPrevViewProj() { m_hasPrevViewProj = false; }
 
 private:
     void updateVectors();
@@ -117,6 +130,8 @@ private:
     bool m_adaptiveFov = true;
 
     bool m_moved = true;
+    mutable glm::mat4 m_prevViewProj{ 1.0f };
+    mutable bool m_hasPrevViewProj = false;
 };
 
 } // namespace pathways

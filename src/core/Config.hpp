@@ -36,6 +36,7 @@ struct Config {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool enable_direct_light = true;
+    bool enable_restir_di = false;
     bool enable_indirect_light = true;
 
     uint32_t gpu_index = 0;

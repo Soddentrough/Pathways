@@ -88,6 +88,12 @@ private:
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
 
+    // ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
+    std::array<std::unique_ptr<Buffer>, 2> m_restirReservoirs;
+    uint32_t m_restirPingPongIndex = 0;
+    void initReSTIRBuffers();
+    void updateReSTIRDescriptors(uint32_t frameSlot);
+
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> m_asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;

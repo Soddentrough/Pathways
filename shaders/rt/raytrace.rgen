@@ -20,6 +20,7 @@ layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
     mat4 projInverse;
+    mat4 prevViewProj;
     vec4 position;
     vec4 viewParams;
     uint frameIndex;
@@ -140,9 +141,11 @@ void main() {
         for (uint bounce = 0; bounce < maxBounces; ++bounce) {
             prd.radiance = vec3(0.0);
             prd.packedThroughputRG = 0u;
-            prd.packedThroughputB_Flags = isDelta ? (2u << 16u) : 0u;
+            uint prdFlags = (isDelta ? 2u : 0u) | (bounce == 0u ? 4u : 0u);
+            prd.packedThroughputB_Flags = prdFlags << 16u;
             prd.seed = seed;
             prd.lastBsdfPdf = lastBsdfPdf;
+            prd.pad = uint(pixelCoord.y * int(pc.tileWidth) + pixelCoord.x);
 
             traceRayEXT(topLevelAS,
                         gl_RayFlagsOpaqueEXT,

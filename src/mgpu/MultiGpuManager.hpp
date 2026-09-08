@@ -38,6 +38,10 @@ struct GpuDeviceNode {
     std::unique_ptr<Buffer> lightBuffer;
     std::unique_ptr<Buffer> cameraUBO;
 
+    // Secondary ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
+    std::array<std::unique_ptr<Buffer>, 2> restirReservoirs;
+    uint32_t restirPingPongIndex = 0;
+
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> asManager;

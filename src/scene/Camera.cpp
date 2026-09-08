@@ -156,6 +156,7 @@ void Camera::lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up) {
     m_centralTarget = target;
     updateVectors();
     m_moved = true;
+    m_hasPrevViewProj = false;
 }
 
 void Camera::updateVectors() {
@@ -325,9 +326,14 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     CameraUniform ubo{};
     glm::mat4 view = getViewMatrix();
     glm::mat4 proj = getProjectionMatrix();
+    glm::mat4 currentViewProj = proj * view;
 
     ubo.viewInverse = glm::inverse(view);
     ubo.projInverse = glm::inverse(proj);
+    ubo.prevViewProj = m_hasPrevViewProj ? m_prevViewProj : currentViewProj;
+    m_prevViewProj = currentViewProj;
+    m_hasPrevViewProj = true;
+
     ubo.position = glm::vec4(m_position, 1.0f);
     ubo.viewParams = glm::vec4(m_fov, m_aspect, m_near, m_far);
     ubo.frameIndex = frameIndex;

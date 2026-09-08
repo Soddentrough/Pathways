@@ -86,6 +86,7 @@ struct Light {
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
     mat4 projInverse;
+    mat4 prevViewProj;
     vec4 position;
     vec4 viewParams;
     uint frameIndex;
@@ -112,6 +113,25 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 8) uniform sampler2D sceneTextures[64];
+
+struct ReservoirDI {
+    uint lightIdx;
+    float uvX;
+    float uvY;
+    float wSum;
+    float M;
+    float W;
+    float targetPdf;
+    uint pad;
+};
+
+layout(std430, binding = 9) buffer CurrentReservoirBuffer {
+    ReservoirDI currentReservoirs[];
+};
+
+layout(std430, binding = 10) readonly buffer HistoryReservoirBuffer {
+    ReservoirDI historyReservoirs[];
+};
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -450,6 +470,20 @@ void main() {
         }
         accumRadiance = emissive * misWeight;
         if (mat.type == 3u /* Emissive */) {
+            bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
+            bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
+            if (enableReSTIR && isPrimary) {
+                ReservoirDI emptyR;
+                emptyR.lightIdx = 0u;
+                emptyR.uvX = 0.0;
+                emptyR.uvY = 0.0;
+                emptyR.wSum = 0.0;
+                emptyR.M = 0.0;
+                emptyR.W = 0.0;
+                emptyR.targetPdf = 0.0;
+                emptyR.pad = 0u;
+                currentReservoirs[prd.pad] = emptyR;
+            }
             prd.radiance = accumRadiance;
             prd.packedThroughputRG = 0u;
             uint flags = 1u; // hit = true, isDelta = false
@@ -507,81 +541,305 @@ void main() {
     float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
-    // 2. Direct Lighting (Analytical Lights with MIS and in-shader shadow ray query)
+    // 2. Direct Lighting (Analytical Lights with ReSTIR DI or NEE Fallback)
+    bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
+    bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
+
     if (enableDirect && pc.numLights > 0u && mat.type != 3u && transmission < 0.1 && mat.type != 2u) {
-        uint lightIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
-        Light light = lights[lightIdx];
+        if (enableReSTIR && isPrimary) {
+            ReservoirDI R;
+            R.lightIdx = 0u;
+            R.uvX = 0.0;
+            R.uvY = 0.0;
+            R.wSum = 0.0;
+            R.M = 0.0;
+            R.W = 0.0;
+            R.targetPdf = 0.0;
+            R.pad = 0u;
 
-        vec3 lightDir;
-        float lightDist;
-        vec3 lightEmission = light.emission.rgb;
-        float lightPdf = 1.0;
+            // 1. Initial Candidate Generation (M_init = 4 candidates with Chao's WRS)
+            const uint M_init = 4u;
+            for (uint c = 0u; c < M_init; ++c) {
+                uint candIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
+                Light cLight = lights[candIdx];
+                vec2 cUv = randVec2(prd.seed);
+                vec3 cLightDir;
+                float cLightDist = 0.0;
+                vec3 cLightEmiss = cLight.emission.rgb;
+                float cLightPdf = 0.0;
 
-        if (light.position.w == 0.0) {
-            // Area light
-            vec2 lightUv = randVec2(prd.seed);
-            vec3 lightSamplePos = light.position.xyz + lightUv.x * light.u.xyz + lightUv.y * light.v.xyz;
-            vec3 toLight = lightSamplePos - hitPoint;
-            lightDist = length(toLight);
-            lightDir = toLight / max(lightDist, 1e-4);
+                if (cLight.position.w == 0.0) {
+                    // Area Light
+                    vec3 cPos = cLight.position.xyz + cUv.x * cLight.u.xyz + cUv.y * cLight.v.xyz;
+                    vec3 toL = cPos - hitPoint;
+                    cLightDist = length(toL);
+                    cLightDir = toL / max(cLightDist, 1e-4);
+                    float cosL = dot(-cLightDir, cLight.normal.xyz);
+                    float lArea = cLight.emission.w;
+                    if (cosL > 0.0 && lArea > 0.0) {
+                        cLightPdf = (cLightDist * cLightDist) / (cosL * lArea * float(pc.numLights));
+                    }
+                } else if (uint(cLight.position.w) == 1u) {
+                    // Spot Light
+                    vec3 toL = cLight.position.xyz - hitPoint;
+                    cLightDist = length(toL);
+                    cLightDir = toL / max(cLightDist, 1e-4);
+                    float cosSpot = dot(-cLightDir, cLight.normal.xyz);
+                    if (cosSpot >= cLight.v.w) {
+                        float spotFactor = clamp((cosSpot - cLight.v.w) / max(cLight.u.w - cLight.v.w, 1e-4), 0.0, 1.0);
+                        cLightEmiss *= spotFactor / max(cLightDist * cLightDist, 1e-4);
+                        cLightPdf = 1.0 / float(pc.numLights);
+                    }
+                }
 
-            float lightArea = light.emission.w;
-            float cosLight = dot(-lightDir, light.normal.xyz);
-            if (cosLight > 0.0 && lightArea > 0.0) {
-                lightPdf = (lightDist * lightDist) / (cosLight * lightArea * float(pc.numLights));
-            } else {
-                lightPdf = 0.0;
+                float cNdotL = dot(hitNormal, cLightDir);
+                float p_hat = 0.0;
+                if (cNdotL > 0.0 && cLightPdf > 0.0) {
+                    vec3 H = normalize(V + cLightDir);
+                    float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                    vec3 F = fresnelSchlickVec(VdotH, F0);
+                    vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                    vec3 specBRDF = vec3(0.0);
+                    if (enableSpecular) {
+                        float D = distributionGGX(NdotH, alphaRoughness);
+                        float Vis = visibilitySmithGGXCorrelated(cNdotL, NdotV, alphaRoughness);
+                        specBRDF = D * Vis * F;
+                    }
+                    vec3 unshadowed = cLightEmiss * (diffBRDF + specBRDF) * cNdotL;
+                    p_hat = dot(unshadowed, vec3(0.2126, 0.7152, 0.0722));
+                }
+
+                float w_i = (cLightPdf > 0.0) ? (p_hat / cLightPdf) : 0.0;
+                R.wSum += w_i;
+                R.M += 1.0;
+                if (randFloat(prd.seed) * R.wSum < w_i) {
+                    R.lightIdx = candIdx;
+                    R.uvX = cUv.x;
+                    R.uvY = cUv.y;
+                    R.targetPdf = p_hat;
+                }
             }
-        } else if (uint(light.position.w) == 1u /* SPOT */) {
-            vec3 toLight = light.position.xyz - hitPoint;
-            lightDist = length(toLight);
-            lightDir = toLight / max(lightDist, 1e-4);
 
-            float cosSpot = dot(-lightDir, light.normal.xyz);
-            float innerCos = light.u.w;
-            float outerCos = light.v.w;
-            if (cosSpot < outerCos) {
-                lightPdf = 0.0;
+            // 2. Temporal Resampling (History Reprojection)
+            vec4 prevClip = ubo.prevViewProj * vec4(hitPoint, 1.0);
+            if (prevClip.w > 0.0) {
+                vec2 prevNDC = prevClip.xy / prevClip.w;
+                vec2 prevUV = prevNDC * 0.5 + 0.5;
+                if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
+                    int prevPx = clamp(int(prevUV.x * float(pc.tileWidth)), 0, int(pc.tileWidth) - 1);
+                    int prevPy = clamp(int(prevUV.y * float(pc.tileHeight)), 0, int(pc.tileHeight) - 1);
+                    uint prevIdx = uint(prevPy * int(pc.tileWidth) + prevPx);
+
+                    ReservoirDI R_prev = historyReservoirs[prevIdx];
+                    if (R_prev.M > 0.0 && R_prev.wSum > 0.0 && R_prev.lightIdx < pc.numLights) {
+                        float historyM = min(R_prev.M, 20.0);
+
+                        Light hLight = lights[R_prev.lightIdx];
+                        vec3 hLightDir;
+                        float hLightDist = 0.0;
+                        vec3 hLightEmiss = hLight.emission.rgb;
+                        float hLightPdf = 0.0;
+
+                        if (hLight.position.w == 0.0) {
+                            vec3 hPos = hLight.position.xyz + R_prev.uvX * hLight.u.xyz + R_prev.uvY * hLight.v.xyz;
+                            vec3 toL = hPos - hitPoint;
+                            hLightDist = length(toL);
+                            hLightDir = toL / max(hLightDist, 1e-4);
+                            float cosL = dot(-hLightDir, hLight.normal.xyz);
+                            float lArea = hLight.emission.w;
+                            if (cosL > 0.0 && lArea > 0.0) {
+                                hLightPdf = (hLightDist * hLightDist) / (cosL * lArea * float(pc.numLights));
+                            }
+                        } else if (uint(hLight.position.w) == 1u) {
+                            vec3 toL = hLight.position.xyz - hitPoint;
+                            hLightDist = length(toL);
+                            hLightDir = toL / max(hLightDist, 1e-4);
+                            float cosSpot = dot(-hLightDir, hLight.normal.xyz);
+                            if (cosSpot >= hLight.v.w) {
+                                float spotFactor = clamp((cosSpot - hLight.v.w) / max(hLight.u.w - hLight.v.w, 1e-4), 0.0, 1.0);
+                                hLightEmiss *= spotFactor / max(hLightDist * hLightDist, 1e-4);
+                                hLightPdf = 1.0 / float(pc.numLights);
+                            }
+                        }
+
+                        float hNdotL = dot(hitNormal, hLightDir);
+                        float p_hat_current = 0.0;
+                        if (hNdotL > 0.0 && hLightPdf > 0.0) {
+                            vec3 H = normalize(V + hLightDir);
+                            float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                            float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                            float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                            vec3 F = fresnelSchlickVec(VdotH, F0);
+                            vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                            vec3 specBRDF = vec3(0.0);
+                            if (enableSpecular) {
+                                float D = distributionGGX(NdotH, alphaRoughness);
+                                float Vis = visibilitySmithGGXCorrelated(hNdotL, NdotV, alphaRoughness);
+                                specBRDF = D * Vis * F;
+                            }
+                            vec3 unshadowed = hLightEmiss * (diffBRDF + specBRDF) * hNdotL;
+                            p_hat_current = dot(unshadowed, vec3(0.2126, 0.7152, 0.0722));
+                        }
+
+                        float w_temporal = p_hat_current * R_prev.W * historyM;
+                        R.wSum += w_temporal;
+                        R.M += historyM;
+                        if (randFloat(prd.seed) * R.wSum < w_temporal) {
+                            R.lightIdx = R_prev.lightIdx;
+                            R.uvX = R_prev.uvX;
+                            R.uvY = R_prev.uvY;
+                            R.targetPdf = p_hat_current;
+                        }
+                    }
+                }
+            }
+
+            // 3. Compute Final Unbiased Weight W & Save to Current Reservoir Buffer
+            if (R.targetPdf > 0.0 && R.M > 0.0) {
+                R.W = R.wSum / (R.M * R.targetPdf);
             } else {
-                float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
-                lightPdf = 1.0 / float(pc.numLights);
+                R.W = 0.0;
+            }
+            currentReservoirs[prd.pad] = R;
+
+            // 4. Deferred Shadow Ray Query for Winning Candidate
+            if (R.W > 0.0 && R.lightIdx < pc.numLights) {
+                Light wLight = lights[R.lightIdx];
+                vec3 wLightDir;
+                float wLightDist = 0.0;
+                vec3 wLightEmiss = wLight.emission.rgb;
+                bool validSample = true;
+
+                if (wLight.position.w == 0.0) {
+                    vec3 wPos = wLight.position.xyz + R.uvX * wLight.u.xyz + R.uvY * wLight.v.xyz;
+                    vec3 toL = wPos - hitPoint;
+                    wLightDist = length(toL);
+                    wLightDir = toL / max(wLightDist, 1e-4);
+                    float cosL = dot(-wLightDir, wLight.normal.xyz);
+                    if (cosL <= 0.0) validSample = false;
+                } else if (uint(wLight.position.w) == 1u) {
+                    vec3 toL = wLight.position.xyz - hitPoint;
+                    wLightDist = length(toL);
+                    wLightDir = toL / max(wLightDist, 1e-4);
+                    float cosSpot = dot(-wLightDir, wLight.normal.xyz);
+                    if (cosSpot < wLight.v.w) validSample = false;
+                    else {
+                        float spotFactor = clamp((cosSpot - wLight.v.w) / max(wLight.u.w - wLight.v.w, 1e-4), 0.0, 1.0);
+                        wLightEmiss *= spotFactor / max(wLightDist * wLightDist, 1e-4);
+                    }
+                }
+
+                float wNdotL = dot(hitNormal, wLightDir);
+                if (validSample && wNdotL > 0.0) {
+                    bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, wLightDir, EPSILON, wLightDist - EPSILON * 2.0) : false;
+                    if (!inShadow) {
+                        vec3 H = normalize(V + wLightDir);
+                        float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                        float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                        vec3 specBRDF = vec3(0.0);
+                        if (enableSpecular) {
+                            float D = distributionGGX(NdotH, alphaRoughness);
+                            float Vis = visibilitySmithGGXCorrelated(wNdotL, NdotV, alphaRoughness);
+                            specBRDF = D * Vis * F;
+                        }
+                        vec3 brdf = diffBRDF + specBRDF;
+                        accumRadiance += wLightEmiss * brdf * wNdotL * R.W;
+                    }
+                }
             }
         } else {
-            lightPdf = 0.0;
-        }
+            // Standard Uniform Light Picking NEE with MIS (Baseline fallback)
+            uint lightIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
+            Light light = lights[lightIdx];
 
-        float NdotL = dot(hitNormal, lightDir);
-        if (NdotL > 0.0 && lightPdf > 0.0) {
-            // Inline shadow test using hardware ray query (bypassed if shadows disabled)
-            bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, lightDir, EPSILON, lightDist - EPSILON * 2.0) : false;
-            if (!inShadow) {
-                vec3 H = normalize(V + lightDir);
-                float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                float VdotH = clamp(dot(V, H), 0.0, 1.0);
+            vec3 lightDir;
+            float lightDist;
+            vec3 lightEmission = light.emission.rgb;
+            float lightPdf = 1.0;
 
-                vec3 F = fresnelSchlickVec(VdotH, F0);
-                vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
-                vec3 specBRDF = vec3(0.0);
-                if (enableSpecular) {
-                    float D = distributionGGX(NdotH, alphaRoughness);
-                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                    specBRDF = D * Vis * F;
+            if (light.position.w == 0.0) {
+                // Area light
+                vec2 lightUv = randVec2(prd.seed);
+                vec3 lightSamplePos = light.position.xyz + lightUv.x * light.u.xyz + lightUv.y * light.v.xyz;
+                vec3 toLight = lightSamplePos - hitPoint;
+                lightDist = length(toLight);
+                lightDir = toLight / max(lightDist, 1e-4);
+
+                float lightArea = light.emission.w;
+                float cosLight = dot(-lightDir, light.normal.xyz);
+                if (cosLight > 0.0 && lightArea > 0.0) {
+                    lightPdf = (lightDist * lightDist) / (cosLight * lightArea * float(pc.numLights));
+                } else {
+                    lightPdf = 0.0;
                 }
+            } else if (uint(light.position.w) == 1u /* SPOT */) {
+                vec3 toLight = light.position.xyz - hitPoint;
+                lightDist = length(toLight);
+                lightDir = toLight / max(lightDist, 1e-4);
 
-                vec3 brdf = diffBRDF + specBRDF;
-
-                // MIS balance heuristic for NEE
-                float misWeightLight = 1.0;
-                if (light.position.w == 0.0 /* Area Light */) {
-                    float bsdfPdf = evalBSDFPdf(V, lightDir, hitNormal, clearcoatNormal, alphaRoughness, clearcoatAlpha, clearcoatProb, baseSpecProb, clearcoat);
-                    misWeightLight = lightPdf / (lightPdf + bsdfPdf);
+                float cosSpot = dot(-lightDir, light.normal.xyz);
+                float innerCos = light.u.w;
+                float outerCos = light.v.w;
+                if (cosSpot < outerCos) {
+                    lightPdf = 0.0;
+                } else {
+                    float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                    lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                    lightPdf = 1.0 / float(pc.numLights);
                 }
+            } else {
+                lightPdf = 0.0;
+            }
 
-                accumRadiance += lightEmission * brdf * NdotL * misWeightLight / lightPdf;
+            float NdotL = dot(hitNormal, lightDir);
+            if (NdotL > 0.0 && lightPdf > 0.0) {
+                // Inline shadow test using hardware ray query (bypassed if shadows disabled)
+                bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, lightDir, EPSILON, lightDist - EPSILON * 2.0) : false;
+                if (!inShadow) {
+                    vec3 H = normalize(V + lightDir);
+                    float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                    vec3 F = fresnelSchlickVec(VdotH, F0);
+                    vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                    vec3 specBRDF = vec3(0.0);
+                    if (enableSpecular) {
+                        float D = distributionGGX(NdotH, alphaRoughness);
+                        float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                        specBRDF = D * Vis * F;
+                    }
+
+                    vec3 brdf = diffBRDF + specBRDF;
+
+                    // MIS balance heuristic for NEE
+                    float misWeightLight = 1.0;
+                    if (light.position.w == 0.0 /* Area Light */) {
+                        float bsdfPdf = evalBSDFPdf(V, lightDir, hitNormal, clearcoatNormal, alphaRoughness, clearcoatAlpha, clearcoatProb, baseSpecProb, clearcoat);
+                        misWeightLight = lightPdf / (lightPdf + bsdfPdf);
+                    }
+
+                    accumRadiance += lightEmission * brdf * NdotL * misWeightLight / lightPdf;
+                }
             }
         }
+    } else if (enableReSTIR && isPrimary) {
+        // Direct lighting disabled or non-diffuse surface; clear reservoir
+        ReservoirDI emptyR;
+        emptyR.lightIdx = 0u;
+        emptyR.uvX = 0.0;
+        emptyR.uvY = 0.0;
+        emptyR.wSum = 0.0;
+        emptyR.M = 0.0;
+        emptyR.W = 0.0;
+        emptyR.targetPdf = 0.0;
+        emptyR.pad = 0u;
+        currentReservoirs[prd.pad] = emptyR;
     }
 
     // 3. BSDF Sampling for Next Direction
