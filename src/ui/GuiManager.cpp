@@ -952,6 +952,26 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Spatiotemporal Reservoir Resampling for Direct Illumination (1 shadow ray/pixel with M=4 candidates).");
             }
+            if (config.enable_restir_di) {
+                ImGui::Indent();
+                if (ImGui::Checkbox("Spatial Resampling", &config.enable_restir_spatial)) {
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Cross-bilateral spatial reservoir reuse with normal and depth validation.");
+                }
+                if (config.enable_restir_spatial) {
+                    int samples = static_cast<int>(config.restir_spatial_samples);
+                    if (ImGui::SliderInt("Spatial Neighbors", &samples, 1, 8)) {
+                        config.restir_spatial_samples = static_cast<uint32_t>(samples);
+                        settingsChanged = true;
+                    }
+                    if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 2.0f, 32.0f, "%.1f px")) {
+                        settingsChanged = true;
+                    }
+                }
+                ImGui::Unindent();
+            }
             if (ImGui::Checkbox("Indirect Diffuse GI", &config.enable_indirect_light)) {
                 settingsChanged = true;
             }

@@ -1621,7 +1621,16 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-    if (m_config.enable_restir_di)      flags |= (1 << 6);
+    if (m_config.enable_restir_di) {
+        flags |= (1 << 6);
+        if (m_config.enable_restir_spatial) {
+            flags |= (1 << 7);
+            uint32_t samples = std::clamp(m_config.restir_spatial_samples, 1u, 8u);
+            uint32_t radius = std::clamp(static_cast<uint32_t>(std::round(m_config.restir_spatial_radius)), 1u, 64u);
+            flags |= (samples & 0xFu) << 8;
+            flags |= (radius & 0xFFu) << 12;
+        }
+    }
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));

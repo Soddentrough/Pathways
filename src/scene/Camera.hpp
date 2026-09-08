@@ -13,7 +13,7 @@ struct ReservoirGPU {
     float    M = 0.0f;
     float    W = 0.0f;
     float    targetPdf = 0.0f;
-    uint32_t pad = 0;
+    uint32_t pad = 0; // Packed geometry: lower 16 bits = oct normal, upper 16 bits = half depth
 };
 
 struct CameraUniform {
@@ -25,7 +25,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI, 7: restirSpatial, bits 8..11: spatialSamples, bits 12..19: spatialRadius
 };
 
 class Camera {

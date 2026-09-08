@@ -99,6 +99,10 @@ void Config::printUsage(const char* progName) {
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --restir-di, --restir   Enable ReSTIR Direct Illumination reservoir resampling\n"
+              << "  --restir-spatial        Enable ReSTIR spatial resampling [default: true when ReSTIR DI enabled]\n"
+              << "  --no-restir-spatial     Disable ReSTIR spatial resampling (temporal only)\n"
+              << "  --restir-spatial-samples <int>  ReSTIR spatial neighbor count (1..8, default: 3)\n"
+              << "  --restir-spatial-radius <float> ReSTIR spatial search radius in pixels (default: 8.0)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
@@ -225,6 +229,18 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_restir_di = true;
         } else if (arg == "--no-restir-di" || arg == "--no-restir") {
             cfg.enable_restir_di = false;
+        } else if (arg == "--restir-spatial") {
+            cfg.enable_restir_spatial = true;
+        } else if (arg == "--no-restir-spatial") {
+            cfg.enable_restir_spatial = false;
+        } else if (arg == "--restir-spatial-samples" && i + 1 < argc) {
+            cfg.restir_spatial_samples = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 8));
+        } else if (arg.starts_with("--restir-spatial-samples=")) {
+            cfg.restir_spatial_samples = static_cast<uint32_t>(std::clamp(std::stoi(arg.substr(arg.find('=') + 1)), 1, 8));
+        } else if (arg == "--restir-spatial-radius" && i + 1 < argc) {
+            cfg.restir_spatial_radius = std::clamp(std::stof(argv[++i]), 1.0f, 64.0f);
+        } else if (arg.starts_with("--restir-spatial-radius=")) {
+            cfg.restir_spatial_radius = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 1.0f, 64.0f);
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;
