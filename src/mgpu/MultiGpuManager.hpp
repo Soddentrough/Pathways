@@ -115,6 +115,12 @@ public:
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
 
+    // Wait for secondary GPU worker thread to become completely idle
+    void waitWorkerIdle();
+
+    // Wait for secondary GPU to finish execution of a specific slot (discarding old in-flight work)
+    void waitSecondarySlot(uint32_t slot);
+
     bool isZeroCopyActive() const { return m_useZeroCopyHost; }
     bool isCrossGpuSyncActive() const { return m_useCrossGpuSync; }
     VkSemaphore getImportedSemaphore(uint32_t slot = 0) const {
@@ -173,6 +179,7 @@ private:
     uint32_t m_waitingSlot = 0;
     bool m_workSubmitted = false;
     std::array<bool, 2> m_slotSubmitted = { false, false };
+    bool m_workerBusy = false;
 
     // Zero-copy host allocation imported into both GPUs via VK_EXT_external_memory_host (Double-buffered)
     std::array<void*, NUM_SHARED_BUFFERS> m_sharedHostPtr = { nullptr, nullptr };

@@ -183,6 +183,7 @@ private:
     std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;
     uint32_t m_frameIndex = 0;
     uint32_t m_totalFramesRendered = 0;
+    MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;
     std::vector<double> m_frameTimesMs;
     double m_lastFrameTimeMs = 0.0;
     double m_lastGpuRtMs = 0.0;

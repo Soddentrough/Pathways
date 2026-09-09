@@ -13,6 +13,8 @@
     #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
+#else
+    #include <unistd.h>
 #endif
 
 namespace pathways {
@@ -707,6 +709,11 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(secNode->commandBuffers[0], secNode->accumTarget->getImage(),
+                         VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+
     vkCmdFillBuffer(secNode->commandBuffers[0], secNode->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
     vkCmdFillBuffer(secNode->commandBuffers[0], secNode->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
@@ -749,6 +756,7 @@ void MultiGpuManager::workerLoop() {
             if (m_stopWorker) break;
             packet = m_pendingWork;
             m_pendingWork.valid = false;
+            m_workerBusy = true;
             m_submitCv.notify_all();
         }
 
@@ -762,6 +770,7 @@ void MultiGpuManager::workerLoop() {
             if (m_useCrossGpuSync && !m_devices.empty()) {
                 m_devices[0]->slotFdReady[slot] = true;
             }
+            m_workerBusy = false;
             m_submitCv.notify_all();
         }
     }
@@ -960,8 +969,11 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_workSubmitted = false;
         m_slotSubmitted[slot] = false;
         if (m_useCrossGpuSync && !m_devices.empty()) {
+            if (m_devices[0]->exportedFd[slot] >= 0) {
+                ::close(m_devices[0]->exportedFd[slot]);
+                m_devices[0]->exportedFd[slot] = -1;
+            }
             m_devices[0]->slotFdReady[slot] = false;
-            m_devices[0]->exportedFd[slot] = -1;
         }
 
         m_workCv.notify_one();
@@ -1024,13 +1036,32 @@ void MultiGpuManager::syncAndTransfer(uint32_t slot, void* dstHostPtr, size_t by
     }
 }
 
+void MultiGpuManager::waitSecondarySlot(uint32_t slot) {
+    if (!m_active || m_devices.empty()) return;
+    uint32_t s = slot % GpuDeviceNode::NUM_IN_FLIGHT;
+
+    // Wait until any pending work destined for this slot has been dequeued by the worker thread
+    std::unique_lock<std::mutex> lock(m_workMutex);
+    m_submitCv.wait(lock, [this, s]() {
+        if (m_pendingWork.valid && (m_pendingWork.bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT) == s) {
+            return false;
+        }
+        return true;
+    });
+}
+
+void MultiGpuManager::waitWorkerIdle() {
+    if (!m_active || m_devices.empty()) return;
+    std::unique_lock<std::mutex> lock(m_workMutex);
+    m_submitCv.wait(lock, [this]() {
+        return !m_pendingWork.valid && !m_workerBusy;
+    });
+}
+
 void MultiGpuManager::resize(uint32_t width, uint32_t height) {
     if (!m_active || m_devices.empty()) return;
 
-    {
-        std::unique_lock<std::mutex> lock(m_workMutex);
-        m_submitCv.wait(lock, [this]() { return !m_pendingWork.valid; });
-    }
+    waitWorkerIdle();
 
     m_config.width = width;
     m_config.height = height;
@@ -1073,6 +1104,11 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
+        VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+        VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(node->commandBuffers[0], node->accumTarget->getImage(),
+                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+
         vkCmdFillBuffer(node->commandBuffers[0], node->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
         vkCmdFillBuffer(node->commandBuffers[0], node->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
@@ -1111,7 +1147,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
             };
             vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+            node->slotHasExecuted[slot] = false;
+            node->slotFdReady[slot] = false;
+            if (node->exportedFd[slot] >= 0) {
+                ::close(node->exportedFd[slot]);
+                node->exportedFd[slot] = -1;
+            }
         }
+        m_slotSubmitted = { false, false };
+        m_workSubmitted = false;
     }
 
     Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);

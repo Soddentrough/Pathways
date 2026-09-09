@@ -1611,6 +1611,21 @@ void Engine::renderFrame() {
                 m_mgpu->setMode(MultiGpuMode::Off);
             }
             m_resetAccumulation = true;
+
+            VkCommandBufferBeginInfo clearBegin{};
+            clearBegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            clearBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandBuffer(m_commandBuffers[0], 0);
+            vkBeginCommandBuffer(m_commandBuffers[0], &clearBegin);
+            VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+            VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(m_commandBuffers[0], m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+            vkEndCommandBuffer(m_commandBuffers[0]);
+            VkSubmitInfo clearSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            clearSubmit.commandBufferCount = 1;
+            clearSubmit.pCommandBuffers = &m_commandBuffers[0];
+            vkQueueSubmit(m_context->getGraphicsQueue(), 1, &clearSubmit, VK_NULL_HANDLE);
+            vkQueueWaitIdle(m_context->getGraphicsQueue());
         }
 
         if (m_pendingDoubleBufferChange) {
@@ -1636,10 +1651,11 @@ void Engine::renderFrame() {
     }
 
     // Reset accumulation if camera moved or UI settings changed
-    if (m_camera->hasMoved() || m_resetAccumulation) {
+    bool accumReset = (m_camera && m_camera->hasMoved()) || m_resetAccumulation || (m_totalFramesRendered == 0);
+    if (accumReset) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
-        m_camera->resetMoved();
+        if (m_camera) m_camera->resetMoved();
         m_resetAccumulation = false;
     }
 
@@ -1821,7 +1837,13 @@ void Engine::renderFrame() {
 
         activeMode = m_config.mgpu_mode;
         if (activeMode == MultiGpuMode::Auto) {
-            activeMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+            activeMode = (activeSpp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+        }
+        if (activeMode != m_lastActiveMgpuMode) {
+            accumReset = true;
+            m_frameIndex = 0;
+            m_accumulatedSamples = 0;
+            m_lastActiveMgpuMode = activeMode;
         }
 
         tileOffsetX_sec = 2u;
@@ -1888,12 +1910,10 @@ void Engine::renderFrame() {
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
-        // 1. Launch secondary GPU for Frame 0 (if not already pre-launched from previous frame)
-        if (m_totalFramesRendered == 0) {
-            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
-                                       m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                       hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
-        }
+        // 1. Launch secondary GPU concurrently for current frame
+        m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
+                                   hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
 
         // 2. Concurrently record and execute primary GPU ray tracing asynchronously
         vkResetCommandBuffer(cmd, 0);
@@ -2238,16 +2258,6 @@ void Engine::renderFrame() {
     submitInfo.pWaitDstStageMask = waitStages.data();
 
     vkQueueSubmit(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
-
-    // Launch secondary GPU for NEXT frame to pipeline execution and prevent idle bubbles
-    if (isMgpu) {
-        uint32_t nextSlot = m_config.double_buffered_shared_mem ? ((m_currentFrame + 1) % 2) : 0;
-        CameraUniform nextUboSec = uboSec;
-        nextUboSec.frameIndex = m_frameIndex + 1 + (activeMode == MultiGpuMode::SampleParallel ? 1000003u : 0u);
-        m_mgpu->launchSecondaryWork(nextUboSec, nextSlot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
-                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
-    }
 
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
