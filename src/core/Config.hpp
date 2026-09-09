@@ -29,6 +29,14 @@ struct Config {
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     float render_scale = 1.0f;
 
+    // Dynamic Quality Governor & Target Frame Rate Limiter
+    uint32_t target_fps = 0;          // 0 = uncapped [Default]
+    bool adaptive_spp = false;        // Enable 3-axis dynamic sample rate governor [Default: false]
+    uint32_t min_spp = 1;             // Minimum SPP floor [Default: 1]
+    uint32_t max_spp = 16;            // Maximum SPP ceiling [Default: 16]
+    uint32_t min_bounces = 2;         // Minimum bounce floor [Default: 2]
+    uint32_t max_dynamic_bounces = 8; // Maximum bounce ceiling [Default: 8]
+
     bool headless = false;
     bool benchmark = false;
     bool validation_layers = true;

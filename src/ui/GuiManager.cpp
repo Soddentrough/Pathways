@@ -9,6 +9,8 @@
 
 #include <stdexcept>
 #include <format>
+#include <cmath>
+#include <algorithm>
 
 namespace pathways {
 
@@ -101,7 +103,83 @@ void GuiManager::resetHistory() {
     m_smoothedFrameTime = 0.0f;
 }
 
+// Renders an unobtrusive, stylish visual indicator at the bottom edge of an informational panel's
+// bounding box whenever lower content is obscured/clipped, with click-to-scroll and pulse animations.
+static void renderMoreDataBelowIndicator(const char* panelId) {
+    (void)panelId;
+    float scrollY = ImGui::GetScrollY();
+    float scrollMaxY = ImGui::GetScrollMaxY();
+
+    // Only display when lower content is obscured below the bottom of the bounding box
+    if (scrollMaxY > 2.0f && scrollY < (scrollMaxY - 2.0f)) {
+        ImVec2 winPos = ImGui::GetWindowPos();
+        ImVec2 winSize = ImGui::GetWindowSize();
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+        // 1. Subtle bottom edge fade-out gradient to soften obscured content at the boundary
+        float fadeH = 26.0f;
+        ImVec2 fadeMin(winPos.x + 2.0f, winPos.y + winSize.y - fadeH - 2.0f);
+        ImVec2 fadeMax(winPos.x + winSize.x - 2.0f, winPos.y + winSize.y - 2.0f);
+        drawList->AddRectFilledMultiColor(
+            fadeMin, fadeMax,
+            IM_COL32(8, 12, 18, 0),     // Top: transparent
+            IM_COL32(8, 12, 18, 0),
+            IM_COL32(8, 12, 18, 240),   // Bottom: dark window background
+            IM_COL32(8, 12, 18, 240)
+        );
+
+        // 2. Centered small visual icon pill pinned to the bottom of the bounding box
+        float pillW = 44.0f;
+        float pillH = 18.0f;
+        float centerX = winPos.x + winSize.x * 0.5f;
+        float pillBottomY = winPos.y + winSize.y - 6.0f;
+        float pillTopY = pillBottomY - pillH;
+
+        ImVec2 pillMin(centerX - pillW * 0.5f, pillTopY);
+        ImVec2 pillMax(centerX + pillW * 0.5f, pillBottomY);
+
+        // Subtle dynamic breath pulse
+        float time = static_cast<float>(ImGui::GetTime());
+        float pulse = 0.82f + 0.18f * std::sin(time * 3.5f);
+
+        ImU32 pillBg = IM_COL32(14, 22, 34, static_cast<int>(230 * pulse));
+        ImU32 pillBorder = IM_COL32(40, 160, 240, static_cast<int>(180 * pulse));
+        ImU32 arrowColor = IM_COL32(80, 220, 255, static_cast<int>(255 * pulse));
+
+        // Hover & Click interaction
+        ImVec2 mousePos = ImGui::GetIO().MousePos;
+        bool hovered = (mousePos.x >= pillMin.x && mousePos.x <= pillMax.x &&
+                        mousePos.y >= pillMin.y && mousePos.y <= pillMax.y);
+        if (hovered) {
+            pillBg = IM_COL32(20, 36, 56, 250);
+            pillBorder = IM_COL32(100, 240, 255, 255);
+            arrowColor = IM_COL32(255, 255, 255, 255);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                ImGui::SetScrollY(std::min(scrollMaxY, scrollY + 140.0f));
+            }
+            ImGui::SetTooltip("More content below (use mouse scroll wheel)");
+        }
+
+        // Rounded pill background & border
+        drawList->AddRectFilled(pillMin, pillMax, pillBg, 9.0f);
+        drawList->AddRect(pillMin, pillMax, pillBorder, 9.0f, 0, 1.2f);
+
+        // Crisp down chevron icon
+        float arrowCenterY = (pillMin.y + pillMax.y) * 0.5f - 1.0f;
+        float arrowHalfW = 6.0f;
+        float arrowH = 5.0f;
+
+        ImVec2 p1(centerX - arrowHalfW, arrowCenterY - arrowH * 0.5f);
+        ImVec2 p2(centerX, arrowCenterY + arrowH * 0.5f);
+        ImVec2 p3(centerX + arrowHalfW, arrowCenterY - arrowH * 0.5f);
+
+        drawList->AddLine(p1, p2, arrowColor, 2.0f);
+        drawList->AddLine(p2, p3, arrowColor, 2.0f);
+    }
+}
+
 bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t width, uint32_t height,
+
                         Config& config, const FrameStats& stats, bool& cameraMode, Camera* camera,
                         const DisplayInfo* displayInfo, bool isFullscreen,
                         GuiActions* actions,
@@ -213,7 +291,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowPos(ImVec2(hudX, hudY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
 
-    if (ImGui::Begin(hudTitle, nullptr)) {
+    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar;
+    if (ImGui::Begin(hudTitle, nullptr, panelFlags)) {
         if (stats.mgpu_mode_str != "off" && stats.secondary_gpu_time_ms > 0.001) {
             ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "Dual %s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
         } else {
@@ -237,7 +316,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.90f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
-        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 58.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
+        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 58.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+
             ImGui::SetWindowFontScale(2.2f);
             if (fps >= 60.0f) {
                 ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.45f, 1.0f), "%.0f FPS", fps);
@@ -405,6 +485,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED (<8ms)" : "EXCEEDED");
             }
         }
+        renderMoreDataBelowIndicator("TelemetryHUD");
     }
     ImGui::End();
 
@@ -414,8 +495,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowPos(ImVec2(ctrlX, ctrlY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(ctrlW, ctrlH), layoutCond);
 
-    if (ImGui::Begin("Pathways Control Panel", nullptr)) {
+    if (ImGui::Begin("Pathways Control Panel", nullptr, panelFlags)) {
         ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Real-Time Pipeline Configuration");
+
         ImGui::Separator();
 
         // Mode Toggle Banner & Quick Action
@@ -586,7 +668,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
 
-                    if (ImGui::BeginChild("##ActiveSceneCard", ImVec2(0, 94.0f), true, ImGuiWindowFlags_NoScrollbar)) {
+                    if (ImGui::BeginChild("##ActiveSceneCard", ImVec2(0, 94.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                         ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "ACTIVE SCENE: %s", cur.label.c_str());
                         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70.0f);
                         ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.28f, 1.0f), "[%s]", cur.group.c_str());
@@ -930,14 +1012,48 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 3. Path Tracer Core Settings
         if (ImGui::CollapsingHeader("Path Tracer Core", ImGuiTreeNodeFlags_DefaultOpen)) {
+            // Dynamic Sample Rate & Frame Rate Governor
+            if (ImGui::Checkbox("Adaptive Dynamic SPP (Governor)", &config.adaptive_spp)) {
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Autonomously adjusts sample count (SPP) and bounce depth to maximize quality within target framerate.");
+            }
+
+            const char* targetFpsLabels[] = { "Uncapped", "30 FPS (33.3 ms)", "60 FPS (16.7 ms)", "90 FPS (11.1 ms)", "120 FPS (8.3 ms)", "144 FPS (6.9 ms)", "240 FPS (4.2 ms)" };
+            const uint32_t targetFpsValues[] = { 0, 30, 60, 90, 120, 144, 240 };
+            int currentTargetIdx = 0;
+            for (int idx = 0; idx < 7; ++idx) {
+                if (config.target_fps == targetFpsValues[idx]) {
+                    currentTargetIdx = idx;
+                    break;
+                }
+            }
+            if (ImGui::Combo("Target Frame Rate", &currentTargetIdx, targetFpsLabels, 7)) {
+                config.target_fps = targetFpsValues[currentTargetIdx];
+                if (config.target_fps > 0) config.adaptive_spp = true;
+                settingsChanged = true;
+            }
+
+            if (config.adaptive_spp && config.target_fps > 0) {
+                ImGui::Indent();
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                    "[Governor: ACTIVE | Dynamic: %u SPP, %u Bounces]",
+                    stats.dynamic_spp, stats.dynamic_bounces);
+                ImGui::Text("Target Budget: %.2f ms (Current RT: %.2f ms)",
+                    1000.0f / config.target_fps, stats.primary_gpu_time_ms);
+                ImGui::Unindent();
+            }
+            ImGui::Separator();
+
             int spp = static_cast<int>(config.spp);
-            if (ImGui::SliderInt("Samples/Pixel (SPP)", &spp, 1, 64)) {
+            if (ImGui::SliderInt(config.adaptive_spp ? "Base Samples/Pixel (SPP)" : "Samples/Pixel (SPP)", &spp, 1, 64)) {
                 config.spp = static_cast<uint32_t>(spp);
                 settingsChanged = true;
             }
 
             int bounces = static_cast<int>(config.max_bounces);
-            if (ImGui::SliderInt("Max Ray Bounces", &bounces, 1, 16)) {
+            if (ImGui::SliderInt(config.adaptive_spp ? "Base Ray Bounces" : "Max Ray Bounces", &bounces, 1, 16)) {
                 config.max_bounces = static_cast<uint32_t>(bounces);
                 settingsChanged = true;
             }
@@ -1024,8 +1140,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (m_exportNotificationTimer > 0.0f) {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", m_lastExportNotification.c_str());
         }
+        renderMoreDataBelowIndicator("ControlPanel");
     }
     ImGui::End();
+
 
     // On-screen load split visualization overlay badges
     if (config.visualize_mgpu_split && config.mgpu_mode != MultiGpuMode::Off) {

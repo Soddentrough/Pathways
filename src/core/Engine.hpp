@@ -15,6 +15,7 @@
 #include "rt/RTPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
+#include "core/QualityGovernor.hpp"
 
 #include <memory>
 #include <vector>
@@ -49,6 +50,7 @@ public:
     std::string getActiveSceneName() const;
     Window* getWindow() const { return m_window.get(); }
     Swapchain* getSwapchain() const { return m_swapchain.get(); }
+    QualityGovernor* getGovernor() const { return m_governor.get(); }
 
 private:
     void initVulkan();
@@ -128,8 +130,10 @@ private:
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_commandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_postCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkSurfaceKHR m_surface = VK_NULL_HANDLE;
     std::array<VkFence, MAX_FRAMES_IN_FLIGHT> m_inFlightFences = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_rtCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     uint32_t m_currentFrame = 0;
     std::vector<VkSemaphore> m_imageAvailableSemaphores;
     std::vector<VkSemaphore> m_renderFinishedSemaphores;
@@ -144,7 +148,6 @@ private:
     std::array<VkDescriptorSet, 2> m_mergeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout m_mergePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_mergePipeline = VK_NULL_HANDLE;
-    VkFence m_rtFence = VK_NULL_HANDLE;
     void updateMergeDescriptors();
     void updateAllImageDescriptors();
     void updateSceneDescriptors();
@@ -174,7 +177,10 @@ private:
     bool m_sceneHasNonOpaque = false;
     void updateSceneTransparencyFlag();
 
-    // Frame tracking
+    // Frame tracking & Quality Governor
+    std::unique_ptr<QualityGovernor> m_governor;
+    uint32_t m_accumulatedSamples = 0;
+    std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;
     uint32_t m_frameIndex = 0;
     uint32_t m_totalFramesRendered = 0;
     std::vector<double> m_frameTimesMs;

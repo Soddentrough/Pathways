@@ -85,6 +85,9 @@ public:
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
     bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
+    bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
+    PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFdKHR = nullptr;
+    PFN_vkImportSemaphoreFdKHR pfnImportSemaphoreFdKHR = nullptr;
     const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
     uint32_t getValidationErrors() const { return s_validationErrors; }
     const PciLinkInfo& getPciLinkInfo() const { return m_pciLinkInfo; }
@@ -121,6 +124,7 @@ private:
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;
     bool m_hasExternalMemoryHost = false;
+    bool m_hasExternalSemaphoreFd = false;
     PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;

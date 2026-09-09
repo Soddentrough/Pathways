@@ -46,10 +46,14 @@ GpuDeviceNode::~GpuDeviceNode() {
 
     rtpKhrPipeline.reset();
     if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
-    if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
+    for (uint32_t i = 0; i < NUM_IN_FLIGHT; ++i) {
+        if (queryPools[i]) vkDestroyQueryPool(device, queryPools[i], nullptr);
+        if (renderFences[i]) vkDestroyFence(device, renderFences[i], nullptr);
+        if (secSemaphores[i]) vkDestroySemaphore(device, secSemaphores[i], nullptr);
+        cameraUBOs[i].reset();
+    }
     if (rtDescLayout) vkDestroyDescriptorSetLayout(device, rtDescLayout, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-    if (renderFence) vkDestroyFence(device, renderFence, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
 
     accumTarget.reset();
@@ -58,7 +62,6 @@ GpuDeviceNode::~GpuDeviceNode() {
     sphereBuffer.reset();
     materialBuffer.reset();
     lightBuffer.reset();
-    cameraUBO.reset();
 }
 
 MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene)
@@ -74,11 +77,35 @@ MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryCon
     Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs (Initial State: {})...",
                  devices.size(), m_mode == MultiGpuMode::Off ? "Standby (Single-GPU)" : "Active");
     initSecondaryDevice(config, scene);
+
+    if (m_active) {
+        m_workerThread = std::thread(&MultiGpuManager::workerLoop, this);
+    }
 }
 
 MultiGpuManager::~MultiGpuManager() {
-    if (m_asyncTask.valid()) {
-        m_asyncTask.wait();
+    {
+        std::lock_guard<std::mutex> lock(m_workMutex);
+        m_stopWorker = true;
+        m_workCv.notify_all();
+    }
+    if (m_workerThread.joinable()) {
+        m_workerThread.join();
+    }
+    if (!m_devices.empty() && m_devices[0]->context) {
+        vkDeviceWaitIdle(m_devices[0]->context->getDevice());
+    }
+    if (m_primaryContext) {
+        vkDeviceWaitIdle(m_primaryContext->getDevice());
+        if (!m_devices.empty()) {
+            VkDevice primDevice = m_primaryContext->getDevice();
+            for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+                if (m_devices[0]->primImportedSemaphores[i] != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(primDevice, m_devices[0]->primImportedSemaphores[i], nullptr);
+                    m_devices[0]->primImportedSemaphores[i] = VK_NULL_HANDLE;
+                }
+            }
+        }
     }
     destroySharedHostBuffer();
     m_devices.clear();
@@ -87,6 +114,11 @@ MultiGpuManager::~MultiGpuManager() {
 double MultiGpuManager::getSecondaryGpuTimeMs() const {
     if (!isMultiGpuActive() || m_devices.empty()) return 0.0;
     return m_devices[0]->lastFrameTimeMs;
+}
+
+double MultiGpuManager::getSecondaryTransferTimeMs() const {
+    if (!isMultiGpuActive() || m_devices.empty()) return 0.0;
+    return m_devices[0]->lastTransferTimeMs;
 }
 
 const std::string& MultiGpuManager::getSecondaryDeviceName() const {
@@ -340,20 +372,45 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmdAllocInfo.commandPool = secNode->commandPool;
     cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAllocInfo.commandBufferCount = 1;
-    vkAllocateCommandBuffers(secDevice, &cmdAllocInfo, &secNode->commandBuffer);
+    cmdAllocInfo.commandBufferCount = GpuDeviceNode::NUM_IN_FLIGHT;
+    vkAllocateCommandBuffers(secDevice, &cmdAllocInfo, secNode->commandBuffers.data());
 
-    // 2. Fence & Query Pool
+    // 2. Fence & Query Pool (Double-buffered, 4 timestamps per pool)
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(secDevice, &fenceInfo, nullptr, &secNode->renderFence);
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        vkCreateFence(secDevice, &fenceInfo, nullptr, &secNode->renderFences[i]);
+    }
 
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 2; // Start, End
-    vkCreateQueryPool(secDevice, &queryInfo, nullptr, &secNode->queryPool);
+    queryInfo.queryCount = 4; // 0: Start RT, 1: End RT, 2: Start Copy, 3: End Copy
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        vkCreateQueryPool(secDevice, &queryInfo, nullptr, &secNode->queryPools[i]);
+    }
+
+    // 2b. Cross-GPU Hardware Synchronization Semaphores (VK_KHR_external_semaphore_fd)
+    VkDevice primDevice = m_primaryContext->getDevice();
+    m_useCrossGpuSync = m_primaryContext->hasExternalSemaphoreFd() && secNode->context->hasExternalSemaphoreFd() &&
+                        m_primaryContext->pfnImportSemaphoreFdKHR && secNode->context->pfnGetSemaphoreFdKHR;
+    if (m_useCrossGpuSync) {
+        for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+            VkExportSemaphoreCreateInfo exportInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+            exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+            VkSemaphoreCreateInfo secSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            secSemInfo.pNext = &exportInfo;
+            vkCreateSemaphore(secDevice, &secSemInfo, nullptr, &secNode->secSemaphores[i]);
+
+            VkSemaphoreCreateInfo primSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            vkCreateSemaphore(primDevice, &primSemInfo, nullptr, &secNode->primImportedSemaphores[i]);
+            secNode->exportedFd[i] = -1;
+            secNode->slotFdReady[i] = false;
+        }
+        Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd (zero-wait GPU-to-GPU pipelining).");
+    }
 
     // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
     uint32_t secWidth = config.width;
@@ -410,12 +467,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 
     VkDeviceSize uboSize = sizeof(CameraUniform);
-    secNode->cameraUBO = std::make_unique<Buffer>(
-        secAlloc, uboSize,
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-    );
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        secNode->cameraUBOs[i] = std::make_unique<Buffer>(
+            secAlloc, uboSize,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+    }
 
     // Hardware Acceleration Structures on secondary device (VK_KHR_ray_query)
     if (secNode->context->hasRayTracing()) {
@@ -544,12 +603,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     rtLayoutInfo.pBindings = rtBindings.data();
     vkCreateDescriptorSetLayout(secDevice, &rtLayoutInfo, nullptr, &secNode->rtDescLayout);
 
+    std::vector<VkDescriptorSetLayout> descLayouts(GpuDeviceNode::NUM_IN_FLIGHT, secNode->rtDescLayout);
     VkDescriptorSetAllocateInfo descAllocInfo{};
     descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     descAllocInfo.descriptorPool = secNode->descriptorPool;
-    descAllocInfo.descriptorSetCount = 1;
-    descAllocInfo.pSetLayouts = &secNode->rtDescLayout;
-    vkAllocateDescriptorSets(secDevice, &descAllocInfo, &secNode->rtDescSet);
+    descAllocInfo.descriptorSetCount = GpuDeviceNode::NUM_IN_FLIGHT;
+    descAllocInfo.pSetLayouts = descLayouts.data();
+    vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
 
     // Allocate secondary ReSTIR reservoir ping-pong buffers
     VkDeviceSize resSize = static_cast<VkDeviceSize>(config.width) * config.height * sizeof(ReservoirGPU);
@@ -566,7 +626,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo uboInfo{ secNode->cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
     VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
@@ -591,20 +650,23 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         }
     }
 
-    std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
-    };
-    vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
+        std::vector<VkWriteDescriptorSet> writes = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
+        };
+        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
 
     // 6. Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) on Secondary GPU
     VkPushConstantRange rtpPushConstant{};
@@ -637,23 +699,23 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(secNode->commandBuffer, &beginInfo);
+    vkBeginCommandBuffer(secNode->commandBuffers[0], &beginInfo);
 
     secNode->accumTarget->transitionLayout(
-        secNode->commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
-    vkCmdFillBuffer(secNode->commandBuffer, secNode->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
-    vkCmdFillBuffer(secNode->commandBuffer, secNode->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
+    vkCmdFillBuffer(secNode->commandBuffers[0], secNode->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
+    vkCmdFillBuffer(secNode->commandBuffers[0], secNode->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
-    vkEndCommandBuffer(secNode->commandBuffer);
+    vkEndCommandBuffer(secNode->commandBuffers[0]);
 
     VkSubmitInfo initSubmit{};
     initSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     initSubmit.commandBufferCount = 1;
-    initSubmit.pCommandBuffers = &secNode->commandBuffer;
+    initSubmit.pCommandBuffers = &secNode->commandBuffers[0];
     vkQueueSubmit(secNode->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
 
@@ -676,6 +738,188 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 }
 
+void MultiGpuManager::workerLoop() {
+    while (true) {
+        SecondaryWorkPacket packet;
+        {
+            std::unique_lock<std::mutex> lock(m_workMutex);
+            m_workCv.wait(lock, [this]() {
+                return m_stopWorker || m_pendingWork.valid;
+            });
+            if (m_stopWorker) break;
+            packet = m_pendingWork;
+            m_pendingWork.valid = false;
+            m_submitCv.notify_all();
+        }
+
+        executeSecondaryWork(packet);
+
+        {
+            std::lock_guard<std::mutex> lock(m_workMutex);
+            uint32_t slot = packet.bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
+            m_workSubmitted = true;
+            m_slotSubmitted[slot] = true;
+            if (m_useCrossGpuSync && !m_devices.empty()) {
+                m_devices[0]->slotFdReady[slot] = true;
+            }
+            m_submitCv.notify_all();
+        }
+    }
+}
+
+void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
+    if (m_devices.empty()) return;
+    GpuDeviceNode* node = m_devices[0].get();
+    VkDevice device = node->context->getDevice();
+    VkQueue queue = node->context->getGraphicsQueue();
+    uint32_t slot = packet.bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
+
+    // 1. Wait for previous execution using this slot to complete before recording
+    vkWaitForFences(device, 1, &node->renderFences[slot], VK_TRUE, UINT64_MAX);
+
+    // Read timestamp queries from completed execution of this slot (only if slot was previously executed)
+    if (node->slotHasExecuted[slot]) {
+        uint64_t slotTimestamps[4] = {0, 0, 0, 0};
+        if (vkGetQueryPoolResults(device, node->queryPools[slot], 0, 4, sizeof(slotTimestamps), slotTimestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            if (slotTimestamps[1] > slotTimestamps[0]) {
+                node->lastFrameTimeMs = (slotTimestamps[1] - slotTimestamps[0]) * node->timestampPeriod * 1e-6;
+            }
+            if (slotTimestamps[3] > slotTimestamps[2]) {
+                node->lastTransferTimeMs = (slotTimestamps[3] - slotTimestamps[2]) * node->timestampPeriod * 1e-6;
+            }
+        }
+    }
+    vkResetFences(device, 1, &node->renderFences[slot]);
+
+    // 2. Update Camera UBO for this slot
+    node->cameraUBOs[slot]->copyFrom(&packet.cameraUniform, sizeof(CameraUniform));
+
+    // 3. Ping-pong ReSTIR DI reservoir buffers if enabled
+    if ((packet.cameraUniform.flags & (1 << 6)) && node->restirReservoirs[0] && node->restirReservoirs[1]) {
+        node->restirPingPongIndex = 1 - node->restirPingPongIndex;
+        VkDeviceSize resSize = static_cast<VkDeviceSize>(packet.tileWidth) * packet.tileHeight * sizeof(ReservoirGPU);
+        VkDescriptorBufferInfo curInfo{ node->restirReservoirs[node->restirPingPongIndex]->getBuffer(), 0, resSize };
+        VkDescriptorBufferInfo histInfo{ node->restirReservoirs[1 - node->restirPingPongIndex]->getBuffer(), 0, resSize };
+        VkWriteDescriptorSet resWrites[2] = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+        };
+        vkUpdateDescriptorSets(device, 2, resWrites, 0, nullptr);
+    }
+
+    // 4. Record secondary GPU commands
+    VkCommandBuffer cmd = node->commandBuffers[slot];
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    vkCmdResetQueryPool(cmd, node->queryPools[slot], 0, 4);
+    // Timestamp 0: RT Start
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, node->queryPools[slot], 0);
+
+    uint32_t envBits = std::bit_cast<uint32_t>(packet.envMapIntensity);
+    uint32_t rtPushConstants[12] = {
+        packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
+        packet.tileOffsetX, packet.tileOffsetY, packet.tileWidth, packet.tileHeight,
+        packet.useHardwareRT,
+        packet.hasEnvMap,
+        envBits,
+        packet.accumulateHistory
+    };
+
+    uint32_t dispatchWidth = packet.tileWidth;
+    uint32_t dispatchHeight = packet.tileHeight;
+
+    if (packet.tileOffsetY == 0u) {
+        if (packet.tileOffsetX == 1u || packet.tileOffsetX == 2u) {
+            dispatchWidth = packet.tileWidth;
+            dispatchHeight = (packet.tileHeight + 1) / 2;
+        }
+    } else {
+        if (packet.tileOffsetX == 1u || packet.tileOffsetX == 2u) {
+            dispatchWidth = (packet.tileWidth + 1) / 2;
+            dispatchHeight = packet.tileHeight;
+        }
+    }
+
+    // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSets[slot], 0, nullptr);
+    VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+    vkCmdPushConstants(cmd, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+
+    node->rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
+
+    // Timestamp 1: RT End
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
+
+    // Transition accumTarget to TRANSFER_SRC_OPTIMAL
+    node->accumTarget->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+    );
+
+    // Timestamp 2: Copy Start
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageOffset = { 0, 0, 0 };
+    copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
+
+    uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
+    VkBuffer targetBuffer = m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer();
+
+    vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           targetBuffer, 1, &copyRegion);
+
+    // Timestamp 3: Copy End
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
+
+    node->accumTarget->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
+    vkEndCommandBuffer(cmd);
+
+    // 5. Submit secondary workload
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    if (m_useCrossGpuSync) {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &node->secSemaphores[slot];
+    }
+    vkQueueSubmit(queue, 1, &submitInfo, node->renderFences[slot]);
+
+    // Export semaphore FD from secondary device
+    if (m_useCrossGpuSync) {
+        VkDevice secDev = node->context->getDevice();
+        VkSemaphoreGetFdInfoKHR getFdInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+        getFdInfo.semaphore = node->secSemaphores[slot];
+        getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        int fd = -1;
+        VkResult res = node->context->pfnGetSemaphoreFdKHR(secDev, &getFdInfo, &fd);
+        if (res == VK_SUCCESS && fd >= 0) {
+            node->exportedFd[slot] = fd;
+        }
+    }
+    node->slotHasExecuted[slot] = true;
+}
+
 void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t bufferSlot,
                                          uint32_t tileOffsetX, uint32_t tileOffsetY,
@@ -690,147 +934,91 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          size_t transferBytes) {
     if (!m_active || m_devices.empty()) return;
 
-    m_asyncTask = std::async(std::launch::async, [this, cameraUniform, bufferSlot,
-                                                 tileOffsetX, tileOffsetY, tileWidth, tileHeight,
-                                                 numTriangles, numSpheres, numMaterials, numLights,
-                                                 useHardwareRT, hasEnvMap, envMapIntensity, accumulateHistory,
-                                                 dstHostPtr, transferBytes]() {
-        GpuDeviceNode* node = m_devices[0].get();
-        VkDevice device = node->context->getDevice();
-        VkQueue queue = node->context->getGraphicsQueue();
+    {
+        std::unique_lock<std::mutex> lock(m_workMutex);
+        m_submitCv.wait(lock, [this]() { return !m_pendingWork.valid; });
 
-        // 1. Update Camera UBO on secondary GPU
-        node->cameraUBO->copyFrom(&cameraUniform, sizeof(CameraUniform));
-
-        // 2. Wait for previous execution to complete
-        vkWaitForFences(device, 1, &node->renderFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &node->renderFence);
-
-        // Ping-pong ReSTIR DI reservoir buffers on secondary GPU if enabled
-        if ((cameraUniform.flags & (1 << 6)) && node->restirReservoirs[0] && node->restirReservoirs[1]) {
-            node->restirPingPongIndex = 1 - node->restirPingPongIndex;
-            VkDeviceSize resSize = static_cast<VkDeviceSize>(tileWidth) * tileHeight * sizeof(ReservoirGPU);
-            VkDescriptorBufferInfo curInfo{ node->restirReservoirs[node->restirPingPongIndex]->getBuffer(), 0, resSize };
-            VkDescriptorBufferInfo histInfo{ node->restirReservoirs[1 - node->restirPingPongIndex]->getBuffer(), 0, resSize };
-            VkWriteDescriptorSet resWrites[2] = {
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
-            };
-            vkUpdateDescriptorSets(device, 2, resWrites, 0, nullptr);
+        m_pendingWork.cameraUniform = cameraUniform;
+        m_pendingWork.bufferSlot = bufferSlot;
+        m_pendingWork.tileOffsetX = tileOffsetX;
+        m_pendingWork.tileOffsetY = tileOffsetY;
+        m_pendingWork.tileWidth = tileWidth;
+        m_pendingWork.tileHeight = tileHeight;
+        m_pendingWork.numTriangles = numTriangles;
+        m_pendingWork.numSpheres = numSpheres;
+        m_pendingWork.numMaterials = numMaterials;
+        m_pendingWork.numLights = numLights;
+        m_pendingWork.useHardwareRT = useHardwareRT;
+        m_pendingWork.hasEnvMap = hasEnvMap;
+        m_pendingWork.envMapIntensity = envMapIntensity;
+        m_pendingWork.accumulateHistory = accumulateHistory;
+        m_pendingWork.dstHostPtr = dstHostPtr;
+        m_pendingWork.transferBytes = transferBytes;
+        m_pendingWork.valid = true;
+        uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
+        m_waitingSlot = slot;
+        m_workSubmitted = false;
+        m_slotSubmitted[slot] = false;
+        if (m_useCrossGpuSync && !m_devices.empty()) {
+            m_devices[0]->slotFdReady[slot] = false;
+            m_devices[0]->exportedFd[slot] = -1;
         }
 
-        // 3. Record secondary GPU commands
-        vkResetCommandBuffer(node->commandBuffer, 0);
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(node->commandBuffer, &beginInfo);
-
-        vkCmdResetQueryPool(node->commandBuffer, node->queryPool, 0, 2);
-        vkCmdWriteTimestamp2(node->commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, node->queryPool, 0);
-
-        uint32_t envBits = std::bit_cast<uint32_t>(envMapIntensity);
-        uint32_t rtPushConstants[12] = {
-            numTriangles, numSpheres, numMaterials, numLights,
-            tileOffsetX, tileOffsetY, tileWidth, tileHeight,
-            useHardwareRT,
-            hasEnvMap,
-            envBits,
-            accumulateHistory
-        };
-
-        uint32_t dispatchWidth = tileWidth;
-        uint32_t dispatchHeight = tileHeight;
-
-        if (tileOffsetY == 0u) {
-            // Interleaved scanlines: each GPU renders half the total rows
-            if (tileOffsetX == 1u || tileOffsetX == 2u) {
-                dispatchWidth = tileWidth;
-                dispatchHeight = (tileHeight + 1) / 2;
-            }
-        } else {
-            // 2D Checkerboard: each GPU renders half the columns
-            if (tileOffsetX == 1u || tileOffsetX == 2u) {
-                dispatchWidth = (tileWidth + 1) / 2;
-                dispatchHeight = tileHeight;
-            }
-        }
-
-        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-        vkCmdBindPipeline(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
-        vkCmdBindDescriptorSets(node->commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSet, 0, nullptr);
-
-        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-        vkCmdPushConstants(node->commandBuffer, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-        node->rtpKhrPipeline->traceRays(node->commandBuffer, dispatchWidth, dispatchHeight, 1);
-
-        vkCmdWriteTimestamp2(node->commandBuffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPool, 1);
-
-        // Transition accumTarget to TRANSFER_SRC_OPTIMAL to copy to host-visible staging buffer
-        node->accumTarget->transitionLayout(
-            node->commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-        );
-
-        VkBufferImageCopy copyRegion{};
-        copyRegion.bufferOffset = 0;
-        copyRegion.bufferRowLength = 0;
-        copyRegion.bufferImageHeight = 0;
-        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.imageSubresource.mipLevel = 0;
-        copyRegion.imageSubresource.baseArrayLayer = 0;
-        copyRegion.imageSubresource.layerCount = 1;
-        copyRegion.imageOffset = { 0, 0, 0 };
-        copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
-
-        uint32_t slot = m_config.double_buffered_shared_mem ? (bufferSlot % NUM_SHARED_BUFFERS) : 0;
-        VkBuffer targetBuffer = m_useZeroCopyHost ? m_sharedBufferSecondary[slot] : node->p2pStagingBuffer->getBuffer();
-
-        vkCmdCopyImageToBuffer(node->commandBuffer, node->accumTarget->getImage(),
-                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               targetBuffer, 1, &copyRegion);
-
-        node->accumTarget->transitionLayout(
-            node->commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-
-        vkEndCommandBuffer(node->commandBuffer);
-
-        // 4. Submit secondary workload
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &node->commandBuffer;
-        vkQueueSubmit(queue, 1, &submitInfo, node->renderFence);
-
-        // 5. Wait for secondary fence and retrieve timestamps
-        vkWaitForFences(device, 1, &node->renderFence, VK_TRUE, UINT64_MAX);
-
-        uint64_t timestamps[2] = {0, 0};
-        vkGetQueryPoolResults(device, node->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-        node->lastFrameTimeMs = (timestamps[1] - timestamps[0]) * node->timestampPeriod * 1e-6;
-
-        // 6. Asynchronous PCIe transfer into host-mapped destination buffer (only for fallback when zero-copy disabled)
-        if (!m_useZeroCopyHost && dstHostPtr != nullptr && transferBytes > 0) {
-            void* srcPtr = node->p2pStagingBuffer->map();
-            parallelMemcpy(dstHostPtr, srcPtr, transferBytes, 8);
-        }
-    });
+        m_workCv.notify_one();
+    }
 }
 
-void MultiGpuManager::syncAndTransfer(void* dstHostPtr, size_t byteSize) {
+void MultiGpuManager::syncAndTransfer(uint32_t slot, void* dstHostPtr, size_t byteSize) {
     if (!m_active || m_devices.empty()) return;
 
-    if (m_asyncTask.valid()) {
-        m_asyncTask.get();
+    uint32_t s = slot % GpuDeviceNode::NUM_IN_FLIGHT;
+
+    if (m_useCrossGpuSync) {
+        // Wait until worker thread has exported the semaphore FD for this slot
+        {
+            std::unique_lock<std::mutex> lock(m_workMutex);
+            m_submitCv.wait(lock, [this, s]() { return m_devices[0]->slotFdReady[s]; });
+        }
+        // Import FD into primary device semaphore on main thread (safe because frame N-2 fence signaled)
+        GpuDeviceNode* node = m_devices[0].get();
+        int fd = node->exportedFd[s];
+        if (fd >= 0) {
+            VkDevice primDev = m_primaryContext->getDevice();
+            VkImportSemaphoreFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+            importInfo.semaphore = node->primImportedSemaphores[s];
+            importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+            importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+            importInfo.fd = fd;
+            m_primaryContext->pfnImportSemaphoreFdKHR(primDev, &importInfo);
+            node->exportedFd[s] = -1;
+        }
+        return;
     }
 
+    // 1. Wait until the worker thread has submitted the command buffer for this slot
+    {
+        std::unique_lock<std::mutex> lock(m_workMutex);
+        m_submitCv.wait(lock, [this, s]() { return m_slotSubmitted[s]; });
+    }
+
+    GpuDeviceNode* node = m_devices[0].get();
+    VkDevice device = node->context->getDevice();
+
+    // 2. Wait for secondary GPU completion of this slot
+    vkWaitForFences(device, 1, &node->renderFences[s], VK_TRUE, UINT64_MAX);
+
+    // 3. Read timestamp queries (0: Start RT, 1: End RT, 2: Start Copy, 3: End Copy)
+    uint64_t timestamps[4] = {0, 0, 0, 0};
+    vkGetQueryPoolResults(device, node->queryPools[s], 0, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (timestamps[1] > timestamps[0]) {
+        node->lastFrameTimeMs = (timestamps[1] - timestamps[0]) * node->timestampPeriod * 1e-6;
+    }
+    if (timestamps[3] > timestamps[2]) {
+        node->lastTransferTimeMs = (timestamps[3] - timestamps[2]) * node->timestampPeriod * 1e-6;
+    }
+
+    // 4. Asynchronous PCIe transfer into host-mapped destination buffer (fallback only when zero-copy disabled)
     if (!m_useZeroCopyHost && dstHostPtr != nullptr && byteSize > 0) {
-        GpuDeviceNode* node = m_devices[0].get();
         void* srcPtr = node->p2pStagingBuffer->map();
         parallelMemcpy(dstHostPtr, srcPtr, byteSize, 8);
     }
@@ -839,8 +1027,9 @@ void MultiGpuManager::syncAndTransfer(void* dstHostPtr, size_t byteSize) {
 void MultiGpuManager::resize(uint32_t width, uint32_t height) {
     if (!m_active || m_devices.empty()) return;
 
-    if (m_asyncTask.valid()) {
-        m_asyncTask.wait();
+    {
+        std::unique_lock<std::mutex> lock(m_workMutex);
+        m_submitCv.wait(lock, [this]() { return !m_pendingWork.valid; });
     }
 
     m_config.width = width;
@@ -861,11 +1050,11 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         );
 
         // Transition accumTarget to GENERAL layout
-        vkResetCommandBuffer(node->commandBuffer, 0);
+        vkResetCommandBuffer(node->commandBuffers[0], 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(node->commandBuffer, &beginInfo);
+        vkBeginCommandBuffer(node->commandBuffers[0], &beginInfo);
 
         VkDeviceSize resSize = static_cast<VkDeviceSize>(width) * height * sizeof(ReservoirGPU);
         for (uint32_t i = 0; i < 2; ++i) {
@@ -878,21 +1067,21 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->restirPingPongIndex = 0;
 
         node->accumTarget->transitionLayout(
-            node->commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
-        vkCmdFillBuffer(node->commandBuffer, node->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
-        vkCmdFillBuffer(node->commandBuffer, node->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
+        vkCmdFillBuffer(node->commandBuffers[0], node->restirReservoirs[0]->getBuffer(), 0, resSize, 0);
+        vkCmdFillBuffer(node->commandBuffers[0], node->restirReservoirs[1]->getBuffer(), 0, resSize, 0);
 
-        vkEndCommandBuffer(node->commandBuffer);
+        vkEndCommandBuffer(node->commandBuffers[0]);
 
         VkSubmitInfo initSubmit{};
         initSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         initSubmit.commandBufferCount = 1;
-        initSubmit.pCommandBuffers = &node->commandBuffer;
+        initSubmit.pCommandBuffers = &node->commandBuffers[0];
         vkQueueSubmit(node->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
         vkQueueWaitIdle(node->context->getGraphicsQueue());
 
@@ -915,13 +1104,14 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         VkDescriptorBufferInfo res0Info{ node->restirReservoirs[0]->getBuffer(), 0, resSize };
         VkDescriptorBufferInfo res1Info{ node->restirReservoirs[1]->getBuffer(), 0, resSize };
 
-        std::vector<VkWriteDescriptorSet> writes = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
-        };
-
-        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+            std::vector<VkWriteDescriptorSet> writes = {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr }
+            };
+            vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
     }
 
     Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);
@@ -1064,7 +1254,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo uboInfo{ secNode->cameraUBO->getBuffer(), 0, sizeof(CameraUniform) };
     VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
@@ -1094,22 +1283,25 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
         res1Info = { secNode->restirReservoirs[1]->getBuffer(), 0, secNode->restirReservoirs[1]->getSize() };
     }
 
-    std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
-    };
-    if (secNode->restirReservoirs[0] && secNode->restirReservoirs[1]) {
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSet, 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
+    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
+        std::vector<VkWriteDescriptorSet> writes = {
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
+            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
+        };
+        if (secNode->restirReservoirs[0] && secNode->restirReservoirs[1]) {
+            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
+            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
+        }
+        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
-    vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());
     return true;
 }

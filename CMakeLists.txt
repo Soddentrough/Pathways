@@ -239,6 +239,24 @@ endif()
 
 add_test(NAME CameraControls COMMAND test_camera_controls)
 
+
+# GUI Mouse Wheel & Scroll Indicator Unit Test Target
+add_executable(test_gui_scroll
+    tests/test_gui_scroll.cpp
+    ${THIRD_PARTY_DIR}/imgui/imgui.cpp
+    ${THIRD_PARTY_DIR}/imgui/imgui_draw.cpp
+    ${THIRD_PARTY_DIR}/imgui/imgui_tables.cpp
+    ${THIRD_PARTY_DIR}/imgui/imgui_widgets.cpp
+)
+target_include_directories(test_gui_scroll PRIVATE
+    ${THIRD_PARTY_DIR}/imgui
+)
+if(UNIX)
+    target_link_libraries(test_gui_scroll PRIVATE m)
+endif()
+add_test(NAME GuiScroll COMMAND test_gui_scroll)
+
+
 # ==============================================================================
 # Installation & CPack Packaging Configuration
 # ==============================================================================

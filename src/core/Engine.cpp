@@ -181,6 +181,21 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     startHwMonThread();
 
+    // Initialize Dynamic Quality Governor
+    GovernorConfig govCfg{};
+    govCfg.targetFps = m_config.target_fps;
+    govCfg.enabled = m_config.adaptive_spp;
+    govCfg.minSpp = m_config.min_spp;
+    govCfg.maxSpp = m_config.max_spp;
+    govCfg.minBounces = m_config.min_bounces;
+    govCfg.maxBounces = m_config.max_dynamic_bounces;
+    m_governor = std::make_unique<QualityGovernor>(govCfg);
+    if (m_governor->getState().active) {
+        Logger::info("Dynamic Quality Governor ACTIVE: Target {} FPS (Budget: {:.2f} ms), SPP Range [{}..{}], Bounces [{}..{}]",
+                     m_config.target_fps, m_governor->getState().targetBudgetMs,
+                     m_config.min_spp, m_config.max_spp, m_config.min_bounces, m_config.max_dynamic_bounces);
+    }
+
     Logger::info("Pathways Engine initialization complete. Ready to render.");
 }
 
@@ -192,8 +207,8 @@ Engine::~Engine() {
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_inFlightFences[i]) vkDestroyFence(device, m_inFlightFences[i], nullptr);
+        if (m_rtCompleteSemaphores[i]) vkDestroySemaphore(device, m_rtCompleteSemaphores[i], nullptr);
     }
-    if (m_rtFence) vkDestroyFence(device, m_rtFence, nullptr);
     if (m_commandPool) vkDestroyCommandPool(device, m_commandPool, nullptr);
 
     if (m_queryPool) vkDestroyQueryPool(device, m_queryPool, nullptr);
@@ -326,6 +341,7 @@ void Engine::initVulkan() {
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
     vkAllocateCommandBuffers(device, &allocInfo, m_commandBuffers.data());
+    vkAllocateCommandBuffers(device, &allocInfo, m_postCommandBuffers.data());
 
     // Create Render Target Images
     VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -1269,10 +1285,13 @@ void Engine::initSyncObjects() {
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFences[i]);
     }
-    vkCreateFence(device, &fenceInfo, nullptr, &m_rtFence);
 
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        vkCreateSemaphore(device, &semInfo, nullptr, &m_rtCompleteSemaphores[i]);
+    }
 
     m_imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -1469,6 +1488,7 @@ void Engine::updateInput() {
 }
 
 void Engine::renderFrame() {
+    m_currentFrameStartTime = std::chrono::high_resolution_clock::now();
     VkDevice device = m_context->getDevice();
     VkQueue queue = m_context->getGraphicsQueue();
 
@@ -1507,6 +1527,15 @@ void Engine::renderFrame() {
                 m_frameTimesMs.erase(m_frameTimesMs.begin());
             }
             recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
+        }
+
+        // Update Dynamic Quality Governor with measured GPU timings
+        if (m_governor && m_config.adaptive_spp) {
+            bool isMgpuSample = (m_mgpu && m_mgpu->isMultiGpuActive() &&
+                                (m_config.mgpu_mode == MultiGpuMode::SampleParallel ||
+                                (m_config.mgpu_mode == MultiGpuMode::Auto && m_governor->getState().currentSpp > 1)));
+            float activeRtMs = static_cast<float>((m_mgpu && m_mgpu->isMultiGpuActive()) ? std::max(gpuRtMs, secGpuMs) : gpuRtMs);
+            m_governor->update(activeRtMs, static_cast<float>(gpuTonemapMs), m_camera && m_camera->hasMoved(), isMgpuSample);
         }
     }
 
@@ -1609,9 +1638,27 @@ void Engine::renderFrame() {
     // Reset accumulation if camera moved or UI settings changed
     if (m_camera->hasMoved() || m_resetAccumulation) {
         m_frameIndex = 0;
+        m_accumulatedSamples = 0;
         m_camera->resetMoved();
         m_resetAccumulation = false;
     }
+
+    if (m_governor) {
+        if (m_governor->getConfig().targetFps != m_config.target_fps) {
+            m_governor->setTargetFps(m_config.target_fps);
+        }
+        if (m_governor->getConfig().enabled != m_config.adaptive_spp) {
+            m_governor->setEnabled(m_config.adaptive_spp);
+        }
+    }
+
+    uint32_t activeSpp = m_config.spp;
+    uint32_t activeBounces = m_config.max_bounces;
+    if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
+        activeSpp = m_governor->getState().currentSpp;
+        activeBounces = m_governor->getState().currentBounces;
+    }
+    m_accumulatedSamples += activeSpp;
 
     // Update Camera Uniform
     uint32_t flags = 0;
@@ -1632,7 +1679,7 @@ void Engine::renderFrame() {
         }
     }
 
-    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, m_config.spp, m_config.max_bounces, flags);
+    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
     uint32_t imageIndex = 0;
@@ -1677,6 +1724,19 @@ void Engine::renderFrame() {
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
+    VkCommandBuffer activeCmd = cmd;
+
+    size_t frameBytes = 0;
+    void* dstHost = nullptr;
+    uint32_t tileOffsetX_sec = 0;
+    uint32_t tileOffsetY_sec = 0;
+    uint32_t secAccumHistory = 1;
+    MultiGpuMode activeMode = m_config.mgpu_mode;
+    CameraUniform uboSec = ubo;
+    uint32_t useHwRT = 1;
+    uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
+    float envIntensity = 1.0f;
+    uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
     if (!isMgpu) {
         // --- Single GPU Execution Path ---
@@ -1700,11 +1760,6 @@ void Engine::renderFrame() {
         uint32_t qBase = m_currentFrame * 4;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
-
-        uint32_t useHwRT = 1;
-        uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-        float envIntensity = 1.0f;
-        uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
         // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
@@ -1743,42 +1798,42 @@ void Engine::renderFrame() {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.visualizeSplit = 0;
-        tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
+        tonemapConstants.totalSamples = m_accumulatedSamples;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else {
         // --- Multi-GPU Path (Checkerboard Tiling or Sample Parallelism) ---
-        uint32_t useHwRT = 1;
-        uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-        float envIntensity = 1.0f;
-        uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
+        useHwRT = 1;
+        hasEnvMap = m_environmentMap ? 1 : 0;
+        envIntensity = 1.0f;
+        envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
         uint32_t formatMode = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 0u : 1u;
         uint32_t bytesPerPixel = (formatMode == 0u) ? 8 : 16;
-        size_t frameBytes = 0;
-        void* dstHost = nullptr;
+        frameBytes = 0;
+        dstHost = nullptr;
         if (!m_mgpu->isZeroCopyActive()) {
             frameBytes = static_cast<size_t>(m_config.width) * m_config.height * bytesPerPixel;
             dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
         }
 
-        MultiGpuMode activeMode = m_config.mgpu_mode;
+        activeMode = m_config.mgpu_mode;
         if (activeMode == MultiGpuMode::Auto) {
             activeMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
         }
 
-        uint32_t tileOffsetX_sec = 2u;
-        uint32_t tileOffsetY_sec = 0u;
+        tileOffsetX_sec = 2u;
+        tileOffsetY_sec = 0u;
         uint32_t tileOffsetX_prim = 1u;
         uint32_t tileOffsetY_prim = 0u;
         uint32_t dispatchWidth = m_config.width;
         uint32_t dispatchHeight = (m_config.height + 1) / 2;
-        uint32_t secAccumHistory = 1u;
+        secAccumHistory = 1u;
         uint32_t mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
 
-        CameraUniform uboSec = ubo;
+        uboSec = ubo;
 
         if (activeMode == MultiGpuMode::InterleavedScanline) {
             mergeMode = 0u;
@@ -1809,8 +1864,13 @@ void Engine::renderFrame() {
             secAccumHistory = 0u; // Secondary only renders current frame's delta; Primary accumulates
 
             // Split SPP: e.g. spp = 2 -> prim: 1, sec: 1; spp = 4 -> prim: 2, sec: 2
-            uint32_t primSpp = (m_config.spp + 1) / 2;
-            uint32_t secSpp = m_config.spp / 2;
+            uint32_t currentTotalSpp = activeSpp;
+            uint32_t primSpp = (currentTotalSpp + 1) / 2;
+            uint32_t secSpp = currentTotalSpp / 2;
+            if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
+                primSpp = m_governor->getState().primSpp;
+                secSpp = m_governor->getState().secSpp;
+            }
             ubo.spp = primSpp;
             uboSec.spp = secSpp;
 
@@ -1828,15 +1888,14 @@ void Engine::renderFrame() {
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
-        // 1. Launch secondary GPU asynchronously
-        m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
-                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
+        // 1. Launch secondary GPU for Frame 0 (if not already pre-launched from previous frame)
+        if (m_totalFramesRendered == 0) {
+            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+                                       m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
+                                       hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
+        }
 
-        // 2. Concurrently record and execute primary GPU
-        vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &m_rtFence);
-
+        // 2. Concurrently record and execute primary GPU ray tracing asynchronously
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo rtBeginInfo{};
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1871,17 +1930,16 @@ void Engine::renderFrame() {
         rtSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         rtSubmit.commandBufferCount = 1;
         rtSubmit.pCommandBuffers = &cmd;
-        vkQueueSubmit(queue, 1, &rtSubmit, m_rtFence);
+        rtSubmit.signalSemaphoreCount = 1;
+        rtSubmit.pSignalSemaphores = &m_rtCompleteSemaphores[m_currentFrame];
+        vkQueueSubmit(queue, 1, &rtSubmit, VK_NULL_HANDLE);
 
-        // 3. Wait for primary GPU raytracing and secondary GPU completion + PCIe transfer
-        vkWaitForFences(device, 1, &m_rtFence, VK_TRUE, UINT64_MAX);
-        m_mgpu->syncAndTransfer(nullptr, 0);
-
-        // 4. Record Merge & Tonemapping commands on primary GPU
-        vkResetCommandBuffer(cmd, 0);
+        // 3. Concurrently record Merge & Tonemapping commands on primary GPU into postCmd
+        activeCmd = m_postCommandBuffers[m_currentFrame];
+        vkResetCommandBuffer(activeCmd, 0);
         VkCommandBufferBeginInfo postBeginInfo{};
         postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(cmd, &postBeginInfo);
+        vkBeginCommandBuffer(activeCmd, &postBeginInfo);
 
         // Barrier: Ensure primary RT writes to m_accumImage and secondary DMA host writes are visible before merge compute reads/writes
         VkMemoryBarrier2 rtToMergeBarrier{};
@@ -1895,18 +1953,18 @@ void Engine::renderFrame() {
         rtToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         rtToMergeDep.memoryBarrierCount = 1;
         rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
-        vkCmdPipelineBarrier2(cmd, &rtToMergeDep);
+        vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
         // Merge Pass
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
+        vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+        vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
         uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
-        vkCmdPushConstants(cmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
+        vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
         uint32_t mergeGroupsX = (m_config.width + 15) / 16;
         uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
-        vkCmdDispatch(cmd, mergeGroupsX, mergeGroupsY, 1);
+        vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
 
         VkMemoryBarrier2 mergeBarrier{};
         mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -1919,20 +1977,20 @@ void Engine::renderFrame() {
         mergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         mergeDep.memoryBarrierCount = 1;
         mergeDep.pMemoryBarriers = &mergeBarrier;
-        vkCmdPipelineBarrier2(cmd, &mergeDep);
+        vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
         // Tonemapping
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+        vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+        vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
 
         tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
         tonemapConstants.tileSize = (activeMode == MultiGpuMode::InterleavedScanline) ? 0u : m_config.tile_size;
-        tonemapConstants.totalSamples = (m_frameIndex + 1) * m_config.spp;
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
-        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        tonemapConstants.totalSamples = m_accumulatedSamples;
+        vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+        vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+        vkCmdDispatch(activeCmd, groupsX, groupsY, 1);
 
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
+        vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay
@@ -1942,7 +2000,7 @@ void Engine::renderFrame() {
 
         // Transition m_outputImage to TRANSFER_SRC_OPTIMAL
         m_outputImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            activeCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
@@ -1963,7 +2021,7 @@ void Engine::renderFrame() {
         depToDst.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depToDst.imageMemoryBarrierCount = 1;
         depToDst.pImageMemoryBarriers = &toDst;
-            vkCmdPipelineBarrier2(cmd, &depToDst);
+        vkCmdPipelineBarrier2(activeCmd, &depToDst);
 
         // Copy or blit output image to swapchain image
         bool extentsMatch = (m_config.width == m_swapchain->getExtent().width &&
@@ -1975,7 +2033,7 @@ void Engine::renderFrame() {
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.extent = { m_config.width, m_config.height, 1 };
-            vkCmdCopyImage(cmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vkCmdCopyImage(activeCmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
         } else {
             VkImageBlit blitRegion{};
@@ -1986,13 +2044,13 @@ void Engine::renderFrame() {
             blitRegion.dstOffsets[0] = { 0, 0, 0 };
             blitRegion.dstOffsets[1] = { static_cast<int32_t>(m_swapchain->getExtent().width), static_cast<int32_t>(m_swapchain->getExtent().height), 1 };
             VkFilter filter = extentsMatch ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-            vkCmdBlitImage(cmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vkCmdBlitImage(activeCmd, m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, filter);
         }
 
         // Transition m_outputImage back to GENERAL
         m_outputImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            activeCmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
         );
@@ -2013,7 +2071,7 @@ void Engine::renderFrame() {
         depToColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depToColor.imageMemoryBarrierCount = 1;
         depToColor.pImageMemoryBarriers = &toColor;
-        vkCmdPipelineBarrier2(cmd, &depToColor);
+        vkCmdPipelineBarrier2(activeCmd, &depToColor);
 
         // Render ImGui overlay
         if (m_gui) {
@@ -2021,7 +2079,7 @@ void Engine::renderFrame() {
             bool prevMode = m_cameraMode;
             MultiGpuMode prevMgpuMode = m_config.mgpu_mode;
             GuiActions guiActions{};
-            if (m_gui->render(cmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
+            if (m_gui->render(activeCmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
                               m_config, getStats(), m_cameraMode, m_camera.get(),
                               &m_window->getDisplayInfo(), m_window->isFullscreen(), &guiActions,
                               m_availableScenes, m_currentSceneIndex)) {
@@ -2087,7 +2145,7 @@ void Engine::renderFrame() {
             depToSrc.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToSrc.imageMemoryBarrierCount = 1;
             depToSrc.pImageMemoryBarriers = &toSrc;
-            vkCmdPipelineBarrier2(cmd, &depToSrc);
+            vkCmdPipelineBarrier2(activeCmd, &depToSrc);
 
             if (!m_uiDumpBuffer) {
                 VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * 4;
@@ -2099,7 +2157,7 @@ void Engine::renderFrame() {
             copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copyRegion.imageSubresource.layerCount = 1;
             copyRegion.imageExtent = { m_swapchain->getExtent().width, m_swapchain->getExtent().height, 1 };
-            vkCmdCopyImageToBuffer(cmd, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_uiDumpBuffer->getBuffer(), 1, &copyRegion);
+            vkCmdCopyImageToBuffer(activeCmd, swapImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_uiDumpBuffer->getBuffer(), 1, &copyRegion);
 
             VkImageMemoryBarrier2 toPresent{};
             toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -2116,7 +2174,7 @@ void Engine::renderFrame() {
             depToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToPresent.imageMemoryBarrierCount = 1;
             depToPresent.pImageMemoryBarriers = &toPresent;
-            vkCmdPipelineBarrier2(cmd, &depToPresent);
+            vkCmdPipelineBarrier2(activeCmd, &depToPresent);
         } else {
             VkImageMemoryBarrier2 toPresent{};
             toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -2133,28 +2191,63 @@ void Engine::renderFrame() {
             depToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             depToPresent.imageMemoryBarrierCount = 1;
             depToPresent.pImageMemoryBarriers = &toPresent;
-            vkCmdPipelineBarrier2(cmd, &depToPresent);
+            vkCmdPipelineBarrier2(activeCmd, &depToPresent);
         }
     }
 
-    vkEndCommandBuffer(cmd);
+    vkEndCommandBuffer(activeCmd);
+
+    // Wait for secondary GPU completion of slot and PCIe transfer (if MGPU)
+    if (isMgpu) {
+        uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
+        m_mgpu->syncAndTransfer(slot, dstHost, frameBytes);
+    }
 
     // Submit Work
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.pCommandBuffers = &activeCmd;
 
-    VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<VkPipelineStageFlags> waitStages;
+
+    if (isMgpu) {
+        waitSemaphores.push_back(m_rtCompleteSemaphores[m_currentFrame]);
+        waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        if (m_mgpu->isCrossGpuSyncActive()) {
+            uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
+            VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
+            if (secSem != VK_NULL_HANDLE) {
+                waitSemaphores.push_back(secSem);
+                waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            }
+        }
+    }
+
     if (!m_config.headless && m_swapchain) {
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &m_imageAvailableSemaphores[m_currentFrame];
-        submitInfo.pWaitDstStageMask = waitStages;
+        waitSemaphores.push_back(m_imageAvailableSemaphores[m_currentFrame]);
+        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
     }
 
+    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size());
+    submitInfo.pWaitSemaphores = waitSemaphores.data();
+    submitInfo.pWaitDstStageMask = waitStages.data();
+
     vkQueueSubmit(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
+
+    // Launch secondary GPU for NEXT frame to pipeline execution and prevent idle bubbles
+    if (isMgpu) {
+        uint32_t nextSlot = m_config.double_buffered_shared_mem ? ((m_currentFrame + 1) % 2) : 0;
+        CameraUniform nextUboSec = uboSec;
+        nextUboSec.frameIndex = m_frameIndex + 1 + (activeMode == MultiGpuMode::SampleParallel ? 1000003u : 0u);
+        m_mgpu->launchSecondaryWork(nextUboSec, nextSlot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
+                                   hasEnvMap, envIntensity, secAccumHistory, dstHost, frameBytes);
+    }
 
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
@@ -2178,6 +2271,11 @@ void Engine::renderFrame() {
         m_pendingResizeW = 0;
         m_pendingResizeH = 0;
         m_window->setWindowResolution(w, h);
+    }
+
+    // High-precision frame pacing if target FPS is set
+    if (m_governor && m_config.target_fps > 0) {
+        m_governor->paceFrame(m_currentFrameStartTime);
     }
 
     m_frameIndex++;
@@ -2390,6 +2488,16 @@ FrameStats Engine::getStats() const {
     stats.current_frame_time_ms = m_lastFrameTimeMs;
     stats.current_fps = m_lastFrameTimeMs > 0.0001 ? (1000.0 / m_lastFrameTimeMs) : 0.0;
 
+    stats.target_fps = m_config.target_fps;
+    stats.adaptive_spp = m_config.adaptive_spp;
+    if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
+        stats.dynamic_spp = m_governor->getState().currentSpp;
+        stats.dynamic_bounces = m_governor->getState().currentBounces;
+    } else {
+        stats.dynamic_spp = m_config.spp;
+        stats.dynamic_bounces = m_config.max_bounces;
+    }
+
     if (!m_frameTimesMs.empty()) {
         double sum = std::accumulate(m_frameTimesMs.begin(), m_frameTimesMs.end(), 0.0);
         stats.avg_frame_time_ms = sum / m_frameTimesMs.size();
@@ -2400,7 +2508,7 @@ FrameStats Engine::getStats() const {
 
         // Rays per second based on active throughput
         double frameTimeForThroughput = stats.current_frame_time_ms > 0.001 ? stats.current_frame_time_ms : stats.avg_frame_time_ms;
-        double raysPerFrame = static_cast<double>(m_config.width) * m_config.height * m_config.spp * m_config.max_bounces;
+        double raysPerFrame = static_cast<double>(m_config.width) * m_config.height * stats.dynamic_spp * stats.dynamic_bounces;
         stats.rays_per_second = (frameTimeForThroughput > 0.0) ? (raysPerFrame / (frameTimeForThroughput / 1000.0)) : 0.0;
     }
 

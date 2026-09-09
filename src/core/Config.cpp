@@ -103,6 +103,13 @@ void Config::printUsage(const char* progName) {
               << "  --no-restir-spatial     Disable ReSTIR spatial resampling (temporal only)\n"
               << "  --restir-spatial-samples <int>  ReSTIR spatial neighbor count (1..8, default: 3)\n"
               << "  --restir-spatial-radius <float> ReSTIR spatial search radius in pixels (default: 8.0)\n"
+               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
+              << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
+              << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
+              << "  --min-spp <int>         Minimum dynamic SPP floor (default: 1)\n"
+              << "  --max-spp <int>         Maximum dynamic SPP ceiling (default: 16)\n"
+              << "  --min-bounces <int>     Minimum dynamic bounce floor (default: 2)\n"
+              << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
@@ -244,6 +251,24 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;
+        } else if (arg == "--target-fps" && i + 1 < argc) {
+            cfg.target_fps = static_cast<uint32_t>(std::stoul(argv[++i]));
+            cfg.adaptive_spp = (cfg.target_fps > 0);
+        } else if (arg.starts_with("--target-fps=")) {
+            cfg.target_fps = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+            cfg.adaptive_spp = (cfg.target_fps > 0);
+        } else if (arg == "--adaptive-spp") {
+            cfg.adaptive_spp = true;
+        } else if (arg == "--no-adaptive-spp") {
+            cfg.adaptive_spp = false;
+        } else if (arg == "--min-spp" && i + 1 < argc) {
+            cfg.min_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--max-spp" && i + 1 < argc) {
+            cfg.max_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--min-bounces" && i + 1 < argc) {
+            cfg.min_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--max-dynamic-bounces" && i + 1 < argc) {
+            cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-validation") {
             cfg.validation_layers = false;
         } else if (arg == "--debug") {

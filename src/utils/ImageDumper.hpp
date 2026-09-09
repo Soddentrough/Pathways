@@ -87,6 +87,10 @@ struct FrameStats {
     float render_scale = 1.0f;
     uint32_t spp = 0;
     uint32_t max_bounces = 0;
+    uint32_t target_fps = 0;
+    bool adaptive_spp = false;
+    uint32_t dynamic_spp = 1;
+    uint32_t dynamic_bounces = 4;
     uint32_t checkerboard_tile_size = 64;
     bool enable_direct_light = true;
     bool enable_indirect_light = true;

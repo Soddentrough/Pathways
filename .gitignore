@@ -13,6 +13,7 @@ scratch/
 /*.png
 /*.exr
 /*.json
+/*.csv
 !CMakePresets.json
 CMakeUserPresets.json
 *.spv

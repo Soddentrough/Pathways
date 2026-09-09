@@ -205,6 +205,10 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)
         << std::format("    \"max_bounces\": {},\n", stats.max_bounces)
+        << std::format("    \"target_fps\": {},\n", stats.target_fps)
+        << std::format("    \"adaptive_spp\": {},\n", stats.adaptive_spp ? "true" : "false")
+        << std::format("    \"dynamic_spp\": {},\n", stats.dynamic_spp)
+        << std::format("    \"dynamic_bounces\": {},\n", stats.dynamic_bounces)
         << std::format("    \"checkerboard_tile_size\": {},\n", stats.checkerboard_tile_size)
         << "    \"shading\": {\n"
         << std::format("      \"direct_lighting\": {},\n", stats.enable_direct_light ? "true" : "false")

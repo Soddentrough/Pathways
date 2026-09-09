@@ -291,6 +291,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, "VK_EXT_external_memory_host") == 0) {
             m_hasExternalMemoryHost = true;
         }
+        if (std::strcmp(ext.extensionName, "VK_KHR_external_semaphore_fd") == 0) {
+            m_hasExternalSemaphoreFd = true;
+        }
     }
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
@@ -577,6 +580,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         deviceExtensions.push_back("VK_KHR_external_memory");
         deviceExtensions.push_back("VK_EXT_external_memory_host");
     }
+    if (m_hasExternalSemaphoreFd) {
+        deviceExtensions.push_back("VK_KHR_external_semaphore_fd");
+    }
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
     VkPhysicalDeviceVulkan14Features features14{};
@@ -661,6 +667,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 
     vkGetDeviceQueue(m_device, m_queueIndices.graphicsComputeFamily, 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueIndices.transferFamily, 0, &m_transferQueue);
+
+    if (m_hasExternalSemaphoreFd) {
+        pfnGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(m_device, "vkGetSemaphoreFdKHR");
+        pfnImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(m_device, "vkImportSemaphoreFdKHR");
+    }
 }
 
 void VulkanContext::initVMA() {
