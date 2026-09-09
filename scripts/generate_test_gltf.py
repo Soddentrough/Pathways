@@ -2,7 +2,6 @@
 """
 Pathways glTF Test Scene Generator
 Generates standard glTF 2.0 assets (with embedded base64 buffers) for automated test verification:
-- scenes/cornell_box.gltf: Cornell box with diffuse walls, metallic cube, dielectric glass sphere, and ceiling light.
 - scenes/test_shapes.gltf: Hierarchical scene with multiple node transforms, indexed meshes, and PBR materials.
 """
 
@@ -218,113 +217,6 @@ def make_quad(p0, p1, p2, p3, normal):
     return positions, normals, uvs, indices
 
 
-def create_cornell_box_gltf(output_path):
-    builder = GltfBuilder()
-
-    # Materials
-    mat_white = builder.add_material("WhiteWall", base_color=(0.75, 0.75, 0.75, 1.0), roughness=0.9)
-    mat_red = builder.add_material("RedWall", base_color=(0.75, 0.12, 0.12, 1.0), roughness=0.9)
-    mat_green = builder.add_material("GreenWall", base_color=(0.12, 0.75, 0.15, 1.0), roughness=0.9)
-    mat_light = builder.add_material("CeilingLight", base_color=(1.0, 1.0, 1.0, 1.0),
-                                     emissive=(1.0, 0.95, 0.8), emissive_strength=18.0)
-    mat_metal = builder.add_material("MetallicBox", base_color=(0.95, 0.85, 0.5, 1.0),
-                                     metallic=0.9, roughness=0.1)
-
-    # 1. Floor (White)
-    pos, norm, uv, idx = make_quad([-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [0, 1, 0])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_white)
-    m_floor = len(builder.meshes)
-    builder.meshes.append({"name": "Floor", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_Floor", "mesh": m_floor})
-
-    # 2. Ceiling (White)
-    pos, norm, uv, idx = make_quad([-1.0, 2.0, 1.0], [1.0, 2.0, 1.0], [1.0, 2.0, -1.0], [-1.0, 2.0, -1.0], [0, -1, 0])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_white)
-    m_ceil = len(builder.meshes)
-    builder.meshes.append({"name": "Ceiling", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_Ceiling", "mesh": m_ceil})
-
-    # 3. Back Wall (White)
-    pos, norm, uv, idx = make_quad([-1.0, 0.0, -1.0], [-1.0, 2.0, -1.0], [1.0, 2.0, -1.0], [1.0, 0.0, -1.0], [0, 0, 1])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_white)
-    m_back = len(builder.meshes)
-    builder.meshes.append({"name": "BackWall", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_BackWall", "mesh": m_back})
-
-    # 4. Left Wall (Red)
-    pos, norm, uv, idx = make_quad([-1.0, 0.0, 1.0], [-1.0, 0.0, -1.0], [-1.0, 2.0, -1.0], [-1.0, 2.0, 1.0], [1, 0, 0])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_red)
-    m_left = len(builder.meshes)
-    builder.meshes.append({"name": "LeftWall", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_LeftWall", "mesh": m_left})
-
-    # 5. Right Wall (Green)
-    pos, norm, uv, idx = make_quad([1.0, 0.0, -1.0], [1.0, 0.0, 1.0], [1.0, 2.0, 1.0], [1.0, 2.0, -1.0], [-1, 0, 0])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_green)
-    m_right = len(builder.meshes)
-    builder.meshes.append({"name": "RightWall", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_RightWall", "mesh": m_right})
-
-    # 6. Ceiling Light Quad (Emissive)
-    lw = 0.35
-    pos, norm, uv, idx = make_quad([-lw, 1.99, lw], [lw, 1.99, lw], [lw, 1.99, -lw], [-lw, 1.99, -lw], [0, -1, 0])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_light)
-    m_light = len(builder.meshes)
-    builder.meshes.append({"name": "CeilingLight", "primitives": [prim]})
-    builder.nodes.append({"name": "Node_CeilingLight", "mesh": m_light})
-
-    # 7. Tall Box inside room (Diffuse White)
-    pos, norm, uv, idx = make_box([-0.275, 0.0, -0.275], [0.275, 1.2, 0.275])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_white)
-    m_box1 = len(builder.meshes)
-    builder.meshes.append({"name": "TallBox", "primitives": [prim]})
-    rad = math.radians(22.0)
-    sin_half = math.sin(rad * 0.5)
-    cos_half = math.cos(rad * 0.5)
-    builder.nodes.append({
-        "name": "Node_TallBox",
-        "mesh": m_box1,
-        "translation": [0.35, 0.0, -0.3],
-        "rotation": [0.0, sin_half, 0.0, cos_half]
-    })
-
-    # 8. Short Metallic Box inside room
-    pos, norm, uv, idx = make_box([-0.3, 0.0, -0.3], [0.3, 0.6, 0.3])
-    prim = builder.add_mesh_primitive(pos, norm, uv, idx, mat_metal)
-    m_box2 = len(builder.meshes)
-    builder.meshes.append({"name": "ShortBox", "primitives": [prim]})
-    rad2 = math.radians(-18.0)
-    sin2 = math.sin(rad2 * 0.5)
-    cos2 = math.cos(rad2 * 0.5)
-    builder.nodes.append({
-        "name": "Node_ShortBox",
-        "mesh": m_box2,
-        "translation": [-0.35, 0.0, 0.3],
-        "rotation": [0.0, sin2, 0.0, cos2]
-    })
-
-    # Camera looking at Cornell Box center
-    builder.cameras.append({
-        "name": "MainCamera",
-        "type": "perspective",
-        "perspective": {
-            "yfov": math.radians(45.0),
-            "znear": 0.1,
-            "zfar": 100.0
-        }
-    })
-    builder.nodes.append({
-        "name": "Node_Camera",
-        "camera": 0,
-        "translation": [0.0, 1.0, 2.7]
-    })
-
-    gltf_json = builder.build_json()
-    with open(output_path, 'w') as f:
-        json.dump(gltf_json, f, indent=2)
-    print(f"Generated Cornell Box glTF: {output_path} ({len(builder.meshes)} meshes, {len(builder.nodes)} nodes)")
-
-
 def create_test_shapes_gltf(output_path):
     builder = GltfBuilder()
 
@@ -369,5 +261,4 @@ def create_test_shapes_gltf(output_path):
 
 if __name__ == "__main__":
     os.makedirs("scenes", exist_ok=True)
-    create_cornell_box_gltf("scenes/cornell_box.gltf")
     create_test_shapes_gltf("scenes/test_shapes.gltf")

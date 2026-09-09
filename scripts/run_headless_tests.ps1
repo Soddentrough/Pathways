@@ -108,20 +108,20 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n[5/6] Generating glTF scene test files..." -ForegroundColor Cyan
 & $Python scripts/generate_test_gltf.py
 
-Write-Host "Running glTF Cornell Box scene test..." -ForegroundColor Cyan
+Write-Host "Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
     --height 1080 `
     --spp 16 `
     --max-bounces 4 `
-    --scene scenes/cornell_box.gltf `
-    --dump-frame (Join-Path $OutputDir "test_gltf_cornell.png") `
-    --dump-stats (Join-Path $OutputDir "stats_gltf_cornell.json")
+    --scene scenes/DamagedHelmet.glb `
+    --dump-frame (Join-Path $OutputDir "test_gltf_helmet.png") `
+    --dump-stats (Join-Path $OutputDir "stats_gltf_helmet.json")
 
-& $Python scripts/verify_frame.py (Join-Path $OutputDir "test_gltf_cornell.png") (Join-Path $OutputDir "stats_gltf_cornell.json") 1920 1080 45.0
+& $Python scripts/verify_frame.py (Join-Path $OutputDir "test_gltf_helmet.png") (Join-Path $OutputDir "stats_gltf_helmet.json") 1920 1080 45.0
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "glTF Cornell Box verification failed!"
+    Write-Error "glTF Damaged Helmet verification failed!"
     exit $LASTEXITCODE
 }
 

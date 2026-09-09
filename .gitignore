@@ -30,8 +30,6 @@ scenes/ripples_normal.png
 scenes/*/
 
 # Re-include Tier 1 shipped research scenes
-!scenes/cornell-box/
-!scenes/cornell-box/**
 !scenes/veach-mis/
 !scenes/veach-mis/**
 !scenes/veach-bidir/

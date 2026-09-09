@@ -25,9 +25,6 @@ int main(int argc, char* argv[]) {
 
         if (config.test_scene_switching) {
             config.headless = true;
-            if (config.scene_path.empty()) {
-                config.scene_path = "scenes/cornell-box/cornell_box_extended.glb";
-            }
             pathways::Engine engine(config);
             const auto& scenes = engine.getAvailableScenes();
             if (scenes.empty()) {

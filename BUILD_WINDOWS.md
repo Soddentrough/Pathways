@@ -129,5 +129,5 @@ This runs:
 2. Camera & FPS navigation unit tests
 3. 1080p 16 SPP path tracing quality verification
 4. 4K native real-time benchmark (<8ms frame budget target)
-5. glTF scene ingestion tests (`cornell_box.gltf` and `test_shapes.gltf`)
+5. glTF scene ingestion tests (`DamagedHelmet.glb` and `test_shapes.gltf`)
 6. Frame integrity and radiance verification via PIL analysis

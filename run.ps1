@@ -5,7 +5,7 @@
     Compiler toolchain: "clang", "gcc", or "auto" (default, detects existing build).
 .EXAMPLE
     .\run.ps1
-    .\run.ps1 -Scene scenes/cornell_box.gltf
+    .\run.ps1 -Scene scenes/DamagedHelmet.glb
     .\run.ps1 -Toolchain gcc
 #>
 param(

@@ -13,8 +13,8 @@ import time
 
 SCENES = [
     {
-        "name": "Cornell Box (Reference)",
-        "path": "scenes/cornell_box.gltf"
+        "name": "Cornell Box (Procedural)",
+        "path": ""
     },
     {
         "name": "Classroom (Interior Arch)",
@@ -48,7 +48,6 @@ def run_bench(scene_path, width, height, spp, mgpu_mode, frames, output_json):
     cmd = [
         "./build/bin/pathways",
         "--headless",
-        "--scene", scene_path,
         "--width", str(width),
         "--height", str(height),
         "--spp", str(spp),
@@ -58,6 +57,8 @@ def run_bench(scene_path, width, height, spp, mgpu_mode, frames, output_json):
         "--no-accumulation",
         "--dump-stats", output_json
     ]
+    if scene_path:
+        cmd += ["--scene", scene_path]
     if mgpu_mode == "off":
         cmd += ["--mgpu-mode", "off"]
     elif mgpu_mode == "interleaved":

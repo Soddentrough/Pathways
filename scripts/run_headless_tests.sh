@@ -139,7 +139,7 @@ python3 scripts/verify_scaling.py output/stats_scaling_single.json output/stats_
 
 # 7. Test Suite 5: glTF 2.0 Ingestion Pipeline & Auto-Framing Verification
 echo ""
-echo "[6/6] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Cornell & Shapes)..."
+echo "[6/6] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Damaged Helmet & Shapes)..."
 python3 scripts/generate_test_gltf.py
 
 ./build/bin/pathways \
@@ -148,11 +148,11 @@ python3 scripts/generate_test_gltf.py
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --scene scenes/cornell_box.gltf \
-    --dump-frame output/test_gltf_cornell.png \
-    --dump-stats output/stats_gltf_cornell.json
+    --scene scenes/DamagedHelmet.glb \
+    --dump-frame output/test_gltf_helmet.png \
+    --dump-stats output/stats_gltf_helmet.json
 
-python3 scripts/verify_frame.py output/test_gltf_cornell.png output/stats_gltf_cornell.json 1920 1080 45.0
+python3 scripts/verify_frame.py output/test_gltf_helmet.png output/stats_gltf_helmet.json 1920 1080 45.0
 
 ./build/bin/pathways \
     --headless \
