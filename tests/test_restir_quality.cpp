@@ -8,7 +8,20 @@
 #include <thread>
 #include <cstddef>
 
+#if defined(__x86_64__) || defined(_M_X64)
+    #include <immintrin.h>
+#endif
+
 using namespace pathways;
+
+static void simulateWork(std::chrono::milliseconds ms) {
+    auto start = std::chrono::high_resolution_clock::now();
+    while (std::chrono::high_resolution_clock::now() - start < ms) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#endif
+    }
+}
 
 static void assert_near(float a, float b, float eps = 0.01f, const char* msg = "") {
     if (std::abs(a - b) > eps) {
@@ -98,7 +111,7 @@ static void test_quality_governor_pacing() {
 
     auto t0 = std::chrono::high_resolution_clock::now();
     // Simulate some work taking 4 ms
-    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    simulateWork(std::chrono::milliseconds(4));
     gov.paceFrame(t0);
     auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -114,7 +127,7 @@ static void test_quality_governor_pacing() {
     gov.init(config120);
 
     t0 = std::chrono::high_resolution_clock::now();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    simulateWork(std::chrono::milliseconds(2));
     gov.paceFrame(t0);
     t1 = std::chrono::high_resolution_clock::now();
 

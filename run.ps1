@@ -47,4 +47,8 @@ if (-not (Test-Path $exe)) {
 }
 
 Write-Host "[INFO] Launching Pathways ($exe)..." -ForegroundColor Green
-Start-Process -FilePath $exe -ArgumentList $EngineArgs -WorkingDirectory $PSScriptRoot
+if ($EngineArgs -and $EngineArgs.Count -gt 0) {
+    Start-Process -FilePath $exe -ArgumentList $EngineArgs -WorkingDirectory $PSScriptRoot
+} else {
+    Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot
+}

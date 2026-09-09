@@ -187,12 +187,7 @@ if ($Run) {
     }
 
     if ($EngineArgs) {
-        $argList = @()
-        $tokens = [System.Management.Automation.Language.Parser]::Tokenize("fake_cmd $EngineArgs", [ref]$null, [ref]$null) |
-                  Where-Object { $_.Kind -ne 'EndOfInput' }
-        for ($i = 1; $i -lt $tokens.Count; $i++) {
-            $argList += $tokens[$i].Text.Trim('"', "'")
-        }
+        $argList = ($EngineArgs -split '\s+') | Where-Object { $_ -ne "" }
         & $PathwaysExe @argList
     } else {
         & $PathwaysExe

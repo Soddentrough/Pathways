@@ -6,7 +6,30 @@
     #include <immintrin.h>
 #endif
 
+#if defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+
+    static void highPrecisionSleep(std::chrono::nanoseconds duration) {
+        if (duration <= std::chrono::nanoseconds::zero()) return;
+        static HANDLE hTimer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+        if (hTimer) {
+            LARGE_INTEGER dueTime;
+            dueTime.QuadPart = -(duration.count() / 100);
+            if (SetWaitableTimer(hTimer, &dueTime, 0, NULL, NULL, FALSE)) {
+                WaitForSingleObject(hTimer, INFINITE);
+                return;
+            }
+        }
+        std::this_thread::sleep_for(duration);
+    }
+#endif
+
 namespace pathways {
+
+QualityGovernor::~QualityGovernor() = default;
 
 QualityGovernor::QualityGovernor(const GovernorConfig& config) {
     init(config);
@@ -175,7 +198,11 @@ void QualityGovernor::paceFrame(std::chrono::high_resolution_clock::time_point f
         auto remaining = deadline - now;
         // Sleep for the coarse duration (leaving 250 microseconds for precision spinning)
         if (remaining > std::chrono::microseconds(350)) {
+#if defined(_WIN32)
+            highPrecisionSleep(remaining - std::chrono::microseconds(250));
+#else
             std::this_thread::sleep_for(remaining - std::chrono::microseconds(250));
+#endif
         }
 
         // High-precision spin-lock tail

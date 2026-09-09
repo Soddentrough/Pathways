@@ -35,6 +35,7 @@ struct GovernorState {
 class QualityGovernor {
 public:
     QualityGovernor() = default;
+    ~QualityGovernor();
     explicit QualityGovernor(const GovernorConfig& config);
 
     void init(const GovernorConfig& config);

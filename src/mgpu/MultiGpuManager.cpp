@@ -13,11 +13,23 @@
     #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
+    #include <malloc.h>
+    #include <io.h>
 #else
     #include <unistd.h>
 #endif
 
 namespace pathways {
+
+static inline void closeFileDescriptor(int fd) {
+    if (fd >= 0) {
+#if defined(_WIN32)
+        _close(fd);
+#else
+        ::close(fd);
+#endif
+    }
+}
 
 static void parallelMemcpy(void* dst, const void* src, size_t size, size_t numThreads = 8) {
     if (!dst || !src || size == 0 || dst == src) return;
@@ -239,7 +251,11 @@ void MultiGpuManager::destroySharedHostBuffer() {
             }
         }
         if (m_sharedHostPtr[slot]) {
+#if defined(_WIN32)
+            _aligned_free(m_sharedHostPtr[slot]);
+#else
             free(m_sharedHostPtr[slot]);
+#endif
             m_sharedHostPtr[slot] = nullptr;
         }
     }
@@ -280,11 +296,20 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 
     bool allSucceeded = true;
     for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
+#if defined(_WIN32)
+        m_sharedHostPtr[slot] = _aligned_malloc(m_sharedBufferSize, hostAlignment);
+        if (!m_sharedHostPtr[slot]) {
+            Logger::warn("Failed to allocate page-aligned host memory for slot {}.", slot);
+            allSucceeded = false;
+            break;
+        }
+#else
         if (posix_memalign(&m_sharedHostPtr[slot], hostAlignment, m_sharedBufferSize) != 0 || !m_sharedHostPtr[slot]) {
             Logger::warn("Failed to allocate page-aligned host memory for slot {}.", slot);
             allSucceeded = false;
             break;
         }
+#endif
         std::memset(m_sharedHostPtr[slot], 0, m_sharedBufferSize);
 
         VkMemoryHostPointerPropertiesEXT hostProps0{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -1574,7 +1599,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_slotSubmitted[slot] = false;
         if (m_useCrossGpuSync && !m_devices.empty()) {
             if (m_devices[0]->exportedFd[slot] >= 0) {
-                ::close(m_devices[0]->exportedFd[slot]);
+                closeFileDescriptor(m_devices[0]->exportedFd[slot]);
                 m_devices[0]->exportedFd[slot] = -1;
             }
             m_devices[0]->slotFdReady[slot] = false;
@@ -1837,7 +1862,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             node->slotHasExecuted[slot] = false;
             node->slotFdReady[slot] = false;
             if (node->exportedFd[slot] >= 0) {
-                ::close(node->exportedFd[slot]);
+                closeFileDescriptor(node->exportedFd[slot]);
                 node->exportedFd[slot] = -1;
             }
         }
