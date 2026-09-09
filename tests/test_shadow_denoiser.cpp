@@ -36,15 +36,16 @@ int main() {
         assert_near(configDefault.shadow_denoiser_depth_sigma, 0.02f, 0.0001f, "Default depth sigma");
         assert_near(configDefault.shadow_denoiser_normal_power, 16.0f, 0.0001f, "Default normal power");
 
+        // Deprecated legacy flags should be safely accepted without crashing
         const char* argv1[] = { "pathways", "--shadow-denoiser" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
-        check_true(c1.enable_shadow_denoiser, "--shadow-denoiser enabled");
+        check_true(!c1.enable_shadow_denoiser, "Deprecated --shadow-denoiser remains disabled");
 
         const char* argv2[] = { "pathways", "--denoise-shadows" };
         Config c2 = Config::parse(2, const_cast<char**>(argv2));
-        check_true(c2.enable_shadow_denoiser, "--denoise-shadows alias enabled");
+        check_true(!c2.enable_shadow_denoiser, "Deprecated --denoise-shadows remains disabled");
 
-        std::cout << "  -> CLI flags and defaults successfully verified." << std::endl;
+        std::cout << "  -> CLI flags and deprecations successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

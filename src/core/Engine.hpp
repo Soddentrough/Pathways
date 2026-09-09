@@ -196,6 +196,22 @@ private:
     void updateTaaDescriptors();
     double m_lastTaaTimeMs = 0.0;
 
+    // A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
+    std::unique_ptr<Image> m_atrousPingPong[2];
+    VkDescriptorSetLayout m_atrousDescLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 3> m_atrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDescriptorSet, 2> m_tonemapAtrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout m_atrousPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_atrousPipeline = VK_NULL_HANDLE;
+
+    void createAtrousPipelines();
+    void createAtrousResources();
+    void destroyAtrousResources();
+    void destroyAtrousPipelines();
+    void updateAtrousDescriptors();
+    uint32_t dispatchAtrous(VkCommandBuffer cmd);
+    double m_lastAtrousTimeMs = 0.0;
+
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";

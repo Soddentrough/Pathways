@@ -565,6 +565,12 @@ void main() {
         if (mat.type == 3u /* Emissive */) {
             bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
             bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
+            if (isPrimary) {
+                int currentPx = int(prd.pad % pc.tileWidth);
+                int currentPy = int(prd.pad / pc.tileWidth);
+                ivec2 baseCoord = ivec2(currentPx, currentPy);
+                imageStore(uNormalDepthImage, baseCoord, vec4(geomNormal, length(hitPoint - ubo.position.xyz)));
+            }
             if (enableReSTIR && isPrimary) {
                 ReservoirDI emptyR;
                 emptyR.lightIdx = 0u;
@@ -1039,6 +1045,12 @@ void main() {
                 nextDirection = refract(unitDir, hitNormal, refractionRatio);
                 prd.nextOrigin = hitPoint - hitNormal * EPSILON;
             }
+            if (isPrimary) {
+                int currentPx = int(prd.pad % pc.tileWidth);
+                int currentPy = int(prd.pad / pc.tileWidth);
+                ivec2 baseCoord = ivec2(currentPx, currentPy);
+                imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+            }
             prd.radiance = accumRadiance;
             prd.packedThroughputRG = packHalf2x16(baseColor.rg);
             uint flags = 1u | 2u; // hit = true, isDelta = true
@@ -1099,6 +1111,13 @@ void main() {
             float Fc = fresnelSchlick(VdotH_diff, 1.5) * clearcoat;
             throughputFactor = (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
         }
+    }
+
+    if (isPrimary) {
+        int currentPx = int(prd.pad % pc.tileWidth);
+        int currentPy = int(prd.pad / pc.tileWidth);
+        ivec2 baseCoord = ivec2(currentPx, currentPy);
+        imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
     }
 
     prd.radiance = accumRadiance;

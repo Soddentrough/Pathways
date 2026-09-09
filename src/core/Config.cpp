@@ -98,16 +98,9 @@ void Config::printUsage(const char* progName) {
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
-              << "  --shadow-denoiser, --denoise-shadows Enable AMD FidelityFX Shadow Denoiser (default: disabled)\n"
-              << "  --taa                   Enable Temporal Anti-Aliasing (TAA) (default: disabled)\n"
-              << "  --no-taa                Disable Temporal Anti-Aliasing (TAA)\n"
-              << "  --taa-alpha <float>     TAA temporal blend alpha (default: 0.10)\n"
-              << "  --taa-gamma <float>     TAA variance clipping gamma (default: 1.25)\n"
-              << "  --restir-di, --restir   Enable ReSTIR Direct Illumination reservoir resampling\n"
-              << "  --restir-spatial        Enable ReSTIR spatial resampling [default: true when ReSTIR DI enabled]\n"
-              << "  --no-restir-spatial     Disable ReSTIR spatial resampling (temporal only)\n"
-              << "  --restir-spatial-samples <int>  ReSTIR spatial neighbor count (1..8, default: 3)\n"
-              << "  --restir-spatial-radius <float> ReSTIR spatial search radius in pixels (default: 8.0)\n"
+              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
+              << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
+              << "  --atrous-passes <int>   Number of A-Trous filter iterations (1..5, default: 3)\n"
                << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
               << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
@@ -212,15 +205,21 @@ Config Config::parse(int argc, char* argv[]) {
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--shadow-denoiser" || arg == "--denoise-shadows") {
-            cfg.enable_shadow_denoiser = true;
-        } else if (arg == "--taa") {
-            cfg.enable_taa = true;
-        } else if (arg == "--no-taa") {
-            cfg.enable_taa = false;
+            Logger::info("FidelityFX Shadow Denoiser option is deprecated and has been removed from the active pipeline.");
+        } else if (arg == "--taa" || arg == "--no-taa") {
+            Logger::info("TAA option is deprecated and has been removed from the active pipeline.");
         } else if (arg == "--taa-alpha" && i + 1 < argc) {
-            cfg.taa_blend_alpha = std::stof(argv[++i]);
+            ++i;
         } else if (arg == "--taa-gamma" && i + 1 < argc) {
-            cfg.taa_clipping_gamma = std::stof(argv[++i]);
+            ++i;
+        } else if (arg == "--atrous") {
+            cfg.enable_atrous = true;
+        } else if (arg == "--no-atrous") {
+            cfg.enable_atrous = false;
+        } else if (arg == "--atrous-passes" && i + 1 < argc) {
+            cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 5));
+        } else if (arg.starts_with("--atrous-passes=")) {
+            cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(arg.substr(arg.find('=') + 1)), 1, 5));
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {
@@ -254,22 +253,13 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
-        } else if (arg == "--restir-di" || arg == "--restir") {
-            cfg.enable_restir_di = true;
-        } else if (arg == "--no-restir-di" || arg == "--no-restir") {
-            cfg.enable_restir_di = false;
-        } else if (arg == "--restir-spatial") {
-            cfg.enable_restir_spatial = true;
-        } else if (arg == "--no-restir-spatial") {
-            cfg.enable_restir_spatial = false;
-        } else if (arg == "--restir-spatial-samples" && i + 1 < argc) {
-            cfg.restir_spatial_samples = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 8));
-        } else if (arg.starts_with("--restir-spatial-samples=")) {
-            cfg.restir_spatial_samples = static_cast<uint32_t>(std::clamp(std::stoi(arg.substr(arg.find('=') + 1)), 1, 8));
-        } else if (arg == "--restir-spatial-radius" && i + 1 < argc) {
-            cfg.restir_spatial_radius = std::clamp(std::stof(argv[++i]), 1.0f, 64.0f);
-        } else if (arg.starts_with("--restir-spatial-radius=")) {
-            cfg.restir_spatial_radius = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 1.0f, 64.0f);
+        } else if (arg == "--restir-di" || arg == "--restir" || arg == "--no-restir-di" || arg == "--no-restir" ||
+                   arg == "--restir-spatial" || arg == "--no-restir-spatial") {
+            Logger::info("ReSTIR DI option is deprecated and has been removed from the active pipeline.");
+        } else if ((arg == "--restir-spatial-samples" || arg == "--restir-spatial-radius") && i + 1 < argc) {
+            ++i;
+        } else if (arg.starts_with("--restir-spatial-samples=") || arg.starts_with("--restir-spatial-radius=")) {
+            // Ignored deprecated flag
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;

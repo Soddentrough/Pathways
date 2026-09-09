@@ -448,9 +448,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
-            if (config.enable_taa) {
-                ImGui::Text("Anti-Aliasing: TAA Active (alpha=%.2f, gamma=%.2f)", config.taa_blend_alpha, config.taa_clipping_gamma);
-            } else if (config.progressive_accumulation) {
+            if (config.enable_atrous) {
+                ImGui::Text("Denoising:    A-Trous Wavelet (%u Passes)", config.atrous_passes);
+            } else {
+                ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
+            }
+            if (config.progressive_accumulation) {
                 ImGui::Text("Accumulation: Frame %u (%u samples accumulated)", stats.total_frames, stats.total_frames * config.spp);
             } else {
                 ImGui::Text("Accumulation: Disabled (Real-Time 1 SPP)");
@@ -602,6 +605,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
                             ImGui::TableNextRow();
                             ImGui::TableNextColumn();
+                            ImGui::PushID(i);
                             bool isSelected = (currentSceneIndex == i);
                             if (ImGui::Selectable(sc.label.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
                                 if (i != currentSceneIndex && actions) {
@@ -626,6 +630,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                             (sc.group == "Research") ? ImVec4(0.38f, 0.72f, 1.0f, 1.0f) :
                                             (sc.group == "Procedural") ? ImVec4(0.85f, 0.55f, 1.0f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
                             ImGui::TextColored(grpCol, "%s", sc.group.c_str());
+                            ImGui::PopID();
                         }
                         ImGui::EndTable();
                     }
@@ -1066,24 +1071,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("Direct Lighting (Area Lights)", &config.enable_direct_light)) {
                 settingsChanged = true;
             }
-            if (ImGui::Checkbox("ReSTIR DI (Reservoir Resampling)", &config.enable_restir_di)) {
-                settingsChanged = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatiotemporal Reservoir Resampling for Direct Illumination (1 shadow ray/pixel with M=4 candidates).");
-            }
-            if (config.enable_restir_di) {
-                ImGui::Indent();
-                int samples = static_cast<int>(config.restir_spatial_samples);
-                if (ImGui::SliderInt("Spatial Neighbors", &samples, 1, 8)) {
-                    config.restir_spatial_samples = static_cast<uint32_t>(samples);
-                    settingsChanged = true;
-                }
-                if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 2.0f, 64.0f, "%.1f px")) {
-                    settingsChanged = true;
-                }
-                ImGui::Unindent();
-            }
             if (ImGui::Checkbox("Indirect Diffuse GI", &config.enable_indirect_light)) {
                 settingsChanged = true;
             }
@@ -1097,62 +1084,40 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 5. Post-Processing & Tonemapping
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::Checkbox("FidelityFX Shadow Denoiser", &config.enable_shadow_denoiser)) {
-                settingsChanged = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("AMD FidelityFX Spatio-Temporal Cross-Bilateral Shadow Denoiser with 8x8 Tile Classification.");
-            }
-            if (config.enable_shadow_denoiser) {
-                ImGui::Indent();
-                if (ImGui::SliderFloat("Depth Tolerance", &config.shadow_denoiser_depth_sigma, 0.005f, 0.100f, "%.3f")) {
-                    settingsChanged = true;
-                }
-                if (ImGui::SliderFloat("Normal Sharpness", &config.shadow_denoiser_normal_power, 4.0f, 64.0f, "%.1f")) {
-                    settingsChanged = true;
-                }
-                ImGui::Unindent();
-            }
-            if (ImGui::Checkbox("Temporal Anti-Aliasing (TAA)", &config.enable_taa)) {
+            if (ImGui::Checkbox("A-Trous Diffuse Denoiser", &config.enable_atrous)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Screen-space motion vector reprojection with YCoCg variance clipping and distributed tile-parallel support.");
+                ImGui::SetTooltip("Hierarchical edge-avoiding A-Trous wavelet filter with normal and depth edge-stopping functions.");
             }
-            if (!config.enable_taa) {
-                if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time noise.");
-                }
-            } else {
-                ImGui::BeginDisabled();
-                bool progDummy = false;
-                ImGui::Checkbox("Progressive Accumulation (Replaced by TAA)", &progDummy);
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("Progressive accumulation is bypassed while TAA temporal exponential averaging is active.");
-                }
-            }
-            if (config.enable_taa) {
+            if (config.enable_atrous) {
                 ImGui::Indent();
-                if (ImGui::SliderFloat("TAA Alpha", &config.taa_blend_alpha, 0.01f, 0.50f, "%.2f")) {
-                    // blend alpha
+                int passes = static_cast<int>(config.atrous_passes);
+                if (ImGui::SliderInt("Filter Passes", &passes, 1, 5)) {
+                    config.atrous_passes = static_cast<uint32_t>(passes);
+                    settingsChanged = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Weight of current frame sample vs. temporal history (lower = smoother, higher = sharper/more responsive).");
+                    ImGui::SetTooltip("Number of dyadic wavelet iterations (step sizes 2^k). 3 passes covers 17x17 px, 4 passes covers 33x33 px.");
                 }
-                if (ImGui::SliderFloat("Clipping Gamma", &config.taa_clipping_gamma, 0.50f, 3.00f, "%.2f")) {
-                    // variance clipping gamma
+                if (ImGui::SliderFloat("Normal Sensitivity", &config.atrous_normal_power, 4.0f, 64.0f, "%.1f")) {
+                    settingsChanged = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Variance bounding box multiplier for clamping history in YCoCg space.");
+                    ImGui::SetTooltip("Exponent for normal similarity weighting (higher = sharper normal edge preservation).");
                 }
                 ImGui::Unindent();
             }
+
+            if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time 1-SPP noise.");
+            }
+
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation
             }

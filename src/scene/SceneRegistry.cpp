@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <unordered_map>
 #include <cctype>
 #include <cstdio>
 
@@ -165,13 +166,23 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             if (!fs::exists(extGlb)) extGlb = item.path() / (underscoreDir + "_extended.glb");
             if (!fs::exists(coreGlb)) coreGlb = item.path() / (underscoreDir + "_core.glb");
 
-            if (fs::exists(extGlb)) {
+            bool hasExt = fs::exists(extGlb);
+            bool hasCore = fs::exists(coreGlb);
+
+            if (hasExt && hasCore) {
                 SceneEntry e{ dirTitle + " (Extended)", extGlb.string(), "Research" };
                 populateSceneMetadata(e);
                 fileEntries.push_back(e);
-            }
-            if (fs::exists(coreGlb)) {
-                SceneEntry e{ dirTitle + " (Core)", coreGlb.string(), "Research" };
+
+                SceneEntry c{ dirTitle + " (Core)", coreGlb.string(), "Research" };
+                populateSceneMetadata(c);
+                fileEntries.push_back(c);
+            } else if (hasExt) {
+                SceneEntry e{ dirTitle, extGlb.string(), "Research" };
+                populateSceneMetadata(e);
+                fileEntries.push_back(e);
+            } else if (hasCore) {
+                SceneEntry e{ dirTitle, coreGlb.string(), "Research" };
                 populateSceneMetadata(e);
                 fileEntries.push_back(e);
             }
@@ -209,6 +220,17 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     });
 
     entries.insert(entries.end(), fileEntries.begin(), fileEntries.end());
+
+    // Disambiguate any duplicate scene labels across groups (e.g. Cornell Box Showcase vs Research)
+    std::unordered_map<std::string, int> labelCounts;
+    for (const auto& e : entries) {
+        labelCounts[e.label]++;
+    }
+    for (auto& e : entries) {
+        if (labelCounts[e.label] > 1) {
+            e.label += " (" + e.group + ")";
+        }
+    }
 
     Logger::info("SceneRegistry: Discovered and indexed {} scene(s) in '{}'.", entries.size(), scenesDir);
     return entries;

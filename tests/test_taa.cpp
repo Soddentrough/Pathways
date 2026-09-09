@@ -43,30 +43,32 @@ int main() {
     std::cout << "==========================================================" << std::endl;
 
     // -------------------------------------------------------------------------
-    // 1. Test CLI Config Parsing
+    // 1. Test CLI Config Parsing & A-Trous / Deprecated Flags
     // -------------------------------------------------------------------------
     {
         std::cout << "[TEST 1] Command-Line Configuration & Flag Parsing..." << std::endl;
         Config configDefault;
         check_true(!configDefault.enable_taa, "Default TAA is off");
-        assert_near(configDefault.taa_blend_alpha, 0.10f, 0.0001f, "Default blend alpha");
-        assert_near(configDefault.taa_clipping_gamma, 2.25f, 0.0001f, "Default clipping gamma");
+        check_true(!configDefault.enable_atrous, "Default A-Trous is off");
+        check_true(configDefault.atrous_passes == 3, "Default A-Trous passes = 3");
 
-        const char* argv1[] = { "pathways", "--taa" };
+        const char* argv1[] = { "pathways", "--atrous" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
-        check_true(c1.enable_taa, "--taa enabled");
+        check_true(c1.enable_atrous, "--atrous enables");
 
-        const char* argv2[] = { "pathways", "--taa", "--no-taa" };
-        Config c2 = Config::parse(3, const_cast<char**>(argv2));
-        check_true(!c2.enable_taa, "--no-taa disables");
+        const char* argv2[] = { "pathways", "--atrous", "--atrous-passes", "4" };
+        Config c2 = Config::parse(4, const_cast<char**>(argv2));
+        check_true(c2.enable_atrous, "--atrous enabled");
+        check_true(c2.atrous_passes == 4, "--atrous-passes sets count");
 
-        const char* argv3[] = { "pathways", "--taa", "--taa-alpha", "0.18", "--taa-gamma", "1.75" };
-        Config c3 = Config::parse(6, const_cast<char**>(argv3));
-        check_true(c3.enable_taa, "--taa enabled");
-        assert_near(c3.taa_blend_alpha, 0.18f, 0.0001f, "Custom blend alpha");
-        assert_near(c3.taa_clipping_gamma, 1.75f, 0.0001f, "Custom clipping gamma");
+        // Deprecated legacy flags should be safely accepted without crashing
+        const char* argv3[] = { "pathways", "--taa", "--restir-di", "--shadow-denoiser" };
+        Config c3 = Config::parse(4, const_cast<char**>(argv3));
+        check_true(!c3.enable_taa, "Deprecated TAA remains disabled");
+        check_true(!c3.enable_restir_di, "Deprecated ReSTIR remains disabled");
+        check_true(!c3.enable_shadow_denoiser, "Deprecated Shadow Denoiser remains disabled");
 
-        std::cout << "  -> CLI flags and defaults successfully verified." << std::endl;
+        std::cout << "  -> CLI flags, A-Trous configuration, and deprecations successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

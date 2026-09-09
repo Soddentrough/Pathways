@@ -123,10 +123,8 @@ void main() {
     if (enableShadowDenoiser) {
         imageStore(uDirectLightImage, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
     }
-    if (enableShadowDenoiser || enableTaa) {
-        ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
-        imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, 0.0));
-    }
+    ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+    imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 0.0, 10000.0));
 
     // Spatiotemporal Blue Noise lookup (64x64 texture with wrapping)
     vec4 bn = texelFetch(uBlueNoiseTexture, ivec2(pixelCoord.x & 63, pixelCoord.y & 63), 0);

@@ -1,0 +1,94 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Bindings
+layout(binding = 0) readonly uniform image2D uInputRadiance;
+layout(binding = 1, rgba16f) readonly uniform image2D uNormalDepth;
+layout(binding = 2) writeonly uniform image2D uOutputRadiance;
+
+layout(push_constant) uniform PushConstants {
+    int imageWidth;
+    int imageHeight;
+    int stepSize;          // 1, 2, 4, 8, etc. (2^k)
+    float normalPower;     // Normal edge-stopping exponent (e.g. 32.0)
+    float depthSigma;      // Depth edge-stopping sensitivity (e.g. 0.03)
+    float colorPhi;        // Luminance edge-stopping factor (e.g. 4.0)
+    uint totalSamples;     // Sample count if static accumulation is active
+    uint isFirstPass;      // 1 if reading raw accumulated buffer, 0 if reading intermediate ping-pong
+} pc;
+
+// 1D B3-spline kernel weights for [-2, -1, 0, 1, 2]
+const float kWeights[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= pc.imageWidth || coord.y >= pc.imageHeight) {
+        return;
+    }
+
+    vec4 centerColor = imageLoad(uInputRadiance, coord);
+    if (pc.isFirstPass != 0u && pc.totalSamples > 1u) {
+        centerColor.rgb /= float(pc.totalSamples);
+    }
+
+    vec4 centerNormDepth = imageLoad(uNormalDepth, coord);
+    vec3 centerNorm = centerNormDepth.xyz;
+    float centerDepth = centerNormDepth.w;
+
+    // Background / Sky fast-path (depth >= 9999.0 or unhit normal)
+    if (centerDepth >= 9999.0 || length(centerNorm) < 0.1) {
+        imageStore(uOutputRadiance, coord, centerColor);
+        return;
+    }
+
+    float centerLum = dot(centerColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+
+    // Dynamic color tolerance: tighten as samples accumulate (1 / sqrt(N))
+    float sampleScale = (pc.totalSamples > 1u) ? (1.0 / sqrt(float(pc.totalSamples))) : 1.0;
+    float colorTol = max(pc.colorPhi * sampleScale * (centerLum + 0.01), 1e-4);
+
+    vec4 sumColor = vec4(0.0);
+    float sumWeight = 0.0;
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        float wy = kWeights[dy + 2];
+        for (int dx = -2; dx <= 2; ++dx) {
+            float wx = kWeights[dx + 2];
+            float h = wx * wy;
+
+            ivec2 tapCoord = clamp(coord + ivec2(dx * pc.stepSize, dy * pc.stepSize),
+                                   ivec2(0), ivec2(pc.imageWidth - 1, pc.imageHeight - 1));
+
+            vec4 tapColor = imageLoad(uInputRadiance, tapCoord);
+            if (pc.isFirstPass != 0u && pc.totalSamples > 1u) {
+                tapColor.rgb /= float(pc.totalSamples);
+            }
+
+            vec4 tapNormDepth = imageLoad(uNormalDepth, tapCoord);
+            vec3 tapNorm = tapNormDepth.xyz;
+            float tapDepth = tapNormDepth.w;
+
+            // 1. Normal Edge-Stopping Weight
+            float nDot = max(0.0, dot(centerNorm, tapNorm));
+            float wn = pow(nDot, pc.normalPower);
+
+            // 2. Depth Edge-Stopping Weight
+            float depthDiff = abs(centerDepth - tapDepth);
+            float wz = exp(-depthDiff / max(pc.depthSigma * centerDepth, 1e-4));
+
+            // 3. Luminance Edge-Stopping Weight
+            float tapLum = dot(tapColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+            float wl = exp(-abs(centerLum - tapLum) / colorTol);
+
+            float w = h * wn * wz * wl;
+
+            sumColor += tapColor * w;
+            sumWeight += w;
+        }
+    }
+
+    vec4 finalColor = (sumWeight > 1e-5) ? (sumColor / sumWeight) : centerColor;
+    imageStore(uOutputRadiance, coord, finalColor);
+}

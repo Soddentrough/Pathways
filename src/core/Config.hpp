@@ -51,9 +51,13 @@ struct Config {
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;
-    bool enable_taa = false;              // Temporal Anti-Aliasing [Default: disabled]
+    bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
+    bool enable_atrous = false;           // Hierarchical Edge-Avoiding A-Trous Wavelet Diffuse Denoiser [Default: disabled]
+    uint32_t atrous_passes = 3;           // Number of A-Trous filter iterations (1-5, default: 3 passes: s=1,2,4)
+    float atrous_normal_power = 32.0f;    // Normal edge-stopping sensitivity
+    float atrous_depth_sigma = 0.03f;     // Depth edge-stopping sensitivity
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
 
