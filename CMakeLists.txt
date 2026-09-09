@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Pathways VERSION 1.5.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
