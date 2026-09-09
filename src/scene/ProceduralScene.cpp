@@ -1,5 +1,6 @@
 #include "scene/ProceduralScene.hpp"
 #include <cmath>
+#include <algorithm>
 
 namespace pathways {
 
@@ -148,8 +149,8 @@ static void addSphere(std::vector<TriangleGPU>& triangles,
     }
 }
 
-SceneData ProceduralScene::createCornellBox() {
-    SceneData scene;
+static std::vector<MaterialGPU> createDefaultCornellBoxMaterials() {
+    std::vector<MaterialGPU> materials;
 
     // Materials:
     // 0: White diffuse (walls/floor/ceiling)
@@ -158,7 +159,7 @@ SceneData ProceduralScene::createCornellBox() {
     matWhite.roughness = 0.9f;
     matWhite.metallic = 0.0f;
     matWhite.type = MATERIAL_DIFFUSE;
-    scene.materials.push_back(matWhite);
+    materials.push_back(matWhite);
 
     // 1: Red diffuse (left wall)
     MaterialGPU matRed{};
@@ -166,7 +167,7 @@ SceneData ProceduralScene::createCornellBox() {
     matRed.roughness = 0.9f;
     matRed.metallic = 0.0f;
     matRed.type = MATERIAL_DIFFUSE;
-    scene.materials.push_back(matRed);
+    materials.push_back(matRed);
 
     // 2: Green diffuse (right wall)
     MaterialGPU matGreen{};
@@ -174,14 +175,14 @@ SceneData ProceduralScene::createCornellBox() {
     matGreen.roughness = 0.9f;
     matGreen.metallic = 0.0f;
     matGreen.type = MATERIAL_DIFFUSE;
-    scene.materials.push_back(matGreen);
+    materials.push_back(matGreen);
 
     // 3: Emissive Light (ceiling area light)
     MaterialGPU matLight{};
     matLight.albedo = glm::vec4(1.0f);
     matLight.emissive = glm::vec4(18.0f, 18.0f, 15.0f, 1.0f);
     matLight.type = MATERIAL_EMISSIVE;
-    scene.materials.push_back(matLight);
+    materials.push_back(matLight);
 
     // 4: Dielectric Refraction (Glass Sphere)
     MaterialGPU matGlass{};
@@ -191,7 +192,7 @@ SceneData ProceduralScene::createCornellBox() {
     matGlass.ior = 1.52f; // Crown glass
     matGlass.transmission = 1.0f;
     matGlass.type = MATERIAL_DIELECTRIC;
-    scene.materials.push_back(matGlass);
+    materials.push_back(matGlass);
 
     // 5: Metallic Specular (Mirror / Metal Sphere)
     MaterialGPU matMetal{};
@@ -199,7 +200,7 @@ SceneData ProceduralScene::createCornellBox() {
     matMetal.roughness = 0.04f;
     matMetal.metallic = 1.0f;
     matMetal.type = MATERIAL_METALLIC;
-    scene.materials.push_back(matMetal);
+    materials.push_back(matMetal);
 
     // 6: Blue diffuse box
     MaterialGPU matBlue{};
@@ -207,7 +208,14 @@ SceneData ProceduralScene::createCornellBox() {
     matBlue.roughness = 0.8f;
     matBlue.metallic = 0.0f;
     matBlue.type = MATERIAL_DIFFUSE;
-    scene.materials.push_back(matBlue);
+    materials.push_back(matBlue);
+
+    return materials;
+}
+
+SceneData ProceduralScene::createCornellBox() {
+    SceneData scene;
+    scene.materials = createDefaultCornellBoxMaterials();
 
     auto recordRange = [&](const std::string& name, uint32_t startTri) {
         if (scene.triangles.size() <= startTri) return;
@@ -305,6 +313,159 @@ SceneData ProceduralScene::createCornellBox() {
     spotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(25.0f))); // inner angle cos
     spotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(35.0f))); // outer angle cos
     scene.lights.push_back(spotLight);
+
+    // Interior objects:
+    // 1. Tall diffuse blue box on the right
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addBox(scene.triangles, glm::vec3(0.35f, 0.6f, -0.3f), glm::vec3(0.55f, 1.2f, 0.55f), 22.0f, 6);
+    recordRange("Tall Blue Box", tStart);
+
+    // 2. Glass Sphere (Dielectric Refraction) on the left
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addSphere(scene.triangles, glm::vec3(-0.4f, 0.35f, -0.35f), 0.35f, 4);
+    recordRange("Glass Sphere", tStart);
+
+    // 3. Metallic / Mirror Sphere in the foreground
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addSphere(scene.triangles, glm::vec3(0.1f, 0.25f, 0.35f), 0.25f, 5);
+    recordRange("Mirror Sphere", tStart);
+
+    scene.hasCamera = true;
+    scene.cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);
+    scene.cameraTarget = glm::vec3(0.0f, 1.0f, 0.0f);
+    scene.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+    scene.cameraFov = 45.0f;
+
+    scene.boundsMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+    scene.boundsMax = glm::vec3(1.0f, 2.0f, 1.0f);
+    scene.sceneRadius = 2.0f;
+    scene.focalBoundsMin = scene.boundsMin;
+    scene.focalBoundsMax = scene.boundsMax;
+    scene.focalRadius = scene.sceneRadius;
+    scene.focalDistance = glm::length(scene.cameraPosition - scene.cameraTarget);
+    scene.centralTarget = scene.cameraTarget;
+
+    return scene;
+}
+
+SceneData ProceduralScene::createManyLightsScene(uint32_t gridDim) {
+    SceneData scene;
+    scene.materials = createDefaultCornellBoxMaterials();
+
+    auto recordRange = [&](const std::string& name, uint32_t startIdx) {
+        MeshRange mr;
+        mr.name = name;
+        mr.firstTriangle = startIdx;
+        mr.triangleCount = static_cast<uint32_t>(scene.triangles.size()) - startIdx;
+        mr.minBound = glm::vec3(1e30f);
+        mr.maxBound = glm::vec3(-1e30f);
+        for (size_t i = startIdx; i < scene.triangles.size(); ++i) {
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
+        }
+        scene.meshRanges.push_back(mr);
+    };
+
+    // Geometry: Box dimensions -1.0 to 1.0
+    // Floor (y = 0.0)
+    uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3(-1.0f, 0.0f,  1.0f),
+            glm::vec3( 1.0f, 0.0f,  1.0f),
+            glm::vec3( 1.0f, 0.0f, -1.0f),
+            glm::vec3(-1.0f, 0.0f, -1.0f),
+            glm::vec3(0.0f, 1.0f, 0.0f), 0);
+    recordRange("Floor", tStart);
+
+    // Ceiling (y = 2.0)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3(-1.0f, 2.0f, -1.0f),
+            glm::vec3( 1.0f, 2.0f, -1.0f),
+            glm::vec3( 1.0f, 2.0f,  1.0f),
+            glm::vec3(-1.0f, 2.0f,  1.0f),
+            glm::vec3(0.0f, -1.0f, 0.0f), 0);
+    recordRange("Ceiling", tStart);
+
+    // Back wall (z = -1.0)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3(-1.0f, 0.0f, -1.0f),
+            glm::vec3( 1.0f, 0.0f, -1.0f),
+            glm::vec3( 1.0f, 2.0f, -1.0f),
+            glm::vec3(-1.0f, 2.0f, -1.0f),
+            glm::vec3(0.0f, 0.0f, 1.0f), 0);
+    recordRange("Back Wall", tStart);
+
+    // Left wall (x = -1.0, Red)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3(-1.0f, 0.0f,  1.0f),
+            glm::vec3(-1.0f, 0.0f, -1.0f),
+            glm::vec3(-1.0f, 2.0f, -1.0f),
+            glm::vec3(-1.0f, 2.0f,  1.0f),
+            glm::vec3(1.0f, 0.0f, 0.0f), 1);
+    recordRange("Left Wall (Red)", tStart);
+
+    // Right wall (x = 1.0, Green)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3( 1.0f, 0.0f, -1.0f),
+            glm::vec3( 1.0f, 0.0f,  1.0f),
+            glm::vec3( 1.0f, 2.0f,  1.0f),
+            glm::vec3( 1.0f, 2.0f, -1.0f),
+            glm::vec3(-1.0f, 0.0f, 0.0f), 2);
+    recordRange("Right Wall (Green)", tStart);
+
+    // Grid of ceiling lights (y = 1.99)
+    uint32_t N = std::clamp(gridDim, 2u, 16u);
+    float step = 1.6f / static_cast<float>(N);
+    float halfSize = std::min(step * 0.35f, 0.04f);
+    float area = (2.0f * halfSize) * (2.0f * halfSize);
+
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    for (uint32_t gz = 0; gz < N; ++gz) {
+        for (uint32_t gx = 0; gx < N; ++gx) {
+            float cx = -0.8f + (static_cast<float>(gx) + 0.5f) * step;
+            float cz = -0.8f + (static_cast<float>(gz) + 0.5f) * step;
+
+            // Generate pleasing varied spectral colors across the grid
+            float uHue = static_cast<float>(gz * N + gx) / static_cast<float>(N * N);
+            float hue = uHue * 6.0f;
+            int hIdx = static_cast<int>(hue) % 6;
+            float f = hue - std::floor(hue);
+            glm::vec3 col(1.0f);
+            if (hIdx == 0) col = glm::vec3(1.0f, f, 0.2f);
+            else if (hIdx == 1) col = glm::vec3(1.0f - f, 1.0f, 0.2f);
+            else if (hIdx == 2) col = glm::vec3(0.2f, 1.0f, f);
+            else if (hIdx == 3) col = glm::vec3(0.2f, 1.0f - f, 1.0f);
+            else if (hIdx == 4) col = glm::vec3(f, 0.2f, 1.0f);
+            else col = glm::vec3(1.0f, 0.2f, 1.0f - f);
+
+            // Add visible emissive quad mesh on ceiling
+            addQuad(scene.triangles,
+                    glm::vec3(cx - halfSize, 1.99f, cz - halfSize),
+                    glm::vec3(cx + halfSize, 1.99f, cz - halfSize),
+                    glm::vec3(cx + halfSize, 1.99f, cz + halfSize),
+                    glm::vec3(cx - halfSize, 1.99f, cz + halfSize),
+                    glm::vec3(0.0f, -1.0f, 0.0f), 3);
+
+            // Add corresponding physical area light
+            LightGPU light{};
+            light.position = glm::vec4(cx - halfSize, 1.99f, cz - halfSize, LIGHT_AREA_QUAD);
+            light.u = glm::vec4(2.0f * halfSize, 0.0f, 0.0f, 0.0f);
+            light.v = glm::vec4(0.0f, 0.0f, 2.0f * halfSize, 0.0f);
+            light.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+            float intensity = 15.0f;
+            light.emission = glm::vec4(col * intensity, area);
+            scene.lights.push_back(light);
+        }
+    }
+    recordRange("Many Ceiling Lights", tStart);
 
     // Interior objects:
     // 1. Tall diffuse blue box on the right

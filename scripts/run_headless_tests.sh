@@ -32,10 +32,10 @@ ninja -C build -j8
 # Create output directory
 mkdir -p output
 
-# 2b. Run camera controls unit test suite
+# 2b. Run CTest unit test suites (Camera controls, ImGui headless, ReSTIR quality, Shadow denoiser)
 echo ""
-echo "[2b] Running Camera Controls Unit Tests..."
-./build/bin/test_camera_controls
+echo "[2b] Running CTest Unit Test Suites..."
+ctest --test-dir build --output-on-failure
 
 # 2c. Run Dynamic Scene Switching Tests
 echo ""
@@ -66,7 +66,9 @@ echo "[4/5] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)
     --height 2160 \
     --spp 1 \
     --max-bounces 4 \
-    --frames 5 \
+    --frames 200 \
+    --warmup-frames 30 \
+    --no-accumulation \
     --benchmark \
     --dump-frame output/test_cornell_4k.png \
     --dump-stats output/stats_4k.json
@@ -82,7 +84,9 @@ echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1
     --height 2160 \
     --spp 1 \
     --max-bounces 4 \
-    --frames 5 \
+    --frames 200 \
+    --warmup-frames 30 \
+    --no-accumulation \
     --mgpu \
     --dump-frame output/test_cornell_4k_mgpu_interleaved.png \
     --dump-stats output/stats_4k_mgpu_interleaved.json
@@ -113,7 +117,9 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 10 \
+    --frames 150 \
+    --warmup-frames 30 \
+    --no-accumulation \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -123,7 +129,9 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 10 \
+    --frames 150 \
+    --warmup-frames 30 \
+    --no-accumulation \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 

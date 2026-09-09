@@ -906,24 +906,21 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 2. Multi-GPU Scalability Mode
         if (ImGui::CollapsingHeader("Multi-GPU Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char* mgpuModes[] = {
-                "Single GPU (Off)",
+                "Single GPU (Secondary Standby)",
                 "Checkerboard Tiling (Optimal RDNA4, default)",
-                "Interleaved Scanlines (Linearly Scalable 50/50)",
                 "Sample Parallelism (Temporal Sample Splitting)",
                 "Auto (SPP Adaptive)"
             };
             int currentMode = 0;
             if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) currentMode = 1;
-            else if (config.mgpu_mode == MultiGpuMode::InterleavedScanline) currentMode = 2;
-            else if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 3;
-            else if (config.mgpu_mode == MultiGpuMode::Auto) currentMode = 4;
+            else if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 2;
+            else if (config.mgpu_mode == MultiGpuMode::Auto) currentMode = 3;
 
             if (ImGui::Combo("Execution Mode", &currentMode, mgpuModes, IM_ARRAYSIZE(mgpuModes))) {
                 MultiGpuMode selectedMode = MultiGpuMode::Off;
                 if (currentMode == 1) selectedMode = MultiGpuMode::CheckerboardTile;
-                else if (currentMode == 2) selectedMode = MultiGpuMode::InterleavedScanline;
-                else if (currentMode == 3) selectedMode = MultiGpuMode::SampleParallel;
-                else if (currentMode == 4) selectedMode = MultiGpuMode::Auto;
+                else if (currentMode == 2) selectedMode = MultiGpuMode::SampleParallel;
+                else if (currentMode == 3) selectedMode = MultiGpuMode::Auto;
 
                 if (actions && selectedMode != config.mgpu_mode) {
                     actions->mgpuModeChanged = true;
@@ -1072,21 +1069,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (config.enable_restir_di) {
                 ImGui::Indent();
-                if (ImGui::Checkbox("Spatial Resampling", &config.enable_restir_spatial)) {
+                int samples = static_cast<int>(config.restir_spatial_samples);
+                if (ImGui::SliderInt("Spatial Neighbors", &samples, 1, 8)) {
+                    config.restir_spatial_samples = static_cast<uint32_t>(samples);
                     settingsChanged = true;
                 }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Cross-bilateral spatial reservoir reuse with normal and depth validation.");
-                }
-                if (config.enable_restir_spatial) {
-                    int samples = static_cast<int>(config.restir_spatial_samples);
-                    if (ImGui::SliderInt("Spatial Neighbors", &samples, 1, 8)) {
-                        config.restir_spatial_samples = static_cast<uint32_t>(samples);
-                        settingsChanged = true;
-                    }
-                    if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 2.0f, 32.0f, "%.1f px")) {
-                        settingsChanged = true;
-                    }
+                if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 2.0f, 64.0f, "%.1f px")) {
+                    settingsChanged = true;
                 }
                 ImGui::Unindent();
             }
@@ -1102,7 +1091,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
 
         // 5. Post-Processing & Tonemapping
-        if (ImGui::CollapsingHeader("Post-Processing & Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Checkbox("FidelityFX Shadow Denoiser", &config.enable_shadow_denoiser)) {
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("AMD FidelityFX Spatio-Temporal Cross-Bilateral Shadow Denoiser with 8x8 Tile Classification.");
+            }
+            if (config.enable_shadow_denoiser) {
+                ImGui::Indent();
+                if (ImGui::SliderFloat("Depth Tolerance", &config.shadow_denoiser_depth_sigma, 0.005f, 0.100f, "%.3f")) {
+                    settingsChanged = true;
+                }
+                if (ImGui::SliderFloat("Normal Sharpness", &config.shadow_denoiser_normal_power, 4.0f, 64.0f, "%.1f")) {
+                    settingsChanged = true;
+                }
+                ImGui::Unindent();
+            }
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation
             }
@@ -1154,19 +1159,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         float midX = isPortrait ? (dispW * 0.5f) : ((hudX + hudW + ctrlX) * 0.5f);
 
-        if (config.mgpu_mode == MultiGpuMode::InterleavedScanline) {
-            float badgeW = 460.0f;
-            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
-            if (ImGui::Begin("##MgpuScanlineBadge", nullptr, overlayFlags)) {
-                ImGui::TextColored(ImVec4(0.0f, 0.9f, 1.0f, 1.0f), "[GPU 0: Cyan (Even Rows)]");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.0f, 1.0f), "[GPU 1: Amber (Odd Rows)]");
-                ImGui::SameLine();
-                ImGui::TextDisabled("| 100%% Load Balance");
-            }
-            ImGui::End();
-        } else if (config.mgpu_mode == MultiGpuMode::CheckerboardTile ||
-                   (config.mgpu_mode == MultiGpuMode::Auto && config.spp == 1)) {
+        if (config.mgpu_mode == MultiGpuMode::CheckerboardTile ||
+            (config.mgpu_mode == MultiGpuMode::Auto && config.spp == 1)) {
             float badgeW = 420.0f;
             ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
             if (ImGui::Begin("##MgpuCheckerboardBadge", nullptr, overlayFlags)) {

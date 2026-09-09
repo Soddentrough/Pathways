@@ -125,6 +125,8 @@ file(MAKE_DIRECTORY ${BIN_SPV_DIR})
 set(SHADER_FILES
     ${SHADER_DIR}/compute/tonemap_aces.comp
     ${SHADER_DIR}/compute/accum_merge.comp
+    ${SHADER_DIR}/compute/ffx_shadow_tileclassify.comp
+    ${SHADER_DIR}/compute/ffx_shadow_filter.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -255,6 +257,37 @@ if(UNIX)
     target_link_libraries(test_gui_scroll PRIVATE m)
 endif()
 add_test(NAME GuiScroll COMMAND test_gui_scroll)
+
+
+# ReSTIR DI Quality & Frame Pacing Unit Test Target
+add_executable(test_restir_quality
+    tests/test_restir_quality.cpp
+    src/scene/ProceduralScene.cpp
+    src/core/QualityGovernor.cpp
+)
+target_include_directories(test_restir_quality PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_restir_quality PRIVATE m Threads::Threads)
+endif()
+add_test(NAME RestirQuality COMMAND test_restir_quality)
+
+# FidelityFX Shadow Denoiser Unit Test Target
+add_executable(test_shadow_denoiser
+    tests/test_shadow_denoiser.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_shadow_denoiser PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_shadow_denoiser PRIVATE m)
+endif()
+add_test(NAME ShadowDenoiser COMMAND test_shadow_denoiser)
 
 
 # ==============================================================================

@@ -36,9 +36,6 @@ struct ConfigKey {
             case MultiGpuMode::Off:
                 modeStr = "Single GPU";
                 break;
-            case MultiGpuMode::InterleavedScanline:
-                modeStr = "Dual GPU (Interleaved Scanlines)";
-                break;
             case MultiGpuMode::CheckerboardTile:
                 modeStr = std::format("Dual GPU (Checkerboard {}x{})", tile_size, tile_size);
                 break;
@@ -46,7 +43,7 @@ struct ConfigKey {
                 modeStr = "Dual GPU (Sample Parallelism)";
                 break;
             case MultiGpuMode::Auto:
-                modeStr = (spp > 1) ? "Dual GPU (Auto: Sample Parallel)" : "Dual GPU (Auto: Interleaved Scanlines)";
+                modeStr = (spp > 1) ? "Dual GPU (Auto: Sample Parallel)" : std::format("Dual GPU (Auto: Checkerboard {}x{})", tile_size, tile_size);
                 break;
         }
         std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";

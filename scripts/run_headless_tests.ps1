@@ -91,8 +91,9 @@ Write-Host "`n[4/6] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchma
     --width 3840 `
     --height 2160 `
     --spp 1 `
-    --max-bounces 4 `
-    --frames 5 `
+    --frames 200 `
+    --warmup-frames 30 `
+    --no-accumulation `
     --benchmark `
     --dump-frame (Join-Path $OutputDir "test_cornell_4k.png") `
     --dump-stats (Join-Path $OutputDir "stats_4k.json")

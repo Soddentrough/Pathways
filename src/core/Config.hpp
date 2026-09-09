@@ -8,10 +8,9 @@ namespace pathways {
 
 enum class MultiGpuMode {
     Off,
-    InterleavedScanline, // Linearly scalable 50/50 scanline work distribution (any SPP) [Default when mGPU active]
-    CheckerboardTile,    // Checkerboard 2D Tiling (16x16, 32x32, 64x64)
+    CheckerboardTile,    // Checkerboard 2D Tiling (16x16, 32x32, 64x64) [Default when mGPU active]
     SampleParallel,      // Temporal Sample Parallelism
-    Auto                 // Adaptive: SampleParallel if SPP > 1, else InterleavedScanline
+    Auto                 // Adaptive: SampleParallel if SPP > 1, else CheckerboardTile
 };
 
 enum class AccumFormat {
@@ -27,6 +26,7 @@ struct Config {
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
+    uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;
 
     // Dynamic Quality Governor & Target Frame Rate Limiter
@@ -48,7 +48,11 @@ struct Config {
     bool enable_restir_spatial = true;
     uint32_t restir_spatial_samples = 3;
     float restir_spatial_radius = 8.0f;
+    bool enable_shadow_denoiser = false;
+    float shadow_denoiser_depth_sigma = 0.02f;
+    float shadow_denoiser_normal_power = 16.0f;
     bool enable_indirect_light = true;
+    bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)

@@ -117,6 +117,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     cornellBox.fileSizeBytes = 0;
     entries.push_back(cornellBox);
 
+    // 0b. Add Procedural Many-Lights Cornell Box as index 1
+    SceneEntry manyLights;
+    manyLights.label = "Procedural Many-Lights (64 Lights)";
+    manyLights.filepath = "procedural:many-lights";
+    manyLights.group = "Procedural";
+    manyLights.triangleCount = 2176;
+    manyLights.materialCount = 7;
+    manyLights.fileSizeBytes = 0;
+    entries.push_back(manyLights);
+
     if (!fs::exists(scenesDir) || !fs::is_directory(scenesDir)) {
         Logger::warn("SceneRegistry: Directory '{}' does not exist.", scenesDir);
         return entries;

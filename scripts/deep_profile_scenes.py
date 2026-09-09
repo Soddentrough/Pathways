@@ -54,6 +54,8 @@ def run_bench(scene_path, width, height, spp, mgpu_mode, frames, output_json):
         "--spp", str(spp),
         "--max-bounces", "4",
         "--frames", str(frames),
+        "--warmup-frames", "30",
+        "--no-accumulation",
         "--dump-stats", output_json
     ]
     if mgpu_mode == "off":
@@ -100,19 +102,19 @@ def main():
 
         # 1. 4K UHD @ 1 SPP - Single GPU Baseline
         json_4k_single = f"output/deep_profile/{base_id}_4k_single.json"
-        data_4k_single = run_bench(spath, 3840, 2160, 1, "off", 20, json_4k_single)
+        data_4k_single = run_bench(spath, 3840, 2160, 1, "off", 200, json_4k_single)
 
         # 2. 4K UHD @ 1 SPP - Dual GPU Interleaved Scanlines
         json_4k_interleaved = f"output/deep_profile/{base_id}_4k_interleaved.json"
-        data_4k_interleaved = run_bench(spath, 3840, 2160, 1, "interleaved", 20, json_4k_interleaved)
+        data_4k_interleaved = run_bench(spath, 3840, 2160, 1, "interleaved", 200, json_4k_interleaved)
 
         # 3. 1080p @ 16 SPP - Single GPU Baseline
         json_1080p_single = f"output/deep_profile/{base_id}_1080p_single.json"
-        data_1080p_single = run_bench(spath, 1920, 1080, 16, "off", 10, json_1080p_single)
+        data_1080p_single = run_bench(spath, 1920, 1080, 16, "off", 150, json_1080p_single)
 
         # 4. 1080p @ 16 SPP - Dual GPU Sample Parallelism
         json_1080p_sample = f"output/deep_profile/{base_id}_1080p_sample.json"
-        data_1080p_sample = run_bench(spath, 1920, 1080, 16, "sample", 10, json_1080p_sample)
+        data_1080p_sample = run_bench(spath, 1920, 1080, 16, "sample", 150, json_1080p_sample)
 
         if not (data_4k_single and data_4k_interleaved and data_1080p_single and data_1080p_sample):
             print(f"  [WARNING] Incomplete data for {sname}.")

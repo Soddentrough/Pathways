@@ -108,6 +108,7 @@ private:
     static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
     std::unique_ptr<Texture> m_dummyWhite;
     std::unique_ptr<Texture> m_dummyNormal;
+    std::unique_ptr<Texture> m_blueNoiseTexture;
     std::unique_ptr<Texture> m_environmentMap;
     std::vector<std::unique_ptr<Texture>> m_sceneTextures;
 
@@ -151,6 +152,31 @@ private:
     void updateMergeDescriptors();
     void updateAllImageDescriptors();
     void updateSceneDescriptors();
+
+    // FidelityFX Shadow Denoiser Resources & Pipelines
+    std::unique_ptr<Image> m_directLightImage;
+    std::unique_ptr<Image> m_normalDepthImage;
+    std::unique_ptr<Image> m_shadowFilterPingImage;
+    std::unique_ptr<Image> m_momentsImages[2];
+    std::unique_ptr<Image> m_depthImages[2];
+    std::unique_ptr<Buffer> m_tileMetaDataBuffer;
+
+    VkDescriptorSetLayout m_shadowClassifyDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_shadowFilterDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_shadowClassifyDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_shadowFilterDescSet = VK_NULL_HANDLE;
+    uint32_t m_shadowPingPongIndex = 0;
+    VkPipelineLayout m_shadowClassifyPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_shadowFilterPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_shadowClassifyPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadowFilterPipeline = VK_NULL_HANDLE;
+
+    void createShadowDenoiserPipelines();
+    void createShadowDenoiserResources();
+    void destroyShadowDenoiserResources();
+    void destroyShadowDenoiserPipelines();
+    void updateShadowDenoiserDescriptors();
+    double m_lastShadowDenoiserTimeMs = 0.0;
 
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;

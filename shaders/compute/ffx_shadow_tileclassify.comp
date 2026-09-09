@@ -1,0 +1,152 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Binding 0: Direct lighting (rgb) + raw shadow visibility factor (a)
+layout(binding = 0) readonly uniform image2D uDirectLightImage;
+
+// Binding 1: World normal (xyz) + linear depth (w)
+layout(binding = 1) readonly uniform image2D uNormalDepthImage;
+
+// Binding 2: Previous frame moments (r: mean shadow, g: sample count)
+layout(binding = 2) readonly uniform image2D uPrevMomentsImage;
+
+// Binding 3: Previous frame linear depth (r)
+layout(binding = 3) readonly uniform image2D uPrevDepthImage;
+
+// Binding 4: Tile metadata SSBO (0 = penumbra, 1 = all shadow, 2 = all lit)
+layout(std430, binding = 4) buffer TileMetaDataBuffer {
+    uint tileMetaData[];
+};
+
+// Binding 5: Current frame moments output (r: mean, g: sample count)
+layout(binding = 5) writeonly uniform image2D uCurrMomentsImage;
+
+// Binding 6: Current frame linear depth output
+layout(binding = 6) writeonly uniform image2D uCurrDepthImage;
+
+// Binding 7: Intermediate shadow mask output for bilateral filter pass
+layout(binding = 7) writeonly uniform image2D uShadowFilterPing;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 bufferDimensions;
+    vec2 invBufferDimensions;
+    mat4 prevViewProj;
+    uint frameIndex;
+    float depthSimilaritySigma;
+    uint tileOffsetX; // 0 = full frame, 1 = GPU 0 white tiles, 2 = GPU 1 black tiles
+    uint tileOffsetY; // Checkerboard tile size (e.g. 32 or 64; 0 = full screen)
+} pc;
+
+shared uint s_litCount;
+shared uint s_shadowCount;
+
+// Checkerboard coordinate mapping
+ivec2 getPixelCoord(ivec2 launchID) {
+    if (pc.tileOffsetY == 0u || pc.tileOffsetX == 0u) {
+        return launchID;
+    }
+    uint tileSize = pc.tileOffsetY;
+    uint ty = uint(launchID.y) / tileSize;
+    uint tx_half = uint(launchID.x) / tileSize;
+    uint localX = uint(launchID.x) % tileSize;
+    uint tx = (pc.tileOffsetX == 1u) ? (tx_half * 2u + (ty & 1u))
+                                     : (tx_half * 2u + (1u - (ty & 1u)));
+    return ivec2(int(tx * tileSize + localX), launchID.y);
+}
+
+void main() {
+    ivec2 launchID = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 pixelCoord = getPixelCoord(launchID);
+
+    if (pixelCoord.x >= pc.bufferDimensions.x || pixelCoord.y >= pc.bufferDimensions.y) {
+        return;
+    }
+
+    if (gl_LocalInvocationIndex == 0u) {
+        s_litCount = 0u;
+        s_shadowCount = 0u;
+    }
+    barrier();
+
+    // 1. Fetch current frame direct lighting, raw shadow factor, normal, and depth
+    vec4 directLightData = imageLoad(uDirectLightImage, pixelCoord);
+    float rawShadow = clamp(directLightData.a, 0.0, 1.0);
+
+    vec4 normDepthData = imageLoad(uNormalDepthImage, pixelCoord);
+    vec3 hitNormal = normDepthData.xyz;
+    float hitDepth = normDepthData.w;
+
+    // 2. Classify 8x8 tile
+    if (rawShadow > 0.99) {
+        atomicAdd(s_litCount, 1u);
+    } else if (rawShadow < 0.01) {
+        atomicAdd(s_shadowCount, 1u);
+    }
+    barrier();
+
+    // Tile metadata: 2 = ALL_LIT, 1 = ALL_SHADOW, 0 = PENUMBRA
+    uint tileMeta = 0u;
+    if (s_litCount == 64u) {
+        tileMeta = 2u;
+    } else if (s_shadowCount == 64u) {
+        tileMeta = 1u;
+    }
+
+    uint tilesX = uint(pc.bufferDimensions.x + 7) / 8u;
+    uint tileIdx = (uint(pixelCoord.y) / 8u) * tilesX + (uint(pixelCoord.x) / 8u);
+    if (gl_LocalInvocationIndex == 0u) {
+        tileMetaData[tileIdx] = tileMeta;
+    }
+
+    // Always store current depth
+    imageStore(uCurrDepthImage, pixelCoord, vec4(hitDepth, 0.0, 0.0, 0.0));
+
+    // For fully uniform tiles, record trivial moments and exit
+    if (tileMeta == 2u) {
+        imageStore(uCurrMomentsImage, pixelCoord, vec4(1.0, 32.0, 0.0, 0.0));
+        imageStore(uShadowFilterPing, pixelCoord, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    } else if (tileMeta == 1u) {
+        imageStore(uCurrMomentsImage, pixelCoord, vec4(0.0, 32.0, 0.0, 0.0));
+        imageStore(uShadowFilterPing, pixelCoord, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // 3. Penumbra Tile: Temporal Reprojection & Variance Tracking
+    vec2 uv = (vec2(pixelCoord) + 0.5) * pc.invBufferDimensions;
+    vec2 ndc = uv * 2.0 - 1.0;
+
+    // Reproject screen-space NDC to previous frame clip space using reprojection matrix
+    vec4 prevClip = pc.prevViewProj * vec4(ndc, 0.95, 1.0);
+    bool validHistory = false;
+    vec2 prevMoments = vec2(rawShadow, 1.0);
+
+    if (pc.frameIndex > 0u && prevClip.w > 0.0) {
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        vec2 prevUV = prevNDC * 0.5 + 0.5;
+        if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
+            ivec2 prevPx = clamp(ivec2(prevUV * vec2(pc.bufferDimensions)), ivec2(0), pc.bufferDimensions - 1);
+            float prevDepth = imageLoad(uPrevDepthImage, prevPx).r;
+            float depthDiff = abs(hitDepth - prevDepth) / max(hitDepth, 1e-3);
+
+            // Disocclusion test
+            if (depthDiff < pc.depthSimilaritySigma * 4.0) {
+                prevMoments = imageLoad(uPrevMomentsImage, prevPx).rg;
+                validHistory = true;
+            }
+        }
+    }
+
+    // Temporal blend with history clamping (variance box clamp to prevent ghosting)
+    float sampleCount = validHistory ? min(prevMoments.g + 1.0, 32.0) : 1.0;
+    float alpha = 1.0 / sampleCount;
+
+    // Clamp history to neighborhood [0.0, 1.0]
+    float clampedHistory = clamp(prevMoments.r, 0.0, 1.0);
+    float filteredShadow = mix(clampedHistory, rawShadow, alpha);
+
+    imageStore(uCurrMomentsImage, pixelCoord, vec4(filteredShadow, sampleCount, 0.0, 0.0));
+    imageStore(uShadowFilterPing, pixelCoord, vec4(filteredShadow, 0.0, 0.0, 0.0));
+}

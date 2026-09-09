@@ -133,6 +133,9 @@ layout(std430, binding = 10) readonly buffer HistoryReservoirBuffer {
     ReservoirDI historyReservoirs[];
 };
 
+layout(binding = 11, rgba16f) uniform image2D uDirectLightImage;
+layout(binding = 12, rgba16f) uniform image2D uNormalDepthImage;
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -409,10 +412,12 @@ float evalLightCandidate(
         vec3 toL = lPos - hitP;
         lDist = length(toL);
         lDir = toL / max(lDist, 1e-4);
-        float cosL = dot(-lDir, l.normal.xyz);
+        float cosL = clamp(dot(-lDir, l.normal.xyz), 0.0, 1.0);
         float lArea = l.emission.w;
         if (cosL > 0.0 && lArea > 0.0) {
-            lPdf = (lDist * lDist) / (cosL * lArea * float(pc.numLights));
+            float geomFactor = cosL / max(lDist * lDist, 1e-4);
+            lEmiss *= geomFactor;
+            lPdf = 1.0 / (lArea * float(pc.numLights));
         }
     } else if (uint(l.position.w) == 1u) {
         // Spot light
@@ -532,6 +537,7 @@ void main() {
     bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
     bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
     bool enableShadows = (ubo.flags & (1 << 4)) != 0;
+    bool enableShadowDenoiser = (ubo.flags & (1u << 20)) != 0u;
 
     // 1. Emissive contribution with MIS
     if (length(emissive) > 1e-3) {
@@ -631,6 +637,7 @@ void main() {
     // 2. Direct Lighting (Analytical Lights with ReSTIR DI or NEE Fallback)
     bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
     bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
+    float hitDepth = length(hitPoint - ubo.position.xyz);
 
     if (enableDirect && pc.numLights > 0u && mat.type != 3u && transmission < 0.1 && mat.type != 2u) {
         if (enableReSTIR && isPrimary) {
@@ -644,10 +651,8 @@ void main() {
             R.targetPdf = 0.0;
             R.pad = 0u;
 
-            float hitDepth = length(hitPoint - ubo.position.xyz);
-
-            // 1. Initial Candidate Generation (M_init = 4 candidates with Chao's WRS)
-            const uint M_init = 4u;
+            // 1. Initial Candidate Generation (M_init = 8 candidates with Chao's WRS)
+            const uint M_init = 8u;
             for (uint c = 0u; c < M_init; ++c) {
                 uint candIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
                 vec2 cUv = randVec2(prd.seed);
@@ -679,7 +684,6 @@ void main() {
                 if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
                     int prevPx = clamp(int(prevUV.x * float(pc.tileWidth)), 0, int(pc.tileWidth) - 1);
                     int prevPy = clamp(int(prevUV.y * float(pc.tileHeight)), 0, int(pc.tileHeight) - 1);
-                    baseCoord = ivec2(prevPx, prevPy);
                     uint prevIdx = uint(prevPy * int(pc.tileWidth) + prevPx);
 
                     ReservoirDI R_prev = historyReservoirs[prevIdx];
@@ -695,7 +699,7 @@ void main() {
                         }
 
                         if (geomValid) {
-                            float historyM = min(R_prev.M, 20.0);
+                            float historyM = R_prev.M;
                             float dummyPdf;
                             float p_hat_current = evalLightCandidate(
                                 R_prev.lightIdx, vec2(R_prev.uvX, R_prev.uvY), hitPoint, hitNormal, V, diffuseColor, F0, alphaRoughness, enableSpecular, dummyPdf
@@ -715,13 +719,16 @@ void main() {
                 }
             }
 
-            // 3. Spatial Resampling (Neighbor Gathering with Cross-Bilateral Validation)
+            // 3. Spatial Resampling (Neighbor Gathering around current pixel with Cross-Bilateral Validation)
             bool enableSpatial = (ubo.flags & (1u << 7)) != 0u;
             if (enableSpatial) {
                 uint spatialSamples = (ubo.flags >> 8u) & 0xFu;
-                if (spatialSamples == 0u) spatialSamples = 3u;
+                if (spatialSamples == 0u) spatialSamples = 4u;
                 float spatialRadius = float((ubo.flags >> 12u) & 0xFFu);
-                if (spatialRadius < 1.0) spatialRadius = 8.0;
+                if (spatialRadius < 1.0) spatialRadius = 16.0;
+
+                // Detect Interleaved Scanline Multi-GPU mode
+                int yStride = (pc.tileOffsetY == 0u && pc.tileOffsetX > 0u) ? 2 : 1;
 
                 for (uint i = 0u; i < spatialSamples; ++i) {
                     float angle = randFloat(prd.seed) * TWO_PI;
@@ -730,6 +737,7 @@ void main() {
                     if (offset == ivec2(0)) {
                         offset = (randFloat(prd.seed) > 0.5) ? ivec2(1, 0) : ivec2(0, 1);
                     }
+                    offset.y *= yStride;
                     ivec2 nbrCoord = clamp(baseCoord + offset, ivec2(0), ivec2(int(pc.tileWidth) - 1, int(pc.tileHeight) - 1));
                     uint nbrIdx = uint(nbrCoord.y * int(pc.tileWidth) + nbrCoord.x);
 
@@ -743,7 +751,7 @@ void main() {
                         float depthDiff = abs(hitDepth - nbrDepth) / max(hitDepth, 1e-3);
 
                         if (normDot > 0.90 && depthDiff < 0.10) {
-                            float nbrM = min(R_nbr.M, 20.0);
+                            float nbrM = R_nbr.M;
                             float dummyPdf;
                             float p_hat_nbr = evalLightCandidate(
                                 R_nbr.lightIdx, vec2(R_nbr.uvX, R_nbr.uvY), hitPoint, hitNormal, V, diffuseColor, F0, alphaRoughness, enableSpecular, dummyPdf
@@ -763,7 +771,13 @@ void main() {
                 }
             }
 
-            // 4. Compute Final Unbiased Weight W & Save to Current Reservoir Buffer
+            // 4. Compute Final Unbiased Weight W with proper M-capping to prevent infinite history lag
+            const float M_max = 24.0;
+            if (R.M > M_max) {
+                R.wSum *= (M_max / R.M);
+                R.M = M_max;
+            }
+
             if (R.targetPdf > 0.0 && R.M > 0.0) {
                 R.W = R.wSum / (R.M * R.targetPdf);
             } else {
@@ -772,7 +786,7 @@ void main() {
             R.pad = packGeom(hitNormal, hitDepth);
             currentReservoirs[prd.pad] = R;
 
-            // 4. Deferred Shadow Ray Query for Winning Candidate
+            // 5. Deferred Shadow Ray Query for Winning Candidate
             if (R.W > 0.0 && R.lightIdx < pc.numLights) {
                 Light wLight = lights[R.lightIdx];
                 vec3 wLightDir;
@@ -785,8 +799,12 @@ void main() {
                     vec3 toL = wPos - hitPoint;
                     wLightDist = length(toL);
                     wLightDir = toL / max(wLightDist, 1e-4);
-                    float cosL = dot(-wLightDir, wLight.normal.xyz);
+                    float cosL = clamp(dot(-wLightDir, wLight.normal.xyz), 0.0, 1.0);
                     if (cosL <= 0.0) validSample = false;
+                    else {
+                        float geomFactor = cosL / max(wLightDist * wLightDist, 1e-4);
+                        wLightEmiss *= geomFactor;
+                    }
                 } else if (uint(wLight.position.w) == 1u) {
                     vec3 toL = wLight.position.xyz - hitPoint;
                     wLightDist = length(toL);
@@ -799,6 +817,83 @@ void main() {
                     }
                 }
 
+                float wNdotL = dot(hitNormal, wLightDir);
+                if (validSample && wNdotL > 0.0) {
+                    bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, wLightDir, EPSILON, wLightDist - EPSILON * 2.0) : false;
+                    if (!inShadow || enableShadowDenoiser) {
+                        vec3 H = normalize(V + wLightDir);
+                        float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+                        float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                        vec3 specBRDF = vec3(0.0);
+                        if (enableSpecular) {
+                            float D = distributionGGX(NdotH, alphaRoughness);
+                            float Vis = visibilitySmithGGXCorrelated(wNdotL, NdotV, alphaRoughness);
+                            specBRDF = D * Vis * F;
+                        }
+                        vec3 brdf = diffBRDF + specBRDF;
+                        vec3 directUnshadowed = wLightEmiss * brdf * wNdotL * R.W;
+                        if (enableShadowDenoiser) {
+                            float rawShadow = inShadow ? 0.0 : 1.0;
+                            imageStore(uDirectLightImage, baseCoord, vec4(directUnshadowed, rawShadow));
+                            imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+                        } else {
+                            accumRadiance += directUnshadowed;
+                        }
+                    }
+                }
+            }
+        } else if (enableReSTIR) {
+            // Secondary Bounces with Resampled Importance Sampling (RIS M=4) to suppress indirect fireflies
+            uint bestLight = 0u;
+            vec2 bestUv = vec2(0.5);
+            float wSum = 0.0;
+            float bestTargetPdf = 0.0;
+            const uint M_sec = 4u;
+            for (uint c = 0u; c < M_sec; ++c) {
+                uint candIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
+                vec2 cUv = randVec2(prd.seed);
+                float cPdf = 0.0;
+                float p_hat = evalLightCandidate(candIdx, cUv, hitPoint, hitNormal, V, diffuseColor, F0, alphaRoughness, enableSpecular, cPdf);
+                float wi = (cPdf > 0.0) ? (p_hat / cPdf) : 0.0;
+                wSum += wi;
+                if (randFloat(prd.seed) * wSum < wi) {
+                    bestLight = candIdx;
+                    bestUv = cUv;
+                    bestTargetPdf = p_hat;
+                }
+            }
+            float W_sec = (bestTargetPdf > 0.0) ? (wSum / (float(M_sec) * bestTargetPdf)) : 0.0;
+            if (W_sec > 0.0 && bestLight < pc.numLights) {
+                Light wLight = lights[bestLight];
+                vec3 wLightDir;
+                float wLightDist = 0.0;
+                vec3 wLightEmiss = wLight.emission.rgb;
+                bool validSample = true;
+                if (wLight.position.w == 0.0) {
+                    vec3 wPos = wLight.position.xyz + bestUv.x * wLight.u.xyz + bestUv.y * wLight.v.xyz;
+                    vec3 toL = wPos - hitPoint;
+                    wLightDist = length(toL);
+                    wLightDir = toL / max(wLightDist, 1e-4);
+                    float cosL = clamp(dot(-wLightDir, wLight.normal.xyz), 0.0, 1.0);
+                    if (cosL <= 0.0) validSample = false;
+                    else {
+                        float geomFactor = cosL / max(wLightDist * wLightDist, 1e-4);
+                        wLightEmiss *= geomFactor;
+                    }
+                } else if (uint(wLight.position.w) == 1u) {
+                    vec3 toL = wLight.position.xyz - hitPoint;
+                    wLightDist = length(toL);
+                    wLightDir = toL / max(wLightDist, 1e-4);
+                    float cosSpot = dot(-wLightDir, wLight.normal.xyz);
+                    if (cosSpot < wLight.v.w) validSample = false;
+                    else {
+                        float spotFactor = clamp((cosSpot - wLight.v.w) / max(wLight.u.w - wLight.v.w, 1e-4), 0.0, 1.0);
+                        wLightEmiss *= spotFactor / max(wLightDist * wLightDist, 1e-4);
+                    }
+                }
                 float wNdotL = dot(hitNormal, wLightDir);
                 if (validSample && wNdotL > 0.0) {
                     bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, wLightDir, EPSILON, wLightDist - EPSILON * 2.0) : false;
@@ -816,12 +911,12 @@ void main() {
                             specBRDF = D * Vis * F;
                         }
                         vec3 brdf = diffBRDF + specBRDF;
-                        accumRadiance += wLightEmiss * brdf * wNdotL * R.W;
+                        accumRadiance += wLightEmiss * brdf * wNdotL * W_sec;
                     }
                 }
             }
         } else {
-            // Standard Uniform Light Picking NEE with MIS (Baseline fallback)
+            // Standard Uniform Light Picking NEE with MIS (Baseline fallback when ReSTIR disabled)
             uint lightIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
             Light light = lights[lightIdx];
 
@@ -868,7 +963,7 @@ void main() {
             if (NdotL > 0.0 && lightPdf > 0.0) {
                 // Inline shadow test using hardware ray query (bypassed if shadows disabled)
                 bool inShadow = enableShadows ? isShadowOccluded(hitPoint + hitNormal * EPSILON, lightDir, EPSILON, lightDist - EPSILON * 2.0) : false;
-                if (!inShadow) {
+                if (!inShadow || (enableShadowDenoiser && isPrimary)) {
                     vec3 H = normalize(V + lightDir);
                     float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
                     float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
@@ -892,7 +987,17 @@ void main() {
                         misWeightLight = lightPdf / (lightPdf + bsdfPdf);
                     }
 
-                    accumRadiance += lightEmission * brdf * NdotL * misWeightLight / lightPdf;
+                    vec3 directUnshadowed = lightEmission * brdf * NdotL * misWeightLight / lightPdf;
+                    if (enableShadowDenoiser && isPrimary) {
+                        int currentPx = int(prd.pad % pc.tileWidth);
+                        int currentPy = int(prd.pad / pc.tileWidth);
+                        ivec2 baseCoord = ivec2(currentPx, currentPy);
+                        float rawShadow = inShadow ? 0.0 : 1.0;
+                        imageStore(uDirectLightImage, baseCoord, vec4(directUnshadowed, rawShadow));
+                        imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+                    } else {
+                        accumRadiance += directUnshadowed;
+                    }
                 }
             }
         }

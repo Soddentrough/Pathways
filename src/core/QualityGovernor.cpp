@@ -16,6 +16,8 @@ void QualityGovernor::init(const GovernorConfig& config) {
     m_config = config;
     m_state.currentSpp = std::clamp(1u, m_config.minSpp, m_config.maxSpp);
     m_state.currentBounces = std::clamp(4u, m_config.minBounces, m_config.maxBounces);
+    m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
+    m_state.fractionalSpp = 0.0f;
     m_state.primSpp = m_state.currentSpp;
     m_state.secSpp = 0;
     m_state.active = m_config.enabled && (m_config.targetFps > 0);
@@ -58,13 +60,17 @@ void QualityGovernor::setBounds(uint32_t minSpp, uint32_t maxSpp, uint32_t minBo
     m_config.minBounces = std::max(1u, minBounces);
     m_config.maxBounces = std::max(m_config.minBounces, maxBounces);
 
-    m_state.currentSpp = std::clamp(m_state.currentSpp, m_config.minSpp, m_config.maxSpp);
+    m_state.effectiveSpp = std::clamp(m_state.effectiveSpp, static_cast<float>(m_config.minSpp), static_cast<float>(m_config.maxSpp));
+    m_state.currentSpp = static_cast<uint32_t>(std::floor(m_state.effectiveSpp));
+    m_state.fractionalSpp = m_state.effectiveSpp - static_cast<float>(m_state.currentSpp);
     m_state.currentBounces = std::clamp(m_state.currentBounces, m_config.minBounces, m_config.maxBounces);
 }
 
 void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel) {
     if (!m_initialized || !m_config.enabled || m_config.targetFps == 0) {
         m_state.active = false;
+        m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
+        m_state.fractionalSpp = 0.0f;
         return;
     }
 
@@ -88,7 +94,7 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
     if (m_emaRtMs <= 0.001f) {
         m_emaRtMs = measuredRtMs;
     } else {
-        // More responsive EMA during first 10 frames of warmup, then smoother
+        // Responsive during warmup, stable during steady state
         float alpha = (m_state.warmUpFrames <= 10) ? 0.35f : 0.15f;
         m_emaRtMs = alpha * measuredRtMs + (1.0f - alpha) * m_emaRtMs;
     }
@@ -98,34 +104,46 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
         m_cooldown--;
     }
 
-    // 1. Emergency Downgrade Threshold: if RT exceeds 95% of budget, step down immediately
-    if (m_emaRtMs > 0.95f * rtBudget || measuredRtMs > 1.05f * rtBudget) {
-        if (m_state.currentBounces > m_config.minBounces + 1) {
-            m_state.currentBounces--;
-            m_cooldown = 4;
-        } else if (m_state.currentSpp > m_config.minSpp) {
-            m_state.currentSpp--;
-            // Slightly lift bounces on SPP drop to soften visual step
-            m_state.currentBounces = std::min(m_config.maxBounces, m_state.currentBounces + 1);
-            m_cooldown = 8;
-        } else if (m_state.currentBounces > m_config.minBounces) {
-            m_state.currentBounces--;
-            m_cooldown = 4;
-        }
-    }
-    // 2. Conservative Upgrade: only when cooldown expired and projected time is safely under budget
-    else if (m_cooldown == 0) {
-        // Project RT time for next SPP step
-        float projectedNextSppRt = m_emaRtMs * (static_cast<float>(m_state.currentSpp + 1) / static_cast<float>(m_state.currentSpp));
+    // Continuous Adaptive Sample Rate Governor
+    // Target 94% of available RT budget to absorb OS compositing jitter
+    float targetRtMs = 0.94f * rtBudget;
+    float currentEff = std::max(1.0f, m_state.effectiveSpp);
+    float timePerSpp = std::max(0.1f, m_emaRtMs / currentEff);
+    float errorMs = targetRtMs - m_emaRtMs;
 
-        // In continuous camera motion, prioritize SPP over bounce depth for noise reduction
-        if (m_state.currentSpp < m_config.maxSpp && projectedNextSppRt < 0.85f * rtBudget) {
-            m_state.currentSpp++;
-            m_cooldown = (m_state.warmUpFrames <= 15) ? 5 : 12;
-        }
-        // If SPP cannot be increased without overshooting, modulate bounce depth (fine vernier)
-        else if (m_state.currentBounces < m_config.maxBounces && m_emaRtMs < 0.88f * rtBudget) {
+    if (m_emaRtMs > 1.02f * rtBudget) {
+        // Fast emergency step-down when overshooting budget
+        float delta = errorMs / timePerSpp;
+        m_state.effectiveSpp = std::clamp(m_state.effectiveSpp + delta,
+                                          static_cast<float>(m_config.minSpp),
+                                          static_cast<float>(m_config.maxSpp));
+        m_cooldown = 4;
+    } else if (m_cooldown == 0) {
+        // Smooth proportional adjustment to continuously track target budget
+        float gain = (m_state.warmUpFrames <= 15) ? 0.35f : 0.12f;
+        float delta = gain * (errorMs / timePerSpp);
+        m_state.effectiveSpp = std::clamp(m_state.effectiveSpp + delta,
+                                          static_cast<float>(m_config.minSpp),
+                                          static_cast<float>(m_config.maxSpp));
+    }
+
+    m_state.currentSpp = static_cast<uint32_t>(std::floor(m_state.effectiveSpp));
+    if (m_state.currentSpp >= m_config.maxSpp) {
+        m_state.currentSpp = m_config.maxSpp;
+        m_state.fractionalSpp = 0.0f;
+    } else {
+        m_state.fractionalSpp = m_state.effectiveSpp - static_cast<float>(m_state.currentSpp);
+    }
+
+    // Secondary fine vernier: modulate bounces only at SPP extremes
+    if (m_state.effectiveSpp >= static_cast<float>(m_config.maxSpp) && m_emaRtMs < 0.85f * rtBudget && m_cooldown == 0) {
+        if (m_state.currentBounces < m_config.maxBounces) {
             m_state.currentBounces++;
+            m_cooldown = 8;
+        }
+    } else if (m_state.effectiveSpp <= static_cast<float>(m_config.minSpp) + 0.05f && m_emaRtMs > 0.98f * rtBudget) {
+        if (m_state.currentBounces > m_config.minBounces) {
+            m_state.currentBounces--;
             m_cooldown = 6;
         }
     }
@@ -145,7 +163,7 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
 }
 
 void QualityGovernor::paceFrame(std::chrono::high_resolution_clock::time_point frameStart) {
-    if (!m_config.enabled || m_config.targetFps == 0) {
+    if (m_config.targetFps == 0) {
         return;
     }
 

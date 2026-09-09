@@ -1,5 +1,6 @@
 #include "vulkan/Texture.hpp"
 #include "core/Logger.hpp"
+#include "assets/BlueNoise64.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -175,6 +176,16 @@ std::unique_ptr<Texture> Texture::createDummyNormal(
     // Normal vector [0, 0, 1] encoded into [128, 128, 255, 255]
     uint8_t flatNormal[4] = {128, 128, 255, 255};
     return createFromPixels(device, allocator, queue, pool, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, flatNormal, sizeof(flatNormal), false);
+}
+
+std::unique_ptr<Texture> Texture::createBlueNoise64(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool
+) {
+    return createFromPixels(device, allocator, queue, pool,
+                            BLUE_NOISE_WIDTH, BLUE_NOISE_HEIGHT,
+                            VK_FORMAT_R8G8B8A8_UNORM,
+                            BLUE_NOISE_64X64_RGBA8.data(),
+                            BLUE_NOISE_BYTES, false);
 }
 
 std::unique_ptr<Texture> Texture::createProceduralHdrSky(

@@ -18,7 +18,7 @@ graph TD
     subgraph Next-Gen Architecture
         W1[Wavefront Passes & Dynamic Enqueue] --> R1[ReSTIR PT & Path Guiding]
         R1 --> N1[Neural Radiance Caching<br/>Cooperative Matrix / WMMA]
-        N1 --> M2[Micro-Geometry: OMMs / DMMs / Cluster AS]
+        N1 --> M2[Micro-Geometry: Cluster AS & Tetrahedral Cages]
         M2 --> D2[Neural Reconstruction<br/>DLSS-RR / Recurrent Autoencoders]
     end
 ```
@@ -456,56 +456,72 @@ In real-time implementations, this is realized via **One-Sample Multiple Importa
 
 ---
 
-## 6. Sub-Triangle Micro-Geometry & Micromaps
+## 6. Massive Virtualized Micro-Geometry & Tetrahedral Cages
 
-### 6.1 The Micro-Polygon Challenge in Ray Tracing
-While real-time rasterization has embraced cluster-based virtualized geometry (e.g., Unreal Engine's Nanite, processing 64–128 triangle meshlets with GPU-driven culling and dynamic continuous LOD), ray tracing pipelines have faced two significant bottlenecks:
-1. **BLAS Memory & Build Exhaustion:**
-   Instantiating millions of micro-triangles in standard hardware BVHs exhausts VRAM (tens of bytes per triangle) and causes prohibitive acceleration structure build times.
-2. **Any-Hit Shader (AHS) Traversal Stalls:**
-   Alpha-tested surfaces (foliage, hair cards, wire fences) require invoking an Any-Hit Shader for every candidate intersection to sample opacity textures. This stalls hardware traversal units, causes register spills, and reduces ray tracing throughput by **3x to 10x**.
+### 6.1 The Virtualized Micro-Geometry Shift: Why Opacity Micromaps (OMMs) Are Dead-End Technology
+For decades, real-time engines simulated complex environmental geometry (tree leaves, pine needles, grass blades, chain-link fences, and hair cards) using coarse flat polygons textured with alpha-cutoff masks. In hardware ray tracing, this paradigm triggered catastrophic performance bottlenecks:
+- **Any-Hit Shader (AHS) Traversal Stalls:** Every candidate intersection along a ray required invoking software Any-Hit Shaders to fetch textures and evaluate alpha cutoffs, stalling hardware traversal pipelines, causing register spills, and dropping ray tracing throughput by **3x to 10x**.
+- **The OMM Interim Attempt (`VK_EXT_opacity_micromap`):** Opacity Micromaps were introduced to alleviate AHS overhead by baking 1-bit or 2-bit sub-triangle opacity bitmasks directly into the acceleration structure, enabling fixed-function Ray Accelerators to resolve alpha transparency on chip.
 
+**Why OMM Is a Dead-End Architecture:**
+Next-generation rendering pipelines (e.g., Unreal Engine Nanite, meshlet-driven virtualized geometry, and micro-mesh pipelines) have rendered alpha-tested billboards completely obsolete. Instead of flat cards with transparency maps, next-gen virtualized geometry represents foliage and fine details as **explicit, watertight 3D geometry down to the sub-pixel micro-polygon level**:
+1. **Zero Alpha Testing:** Every leaf stem, leaf vein, pine needle, and wire link is an actual 3D triangle mesh.
+2. **Purely Opaque Hardware Traversal:** Primitives are flagged strictly opaque (`VK_GEOMETRY_OPAQUE_BIT_KHR` / `gl_RayFlagsOpaqueEXT`). Ray traversal bypasses Any-Hit Shaders entirely and executes at theoretical peak hardware throughput.
+3. **No Micromap Overhead:** Bypasses all OMM memory overhead, offline/runtime bitmask baking passes, and driver complexity.
+
+### 6.2 The Animation Scaling Problem in Virtualized Ray Tracing
+While rasterization pipelines can effortlessly animate billions of explicit micro-triangles using GPU-driven mesh shaders and compute skinning, hardware ray tracing encounters an acute bottleneck when dealing with massive animated micro-geometry:
+- **The BLAS Rebuild Wall:** In standard ray tracing, every uniquely deformed object requires its vertices to be skinned and its Bottom-Level Acceleration Structure (BLAS) to be updated or rebuilt each frame.
+- **Cost Scaling:** Rebuilding acceleration structures scales with triangle count ($O(N \log N)$). For dense virtualized environments (e.g., 25,000 independently swaying plants and trees comprising 500 million to 2.8 billion triangles), classic BLAS rebuilds consume **over 80 GB of VRAM** for unique BVHs and take **$>300\text{ ms}$ per frame** on modern high-end GPUs—completely breaking the 60–120 FPS real-time path tracing budget.
+
+```mermaid
+graph TD
+    subgraph Traditional Dynamic Ray Tracing (Broken at Scale)
+        V1[Dense Explicit Micro-Geometry<br/>500M+ Opaque Triangles] --> V2[Per-Vertex Skinning Compute]
+        V2 --> V3[Per-Instance BLAS Rebuild/Refit]
+        V3 --> V4[Fatal Overhead: 80GB VRAM + >300ms Build Time]
+    end
+
+    subgraph Tetrahedral Cage Ray Tracing (Gruen et al. 2026)
+        G1[Rest-Pose Disjoint Mesh Clipping] --> G2[Static Mini-BLASes Built ONCE]
+        G2 -. Shared across 25k instances .-> R1[Hardware Ray Traversal]
+        C1[Animate Coarse Tetrahedral Cage] --> C2[Update TLAS Instance Transforms]
+        C2 --> R1
+        R1 --> R2[Ray-Space Inversion: Piecewise-Linear Deformation]
+    end
 ```
-Standard Alpha-Test Traversal (AHS Stall)
-Ray ──> [BVH Node] ──> [Leaf Triangle] ──> STALL ──> [Invoke Any-Hit Shader] ──> [Sample Texture] ──> Resume
 
-Opacity Micromap Traversal (Native Hardware Evaluation)
-Ray ──> [BVH Node] ──> [Leaf w/ OMM] ──> Hardware Bitmask Test ──> [Pass / Drop Instantly on Chip]
-```
+### 6.3 Decoupling Animation and Micro-Geometry via Tetrahedral Cages (Gruen et al., HPG 2026)
+The breakthrough paper *"Ray Tracing Massive Amounts of Animated Geometry"* by Gruen, Benthin, Kern, and McAllister (AMD Research, HPG 2026 / ACM PACMCGIT, 3rd-place Wolfgang Straßer Best Paper Award) decouples animation cost from triangle count by representing deformation through a coarse volumetric tetrahedral proxy:
 
-### 6.2 Opacity Micromaps (OMMs) - `VK_EXT_opacity_micromap`
-`VK_EXT_opacity_micromap` solves the alpha-testing bottleneck by encoding sub-triangle opacity directly into the acceleration structure:
+#### 1. Preprocessing: Disjoint Partitioning & Static Mini-BLASes
+- A low-resolution tetrahedral cage is fitted around the rest-pose high-resolution mesh.
+- The high-resolution mesh is clipped into disjoint sub-meshes, each strictly bounded within a single tetrahedron $T_k$.
+- **Static mini-BLASes are built once at rest pose and never modified.** Because these mini-BLASes are completely static, the Vulkan driver can apply maximum hardware BVH quantization, leaf compaction, and spatial clustering (`VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR`), yielding near-$100\%$ L2 and Infinity Cache hit rates.
 
-- **Micro-Triangle Subdivision:**
-  Base triangles are subdivided into regular micro-triangles up to subdivision level 12 (up to 4096 micro-triangles per base triangle).
-- **Format States:**
-  - `VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT`: 1 bit per micro-triangle (Opaque, Transparent).
-  - `VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT`: 2 bits per micro-triangle (Fully Opaque, Fully Transparent, Unknown-Opaque, Unknown-Transparent).
-- **Hardware Traversal Integration:**
-  The hardware ray intersection engine evaluates the micro-triangle bitmask directly on chip:
-  - **Fully Opaque:** Hit accepted immediately without invoking an Any-Hit Shader.
-  - **Fully Transparent:** Hit rejected immediately without invoking an Any-Hit Shader.
-  - **Unknown States:** Any-Hit Shader is invoked *only* for borderline micro-triangles straddling the alpha cutoff edge.
-- **Pipeline Flags:**
-  Pipelines enable support via `VK_PIPELINE_CREATE_2_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT`.
-- **Result:** Traversal performance for dense foliage and vegetation matches that of fully opaque geometry, restoring full ray tracing throughput.
+#### 2. Runtime: Animated Tetrahedral Cages
+- At runtime, only the coarse tetrahedral vertices ($4$ vertices per tetrahedron) are deformed via skeletal hierarchies, wind simulations, or physical springs.
+- Each deformed tetrahedron $T_k$ defines an affine transformation $\mathbf{M}_k = [\mathbf{A}_k \mid \mathbf{t}_k] \in \mathbb{R}^{3 \times 4}$ that maps rest-pose space to world space:
+  $$\mathbf{x}' = \mathbf{A}_k (\mathbf{x} - \mathbf{v}_{k,0}) + \mathbf{v}'_{k,0}$$
+  where $\mathbf{v}_{k,i}$ are rest vertices, $\mathbf{v}'_{k,i}$ are deformed vertices, and $\mathbf{A}_k = \mathbf{V}'_k \mathbf{V}_k^{-1}$ is the $3 \times 3$ deformation gradient tensor.
 
-### 6.3 Displacement Micromaps (DMMs) - `VK_NV_displacement_micromap`
-Displacement Micromaps extend micro-structures to geometric displacement:
-- **Topology:**
-  Base triangles store a compressed micro-mesh hierarchy containing scalar displacement values defined along vertex normals.
-- **On-Chip Intersect:**
-  Hardware ray tracing units natively traverse and intersect the micro-triangles directly from compressed DMM memory without tessellating the geometry into explicit triangles in VRAM.
-- **Memory Reduction:**
-  Reduces BVH memory footprints for displaced meshes by **up to 90%** compared to pre-tessellated BLAS instances, enabling film-quality micro-displacement in real-time path tracers.
+#### 3. Ray Traversal & Ray-Space Inversion
+- In Vulkan 1.4, each animated tetrahedron maps directly to a `VkAccelerationStructureInstanceKHR` referencing its static mini-BLAS.
+- When traversing the Top-Level Acceleration Structure (TLAS), the hardware Ray Accelerators automatically transform rays into the tetrahedron’s rest-pose space:
+  $$\mathbf{o}_{\text{rest}} = \mathbf{A}_k^{-1}(\mathbf{o} - \mathbf{t}_k), \quad \mathbf{d}_{\text{rest}} = \mathbf{A}_k^{-1}\mathbf{d}$$
+- In the closest-hit shader, surface normals are transformed back to world space using the inverse-transpose matrix via hardware matrix registers:
+  $$\mathbf{n}_{\text{world}} = \text{normalize}\left(\mathbf{n}_{\text{rest}} \times \mathtt{gl\_WorldToObjectEXT}\right)$$
 
-### 6.4 Cluster Acceleration Structures - `VK_NV_cluster_acceleration_structure`
-Brings cluster/meshlet-native ray tracing directly to the Vulkan API:
-- Allows BLAS structures to be built from clusters of triangles (meshlets) directly on the GPU timeline via compute shaders:
-  - `VK_CLUSTER_ACCELERATION_STRUCTURE_TYPE_CLUSTERS_BOTTOM_LEVEL_NV`
-  - `VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV`
-- **GPU-Driven Pipeline:**
-  Enables continuous LOD transitions, cluster culling, and dynamic streaming geometry to update bottom-level acceleration structures entirely within compute queues without host CPU intervention.
+#### 4. Hardware and Memory Scalability on AMD RDNA 4
+- **Zero BLAS Memory Footprint Growth:** 25,000 plant instances share the exact same set of static rest-pose mini-BLASes (${\sim}20\text{--}50\text{ MB}$ total).
+- **GPU-Autonomous TLAS Rebuilds:** Updating $500\text{k}\text{--}1.25\text{M}$ instance transforms in the TLAS buffer takes $<1.0\text{ ms}$ on the GPU timeline via compute / `DGCManager`, compared to $>300\text{ ms}$ for triangle BLAS rebuilds.
+- **Massive Triangle Throughput:** Demonstrated 585 million animated, explicit triangles ray traced at 60 FPS on an AMD Radeon RX 9070 XT at 1080p (primary + shadow rays).
+
+### 6.4 Cluster Acceleration Structures (CLAS) & Micro-Mesh Integration
+Tetrahedral cage indirection coexists seamlessly with cluster-level acceleration structures (such as `VK_NV_cluster_acceleration_structure` and future multi-vendor equivalents):
+- **Meshlet Clustering within Tetrahedra:** Disjoint triangle partitions inside each tetrahedron are grouped into 64–128 triangle clusters.
+- **Continuous Cluster LOD:** Cluster-level BVHs allow fine-grained continuous LOD streaming inside the static rest-pose domain, while the tetrahedral cage supplies the macroscopic deformation.
+- **Displacement Micromaps (DMMs):** For surface relief, base triangles in rest-pose mini-BLASes can encode scalar displacement without dynamic CPU/GPU tessellation.
 
 ---
 
@@ -515,7 +531,8 @@ The following matrix categorizes the core modern and proposed Vulkan extensions 
 
 | Vulkan Extension | Status / Scope | Target Problem / Subsystem | Performance / Quality Impact |
 | :--- | :--- | :--- | :--- |
-| **`VK_EXT_opacity_micromap`** | Ratified EXT | Alpha-tested geometry (foliage, hair, fences) | **3x–10x speedup** on alpha ray traversal; eliminates Any-Hit Shader stalls. |
+| **`VK_EXT_opacity_micromap`** | Ratified EXT | Legacy alpha-tested billboard cards | **Dead-End / Deprecated:** Superseded by explicit virtualized micro-geometry and tetrahedral cages. |
+| **Tetrahedral Cage Instancing** | Core Vulkan 1.4 / Extensionless | Massive animated virtualized geometry (foliage, crowds) | **50x–100x memory saving, zero BLAS rebuilds** for hundreds of millions of animated triangles. |
 | **`VK_NV_displacement_micromap`** | Vendor (NV) | Extreme sub-triangle geometric displacement | **10x memory reduction** in BVH; enables real-time micro-displacement. |
 | **`VK_NV_cluster_acceleration_structure`** | Vendor (NV) | Meshlet / Nanite-style cluster ray tracing | Native cluster BLAS; allows GPU-driven streaming micro-geometry. |
 | **`VK_EXT_ray_tracing_invocation_reorder`** | Ratified EXT (SER) | Divergent ray execution in megakernels & wavefronts | **30%–60% execution speedup** by grouping spatially and materially coherent rays. |
@@ -523,7 +540,7 @@ The following matrix categorizes the core modern and proposed Vulkan extensions 
 | **`VK_EXT_device_generated_commands`** | Ratified EXT | GPU-driven command buffer generation (DGC) | Allows compute & ray tracing dispatches to be scheduled directly by GPU shaders. |
 | **`VK_KHR_cooperative_matrix`** | Ratified KHR | On-chip matrix multiplication for Neural Radiance Caching | Enables real-time MLP training & inference on tensor/WMMA hardware. |
 | **`VK_NV_cooperative_vector`** | Vendor (NV) | Inference & training optimal matrix-vector layouts | Maximizes throughput for online streaming MLP weight updates. |
-| **`VK_KHR_ray_tracing_position_fetch`** | Ratified KHR | Vertex coordinate access in hit shaders & ray queries | **Regressed static mesh PT by 10%–26%** due to +82% BLAS uncompression bloat; only suitable for deformation/OMM. |
+| **`VK_KHR_ray_tracing_position_fetch`** | Ratified KHR | Vertex coordinate access in hit shaders & ray queries | **Regressed static mesh PT by 10%–26%** due to +82% BLAS uncompression bloat; only suitable for deformation. |
 | **`VK_KHR_ray_tracing_maintenance1`** | Ratified KHR | Indirect ray tracing pipeline dispatches (`TraceRaysIndirect2`) | GPU-driven ray budgets; ray counts generated dynamically in compute. |
 | **`VK_EXT_descriptor_buffer`** | Ratified EXT | Direct GPU memory access for descriptor tables | Eliminates CPU descriptor set bottlenecks; enables massive bindless material indexing. |
 | **`VK_KHR_shader_subgroup_rotate`** | Ratified KHR (VK 1.4) | Cross-lane data exchange for stream compaction | High-throughput wavefront compaction and reservoir exchange across SIMD lanes. |
@@ -552,7 +569,7 @@ Frametime Allocation (7.0 ms Path Tracing Budget)
 | **Neural Radiance Caching** | +1.0 ms – 1.5 ms | **Infinite bounce approximation** | Energy loss from early ray termination, dark corners. | `VK_KHR_cooperative_matrix` |
 | **Wavefront + SER** | **-1.5 ms to -2.8 ms (Net Gain)** | N/A (Throughput Optimization) | SIMD idling, VGPR register spilling, execution stalls. | `VK_EXT_ray_tracing_invocation_reorder` |
 | **Real-Time Path Guiding** | +0.5 ms – 0.9 ms | **4x – 16x in occluded regions** | Fireflies and black holes in indirectly lit interiors. | Atomic Shared Storage, Buffer Device Address |
-| **Opacity Micromaps (OMM)** | **-1.0 ms to -3.0 ms on foliage** | N/A (Throughput Optimization) | Any-hit shader stalls, pipeline thrashing on vegetation. | `VK_EXT_opacity_micromap` |
+| **Tetrahedral Cages (Gruen et al.)** | **-2.0 ms to -5.0 ms net** | N/A (Memory & Rebuild Elimination) | BLAS rebuild stalls & memory explosion on massive animated geometry. | Core TLAS Instancing, DGC |
 | **Neural Reconstruction** | +1.5 ms – 2.0 ms | **Perceptual 4x–8x** | Heuristic blurring, ghosting on reflections, temporal smearing. | Tensor MMA / Cooperative Matrix |
 
 ---
@@ -566,7 +583,7 @@ To transition Pathways into a next-generation real-time path tracer, the followi
 ```mermaid
 graph LR
     Phase1[Phase 1:<br/>Wavefront & SER] --> Phase2[Phase 2:<br/>ReSTIR Resampling]
-    Phase2 --> Phase3[Phase 3:<br/>Micro-Geometry & OMM]
+    Phase2 --> Phase3[Phase 3:<br/>Massive Geometry & Tetrahedral Cages]
     Phase3 --> Phase4[Phase 4:<br/>Neural Caching & NRC]
     Phase4 --> Phase5[Phase 5:<br/>Work Graphs & Enqueue]
 ```
@@ -587,13 +604,14 @@ graph LR
   3. Implement spatial resampling across neighbor pixels utilizing hybrid reconnection shift mapping and Pairwise MIS (P-MIS) to prevent boiling.
   4. Use `DGCManager` (`VK_EXT_device_generated_commands`) to dispatch variable reconnection ray tests based on active reservoir candidate counts.
 
-### Phase 3: Hardware-Accelerated Micro-Geometry (OMM Support)
-- **Objective:** Optimize alpha-tested materials (foliage, grates, vegetation).
+### Phase 3: Massive Virtualized Micro-Geometry & Tetrahedral Cages
+- **Objective:** Enable hundreds of millions of animated, explicit micro-triangles (dense foliage, grass, crowds) without per-frame BLAS rebuilds or memory bloat; phase out legacy alpha billboards and OMM.
 - **Implementation Steps:**
-  1. Extend `AccelerationStructure.cpp` to check for and enable `VkPhysicalDeviceOpacityMicromapFeaturesEXT`.
-  2. Build 2-state and 4-state Opacity Micromap arrays during glTF scene loading for materials using `ALPHA_MODE_MASK`.
-  3. Attach micromap data directly to `VkAccelerationStructureGeometryTrianglesDataKHR` using `VkAccelerationStructureTrianglesOpacityMicromapEXT`.
-  4. Disable expensive Any-Hit Shaders for fully resolved micro-triangles, restoring full hardware traversal speed.
+  1. **Deprecate Alpha Billboard Cards / OMM:** Adopt watertight, explicit 3D micro-geometry (`VK_GEOMETRY_OPAQUE_BIT_KHR`) across foliage and environmental assets. Enforce fully opaque hardware ray traversal (`gl_RayFlagsOpaqueEXT`), bypassing Any-Hit Shaders natively.
+  2. **Implement `TetrahedralMesh` Abstraction:** Create a pipeline in `src/scene/` to load/cook tetrahedral bounding cages and partition high-res meshes into disjoint sub-meshes.
+  3. **Static Rest-Pose Mini-BLASes:** Build compact, fully quantized static mini-BLASes once at asset load time (`VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR`), ensuring 100% cache residency in RDNA 4 Infinity Cache.
+  4. **GPU-Timeline Cage Animation Pass (`cage_animate.comp`):** Evaluate skeletal, wind, and spring deformation on coarse cage vertices in compute, deriving affine transforms $\mathbf{M}_k = [\mathbf{A}_k \mid \mathbf{t}_k]$ and writing `VkAccelerationStructureInstanceKHR` records directly in device-local VRAM.
+  5. **GPU-Autonomous TLAS Rebuild:** Integrate with `DGCManager` to trigger fast GPU-timeline TLAS rebuilds ($<1.0\text{ ms}$ for $1\text{M}$ instances), keeping CPU frametime contribution at zero.
 
 ### Phase 4: Neural Radiance Caching via Cooperative Matrix
 - **Objective:** Replace deep diffuse/specular physical ray bounces with on-chip neural inference.
@@ -772,3 +790,8 @@ As part of the Pathways research roadmap, candidate optimizations were implement
    - Khronos Group. *VK_KHR_ray_tracing_position_fetch Specification*.
    - AMD Corporation. *VK_AMDX_shader_enqueue Specification & RDNA Work Graph Guides*.
    - AMD Corporation. *AMD RDNA 4 Instruction Set Architecture (ISA) & Performance Guides*.
+
+5. **Massive Animated Geometry & Tetrahedral Structures:**
+   - Gruen, H., Benthin, C., Kern, M., & McAllister, D. (2026). *Ray Tracing Massive Amounts of Animated Geometry*. Proceedings of the ACM on Computer Graphics and Interactive Techniques (HPG 2026, Best Paper Award - 3rd Place).
+   - Luton, P., & Tricard, T. (2026). *Fast Hardware Ray-Tracing of Animated Objects Using a Tetrahedral Indirection Structure*. HAL Science / INRIA.
+

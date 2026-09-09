@@ -68,6 +68,7 @@ struct GpuDeviceNode {
     std::unique_ptr<Texture> dummyNormal;
     std::unique_ptr<Texture> environmentMap;
     std::vector<std::unique_ptr<Texture>> sceneTextures;
+    std::unique_ptr<Texture> blueNoiseTexture;
 
     // Secondary hardware ray tracing pipeline & descriptors (VK_KHR_ray_tracing_pipeline)
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -75,6 +76,25 @@ struct GpuDeviceNode {
     std::array<VkDescriptorSet, NUM_IN_FLIGHT> rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout rtpPipelineLayout = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> rtpKhrPipeline;
+
+    // Secondary FidelityFX Shadow Denoiser Resources & Pipelines
+    std::unique_ptr<Image> directLightImage;
+    std::unique_ptr<Image> normalDepthImage;
+    std::unique_ptr<Image> shadowFilterPingImage;
+    std::unique_ptr<Image> momentsImages[2];
+    std::unique_ptr<Image> depthImages[2];
+    std::unique_ptr<Buffer> tileMetaDataBuffer;
+
+    VkDescriptorSetLayout shadowClassifyDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout shadowFilterDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet shadowClassifyDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet shadowFilterDescSet = VK_NULL_HANDLE;
+    uint32_t shadowPingPongIndex = 0;
+
+    VkPipelineLayout shadowClassifyPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout shadowFilterPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline shadowClassifyPipeline = VK_NULL_HANDLE;
+    VkPipeline shadowFilterPipeline = VK_NULL_HANDLE;
 
     ~GpuDeviceNode();
 };
@@ -109,6 +129,7 @@ public:
                              uint32_t hasEnvMap = 0,
                              float envMapIntensity = 1.0f,
                              uint32_t accumulateHistory = 1,
+                             float fractionalSpp = 0.0f,
                              void* dstHostPtr = nullptr,
                              size_t transferBytes = 0);
 
@@ -149,6 +170,7 @@ private:
         uint32_t hasEnvMap = 0;
         float envMapIntensity = 1.0f;
         uint32_t accumulateHistory = 1;
+        float fractionalSpp = 0.0f;
         void* dstHostPtr = nullptr;
         size_t transferBytes = 0;
         bool valid = false;
@@ -158,6 +180,7 @@ private:
     void executeSecondaryWork(const SecondaryWorkPacket& packet);
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
+    void updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode);
     void initSharedHostBuffer(VkDeviceSize bufferSize);
     void destroySharedHostBuffer();
     std::vector<char> loadShaderSPIRV(const std::string& filename);

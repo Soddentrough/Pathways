@@ -43,6 +43,10 @@ public:
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool
     );
 
+    static std::unique_ptr<Texture> createBlueNoise64(
+        VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool
+    );
+
     static std::unique_ptr<Texture> createProceduralHdrSky(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
         uint32_t width = 512, uint32_t height = 256

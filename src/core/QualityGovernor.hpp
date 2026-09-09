@@ -18,6 +18,8 @@ struct GovernorConfig {
 struct GovernorState {
     uint32_t currentSpp = 1;
     uint32_t currentBounces = 4;
+    float effectiveSpp = 1.0f;       // Continuous dynamic sample rate (e.g. 1.45 SPP)
+    float fractionalSpp = 0.0f;      // Fractional part for halftone blue-noise sampling [0.0, 1.0)
     uint32_t primSpp = 1;
     uint32_t secSpp = 0;
     float targetBudgetMs = 0.0f;
@@ -45,6 +47,8 @@ public:
 
     const GovernorState& getState() const { return m_state; }
     const GovernorConfig& getConfig() const { return m_config; }
+    float getEffectiveSpp() const { return m_state.effectiveSpp; }
+    float getFractionalSpp() const { return m_state.fractionalSpp; }
 
 private:
     GovernorConfig m_config;

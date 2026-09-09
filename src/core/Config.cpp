@@ -83,8 +83,8 @@ void Config::printUsage(const char* progName) {
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
-              << "  --max-bounces <int>     Maximum ray bounces (default: 4)\n"
               << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
+              << "  --warmup-frames <int>   Initial frames to exclude from benchmark stats (default: 0)\n"
               << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
@@ -92,12 +92,13 @@ void Config::printUsage(const char* progName) {
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
-              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'interleave' (Interleaved Scanlines), 'sample' (Sample Parallel), 'auto', or 'off'\n"
+              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
+              << "  --shadow-denoiser, --denoise-shadows Enable AMD FidelityFX Shadow Denoiser (default: disabled)\n"
               << "  --restir-di, --restir   Enable ReSTIR Direct Illumination reservoir resampling\n"
               << "  --restir-spatial        Enable ReSTIR spatial resampling [default: true when ReSTIR DI enabled]\n"
               << "  --no-restir-spatial     Disable ReSTIR spatial resampling (temporal only)\n"
@@ -111,6 +112,8 @@ void Config::printUsage(const char* progName) {
               << "  --min-bounces <int>     Minimum dynamic bounce floor (default: 2)\n"
               << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
+              << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
+              << "  --no-indirect, --direct-only  Disable indirect diffuse GI (isolate direct area light illumination)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -173,6 +176,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
             cfg.frame_limit = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--warmup-frames" && i + 1 < argc) {
+            cfg.warmup_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--render-scale" && i + 1 < argc) {
             cfg.render_scale = std::stof(argv[++i]);
         } else if (arg == "--scene" && i + 1 < argc) {
@@ -194,11 +199,16 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
-            else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") cfg.mgpu_mode = MultiGpuMode::InterleavedScanline;
+            else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
+                Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            }
             else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
+        } else if (arg == "--shadow-denoiser" || arg == "--denoise-shadows") {
+            cfg.enable_shadow_denoiser = true;
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {
@@ -269,6 +279,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.min_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--max-dynamic-bounces" && i + 1 < argc) {
             cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--no-accumulation" || arg == "--realtime") {
+            cfg.progressive_accumulation = false;
+        } else if (arg == "--accumulation") {
+            cfg.progressive_accumulation = true;
+        } else if (arg == "--no-indirect" || arg == "--direct-only") {
+            cfg.enable_indirect_light = false;
+        } else if (arg == "--indirect") {
+            cfg.enable_indirect_light = true;
         } else if (arg == "--no-validation") {
             cfg.validation_layers = false;
         } else if (arg == "--debug") {
@@ -288,6 +306,13 @@ Config Config::parse(int argc, char* argv[]) {
     if (cfg.headless && cfg.frame_limit == 0) {
         // In headless mode, default to 1 frame unless explicitly told to run more
         cfg.frame_limit = 1;
+    }
+
+    // Scale default spatial search radius for 4K (3840x2160) to maintain wide angular neighbor coverage
+    if (cfg.width >= 3840 || cfg.height >= 2160) {
+        if (cfg.restir_spatial_radius == 8.0f) {
+            cfg.restir_spatial_radius = 16.0f;
+        }
     }
 
     return cfg;

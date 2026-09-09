@@ -1,0 +1,135 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Binding 0: Tile metadata SSBO (0 = penumbra, 1 = all shadow, 2 = all lit)
+layout(std430, binding = 0) readonly buffer TileMetaDataBuffer {
+    uint tileMetaData[];
+};
+
+// Binding 1: World normal (xyz) + linear depth (w)
+layout(binding = 1) readonly uniform image2D uNormalDepthImage;
+
+// Binding 2: Intermediate shadow mask from Tile Classification / Reprojection pass
+layout(binding = 2) readonly uniform image2D uShadowFilterPing;
+
+// Binding 3: Unshadowed direct lighting (rgb)
+layout(binding = 3) readonly uniform image2D uDirectLightImage;
+
+// Binding 4: Final accumulation target (emissive + indirect bounces + resolved direct light)
+layout(binding = 4) uniform image2D uAccumImage;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 bufferDimensions;
+    vec2 invBufferDimensions;
+    int stepSize;
+    float depthSimilaritySigma;
+    float normalPower;
+    uint tileOffsetX; // 0 = full frame, 1 = GPU 0 white tiles, 2 = GPU 1 black tiles
+    uint tileOffsetY; // 0 = full screen
+    uint tileSize;    // Checkerboard tile size (e.g. 32 or 64)
+} pc;
+
+ivec2 getPixelCoord(ivec2 launchID) {
+    if (pc.tileOffsetY == 0u || pc.tileOffsetX == 0u) {
+        return launchID;
+    }
+    uint tileSize = (pc.tileSize > 0u) ? pc.tileSize : pc.tileOffsetY;
+    uint ty = uint(launchID.y) / tileSize;
+    uint tx_half = uint(launchID.x) / tileSize;
+    uint localX = uint(launchID.x) % tileSize;
+    uint tx = (pc.tileOffsetX == 1u) ? (tx_half * 2u + (ty & 1u))
+                                     : (tx_half * 2u + (1u - (ty & 1u)));
+    return ivec2(int(tx * tileSize + localX), launchID.y);
+}
+
+void main() {
+    ivec2 launchID = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 pixelCoord = getPixelCoord(launchID);
+
+    if (pixelCoord.x >= pc.bufferDimensions.x || pixelCoord.y >= pc.bufferDimensions.y) {
+        return;
+    }
+
+    uint tilesX = uint(pc.bufferDimensions.x + 7) / 8u;
+    uint tileIdx = (uint(pixelCoord.y) / 8u) * tilesX + (uint(pixelCoord.x) / 8u);
+    uint tileMeta = tileMetaData[tileIdx];
+
+    // Fast-path: Fully Lit Tiles (zero filtering overhead)
+    if (tileMeta == 2u) {
+        vec3 directLight = imageLoad(uDirectLightImage, pixelCoord).rgb;
+        ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+        vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
+        imageStore(uAccumImage, storeCoord, prevAccum + vec4(directLight, 0.0));
+        return;
+    }
+
+    // Fast-path: Fully Shadowed Tiles (zero filtering overhead)
+    if (tileMeta == 1u) {
+        return;
+    }
+
+    // Active Penumbra Tile: Cross-Bilateral À-Trous Filter
+    vec4 normDepth0 = imageLoad(uNormalDepthImage, pixelCoord);
+    vec3 n0 = normDepth0.xyz;
+    float z0 = normDepth0.w;
+
+    if (z0 <= 0.0) {
+        return; // Sky or background
+    }
+
+    // Checkerboard tile border clamping bounds
+    int minTileX = 0;
+    int maxTileX = pc.bufferDimensions.x - 1;
+    if ((pc.tileOffsetY > 0u || pc.tileSize > 0u) && pc.tileOffsetX > 0u) {
+        uint ts = (pc.tileSize > 0u) ? pc.tileSize : pc.tileOffsetY;
+        minTileX = int((uint(pixelCoord.x) / ts) * ts);
+        maxTileX = minTileX + int(ts) - 1;
+    }
+
+    // 9-tap 3x3 À-Trous filter kernel with stepSize
+    float spatialWeights[3] = { 0.25, 0.5, 0.25 };
+    float sumS = 0.0;
+    float sumW = 0.0;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 tapCoord = pixelCoord + ivec2(dx, dy) * pc.stepSize;
+
+            // Clamp coordinate within local checkerboard tile bounds and screen extents
+            tapCoord.x = clamp(tapCoord.x, minTileX, maxTileX);
+            tapCoord.y = clamp(tapCoord.y, 0, pc.bufferDimensions.y - 1);
+
+            vec4 tapNormDepth = imageLoad(uNormalDepthImage, tapCoord);
+            vec3 n_tap = tapNormDepth.xyz;
+            float z_tap = tapNormDepth.w;
+            float s_tap = imageLoad(uShadowFilterPing, tapCoord).r;
+
+            float kSpatial = spatialWeights[dx + 1] * spatialWeights[dy + 1];
+
+            // Depth edge-stopping weight
+            float depthDiff = abs(z_tap - z0);
+            float depthWeight = exp(-depthDiff / (pc.depthSimilaritySigma * z0 + 1e-4));
+
+            // Normal edge-stopping weight
+            float normDot = max(0.0, dot(n0, n_tap));
+            float normWeight = pow(normDot, pc.normalPower);
+
+            float weight = kSpatial * depthWeight * normWeight;
+            sumS += s_tap * weight;
+            sumW += weight;
+        }
+    }
+
+    float filteredShadow = sumS / max(sumW, 1e-4);
+
+    // Contact contrast remapping: restores crispness at contact shadow edges
+    filteredShadow = pow(clamp(filteredShadow, 0.0, 1.0), 1.15);
+
+    // Composite direct light with filtered shadow mask directly into accumulation target
+    vec3 directLight = imageLoad(uDirectLightImage, pixelCoord).rgb;
+    ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+    vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
+    imageStore(uAccumImage, storeCoord, prevAccum + vec4(directLight * filteredShadow, 0.0));
+}
