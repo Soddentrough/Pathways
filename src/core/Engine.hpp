@@ -178,6 +178,23 @@ private:
     void updateShadowDenoiserDescriptors();
     double m_lastShadowDenoiserTimeMs = 0.0;
 
+    // Temporal Anti-Aliasing (TAA) Resources & Pipelines
+    std::unique_ptr<Image> m_motionVectorImage;
+    std::unique_ptr<Image> m_taaHistoryImages[2];
+    VkSampler m_taaHistorySampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_taaDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_taaDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    uint32_t m_taaPingPongIndex = 0;
+    VkPipelineLayout m_taaPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_taaPipeline = VK_NULL_HANDLE;
+
+    void createTaaPipelines();
+    void createTaaResources();
+    void destroyTaaResources();
+    void destroyTaaPipelines();
+    void updateTaaDescriptors();
+    double m_lastTaaTimeMs = 0.0;
+
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";

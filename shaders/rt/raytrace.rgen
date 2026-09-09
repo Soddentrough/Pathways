@@ -19,6 +19,7 @@ layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 11, rgba16f) uniform image2D uDirectLightImage;
 layout(binding = 12, rgba16f) uniform image2D uNormalDepthImage;
 layout(binding = 13) uniform sampler2D uBlueNoiseTexture;
+layout(binding = 14, rg16f) uniform image2D uMotionVectorImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -30,6 +31,8 @@ layout(binding = 1) uniform CameraUBO {
     uint spp;
     uint maxBounces;
     uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
 } ubo;
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
@@ -182,6 +185,31 @@ void main() {
 
             // Direct emissive + direct light (accumulated in rchit) or sky (miss)
             radiance += throughput * prd.radiance;
+
+            // Primary bounce: compute and store screen-space geometric motion vector
+            if (bounce == 0u && s == 0u) {
+                vec2 mv = vec2(0.0);
+                if (hit) {
+                    vec3 hitPoint = prd.nextOrigin;
+                    vec4 currClip = ubo.unjitteredViewProj * vec4(hitPoint, 1.0);
+                    vec4 prevClip = ubo.prevViewProj * vec4(hitPoint, 1.0);
+                    if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
+                        vec2 currNdc = currClip.xy / currClip.w;
+                        vec2 prevNdc = prevClip.xy / prevClip.w;
+                        mv = (currNdc - prevNdc) * 0.5;
+                    }
+                } else {
+                    vec4 currClip = ubo.unjitteredViewProj * vec4(rayDir, 0.0);
+                    vec4 prevClip = ubo.prevViewProj * vec4(rayDir, 0.0);
+                    if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
+                        vec2 currNdc = currClip.xy / currClip.w;
+                        vec2 prevNdc = prevClip.xy / prevClip.w;
+                        mv = (currNdc - prevNdc) * 0.5;
+                    }
+                }
+                ivec2 mvStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+                imageStore(uMotionVectorImage, mvStoreCoord, vec4(mv, 0.0, 0.0));
+            }
 
             if (!hit) {
                 break;

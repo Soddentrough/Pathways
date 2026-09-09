@@ -322,16 +322,32 @@ glm::mat4 Camera::getProjectionMatrix() const {
     return proj;
 }
 
-CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags) const {
+CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags,
+                                     bool enableTaa, uint32_t width, uint32_t height, uint32_t phaseOffset) const {
     CameraUniform ubo{};
     glm::mat4 view = getViewMatrix();
     glm::mat4 proj = getProjectionMatrix();
-    glm::mat4 currentViewProj = proj * view;
+    glm::mat4 unjitteredProj = proj;
+    glm::mat4 unjitteredViewProj = unjitteredProj * view;
+
+    glm::vec2 pixelJitter(0.0f);
+    glm::vec2 ndcJitter(0.0f);
+    if (enableTaa && width > 0 && height > 0) {
+        flags |= (1u << 21); // bit 21: TAA active flag
+        pixelJitter = getHaltonJitter(frameIndex + phaseOffset);
+        ndcJitter.x = (2.0f * pixelJitter.x) / static_cast<float>(width);
+        ndcJitter.y = (2.0f * pixelJitter.y) / static_cast<float>(height);
+
+        // Subpixel projection jitter offset in Vulkan clip space
+        proj[2][0] += ndcJitter.x;
+        proj[2][1] += ndcJitter.y;
+    }
 
     ubo.viewInverse = glm::inverse(view);
     ubo.projInverse = glm::inverse(proj);
-    ubo.prevViewProj = m_hasPrevViewProj ? m_prevViewProj : currentViewProj;
-    m_prevViewProj = currentViewProj;
+    ubo.unjitteredViewProj = unjitteredViewProj;
+    ubo.prevViewProj = m_hasPrevViewProj ? m_prevViewProj : unjitteredViewProj;
+    m_prevViewProj = unjitteredViewProj; // Store unjittered for velocity estimation
     m_hasPrevViewProj = true;
 
     ubo.position = glm::vec4(m_position, 1.0f);
@@ -340,6 +356,7 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     ubo.spp = spp;
     ubo.maxBounces = maxBounces;
     ubo.flags = flags;
+    ubo.jitterOffset = glm::vec4(pixelJitter.x, pixelJitter.y, ndcJitter.x, ndcJitter.y);
 
     return ubo;
 }

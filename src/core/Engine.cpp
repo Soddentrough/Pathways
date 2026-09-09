@@ -231,6 +231,8 @@ Engine::~Engine() {
     m_rtpKhrPipeline.reset();
     destroyShadowDenoiserResources();
     destroyShadowDenoiserPipelines();
+    destroyTaaResources();
+    destroyTaaPipelines();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
 
@@ -890,7 +892,7 @@ void Engine::initPipelines() {
 
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 160 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32 },
@@ -901,7 +903,7 @@ void Engine::initPipelines() {
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = 128;
+    poolInfo.maxSets = 160;
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool);
 
     // 2. Ray Tracing Descriptor Set Layout (VK_KHR_ray_tracing_pipeline)
@@ -921,7 +923,8 @@ void Engine::initPipelines() {
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr }
+        { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1106,6 +1109,11 @@ void Engine::initPipelines() {
     // 8. FidelityFX Shadow Denoiser Resources & Pipelines
     createShadowDenoiserPipelines();
     createShadowDenoiserResources();
+
+    // 9. Temporal Anti-Aliasing (TAA) Resources & Pipelines
+    createTaaPipelines();
+    createTaaResources();
+
     updateAllImageDescriptors();
 }
 
@@ -1128,6 +1136,11 @@ void Engine::updateAllImageDescriptors() {
     if (m_normalDepthImage) {
         normDepthInfo.imageView = m_normalDepthImage->getImageView();
         normDepthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    VkDescriptorImageInfo mvImageInfo{};
+    if (m_motionVectorImage) {
+        mvImageInfo.imageView = m_motionVectorImage->getImageView();
+        mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     std::vector<VkWriteDescriptorSet> writes;
@@ -1157,6 +1170,16 @@ void Engine::updateAllImageDescriptors() {
                 w12.descriptorCount = 1;
                 w12.pImageInfo = &normDepthInfo;
                 writes.push_back(w12);
+            }
+
+            if (m_motionVectorImage) {
+                VkWriteDescriptorSet w14{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                w14.dstSet = m_rtDescSets[i];
+                w14.dstBinding = 14;
+                w14.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w14.descriptorCount = 1;
+                w14.pImageInfo = &mvImageInfo;
+                writes.push_back(w14);
             }
         }
     }
@@ -1405,6 +1428,167 @@ void Engine::updateShadowDenoiserDescriptors() {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr }
     };
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void Engine::createTaaPipelines() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Create Sampler for history reprojection (bilinear clamp-to-edge)
+    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    vkCreateSampler(device, &samplerInfo, nullptr, &m_taaHistorySampler);
+
+    // 2. Create Descriptor Set Layout
+    std::vector<VkDescriptorSetLayoutBinding> taaBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(taaBindings.size());
+    layoutInfo.pBindings = taaBindings.data();
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_taaDescLayout);
+
+    // 3. Allocate Ping-Pong Descriptor Sets
+    std::array<VkDescriptorSetLayout, 2> layouts = { m_taaDescLayout, m_taaDescLayout };
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_descriptorPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = layouts.data();
+    vkAllocateDescriptorSets(device, &allocInfo, m_taaDescSets);
+
+    // 4. Create Pipeline Layout
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 3 + sizeof(float) * 2 + sizeof(uint32_t) * 3;
+
+    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &m_taaDescLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    vkCreatePipelineLayout(device, &plInfo, nullptr, &m_taaPipelineLayout);
+
+    // 5. Create Compute Pipeline
+    auto taaCode = loadShaderSPIRV("taa_resolve.comp.spv");
+    VkShaderModule taaShaderModule = createShaderModule(taaCode);
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, taaShaderModule, "main", nullptr };
+    pipeInfo.layout = m_taaPipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_taaPipeline);
+    vkDestroyShaderModule(device, taaShaderModule, nullptr);
+
+    Logger::info("Temporal Anti-Aliasing (TAA) pipelines created successfully.");
+}
+
+void Engine::destroyTaaPipelines() {
+    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
+    if (!device) return;
+
+    if (m_taaPipeline) { vkDestroyPipeline(device, m_taaPipeline, nullptr); m_taaPipeline = VK_NULL_HANDLE; }
+    if (m_taaPipelineLayout) { vkDestroyPipelineLayout(device, m_taaPipelineLayout, nullptr); m_taaPipelineLayout = VK_NULL_HANDLE; }
+    if (m_taaDescLayout) { vkDestroyDescriptorSetLayout(device, m_taaDescLayout, nullptr); m_taaDescLayout = VK_NULL_HANDLE; }
+    if (m_taaHistorySampler) { vkDestroySampler(device, m_taaHistorySampler, nullptr); m_taaHistorySampler = VK_NULL_HANDLE; }
+    m_taaDescSets[0] = VK_NULL_HANDLE;
+    m_taaDescSets[1] = VK_NULL_HANDLE;
+}
+
+void Engine::createTaaResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    uint32_t w = m_config.width;
+    uint32_t h = m_config.height;
+
+    // Allocate Motion Vector Image (RG16F)
+    m_motionVectorImage = std::make_unique<Image>(device, allocator, w, h,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+    // Allocate History Images (RGBA16F to match radiance)
+    for (int i = 0; i < 2; ++i) {
+        m_taaHistoryImages[i] = std::make_unique<Image>(device, allocator, w, h,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    }
+
+    // Transition layouts to GENERAL
+    VkCommandBuffer cmd = m_commandBuffers[0];
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cmd, &beginInfo);
+    m_motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    for (int i = 0; i < 2; ++i) {
+        m_taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+
+    m_taaPingPongIndex = 0;
+    updateTaaDescriptors();
+    Logger::info("Temporal Anti-Aliasing (TAA) resources allocated successfully.");
+}
+
+void Engine::destroyTaaResources() {
+    m_motionVectorImage.reset();
+    m_taaHistoryImages[0].reset();
+    m_taaHistoryImages[1].reset();
+}
+
+void Engine::updateTaaDescriptors() {
+    if (m_taaDescSets[0] == VK_NULL_HANDLE || m_taaDescSets[1] == VK_NULL_HANDLE ||
+        !m_motionVectorImage || !m_taaHistoryImages[0] || !m_taaHistoryImages[1] ||
+        !m_accumImage || !m_normalDepthImage || m_taaHistorySampler == VK_NULL_HANDLE) return;
+
+    VkDevice device = m_context->getDevice();
+
+    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    VkDescriptorImageInfo histInfo0{ m_taaHistorySampler, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo histInfo1{ m_taaHistorySampler, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    VkDescriptorImageInfo outInfo0{ VK_NULL_HANDLE, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outInfo1{ VK_NULL_HANDLE, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        // Set 0: Read history from [0], resolve output into [1]
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo0, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo1, nullptr, nullptr },
+
+        // Set 1: Read history from [1], resolve output into [0]
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo1, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo0, nullptr, nullptr }
+    };
+
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -1984,8 +2168,12 @@ void Engine::renderFrame() {
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
+    if (m_config.enable_taa) {
+        flags |= (1 << 21);
+    }
 
-    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags);
+    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
+                                                 m_config.enable_taa, m_config.width, m_config.height, 0);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
     uint32_t imageIndex = 0;
@@ -2172,6 +2360,80 @@ void Engine::renderFrame() {
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
+        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
+            VkMemoryBarrier2 rtToTaaBarrier{};
+            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+            VkDependencyInfo taaDep{};
+            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            taaDep.memoryBarrierCount = 1;
+            taaDep.pMemoryBarriers = &rtToTaaBarrier;
+            vkCmdPipelineBarrier2(cmd, &taaDep);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
+
+            struct TaaPushConstants {
+                int32_t imageWidth;
+                int32_t imageHeight;
+                float invImageWidth;
+                float invImageHeight;
+                uint32_t tileOffsetX;
+                uint32_t tileOffsetY;
+                uint32_t tileSize;
+                float blendAlpha;
+                float clippingGamma;
+                uint32_t resetHistory;
+                uint32_t isSampleParallel;
+                uint32_t screenWidth;
+            } taaPC;
+            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
+            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
+            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
+            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
+            taaPC.tileOffsetX = 0;
+            taaPC.tileOffsetY = 0;
+            taaPC.tileSize = m_config.tile_size;
+            taaPC.blendAlpha = m_config.taa_blend_alpha;
+            taaPC.clippingGamma = m_config.taa_clipping_gamma;
+            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
+            taaPC.isSampleParallel = 0u;
+            taaPC.screenWidth = m_config.width;
+
+            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
+            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
+
+            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.extent = { m_config.width, m_config.height, 1 };
+
+            VkMemoryBarrier2 taaToCopyBarrier{};
+            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+            VkDependencyInfo taaToCopyDep{};
+            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            taaToCopyDep.memoryBarrierCount = 1;
+            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
+            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
+
+            vkCmdCopyImage(cmd,
+                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                1, &copyRegion);
+
+            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
+        }
+
         VkMemoryBarrier2 memBarrier{};
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
@@ -2268,8 +2530,18 @@ void Engine::renderFrame() {
             // De-correlate secondary PRNG seed from primary
             uboSec.frameIndex = m_frameIndex + 1000003u;
 
+            if (m_config.enable_taa) {
+                uboSec = m_camera->getUniformData(m_frameIndex, secSpp, activeBounces, flags,
+                                                  true, m_config.width, m_config.height, 4);
+                uboSec.frameIndex = m_frameIndex + 1000003u;
+            }
+
             // Re-upload primary camera UBO with primSpp
             m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
+        }
+
+        if (m_mgpu) {
+            m_mgpu->setConfig(m_config);
         }
 
         if (!m_mgpu->isZeroCopyActive()) {
@@ -2398,6 +2670,80 @@ void Engine::renderFrame() {
 
             // Ping-pong moments and depth image resources for next frame
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
+        }
+
+        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
+            VkMemoryBarrier2 rtToTaaBarrier{};
+            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+            VkDependencyInfo taaDep{};
+            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            taaDep.memoryBarrierCount = 1;
+            taaDep.pMemoryBarriers = &rtToTaaBarrier;
+            vkCmdPipelineBarrier2(cmd, &taaDep);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
+
+            struct TaaPushConstants {
+                int32_t imageWidth;
+                int32_t imageHeight;
+                float invImageWidth;
+                float invImageHeight;
+                uint32_t tileOffsetX;
+                uint32_t tileOffsetY;
+                uint32_t tileSize;
+                float blendAlpha;
+                float clippingGamma;
+                uint32_t resetHistory;
+                uint32_t isSampleParallel;
+                uint32_t screenWidth;
+            } taaPC;
+            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
+            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
+            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
+            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
+            taaPC.tileOffsetX = tileOffsetX_prim;
+            taaPC.tileOffsetY = tileOffsetY_prim;
+            taaPC.tileSize = m_config.tile_size;
+            taaPC.blendAlpha = m_config.taa_blend_alpha;
+            taaPC.clippingGamma = m_config.taa_clipping_gamma;
+            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
+            taaPC.isSampleParallel = (activeMode == MultiGpuMode::SampleParallel) ? 1u : 0u;
+            taaPC.screenWidth = m_config.width;
+
+            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
+            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
+
+            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.extent = { m_config.width, m_config.height, 1 };
+
+            VkMemoryBarrier2 taaToCopyBarrier{};
+            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+            VkDependencyInfo taaToCopyDep{};
+            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            taaToCopyDep.memoryBarrierCount = 1;
+            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
+            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
+
+            vkCmdCopyImage(cmd,
+                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                1, &copyRegion);
+
+            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
         }
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
@@ -3270,9 +3616,11 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    // 6. Recreate Shadow Denoiser Resources, update all image descriptors and multi-GPU merge descriptors
+    // 6. Recreate Shadow Denoiser & TAA Resources, update all image descriptors and multi-GPU merge descriptors
     destroyShadowDenoiserResources();
     createShadowDenoiserResources();
+    destroyTaaResources();
+    createTaaResources();
     updateAllImageDescriptors();
     updateMergeDescriptors();
 

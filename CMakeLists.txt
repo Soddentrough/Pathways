@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.25)
-project(Pathways VERSION 1.6.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.28)
+project(Pathways VERSION 1.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -127,6 +127,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/accum_merge.comp
     ${SHADER_DIR}/compute/ffx_shadow_tileclassify.comp
     ${SHADER_DIR}/compute/ffx_shadow_filter.comp
+    ${SHADER_DIR}/compute/taa_resolve.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -288,6 +289,22 @@ if(UNIX)
     target_link_libraries(test_shadow_denoiser PRIVATE m)
 endif()
 add_test(NAME ShadowDenoiser COMMAND test_shadow_denoiser)
+
+# Temporal Anti-Aliasing (TAA) Unit Test Target
+add_executable(test_taa
+    tests/test_taa.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+    src/scene/Camera.cpp
+)
+target_include_directories(test_taa PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_taa PRIVATE m)
+endif()
+add_test(NAME TemporalAntiAliasing COMMAND test_taa)
 
 
 # ==============================================================================

@@ -99,6 +99,10 @@ void Config::printUsage(const char* progName) {
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --shadow-denoiser, --denoise-shadows Enable AMD FidelityFX Shadow Denoiser (default: disabled)\n"
+              << "  --taa                   Enable Temporal Anti-Aliasing (TAA) (default: disabled)\n"
+              << "  --no-taa                Disable Temporal Anti-Aliasing (TAA)\n"
+              << "  --taa-alpha <float>     TAA temporal blend alpha (default: 0.10)\n"
+              << "  --taa-gamma <float>     TAA variance clipping gamma (default: 1.25)\n"
               << "  --restir-di, --restir   Enable ReSTIR Direct Illumination reservoir resampling\n"
               << "  --restir-spatial        Enable ReSTIR spatial resampling [default: true when ReSTIR DI enabled]\n"
               << "  --no-restir-spatial     Disable ReSTIR spatial resampling (temporal only)\n"
@@ -209,6 +213,14 @@ Config Config::parse(int argc, char* argv[]) {
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--shadow-denoiser" || arg == "--denoise-shadows") {
             cfg.enable_shadow_denoiser = true;
+        } else if (arg == "--taa") {
+            cfg.enable_taa = true;
+        } else if (arg == "--no-taa") {
+            cfg.enable_taa = false;
+        } else if (arg == "--taa-alpha" && i + 1 < argc) {
+            cfg.taa_blend_alpha = std::stof(argv[++i]);
+        } else if (arg == "--taa-gamma" && i + 1 < argc) {
+            cfg.taa_clipping_gamma = std::stof(argv[++i]);
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {

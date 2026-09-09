@@ -96,6 +96,16 @@ struct GpuDeviceNode {
     VkPipeline shadowClassifyPipeline = VK_NULL_HANDLE;
     VkPipeline shadowFilterPipeline = VK_NULL_HANDLE;
 
+    // Secondary TAA Resources & Pipelines (Solution 2 & 1)
+    std::unique_ptr<Image> motionVectorImage;
+    std::unique_ptr<Image> taaHistoryImages[2];
+    VkSampler taaHistorySampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout taaDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet taaDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    uint32_t taaPingPongIndex = 0;
+    VkPipelineLayout taaPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline taaPipeline = VK_NULL_HANDLE;
+
     ~GpuDeviceNode();
 };
 
@@ -111,6 +121,7 @@ public:
     MultiGpuMode getMode() const { return m_mode; }
     void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
     void setFormat(AccumFormat format) { m_config.accum_format = format; }
+    void setConfig(const Config& config) { m_config = config; }
     double getSecondaryGpuTimeMs() const;
     double getSecondaryTransferTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
@@ -181,6 +192,11 @@ private:
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
     void updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode);
+    void createSecondaryTaaPipelines(GpuDeviceNode* secNode);
+    void createSecondaryTaaResources(GpuDeviceNode* secNode, uint32_t width, uint32_t height);
+    void destroySecondaryTaaResources(GpuDeviceNode* secNode);
+    void destroySecondaryTaaPipelines(GpuDeviceNode* secNode);
+    void updateSecondaryTaaDescriptors(GpuDeviceNode* secNode);
     void initSharedHostBuffer(VkDeviceSize bufferSize);
     void destroySharedHostBuffer();
     std::vector<char> loadShaderSPIRV(const std::string& filename);

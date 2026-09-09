@@ -1108,6 +1108,28 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 ImGui::Unindent();
             }
+            if (ImGui::Checkbox("Temporal Anti-Aliasing (TAA)", &config.enable_taa)) {
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Screen-space motion vector reprojection with YCoCg variance clipping and distributed tile-parallel support.");
+            }
+            if (config.enable_taa) {
+                ImGui::Indent();
+                if (ImGui::SliderFloat("TAA Alpha", &config.taa_blend_alpha, 0.01f, 0.50f, "%.2f")) {
+                    // blend alpha
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Weight of current frame sample vs. temporal history (lower = smoother, higher = sharper/more responsive).");
+                }
+                if (ImGui::SliderFloat("Clipping Gamma", &config.taa_clipping_gamma, 0.50f, 3.00f, "%.2f")) {
+                    // variance clipping gamma
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Variance bounding box multiplier for clamping history in YCoCg space.");
+                }
+                ImGui::Unindent();
+            }
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation
             }

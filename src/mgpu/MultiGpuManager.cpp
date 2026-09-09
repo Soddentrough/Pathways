@@ -72,6 +72,11 @@ GpuDeviceNode::~GpuDeviceNode() {
     if (shadowClassifyDescLayout) vkDestroyDescriptorSetLayout(device, shadowClassifyDescLayout, nullptr);
     if (shadowFilterDescLayout) vkDestroyDescriptorSetLayout(device, shadowFilterDescLayout, nullptr);
 
+    if (taaPipeline) vkDestroyPipeline(device, taaPipeline, nullptr);
+    if (taaPipelineLayout) vkDestroyPipelineLayout(device, taaPipelineLayout, nullptr);
+    if (taaDescLayout) vkDestroyDescriptorSetLayout(device, taaDescLayout, nullptr);
+    if (taaHistorySampler) vkDestroySampler(device, taaHistorySampler, nullptr);
+
     directLightImage.reset();
     normalDepthImage.reset();
     shadowFilterPingImage.reset();
@@ -80,6 +85,10 @@ GpuDeviceNode::~GpuDeviceNode() {
     depthImages[0].reset();
     depthImages[1].reset();
     tileMetaDataBuffer.reset();
+
+    motionVectorImage.reset();
+    taaHistoryImages[0].reset();
+    taaHistoryImages[1].reset();
 }
 
 MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene)
@@ -587,7 +596,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     // 5. Descriptor Pool & Sets on secondary device
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 },
@@ -597,7 +606,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descPoolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     descPoolInfo.pPoolSizes = poolSizes.data();
-    descPoolInfo.maxSets = 16;
+    descPoolInfo.maxSets = 32;
     vkCreateDescriptorPool(secDevice, &descPoolInfo, nullptr, &secNode->descriptorPool);
 
     VkShaderStageFlags rtStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
@@ -616,7 +625,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr }
+        { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -674,12 +684,17 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
+    secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
@@ -722,7 +737,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
         };
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -838,11 +854,22 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     );
     Logger::info("Secondary GPU: Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) initialized.");
 
-    // 7. Transition secondary images to GENERAL layout
+    // 7. Secondary Temporal Anti-Aliasing (TAA) Pipelines & Resources
+    createSecondaryTaaPipelines(secNode.get());
+    createSecondaryTaaResources(secNode.get(), config.width, config.height);
+
+    // 8. Transition secondary images to GENERAL layout
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(secNode->commandBuffers[0], &beginInfo);
+
+    secNode->motionVectorImage->transitionLayout(
+        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
 
     secNode->accumTarget->transitionLayout(
         secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -958,6 +985,166 @@ void MultiGpuManager::updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* se
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr }
     };
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void MultiGpuManager::createSecondaryTaaPipelines(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->context) return;
+    VkDevice device = secNode->context->getDevice();
+
+    // 1. Create history reprojection sampler
+    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    vkCreateSampler(device, &samplerInfo, nullptr, &secNode->taaHistorySampler);
+
+    // 2. Create Descriptor Set Layout
+    std::vector<VkDescriptorSetLayoutBinding> taaBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(taaBindings.size());
+    layoutInfo.pBindings = taaBindings.data();
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &secNode->taaDescLayout);
+
+    // 3. Allocate Descriptor Sets
+    std::array<VkDescriptorSetLayout, 2> layouts = { secNode->taaDescLayout, secNode->taaDescLayout };
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = secNode->descriptorPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = layouts.data();
+    vkAllocateDescriptorSets(device, &allocInfo, secNode->taaDescSets);
+
+    // 4. Create Pipeline Layout
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 3 + sizeof(float) * 2 + sizeof(uint32_t) * 3;
+
+    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &secNode->taaDescLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    vkCreatePipelineLayout(device, &plInfo, nullptr, &secNode->taaPipelineLayout);
+
+    // 5. Create Pipeline
+    auto taaCode = loadShaderSPIRV("taa_resolve.comp.spv");
+    VkShaderModule taaShaderModule = createShaderModule(device, taaCode);
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, taaShaderModule, "main", nullptr };
+    pipeInfo.layout = secNode->taaPipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &secNode->taaPipeline);
+    vkDestroyShaderModule(device, taaShaderModule, nullptr);
+
+    Logger::info("Secondary GPU: Temporal Anti-Aliasing (TAA) pipelines created successfully.");
+}
+
+void MultiGpuManager::destroySecondaryTaaPipelines(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->context) return;
+    VkDevice device = secNode->context->getDevice();
+    if (secNode->taaPipeline) { vkDestroyPipeline(device, secNode->taaPipeline, nullptr); secNode->taaPipeline = VK_NULL_HANDLE; }
+    if (secNode->taaPipelineLayout) { vkDestroyPipelineLayout(device, secNode->taaPipelineLayout, nullptr); secNode->taaPipelineLayout = VK_NULL_HANDLE; }
+    if (secNode->taaDescLayout) { vkDestroyDescriptorSetLayout(device, secNode->taaDescLayout, nullptr); secNode->taaDescLayout = VK_NULL_HANDLE; }
+    if (secNode->taaHistorySampler) { vkDestroySampler(device, secNode->taaHistorySampler, nullptr); secNode->taaHistorySampler = VK_NULL_HANDLE; }
+    secNode->taaDescSets[0] = VK_NULL_HANDLE;
+    secNode->taaDescSets[1] = VK_NULL_HANDLE;
+}
+
+void MultiGpuManager::createSecondaryTaaResources(GpuDeviceNode* secNode, uint32_t width, uint32_t height) {
+    if (!secNode || !secNode->context) return;
+    VkDevice device = secNode->context->getDevice();
+    VmaAllocator allocator = secNode->context->getAllocator();
+
+    if (!secNode->motionVectorImage) {
+        secNode->motionVectorImage = std::make_unique<Image>(device, allocator, width, height,
+            VK_FORMAT_R16G16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        secNode->taaHistoryImages[i] = std::make_unique<Image>(device, allocator, width, height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    }
+
+    VkCommandBuffer cmd = secNode->commandBuffers[0];
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cmd, &beginInfo);
+    secNode->motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    for (int i = 0; i < 2; ++i) {
+        secNode->taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(secNode->context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(secNode->context->getGraphicsQueue());
+
+    secNode->taaPingPongIndex = 0;
+    updateSecondaryTaaDescriptors(secNode);
+    Logger::info("Secondary GPU: Temporal Anti-Aliasing (TAA) resources allocated successfully.");
+}
+
+void MultiGpuManager::destroySecondaryTaaResources(GpuDeviceNode* secNode) {
+    if (!secNode) return;
+    secNode->motionVectorImage.reset();
+    secNode->taaHistoryImages[0].reset();
+    secNode->taaHistoryImages[1].reset();
+}
+
+void MultiGpuManager::updateSecondaryTaaDescriptors(GpuDeviceNode* secNode) {
+    if (!secNode || secNode->taaDescSets[0] == VK_NULL_HANDLE || secNode->taaDescSets[1] == VK_NULL_HANDLE ||
+        !secNode->motionVectorImage || !secNode->taaHistoryImages[0] || !secNode->taaHistoryImages[1] ||
+        !secNode->accumTarget || !secNode->normalDepthImage || secNode->taaHistorySampler == VK_NULL_HANDLE) return;
+
+    VkDevice device = secNode->context->getDevice();
+
+    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, secNode->accumTarget->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    VkDescriptorImageInfo histInfo0{ secNode->taaHistorySampler, secNode->taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo histInfo1{ secNode->taaHistorySampler, secNode->taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    VkDescriptorImageInfo outInfo0{ VK_NULL_HANDLE, secNode->taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outInfo1{ VK_NULL_HANDLE, secNode->taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        // Set 0: Read history from [0], resolve output into [1]
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo0, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo1, nullptr, nullptr },
+
+        // Set 1: Read history from [1], resolve output into [0]
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo1, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->taaDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo0, nullptr, nullptr }
+    };
+
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -1161,6 +1348,87 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         vkCmdDispatch(cmd, (packet.tileWidth + 7) / 8, (packet.tileHeight + 7) / 8, 1);
 
         node->shadowPingPongIndex = 1 - node->shadowPingPongIndex;
+    }
+
+    if (m_config.enable_taa && node->taaPipeline && node->motionVectorImage && node->taaHistoryImages[0] && node->taaHistoryImages[1]) {
+        VkMemoryBarrier2 rtToTaaBarrier{};
+        rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+        VkDependencyInfo taaDep{};
+        taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        taaDep.memoryBarrierCount = 1;
+        taaDep.pMemoryBarriers = &rtToTaaBarrier;
+        vkCmdPipelineBarrier2(cmd, &taaDep);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->taaPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->taaPipelineLayout, 0, 1, &node->taaDescSets[node->taaPingPongIndex], 0, nullptr);
+
+        uint32_t taaWidth = packet.tileWidth;
+        uint32_t taaHeight = packet.tileHeight;
+        if (packet.tileOffsetX == 2u) {
+            taaWidth = (packet.tileWidth + 1) / 2;
+            taaHeight = packet.tileHeight;
+        }
+
+        struct TaaPushConstants {
+            int32_t imageWidth;
+            int32_t imageHeight;
+            float invImageWidth;
+            float invImageHeight;
+            uint32_t tileOffsetX;
+            uint32_t tileOffsetY;
+            uint32_t tileSize;
+            float blendAlpha;
+            float clippingGamma;
+            uint32_t resetHistory;
+            uint32_t isSampleParallel;
+            uint32_t screenWidth;
+        } taaPC;
+        taaPC.imageWidth = static_cast<int32_t>(taaWidth);
+        taaPC.imageHeight = static_cast<int32_t>(taaHeight);
+        taaPC.invImageWidth = 1.0f / static_cast<float>(taaWidth);
+        taaPC.invImageHeight = 1.0f / static_cast<float>(taaHeight);
+        taaPC.tileOffsetX = packet.tileOffsetX;
+        taaPC.tileOffsetY = packet.tileOffsetY;
+        taaPC.tileSize = m_config.tile_size;
+        taaPC.blendAlpha = m_config.taa_blend_alpha;
+        taaPC.clippingGamma = m_config.taa_clipping_gamma;
+        taaPC.resetHistory = (packet.cameraUniform.frameIndex == 0u) ? 1u : 0u;
+        taaPC.isSampleParallel = (packet.tileOffsetX == 0u) ? 1u : 0u;
+        taaPC.screenWidth = packet.tileWidth;
+
+        vkCmdPushConstants(cmd, node->taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
+        vkCmdDispatch(cmd, (taaWidth + 7) / 8, (taaHeight + 7) / 8, 1);
+
+        // Copy resolved output from history image [1 - node->taaPingPongIndex] back to node->accumTarget
+        VkImageCopy copyRegion{};
+        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.extent = { taaWidth, taaHeight, 1 };
+
+        VkMemoryBarrier2 taaToCopyBarrier{};
+        taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+        VkDependencyInfo taaToCopyDep{};
+        taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        taaToCopyDep.memoryBarrierCount = 1;
+        taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
+
+        vkCmdCopyImage(cmd,
+            node->taaHistoryImages[1 - node->taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            node->accumTarget->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            1, &copyRegion);
+
+        node->taaPingPongIndex = 1 - node->taaPingPongIndex;
     }
 
     // Timestamp 1: RT End
@@ -1473,6 +1741,20 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         }
         node->shadowPingPongIndex = 0;
 
+        // Recreate secondary TAA resources
+        node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+            VK_FORMAT_R16G16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        destroySecondaryTaaResources(node.get());
+        createSecondaryTaaResources(node.get(), width, height);
+
+        node->motionVectorImage->transitionLayout(
+            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+
         VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdClearColorImage(node->commandBuffers[0], node->accumTarget->getImage(),
@@ -1508,6 +1790,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, node->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
         VkDescriptorBufferInfo res0Info{ node->restirReservoirs[0]->getBuffer(), 0, resSize };
         VkDescriptorBufferInfo res1Info{ node->restirReservoirs[1]->getBuffer(), 0, resSize };
@@ -1518,7 +1801,8 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr }
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
             };
             vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -1530,6 +1814,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             }
         }
         updateSecondaryShadowDenoiserDescriptors(node.get());
+        updateSecondaryTaaDescriptors(node.get());
         m_slotSubmitted = { false, false };
         m_workSubmitted = false;
     }
