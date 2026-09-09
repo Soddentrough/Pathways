@@ -43,6 +43,7 @@ public:
 
     void setCameraMode(bool active);
     bool isCameraMode() const { return m_cameraMode; }
+    void setMgpuMode(MultiGpuMode mode);
 
     bool loadScene(const std::string& filepath);
     const std::vector<SceneEntry>& getAvailableScenes() const { return m_availableScenes; }

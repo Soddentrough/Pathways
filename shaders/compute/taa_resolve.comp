@@ -109,56 +109,76 @@ void main() {
 
     vec3 mu = m1 * (1.0 / 9.0);
     vec3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mu * mu, vec3(0.0)));
-    vec3 boxMin = mu - pc.clippingGamma * sigma;
-    vec3 boxMax = mu + pc.clippingGamma * sigma;
 
     // 2. Fetch screen UV motion vector and convert to pixel offset
     vec2 mv = imageLoad(uMotionVectors, bestMvCoord).xy;
     float fullWidth = (pc.screenWidth > 0u) ? float(pc.screenWidth) : float(pc.imageWidth);
     vec2 pixelOffset = mv * vec2(fullWidth, float(pc.imageHeight));
+    float motionLen = length(pixelOffset);
     vec2 prevCoord = vec2(coord) + vec2(0.5) - pixelOffset;
 
     // 3. Disocclusion & Tile Boundary Testing
     bool disoccluded = (pc.resetHistory != 0u);
+    vec3 debugReason = vec3(0.0);
+    if (pc.resetHistory != 0u) debugReason = vec3(1.0, 1.0, 1.0);
     if (pc.tileOffsetX > 0u) {
-        if (prevCoord.x < float(tileMinX) || prevCoord.x > float(tileMaxX) ||
-            prevCoord.y < float(tileMinY) || prevCoord.y > float(tileMaxY)) {
-            // Motion reprojected across tile boundary into other GPU's domain:
-            // Gracefully disocclude and refresh sample without ghosting
-            disoccluded = true;
-        }
+        if (prevCoord.x < float(tileMinX) - 0.01) { disoccluded = true; debugReason = vec3(0.0, 1.0, 0.0); }
+        else if (prevCoord.x > float(tileMaxX + 1) + 0.01) { disoccluded = true; debugReason = vec3(0.0, 0.0, 1.0); }
+        else if (prevCoord.y < float(tileMinY) - 0.01) { disoccluded = true; debugReason = vec3(1.0, 1.0, 0.0); }
+        else if (prevCoord.y > float(tileMaxY + 1) + 0.01) { disoccluded = true; debugReason = vec3(1.0, 0.0, 1.0); }
     } else {
         if (prevCoord.x < 0.0 || prevCoord.x > float(pc.imageWidth) ||
             prevCoord.y < 0.0 || prevCoord.y > float(pc.imageHeight)) {
             disoccluded = true;
+            debugReason = vec3(0.5, 0.5, 0.5);
         }
+    }
+    if (length(mv) > 1e-4) {
+        debugReason.r += 0.5;
     }
 
     // 4. Sample and Variance-Clip History
     vec3 histColor;
+    vec4 rawHist = vec4(0.0);
+    vec2 histTexSize = vec2(textureSize(uHistoryRadiance, 0));
+    vec2 prevUv = vec2(0.0);
+    vec2 sampleCoord = vec2(0.0);
     if (disoccluded) {
         histColor = currCenter;
     } else {
-        vec2 histTexSize = vec2(textureSize(uHistoryRadiance, 0));
-        vec2 prevUv = prevCoord / histTexSize;
-        vec4 rawHist = texture(uHistoryRadiance, prevUv);
+        sampleCoord = (pc.tileOffsetX > 0u) ?
+            clamp(prevCoord, vec2(float(tileMinX) + 0.5, float(tileMinY) + 0.5),
+                             vec2(float(tileMaxX) + 0.5, float(tileMaxY) + 0.5)) : prevCoord;
+        prevUv = sampleCoord / histTexSize;
+        rawHist = textureLod(uHistoryRadiance, prevUv, 0.0);
         vec3 histYCoCg = rgbToYCoCg(rawHist.rgb);
-        // Clip history color towards neighborhood mean to prevent ghosting
-        vec3 clippedYCoCg = clamp(histYCoCg, boxMin, boxMax);
+        // Clip history color towards neighborhood mean to prevent ghosting during motion.
+        // For static surfaces (length(pixelOffset) < 0.1), bypass clipping to prevent crushing sparse 1-SPP Monte Carlo hits.
+        vec3 clippedYCoCg;
+        if (motionLen >= 0.1 && mu.x > 1e-4) {
+            vec3 boxMin = mu - pc.clippingGamma * sigma;
+            vec3 boxMax = mu + pc.clippingGamma * sigma;
+            boxMin.x = max(boxMin.x, 0.0);
+            clippedYCoCg = clamp(histYCoCg, boxMin, boxMax);
+        } else {
+            clippedYCoCg = histYCoCg;
+        }
         histColor = max(yCoCgToRgb(clippedYCoCg), vec3(0.0));
     }
 
-    // 5. Karis High-Dynamic-Range Luminance Weighting
-    float lumCurr = dot(currCenter, vec3(0.2126, 0.7152, 0.0722));
-    float lumHist = dot(histColor, vec3(0.2126, 0.7152, 0.0722));
-    float wCurr = 1.0 / max(1.0 + lumCurr, 1e-4);
-    float wHist = 1.0 / max(1.0 + lumHist, 1e-4);
-
     float alpha = disoccluded ? 1.0 : pc.blendAlpha;
-    vec3 resolved = ((1.0 - alpha) * wHist * histColor + alpha * wCurr * currCenter) /
+    vec3 resolved;
+    if (motionLen < 0.1 && !disoccluded) {
+        resolved = (1.0 - alpha) * histColor + alpha * currCenter;
+    } else {
+        // Karis High-Dynamic-Range Luminance Weighting for dynamic motion to suppress fireflies
+        float lumCurr = dot(currCenter, vec3(0.2126, 0.7152, 0.0722));
+        float lumHist = dot(histColor, vec3(0.2126, 0.7152, 0.0722));
+        float wCurr = 1.0 / max(1.0 + lumCurr, 1e-4);
+        float wHist = 1.0 / max(1.0 + lumHist, 1e-4);
+        resolved = ((1.0 - alpha) * wHist * histColor + alpha * wCurr * currCenter) /
                     max((1.0 - alpha) * wHist + alpha * wCurr, 1e-4);
-
-    resolved = clamp(resolved, vec3(0.0), vec3(65000.0));
+    }
 
     imageStore(uResolvedOutput, coord, vec4(resolved, 1.0));
 }

@@ -53,7 +53,7 @@ struct Config {
     float shadow_denoiser_normal_power = 16.0f;
     bool enable_taa = false;              // Temporal Anti-Aliasing [Default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
-    float taa_clipping_gamma = 1.25f;     // TAA variance clipping bounding box multiplier
+    float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
 

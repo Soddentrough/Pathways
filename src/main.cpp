@@ -64,13 +64,39 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to Living Room and rendered 3 frames cleanly.");
 
+            // Switch to scene 4: Pontiac GTO Extended (user-reported crash scenario)
+            if (!engine.loadScene("scenes/pontiac-gto/pontiac_gto_extended.glb")) {
+                pathways::Logger::error("Test failed: loadScene Pontiac GTO failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Pontiac GTO Extended (Single-GPU) and rendered 3 frames cleanly.");
+
+            // Dynamically switch to Dual-GPU Checkerboard Tiling mode
+            pathways::Logger::info("Dynamically switching to Dual-GPU Checkerboard Tiling mode on Pontiac scene...");
+            engine.setMgpuMode(pathways::MultiGpuMode::CheckerboardTile);
+            for (int i = 0; i < 5; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Dual-GPU Checkerboard Tiling rendered 5 frames cleanly on Pontiac scene.");
+
+            // Dynamically switch to Dual-GPU Sample Parallel mode
+            pathways::Logger::info("Dynamically switching to Dual-GPU Sample Parallel mode on Pontiac scene...");
+            engine.setMgpuMode(pathways::MultiGpuMode::SampleParallel);
+            for (int i = 0; i < 5; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Dual-GPU Sample Parallel rendered 5 frames cleanly on Pontiac scene.");
+
+            // Dynamically switch back to Single-GPU mode
+            pathways::Logger::info("Dynamically switching back to Single-GPU mode...");
+            engine.setMgpuMode(pathways::MultiGpuMode::Off);
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched back to Single-GPU and rendered 3 frames cleanly.");
+
             engine.printExecutionSummary();
             auto stats = engine.getStats();
             if (stats.validation_errors > 0) {
                 pathways::Logger::error("Test failed: Validation errors encountered: {}", stats.validation_errors);
                 return 1;
             }
-            pathways::Logger::info("[SUCCESS] Dynamic scene switching test PASSED cleanly with 0 validation errors!");
+            pathways::Logger::info("[SUCCESS] Dynamic scene & Multi-GPU mode switching test PASSED cleanly with 0 validation errors!");
             return 0;
         }
 

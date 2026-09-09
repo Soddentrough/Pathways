@@ -448,8 +448,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
-            ImGui::Text("Viewport:     %u x %u (Aspect: %.3f, %s)", stats.width, stats.height, aspect, isPortrait ? "Portrait" : "Landscape");
-            ImGui::Text("Accumulation: Frame %u (%u samples accumulated)", stats.total_frames, stats.total_frames * config.spp);
+            if (config.enable_taa) {
+                ImGui::Text("Anti-Aliasing: TAA Active (alpha=%.2f, gamma=%.2f)", config.taa_blend_alpha, config.taa_clipping_gamma);
+            } else if (config.progressive_accumulation) {
+                ImGui::Text("Accumulation: Frame %u (%u samples accumulated)", stats.total_frames, stats.total_frames * config.spp);
+            } else {
+                ImGui::Text("Accumulation: Disabled (Real-Time 1 SPP)");
+            }
         }
 
         // 6. Offline Telemetry Export
@@ -1110,9 +1115,27 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::Checkbox("Temporal Anti-Aliasing (TAA)", &config.enable_taa)) {
                 settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Screen-space motion vector reprojection with YCoCg variance clipping and distributed tile-parallel support.");
+            }
+            if (!config.enable_taa) {
+                if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time noise.");
+                }
+            } else {
+                ImGui::BeginDisabled();
+                bool progDummy = false;
+                ImGui::Checkbox("Progressive Accumulation (Replaced by TAA)", &progDummy);
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Progressive accumulation is bypassed while TAA temporal exponential averaging is active.");
+                }
             }
             if (config.enable_taa) {
                 ImGui::Indent();

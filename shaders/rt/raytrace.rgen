@@ -119,9 +119,13 @@ void main() {
     }
 
     bool enableShadowDenoiser = (ubo.flags & (1u << 20)) != 0u;
+    bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
     if (enableShadowDenoiser) {
         imageStore(uDirectLightImage, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
-        imageStore(uNormalDepthImage, pixelCoord, vec4(0.0, 0.0, 1.0, 0.0));
+    }
+    if (enableShadowDenoiser || enableTaa) {
+        ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+        imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, 0.0));
     }
 
     // Spatiotemporal Blue Noise lookup (64x64 texture with wrapping)
@@ -140,8 +144,13 @@ void main() {
     vec3 pixelRadiance = vec3(0.0);
 
     for (uint s = 0; s < pixelSpp; ++s) {
-        vec2 jitter = fract(stNoise.xy + float(s) * phi4.xy) - vec2(0.5);
-        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(imageSize);
+        vec2 subpixelOffset;
+        if (enableTaa) {
+            subpixelOffset = (s == 0u) ? vec2(0.5) : (vec2(0.5) + fract(stNoise.xy + float(s) * phi4.xy) - vec2(0.5));
+        } else {
+            subpixelOffset = vec2(0.5) + fract(stNoise.xy + float(s) * phi4.xy) - vec2(0.5);
+        }
+        vec2 uv = (vec2(pixelCoord) + subpixelOffset) / vec2(imageSize);
         vec2 d = uv * 2.0 - 1.0;
 
         vec4 target = ubo.projInverse * vec4(d.x, d.y, 1.0, 1.0);
@@ -186,7 +195,7 @@ void main() {
             // Direct emissive + direct light (accumulated in rchit) or sky (miss)
             radiance += throughput * prd.radiance;
 
-            // Primary bounce: compute and store screen-space geometric motion vector
+            // Primary bounce: compute and store screen-space geometric motion vector & normal-depth
             if (bounce == 0u && s == 0u) {
                 vec2 mv = vec2(0.0);
                 if (hit) {
@@ -198,13 +207,23 @@ void main() {
                         vec2 prevNdc = prevClip.xy / prevClip.w;
                         mv = (currNdc - prevNdc) * 0.5;
                     }
+                    if (enableTaa && !enableShadowDenoiser) {
+                        float hitDist = length(hitPoint - ubo.position.xyz);
+                        ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+                        imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, hitDist));
+                    }
                 } else {
-                    vec4 currClip = ubo.unjitteredViewProj * vec4(rayDir, 0.0);
-                    vec4 prevClip = ubo.prevViewProj * vec4(rayDir, 0.0);
+                    vec3 skyDirPt = ubo.position.xyz + rayDir * 1000.0;
+                    vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
+                    vec4 prevClip = ubo.prevViewProj * vec4(skyDirPt, 1.0);
                     if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
                         vec2 currNdc = currClip.xy / currClip.w;
                         vec2 prevNdc = prevClip.xy / prevClip.w;
                         mv = (currNdc - prevNdc) * 0.5;
+                    }
+                    if (enableTaa && !enableShadowDenoiser) {
+                        ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+                        imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, 10000.0));
                     }
                 }
                 ivec2 mvStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;

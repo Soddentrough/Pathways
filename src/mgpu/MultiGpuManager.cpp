@@ -686,7 +686,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
@@ -1076,7 +1076,7 @@ void MultiGpuManager::createSecondaryTaaResources(GpuDeviceNode* secNode, uint32
     if (!secNode->motionVectorImage) {
         secNode->motionVectorImage = std::make_unique<Image>(device, allocator, width, height,
             VK_FORMAT_R16G16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
 
     for (int i = 0; i < 2; ++i) {
@@ -1089,10 +1089,35 @@ void MultiGpuManager::createSecondaryTaaResources(GpuDeviceNode* secNode, uint32
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(cmd, &beginInfo);
-    secNode->motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    secNode->motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     for (int i = 0; i < 2; ++i) {
-        secNode->taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        secNode->taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
+
+    VkClearColorValue zeroColor{};
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0;
+    range.levelCount = 1;
+    range.baseArrayLayer = 0;
+    range.layerCount = 1;
+
+    vkCmdClearColorImage(cmd, secNode->motionVectorImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
+    for (int i = 0; i < 2; ++i) {
+        vkCmdClearColorImage(cmd, secNode->taaHistoryImages[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
+    }
+
+    VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    clearDep.memoryBarrierCount = 1;
+    clearDep.pMemoryBarriers = &clearBarrier;
+    vkCmdPipelineBarrier2(cmd, &clearDep);
+
     vkEndCommandBuffer(cmd);
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
@@ -1395,9 +1420,15 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         taaPC.tileOffsetX = packet.tileOffsetX;
         taaPC.tileOffsetY = packet.tileOffsetY;
         taaPC.tileSize = m_config.tile_size;
-        taaPC.blendAlpha = m_config.taa_blend_alpha;
+        uint32_t secFrameIndex = packet.cameraUniform.frameIndex % 1000000u;
+        uint32_t currentSample = secFrameIndex + 1u;
+        if (m_config.progressive_accumulation && currentSample > 1u) {
+            taaPC.blendAlpha = 1.0f / static_cast<float>(currentSample);
+        } else {
+            taaPC.blendAlpha = m_config.taa_blend_alpha;
+        }
         taaPC.clippingGamma = m_config.taa_clipping_gamma;
-        taaPC.resetHistory = (packet.cameraUniform.frameIndex == 0u) ? 1u : 0u;
+        taaPC.resetHistory = (secFrameIndex == 0u) ? 1u : 0u;
         taaPC.isSampleParallel = (packet.tileOffsetX == 0u) ? 1u : 0u;
         taaPC.screenWidth = packet.tileWidth;
 
@@ -1412,10 +1443,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         VkMemoryBarrier2 taaToCopyBarrier{};
         taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
         taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
 
         VkDependencyInfo taaToCopyDep{};
         taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -1437,7 +1468,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     // Transition accumTarget to TRANSFER_SRC_OPTIMAL
     node->accumTarget->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
     );
 
@@ -1653,13 +1684,6 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
         );
 
-        // Transition accumTarget to GENERAL layout
-        vkResetCommandBuffer(node->commandBuffers[0], 0);
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(node->commandBuffers[0], &beginInfo);
-
         VkDeviceSize resSize = static_cast<VkDeviceSize>(width) * height * sizeof(ReservoirGPU);
         for (uint32_t i = 0; i < 2; ++i) {
             node->restirReservoirs[i] = std::make_unique<Buffer>(
@@ -1669,13 +1693,6 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             );
         }
         node->restirPingPongIndex = 0;
-
-        node->accumTarget->transitionLayout(
-            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
 
         // Recreate secondary FidelityFX Shadow Denoiser resources
         node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
@@ -1699,6 +1716,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 VK_FORMAT_R16_SFLOAT,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         }
+        node->shadowPingPongIndex = 0;
 
         uint32_t tilesX = (width + 7) / 8;
         uint32_t tilesY = (height + 7) / 8;
@@ -1706,6 +1724,24 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->tileMetaDataBuffer = std::make_unique<Buffer>(secAlloc, tileBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        // Recreate secondary TAA resources (handles image allocations, transitions, clears, and submits on commandBuffers[0])
+        destroySecondaryTaaResources(node.get());
+        createSecondaryTaaResources(node.get(), width, height);
+
+        // Transition secondary targets to GENERAL layout and clear accumulation & ReSTIR reservoirs
+        vkResetCommandBuffer(node->commandBuffers[0], 0);
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(node->commandBuffers[0], &beginInfo);
+
+        node->accumTarget->transitionLayout(
+            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
 
         node->directLightImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -1739,14 +1775,6 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
             );
         }
-        node->shadowPingPongIndex = 0;
-
-        // Recreate secondary TAA resources
-        node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
-            VK_FORMAT_R16G16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        destroySecondaryTaaResources(node.get());
-        createSecondaryTaaResources(node.get(), width, height);
 
         node->motionVectorImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,

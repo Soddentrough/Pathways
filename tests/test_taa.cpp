@@ -50,7 +50,7 @@ int main() {
         Config configDefault;
         check_true(!configDefault.enable_taa, "Default TAA is off");
         assert_near(configDefault.taa_blend_alpha, 0.10f, 0.0001f, "Default blend alpha");
-        assert_near(configDefault.taa_clipping_gamma, 1.25f, 0.0001f, "Default clipping gamma");
+        assert_near(configDefault.taa_clipping_gamma, 2.25f, 0.0001f, "Default clipping gamma");
 
         const char* argv1[] = { "pathways", "--taa" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
