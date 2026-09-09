@@ -195,7 +195,7 @@ In complex scenes with mixed light types (directional sun, point/spot lights, em
   - Compute shader pass 2: Temporal reprojection and history clamping.
   - Compute shader pass 3: Spatial resampling with bilateral normal/depth filtering.
   - Hardware shadow ray query in `raytrace.rgen` / `raytrace.rchit` evaluating the winning reservoir.
-- **Verification:** Benchmarking frametimes and noise reduction across `CornellBox`, `Classroom`, `LivingRoom`, and `VeachMIS`.
+- **Verification:** Benchmarking frametimes and noise reduction across `CornellBox`, `Classroom`, `LivingRoom`, and `CoffeeMaker`.
 
 ### Phase 2: Vulkan 1.4 DGC Work Compaction & Indirect Trace
 - **Goal:** Eliminate wave divergence in the final shadow validation pass.

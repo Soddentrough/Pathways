@@ -21,8 +21,8 @@ SCENES = [
         "path": "scenes/classroom/classroom_extended.glb"
     },
     {
-        "name": "Veach MIS (Direct Lighting)",
-        "path": "scenes/veach-mis/veach_mis_extended.glb"
+        "name": "Coffee Maker (Complex Materials & Lighting)",
+        "path": "scenes/coffee-maker/coffee_maker_extended.glb"
     },
     {
         "name": "Dragon (High Polygon Density & Attenuation)",
