@@ -37,7 +37,8 @@ public:
                       const std::vector<char>& shadeDiffuseCode = {},
                       const std::vector<char>& shadeDielectricCode = {},
                       const std::vector<char>& shadeConductorCode = {},
-                      const std::vector<char>& shadeComplexCode = {});
+                      const std::vector<char>& shadeComplexCode = {},
+                      bool supportsExecutionSet = false);
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -92,6 +93,7 @@ private:
     uint32_t m_tileSize = 256;
     uint32_t m_maxCapacity = 0;
     uint32_t m_sortMode = 0;
+    bool m_supportsExecutionSet = false;
 
     // Ray Work Queues & Counter SSBOs (SoA Layout)
     std::unique_ptr<Buffer> m_rayGeomQueueA;  // 32B RayGeometry

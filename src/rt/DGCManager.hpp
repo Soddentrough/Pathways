@@ -16,7 +16,7 @@ struct DGCCommand {
 
 class DGCManager {
 public:
-    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout);
+    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet = false);
     ~DGCManager();
 
     bool isSupported() const { return m_supported; }

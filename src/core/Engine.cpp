@@ -228,6 +228,7 @@ Engine::~Engine() {
     }
     m_renderFinishedSemaphores.clear();
 
+    m_wavefrontPipeline.reset();
     m_rtpKhrPipeline.reset();
     destroyShadowDenoiserResources();
     destroyShadowDenoiserPipelines();
@@ -1101,7 +1102,8 @@ void Engine::initPipelines() {
         m_config.width, m_config.height,
         m_config.wavefront_tile_size,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode, wfResolveCode,
-        wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode
+        wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
+        m_context->hasDgcExecutionSet()
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 

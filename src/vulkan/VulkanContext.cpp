@@ -349,11 +349,16 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                      m_rtPipelineProperties.maxRayRecursionDepth);
     }
     if (m_hasDGC) {
-        Logger::info("DGC Hardware Limits -> MaxTokens: {}, MaxSequences: {}, MaxStride: {} B, Stages: 0x{:x}",
+        if ((dgcProps.supportedIndirectCommandsShaderStagesPipelineBinding & VK_SHADER_STAGE_COMPUTE_BIT) ||
+            (dgcProps.supportedIndirectCommandsShaderStagesShaderBinding & VK_SHADER_STAGE_COMPUTE_BIT)) {
+            m_hasDgcExecutionSet = true;
+        }
+        Logger::info("DGC Hardware Limits -> MaxTokens: {}, MaxSequences: {}, MaxStride: {} B, Stages: 0x{:x}, ComputeExecutionSet: {}",
                      dgcProps.maxIndirectCommandsTokenCount,
                      dgcProps.maxIndirectSequenceCount,
                      dgcProps.maxIndirectCommandsIndirectStride,
-                     dgcProps.supportedIndirectCommandsShaderStages);
+                     dgcProps.supportedIndirectCommandsShaderStages,
+                     m_hasDgcExecutionSet ? "SUPPORTED" : "UNSUPPORTED");
     }
 }
 

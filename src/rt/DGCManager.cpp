@@ -6,7 +6,7 @@
 
 namespace pathways {
 
-DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout)
+DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet)
     : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout) {
 
     loadFunctionPointers();
@@ -45,7 +45,7 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         m_supported = false;
     }
 
-    if (m_supported) {
+    if (m_supported && supportsExecutionSet) {
         VkIndirectCommandsExecutionSetTokenEXT execSetToken{};
         execSetToken.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
         execSetToken.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -73,11 +73,13 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         if (matRes == VK_SUCCESS) {
             Logger::info("Created DGC Material indirect commands layout (ExecutionSet + Dispatch, stride: {} bytes).",
                          matCreateInfo.indirectStride);
-            m_materialDGCSupported = false;
+            m_materialDGCSupported = true;
         } else {
             Logger::warn("Note: DGC Material indirect commands layout not supported by driver (code: {}). Using multi-dispatch indirect.", (int)matRes);
             m_materialDGCSupported = false;
         }
+    } else {
+        m_materialDGCSupported = false;
     }
 }
 
@@ -123,38 +125,8 @@ void DGCManager::loadFunctionPointers() {
 void DGCManager::initExecutionSet(const std::vector<VkPipeline>& pipelines) {
     if (!m_supported || pipelines.empty()) return;
 
-    if (m_executionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
-        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_executionSet, nullptr);
-        m_executionSet = VK_NULL_HANDLE;
-    }
-
-    VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
-    pipelineInfo.initialPipeline = pipelines[0];
-    pipelineInfo.maxPipelineCount = static_cast<uint32_t>(pipelines.size());
-
-    VkIndirectExecutionSetCreateInfoEXT execSetCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
-    execSetCreateInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
-    execSetCreateInfo.info.pPipelineInfo = &pipelineInfo;
-
-    VkResult res = pfn_vkCreateIndirectExecutionSetEXT(m_device, &execSetCreateInfo, nullptr, &m_executionSet);
-    if (res != VK_SUCCESS) {
-        Logger::warn("Failed to create VkIndirectExecutionSetEXT (code: {}). DGC disabled.", (int)res);
-        m_supported = false;
-        return;
-    }
-
-    std::vector<VkWriteIndirectExecutionSetPipelineEXT> writes(pipelines.size());
-    for (size_t i = 0; i < pipelines.size(); ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT;
-        writes[i].pNext = nullptr;
-        writes[i].index = static_cast<uint32_t>(i);
-        writes[i].pipeline = pipelines[i];
-    }
-
-    pfn_vkUpdateIndirectExecutionSetPipelineEXT(m_device, m_executionSet, static_cast<uint32_t>(writes.size()), writes.data());
-    Logger::info("Initialized VkIndirectExecutionSetEXT with {} compute microkernel pipelines.", pipelines.size());
-
-    // Pre-allocate preprocess buffer
+    // Single-dispatch DGC token layout does not require an Execution Set (uses VK_NULL_HANDLE).
+    // Pre-allocate preprocess buffer for the primary compute pipeline.
     ensurePreprocessBuffer(pipelines[0], 1);
 }
 
@@ -255,7 +227,10 @@ void DGCManager::recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuf
 }
 
 void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines) {
-    if (!m_supported || materialPipelines.empty()) return;
+    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || materialPipelines.empty()) {
+        m_materialDGCSupported = false;
+        return;
+    }
 
     if (m_materialExecutionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
         pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);
@@ -271,9 +246,10 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
     execSetCreateInfo.info.pPipelineInfo = &pipelineInfo;
 
     VkResult res = pfn_vkCreateIndirectExecutionSetEXT(m_device, &execSetCreateInfo, nullptr, &m_materialExecutionSet);
-    if (res != VK_SUCCESS) {
+    if (res != VK_SUCCESS || m_materialExecutionSet == VK_NULL_HANDLE) {
         Logger::warn("Failed to create material VkIndirectExecutionSetEXT (code: {}). Falling back to multi-dispatch indirect.", (int)res);
         m_materialDGCSupported = false;
+        m_materialExecutionSet = VK_NULL_HANDLE;
         return;
     }
 

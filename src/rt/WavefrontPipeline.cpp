@@ -18,8 +18,10 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadeDiffuseCode,
                                      const std::vector<char>& shadeDielectricCode,
                                      const std::vector<char>& shadeConductorCode,
-                                     const std::vector<char>& shadeComplexCode)
-    : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize) {
+                                     const std::vector<char>& shadeComplexCode,
+                                     bool supportsExecutionSet)
+    : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize),
+      m_supportsExecutionSet(supportsExecutionSet) {
 
     if (m_tileSize > 0) {
         m_maxCapacity = std::min(m_tileSize * m_tileSize, m_width * m_height);
@@ -47,6 +49,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
 }
 
 WavefrontPipeline::~WavefrontPipeline() {
+    m_dgcManager.reset();
+
     for (int i = 0; i < 2; ++i) {
         if (m_queryPools[i]) vkDestroyQueryPool(m_device, m_queryPools[i], nullptr);
     }
@@ -393,9 +397,8 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
         m_shadeComplexPipeline = buildComputePipeline(shadeComplexCode, "shade_complex");
     }
 
-    // Initialize DGCManager with Execution Set:
-    // [0] classify, [1] intersect, [2] shade, [3] shadow, [4] resolve
-    m_dgcManager = std::make_unique<DGCManager>(m_device, m_allocator, m_pipelineLayout);
+    // Initialize DGCManager:
+    m_dgcManager = std::make_unique<DGCManager>(m_device, m_allocator, m_pipelineLayout, m_supportsExecutionSet);
     m_dgcManager->initExecutionSet({
         m_classifyPipeline,
         m_intersectPipeline,

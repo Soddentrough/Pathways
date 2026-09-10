@@ -86,6 +86,7 @@ public:
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
     bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
     bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
+    bool hasDgcExecutionSet() const { return m_hasDgcExecutionSet; }
     PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFdKHR = nullptr;
     PFN_vkImportSemaphoreFdKHR pfnImportSemaphoreFdKHR = nullptr;
     const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
@@ -125,6 +126,7 @@ private:
     bool m_hasSubgroupSizeControl = false;
     bool m_hasExternalMemoryHost = false;
     bool m_hasExternalSemaphoreFd = false;
+    bool m_hasDgcExecutionSet = false;
     PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;
