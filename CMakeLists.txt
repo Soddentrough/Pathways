@@ -327,6 +327,23 @@ if(UNIX)
     add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
 endif()
 
+# Pipeline Comparison & Telemetry Unit Test Target
+add_executable(test_pipeline_comparison
+    tests/test_pipeline_comparison.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+    src/utils/ImageDumper.cpp
+)
+target_include_directories(test_pipeline_comparison PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_pipeline_comparison PRIVATE m Threads::Threads ZLIB::ZLIB)
+endif()
+add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
+
+
 
 # ==============================================================================
 # Installation & CPack Packaging Configuration

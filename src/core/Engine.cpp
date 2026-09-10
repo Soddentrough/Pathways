@@ -3777,6 +3777,7 @@ FrameStats Engine::getStats() const {
     stats.height = m_config.height;
     stats.spp = m_config.spp;
     stats.total_frames = m_totalFramesRendered;
+    stats.total_samples = m_accumulatedSamples;
     stats.validation_errors = m_context->getValidationErrors();
 
     stats.current_frame_time_ms = m_lastFrameTimeMs;

@@ -211,10 +211,6 @@ void main() {
             }
 
             vec3 diffuseColor = baseColor.rgb;
-            if (mat.occlusionTex > 0u && mat.occlusionTex <= 64u) {
-                float occSample = texture(sceneTextures[mat.occlusionTex - 1u], hitUv).r;
-                diffuseColor *= (1.0 + mat.occlusionStrength * (occSample - 1.0));
-            }
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;

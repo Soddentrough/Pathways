@@ -641,7 +641,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     // 4b. Shadow microkernel (100% coherent hardware ray queries)
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
-                    uint32_t shadowPC[4] = {
+                    uint32_t shadowPC[8] = {
+                        sceneData.numTriangles,
+                        sceneData.numSpheres,
+                        sceneData.numMaterials,
+                        sceneData.numLights,
                         width,
                         height,
                         sceneData.frameIndex,
