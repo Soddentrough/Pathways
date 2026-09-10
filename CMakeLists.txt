@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.10.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.11.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -317,6 +317,15 @@ if(UNIX)
     target_link_libraries(test_taa PRIVATE m)
 endif()
 add_test(NAME TemporalAntiAliasing COMMAND test_taa)
+
+if(UNIX)
+    # P2P Direct BAR DMA-BUF Unit Test Target
+    add_executable(test_p2p_direct_bar
+        tests/test_p2p_direct_bar.cpp
+    )
+    target_link_libraries(test_p2p_direct_bar PRIVATE Vulkan::Vulkan)
+    add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
+endif()
 
 
 # ==============================================================================

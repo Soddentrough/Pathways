@@ -35,6 +35,7 @@ struct FrameStats {
     std::string secondary_arch_name = "";
     std::string mgpu_interconnect_str = "PCIe 5.0 x16 (32 GT/s / ~64 GB/s Full-Duplex)";
     std::string mgpu_mode_str = "off";
+    std::string mgpu_transfer_mode_str = "N/A";
     bool is_mgpu_active = false;
     bool visualize_mgpu_split = false;
 

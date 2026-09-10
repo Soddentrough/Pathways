@@ -225,7 +225,185 @@ VkShaderModule MultiGpuManager::createShaderModule(VkDevice device, const std::v
     return shaderModule;
 }
 
+void MultiGpuManager::destroySharedP2PBuffer() {
+    VkDevice dev0 = m_primaryContext ? m_primaryContext->getDevice() : VK_NULL_HANDLE;
+    VkDevice dev1 = (!m_devices.empty() && m_devices[0]->context) ? m_devices[0]->context->getDevice() : VK_NULL_HANDLE;
+
+    for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
+        if (dev0 != VK_NULL_HANDLE) {
+            if (m_p2pBufferPrimary[slot] != VK_NULL_HANDLE) {
+                vkDestroyBuffer(dev0, m_p2pBufferPrimary[slot], nullptr);
+                m_p2pBufferPrimary[slot] = VK_NULL_HANDLE;
+            }
+            if (m_p2pMemPrimary[slot] != VK_NULL_HANDLE) {
+                vkFreeMemory(dev0, m_p2pMemPrimary[slot], nullptr);
+                m_p2pMemPrimary[slot] = VK_NULL_HANDLE;
+            }
+        }
+        if (dev1 != VK_NULL_HANDLE) {
+            if (m_p2pBufferSecondary[slot] != VK_NULL_HANDLE) {
+                vkDestroyBuffer(dev1, m_p2pBufferSecondary[slot], nullptr);
+                m_p2pBufferSecondary[slot] = VK_NULL_HANDLE;
+            }
+            if (m_p2pMemSecondary[slot] != VK_NULL_HANDLE) {
+                vkFreeMemory(dev1, m_p2pMemSecondary[slot], nullptr);
+                m_p2pMemSecondary[slot] = VK_NULL_HANDLE;
+            }
+        }
+    }
+}
+
+bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
+    destroySharedP2PBuffer();
+
+    if (!m_primaryContext || !m_primaryContext->hasExternalMemoryDmaBuf() || !m_primaryContext->hasExternalMemoryFd() ||
+        m_devices.empty() || !m_devices[0]->context || !m_devices[0]->context->hasExternalMemoryDmaBuf() || !m_devices[0]->context->hasExternalMemoryFd()) {
+        return false;
+    }
+
+    auto pfnGetFd = m_devices[0]->context->pfnGetMemoryFdKHR;
+    auto pfnGetFdProps = m_primaryContext->pfnGetMemoryFdPropertiesKHR;
+    if (!pfnGetFd || !pfnGetFdProps) {
+        return false;
+    }
+
+    VkDevice dev0 = m_primaryContext->getDevice();
+    VkPhysicalDevice phys0 = m_primaryContext->getPhysicalDevice();
+    VkDevice dev1 = m_devices[0]->context->getDevice();
+    VkPhysicalDevice phys1 = m_devices[0]->context->getPhysicalDevice();
+
+    VkPhysicalDeviceMemoryProperties memProps0, memProps1;
+    vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
+    vkGetPhysicalDeviceMemoryProperties(phys1, &memProps1);
+
+    // Find Device-Local memory type on Device 1
+    uint32_t devLocalIdx1 = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+        if (memProps1.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            devLocalIdx1 = i;
+            break;
+        }
+    }
+    if (devLocalIdx1 == UINT32_MAX) return false;
+
+    // Align buffer size to 64KB (standard PCI page alignment)
+    VkDeviceSize alignment = 65536;
+    VkDeviceSize alignedSize = (bufferSize + alignment - 1) & ~(alignment - 1);
+    auto handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    bool allSucceeded = true;
+    for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
+        // 1. Create buffer on Device 1 (GPU 1 VRAM)
+        VkExternalMemoryBufferCreateInfo extBufInfo1{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+        extBufInfo1.handleTypes = handleType;
+
+        VkBufferCreateInfo bufInfo1{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufInfo1.pNext = &extBufInfo1;
+        bufInfo1.size = alignedSize;
+        bufInfo1.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo1.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkResult res = vkCreateBuffer(dev1, &bufInfo1, nullptr, &m_p2pBufferSecondary[slot]);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        VkMemoryRequirements memReq1;
+        vkGetBufferMemoryRequirements(dev1, m_p2pBufferSecondary[slot], &memReq1);
+
+        // 2. Allocate exportable Device-Local memory on Device 1
+        VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
+        exportAllocInfo.handleTypes = handleType;
+
+        VkMemoryAllocateInfo allocInfo1{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo1.pNext = &exportAllocInfo;
+        allocInfo1.allocationSize = memReq1.size;
+        allocInfo1.memoryTypeIndex = devLocalIdx1;
+
+        res = vkAllocateMemory(dev1, &allocInfo1, nullptr, &m_p2pMemSecondary[slot]);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        res = vkBindBufferMemory(dev1, m_p2pBufferSecondary[slot], m_p2pMemSecondary[slot], 0);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        // 3. Export FD from Device 1
+        VkMemoryGetFdInfoKHR getFdInfo{ VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+        getFdInfo.memory = m_p2pMemSecondary[slot];
+        getFdInfo.handleType = handleType;
+
+        int memFd = -1;
+        res = pfnGetFd(dev1, &getFdInfo, &memFd);
+        if (res != VK_SUCCESS || memFd < 0) { allSucceeded = false; break; }
+
+        // 4. Query FD memory type on Device 0
+        VkMemoryFdPropertiesKHR fdProps{ VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
+        res = pfnGetFdProps(dev0, handleType, memFd, &fdProps);
+        if (res != VK_SUCCESS) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        uint32_t memIdx0 = UINT32_MAX;
+        for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+            if (fdProps.memoryTypeBits & (1 << i)) {
+                memIdx0 = i;
+                break;
+            }
+        }
+        if (memIdx0 == UINT32_MAX) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        // 5. Import FD into Device 0
+        VkImportMemoryFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+        importInfo.handleType = handleType;
+        importInfo.fd = memFd;
+
+        VkMemoryAllocateInfo allocInfo0{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo0.pNext = &importInfo;
+        allocInfo0.allocationSize = memReq1.size;
+        allocInfo0.memoryTypeIndex = memIdx0;
+
+        res = vkAllocateMemory(dev0, &allocInfo0, nullptr, &m_p2pMemPrimary[slot]);
+        if (res != VK_SUCCESS) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        // 6. Create buffer on Device 0 and bind imported memory
+        VkExternalMemoryBufferCreateInfo extBufInfo0{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+        extBufInfo0.handleTypes = handleType;
+
+        VkBufferCreateInfo bufInfo0{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufInfo0.pNext = &extBufInfo0;
+        bufInfo0.size = alignedSize;
+        bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        res = vkCreateBuffer(dev0, &bufInfo0, nullptr, &m_p2pBufferPrimary[slot]);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        res = vkBindBufferMemory(dev0, m_p2pBufferPrimary[slot], m_p2pMemPrimary[slot], 0);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+    }
+
+    if (allSucceeded) {
+        m_sharedBufferSize = alignedSize;
+        m_transferMode = InterGpuTransferMode::P2P_Direct_BAR;
+        m_useZeroCopyHost = true;
+        Logger::info("Inter-GPU: Activated P2P Direct BAR Transfer via Linux DMA-BUF (2x {:.2f} MB).",
+                     static_cast<double>(alignedSize) / (1024.0 * 1024.0));
+        return true;
+    }
+
+    destroySharedP2PBuffer();
+    return false;
+}
+
 void MultiGpuManager::destroySharedHostBuffer() {
+    destroySharedP2PBuffer();
     VkDevice dev0 = m_primaryContext ? m_primaryContext->getDevice() : VK_NULL_HANDLE;
     VkDevice dev1 = (!m_devices.empty() && m_devices[0]->context) ? m_devices[0]->context->getDevice() : VK_NULL_HANDLE;
 
@@ -261,15 +439,23 @@ void MultiGpuManager::destroySharedHostBuffer() {
     }
     m_sharedBufferSize = 0;
     m_useZeroCopyHost = false;
+    m_transferMode = InterGpuTransferMode::CpuStaging;
 }
 
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     destroySharedHostBuffer();
 
+    // Priority 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF
+    if (initSharedP2PBuffer(bufferSize)) {
+        return;
+    }
+
+    // Priority 2: Zero-Copy Host Memory fallback via VK_EXT_external_memory_host
     if (!m_primaryContext || !m_primaryContext->hasExternalMemoryHost() ||
         m_devices.empty() || !m_devices[0]->context || !m_devices[0]->context->hasExternalMemoryHost()) {
-        Logger::warn("VK_EXT_external_memory_host not available on both devices. Falling back to CPU staging copy.");
+        Logger::warn("P2P Direct BAR and external_memory_host unavailable. Falling back to CPU staging copy.");
         m_useZeroCopyHost = false;
+        m_transferMode = InterGpuTransferMode::CpuStaging;
         return;
     }
 
@@ -389,6 +575,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 
     if (allSucceeded) {
         m_useZeroCopyHost = true;
+        m_transferMode = InterGpuTransferMode::ZeroCopy_HostMemory;
         Logger::info("{} Zero-Copy Inter-GPU Host Buffers initialized via VK_EXT_external_memory_host (2x {:.2f} MB).",
                      m_config.double_buffered_shared_mem ? "Double-Buffered" : "Single-Buffered (Double-Buffering Disabled)",
                      static_cast<double>(m_sharedBufferSize) / (1024.0 * 1024.0));
@@ -396,6 +583,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         Logger::warn("Failed to bind zero-copy host buffers on both GPUs. Falling back to CPU staging.");
         destroySharedHostBuffer();
         m_useZeroCopyHost = false;
+        m_transferMode = InterGpuTransferMode::CpuStaging;
     }
 }
 
@@ -1513,7 +1701,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
 
     uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
-    VkBuffer targetBuffer = m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer();
+    VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
+        ? m_p2pBufferSecondary[sharedSlot]
+        : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
 
     vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,

@@ -3808,6 +3808,10 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
+    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+        stats.mgpu_transfer_mode_str = m_mgpu->getTransferModeString();
+    }
+
     stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "rtp";
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;

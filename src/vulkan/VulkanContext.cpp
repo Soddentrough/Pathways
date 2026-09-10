@@ -291,6 +291,12 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, "VK_EXT_external_memory_host") == 0) {
             m_hasExternalMemoryHost = true;
         }
+        if (std::strcmp(ext.extensionName, "VK_KHR_external_memory_fd") == 0) {
+            m_hasExternalMemoryFd = true;
+        }
+        if (std::strcmp(ext.extensionName, "VK_EXT_external_memory_dma_buf") == 0) {
+            m_hasExternalMemoryDmaBuf = true;
+        }
         if (std::strcmp(ext.extensionName, "VK_KHR_external_semaphore_fd") == 0) {
             m_hasExternalSemaphoreFd = true;
         }
@@ -576,9 +582,17 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     }
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
-    if (m_hasExternalMemoryHost) {
+    if (m_hasExternalMemoryHost || m_hasExternalMemoryFd) {
         deviceExtensions.push_back("VK_KHR_external_memory");
+    }
+    if (m_hasExternalMemoryHost) {
         deviceExtensions.push_back("VK_EXT_external_memory_host");
+    }
+    if (m_hasExternalMemoryFd) {
+        deviceExtensions.push_back("VK_KHR_external_memory_fd");
+    }
+    if (m_hasExternalMemoryDmaBuf) {
+        deviceExtensions.push_back("VK_EXT_external_memory_dma_buf");
     }
     if (m_hasExternalSemaphoreFd) {
         deviceExtensions.push_back("VK_KHR_external_semaphore_fd");
@@ -671,6 +685,10 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasExternalSemaphoreFd) {
         pfnGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(m_device, "vkGetSemaphoreFdKHR");
         pfnImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(m_device, "vkImportSemaphoreFdKHR");
+    }
+    if (m_hasExternalMemoryFd) {
+        pfnGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryFdKHR");
+        pfnGetMemoryFdPropertiesKHR = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryFdPropertiesKHR");
     }
 }
 
