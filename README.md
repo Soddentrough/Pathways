@@ -4,6 +4,7 @@ No megakernel, only efficient Device Generated Commands and moden ideas.
 
 The baseline API version is 1.4.341.
 Baseline hardware target is AMD's RDNA4 architecture (and RDNA3).
+No proprietay extentions.
 
 # Functions
 
