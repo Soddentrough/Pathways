@@ -2,52 +2,41 @@
 
 layout(local_size_x = 32) in;
 
-struct VkDispatchIndirectCommand {
+struct DispatchCommand {
     uint x;
+    uint y;
+    uint z;
+    uint pad;
+};
+
+struct DGCCommand {
+    uint pipelineIndex; // Token 0: EXECUTION_SET_EXT
+    uint x;             // Token 1: DISPATCH_EXT (strictly last!)
     uint y;
     uint z;
 };
 
-struct ShadePushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint currentBounce;
-    uint maxBounces;
-    uint maxQueueCapacity;
-    uint sppSampleIndex;
-    uint hasEnvMap;
-    float envMapIntensity;
-    uint useHardwareRT;
-};
-
-struct DGCSequenceItem {
-    ShadePushConstants pc;
-    VkDispatchIndirectCommand dispatch;
-};
-
-layout(std430, binding = 0) buffer QueueCounters {
+layout(std430, binding = 11) buffer QueueCounters {
     uint activeRayCount;
     uint nextActiveCount;
     uint totalProcessed;
-    uint padding;
+    uint shadowRayCount;
 } queueCounters;
 
-layout(std430, binding = 1) buffer IndirectCommand {
-    VkDispatchIndirectCommand dispatchCmd;
+layout(std430, binding = 13) buffer IndirectCommand {
+    DispatchCommand shadeDispatch;     // Offset 0
+    DispatchCommand shadowDispatch;    // Offset 16
+    DispatchCommand intersectDispatch; // Offset 32
 } indirect;
 
-layout(std430, binding = 2) buffer DGCStream {
-    uint dynamicSequenceCount;
-    uint pad[15]; // 60 bytes pad -> offset 64 for sequence item
-    DGCSequenceItem sequence;
+layout(std430, binding = 14) buffer DGCStream {
+    DGCCommand shadeCmd;     // Offset 0  (16 bytes)
+    DGCCommand shadowCmd;    // Offset 16 (16 bytes)
+    DGCCommand intersectCmd; // Offset 32 (16 bytes)
 } dgcStream;
 
 layout(push_constant) uniform PushConstants {
-    uint mode; // 0: initial resolve (classify -> shade), 1: bounce ping-pong swap
+    uint mode; // 0: initial resolve (classify -> shade), 1: post-shade (shadow + intersect), 2: advance bounce
     uint bounce;
     uint maxBounces;
     uint width;
@@ -65,44 +54,73 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     if (gl_LocalInvocationIndex == 0u) {
-        uint count = (pc.mode == 0u) ? queueCounters.activeRayCount : queueCounters.nextActiveCount;
-        queueCounters.activeRayCount = count;
-        uint groups = (count + 31u) / 32u;
+        if (pc.mode == 0u) {
+            // Mode 0: After primary raygen / classify
+            uint activeCount = queueCounters.activeRayCount;
+            uint shadeGroups = (activeCount + 31u) / 32u;
+            indirect.shadeDispatch.x = shadeGroups;
+            indirect.shadeDispatch.y = 1u;
+            indirect.shadeDispatch.z = 1u;
+            indirect.shadeDispatch.pad = 0u;
 
-        // Populate indirect dispatch command (fallback)
-        indirect.dispatchCmd.x = groups;
-        indirect.dispatchCmd.y = 1u;
-        indirect.dispatchCmd.z = 1u;
+            dgcStream.shadeCmd.pipelineIndex = 2u; // Shade pipeline
+            dgcStream.shadeCmd.x = shadeGroups;
+            dgcStream.shadeCmd.y = 1u;
+            dgcStream.shadeCmd.z = 1u;
 
-        // Populate multi-token DGC sequence with push constants + dispatch
-        if (count > 0u) {
-            dgcStream.dynamicSequenceCount = 1u;
-            dgcStream.sequence.pc.numTriangles = pc.numTriangles;
-            dgcStream.sequence.pc.numSpheres = pc.numSpheres;
-            dgcStream.sequence.pc.numMaterials = pc.numMaterials;
-            dgcStream.sequence.pc.numLights = pc.numLights;
-            dgcStream.sequence.pc.width = pc.width;
-            dgcStream.sequence.pc.height = pc.height;
-            dgcStream.sequence.pc.currentBounce = pc.bounce;
-            dgcStream.sequence.pc.maxBounces = pc.maxBounces;
-            dgcStream.sequence.pc.maxQueueCapacity = pc.maxCapacity;
-            dgcStream.sequence.pc.sppSampleIndex = pc.sppSampleIndex;
-            dgcStream.sequence.pc.hasEnvMap = pc.hasEnvMap;
-            dgcStream.sequence.pc.envMapIntensity = pc.envIntensity;
-            dgcStream.sequence.pc.useHardwareRT = pc.useHwRT;
+            // Clear downstream counters
+            queueCounters.nextActiveCount = 0u;
+            queueCounters.shadowRayCount = 0u;
+        } else if (pc.mode == 1u) {
+            // Mode 1: Post-shade (prepare shadow and intersect dispatches, AND next bounce shade)
+            uint shadowCount = queueCounters.shadowRayCount;
+            uint shadowGroups = (shadowCount + 31u) / 32u;
+            indirect.shadowDispatch.x = shadowGroups;
+            indirect.shadowDispatch.y = 1u;
+            indirect.shadowDispatch.z = 1u;
+            indirect.shadowDispatch.pad = 0u;
 
-            dgcStream.sequence.dispatch.x = groups;
-            dgcStream.sequence.dispatch.y = 1u;
-            dgcStream.sequence.dispatch.z = 1u;
-        } else {
-            dgcStream.dynamicSequenceCount = 0u;
-            dgcStream.sequence.dispatch.x = 0u;
-            dgcStream.sequence.dispatch.y = 0u;
-            dgcStream.sequence.dispatch.z = 0u;
+            dgcStream.shadowCmd.pipelineIndex = 3u; // Shadow pipeline
+            dgcStream.shadowCmd.x = shadowGroups;
+            dgcStream.shadowCmd.y = 1u;
+            dgcStream.shadowCmd.z = 1u;
+
+            uint nextCount = queueCounters.nextActiveCount;
+            uint intersectGroups = (nextCount + 31u) / 32u;
+            indirect.intersectDispatch.x = intersectGroups;
+            indirect.intersectDispatch.y = 1u;
+            indirect.intersectDispatch.z = 1u;
+            indirect.intersectDispatch.pad = 0u;
+
+            dgcStream.intersectCmd.pipelineIndex = 1u; // Intersect pipeline
+            dgcStream.intersectCmd.x = intersectGroups;
+            dgcStream.intersectCmd.y = 1u;
+            dgcStream.intersectCmd.z = 1u;
+
+            // Advance next bounce shade dispatch directly
+            indirect.shadeDispatch.x = intersectGroups;
+            indirect.shadeDispatch.y = 1u;
+            indirect.shadeDispatch.z = 1u;
+            indirect.shadeDispatch.pad = 0u;
+
+            dgcStream.shadeCmd.pipelineIndex = 2u; // Shade pipeline
+            dgcStream.shadeCmd.x = intersectGroups;
+            dgcStream.shadeCmd.y = 1u;
+            dgcStream.shadeCmd.z = 1u;
+
+            // Advance counters
+            if (pc.bounce + 1u < pc.maxBounces) {
+                queueCounters.activeRayCount = nextCount;
+                queueCounters.nextActiveCount = 0u;
+                queueCounters.shadowRayCount = 0u;
+                queueCounters.totalProcessed += nextCount;
+            } else {
+                // Last bounce of this tile: clear activeRayCount to 0 for next tile
+                queueCounters.activeRayCount = 0u;
+                queueCounters.nextActiveCount = 0u;
+                queueCounters.shadowRayCount = 0u;
+                queueCounters.totalProcessed = 0u;
+            }
         }
-
-        // Reset downstream counter for the upcoming pass
-        queueCounters.nextActiveCount = 0u;
-        queueCounters.totalProcessed += count;
     }
 }

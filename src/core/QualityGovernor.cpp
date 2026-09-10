@@ -44,10 +44,19 @@ void QualityGovernor::init(const GovernorConfig& config) {
     m_state.primSpp = m_state.currentSpp;
     m_state.secSpp = 0;
     m_state.active = m_config.enabled && (m_config.targetFps > 0);
+    m_state.cameraMoving = false;
     m_state.warmUpFrames = 0;
-    m_emaRtMs = 0.0f;
+    m_state.costPerSpp = 0.0f;
+    m_state.predictedRtMs = 0.0f;
+    m_emaCostPerSpp = 0.0f;
     m_cooldown = 0;
     m_initialized = true;
+
+    for (auto& rec : m_slotRecords) {
+        rec.spp = m_state.currentSpp;
+        rec.bounces = m_state.currentBounces;
+        rec.valid = false;
+    }
 
     if (m_config.targetFps > 0) {
         m_state.targetBudgetMs = 1000.0f / static_cast<float>(m_config.targetFps);
@@ -83,13 +92,39 @@ void QualityGovernor::setBounds(uint32_t minSpp, uint32_t maxSpp, uint32_t minBo
     m_config.minBounces = std::max(1u, minBounces);
     m_config.maxBounces = std::max(m_config.minBounces, maxBounces);
 
-    m_state.effectiveSpp = std::clamp(m_state.effectiveSpp, static_cast<float>(m_config.minSpp), static_cast<float>(m_config.maxSpp));
-    m_state.currentSpp = static_cast<uint32_t>(std::floor(m_state.effectiveSpp));
-    m_state.fractionalSpp = m_state.effectiveSpp - static_cast<float>(m_state.currentSpp);
+    m_state.currentSpp = std::clamp(m_state.currentSpp, m_config.minSpp, m_config.maxSpp);
     m_state.currentBounces = std::clamp(m_state.currentBounces, m_config.minBounces, m_config.maxBounces);
+    m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
 }
 
-void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel) {
+void QualityGovernor::recordDispatch(uint32_t slot, uint32_t spp, uint32_t bounces) {
+    uint32_t s = slot % 2;
+    m_slotRecords[s].spp = spp;
+    m_slotRecords[s].bounces = bounces;
+    m_slotRecords[s].valid = true;
+}
+
+float QualityGovernor::getBounceMultiplier(uint32_t bounces) {
+    // In real path-traced interior scenes, secondary bounces require significant recursive traversal.
+    // Calibrated model relative to nominal 4 bounces (1.00x):
+    // 1: 0.51x, 2: 0.68x, 3: 0.84x, 4: 1.00x, 5: 1.25x, 6: 1.50x, 7: 1.75x, 8: 2.00x
+    bounces = std::clamp(bounces, 1u, 16u);
+    if (bounces <= 4) {
+        return 0.35f + 0.1625f * static_cast<float>(bounces);
+    }
+    return 1.00f + 0.25f * static_cast<float>(bounces - 4);
+}
+
+float QualityGovernor::predictTime(uint32_t spp, uint32_t bounces, bool isMgpu) const {
+    if (m_emaCostPerSpp <= 0.001f) {
+        return 0.0f;
+    }
+    uint32_t effectiveSppPerGpu = (isMgpu && spp > 1) ? ((spp + 1) / 2) : spp;
+    float bounceMult = getBounceMultiplier(bounces);
+    return static_cast<float>(effectiveSppPerGpu) * m_emaCostPerSpp * bounceMult;
+}
+
+void QualityGovernor::update(uint32_t slot, float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel) {
     if (!m_initialized || !m_config.enabled || m_config.targetFps == 0) {
         m_state.active = false;
         m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
@@ -98,9 +133,9 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
     }
 
     m_state.active = true;
+    m_state.cameraMoving = cameraMoving;
     m_state.warmUpFrames++;
 
-    // Total target budget and available ray tracing budget
     float targetTotalMs = 1000.0f / static_cast<float>(m_config.targetFps);
     float safeOverhead = std::clamp(fixedOverheadMs, 0.2f, 2.5f);
     float rtBudget = std::max(0.5f, targetTotalMs - safeOverhead);
@@ -113,65 +148,161 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
         return;
     }
 
-    // Filter measured ray tracing duration via Exponential Moving Average
-    if (m_emaRtMs <= 0.001f) {
-        m_emaRtMs = measuredRtMs;
-    } else {
-        // Responsive during warmup, stable during steady state
-        float alpha = (m_state.warmUpFrames <= 10) ? 0.35f : 0.15f;
-        m_emaRtMs = alpha * measuredRtMs + (1.0f - alpha) * m_emaRtMs;
-    }
-    m_state.filteredRtMs = m_emaRtMs;
+    // 1. In-flight Latency Compensation: Retrieve the exact dispatch that produced measuredRtMs
+    uint32_t s = slot % 2;
+    uint32_t dispSpp = m_slotRecords[s].valid ? m_slotRecords[s].spp : m_state.currentSpp;
+    uint32_t dispBounces = m_slotRecords[s].valid ? m_slotRecords[s].bounces : m_state.currentBounces;
 
+    uint32_t dispGpuSpp = (isMgpuSampleParallel && dispSpp > 1) ? ((dispSpp + 1) / 2) : dispSpp;
+    dispGpuSpp = std::max(1u, dispGpuSpp);
+    float dispBounceMult = getBounceMultiplier(dispBounces);
+
+    // Compute normalized cost per sample (at nominal 4 bounces)
+    float sampleCost = measuredRtMs / (static_cast<float>(dispGpuSpp) * dispBounceMult);
+    if (sampleCost > 0.01f && sampleCost < 200.0f) {
+        if (m_emaCostPerSpp <= 0.001f) {
+            m_emaCostPerSpp = sampleCost;
+        } else {
+            float alpha = (m_state.warmUpFrames <= 10) ? 0.35f : 0.15f;
+            m_emaCostPerSpp = alpha * sampleCost + (1.0f - alpha) * m_emaCostPerSpp;
+        }
+    }
+    m_state.costPerSpp = m_emaCostPerSpp;
+    m_state.filteredRtMs = measuredRtMs;
+
+    if (m_failLockoutFrames > 0) {
+        m_failLockoutFrames--;
+    }
+
+    // Pipeline Drain Protection: If cooling down from a recent change, do not take action.
+    // This completely prevents in-flight cascading downscales.
     if (m_cooldown > 0) {
         m_cooldown--;
-    }
-
-    // Continuous Adaptive Sample Rate Governor
-    // Target 94% of available RT budget to absorb OS compositing jitter
-    float targetRtMs = 0.94f * rtBudget;
-    float currentEff = std::max(1.0f, m_state.effectiveSpp);
-    float timePerSpp = std::max(0.1f, m_emaRtMs / currentEff);
-    float errorMs = targetRtMs - m_emaRtMs;
-
-    if (m_emaRtMs > 1.02f * rtBudget) {
-        // Fast emergency step-down when overshooting budget
-        float delta = errorMs / timePerSpp;
-        m_state.effectiveSpp = std::clamp(m_state.effectiveSpp + delta,
-                                          static_cast<float>(m_config.minSpp),
-                                          static_cast<float>(m_config.maxSpp));
-        m_cooldown = 4;
-    } else if (m_cooldown == 0) {
-        // Smooth proportional adjustment to continuously track target budget
-        float gain = (m_state.warmUpFrames <= 15) ? 0.35f : 0.12f;
-        float delta = gain * (errorMs / timePerSpp);
-        m_state.effectiveSpp = std::clamp(m_state.effectiveSpp + delta,
-                                          static_cast<float>(m_config.minSpp),
-                                          static_cast<float>(m_config.maxSpp));
-    }
-
-    m_state.currentSpp = static_cast<uint32_t>(std::floor(m_state.effectiveSpp));
-    if (m_state.currentSpp >= m_config.maxSpp) {
-        m_state.currentSpp = m_config.maxSpp;
+        m_state.predictedRtMs = predictTime(m_state.currentSpp, m_state.currentBounces, isMgpuSampleParallel);
+        m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
         m_state.fractionalSpp = 0.0f;
-    } else {
-        m_state.fractionalSpp = m_state.effectiveSpp - static_cast<float>(m_state.currentSpp);
+        if (isMgpuSampleParallel && m_state.currentSpp > 1) {
+            m_state.primSpp = (m_state.currentSpp + 1) / 2;
+            m_state.secSpp = m_state.currentSpp / 2;
+        } else {
+            m_state.primSpp = m_state.currentSpp;
+            m_state.secSpp = 0;
+        }
+        m_state.headroomMs = rtBudget - m_state.predictedRtMs;
+        m_state.headroomPercent = (rtBudget > 0.001f) ? (m_state.headroomMs / rtBudget) * 100.0f : 0.0f;
+        return;
     }
 
-    // Secondary fine vernier: modulate bounces only at SPP extremes
-    if (m_state.effectiveSpp >= static_cast<float>(m_config.maxSpp) && m_emaRtMs < 0.85f * rtBudget && m_cooldown == 0) {
-        if (m_state.currentBounces < m_config.maxBounces) {
-            m_state.currentBounces++;
-            m_cooldown = 8;
-        }
-    } else if (m_state.effectiveSpp <= static_cast<float>(m_config.minSpp) + 0.05f && m_emaRtMs > 0.98f * rtBudget) {
-        if (m_state.currentBounces > m_config.minBounces) {
+    // 2. Safe Headroom Target Line: Require 15% margin for upgrades
+    float targetRtMs = 0.85f * rtBudget;
+
+    // 3. Emergency Downscale if overshooting budget
+    if (measuredRtMs > 1.01f * rtBudget) {
+        // Record this configuration as failed to prevent hunting
+        m_failedSpp = dispSpp;
+        m_failedBounces = dispBounces;
+        m_failLockoutFrames = 90; // Lock out failed config for 90 frames (~1.5s)
+
+        // Downscale either bounces or SPP by exactly 1 step
+        if (m_state.currentBounces > m_config.minBounces && m_state.currentSpp <= m_config.minSpp) {
             m_state.currentBounces--;
+        } else if (m_state.currentSpp > m_config.minSpp) {
+            m_state.currentSpp--;
+        } else if (m_state.currentBounces > m_config.minBounces) {
+            m_state.currentBounces--;
+        }
+
+        m_cooldown = 3; // Drain 2 in-flight frames before any further decision
+    } else if (m_emaCostPerSpp > 0.001f) {
+        auto isConfigAllowed = [&](uint32_t spp, uint32_t bounces) -> bool {
+            if (m_failLockoutFrames > 0 && spp >= m_failedSpp && bounces >= m_failedBounces) {
+                return false;
+            }
+            return true;
+        };
+
+        // 4. Model-Predictive Optimal Configuration Search
+        uint32_t bestSpp = m_state.currentSpp;
+        uint32_t bestBounces = m_state.currentBounces;
+
+        if (cameraMoving) {
+            // Motion Profile: Maximize Primary SPP to suppress spatial/temporal noise.
+            // Lock bounces to 3-4 so primary SPP has maximum headroom.
+            uint32_t motionBounces = std::clamp(3u, m_config.minBounces, std::min(4u, m_config.maxBounces));
+
+            uint32_t candidateSpp = m_config.minSpp;
+            for (uint32_t spp = m_config.minSpp; spp <= m_config.maxSpp; ++spp) {
+                if (!isConfigAllowed(spp, motionBounces)) break;
+                if (predictTime(spp, motionBounces, isMgpuSampleParallel) <= targetRtMs) {
+                    candidateSpp = spp;
+                } else {
+                    break;
+                }
+            }
+            bestSpp = candidateSpp;
+            bestBounces = motionBounces;
+
+            // Extra headroom: check if bounce depth can be slightly increased (up to 5)
+            for (uint32_t b = motionBounces + 1; b <= std::min(5u, m_config.maxBounces); ++b) {
+                if (!isConfigAllowed(bestSpp, b)) break;
+                if (predictTime(bestSpp, b, isMgpuSampleParallel) <= targetRtMs) {
+                    bestBounces = b;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Stationary Profile: Progressive accumulation handles samples over static frames;
+            // prioritize high bounce transport and stable SPP without hunting or pulsing.
+            // Find highest bounce count at minSpp first
+            uint32_t optBounces = m_config.minBounces;
+            for (uint32_t b = m_config.minBounces; b <= m_config.maxBounces; ++b) {
+                if (!isConfigAllowed(m_config.minSpp, b)) break;
+                if (predictTime(m_config.minSpp, b, isMgpuSampleParallel) <= targetRtMs) {
+                    optBounces = b;
+                } else {
+                    break;
+                }
+            }
+
+            // Now check if higher SPP fits with that bounce depth
+            uint32_t optSpp = m_config.minSpp;
+            for (uint32_t spp = m_config.minSpp + 1; spp <= m_config.maxSpp; ++spp) {
+                if (!isConfigAllowed(spp, optBounces)) break;
+                if (predictTime(spp, optBounces, isMgpuSampleParallel) <= targetRtMs) {
+                    optSpp = spp;
+                } else {
+                    break;
+                }
+            }
+
+            bestSpp = optSpp;
+            bestBounces = optBounces;
+        }
+
+        // Apply smooth, single-step rate-limiting
+        if (bestSpp > m_state.currentSpp) {
+            m_state.currentSpp++;
             m_cooldown = 6;
+        } else if (bestBounces > m_state.currentBounces) {
+            m_state.currentBounces++;
+            m_cooldown = 6;
+        } else if (bestSpp < m_state.currentSpp) {
+            m_state.currentSpp--;
+            m_cooldown = 3;
+        } else if (bestBounces < m_state.currentBounces) {
+            m_state.currentBounces--;
+            m_cooldown = 3;
         }
     }
 
-    // Assign Multi-GPU Sample Parallel split
+    m_state.currentSpp = std::clamp(m_state.currentSpp, m_config.minSpp, m_config.maxSpp);
+    m_state.currentBounces = std::clamp(m_state.currentBounces, m_config.minBounces, m_config.maxBounces);
+    m_state.effectiveSpp = static_cast<float>(m_state.currentSpp);
+    m_state.fractionalSpp = 0.0f;
+    m_state.predictedRtMs = predictTime(m_state.currentSpp, m_state.currentBounces, isMgpuSampleParallel);
+
+    // Multi-GPU Sample Parallel balancing
     if (isMgpuSampleParallel && m_state.currentSpp > 1) {
         m_state.primSpp = (m_state.currentSpp + 1) / 2;
         m_state.secSpp = m_state.currentSpp / 2;
@@ -180,8 +311,8 @@ void QualityGovernor::update(float measuredRtMs, float fixedOverheadMs, bool cam
         m_state.secSpp = 0;
     }
 
-    // Compute headroom
-    m_state.headroomMs = rtBudget - m_emaRtMs;
+    // Telemetry Headroom
+    m_state.headroomMs = rtBudget - m_state.predictedRtMs;
     m_state.headroomPercent = (rtBudget > 0.001f) ? (m_state.headroomMs / rtBudget) * 100.0f : 0.0f;
 }
 
@@ -196,7 +327,7 @@ void QualityGovernor::paceFrame(std::chrono::high_resolution_clock::time_point f
 
     if (now < deadline) {
         auto remaining = deadline - now;
-        // Sleep for the coarse duration (leaving 250 microseconds for precision spinning)
+        // Coarse sleep (leave 250 microseconds for precision spin-locking)
         if (remaining > std::chrono::microseconds(350)) {
 #if defined(_WIN32)
             highPrecisionSleep(remaining - std::chrono::microseconds(250));

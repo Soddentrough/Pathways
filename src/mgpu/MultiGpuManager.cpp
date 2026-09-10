@@ -1290,7 +1290,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         envBits,
         packet.accumulateHistory,
         fracBits,
-        0, 0, 0
+        packet.totalCompositeSpp,
+        0, 0
     };
 
     uint32_t dispatchWidth = packet.tileWidth;
@@ -1568,7 +1569,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t accumulateHistory,
                                          float fractionalSpp,
                                          void* dstHostPtr,
-                                         size_t transferBytes) {
+                                         size_t transferBytes,
+                                         uint32_t totalCompositeSpp) {
     if (!m_active || m_devices.empty()) return;
 
     {
@@ -1592,6 +1594,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.fractionalSpp = fractionalSpp;
         m_pendingWork.dstHostPtr = dstHostPtr;
         m_pendingWork.transferBytes = transferBytes;
+        m_pendingWork.totalCompositeSpp = totalCompositeSpp;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
         m_waitingSlot = slot;

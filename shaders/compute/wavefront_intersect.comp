@@ -1,0 +1,326 @@
+#version 460
+#extension GL_EXT_ray_query : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 2) readonly buffer TrianglesBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 3) readonly buffer SpheresBuffer {
+    Sphere spheres[];
+};
+
+layout(std430, binding = 4) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
+layout(std430, binding = 9) readonly buffer InRayStateQueue {
+    RayState inStates[];
+};
+
+layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
+    RayState outStates[];
+};
+
+layout(std430, binding = 11) buffer QueueCountersBuffer {
+    uint activeRayCount;
+    uint nextActiveCount;
+    uint totalProcessed;
+    uint shadowRayCount;
+    uint retiredWorkgroups;
+    uint currentShadowCount;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint currentMaterialCounts[4];
+    uint totalShadeWorkgroups;
+    uint pad[13];
+} queueCounters;
+
+layout(std430, binding = 13) buffer IndirectCommand {
+    DispatchCommand commands[];
+} indirect;
+
+layout(std430, binding = 14) buffer DGCStream {
+    DGCCommand commands[];
+} dgcStream;
+
+layout(std430, binding = 15) readonly buffer InRayGeomQueue {
+    RayGeometry inGeom[];
+};
+
+layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
+    RayGeometry outGeoms[];
+};
+
+layout(std430, binding = 17) writeonly buffer OutRayHitQueue {
+    RayHit outHits[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint width;
+    uint height;
+    uint currentBounce;
+    uint maxBounces;
+    uint maxQueueCapacity;
+    uint sppSampleIndex;
+    uint hasEnvMap;
+    float envMapIntensity;
+    uint useHardwareRT;
+    uint sortMode;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    bool inRange = (idx < queueCounters.activeRayCount);
+
+    RayGeometry geom;
+    if (inRange) {
+        geom = inGeom[idx];
+    } else {
+        geom.originAndTMin = vec4(0.0);
+        geom.dirAndTMax = vec4(0.0);
+    }
+
+    vec3 origin = geom.originAndTMin.xyz;
+    float tMin = geom.originAndTMin.w;
+    vec3 direction = geom.dirAndTMax.xyz;
+    float tMax = geom.dirAndTMax.w;
+
+    float closestT = tMax;
+    int closestTri = -1;
+    vec2 closestBary = vec2(0.0);
+    int closestSphere = -1;
+
+    if (inRange) {
+        // Fixed-function hardware BVH traversal with zero shader ALU interrupts
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, tMin, direction, closestT);
+        rayQueryProceedEXT(rq);
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            closestT = rayQueryGetIntersectionTEXT(rq, true);
+            closestTri = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+            closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        }
+
+        // Procedural Spheres intersection test
+        if (pc.numSpheres > 0u) {
+            for (uint i = 0; i < pc.numSpheres; ++i) {
+                float spT;
+                vec3 spNorm;
+                if (intersectSphere(origin, direction, spheres[i], tMin, closestT, spT, spNorm)) {
+                    closestT = spT;
+                    closestSphere = int(i);
+                    closestTri = -1;
+                }
+            }
+        }
+    }
+
+    RayHit hit;
+    uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
+    if (inRange) {
+        if (closestTri >= 0) {
+            hit.hitData = vec4(closestT,
+                               uintBitsToFloat(uint(closestTri)),
+                               uintBitsToFloat(packHalf2x16(closestBary)),
+                               uintBitsToFloat(0u)); // 0: triangle
+            uint matId = triangles[closestTri].materialId;
+            if (matId < pc.numMaterials) {
+                archetype = getMaterialArchetype(materials[matId]);
+            }
+        } else if (closestSphere >= 0) {
+            hit.hitData = vec4(closestT,
+                               uintBitsToFloat(uint(closestSphere)),
+                               uintBitsToFloat(0u),
+                               uintBitsToFloat(1u)); // 1: sphere
+            uint matId = spheres[closestSphere].materialId;
+            if (matId < pc.numMaterials) {
+                archetype = getMaterialArchetype(materials[matId]);
+            }
+        } else {
+            hit.hitData = vec4(closestT,
+                               uintBitsToFloat(0xFFFFFFFFu),
+                               uintBitsToFloat(0u),
+                               uintBitsToFloat(2u)); // 2: miss
+            archetype = MATERIAL_ARCHETYPE_DIFFUSE; // Miss radiance evaluated in diffuse microkernel
+        }
+    }
+
+    uint sourceIdx = idx;
+    if (pc.sortMode > 0u) {
+        if (pc.sortMode == 3u) {
+            // Technique D: 3D Spatial-Morton + Material Dual-Binning via Intra-Wave Bitonic Sort
+            uint mortonCode = 0u;
+            uint hitType = floatBitsToUint(hit.hitData.w);
+            if (inRange && hitType != 2u) {
+                vec3 hitP = geom.originAndTMin.xyz + hit.hitData.x * geom.dirAndTMax.xyz;
+                vec3 pNorm = fract((hitP * 0.1) + 0.5);
+                uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
+                mortonCode = morton3D_10bit(qPos) & 0x0FFFu;
+            }
+            uint sortKey = inRange ? ((archetype << 12u) | mortonCode) : 0xFFFFu;
+            uint sortedLane = gl_SubgroupInvocationID;
+
+            uint lane = gl_SubgroupInvocationID;
+            [[unroll]]
+            for (uint k = 2u; k <= 32u; k <<= 1u) {
+                [[unroll]]
+                for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+                    uint partnerLane = lane ^ j;
+                    uint partnerKey = subgroupShuffle(sortKey, partnerLane);
+                    uint partnerLaneId = subgroupShuffle(sortedLane, partnerLane);
+
+                    bool ascending = ((lane & k) == 0u);
+                    bool swap = ascending ? (sortKey > partnerKey) : (sortKey < partnerKey);
+                    if (swap) {
+                        sortKey = partnerKey;
+                        sortedLane = partnerLaneId;
+                    }
+                }
+            }
+            inRange = (sortKey != 0xFFFFu);
+            archetype = (sortKey >> 12u) & 0xFu;
+            sourceIdx = (idx - lane) + sortedLane;
+            hit.hitData = subgroupShuffle(hit.hitData, sortedLane);
+            geom = inGeom[sourceIdx];
+        }
+
+        // Technique B: Subgroup Ballot Multi-Queue Partitioning (Zero-Sort)
+        for (uint k = 0u; k < 4u; ++k) {
+            bool isMatch = (inRange && archetype == k);
+            uvec4 matBallot = subgroupBallot(isMatch);
+            uint matchCount = subgroupBallotBitCount(matBallot);
+
+            if (matchCount > 0u) {
+                uint laneSlot = subgroupBallotExclusiveBitCount(matBallot);
+                uint waveQueueBase = 0u;
+                if (subgroupElect()) {
+                    if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
+                    else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
+                    else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.conductorCount, matchCount);
+                    else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
+                }
+                waveQueueBase = subgroupBroadcastFirst(waveQueueBase);
+
+                if (isMatch) {
+                    uint targetIdx = k * pc.maxQueueCapacity + (waveQueueBase + laneSlot);
+                    if (waveQueueBase + laneSlot < pc.maxQueueCapacity) {
+                        outGeoms[targetIdx] = geom;
+                        outHits[targetIdx]  = hit;
+                        outStates[targetIdx] = inStates[sourceIdx];
+                    }
+                }
+            }
+        }
+    } else {
+        if (inRange) {
+            outHits[idx] = hit;
+        }
+    }
+
+    // Atomic workgroup retirement to prepare Bounce b+1 Shade dispatch directly
+    memoryBarrierBuffer();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint totalWgs = gl_NumWorkGroups.x;
+        uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
+        if (retired == totalWgs - 1u) {
+            uint b = pc.currentBounce;
+            uint nextB = b + 1u;
+            if (pc.sortMode > 0u && nextB < pc.maxBounces) {
+                uint diffCnt = queueCounters.diffuseCount;
+                uint dielCnt = queueCounters.dielectricCount;
+                uint condCnt = queueCounters.conductorCount;
+                uint compCnt = queueCounters.complexCount;
+
+                queueCounters.currentMaterialCounts[0] = diffCnt;
+                queueCounters.currentMaterialCounts[1] = dielCnt;
+                queueCounters.currentMaterialCounts[2] = condCnt;
+                queueCounters.currentMaterialCounts[3] = compCnt;
+
+                uint diffGroups = (diffCnt + 31u) / 32u;
+                uint dielGroups = (dielCnt + 31u) / 32u;
+                uint condGroups = (condCnt + 31u) / 32u;
+                uint compGroups = (compCnt + 31u) / 32u;
+
+                // Bounce nextB Shading Commands (Sequence 0..3)
+                indirect.commands[nextB * 6u + 0u].x = diffGroups;
+                indirect.commands[nextB * 6u + 0u].y = 1u;
+                indirect.commands[nextB * 6u + 0u].z = 1u;
+                indirect.commands[nextB * 6u + 0u].pad = diffCnt;
+
+                indirect.commands[nextB * 6u + 1u].x = dielGroups;
+                indirect.commands[nextB * 6u + 1u].y = 1u;
+                indirect.commands[nextB * 6u + 1u].z = 1u;
+                indirect.commands[nextB * 6u + 1u].pad = dielCnt;
+
+                indirect.commands[nextB * 6u + 2u].x = condGroups;
+                indirect.commands[nextB * 6u + 2u].y = 1u;
+                indirect.commands[nextB * 6u + 2u].z = 1u;
+                indirect.commands[nextB * 6u + 2u].pad = condCnt;
+
+                indirect.commands[nextB * 6u + 3u].x = compGroups;
+                indirect.commands[nextB * 6u + 3u].y = 1u;
+                indirect.commands[nextB * 6u + 3u].z = 1u;
+                indirect.commands[nextB * 6u + 3u].pad = compCnt;
+
+                dgcStream.commands[nextB * 6u + 0u].pipelineIndex = 0u; // Diffuse
+                dgcStream.commands[nextB * 6u + 0u].x = diffGroups;
+                dgcStream.commands[nextB * 6u + 0u].y = 1u;
+                dgcStream.commands[nextB * 6u + 0u].z = 1u;
+
+                dgcStream.commands[nextB * 6u + 1u].pipelineIndex = 1u; // Dielectric
+                dgcStream.commands[nextB * 6u + 1u].x = dielGroups;
+                dgcStream.commands[nextB * 6u + 1u].y = 1u;
+                dgcStream.commands[nextB * 6u + 1u].z = 1u;
+
+                dgcStream.commands[nextB * 6u + 2u].pipelineIndex = 2u; // Conductor
+                dgcStream.commands[nextB * 6u + 2u].x = condGroups;
+                dgcStream.commands[nextB * 6u + 2u].y = 1u;
+                dgcStream.commands[nextB * 6u + 2u].z = 1u;
+
+                dgcStream.commands[nextB * 6u + 3u].pipelineIndex = 3u; // Complex
+                dgcStream.commands[nextB * 6u + 3u].x = compGroups;
+                dgcStream.commands[nextB * 6u + 3u].y = 1u;
+                dgcStream.commands[nextB * 6u + 3u].z = 1u;
+
+                uint totalShadeWgs = diffGroups + dielGroups + condGroups + compGroups;
+                queueCounters.totalShadeWorkgroups = totalShadeWgs;
+
+                if (totalShadeWgs == 0u) {
+                    indirect.commands[nextB * 6u + 4u].x = 0u;
+                    indirect.commands[nextB * 6u + 5u].x = 0u;
+                }
+
+                queueCounters.diffuseCount = 0u;
+                queueCounters.dielectricCount = 0u;
+                queueCounters.conductorCount = 0u;
+                queueCounters.complexCount = 0u;
+            }
+
+            queueCounters.currentShadowCount = 0u;
+            queueCounters.nextActiveCount = 0u;
+            queueCounters.shadowRayCount = 0u;
+            queueCounters.retiredWorkgroups = 0u;
+        }
+    }
+}

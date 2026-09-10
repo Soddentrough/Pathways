@@ -318,3 +318,128 @@ To bridge meshlets with hardware ray tracing:
   - Benchmark on multi-million polygon datasets (e.g. Stanford Lucy, high-detail CAD scans).
   - Verify sustained sub-8ms 120 FPS performance on Dual R9700 hardware.
 
+---
+
+## 4. Next-Generation Scene Ingestion: glTF 2.1 (64-Bit GLB Container) & OpenUSD Binary Crate (`.usdc`)
+
+- **Status:** Proposed / Architectural Specification & Backlog
+- **Target Hardware:** Dual AMD Radeon AI PRO R9700 (gfx1201 / RDNA 4), 64 GB System RAM, 64 GB VRAM
+- **Priority:** High (Unblocks massive photogrammetry scans, digital twins, and cinematic film assets exceeding the 4 GiB 32-bit barrier)
+
+---
+
+### 4.1 Motivation & Problem Statement
+
+Pathways currently relies on **glTF 2.0 (`.gltf`, `.glb`)** via `cgltf v1.15` as its sole runtime file-based ingestion pipeline. While effective for lightweight real-time assets, this architecture exhibits critical limitations when handling industrial-grade, dense datasets:
+
+1. **The 4 GiB GLB File Ceiling:**
+   - The glTF 2.0 binary format (`GlbVersion = 2`) stores chunk lengths and buffer offsets as 32-bit unsigned integers (`uint32_t`).
+   - Photogrammetry scans, large architectural models, CAD datasets, and complex VFX scenes easily exceed 4 GiB, causing `cgltf` to reject the file or truncate offsets.
+   - The **glTF 2.1** specification (released June 2026) addresses this by introducing Binary Format Version 3 with **64-bit chunk length fields and offsets**, lifting the 4 GiB ceiling.
+2. **Absence of 64-Bit Accessor Types (`DOUBLE`, `INT64`):**
+   - glTF 2.0 only supports component types up to 32-bit (`FLOAT`, `UNSIGNED_INT`).
+   - Large-world coordinate spaces (planetary GIS, aerospace simulations, expansive cityscapes) require double-precision floating-point coordinates (`DOUBLE`) to prevent floating-point precision jitter near distant geometry.
+   - glTF 2.1 officially adds `DOUBLE` (64-bit float) and `INT64` / `UINT64` accessors.
+3. **Monolithic Asset Delivery vs. Production Binary Crate (`.usdc`):**
+   - glTF files require parsing JSON hierarchies and copying buffers, creating substantial CPU ingestion latency on multi-gigabyte models.
+   - Pixar's **OpenUSD Binary Crate (`.usdc`)** format provides a high-performance, memory-mapped, zero-copy binary serialization format specifically designed for rapid streaming of multi-million polygon geometries and material graphs without deserialization bottlenecks.
+
+---
+
+### 4.2 Architectural Design & Data Flow
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Unified High-Capacity Scene Ingestion                         │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+    glTF 2.1 (.gltf / .glb v3 64-bit)                OpenUSD Binary Crate (.usdc / .usdz)
+    - 64-bit Chunk Headers (>4 GiB)                  - Zero-Copy Memory-Mapped Tables
+    - DOUBLE / INT64 Accessors                       - VtArray<GfVec3d> Double Precision
+                   │                                                  │
+                   ▼                                                  ▼
+    ┌──────────────────────────────┐                 ┌────────────────────────────────┐
+    │     Modern glTF 2.1 Parser   │                 │     OpenUSD Core / Crate API   │
+    │     (fastgltf / cgltf-ng)    │                 │   (pxr::UsdStage, pxr::UsdGeom)│
+    └──────────────┬───────────────┘                 └────────────────┬───────────────┘
+                   │                                                  │
+                   └────────────────────────┬─────────────────────────┘
+                                            │
+                                            ▼
+    ┌────────────────────────────────────────────────────────────────────────────────────┐
+    │                      64-Bit Geometry Adapter & Normalization                       │
+    │  - Camera-Relative Translation: x_rel = float(x_world - camera_world)              │
+    │  - Float64 -> Float32 demotion for Vulkan Hardware Ray Tracing BLAS                │
+    │  - Multi-BLAS Spatial Chunking (partitions meshes exceeding 2^32-1 vertex limit)   │
+    └───────────────────────────────────────┬────────────────────────────────────────────┘
+                                            │
+                                            ▼
+    ┌────────────────────────────────────────────────────────────────────────────────────┐
+    │                              Pathways Core Scene Data                              │
+    │  - TriangleGPU Buffer (std430 SSBO: 160 B/tri, 32-bit floats, 32-bit material IDs) │
+    │  - MaterialGPU Buffer (PBR, Transmission, Clearcoat, Emissive)                     │
+    │  - AccelerationStructureManager (VK_FORMAT_R32G32B32_SFLOAT, VK_INDEX_TYPE_UINT32)│
+    └───────────────────────────────────────┬────────────────────────────────────────────┘
+                                            │
+                                            ▼
+    ┌────────────────────────────────────────────────────────────────────────────────────┐
+    │                    Dual AMD Radeon AI PRO R9700 Hardware RT                        │
+    │  - Native 32-bit RDNA 4 Ray Accelerators (Wave32 Traversal & Intersection)         │
+    │  - Multi-GPU Zero-Copy Shared Host Memory Pipelining                               │
+    └────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### A. glTF 2.1 Specification Support
+- **64-Bit GLB Container (Version 3):**
+  - Parse binary header: Magic `0x46546C67`, Version `3`, followed by 64-bit unsigned integer chunk lengths.
+  - Remove memory mapping limits, enabling seamless loading of 10–50+ GB single-file `.glb` captures.
+- **Extended Accessors:**
+  - Support `componentType = 5130` (`DOUBLE` / 64-bit IEEE 754 float) and `5128` (`INT64` / `UINT64`).
+  - Convert double-precision vertex attributes on ingest into camera-relative single-precision floats (`float32`) for compatibility with Vulkan hardware RT.
+- **Implicit Shapes & BVH Extensions:**
+  - Parse glTF 2.1 native implicit primitives (analytical boxes, spheres, capsules, cylinders) directly into Pathways analytical intersection pipelines (`SphereGPU` / procedural primitives).
+
+#### B. OpenUSD Binary Crate (`.usdc`) Ingestion
+- **Memory-Mapped Direct Ingestion:**
+  - Implement `UsdLoader::loadSceneData(filepath)` utilizing the OpenUSD C++ API (`pxr::UsdStage::Open`).
+  - Stream `UsdGeomMesh` points (`VtArray<GfVec3f>` and `VtArray<GfVec3d>`), face vertex counts, and face vertex indices directly from the binary Crate file into Vulkan staging buffers without temporary allocations.
+- **MaterialX & UsdPreviewSurface Translation:**
+  - Map `UsdPreviewSurface` inputs (`diffuseColor`, `metallic`, `roughness`, `clearcoat`, `ior`, `opacity`) into `MaterialGPU` parameters.
+  - Resolve asset paths relative to the USD root layer with support for packaged `.usdz` ZIP archives.
+
+#### C. Handling Ultra-Dense 64-Bit Geometry in Vulkan Ray Tracing
+- **The Vulkan 32-Bit RT Barrier:**
+  - Hardware Ray Tracing units (`VK_KHR_acceleration_structure`) and SPIR-V ray tracing builtins (`gl_PrimitiveID`) operate strictly on 32-bit indices and 32-bit floating-point bounding boxes/vertices.
+  - Neither Vulkan nor GPU RT hardware supports 64-bit index buffers (`VK_INDEX_TYPE_UINT64` does not exist in the specification).
+- **Multi-BLAS Partitioning Scheme:**
+  - If a dense CAD or photogrammetry mesh contains more than $2^{32}-1$ indices (~1.43 billion triangles), Pathways will automatically partition the geometry across spatial clusters into multiple individual BLAS structures under a unified top-level acceleration structure (TLAS).
+- **Camera-Relative Jitter Elimination:**
+  - High-precision world coordinates ($\mathbf{x}_{\text{world}} \in \mathbb{R}^3$, 64-bit float) are translated to camera-relative space before uploading to `VkBuffer`:
+    $$\mathbf{x}_{\text{rel}} = \text{float32}(\mathbf{x}_{\text{world}} - \mathbf{x}_{\text{cam}})$$
+  - This eliminates numerical precision degradation at large coordinates while maintaining full hardware RT throughput on RDNA 4.
+
+---
+
+### 4.3 Implementation Roadmap & Checklist
+
+- [ ] **1. Parser Modernization for glTF 2.1 (`third_party/fastgltf` or `cgltf` update):**
+  - Integrate `fastgltf` (modern C++20 glTF parser) supporting glTF 2.0 & 2.1, GLB version 3 (64-bit chunks), SIMD JSON decoding, and memory-mapped file buffers.
+  - Update `GltfLoader.cpp` to parse 64-bit buffer views and chunk lengths without truncation.
+- [ ] **2. glTF 2.1 Extended Accessor Decoding (`src/scene/GltfLoader.cpp`):**
+  - Implement decoders for `DOUBLE` (64-bit float) vertex positions and `INT64` / `UINT64` indices.
+  - Implement automatic CPU demotion to 32-bit floats with camera-relative centering.
+- [ ] **3. OpenUSD Binary Crate Loader (`src/scene/UsdLoader.hpp` / `.cpp`):**
+  - Create native USD stage reader (`UsdLoader`) linked against OpenUSD Core C++ libraries.
+  - Ingest `UsdGeomMesh` and `UsdGeomSubset` data directly into Pathways `SceneData`.
+  - Extract UVs, normals, tangents, and material bindings from `UsdShadeMaterial`.
+- [ ] **4. Ultra-Dense Mesh Partitioning (`src/scene/MeshPartition.hpp`):**
+  - Implement spatial k-d tree or AABB clustering to split geometries exceeding $2^{31}$ vertices into sub-mesh primitives.
+  - Register partitioned primitives as separate BLAS geometries or multi-BLAS TLAS instances.
+- [ ] **5. Dynamic Scene Registry & GUI Extension (`src/scene/SceneRegistry.cpp`, `src/ui/GuiManager.cpp`):**
+  - Extend scene discovery scanner to recognize `.usdc`, `.usd`, and `.usdz` extensions alongside `.gltf` and `.glb`.
+  - Display container version (`glTF 2.0` vs `glTF 2.1 (64-bit)` vs `OpenUSD Crate`) and precision mode in the Dear ImGui Active Scene card.
+- [ ] **6. Performance & Scale Validation:**
+  - Ingest and benchmark a multi-gigabyte (>4 GiB) glTF 2.1 model and a production `.usdc` scene.
+  - Verify zero GPU memory leaks, sub-8ms frame budget on Dual R9700 GPUs, and clean Vulkan validation pass.
+
+

@@ -1,5 +1,6 @@
 #include "scene/Camera.hpp"
 #include "scene/ProceduralScene.hpp"
+#include "core/Config.hpp"
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -274,6 +275,74 @@ int main() {
     assert_near(hitPoint.x, -1.0f, 0.01f, "Left wall hit X");
     check_true(hitName == "Left Wall (Red)", "Hit name must be Left Wall (Red)");
     std::cout << "[PASS] Scene raycast against Cornell Box objects (Back Wall, Floor, Left Wall) verified." << std::endl;
+
+    // 19. CLI Camera Configuration & Override Tests
+    {
+        // 19a. Combination --camera with comma separation (px,py,pz,tx,ty,tz,fov)
+        const char* argv1[] = {
+            "pathways", "--headless",
+            "--camera", "1.5,-2.0,3.75,0.0,1.0,0.0,60.0"
+        };
+        Config cfg1 = Config::parse(4, const_cast<char**>(argv1));
+        check_true(cfg1.camera_pos.has_value(), "cfg1 has camera_pos");
+        check_true(cfg1.camera_target.has_value(), "cfg1 has camera_target");
+        check_true(cfg1.camera_fov.has_value(), "cfg1 has camera_fov");
+        assert_near(cfg1.camera_pos->x, 1.5f, 0.001f, "cfg1 pos x");
+        assert_near(cfg1.camera_pos->y, -2.0f, 0.001f, "cfg1 pos y");
+        assert_near(cfg1.camera_pos->z, 3.75f, 0.001f, "cfg1 pos z");
+        assert_near(cfg1.camera_target->x, 0.0f, 0.001f, "cfg1 target x");
+        assert_near(cfg1.camera_target->y, 1.0f, 0.001f, "cfg1 target y");
+        assert_near(cfg1.camera_target->z, 0.0f, 0.001f, "cfg1 target z");
+        assert_near(*cfg1.camera_fov, 60.0f, 0.001f, "cfg1 fov");
+        std::cout << "[PASS] Combination --camera comma-separated parsing verified." << std::endl;
+
+        // 19b. Combination --camera with space separation
+        const char* argv2[] = {
+            "pathways", "--headless",
+            "--camera", "-0.5", "1.25", "4.0", "0.0", "0.5", "-1.0", "55.0"
+        };
+        Config cfg2 = Config::parse(10, const_cast<char**>(argv2));
+        check_true(cfg2.camera_pos.has_value(), "cfg2 has camera_pos");
+        check_true(cfg2.camera_target.has_value(), "cfg2 has camera_target");
+        check_true(cfg2.camera_fov.has_value(), "cfg2 has camera_fov");
+        assert_near(cfg2.camera_pos->x, -0.5f, 0.001f, "cfg2 pos x");
+        assert_near(cfg2.camera_pos->y, 1.25f, 0.001f, "cfg2 pos y");
+        assert_near(cfg2.camera_pos->z, 4.0f, 0.001f, "cfg2 pos z");
+        assert_near(cfg2.camera_target->x, 0.0f, 0.001f, "cfg2 target x");
+        assert_near(cfg2.camera_target->y, 0.5f, 0.001f, "cfg2 target y");
+        assert_near(cfg2.camera_target->z, -1.0f, 0.001f, "cfg2 target z");
+        assert_near(*cfg2.camera_fov, 55.0f, 0.001f, "cfg2 fov");
+        std::cout << "[PASS] Combination --camera space-separated parsing verified." << std::endl;
+
+        // 19c. Individual --camera-pos, --camera-target, --camera-up, --camera-fov
+        const char* argv3[] = {
+            "pathways", "--headless",
+            "--camera-pos", "0.0,2.5,5.0",
+            "--camera-target", "0.0,0.0,0.0",
+            "--camera-up", "0.0,1.0,0.0",
+            "--camera-fov", "75.0"
+        };
+        Config cfg3 = Config::parse(10, const_cast<char**>(argv3));
+        check_true(cfg3.camera_pos.has_value(), "cfg3 has camera_pos");
+        check_true(cfg3.camera_target.has_value(), "cfg3 has camera_target");
+        check_true(cfg3.camera_up.has_value(), "cfg3 has camera_up");
+        check_true(cfg3.camera_fov.has_value(), "cfg3 has camera_fov");
+        assert_near(cfg3.camera_pos->y, 2.5f, 0.001f, "cfg3 pos y");
+        assert_near(cfg3.camera_pos->z, 5.0f, 0.001f, "cfg3 pos z");
+        assert_near(*cfg3.camera_fov, 75.0f, 0.001f, "cfg3 fov");
+        std::cout << "[PASS] Individual --camera-pos, --camera-target, --camera-up, --camera-fov parsing verified." << std::endl;
+
+        // 19d. Applying overrides to Camera instance
+        Camera testCam;
+        testCam.lookAt(*cfg1.camera_pos, *cfg1.camera_target);
+        testCam.setFov(*cfg1.camera_fov);
+        testCam.setAdaptiveFov(false);
+        assert_near(testCam.getPosition().x, 1.5f, 0.001f, "testCam pos x");
+        assert_near(testCam.getPosition().y, -2.0f, 0.001f, "testCam pos y");
+        assert_near(testCam.getPosition().z, 3.75f, 0.001f, "testCam pos z");
+        assert_near(testCam.getFov(), 60.0f, 0.001f, "testCam fov");
+        std::cout << "[PASS] Camera view override application verified." << std::endl;
+    }
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  All Camera & FPS Navigation Unit Tests PASSED Cleanly!" << std::endl;

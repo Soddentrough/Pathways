@@ -57,8 +57,17 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint pad1;
-    uint pad2;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint currentMaterialCounts[4];
+    uint totalShadeWorkgroups;
+    uint pad[13];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -66,11 +75,11 @@ layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
 };
 
 layout(std430, binding = 13) buffer IndirectCommand {
-    BounceDispatch bounceDispatches[];
+    DispatchCommand commands[];
 } indirect;
 
 layout(std430, binding = 14) buffer DGCStream {
-    BounceDGC bounceDGC[];
+    DGCCommand commands[];
 } dgcStream;
 
 layout(std430, binding = 15) readonly buffer InRayGeomQueue {
@@ -103,7 +112,8 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    bool inRange = (idx < queueCounters.activeRayCount);
+    uint activeCount = queueCounters.currentMaterialCounts[3]; // Complex queue
+    bool inRange = (idx < activeCount);
     bool survivesToNext = false;
     bool hasShadowRay = false;
     RayGeometry nextGeom;
@@ -111,9 +121,10 @@ void main() {
     PackedShadowRay shadowCandidate;
 
     if (inRange) {
-        RayGeometry geom = inGeoms[idx];
-        RayHit hit = inHits[idx];
-        RayState state = inStates[idx];
+        uint queueIdx = 3u * pc.maxQueueCapacity + idx;
+        RayGeometry geom = inGeoms[queueIdx];
+        RayHit hit = inHits[queueIdx];
+        RayState state = inStates[queueIdx];
 
         vec3 origin = geom.originAndTMin.xyz;
         vec3 rayDir = geom.dirAndTMax.xyz;
@@ -128,7 +139,6 @@ void main() {
         uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
         uint bounce = pc.currentBounce;
 
-        // 0. Check if secondary ray hit sky / environment (Miss)
         if (hitType == 2u) {
             vec3 skyColor;
             if (pc.hasEnvMap == 1u) {
@@ -142,7 +152,6 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
-            // Ray terminates here (survivesToNext remains false)
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             vec3 hitNormal = vec3(0.0, 1.0, 0.0);
@@ -151,7 +160,6 @@ void main() {
             bool frontFace = true;
 
             if (hitType == 0u) {
-                // Triangle geometry: load only needed attributes directly without copying full 160B struct
                 float u = hitBary.x;
                 float v = hitBary.y;
                 float w = 1.0 - u - v;
@@ -171,8 +179,6 @@ void main() {
                 hitNormal = frontFace ? hitNormal : -hitNormal;
 
                 Material mat = materials[matId];
-
-                // Tangent frame & Normal mapping: load tangents only when normal texture is active
                 if (mat.normalTex > 0u && mat.normalTex <= 64u) {
                     vec4 tan0 = triangles[primId].v0.tangent;
                     vec4 tan1 = triangles[primId].v1.tangent;
@@ -190,7 +196,6 @@ void main() {
                     hitNormal = normalize(tbn * normalMap);
                 }
             } else if (hitType == 1u) {
-                // Procedural Sphere
                 Sphere sp = spheres[primId];
                 hitNormal = (hitPoint - sp.centerRadius.xyz) / sp.centerRadius.w;
                 matId = sp.materialId;
@@ -199,24 +204,19 @@ void main() {
             }
 
             Material mat = materials[matId];
-
-            // 1. Sample glTF 2.0 Material Textures & Factors
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
-            // Alpha masking & stochastic alpha blending
             if ((mat.alphaMode == 1u && baseColor.a < mat.alphaCutoff) ||
                 (mat.alphaMode == 2u && randFloat(seed) > baseColor.a)) {
-                // Transparent / masked pixel - passthrough ray
                 survivesToNext = true;
                 nextGeom.originAndTMin = vec4(hitPoint + rayDir * EPSILON, EPSILON);
                 nextGeom.dirAndTMax = vec4(rayDir, 10000.0);
                 nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
                 nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
             } else {
-                // Emissive radiance evaluation
                 vec3 emissive = mat.emissive.rgb;
                 if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
                     emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
@@ -233,8 +233,8 @@ void main() {
                     float metallic = mat.metallic;
                     if (mat.mrTex > 0u && mat.mrTex <= 64u) {
                         vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
-                        roughness *= mrSample.g; // Green = roughness
-                        metallic *= mrSample.b;  // Blue = metallic
+                        roughness *= mrSample.g;
+                        metallic *= mrSample.b;
                     }
                     roughness = clamp(roughness, 0.04, 1.0);
                     metallic = clamp(metallic, 0.0, 1.0);
@@ -262,7 +262,6 @@ void main() {
                     vec3 diffuseColor = baseColor.rgb * (1.0 - metallic);
                     vec3 V = -rayDir;
 
-                    // Clearcoat properties
                     float clearcoat = mat.clearcoat;
                     if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 64u) {
                         clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1u], hitUv).r;
@@ -283,7 +282,6 @@ void main() {
                         clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
                     }
 
-                    // Volumetric Beer-Lambert absorption
                     float thickness = mat.thickness;
                     if (mat.thicknessTex > 0u && mat.thicknessTex <= 64u) {
                         thickness *= texture(sceneTextures[mat.thicknessTex - 1u], hitUv).g;
@@ -304,7 +302,7 @@ void main() {
                     float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
                     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
-                    // 2. Next Event Estimation (Stochastic 1-Light NEE + Cook-Torrance GGX Microfacet Model + MIS)
+                    // Direct Lighting
                     if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
                         uint lightIdx = 0u;
                         float lightSelectPdf = 1.0;
@@ -351,184 +349,115 @@ void main() {
                             }
                         }
 
-                        if (validLightSample) {
-                            float NdotL = dot(hitNormal, lightDir);
-                            if (NdotL > 0.0) {
-                                vec3 H = normalize(V + lightDir);
-                                float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                                float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                        float NdotL = dot(hitNormal, lightDir);
+                        if (validLightSample && NdotL > 0.0) {
+                            float bsdfPdf = evalBSDFPdf(V, lightDir, hitNormal, clearcoatNormal, alphaRoughness, clearcoatAlpha, clearcoatProb, baseSpecProb, clearcoat);
+                            float misWeight = 1.0;
+                            if (uint(light.position.w) == 0u) {
+                                float lightPdfEff = lightPdf * lightSelectPdf;
+                                misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + bsdfPdf * bsdfPdf, 1e-6);
+                            }
 
-                                float D = distributionGGX(NdotH, alphaRoughness);
-                                float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                                vec3 F = fresnelSchlickVec(VdotH, F0);
+                            vec3 H = normalize(V + lightDir);
+                            float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                            float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                            float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
 
-                                vec3 specBRDF = enableSpecular ? (D * Vis * F) : vec3(0.0);
-                                vec3 diffBRDF = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                            float D = distributionGGX(NdotH, alphaRoughness);
+                            float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                            vec3 F = fresnelSchlickVec(VdotH, F0);
+                            vec3 specBrdf = D * G * F;
 
-                                // Clearcoat layer evaluation
-                                float Fc = 0.0;
-                                vec3 clearcoatBRDF = vec3(0.0);
-                                float Dc = 0.0;
-                                float NcDotH = 0.0;
-                                float VDotHc = 0.0;
-                                float NcDotL = 0.0;
-                                if (clearcoat > 0.001 && enableSpecular) {
-                                    NcDotL = clamp(dot(clearcoatNormal, lightDir), 0.0, 1.0);
-                                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
-                                    NcDotH = clamp(dot(clearcoatNormal, H), 0.0, 1.0);
-                                    VDotHc = VdotH;
+                            vec3 diffuseBrdf = diffuseColor * INV_PI;
+                            vec3 baseBrdf = diffuseBrdf + specBrdf;
 
-                                    Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
-                                    Dc = distributionGGX(NcDotH, clearcoatAlpha);
-                                    float VisC = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
-                                    clearcoatBRDF = vec3(Fc * Dc * VisC);
-                                }
+                            if (clearcoat > 0.001) {
+                                float NcDotL = clamp(dot(clearcoatNormal, lightDir), 0.0, 1.0);
+                                float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
+                                float NcDotH = clamp(dot(clearcoatNormal, H), 0.0, 1.0);
+                                float Dc = distributionGGX(NcDotH, clearcoatAlpha);
+                                float Gc = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
+                                float Fc = fresnelSchlick(clamp(dot(V, H), 0.0, 1.0), 1.5) * clearcoat;
+                                vec3 clearcoatBrdf = vec3(Dc * Gc * Fc);
+                                baseBrdf = baseBrdf * (1.0 - Fc) + clearcoatBrdf;
+                            }
 
-                                vec3 brdf = (diffBRDF + specBRDF) * (1.0 - Fc) + clearcoatBRDF;
+                            vec3 unshadowed = throughput * baseBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
 
-                                // Multiple Importance Sampling (MIS) balance heuristic for NEE
-                                float misWeightLight = 1.0;
-                                if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                                    float diffProb = max(1.0 - clearcoatProb - baseSpecProb, 0.0);
-                                    float diffPdf = NdotL * INV_PI;
-                                    float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                                    float clearcoatPdf = (clearcoat > 0.001 && NcDotL > 0.0) ? ((Dc * NcDotH) / max(4.0 * VDotHc, 1e-4)) : 0.0;
-                                    float bsdfPdf = diffProb * diffPdf + baseSpecProb * specPdf + clearcoatProb * clearcoatPdf;
-                                    misWeightLight = lightPdf / (lightPdf + bsdfPdf);
-                                }
-
-                                vec3 unshadowed = (throughput * lightEmission * brdf * NdotL * misWeightLight) / (max(lightPdf, 1e-4) * lightSelectPdf);
-
-                                if (any(greaterThan(unshadowed, vec3(1e-5)))) {
-                                    if (enableShadows) {
-                                        hasShadowRay = true;
-                                        shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                                        shadowCandidate.dirPixel = vec4(lightDir, uintBitsToFloat(pixelIndex));
-                                        shadowCandidate.unshadowedRadiance = vec4(unshadowed, uintBitsToFloat(bounce));
-                                    } else {
-                                        accumRadiance += unshadowed;
-                                    }
-                                }
+                            if (length(unshadowed) > 1e-5) {
+                                hasShadowRay = true;
+                                shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                                shadowCandidate.dirPixel = vec4(lightDir, uintBitsToFloat(pixelIndex));
+                                shadowCandidate.unshadowedRadiance = vec4(unshadowed, uintBitsToFloat(bounce));
                             }
                         }
                     }
 
-                    // 3. Sample BSDF for Secondary Bounce
-                    if (bounce + 1u >= pc.maxBounces || (!enableIndirect && bounce > 0u)) {
-                        pathTerminated = true;
-                    }
-
+                    // Indirect Bounce
                     vec3 nextDirection;
                     vec3 nextOrigin;
-                    bool isDelta = false;
 
-                    if (!pathTerminated) {
-                        if (transmission > 0.01 || mat.type == 2u /* DIELECTRIC / REFRACTION */) {
-                            isDelta = true;
-                            if (!enableRefraction) {
-                                nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                nextOrigin = hitPoint + hitNormal * EPSILON;
-                                throughput *= baseColor.rgb;
-                            } else {
-                                float refractionRatio = frontFace ? (1.0 / iorVal) : iorVal;
-                                vec3 unitDir = normalize(rayDir);
-                                float cosTheta = min(dot(-unitDir, hitNormal), 1.0);
-                                float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+                    if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
+                        pathTerminated = true;
+                    } else if (enableRefraction && (transmission > 0.001 || mat.type == 2u)) {
+                        float eta = frontFace ? (1.0 / iorVal) : iorVal;
+                        float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);
+                        float fresnel = fresnelSchlick(cosTheta, iorVal);
 
-                                bool cannotRefract = refractionRatio * sinTheta > 1.0;
-                                float reflectProb = fresnelSchlick(cosTheta, refractionRatio);
-
-                                if (cannotRefract || reflectProb > randFloat(seed)) {
-                                    nextDirection = reflect(unitDir, hitNormal);
-                                    nextOrigin = hitPoint + hitNormal * EPSILON;
-                                } else {
-                                    nextDirection = refract(unitDir, hitNormal, refractionRatio);
-                                    nextOrigin = hitPoint - hitNormal * EPSILON;
-                                }
-                                throughput *= baseColor.rgb;
-                            }
-                        } else {
-                            // Clearcoat + Cook-Torrance GGX importance sampling
-                            float xi = randFloat(seed);
-
-                            if (xi < clearcoatProb) {
-                                // Clearcoat specular lobe: GGX microfacet sampling with clearcoatNormal
-                                vec3 Hc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
-                                vec3 L = reflect(-V, Hc);
-                                float NcDotL = dot(clearcoatNormal, L);
-
-                                if (NcDotL > 0.0) {
-                                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
-                                    float NcDotH = clamp(dot(clearcoatNormal, Hc), 0.001, 1.0);
-                                    float VDotHc = clamp(dot(V, Hc), 0.0, 1.0);
-
-                                    float VisC = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
-                                    float Fc = fresnelSchlick(VDotHc, 1.5) * clearcoat;
-
-                                    vec3 specWeight = vec3((4.0 * VisC * Fc * NcDotL * VDotHc) / max(NcDotH * clearcoatProb, 1e-4));
-                                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
-                                    nextDirection = L;
-                                } else {
-                                    // Fallback to diffuse
-                                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                    vec3 H_diff = normalize(V + nextDirection);
-                                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                                    throughput *= (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
-                                }
-                            } else if (xi < clearcoatProb + baseSpecProb) {
-                                // Base Specular lobe: GGX microfacet sampling
-                                vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
-                                vec3 L = reflect(-V, H);
-                                float NdotL = dot(hitNormal, L);
-
-                                if (NdotL > 0.0) {
-                                    float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                                    vec3 F = fresnelSchlickVec(VdotH, F0);
-                                    float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
-
-                                    vec3 specWeight = (4.0 * Vis * F * NdotL * VdotH * (1.0 - Fc)) / max(NdotH * baseSpecProb, 1e-4);
-                                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
-                                    nextDirection = L;
-                                } else {
-                                    // Fallback to diffuse
-                                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                    vec3 H_diff = normalize(V + nextDirection);
-                                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                                    float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                                    throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
-                                }
-                            } else {
-                                // Diffuse lobe: Cosine-weighted hemisphere sampling
-                                nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                vec3 H_diff = normalize(V + nextDirection);
-                                vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                                float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                                throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
-                            }
+                        if (randFloat(seed) < fresnel) {
+                            nextDirection = reflect(rayDir, hitNormal);
                             nextOrigin = hitPoint + hitNormal * EPSILON;
-                        }
-
-                        // 4. Luminance check & Russian Roulette path termination (aligned with raytrace.rgen)
-                        float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                        if (lum < 0.001) {
-                            pathTerminated = true;
-                        } else if (bounce >= 1u) {
-                            float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                            float p = clamp(lum, minP, 0.95);
-                            if (randFloat(seed) > p) {
-                                pathTerminated = true;
+                        } else {
+                            vec3 refracted = refract(rayDir, hitNormal, eta);
+                            if (length(refracted) > 1e-4) {
+                                nextDirection = normalize(refracted);
+                                nextOrigin = hitPoint - hitNormal * EPSILON;
                             } else {
-                                throughput /= p;
+                                nextDirection = reflect(rayDir, hitNormal);
+                                nextOrigin = hitPoint + hitNormal * EPSILON;
                             }
+                        }
+                        throughput *= baseColor.rgb;
+                    } else {
+                        float lobeSelect = randFloat(seed);
+                        if (lobeSelect < clearcoatProb) {
+                            vec3 H_cc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
+                            nextDirection = reflect(-V, H_cc);
+                            nextOrigin = hitPoint + clearcoatNormal * EPSILON;
+                            float Fc = fresnelSchlick(clamp(dot(V, H_cc), 0.0, 1.0), 1.5) * clearcoat;
+                            throughput *= Fc / max(clearcoatProb, 1e-4);
+                        } else if (lobeSelect < (clearcoatProb + baseSpecProb)) {
+                            vec3 H_spec = sampleGGX(hitNormal, alphaRoughness, seed);
+                            nextDirection = reflect(-V, H_spec);
+                            nextOrigin = hitPoint + hitNormal * EPSILON;
+                            float VdotH = clamp(dot(V, H_spec), 0.0, 1.0);
+                            vec3 F_spec = fresnelSchlickVec(VdotH, F0);
+                            float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
+                            throughput *= (1.0 - Fc) * F_spec / max(baseSpecProb, 1e-4);
+                        } else {
+                            nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                            nextOrigin = hitPoint + hitNormal * EPSILON;
+                            vec3 H_diff = normalize(V + nextDirection);
+                            vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
+                            float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
+                            throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
                         }
                     }
 
-                    // 5. Emit Surviving Secondary Ray
+                    // Russian roulette
+                    float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
+                    if (lum < 0.001) {
+                        pathTerminated = true;
+                    } else if (bounce >= 1u) {
+                        float minP = (bounce >= 2u) ? 0.02 : 0.05;
+                        float p = clamp(lum, minP, 0.95);
+                        if (randFloat(seed) > p) {
+                            pathTerminated = true;
+                        } else {
+                            throughput /= p;
+                        }
+                    }
+
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
@@ -538,7 +467,6 @@ void main() {
                     }
                 }
 
-                // If path terminated at this stage, accumulate any remaining radiance into the image
                 if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                     vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -548,7 +476,7 @@ void main() {
         }
     }
 
-    // Subgroup Wave Ballot Compaction into downstream queue
+    // Subgroup Wave Ballot Compaction into downstream surviving secondary ray queue
     uvec4 ballot = subgroupBallot(survivesToNext);
     uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
     uint waveActiveCount = subgroupBallotBitCount(ballot);
@@ -585,49 +513,37 @@ void main() {
         }
     }
 
-    // Atomic workgroup retirement to prepare downstream dispatches directly (eliminating Mode 1 Resolve)
+    // Atomic workgroup retirement to prepare downstream dispatches directly
     memoryBarrierBuffer();
     if (gl_LocalInvocationIndex == 0u) {
-        uint totalWgs = gl_NumWorkGroups.x;
         uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
-        if (retired == totalWgs - 1u) {
+        if (retired == queueCounters.totalShadeWorkgroups - 1u) {
             uint shadowCount = queueCounters.shadowRayCount;
             uint shadowGroups = (shadowCount + 31u) / 32u;
             uint b = pc.currentBounce;
 
-            indirect.bounceDispatches[b].shadowDispatch.x = shadowGroups;
-            indirect.bounceDispatches[b].shadowDispatch.y = 1u;
-            indirect.bounceDispatches[b].shadowDispatch.z = 1u;
-            indirect.bounceDispatches[b].shadowDispatch.pad = shadowCount;
+            indirect.commands[b * 6u + 4u].x = shadowGroups;
+            indirect.commands[b * 6u + 4u].y = 1u;
+            indirect.commands[b * 6u + 4u].z = 1u;
+            indirect.commands[b * 6u + 4u].pad = shadowCount;
 
-            dgcStream.bounceDGC[b].shadowCmd.pipelineIndex = 3u;
-            dgcStream.bounceDGC[b].shadowCmd.x = shadowGroups;
-            dgcStream.bounceDGC[b].shadowCmd.y = 1u;
-            dgcStream.bounceDGC[b].shadowCmd.z = 1u;
+            dgcStream.commands[b * 6u + 4u].pipelineIndex = 3u; // Shadow pipeline
+            dgcStream.commands[b * 6u + 4u].x = shadowGroups;
+            dgcStream.commands[b * 6u + 4u].y = 1u;
+            dgcStream.commands[b * 6u + 4u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
             uint intersectGroups = (nextCount + 31u) / 32u;
-            indirect.bounceDispatches[b].intersectDispatch.x = intersectGroups;
-            indirect.bounceDispatches[b].intersectDispatch.y = 1u;
-            indirect.bounceDispatches[b].intersectDispatch.z = 1u;
-            indirect.bounceDispatches[b].intersectDispatch.pad = nextCount;
 
-            dgcStream.bounceDGC[b].intersectCmd.pipelineIndex = 1u;
-            dgcStream.bounceDGC[b].intersectCmd.x = intersectGroups;
-            dgcStream.bounceDGC[b].intersectCmd.y = 1u;
-            dgcStream.bounceDGC[b].intersectCmd.z = 1u;
+            indirect.commands[b * 6u + 5u].x = intersectGroups;
+            indirect.commands[b * 6u + 5u].y = 1u;
+            indirect.commands[b * 6u + 5u].z = 1u;
+            indirect.commands[b * 6u + 5u].pad = nextCount;
 
-            if (b + 1u < pc.maxBounces) {
-                indirect.bounceDispatches[b + 1u].shadeDispatch.x = intersectGroups;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.y = 1u;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.z = 1u;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.pad = nextCount;
-
-                dgcStream.bounceDGC[b + 1u].shadeCmd.pipelineIndex = 2u;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.x = intersectGroups;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.y = 1u;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.z = 1u;
-            }
+            dgcStream.commands[b * 6u + 5u].pipelineIndex = 1u; // Intersect pipeline
+            dgcStream.commands[b * 6u + 5u].x = intersectGroups;
+            dgcStream.commands[b * 6u + 5u].y = 1u;
+            dgcStream.commands[b * 6u + 5u].z = 1u;
 
             queueCounters.currentShadowCount = shadowCount;
             queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;

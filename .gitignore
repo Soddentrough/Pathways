@@ -25,6 +25,7 @@ scenes/pbr_*
 scenes/textured_quad.gltf
 scenes/checker.png
 scenes/ripples_normal.png
+scenes/Bedroom_1.gltf
 
 # Research scenes: ignore untracked subdirectories by default
 scenes/*/

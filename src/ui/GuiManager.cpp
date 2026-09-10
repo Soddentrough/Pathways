@@ -436,7 +436,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("VK_KHR_acceleration_structure (BLAS + TLAS)");
             ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
             ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
-            ImGui::Text("Pipeline:           Hardware Ray Tracing (VK_KHR_ray_tracing_pipeline)");
+            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Work Lists & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
             ImGui::Text("Ray Scheduling:     RDNA4 Hardware BVH Traversal (Wave32)");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
@@ -906,9 +906,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
-            ImGui::Text("Dedicated Hardware RT Pipeline (VK_KHR_ray_tracing_pipeline)");
-            ImGui::Text("GPU Indirect Execution (Work List / TraceRaysIndirect)");
-
+            int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
+            if (ImGui::RadioButton("Wavefront Path Tracing (Work Lists & DGC)", &pipeType, 0)) {
+                config.pipeline_type = PipelineType::Wavefront;
+            }
+            if (ImGui::RadioButton("Dedicated RTP (VK_KHR_ray_tracing_pipeline)", &pipeType, 1)) {
+                config.pipeline_type = PipelineType::RTP;
+            }
             ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
             ImGui::Separator();
         }
@@ -941,12 +945,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             if (config.mgpu_mode == MultiGpuMode::Auto) {
-                MultiGpuMode active = (config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  -> Active Policy: %s",
-                                   (active == MultiGpuMode::SampleParallel) ? "Sample Parallelism (Split SPP)" : "Checkerboard Tiling (Optimal RDNA4)");
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  -> Active Policy: Checkerboard Tiling (Optimal RDNA4)");
             }
 
-            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || (config.mgpu_mode == MultiGpuMode::Auto && config.spp == 1)) {
+            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || config.mgpu_mode == MultiGpuMode::Auto) {
                 const char* tileSizes[] = {
                     "16x16 (Finest Interleaving)",
                     "32x32 (Balanced Cache)",
@@ -973,7 +975,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     config.tile_size = chosenSize;
                     settingsChanged = true;
                 }
-            } else if (config.mgpu_mode == MultiGpuMode::SampleParallel || (config.mgpu_mode == MultiGpuMode::Auto && config.spp > 1)) {
+            } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
                 uint32_t primSpp = (config.spp + 1) / 2;
                 uint32_t secSpp = config.spp / 2;
                 ImGui::TextDisabled("  Sample Split: GPU 0 = %u SPP, GPU 1 = %u SPP", primSpp, secSpp);
@@ -1050,19 +1052,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Target Budget: %.2f ms (Current RT: %.2f ms)",
                     1000.0f / config.target_fps, stats.primary_gpu_time_ms);
                 ImGui::Unindent();
-            }
-            ImGui::Separator();
 
-            int spp = static_cast<int>(config.spp);
-            if (ImGui::SliderInt(config.adaptive_spp ? "Base Samples/Pixel (SPP)" : "Samples/Pixel (SPP)", &spp, 1, 64)) {
-                config.spp = static_cast<uint32_t>(spp);
-                settingsChanged = true;
-            }
+                ImGui::Spacing();
+                ImGui::TextDisabled("Governor Dynamic Search Bounds:");
+                int minSpp = static_cast<int>(config.min_spp);
+                if (ImGui::SliderInt("Min SPP Floor", &minSpp, 1, static_cast<int>(config.max_spp))) {
+                    config.min_spp = static_cast<uint32_t>(minSpp);
+                    settingsChanged = true;
+                }
+                int maxSpp = static_cast<int>(config.max_spp);
+                if (ImGui::SliderInt("Max SPP Ceiling", &maxSpp, static_cast<int>(config.min_spp), 32)) {
+                    config.max_spp = static_cast<uint32_t>(maxSpp);
+                    settingsChanged = true;
+                }
+                int minB = static_cast<int>(config.min_bounces);
+                if (ImGui::SliderInt("Min Bounces Floor", &minB, 1, static_cast<int>(config.max_dynamic_bounces))) {
+                    config.min_bounces = static_cast<uint32_t>(minB);
+                    settingsChanged = true;
+                }
+                int maxB = static_cast<int>(config.max_dynamic_bounces);
+                if (ImGui::SliderInt("Max Bounces Ceiling", &maxB, static_cast<int>(config.min_bounces), 16)) {
+                    config.max_dynamic_bounces = static_cast<uint32_t>(maxB);
+                    settingsChanged = true;
+                }
+            } else {
+                int spp = static_cast<int>(config.spp);
+                if (ImGui::SliderInt("Samples/Pixel (SPP)", &spp, 1, 64)) {
+                    config.spp = static_cast<uint32_t>(spp);
+                    settingsChanged = true;
+                }
 
-            int bounces = static_cast<int>(config.max_bounces);
-            if (ImGui::SliderInt(config.adaptive_spp ? "Base Ray Bounces" : "Max Ray Bounces", &bounces, 1, 16)) {
-                config.max_bounces = static_cast<uint32_t>(bounces);
-                settingsChanged = true;
+                int bounces = static_cast<int>(config.max_bounces);
+                if (ImGui::SliderInt("Max Ray Bounces", &bounces, 1, 16)) {
+                    config.max_bounces = static_cast<uint32_t>(bounces);
+                    settingsChanged = true;
+                }
             }
         }
 
@@ -1170,7 +1194,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         float midX = isPortrait ? (dispW * 0.5f) : ((hudX + hudW + ctrlX) * 0.5f);
 
         if (config.mgpu_mode == MultiGpuMode::CheckerboardTile ||
-            (config.mgpu_mode == MultiGpuMode::Auto && config.spp == 1)) {
+            config.mgpu_mode == MultiGpuMode::Auto) {
             float badgeW = 420.0f;
             ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
             if (ImGui::Begin("##MgpuCheckerboardBadge", nullptr, overlayFlags)) {
@@ -1181,7 +1205,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextDisabled("| %ux%u Tiling", config.tile_size, config.tile_size);
             }
             ImGui::End();
-        } else if (config.mgpu_mode == MultiGpuMode::SampleParallel || (config.mgpu_mode == MultiGpuMode::Auto && config.spp > 1)) {
+        } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
             float badgeW = 420.0f;
             ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
             if (ImGui::Begin("##MgpuSampleParallelBadge", nullptr, overlayFlags)) {

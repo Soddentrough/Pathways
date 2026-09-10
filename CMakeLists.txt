@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.8.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.10.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -129,6 +129,15 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/ffx_shadow_filter.comp
     ${SHADER_DIR}/compute/taa_resolve.comp
     ${SHADER_DIR}/compute/atrous_denoise.comp
+    ${SHADER_DIR}/compute/wavefront_classify.comp
+    ${SHADER_DIR}/compute/wavefront_intersect.comp
+    ${SHADER_DIR}/compute/wavefront_shade.comp
+    ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp
+    ${SHADER_DIR}/compute/wavefront_shade_dielectric.comp
+    ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
+    ${SHADER_DIR}/compute/wavefront_shade_complex.comp
+    ${SHADER_DIR}/compute/wavefront_shadow.comp
+    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -143,7 +152,7 @@ foreach(SHADER ${SHADER_FILES})
         set(BIN_SPV_FILE ${BIN_SPV_DIR}/${SHADER_NAME}.spv)
         add_custom_command(
             OUTPUT ${SPV_FILE}
-            COMMAND ${GLSLC} --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
+            COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
             DEPENDS ${SHADER}
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
@@ -231,6 +240,8 @@ add_executable(test_camera_controls
     tests/test_camera_controls.cpp
     src/scene/Camera.cpp
     src/scene/ProceduralScene.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
 )
 target_include_directories(test_camera_controls PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

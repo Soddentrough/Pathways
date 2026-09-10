@@ -142,7 +142,8 @@ public:
                              uint32_t accumulateHistory = 1,
                              float fractionalSpp = 0.0f,
                              void* dstHostPtr = nullptr,
-                             size_t transferBytes = 0);
+                             size_t transferBytes = 0,
+                             uint32_t totalCompositeSpp = 0);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
@@ -184,6 +185,7 @@ private:
         float fractionalSpp = 0.0f;
         void* dstHostPtr = nullptr;
         size_t transferBytes = 0;
+        uint32_t totalCompositeSpp = 0;
         bool valid = false;
     };
 

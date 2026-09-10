@@ -75,6 +75,6 @@ void main() {
         }
 
         vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);
-        imageStore(uPrimaryAccum, pixelCoord, primVal + secVal);
+        imageStore(uPrimaryAccum, pixelCoord, vec4(primVal.rgb + secVal.rgb, primVal.a));
     }
 }

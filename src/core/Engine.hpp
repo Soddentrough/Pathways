@@ -13,6 +13,7 @@
 #include "rt/AccelerationStructure.hpp"
 #include "rt/DGCManager.hpp"
 #include "rt/RTPipeline.hpp"
+#include "rt/WavefrontPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
 #include "core/QualityGovernor.hpp"
@@ -69,6 +70,7 @@ private:
 
     bool m_cameraMode = false;
     bool m_resetAccumulation = false;
+    bool m_cameraMovedLastFrame = false;
     bool m_pendingToggleFullscreen = false;
     uint32_t m_pendingResizeW = 0;
     uint32_t m_pendingResizeH = 0;
@@ -128,6 +130,7 @@ private:
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
+    std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
@@ -153,6 +156,7 @@ private:
     void updateMergeDescriptors();
     void updateAllImageDescriptors();
     void updateSceneDescriptors();
+    void updateWavefrontSceneDescriptors();
 
     // FidelityFX Shadow Denoiser Resources & Pipelines
     std::unique_ptr<Image> m_directLightImage;

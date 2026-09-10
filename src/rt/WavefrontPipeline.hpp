@@ -1,0 +1,130 @@
+#pragma once
+
+#include <vulkan/vulkan.h>
+#include "vulkan/Buffer.hpp"
+#include "rt/DGCManager.hpp"
+#include <memory>
+#include <vector>
+#include <array>
+#include <string>
+
+namespace pathways {
+
+struct WavefrontSceneData {
+    uint32_t numTriangles = 0;
+    uint32_t numSpheres = 0;
+    uint32_t numMaterials = 0;
+    uint32_t numLights = 0;
+    uint32_t hasEnvMap = 0;
+    float envMapIntensity = 1.0f;
+    uint32_t useHardwareRT = 1;
+    uint32_t frameIndex = 0;
+    uint32_t useMorton = 1;
+    uint32_t accumulateHistory = 1;
+    uint32_t sortMode = 0; // 0: None, 1: Archetype, 2: BDA, 3: Dual
+};
+
+class WavefrontPipeline {
+public:
+    WavefrontPipeline(VkDevice device, VmaAllocator allocator,
+                      uint32_t width, uint32_t height,
+                      uint32_t tileSize,
+                      const std::vector<char>& classifyCode,
+                      const std::vector<char>& intersectCode,
+                      const std::vector<char>& shadeCode,
+                      const std::vector<char>& shadowCode,
+                      const std::vector<char>& resolveCode,
+                      const std::vector<char>& shadeDiffuseCode = {},
+                      const std::vector<char>& shadeDielectricCode = {},
+                      const std::vector<char>& shadeConductorCode = {},
+                      const std::vector<char>& shadeComplexCode = {});
+    ~WavefrontPipeline();
+
+    WavefrontPipeline(const WavefrontPipeline&) = delete;
+    WavefrontPipeline& operator=(const WavefrontPipeline&) = delete;
+
+    void updateSceneDescriptors(uint32_t frameSlot,
+                                VkImageView accumImageView,
+                                VkBuffer cameraUBO,
+                                VkBuffer triangleBuffer, VkDeviceSize triSize,
+                                VkBuffer sphereBuffer, VkDeviceSize sphereSize,
+                                VkBuffer matBuffer, VkDeviceSize matSize,
+                                VkBuffer lightBuffer, VkDeviceSize lightSize,
+                                VkAccelerationStructureKHR tlas,
+                                VkDescriptorImageInfo envMapInfo,
+                                const std::vector<VkDescriptorImageInfo>& sceneTexInfos);
+
+    void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
+    void setTileSize(uint32_t tileSize);
+    uint32_t getTileSize() const { return m_tileSize; }
+
+    void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
+                     uint32_t spp, uint32_t maxBounces,
+                     const WavefrontSceneData& sceneData);
+
+    void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+
+    VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
+    DGCManager* getDGCManager() const { return m_dgcManager.get(); }
+
+private:
+    void createDescriptorLayout();
+    void allocateDescriptorSets();
+    void allocateQueues(uint32_t capacity);
+    void updateQueueDescriptors();
+    void createPipelines(const std::vector<char>& classifyCode,
+                         const std::vector<char>& intersectCode,
+                         const std::vector<char>& shadeCode,
+                         const std::vector<char>& shadowCode,
+                         const std::vector<char>& resolveCode,
+                         const std::vector<char>& shadeDiffuseCode,
+                         const std::vector<char>& shadeDielectricCode,
+                         const std::vector<char>& shadeConductorCode,
+                         const std::vector<char>& shadeComplexCode);
+
+    VkShaderModule createShaderModule(const std::vector<char>& code);
+
+    VkDevice m_device = VK_NULL_HANDLE;
+    VmaAllocator m_allocator = VK_NULL_HANDLE;
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+    uint32_t m_tileSize = 256;
+    uint32_t m_maxCapacity = 0;
+    uint32_t m_sortMode = 0;
+
+    // Ray Work Queues & Counter SSBOs (SoA Layout)
+    std::unique_ptr<Buffer> m_rayGeomQueueA;  // 32B RayGeometry
+    std::unique_ptr<Buffer> m_rayGeomQueueB;  // 32B RayGeometry
+    std::unique_ptr<Buffer> m_rayStateQueueA; // 32B RayState
+    std::unique_ptr<Buffer> m_rayStateQueueB; // 32B RayState
+    std::unique_ptr<Buffer> m_rayHitQueue;    // 16B RayHit
+    std::unique_ptr<Buffer> m_shadowQueue;    // 48B PackedShadowRay
+    std::unique_ptr<Buffer> m_queueCounters;
+    std::unique_ptr<Buffer> m_indirectArgs;
+    std::unique_ptr<Buffer> m_dgcStream;
+
+    // Descriptors
+    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_descSetLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_descSetsEven = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // In: A, Out: B
+    std::array<VkDescriptorSet, 2> m_descSetsOdd = { VK_NULL_HANDLE, VK_NULL_HANDLE };  // In: B, Out: A
+
+    // Pipelines
+    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_classifyPipeline = VK_NULL_HANDLE;
+    VkPipeline m_intersectPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadePipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
+    VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffusePipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeConductorPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
+
+    std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+    std::unique_ptr<DGCManager> m_dgcManager;
+};
+
+} // namespace pathways

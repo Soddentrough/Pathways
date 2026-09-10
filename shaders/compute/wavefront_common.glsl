@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
 
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
@@ -71,7 +72,80 @@ struct Light {
     vec4 normal;   // xyz: normal/dir, w: padding
 };
 
-// 96-byte cache-line friendly ray payload
+// 32-bit Octahedral normal/direction encoding (Cigolle et al.)
+vec2 octSign(vec2 v) {
+    return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);
+}
+
+vec2 octEncode(vec3 v) {
+    v /= (abs(v.x) + abs(v.y) + abs(v.z));
+    return (v.z >= 0.0) ? v.xy : (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+}
+
+vec3 octDecode(vec2 f) {
+    vec3 v = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (v.z < 0.0) {
+        v.xy = (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+    }
+    return normalize(v);
+}
+
+uint packOct32(vec3 v) {
+    return packSnorm2x16(octEncode(normalize(v)));
+}
+
+vec3 unpackOct32(uint p) {
+    return octDecode(unpackSnorm2x16(p));
+}
+
+// 32-byte cache-line aligned ray geometry (read by intersect & shade)
+struct RayGeometry {
+    vec4 originAndTMin; // xyz: origin, w: tMin (16 bytes)
+    vec4 dirAndTMax;    // xyz: direction, w: tMax (16 bytes)
+};
+
+// 16-byte cache-line aligned ray hit (written by intersect/classify, read by shade)
+struct RayHit {
+    vec4 hitData;
+    // x: hitT (float)
+    // y: uintBitsToFloat(primitiveIndex)
+    // z: uintBitsToFloat(packHalf2x16(barycentrics))
+    // w: uintBitsToFloat(hitType) (0: triangle, 1: sphere, 2: miss)
+};
+
+// 32-byte cache-line aligned ray state (read/written by shade, NEVER touched by intersect)
+struct RayState {
+    vec4 throughputSeed;  // rgb: throughput, w: uintBitsToFloat(seed) (16 bytes)
+    vec4 radiancePixel;   // rgb: accumRadiance, w: uintBitsToFloat(pixelIndex) (16 bytes)
+};
+
+#define MATERIAL_ARCHETYPE_DIFFUSE    0u
+#define MATERIAL_ARCHETYPE_DIELECTRIC 1u
+#define MATERIAL_ARCHETYPE_CONDUCTOR  2u
+#define MATERIAL_ARCHETYPE_COMPLEX    3u
+#define NUM_MATERIAL_ARCHETYPES       4u
+
+uint getMaterialArchetype(Material mat) {
+    if (mat.clearcoat > 0.001 || mat.alphaMode != 0u || mat.type == 3u /* emissive */) {
+        return MATERIAL_ARCHETYPE_COMPLEX;
+    }
+    if (mat.transmission > 0.0 || mat.type == 2u /* dielectric */) {
+        return MATERIAL_ARCHETYPE_DIELECTRIC;
+    }
+    if (mat.type == 1u /* metallic */ || mat.metallic > 0.5) {
+        return MATERIAL_ARCHETYPE_CONDUCTOR;
+    }
+    return MATERIAL_ARCHETYPE_DIFFUSE;
+}
+
+// 48-byte clean aligned packed shadow ray (zero padding)
+struct PackedShadowRay {
+    vec4 originDist;        // xyz: origin, w: lightDist (16 bytes)
+    vec4 dirPixel;          // xyz: direction, w: uintBitsToFloat(pixelIndex) (16 bytes)
+    vec4 unshadowedRadiance;// rgb: unshadowed radiance, w: uintBitsToFloat(bounce) (16 bytes)
+};
+
+// Legacy 96-byte ray payload preserved for compatibility
 struct RayPayload {
     vec4 origin;     // xyz: origin, w: uintBitsToFloat(flags: active=1)
     vec4 direction;  // xyz: direction, w: uintBitsToFloat(bounce)
@@ -79,6 +153,50 @@ struct RayPayload {
     vec4 radiance;   // rgb: accumulated radiance, w: uintBitsToFloat(pixelIndex)
     vec4 hitNormal;  // xyz: shading normal, w: uintBitsToFloat(materialId)
     vec4 hitExtra;   // xy: uv, z: hit t, w: uintBitsToFloat(frontFace | hitType)
+};
+
+struct DispatchCommand {
+    uint x;
+    uint y;
+    uint z;
+    uint pad;
+};
+
+struct DGCCommand {
+    uint pipelineIndex; // Token 0: EXECUTION_SET_EXT
+    uint x;             // Token 1: DISPATCH_EXT (strictly last!)
+    uint y;
+    uint z;
+};
+
+struct BounceDispatch {
+    DispatchCommand shadeDispatch;     // Offset 0
+    DispatchCommand shadowDispatch;    // Offset 16
+    DispatchCommand intersectDispatch; // Offset 32
+};
+
+struct BounceDGC {
+    DGCCommand shadeCmd;     // Offset 0
+    DGCCommand shadowCmd;    // Offset 16
+    DGCCommand intersectCmd; // Offset 32
+};
+
+struct BounceMaterialDispatch {
+    DispatchCommand shadeDiffuse;      // Offset 0
+    DispatchCommand shadeDielectric;   // Offset 16
+    DispatchCommand shadeConductor;    // Offset 32
+    DispatchCommand shadeComplex;      // Offset 48
+    DispatchCommand shadowDispatch;    // Offset 64
+    DispatchCommand intersectDispatch; // Offset 80
+};
+
+struct BounceMaterialDGC {
+    DGCCommand shadeDiffuse;      // Offset 0
+    DGCCommand shadeDielectric;   // Offset 16
+    DGCCommand shadeConductor;    // Offset 32
+    DGCCommand shadeComplex;      // Offset 48
+    DGCCommand shadowCmd;         // Offset 64
+    DGCCommand intersectCmd;      // Offset 80
 };
 
 struct VkDispatchIndirectCommand {
@@ -124,6 +242,20 @@ ivec2 getPixelCoordsMorton8x4(uint linearIdx, uint width, uint height) {
     uint my = ((inTile >> 1u) & 1u) | (((inTile >> 3u) & 1u) << 1u);
 
     return ivec2(int(tileX * 8u + mx), int(tileY * 4u + my));
+}
+
+// 3D Morton encoding (10 bits per axis, 30-bit total code)
+uint part1By2(uint x) {
+    x &= 0x000003ffu;
+    x = (x ^ (x << 16u)) & 0xff0000ffu;
+    x = (x ^ (x <<  8u)) & 0x0300f00fu;
+    x = (x ^ (x <<  4u)) & 0x030c30c3u;
+    x = (x ^ (x <<  2u)) & 0x09249249u;
+    return x;
+}
+
+uint morton3D_10bit(uvec3 v) {
+    return (part1By2(v.z) << 2u) | (part1By2(v.y) << 1u) | part1By2(v.x);
 }
 
 // Cosine-weighted hemisphere sampling

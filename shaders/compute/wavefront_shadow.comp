@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_image_load_formatted : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
+layout(std430, binding = 12) readonly buffer ShadowRayQueue {
+    PackedShadowRay shadowRays[];
+};
+
+layout(std430, binding = 11) buffer QueueCounters {
+    uint activeRayCount;
+    uint nextActiveCount;
+    uint totalProcessed;
+    uint shadowRayCount;
+    uint retiredWorkgroups;
+    uint currentShadowCount;
+    uint pad1;
+    uint pad2;
+} queueCounters;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint sppSampleIndex;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= queueCounters.currentShadowCount) return;
+
+    PackedShadowRay sRay = shadowRays[idx];
+    vec3 origin = sRay.originDist.xyz;
+    float maxDist = sRay.originDist.w;
+    vec3 dir = sRay.dirPixel.xyz;
+    uint pixelIndex = floatBitsToUint(sRay.dirPixel.w);
+    vec3 radiance = sRay.unshadowedRadiance.rgb;
+
+    if (length(radiance) <= 1e-5) return;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS,
+                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                          0xFF, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
+    rayQueryProceedEXT(rq);
+
+    bool occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+    if (!occluded) {
+        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+        imageStore(uAccumImage, pixelCoord, prev + vec4(radiance, 0.0));
+    }
+}

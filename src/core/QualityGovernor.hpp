@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <array>
 
 namespace pathways {
 
@@ -18,18 +19,21 @@ struct GovernorConfig {
 struct GovernorState {
     uint32_t currentSpp = 1;
     uint32_t currentBounces = 4;
-    float effectiveSpp = 1.0f;       // Continuous dynamic sample rate (e.g. 1.45 SPP)
-    float fractionalSpp = 0.0f;      // Fractional part for halftone blue-noise sampling [0.0, 1.0)
-    uint32_t primSpp = 1;
-    uint32_t secSpp = 0;
-    float targetBudgetMs = 0.0f;
-    float targetRtBudgetMs = 0.0f;
-    float filteredRtMs = 0.0f;
-    float lastFrameTimeMs = 0.0f;
-    float headroomMs = 0.0f;
-    float headroomPercent = 0.0f;
-    bool active = false;
-    uint32_t warmUpFrames = 0;
+    float effectiveSpp = 1.0f;       // Backwards-compatible SPP representation
+    float fractionalSpp = 0.0f;      // Kept for interface compatibility (always 0.0 to prevent SIMD divergence)
+    uint32_t primSpp = 1;            // GPU 0 sample count
+    uint32_t secSpp = 0;             // GPU 1 sample count
+    float targetBudgetMs = 0.0f;     // 1000 / targetFps
+    float targetRtBudgetMs = 0.0f;   // Available RT budget (minus fixed tonemap/UI overhead)
+    float filteredRtMs = 0.0f;       // Filtered ray tracing time (ms)
+    float lastFrameTimeMs = 0.0f;    // Last measured total frame time (ms)
+    float headroomMs = 0.0f;         // Available RT headroom (ms)
+    float headroomPercent = 0.0f;    // Headroom percentage
+    float costPerSpp = 0.0f;         // Filtered normalized cost per sample (ms)
+    float predictedRtMs = 0.0f;      // Model-predicted RT time for current workload
+    bool active = false;             // Whether governor is currently regulating
+    bool cameraMoving = false;       // Whether camera was moving during evaluation
+    uint32_t warmUpFrames = 0;       // Warmup frame counter
 };
 
 class QualityGovernor {
@@ -39,7 +43,19 @@ public:
     explicit QualityGovernor(const GovernorConfig& config);
 
     void init(const GovernorConfig& config);
-    void update(float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel);
+
+    // Records the workload dispatched into a specific in-flight slot (0 or 1)
+    void recordDispatch(uint32_t slot, uint32_t spp, uint32_t bounces);
+
+    // Updates governor state using GPU measurements corresponding to the completed in-flight slot
+    void update(uint32_t slot, float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel);
+
+    // Legacy overload without slot (assumes slot 0)
+    void update(float measuredRtMs, float fixedOverheadMs, bool cameraMoving, bool isMgpuSampleParallel) {
+        update(0, measuredRtMs, fixedOverheadMs, cameraMoving, isMgpuSampleParallel);
+    }
+
+    // High-resolution CPU frame pacer / sleep until deadline
     void paceFrame(std::chrono::high_resolution_clock::time_point frameStart);
 
     void setTargetFps(uint32_t fps);
@@ -48,15 +64,28 @@ public:
 
     const GovernorState& getState() const { return m_state; }
     const GovernorConfig& getConfig() const { return m_config; }
-    float getEffectiveSpp() const { return m_state.effectiveSpp; }
-    float getFractionalSpp() const { return m_state.fractionalSpp; }
+    float getEffectiveSpp() const { return static_cast<float>(m_state.currentSpp); }
+    float getFractionalSpp() const { return 0.0f; }
 
 private:
+    float predictTime(uint32_t spp, uint32_t bounces, bool isMgpu) const;
+    static float getBounceMultiplier(uint32_t bounces);
+
     GovernorConfig m_config;
     GovernorState m_state;
 
-    float m_emaRtMs = 0.0f;
+    struct SlotRecord {
+        uint32_t spp = 1;
+        uint32_t bounces = 4;
+        bool valid = false;
+    };
+    std::array<SlotRecord, 2> m_slotRecords{};
+
+    float m_emaCostPerSpp = 0.0f;
     uint32_t m_cooldown = 0;
+    uint32_t m_failedSpp = 0;
+    uint32_t m_failedBounces = 0;
+    uint32_t m_failLockoutFrames = 0;
     bool m_initialized = false;
 };
 

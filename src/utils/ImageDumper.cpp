@@ -108,7 +108,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"timestamp_iso8601\": \"{}\",\n", timeBuf)
         << std::format("    \"timestamp_unix\": {},\n", static_cast<uint64_t>(now_c))
         << "    \"application\": \"Pathways Pure Vulkan 1.4 Path Tracer\",\n"
-        << "    \"engine_version\": \"1.8.0\"\n"
+        << "    \"engine_version\": \"1.10.0\"\n"
         << "  },\n"
         << "  \"platform\": {\n"
         << std::format("    \"os\": \"{}\",\n", stats.os_name)
@@ -216,9 +216,15 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"dielectric_refraction\": {},\n", stats.enable_refraction ? "true" : "false")
         << std::format("      \"soft_shadows\": {},\n", stats.enable_shadows ? "true" : "false")
         << std::format("      \"aces_tonemapping\": {}\n", stats.aces_tonemap ? "true" : "false")
-        << "    },\n"
-        << "    \"scene\": {\n"
-        << std::format("      \"path\": \"{}\",\n", stats.scene_path)
+        << "    },\n";
+
+    std::string safeScenePath = stats.scene_path;
+    std::replace(safeScenePath.begin(), safeScenePath.end(), '\\', '/');
+    std::string safeHdriPath = stats.hdri_path;
+    std::replace(safeHdriPath.begin(), safeHdriPath.end(), '\\', '/');
+
+    out << "    \"scene\": {\n"
+        << std::format("      \"path\": \"{}\",\n", safeScenePath)
         << std::format("      \"num_triangles\": {},\n", stats.num_triangles)
         << std::format("      \"num_spheres\": {},\n", stats.num_spheres)
         << std::format("      \"num_materials\": {},\n", stats.num_materials)

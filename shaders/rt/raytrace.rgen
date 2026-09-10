@@ -51,7 +51,7 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint accumulateHistory;
     float fractionalSpp;
-    uint pad0;
+    uint totalCompositeSpp;
     uint pad1;
     uint pad2;
 } pc;
@@ -131,11 +131,8 @@ void main() {
     const vec4 phi4 = vec4(0.7548776662, 0.5698402910, 0.4411124503, 0.3541421356);
     vec4 stNoise = fract(bn + float(ubo.frameIndex) * phi4);
 
-    // Continuous Dynamic Fractional SPP Halftone Sampling
+    // Discrete integer sample count (100% SIMD lane coherence)
     uint pixelSpp = ubo.spp;
-    if (pc.fractionalSpp > 0.0 && stNoise.r < pc.fractionalSpp) {
-        pixelSpp += 1u;
-    }
 
     uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + ubo.frameIndex * 26699) | 1u;
     seed ^= uint(stNoise.b * 4294967295.0);
@@ -260,8 +257,9 @@ void main() {
         pixelRadiance += radiance;
     }
 
-    if (pixelSpp > 1u) {
-        pixelRadiance /= float(pixelSpp);
+    uint compositeDivisor = (pc.totalCompositeSpp > 0u) ? pc.totalCompositeSpp : pixelSpp;
+    if (compositeDivisor > 1u) {
+        pixelRadiance /= float(compositeDivisor);
     }
 
     if (isnan(pixelRadiance.r) || isnan(pixelRadiance.g) || isnan(pixelRadiance.b) ||

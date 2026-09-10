@@ -1,0 +1,405 @@
+#version 460
+#extension GL_EXT_ray_query : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_image_load_formatted : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(binding = 0) uniform image2D uAccumImage;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+} ubo;
+
+layout(std430, binding = 2) readonly buffer TrianglesBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 3) readonly buffer SpheresBuffer {
+    Sphere spheres[];
+};
+
+layout(std430, binding = 4) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 5) readonly buffer LightsBuffer {
+    Light lights[];
+};
+
+layout(binding = 7) uniform sampler2D environmentMap;
+layout(binding = 8) uniform sampler2D sceneTextures[64];
+
+layout(std430, binding = 9) readonly buffer InRayStateQueue {
+    RayState inStates[];
+};
+
+layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
+    RayState outStates[];
+};
+
+layout(std430, binding = 11) buffer QueueCounters {
+    uint activeRayCount;
+    uint nextActiveCount;
+    uint totalProcessed;
+    uint shadowRayCount;
+    uint retiredWorkgroups;
+    uint currentShadowCount;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint currentMaterialCounts[4];
+    uint totalShadeWorkgroups;
+    uint pad[13];
+} queueCounters;
+
+layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
+    PackedShadowRay shadowRays[];
+};
+
+layout(std430, binding = 13) buffer IndirectCommand {
+    DispatchCommand commands[];
+} indirect;
+
+layout(std430, binding = 14) buffer DGCStream {
+    DGCCommand commands[];
+} dgcStream;
+
+layout(std430, binding = 15) readonly buffer InRayGeomQueue {
+    RayGeometry inGeoms[];
+};
+
+layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
+    RayGeometry outGeoms[];
+};
+
+layout(std430, binding = 17) readonly buffer InRayHitQueue {
+    RayHit inHits[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint width;
+    uint height;
+    uint currentBounce;
+    uint maxBounces;
+    uint maxQueueCapacity;
+    uint sppSampleIndex;
+    uint hasEnvMap;
+    float envMapIntensity;
+    uint useHardwareRT;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint activeCount = queueCounters.currentMaterialCounts[0]; // Diffuse queue
+    bool inRange = (idx < activeCount);
+    bool survivesToNext = false;
+    bool hasShadowRay = false;
+    RayGeometry nextGeom;
+    RayState nextState;
+    PackedShadowRay shadowCandidate;
+
+    if (inRange) {
+        uint queueIdx = 0u * pc.maxQueueCapacity + idx;
+        RayGeometry geom = inGeoms[queueIdx];
+        RayHit hit = inHits[queueIdx];
+        RayState state = inStates[queueIdx];
+
+        vec3 origin = geom.originAndTMin.xyz;
+        vec3 rayDir = geom.dirAndTMax.xyz;
+        float hitT = hit.hitData.x;
+        uint primId = floatBitsToUint(hit.hitData.y);
+        vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
+        uint hitType = floatBitsToUint(hit.hitData.w);
+
+        vec3 throughput = state.throughputSeed.rgb;
+        uint seed = floatBitsToUint(state.throughputSeed.w);
+        vec3 accumRadiance = state.radiancePixel.rgb;
+        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
+        uint bounce = pc.currentBounce;
+
+        if (hitType == 2u) {
+            // Environment sky miss
+            vec3 skyColor;
+            if (pc.hasEnvMap == 1u) {
+                vec2 envUv = directionToEquirectangular(rayDir);
+                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+            } else {
+                float t = 0.5 * (rayDir.y + 1.0);
+                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+            }
+            accumRadiance += throughput * skyColor;
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+        } else {
+            vec3 hitPoint = origin + hitT * rayDir;
+            vec3 hitNormal = vec3(0.0, 1.0, 0.0);
+            vec2 hitUv = vec2(0.0);
+            uint matId = 0u;
+            bool frontFace = true;
+
+            if (hitType == 0u) {
+                float u = hitBary.x;
+                float v = hitBary.y;
+                float w = 1.0 - u - v;
+
+                vec3 n0 = triangles[primId].v0.normal.xyz;
+                vec3 n1 = triangles[primId].v1.normal.xyz;
+                vec3 n2 = triangles[primId].v2.normal.xyz;
+                hitNormal = normalize(w * n0 + u * n1 + v * n2);
+
+                vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
+                vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
+                vec2 uv2 = vec2(triangles[primId].v2.position.w, triangles[primId].v2.normal.w);
+                hitUv = w * uv0 + u * uv1 + v * uv2;
+                matId = triangles[primId].materialId;
+
+                frontFace = dot(rayDir, hitNormal) < 0.0;
+                hitNormal = frontFace ? hitNormal : -hitNormal;
+
+                Material mat = materials[matId];
+                if (mat.normalTex > 0u && mat.normalTex <= 64u) {
+                    vec4 tan0 = triangles[primId].v0.tangent;
+                    vec4 tan1 = triangles[primId].v1.tangent;
+                    vec4 tan2 = triangles[primId].v2.tangent;
+                    vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
+                    float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
+
+                    vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                    normalMap.xy *= mat.normalScale;
+                    normalMap = normalize(normalMap);
+
+                    geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
+                    vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
+                    mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
+                    hitNormal = normalize(tbn * normalMap);
+                }
+            } else if (hitType == 1u) {
+                Sphere sp = spheres[primId];
+                hitNormal = (hitPoint - sp.centerRadius.xyz) / sp.centerRadius.w;
+                matId = sp.materialId;
+                frontFace = dot(rayDir, hitNormal) < 0.0;
+                hitNormal = frontFace ? hitNormal : -hitNormal;
+            }
+
+            Material mat = materials[matId];
+            vec4 baseColor = mat.albedo;
+            if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
+            }
+
+            vec3 diffuseColor = baseColor.rgb;
+            if (mat.occlusionTex > 0u && mat.occlusionTex <= 64u) {
+                float occSample = texture(sceneTextures[mat.occlusionTex - 1u], hitUv).r;
+                diffuseColor *= (1.0 + mat.occlusionStrength * (occSample - 1.0));
+            }
+
+            bool enableDirect = (ubo.flags & (1 << 0)) != 0;
+            bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
+
+            // Direct Lighting (1-candidate stochastic NEE for diffuse)
+            if (enableDirect && pc.numLights > 0u) {
+                uint lightIdx = 0u;
+                float lightSelectPdf = 1.0;
+                if (pc.numLights > 1u) {
+                    lightIdx = uint(randFloat(seed) * float(pc.numLights));
+                    lightIdx = min(lightIdx, pc.numLights - 1u);
+                    lightSelectPdf = 1.0 / float(pc.numLights);
+                }
+
+                Light light = lights[lightIdx];
+                vec3 lightPoint;
+                vec3 lightDir;
+                float lightDist = 0.0;
+                float lightPdf = 1.0;
+                vec3 lightEmission = light.emission.rgb;
+                bool validLightSample = false;
+
+                if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                    vec2 luv = randVec2(seed);
+                    lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                    vec3 toLight = lightPoint - hitPoint;
+                    lightDist = length(toLight);
+                    lightDir = toLight / max(lightDist, 1e-4);
+
+                    float cosLight = dot(-lightDir, light.normal.xyz);
+                    if (cosLight > 0.0) {
+                        float area = light.emission.w;
+                        lightPdf = (lightDist * lightDist) / (area * cosLight);
+                        validLightSample = true;
+                    }
+                } else if (uint(light.position.w) == 1u /* SPOT */) {
+                    vec3 toLight = light.position.xyz - hitPoint;
+                    lightDist = length(toLight);
+                    lightDir = toLight / max(lightDist, 1e-4);
+
+                    float cosSpot = dot(-lightDir, light.normal.xyz);
+                    float innerCos = light.u.w;
+                    float outerCos = light.v.w;
+                    if (cosSpot >= outerCos) {
+                        float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                        lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                        lightPdf = 1.0;
+                        validLightSample = true;
+                    }
+                }
+
+                float NdotL = dot(hitNormal, lightDir);
+                if (validLightSample && NdotL > 0.0) {
+                    float bsdfPdf = NdotL * INV_PI;
+                    float misWeight = 1.0;
+                    if (uint(light.position.w) == 0u) {
+                        float lightPdfEff = lightPdf * lightSelectPdf;
+                        misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + bsdfPdf * bsdfPdf, 1e-6);
+                    }
+
+                    vec3 diffuseBrdf = diffuseColor * INV_PI;
+                    vec3 unshadowed = throughput * diffuseBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+
+                    if (length(unshadowed) > 1e-5) {
+                        hasShadowRay = true;
+                        shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                        shadowCandidate.dirPixel = vec4(lightDir, uintBitsToFloat(pixelIndex));
+                        shadowCandidate.unshadowedRadiance = vec4(unshadowed, uintBitsToFloat(bounce));
+                    }
+                }
+            }
+
+            // Indirect Bounce: Cosine-weighted hemisphere sampling
+            bool pathTerminated = false;
+            if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
+                pathTerminated = true;
+            } else {
+                vec3 nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
+                throughput *= diffuseColor;
+
+                float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
+                if (lum < 0.001) {
+                    pathTerminated = true;
+                } else if (bounce >= 1u) {
+                    float minP = (bounce >= 2u) ? 0.02 : 0.05;
+                    float p = clamp(lum, minP, 0.95);
+                    if (randFloat(seed) > p) {
+                        pathTerminated = true;
+                    } else {
+                        throughput /= p;
+                    }
+                }
+
+                if (!pathTerminated) {
+                    survivesToNext = true;
+                    nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
+                    nextGeom.dirAndTMax = vec4(nextDirection, 10000.0);
+                    nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
+                    nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                }
+            }
+
+            if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
+                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            }
+        }
+    }
+
+    // Subgroup Wave Ballot Compaction into downstream surviving secondary ray queue
+    uvec4 ballot = subgroupBallot(survivesToNext);
+    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+    uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+    uint waveGlobalOffset = 0u;
+    if (subgroupElect()) {
+        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+    }
+    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+    if (survivesToNext) {
+        uint targetIdx = waveGlobalOffset + laneSlot;
+        if (targetIdx < pc.maxQueueCapacity) {
+            outGeoms[targetIdx] = nextGeom;
+            outStates[targetIdx] = nextState;
+        }
+    }
+
+    // Subgroup Wave Ballot Compaction for Shadow Rays
+    uvec4 shadowBallot = subgroupBallot(hasShadowRay);
+    uint shadowLaneSlot = subgroupBallotExclusiveBitCount(shadowBallot);
+    uint shadowWaveCount = subgroupBallotBitCount(shadowBallot);
+
+    uint shadowGlobalOffset = 0u;
+    if (subgroupElect()) {
+        shadowGlobalOffset = atomicAdd(queueCounters.shadowRayCount, shadowWaveCount);
+    }
+    shadowGlobalOffset = subgroupBroadcastFirst(shadowGlobalOffset);
+
+    if (hasShadowRay) {
+        uint targetIdx = shadowGlobalOffset + shadowLaneSlot;
+        if (targetIdx < pc.maxQueueCapacity) {
+            shadowRays[targetIdx] = shadowCandidate;
+        }
+    }
+
+    // Atomic workgroup retirement to prepare downstream dispatches directly
+    memoryBarrierBuffer();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
+        if (retired == queueCounters.totalShadeWorkgroups - 1u) {
+            uint shadowCount = queueCounters.shadowRayCount;
+            uint shadowGroups = (shadowCount + 31u) / 32u;
+            uint b = pc.currentBounce;
+
+            indirect.commands[b * 6u + 4u].x = shadowGroups;
+            indirect.commands[b * 6u + 4u].y = 1u;
+            indirect.commands[b * 6u + 4u].z = 1u;
+            indirect.commands[b * 6u + 4u].pad = shadowCount;
+
+            dgcStream.commands[b * 6u + 4u].pipelineIndex = 3u; // Shadow pipeline
+            dgcStream.commands[b * 6u + 4u].x = shadowGroups;
+            dgcStream.commands[b * 6u + 4u].y = 1u;
+            dgcStream.commands[b * 6u + 4u].z = 1u;
+
+            uint nextCount = queueCounters.nextActiveCount;
+            uint intersectGroups = (nextCount + 31u) / 32u;
+
+            indirect.commands[b * 6u + 5u].x = intersectGroups;
+            indirect.commands[b * 6u + 5u].y = 1u;
+            indirect.commands[b * 6u + 5u].z = 1u;
+            indirect.commands[b * 6u + 5u].pad = nextCount;
+
+            dgcStream.commands[b * 6u + 5u].pipelineIndex = 1u; // Intersect pipeline
+            dgcStream.commands[b * 6u + 5u].x = intersectGroups;
+            dgcStream.commands[b * 6u + 5u].y = 1u;
+            dgcStream.commands[b * 6u + 5u].z = 1u;
+
+            queueCounters.currentShadowCount = shadowCount;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+            queueCounters.nextActiveCount = 0u;
+            queueCounters.shadowRayCount = 0u;
+            queueCounters.retiredWorkgroups = 0u;
+        }
+    }
+}

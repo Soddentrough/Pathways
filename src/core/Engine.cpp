@@ -444,10 +444,43 @@ void Engine::initScene() {
 
     if (m_camera) {
         m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
-        if (m_sceneData.hasCamera) {
-            m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
-            m_camera->setFov(m_sceneData.cameraFov);
-            m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
+
+        glm::vec3 camPos = m_sceneData.cameraPosition;
+        glm::vec3 camTarget = m_sceneData.cameraTarget;
+        glm::vec3 camUp = m_sceneData.cameraUp;
+        float camFov = m_sceneData.cameraFov;
+        bool hasOverride = false;
+
+        if (m_config.camera_pos.has_value()) {
+            camPos = *m_config.camera_pos;
+            hasOverride = true;
+        }
+        if (m_config.camera_target.has_value()) {
+            camTarget = *m_config.camera_target;
+            hasOverride = true;
+        }
+        if (m_config.camera_up.has_value()) {
+            camUp = *m_config.camera_up;
+            hasOverride = true;
+        }
+        if (m_config.camera_fov.has_value()) {
+            camFov = *m_config.camera_fov;
+            hasOverride = true;
+        }
+
+        if (m_sceneData.hasCamera || hasOverride) {
+            m_camera->lookAt(camPos, camTarget, camUp);
+            m_camera->setFov(camFov);
+            if (m_config.camera_fov.has_value()) {
+                m_camera->setAdaptiveFov(false);
+            }
+            m_camera->setDefaultFraming(camPos, camTarget, camFov);
+            Logger::info("Active Camera: pos=({:.3f}, {:.3f}, {:.3f}), target=({:.3f}, {:.3f}, {:.3f}), up=({:.3f}, {:.3f}, {:.3f}), fov={:.1f}°{}",
+                         camPos.x, camPos.y, camPos.z,
+                         camTarget.x, camTarget.y, camTarget.z,
+                         camUp.x, camUp.y, camUp.z,
+                         camFov,
+                         hasOverride ? " [CLI Override]" : "");
         }
     }
 
@@ -785,9 +818,42 @@ bool Engine::loadScene(const std::string& filepath) {
     // Update camera framing
     if (m_camera) {
         m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
-        m_camera->lookAt(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraUp);
-        m_camera->setFov(m_sceneData.cameraFov);
-        m_camera->setDefaultFraming(m_sceneData.cameraPosition, m_sceneData.cameraTarget, m_sceneData.cameraFov);
+
+        glm::vec3 camPos = m_sceneData.cameraPosition;
+        glm::vec3 camTarget = m_sceneData.cameraTarget;
+        glm::vec3 camUp = m_sceneData.cameraUp;
+        float camFov = m_sceneData.cameraFov;
+        bool hasOverride = false;
+
+        if (m_config.camera_pos.has_value()) {
+            camPos = *m_config.camera_pos;
+            hasOverride = true;
+        }
+        if (m_config.camera_target.has_value()) {
+            camTarget = *m_config.camera_target;
+            hasOverride = true;
+        }
+        if (m_config.camera_up.has_value()) {
+            camUp = *m_config.camera_up;
+            hasOverride = true;
+        }
+        if (m_config.camera_fov.has_value()) {
+            camFov = *m_config.camera_fov;
+            hasOverride = true;
+        }
+
+        m_camera->lookAt(camPos, camTarget, camUp);
+        m_camera->setFov(camFov);
+        if (m_config.camera_fov.has_value()) {
+            m_camera->setAdaptiveFov(false);
+        }
+        m_camera->setDefaultFraming(camPos, camTarget, camFov);
+        Logger::info("Active Camera: pos=({:.3f}, {:.3f}, {:.3f}), target=({:.3f}, {:.3f}, {:.3f}), up=({:.3f}, {:.3f}, {:.3f}), fov={:.1f}°{}",
+                     camPos.x, camPos.y, camPos.z,
+                     camTarget.x, camTarget.y, camTarget.z,
+                     camUp.x, camUp.y, camUp.z,
+                     camFov,
+                     hasOverride ? " [CLI Override]" : "");
     }
 
     // Update scene path and current index
@@ -1019,6 +1085,26 @@ void Engine::initPipelines() {
     );
     Logger::info("Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
 
+    // 6b. Wavefront Path Tracing Pipeline (Work Lists & DGC)
+    auto wfClassifyCode = loadShaderSPIRV("wavefront_classify.comp.spv");
+    auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
+    auto wfShadeCode = loadShaderSPIRV("wavefront_shade.comp.spv");
+    auto wfShadowCode = loadShaderSPIRV("wavefront_shadow.comp.spv");
+    auto wfResolveCode = loadShaderSPIRV("wavefront_resolve.comp.spv");
+    auto wfShadeDiffuseCode = loadShaderSPIRV("wavefront_shade_diffuse.comp.spv");
+    auto wfShadeDielectricCode = loadShaderSPIRV("wavefront_shade_dielectric.comp.spv");
+    auto wfShadeConductorCode = loadShaderSPIRV("wavefront_shade_conductor.comp.spv");
+    auto wfShadeComplexCode = loadShaderSPIRV("wavefront_shade_complex.comp.spv");
+
+    m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
+        device, allocator,
+        m_config.width, m_config.height,
+        m_config.wavefront_tile_size,
+        wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode, wfResolveCode,
+        wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode
+    );
+    Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
+
     // 7. ACES Tonemapping Compute Pipeline (Wave32 execution mode on RDNA4)
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1213,6 +1299,7 @@ void Engine::updateAllImageDescriptors() {
     }
 
     updateAtrousDescriptors();
+    updateWavefrontSceneDescriptors();
 }
 
 void Engine::createShadowDenoiserPipelines() {
@@ -1886,6 +1973,40 @@ void Engine::updateSceneDescriptors() {
     if (!writes.empty()) {
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
+
+    updateWavefrontSceneDescriptors();
+}
+
+void Engine::updateWavefrontSceneDescriptors() {
+    if (!m_wavefrontPipeline || !m_accumImage || !m_triangleBuffer) return;
+
+    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
+    VkDescriptorImageInfo envInfo = m_environmentMap ? m_environmentMap->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
+
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
+        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
+            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = m_dummyWhite->getDescriptorInfo();
+        }
+    }
+
+    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
+        if (!m_cameraUBOs[slot]) continue;
+        m_wavefrontPipeline->updateSceneDescriptors(
+            slot,
+            m_accumImage->getImageView(),
+            m_cameraUBOs[slot]->getBuffer(),
+            m_triangleBuffer->getBuffer(), m_triangleBuffer->getSize(),
+            m_sphereBuffer->getBuffer(), m_sphereBuffer->getSize(),
+            m_materialBuffer->getBuffer(), m_materialBuffer->getSize(),
+            m_lightBuffer->getBuffer(), m_lightBuffer->getSize(),
+            tlasHandle,
+            envInfo,
+            texInfos
+        );
+    }
 }
 
 void Engine::initReSTIRBuffers() {
@@ -2241,13 +2362,20 @@ void Engine::renderFrame() {
             }
         }
 
+        bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
+        if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+            static int wfProfCount = 0;
+            if ((m_config.benchmark && (++wfProfCount == 10)) || getenv("PATHWAYS_PROFILE_WF")) {
+                m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+            }
+        }
+
         // Update Dynamic Quality Governor with measured GPU timings
         if (m_governor && m_config.adaptive_spp) {
             bool isMgpuSample = (m_mgpu && m_mgpu->isMultiGpuActive() &&
-                                (m_config.mgpu_mode == MultiGpuMode::SampleParallel ||
-                                (m_config.mgpu_mode == MultiGpuMode::Auto && m_governor->getState().currentSpp > 1)));
+                                (m_config.mgpu_mode == MultiGpuMode::SampleParallel));
             float activeRtMs = static_cast<float>((m_mgpu && m_mgpu->isMultiGpuActive()) ? std::max(gpuRtMs, secGpuMs) : gpuRtMs);
-            m_governor->update(activeRtMs, static_cast<float>(gpuTonemapMs), m_camera && m_camera->hasMoved(), isMgpuSample);
+            m_governor->update(m_currentFrame, activeRtMs, static_cast<float>(gpuTonemapMs), m_cameraMovedLastFrame, isMgpuSample);
         }
     }
 
@@ -2363,7 +2491,8 @@ void Engine::renderFrame() {
     }
 
     // Reset accumulation if camera moved or UI settings changed
-    bool accumReset = (m_camera && m_camera->hasMoved()) || m_resetAccumulation || (m_totalFramesRendered == 0);
+    m_cameraMovedLastFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
+    bool accumReset = m_cameraMovedLastFrame || m_resetAccumulation || (m_totalFramesRendered == 0);
     if (accumReset) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
@@ -2378,6 +2507,7 @@ void Engine::renderFrame() {
         if (m_governor->getConfig().enabled != m_config.adaptive_spp) {
             m_governor->setEnabled(m_config.adaptive_spp);
         }
+        m_governor->setBounds(m_config.min_spp, m_config.max_spp, m_config.min_bounces, m_config.max_dynamic_bounces);
     }
 
     uint32_t activeSpp = m_config.spp;
@@ -2502,25 +2632,68 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
-        // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+            bool needAccumReset = accumReset || !m_config.progressive_accumulation;
+            if (needAccumReset && m_accumImage) {
+                VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
 
-        uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
-        uint32_t rtPushConstants[16] = {
-            m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-            0, 0, m_config.width, m_config.height,
-            useHwRT,
-            hasEnvMap,
-            envIntensityBits,
-            (m_config.progressive_accumulation && !accumReset) ? 1u : 0u, // accumulateHistory
-            fracSppBits,
-            0u, 0u, 0u
-        };
-        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-        vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+                VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                clearBarrier.image = m_accumImage->getImage();
+                clearBarrier.subresourceRange = clearRange;
 
-        m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
+                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                clearDep.imageMemoryBarrierCount = 1;
+                clearDep.pImageMemoryBarriers = &clearBarrier;
+                vkCmdPipelineBarrier2(cmd, &clearDep);
+            }
+
+            WavefrontSceneData wfSceneData{};
+            wfSceneData.numTriangles = m_numTriangles;
+            wfSceneData.numSpheres = m_numSpheres;
+            wfSceneData.numMaterials = m_numMaterials;
+            wfSceneData.numLights = m_numLights;
+            wfSceneData.hasEnvMap = hasEnvMap;
+            wfSceneData.envMapIntensity = envIntensity;
+            wfSceneData.useHardwareRT = useHwRT;
+            wfSceneData.frameIndex = m_frameIndex;
+            wfSceneData.useMorton = 1u;
+            wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+            wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+
+            m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
+                                             activeSpp, activeBounces, wfSceneData);
+        } else {
+            // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+
+            uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
+            uint32_t rtPushConstants[16] = {
+                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
+                0, 0, m_config.width, m_config.height,
+                useHwRT,
+                hasEnvMap,
+                envIntensityBits,
+                (m_config.progressive_accumulation && !accumReset) ? 1u : 0u, // accumulateHistory
+                fracSppBits,
+                0u, 0u, 0u
+            };
+            VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+
+            m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
+        }
+        if (m_governor) {
+            m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
+        }
 
         if (m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
             VkMemoryBarrier2 rtToClassifyBarrier{};
@@ -2736,7 +2909,7 @@ void Engine::renderFrame() {
 
         activeMode = m_config.mgpu_mode;
         if (activeMode == MultiGpuMode::Auto) {
-            activeMode = (activeSpp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+            activeMode = MultiGpuMode::CheckerboardTile;
         }
         if (activeMode != m_lastActiveMgpuMode) {
             accumReset = true;
@@ -2810,10 +2983,13 @@ void Engine::renderFrame() {
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
+        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (ubo.spp + uboSec.spp) : 0u;
+
         // 1. Launch secondary GPU concurrently for current frame
         m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
                                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes);
+                                   hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
+                                   totalCompositeSpp);
 
         // 2. Concurrently record and execute primary GPU ray tracing asynchronously
         vkResetCommandBuffer(cmd, 0);
@@ -2836,7 +3012,8 @@ void Engine::renderFrame() {
             envIntensityBits,
             (m_config.progressive_accumulation && !accumReset) ? 1u : 0u, // accumulateHistory
             fracSppBits,
-            0u, 0u, 0u
+            totalCompositeSpp,
+            0u, 0u
         };
 
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
@@ -2845,6 +3022,9 @@ void Engine::renderFrame() {
         VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
         vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
         m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
+        if (m_governor) {
+            m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
+        }
 
         if (m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
             VkMemoryBarrier2 rtToClassifyBarrier{};
@@ -3396,7 +3576,19 @@ void Engine::renderFrame() {
         double secGpuMs = m_lastSecGpuMs;
         double gpuTonemapMs = m_lastTonemapMs;
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
-        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+        if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
+            uint32_t curSpp = m_governor->getState().currentSpp;
+            uint32_t curBounces = m_governor->getState().currentBounces;
+            if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+                Logger::info("Frame {:3d} | Dual-GPU: {:.3f} ms (GPU 0: {:.3f} ms [{} SPP], GPU 1: {:.3f} ms [{} SPP]) | Dynamic: {} SPP, {} Bounces | Target {} FPS",
+                             m_totalFramesRendered, totalGpuMs, gpuRtMs, m_governor->getState().primSpp, secGpuMs, m_governor->getState().secSpp,
+                             curSpp, curBounces, m_config.target_fps);
+            } else {
+                Logger::info("Frame {:3d} | Single GPU: {:.3f} ms (RT: {:.3f} ms, Tonemap: {:.3f} ms) | Dynamic: {} SPP, {} Bounces | Target {} FPS",
+                             m_totalFramesRendered, totalGpuMs, gpuRtMs, gpuTonemapMs,
+                             curSpp, curBounces, m_config.target_fps);
+            }
+        } else if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs,
                          totalGpuMs < 8.0 ? "\033[32mPASS\033[0m" : "\033[33mCHECK\033[0m");
@@ -3616,7 +3808,7 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
-    stats.pipeline_type_str = "rtp";
+    stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "rtp";
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
@@ -3910,6 +4102,11 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     updateAllImageDescriptors();
     updateMergeDescriptors();
 
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->resize(m_config.width, m_config.height, m_config.wavefront_tile_size);
+        updateWavefrontSceneDescriptors();
+    }
+
     // 5. Reset UI dump buffer if allocated
     if (m_uiDumpBuffer) {
         m_uiDumpBuffer.reset();
@@ -3942,11 +4139,12 @@ std::string Engine::getActiveSceneName() const {
 void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs) {
     ConfigKey key;
     key.scene_name = getActiveSceneName();
+    key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
     key.width = m_config.width;
     key.height = m_config.height;
-    key.spp = m_config.spp;
-    key.max_bounces = m_config.max_bounces;
+    key.spp = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentSpp : m_config.spp;
+    key.max_bounces = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentBounces : m_config.max_bounces;
     key.accum_format = m_config.accum_format;
     key.tile_size = m_config.tile_size;
 

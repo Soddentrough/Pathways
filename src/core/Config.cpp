@@ -71,12 +71,55 @@ bool parseResolutionString(std::string_view str, uint32_t& outW, uint32_t& outH)
 
     return false;
 }
+
+std::vector<float> parseNumbers(std::string_view str) {
+    std::vector<float> numbers;
+    while (!str.empty() && (str.front() == ' ' || str.front() == '\t' || str.front() == '[' || str.front() == '(')) {
+        str.remove_prefix(1);
+    }
+    while (!str.empty() && (str.back() == ' ' || str.back() == '\t' || str.back() == ']' || str.back() == ')')) {
+        str.remove_suffix(1);
+    }
+    if (str.empty()) return numbers;
+
+    std::string s(str);
+    for (char& c : s) {
+        if (c == ',' || c == ';' || c == '/' || c == '[' || c == ']' || c == '(' || c == ')') {
+            c = ' ';
+        }
+    }
+
+    size_t start = 0;
+    while (start < s.size()) {
+        while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) ++start;
+        if (start >= s.size()) break;
+        size_t end = start;
+        while (end < s.size() && s[end] != ' ' && s[end] != '\t') ++end;
+        try {
+            numbers.push_back(std::stof(s.substr(start, end - start)));
+        } catch (...) {
+            return {};
+        }
+        start = end;
+    }
+    return numbers;
+}
+
+bool parseVec3(std::string_view str, glm::vec3& outVec) {
+    auto nums = parseNumbers(str);
+    if (nums.size() == 3) {
+        outVec = glm::vec3(nums[0], nums[1], nums[2]);
+        return true;
+    }
+    return false;
+}
 } // namespace
 
 void Config::printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
               << "Options:\n"
               << "  --headless              Run in headless offscreen mode (no window)\n"
+              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Work Lists & DGC [default]) or 'rtp' (KHR Ray Tracing Pipeline)\n"
               << "  --fullscreen            Run in fullscreen mode [default]\n"
               << "  --windowed              Run in windowed / non-fullscreen mode\n"
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
@@ -97,6 +140,8 @@ void Config::printUsage(const char* progName) {
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
+              << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
+              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'none' [default], 'archetype' (A & B), 'bda' (C), or 'dual' (D)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
               << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
@@ -110,7 +155,12 @@ void Config::printUsage(const char* progName) {
               << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --no-indirect, --direct-only  Disable indirect diffuse GI (isolate direct area light illumination)\n"
+              << "  --camera-motion         Simulate continuous camera motion\n"
+              << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
+              << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
+              << "  --camera-target <x,y,z> Set camera target look-at point (or --cam-target)\n"
+              << "  --camera-up <x,y,z>     Set camera world up vector (default: 0,1,0)\n"
+              << "  --camera-fov <degrees>  Set camera vertical field of view in degrees (or --fov)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -228,6 +278,22 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::warn("Invalid tile size {} specified. Must be 16, 32, 64, or 128. Defaulting to 64.", sz);
                 cfg.tile_size = 64;
             }
+        } else if ((arg == "--wavefront-tile" || arg == "--wf-tile" || arg == "--wavefront-tile-size") && i + 1 < argc) {
+            cfg.wavefront_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--wavefront-tile=") || arg.starts_with("--wf-tile=") || arg.starts_with("--wavefront-tile-size=")) {
+            cfg.wavefront_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if ((arg == "--wavefront-sort" || arg == "--wf-sort" || arg == "--material-sort") && i + 1 < argc) {
+            std::string s = argv[++i];
+            if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
+            else if (s == "bda" || s == "c") cfg.wavefront_sort_mode = WavefrontSortMode::BDA;
+            else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
+            else cfg.wavefront_sort_mode = WavefrontSortMode::None;
+        } else if (arg.starts_with("--wavefront-sort=") || arg.starts_with("--wf-sort=") || arg.starts_with("--material-sort=")) {
+            std::string s = arg.substr(arg.find('=') + 1);
+            if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
+            else if (s == "bda" || s == "c") cfg.wavefront_sort_mode = WavefrontSortMode::BDA;
+            else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
+            else cfg.wavefront_sort_mode = WavefrontSortMode::None;
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
@@ -241,6 +307,163 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.double_buffered_shared_mem = true;
         } else if (arg == "--camera-motion") {
             cfg.camera_motion = true;
+        } else if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {
+            std::string combinedStr = argv[++i];
+            auto nums = parseNumbers(combinedStr);
+            while (nums.size() < 6 && i + 1 < argc) {
+                std::string nextArg = argv[i + 1];
+                if (nextArg.starts_with("--") || (nextArg.starts_with("-") && nextArg.size() > 1 && !std::isdigit(static_cast<unsigned char>(nextArg[1])) && nextArg[1] != '.')) {
+                    break;
+                }
+                combinedStr += " " + nextArg;
+                nums = parseNumbers(combinedStr);
+                ++i;
+            }
+            if (nums.size() == 6 && i + 1 < argc) {
+                std::string nextArg = argv[i + 1];
+                if (!nextArg.starts_with("--") && (!nextArg.starts_with("-") || (nextArg.size() > 1 && (std::isdigit(static_cast<unsigned char>(nextArg[1])) || nextArg[1] == '.')))) {
+                    auto testNums = parseNumbers(combinedStr + " " + nextArg);
+                    if (testNums.size() == 7) {
+                        nums = testNums;
+                        combinedStr += " " + nextArg;
+                        ++i;
+                    }
+                }
+            }
+            if (nums.size() >= 6) {
+                cfg.camera_pos = glm::vec3(nums[0], nums[1], nums[2]);
+                cfg.camera_target = glm::vec3(nums[3], nums[4], nums[5]);
+                if (nums.size() == 7) {
+                    cfg.camera_fov = nums[6];
+                } else if (nums.size() == 9) {
+                    cfg.camera_up = glm::vec3(nums[6], nums[7], nums[8]);
+                } else if (nums.size() >= 10) {
+                    cfg.camera_up = glm::vec3(nums[6], nums[7], nums[8]);
+                    cfg.camera_fov = nums[9];
+                }
+            } else {
+                Logger::warn("Invalid --camera argument '{}'. Expected at least 6 values: px,py,pz,tx,ty,tz[,fov]", combinedStr);
+            }
+        } else if (arg.starts_with("--camera=") || arg.starts_with("-c=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            auto nums = parseNumbers(val);
+            if (nums.size() >= 6) {
+                cfg.camera_pos = glm::vec3(nums[0], nums[1], nums[2]);
+                cfg.camera_target = glm::vec3(nums[3], nums[4], nums[5]);
+                if (nums.size() == 7) {
+                    cfg.camera_fov = nums[6];
+                } else if (nums.size() == 9) {
+                    cfg.camera_up = glm::vec3(nums[6], nums[7], nums[8]);
+                } else if (nums.size() >= 10) {
+                    cfg.camera_up = glm::vec3(nums[6], nums[7], nums[8]);
+                    cfg.camera_fov = nums[9];
+                }
+            } else {
+                Logger::warn("Invalid --camera argument '{}'. Expected at least 6 values: px,py,pz,tx,ty,tz[,fov]", val);
+            }
+        } else if ((arg == "--camera-pos" || arg == "--cam-pos" || arg == "--camera-position" || arg == "--cam-position") && i + 1 < argc) {
+            std::string combinedStr = argv[++i];
+            glm::vec3 pos;
+            if (parseVec3(combinedStr, pos)) {
+                cfg.camera_pos = pos;
+            } else if (i + 2 < argc) {
+                std::string s3 = combinedStr + " " + argv[i + 1] + " " + argv[i + 2];
+                if (parseVec3(s3, pos)) {
+                    cfg.camera_pos = pos;
+                    i += 2;
+                } else {
+                    Logger::warn("Invalid camera position '{}'. Expected x,y,z", combinedStr);
+                }
+            } else {
+                Logger::warn("Invalid camera position '{}'. Expected x,y,z", combinedStr);
+            }
+        } else if (arg.starts_with("--camera-pos=") || arg.starts_with("--cam-pos=") ||
+                   arg.starts_with("--camera-position=") || arg.starts_with("--cam-position=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            glm::vec3 pos;
+            if (parseVec3(val, pos)) {
+                cfg.camera_pos = pos;
+            } else {
+                Logger::warn("Invalid camera position '{}'. Expected x,y,z", val);
+            }
+        } else if ((arg == "--camera-target" || arg == "--cam-target" || arg == "--camera-lookat" || arg == "--cam-lookat") && i + 1 < argc) {
+            std::string combinedStr = argv[++i];
+            glm::vec3 target;
+            if (parseVec3(combinedStr, target)) {
+                cfg.camera_target = target;
+            } else if (i + 2 < argc) {
+                std::string s3 = combinedStr + " " + argv[i + 1] + " " + argv[i + 2];
+                if (parseVec3(s3, target)) {
+                    cfg.camera_target = target;
+                    i += 2;
+                } else {
+                    Logger::warn("Invalid camera target '{}'. Expected x,y,z", combinedStr);
+                }
+            } else {
+                Logger::warn("Invalid camera target '{}'. Expected x,y,z", combinedStr);
+            }
+        } else if (arg.starts_with("--camera-target=") || arg.starts_with("--cam-target=") ||
+                   arg.starts_with("--camera-lookat=") || arg.starts_with("--cam-lookat=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            glm::vec3 target;
+            if (parseVec3(val, target)) {
+                cfg.camera_target = target;
+            } else {
+                Logger::warn("Invalid camera target '{}'. Expected x,y,z", val);
+            }
+        } else if ((arg == "--camera-up" || arg == "--cam-up") && i + 1 < argc) {
+            std::string combinedStr = argv[++i];
+            glm::vec3 up;
+            if (parseVec3(combinedStr, up)) {
+                cfg.camera_up = up;
+            } else if (i + 2 < argc) {
+                std::string s3 = combinedStr + " " + argv[i + 1] + " " + argv[i + 2];
+                if (parseVec3(s3, up)) {
+                    cfg.camera_up = up;
+                    i += 2;
+                } else {
+                    Logger::warn("Invalid camera up vector '{}'. Expected x,y,z", combinedStr);
+                }
+            } else {
+                Logger::warn("Invalid camera up vector '{}'. Expected x,y,z", combinedStr);
+            }
+        } else if (arg.starts_with("--camera-up=") || arg.starts_with("--cam-up=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            glm::vec3 up;
+            if (parseVec3(val, up)) {
+                cfg.camera_up = up;
+            } else {
+                Logger::warn("Invalid camera up vector '{}'. Expected x,y,z", val);
+            }
+        } else if ((arg == "--camera-fov" || arg == "--cam-fov" || arg == "--fov") && i + 1 < argc) {
+            try {
+                cfg.camera_fov = std::stof(argv[++i]);
+            } catch (...) {
+                Logger::warn("Invalid camera fov '{}'. Expected degrees float", argv[i]);
+            }
+        } else if (arg.starts_with("--camera-fov=") || arg.starts_with("--cam-fov=") || arg.starts_with("--fov=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            try {
+                cfg.camera_fov = std::stof(val);
+            } catch (...) {
+                Logger::warn("Invalid camera fov '{}'. Expected degrees float", val);
+            }
+        } else if ((arg == "--pipeline" || arg == "-p") && i + 1 < argc) {
+            std::string pipeStr = argv[++i];
+            std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
+            if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
+                cfg.pipeline_type = PipelineType::RTP;
+            } else {
+                cfg.pipeline_type = PipelineType::Wavefront;
+            }
+        } else if (arg.starts_with("--pipeline=")) {
+            std::string pipeStr = arg.substr(arg.find('=') + 1);
+            std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
+            if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
+                cfg.pipeline_type = PipelineType::RTP;
+            } else {
+                cfg.pipeline_type = PipelineType::Wavefront;
+            }
         } else if (arg == "--visualize-split" || arg == "--show-split") {
             cfg.visualize_mgpu_split = true;
         } else if (arg == "--no-visualize-split") {

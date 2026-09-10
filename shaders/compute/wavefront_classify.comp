@@ -3,6 +3,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_shader_image_load_formatted : require
 
 #include "wavefront_common.glsl"
@@ -14,6 +15,7 @@ layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
     mat4 projInverse;
+    mat4 prevViewProj;
     vec4 position;
     vec4 viewParams;
     uint frameIndex;
@@ -34,24 +36,48 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
     Material materials[];
 };
 
-layout(std430, binding = 5) readonly buffer LightsBuffer {
-    Light lights[];
-};
-
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[64];
 
-layout(std430, binding = 9) writeonly buffer OutRayQueue {
-    RayPayload outRays[];
+layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
+    RayState outStates[];
 };
 
-layout(std430, binding = 10) buffer QueueCounters {
+layout(std430, binding = 11) buffer QueueCounters {
     uint activeRayCount;
     uint nextActiveCount;
     uint totalProcessed;
-    uint padding;
+    uint shadowRayCount;
+    uint retiredWorkgroups;
+    uint currentShadowCount;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint currentMaterialCounts[4];
+    uint totalShadeWorkgroups;
+    uint pad[13];
 } queueCounters;
+
+layout(std430, binding = 13) buffer IndirectCommand {
+    DispatchCommand commands[];
+} indirect;
+
+layout(std430, binding = 14) buffer DGCStream {
+    DGCCommand commands[];
+} dgcStream;
+
+layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
+    RayGeometry outGeoms[];
+};
+
+layout(std430, binding = 17) writeonly buffer OutRayHitQueue {
+    RayHit outHits[];
+};
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -66,21 +92,40 @@ layout(push_constant) uniform PushConstants {
     uint maxQueueCapacity;
     uint sppSampleIndex;
     uint useHardwareRT;
+    uint tileOffsetX;
+    uint tileOffsetY;
+    uint tileSizeX;
+    uint tileSizeY;
+    uint sortMode;
 } pc;
 
 void main() {
     ivec2 pixelCoord;
+    bool inBounds = false;
     uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
 
-    if (pc.useMorton != 0u) {
-        pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+    if (pc.tileSizeX > 0u && pc.tileSizeY > 0u) {
+        ivec2 localCoord;
+        if (pc.useMorton != 0u) {
+            localCoord = getPixelCoordsMorton8x4(linearIdx, pc.tileSizeX, pc.tileSizeY);
+        } else {
+            localCoord = ivec2(gl_GlobalInvocationID.xy);
+        }
+        pixelCoord = localCoord + ivec2(pc.tileOffsetX, pc.tileOffsetY);
+        inBounds = (localCoord.x < int(pc.tileSizeX) && localCoord.y < int(pc.tileSizeY) &&
+                    pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height));
     } else {
-        pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+        if (pc.useMorton != 0u) {
+            pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+        } else {
+            pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+        }
+        inBounds = (pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height));
     }
-
-    bool inBounds = (pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height));
     bool isActive = false;
-    RayPayload payload;
+    RayGeometry geom;
+    RayHit hit;
+    RayState state;
 
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
@@ -98,33 +143,11 @@ void main() {
         int closestTri = -1;
         vec2 closestBary = vec2(0.0);
         int closestSphere = -1;
-        vec3 sphereNormal = vec3(0.0);
 
-        // Hardware BVH Traversal with Any-Hit Alpha Mask cutout testing
+        // Hardware BVH Traversal with 100% fixed-function opaque traversal
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, origin, EPSILON, direction, closestT);
-        while (rayQueryProceedEXT(rq)) {
-            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                Material candMat = materials[triangles[triIdx].materialId];
-                if (candMat.alphaMode == 1u /* MASK */) {
-                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                    float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
-                    Triangle ctri = triangles[triIdx];
-                    vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
-                               cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
-                               cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
-                    float calpha = candMat.albedo.a;
-                    if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
-                        calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
-                    }
-                    if (calpha < candMat.alphaCutoff) {
-                        continue; // Pass through alpha cutout
-                    }
-                }
-                rayQueryConfirmIntersectionEXT(rq);
-            }
-        }
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, EPSILON, direction, closestT);
+        rayQueryProceedEXT(rq);
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(rq, true);
@@ -133,16 +156,19 @@ void main() {
         }
 
         // Test procedural spheres
-        for (uint i = 0; i < pc.numSpheres; ++i) {
-            float spT;
-            vec3 spNorm;
-            if (intersectSphere(origin, direction, spheres[i], EPSILON, closestT, spT, spNorm)) {
-                closestT = spT;
-                closestSphere = int(i);
-                closestTri = -1;
-                sphereNormal = spNorm;
+        if (pc.numSpheres > 0u) {
+            for (uint i = 0; i < pc.numSpheres; ++i) {
+                float spT;
+                vec3 spNorm;
+                if (intersectSphere(origin, direction, spheres[i], EPSILON, closestT, spT, spNorm)) {
+                    closestT = spT;
+                    closestSphere = int(i);
+                    closestTri = -1;
+                }
             }
         }
+
+        float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
 
         if (closestTri < 0 && closestSphere < 0) {
             // Miss: Sky / ambient radiance
@@ -154,112 +180,189 @@ void main() {
                 float t = 0.5 * (direction.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
+            skyColor *= invSpp;
 
-            if (ubo.frameIndex == 0u && pc.sppSampleIndex == 0u) {
-                imageStore(uAccumImage, pixelCoord, vec4(skyColor, 1.0));
-            } else {
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(skyColor, 1.0));
-            }
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(skyColor, 0.0));
         } else {
-            // Hit! Extract geometry info
-            vec3 hitPoint = origin + closestT * direction;
-            vec3 normal = vec3(0.0, 1.0, 0.0);
-            vec2 hitUv = vec2(0.0);
-            uint matId = 0;
-            bool frontFace = true;
+            // Hit! Setup SoA state
+            isActive = true;
+            uint pixelIndex = uint(pixelCoord.x + pixelCoord.y * int(pc.width));
 
+            geom.originAndTMin = vec4(origin, EPSILON);
+            geom.dirAndTMax = vec4(direction, closestT);
+
+            uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
             if (closestTri >= 0) {
-                Triangle tri = triangles[closestTri];
-                float u = closestBary.x;
-                float v = closestBary.y;
-                float w = 1.0 - u - v;
-
-                vec3 n0 = tri.v0.normal.xyz;
-                vec3 n1 = tri.v1.normal.xyz;
-                vec3 n2 = tri.v2.normal.xyz;
-                normal = normalize(w * n0 + u * n1 + v * n2);
-
-                vec2 uv0 = vec2(tri.v0.position.w, tri.v0.normal.w);
-                vec2 uv1 = vec2(tri.v1.position.w, tri.v1.normal.w);
-                vec2 uv2 = vec2(tri.v2.position.w, tri.v2.normal.w);
-                hitUv = w * uv0 + u * uv1 + v * uv2;
-                matId = tri.materialId;
-
-                frontFace = dot(direction, normal) < 0.0;
-                normal = frontFace ? normal : -normal;
-
-                Material mat = materials[matId];
-
-                // Tangent frame & Normal mapping
-                if (mat.normalTex > 0u && mat.normalTex <= 64u) {
-                    vec4 tan0 = tri.v0.tangent;
-                    vec4 tan1 = tri.v1.tangent;
-                    vec4 tan2 = tri.v2.tangent;
-                    vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
-                    float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
-
-                    vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
-                    normalMap.xy *= mat.normalScale;
-                    normalMap = normalize(normalMap);
-
-                    geomTan = normalize(geomTan - dot(geomTan, normal) * normal);
-                    vec3 geomBitangent = cross(normal, geomTan) * tanSign;
-                    mat3 tbn = mat3(geomTan, geomBitangent, normal);
-                    normal = normalize(tbn * normalMap);
-                }
-            } else if (closestSphere >= 0) {
-                normal = sphereNormal;
-                matId = spheres[closestSphere].materialId;
-                frontFace = dot(direction, normal) < 0.0;
-                normal = frontFace ? normal : -normal;
-            }
-
-            Material mat = materials[matId];
-
-            vec3 emissiveRad = mat.emissive.rgb;
-            if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
-                emissiveRad *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
-            }
-
-            // If pure emissive light source, add radiance directly and terminate path early
-            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
-                if (ubo.frameIndex == 0u && pc.sppSampleIndex == 0u) {
-                    imageStore(uAccumImage, pixelCoord, vec4(emissiveRad, 1.0));
-                } else {
-                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                    imageStore(uAccumImage, pixelCoord, prev + vec4(emissiveRad, 1.0));
+                hit.hitData = vec4(closestT,
+                                   uintBitsToFloat(uint(closestTri)),
+                                   uintBitsToFloat(packHalf2x16(closestBary)),
+                                   uintBitsToFloat(0u)); // 0: triangle
+                uint matId = triangles[closestTri].materialId;
+                if (matId < pc.numMaterials) {
+                    archetype = getMaterialArchetype(materials[matId]);
                 }
             } else {
-                // Active path for shading micro-kernel (with initial emission if present)
-                isActive = true;
-                uint pixelIndex = uint(pixelCoord.x + pixelCoord.y * int(pc.width));
+                hit.hitData = vec4(closestT,
+                                   uintBitsToFloat(uint(closestSphere)),
+                                   uintBitsToFloat(0u),
+                                   uintBitsToFloat(1u)); // 1: sphere
+                uint matId = spheres[closestSphere].materialId;
+                if (matId < pc.numMaterials) {
+                    archetype = getMaterialArchetype(materials[matId]);
+                }
+            }
 
-                payload.origin = vec4(hitPoint, uintBitsToFloat(1u));
-                payload.direction = vec4(direction, uintBitsToFloat(0u)); // bounce 0
-                payload.throughput = vec4(1.0, 1.0, 1.0, uintBitsToFloat(seed));
-                payload.radiance = vec4(emissiveRad, uintBitsToFloat(pixelIndex));
-                payload.hitNormal = vec4(normal, uintBitsToFloat(matId));
-                payload.hitExtra = vec4(hitUv, closestT, uintBitsToFloat(frontFace ? 1u : 0u));
+            state.throughputSeed = vec4(vec3(invSpp), uintBitsToFloat(seed));
+            state.radiancePixel = vec4(0.0, 0.0, 0.0, uintBitsToFloat(pixelIndex));
+
+            if (pc.sortMode > 0u) {
+                // Technique B: Subgroup Ballot Multi-Queue Partitioning (Zero-Sort)
+                for (uint k = 0u; k < 4u; ++k) {
+                    bool isMatch = (archetype == k);
+                    uvec4 matBallot = subgroupBallot(isMatch);
+                    uint matchCount = subgroupBallotBitCount(matBallot);
+
+                    if (matchCount > 0u) {
+                        uint laneSlot = subgroupBallotExclusiveBitCount(matBallot);
+                        uint waveQueueBase = 0u;
+                        if (subgroupElect()) {
+                            if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
+                            else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
+                            else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.conductorCount, matchCount);
+                            else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
+                        }
+                        waveQueueBase = subgroupBroadcastFirst(waveQueueBase);
+
+                        if (isMatch) {
+                            uint targetIdx = k * pc.maxQueueCapacity + (waveQueueBase + laneSlot);
+                            if (waveQueueBase + laneSlot < pc.maxQueueCapacity) {
+                                outGeoms[targetIdx] = geom;
+                                outHits[targetIdx]  = hit;
+                                outStates[targetIdx] = state;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    // High-performance Wavefront Stream Compaction via Subgroup Ballots
-    uvec4 ballot = subgroupBallot(isActive);
-    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-    uint waveActiveCount = subgroupBallotBitCount(ballot);
+    if (pc.sortMode == 0u) {
+        // Monolithic Stream Compaction via Subgroup Ballots
+        uvec4 ballot = subgroupBallot(isActive);
+        uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+        uint waveActiveCount = subgroupBallotBitCount(ballot);
 
-    uint waveGlobalOffset = 0u;
-    if (subgroupElect()) {
-        waveGlobalOffset = atomicAdd(queueCounters.activeRayCount, waveActiveCount);
+        uint waveGlobalOffset = 0u;
+        if (subgroupElect()) {
+            waveGlobalOffset = atomicAdd(queueCounters.activeRayCount, waveActiveCount);
+        }
+        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+        if (isActive) {
+            uint targetIdx = waveGlobalOffset + laneSlot;
+            if (targetIdx < pc.maxQueueCapacity) {
+                outGeoms[targetIdx] = geom;
+                outHits[targetIdx]  = hit;
+                outStates[targetIdx] = state;
+            }
+        }
     }
-    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
 
-    if (isActive) {
-        uint targetIdx = waveGlobalOffset + laneSlot;
-        if (targetIdx < pc.maxQueueCapacity) {
-            outRays[targetIdx] = payload;
+    // Atomic workgroup retirement to prepare Bounce 0 Shade dispatch directly
+    memoryBarrierBuffer();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint totalWgs = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+        uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
+        if (retired == totalWgs - 1u) {
+            if (pc.sortMode > 0u) {
+                uint diffCnt = queueCounters.diffuseCount;
+                uint dielCnt = queueCounters.dielectricCount;
+                uint condCnt = queueCounters.conductorCount;
+                uint compCnt = queueCounters.complexCount;
+
+                queueCounters.currentMaterialCounts[0] = diffCnt;
+                queueCounters.currentMaterialCounts[1] = dielCnt;
+                queueCounters.currentMaterialCounts[2] = condCnt;
+                queueCounters.currentMaterialCounts[3] = compCnt;
+
+                uint diffGroups = (diffCnt + 31u) / 32u;
+                uint dielGroups = (dielCnt + 31u) / 32u;
+                uint condGroups = (condCnt + 31u) / 32u;
+                uint compGroups = (compCnt + 31u) / 32u;
+
+                // Bounce 0 Shading Commands (Sequence 0..3)
+                indirect.commands[0].x = diffGroups;
+                indirect.commands[0].y = 1u;
+                indirect.commands[0].z = 1u;
+                indirect.commands[0].pad = diffCnt;
+
+                indirect.commands[1].x = dielGroups;
+                indirect.commands[1].y = 1u;
+                indirect.commands[1].z = 1u;
+                indirect.commands[1].pad = dielCnt;
+
+                indirect.commands[2].x = condGroups;
+                indirect.commands[2].y = 1u;
+                indirect.commands[2].z = 1u;
+                indirect.commands[2].pad = condCnt;
+
+                indirect.commands[3].x = compGroups;
+                indirect.commands[3].y = 1u;
+                indirect.commands[3].z = 1u;
+                indirect.commands[3].pad = compCnt;
+
+                dgcStream.commands[0].pipelineIndex = 0u; // Diffuse
+                dgcStream.commands[0].x = diffGroups;
+                dgcStream.commands[0].y = 1u;
+                dgcStream.commands[0].z = 1u;
+
+                dgcStream.commands[1].pipelineIndex = 1u; // Dielectric
+                dgcStream.commands[1].x = dielGroups;
+                dgcStream.commands[1].y = 1u;
+                dgcStream.commands[1].z = 1u;
+
+                dgcStream.commands[2].pipelineIndex = 2u; // Conductor
+                dgcStream.commands[2].x = condGroups;
+                dgcStream.commands[2].y = 1u;
+                dgcStream.commands[2].z = 1u;
+
+                dgcStream.commands[3].pipelineIndex = 3u; // Complex
+                dgcStream.commands[3].x = compGroups;
+                dgcStream.commands[3].y = 1u;
+                dgcStream.commands[3].z = 1u;
+
+                uint totalShadeWgs = diffGroups + dielGroups + condGroups + compGroups;
+                queueCounters.totalShadeWorkgroups = totalShadeWgs;
+
+                if (totalShadeWgs == 0u) {
+                    indirect.commands[4].x = 0u;
+                    indirect.commands[5].x = 0u;
+                }
+
+                queueCounters.diffuseCount = 0u;
+                queueCounters.dielectricCount = 0u;
+                queueCounters.conductorCount = 0u;
+                queueCounters.complexCount = 0u;
+            } else {
+                uint activeCount = queueCounters.activeRayCount;
+                uint shadeGroups = (activeCount + 31u) / 32u;
+                indirect.commands[0].x = shadeGroups;
+                indirect.commands[0].y = 1u;
+                indirect.commands[0].z = 1u;
+                indirect.commands[0].pad = activeCount;
+
+                dgcStream.commands[0].pipelineIndex = 2u; // Shade pipeline
+                dgcStream.commands[0].x = shadeGroups;
+                dgcStream.commands[0].y = 1u;
+                dgcStream.commands[0].z = 1u;
+            }
+
+            queueCounters.currentShadowCount = 0u;
+            queueCounters.nextActiveCount = 0u;
+            queueCounters.shadowRayCount = 0u;
+            queueCounters.retiredWorkgroups = 0u;
         }
     }
 }

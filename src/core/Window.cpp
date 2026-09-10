@@ -171,10 +171,9 @@ Window::Window(const Config& config)
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {
-        if (!config.fullscreen && config.custom_resolution &&
-            std::abs(actualW - static_cast<int>(m_width)) <= 2 &&
-            std::abs(actualH - static_cast<int>(m_height)) <= 2) {
-            // Keep exact pixel resolution if within fractional rounding tolerance
+        if (config.custom_resolution && !config.fullscreen) {
+            m_width = config.width;
+            m_height = config.height;
         } else {
             m_width = static_cast<uint32_t>(actualW);
             m_height = static_cast<uint32_t>(actualH);

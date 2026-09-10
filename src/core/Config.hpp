@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <optional>
+#include <glm/glm.hpp>
 
 namespace pathways {
 
@@ -18,7 +20,21 @@ enum class AccumFormat {
     RGBA32_SFLOAT  // 128-bit Full Float HDR
 };
 
+enum class PipelineType {
+    RTP,       // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+    Wavefront  // Wavefront Path Tracing with Work Lists & DGC
+};
+
+enum class WavefrontSortMode {
+    None,      // Monolithic shade kernel, no material partitioning
+    Archetype, // Technique A & B: Multi-queue wave-ballot partitioning with DGC Execution Sets
+    BDA,       // Technique C: Buffer Device Address queue pointers
+    Dual       // Technique D: 2D Spatial-Morton + Material Dual-Binning
+};
+
 struct Config {
+    PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
+    WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::None; // Default: Monolithic
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -67,9 +83,16 @@ struct Config {
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     uint32_t tile_size = 64;
+    uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
+
+    // Camera view overrides (useful for headless testing & reproducible framing)
+    std::optional<glm::vec3> camera_pos;
+    std::optional<glm::vec3> camera_target;
+    std::optional<glm::vec3> camera_up;
+    std::optional<float> camera_fov;
 
     std::string scene_path = "";
     std::string hdri_path = "";

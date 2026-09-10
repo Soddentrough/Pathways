@@ -179,10 +179,10 @@ static void test_quality_governor_regulation() {
 }
 
 // -----------------------------------------------------------------------------
-// 3b. Fractional SPP Regulation Tests
+// 3b. Model-Predictive SPP Regulation Tests
 // -----------------------------------------------------------------------------
 static void test_fractional_spp_regulation() {
-    std::cout << "[RUN] Testing QualityGovernor continuous fractional SPP regulation..." << std::endl;
+    std::cout << "[RUN] Testing QualityGovernor model-predictive SPP regulation..." << std::endl;
 
     QualityGovernor gov;
     GovernorConfig cfg{};
@@ -199,25 +199,26 @@ static void test_fractional_spp_regulation() {
     assert_near(st0.effectiveSpp, 1.0f, 0.001f, "Initial effective SPP should be 1.0");
     assert_near(st0.fractionalSpp, 0.0f, 0.001f, "Initial fractional SPP should be 0.0");
 
-    // Under-budget frames (e.g. 8.0ms RT on 16.67ms budget -> plenty of headroom)
-    for (int i = 0; i < 20; ++i) {
-        gov.update(8.0f, 0.5f, false, false);
+    // Under-budget frames with ample headroom (e.g. 2.0ms RT on 16.67ms budget)
+    // Run enough frames for governor cooldown cycles to allow progressive SPP upgrades
+    for (int i = 0; i < 40; ++i) {
+        gov.update(2.0f, 0.5f, false, false);
     }
     const auto& stFast = gov.getState();
-    check_true(stFast.effectiveSpp > 1.2f, "Effective SPP should continuously increase when significantly under budget");
-    check_true(stFast.fractionalSpp >= 0.0f && stFast.fractionalSpp < 1.0f, "Fractional SPP must remain in [0, 1)");
-    check_true(stFast.currentSpp == static_cast<uint32_t>(stFast.effectiveSpp), "currentSpp should match floor of effectiveSpp");
+    check_true(stFast.currentSpp >= 2, "Current SPP should upgrade when significantly under budget");
+    check_true(stFast.fractionalSpp == 0.0f, "Fractional SPP must remain 0.0 to prevent SIMD divergence");
+    check_true(stFast.currentSpp == static_cast<uint32_t>(stFast.effectiveSpp), "currentSpp should match effectiveSpp");
 
     // Over-budget frames (e.g. 25.0ms RT on 16.67ms budget -> deficit)
     for (int i = 0; i < 30; ++i) {
         gov.update(25.0f, 0.5f, false, false);
     }
     const auto& stSlow = gov.getState();
-    check_true(stSlow.effectiveSpp <= stFast.effectiveSpp, "Effective SPP should decrease when over budget");
-    check_true(stSlow.effectiveSpp >= 1.0f, "Effective SPP should not drop below minSpp (1.0)");
+    check_true(stSlow.currentSpp <= stFast.currentSpp, "SPP should decrease when over budget");
+    check_true(stSlow.currentSpp >= 1, "SPP should not drop below minSpp (1)");
 
-    std::cout << "[PASS] QualityGovernor continuous fractional SPP verified (effective SPP ramped up to " 
-              << stFast.effectiveSpp << " under 8ms load)." << std::endl;
+    std::cout << "[PASS] QualityGovernor model-predictive SPP verified (SPP ramped up to " 
+              << stFast.currentSpp << " under 2ms load, stepped down cleanly under 25ms load)." << std::endl;
 }
 
 // -----------------------------------------------------------------------------
