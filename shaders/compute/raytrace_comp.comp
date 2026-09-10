@@ -595,11 +595,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         }
 
         // Volumetric Beer-Lambert absorption
-        float thickness = mat.thickness;
-        if (mat.thicknessTex > 0 && mat.thicknessTex <= 64) {
-            thickness *= texture(sceneTextures[mat.thicknessTex - 1], hit.uv).g;
-        }
-        float mediumDist = !hit.frontFace ? hit.t : (thickness > 0.0 ? thickness / max(abs(dot(currentRay.direction, hitNormal)), 0.01) : 0.0);
+        float mediumDist = !hit.frontFace ? hit.t : 0.0;
         if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
             vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
             vec3 transmittance = exp(-sigma_a * mediumDist);
