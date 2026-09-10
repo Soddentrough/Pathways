@@ -11,6 +11,7 @@
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
+#include <array>
 #include <string>
 #include <future>
 #include <thread>

@@ -1,7 +1,9 @@
 The goal is to create a pure Vulkan API based real-time path tracer and renderer engine using leading edge systems and methods such as asynchronous processing (vkCmdExecuteGeneratedCommandsEXT) and device generated commands (VK_EXT_device_generated_commands).
 
+No megakernel, only efficient Device Generated Commands and moden ideas.
+
 The baseline API version is 1.4.341.
-Baseline hardware target is AMD's RDNA4 architecture.
+Baseline hardware target is AMD's RDNA4 architecture (and RDNA3).
 
 # Functions
 
@@ -17,8 +19,12 @@ Baseline hardware target is AMD's RDNA4 architecture.
 
 # Deliverables
 
-The end user should be able to load a scene and 'fly' through it in real time.
-They should notice realistic reflections, refreaction, and shadows.
+Load a glTF scene and allow the user 'fly' through it in real time.
+
+# Requiemts
+
+Vulkan 1.4
+SDL3
 
 # Software and tools
 
@@ -58,6 +64,9 @@ vulkan-loader-1.4.341.0-1.fc44.i686
 mesa-vulkan-drivers-26.1.8-1.fc44.x86_64
 mesa-vulkan-drivers-26.1.8-1.fc44.i686
 
+# Thanks
+
+Additional thanks to MrMPFR
 
 # References
 
