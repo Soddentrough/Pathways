@@ -442,4 +442,128 @@ Pathways currently relies on **glTF 2.0 (`.gltf`, `.glb`)** via `cgltf v1.15` as
   - Ingest and benchmark a multi-gigabyte (>4 GiB) glTF 2.1 model and a production `.usdc` scene.
   - Verify zero GPU memory leaks, sub-8ms frame budget on Dual R9700 GPUs, and clean Vulkan validation pass.
 
+---
+
+## 5. Multi-GPU Load Balancing & Ray Distribution Optimization
+
+- **Status:** Identified in 4K DGC Benchmark Battery / Follow-Up Backlog
+- **Target Hardware:** Dual AMD Radeon AI PRO R9700 (gfx1201 / RDNA 4), Vulkan 1.4
+- **Priority:** Medium-High (Directly unlocks linear 1.9x–2.0x scaling across all complex scene topologies)
+
+---
+
+### 5.1 Empirical Scaling Discrepancy & Problem Statement
+
+In the comprehensive 4K native 80-run benchmark battery conducted on Dual AMD Radeon AI PRO R9700 hardware, multi-GPU scaling exhibited sharp disparities depending on scene topology, material concentration, and ray propagation depth:
+
+| Scene | Single-GPU (Technique D) | Multi-GPU (Technique D) | Speedup | Scaling Efficiency | Bottleneck Profile |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Cornell Box** | 7.53 ms | 3.89 ms | **1.94x** | **97.0%** | Uniform diffuse geometry; symmetric workload |
+| **Cornell Caustic** | 7.28 ms | 4.00 ms | **1.82x** | **91.0%** | Concentrated dielectric; minor tile variance |
+| **Coffee Maker** | 8.44 ms | 3.81 ms | **2.21x** | **110.5%** | Cache-bound single GPU; split working set fits L2/L3 |
+| **Living Room** | 9.33 ms | 5.73 ms | **1.63x** | **81.5%** | Moderate spatial variance in bounce depth |
+| **Classroom** | 12.68 ms | 7.87 ms | **1.61x** | **80.5%** | Moderate occlusion variance across view |
+| **Kitchen Extended** | 13.54 ms | 8.75 ms | **1.55x** | **77.5%** | Severe structural imbalance (dense cabinets vs open counters) |
+| **Dragon Attenuation** | 5.72 ms | 3.83 ms | **1.49x** | **74.5%** | Centered high-bounce glass; sky backdrop terminates early |
+| **Bistro Interior** | 3.16 ms | 2.11 ms | **1.50x** | **75.0%** | Fast frame time; PCIe sync/compositing latency wall |
+
+Three scenes in particular demonstrated sub-80% scaling efficiency: **`Kitchen Extended` (77.5%)**, **`Dragon Attenuation` (74.5%)**, and **`Bistro Interior` (75.0%)**. Analysis reveals three distinct root causes:
+
+1. **Spatial Ray Divergence & Workload Asymmetry (*Kitchen Extended*, *Dragon Attenuation*):**
+   - In static screen-space tile or split-frame distribution (e.g. half-screen or uniform checkerboard), geometric complexity and bounce propagation are rarely uniform across the image.
+   - In *Dragon Attenuation*, the central region contains dense glass transmission with up to 4 refraction/reflection bounces, whereas peripheral tiles immediately hit the environment/skybox and terminate after 1 bounce. If one GPU processes the center and the other the borders, one GPU idles while the other grinds through complex paths.
+   - In *Kitchen Extended*, one half of the viewport features multi-surface metallic reflections and dense cabinet occlusion, while the other features broad diffuse walls and countertops. The busy GPU determines total frame time, creating large synchronization stalls at the inter-GPU composite barrier.
+
+2. **Amdahl's Law & Fixed PCIe Latency Floor (*Bistro Interior*):**
+   - At 4K native, single-GPU execution of *Bistro Interior* is exceptionally fast (3.16 ms, or ~316 FPS).
+   - Multi-GPU compositing incurs fixed overhead: fence signaling, inter-GPU DMA/PCIe transfer of the secondary half-frame or tile buffers (~0.4–0.6 ms), and composite compute pass submission (~0.1 ms).
+   - When total GPU compute drops below 2.5 ms, a 0.5 ms fixed transfer floor accounts for >20% of the entire frame time, mathematically capping maximum scaling at $\approx 1.5\times$.
+
+3. **Wavefront Compaction & Queue Disparity Across GPUs:**
+   - In the wavefront pipeline, rays are sorted into specialized archetype queues (`diffuse`, `dielectric`, `conductor`, `complex`).
+   - If GPU 0 processes 90% dielectric rays and GPU 1 processes 90% diffuse rays, GPU 0 executes 4 indirect bounce dispatches with heavy register usage, while GPU 1 completes early and waits at the Vulkan queue synchronization barrier.
+
+---
+
+### 5.2 Proposed Architecture & Solutions
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│               Dynamic Multi-GPU Workload Optimization                  │
+└────────────────────────────────────────────────────────────────────────┘
+
+    Option A: Fine-Grained Dynamic Work Stealing (Tile Queue)
+    ┌────────────────────────────────────────────────────────────────────┐
+    │ Atomic Tile Queue in Host-Visible / PCIe P2P Memory                │
+    │ [ Tile 0 ] [ Tile 1 ] [ Tile 2 ] ... [ Tile N-1 ] (e.g. 64x64 px)  │
+    └──────────────────┬───────────────────────────────┬─────────────────┘
+                       │ atomicAdd                     │ atomicAdd
+                       ▼                               ▼
+               ┌───────────────┐               ┌───────────────┐
+               │     GPU 0     │               │     GPU 1     │
+               │  Pulls tiles  │               │  Pulls tiles  │
+               │ continuously  │               │ continuously  │
+               └───────────────┘               └───────────────┘
+                       ▲                               ▲
+                       └───────────────┬───────────────┘
+                                       │ Automatically load balances
+                                       │ spatial ray variance!
+
+    Option B: Online Dynamic Split-Boundary Feedback Governor
+    ┌────────────────────────────────────────────────────────────────────┐
+    │ GPU Timestamp Feedback: t(GPU0) vs t(GPU1)                         │
+    │ If t(GPU0) > t(GPU1) + delta: Shift split line X_split -= step     │
+    │ If t(GPU1) > t(GPU0) + delta: Shift split line X_split += step     │
+    └────────────────────────────────────────────────────────────────────┘
+
+    Option C: Sample-Parallel Domain Decomposition (SPP >= 2)
+    ┌────────────────────────────────────────────────────────────────────┐
+    │ Both GPUs render full 4K frame at N/2 SPP (Identical workload!)    │
+    │ Zero spatial imbalance; resolved via fast FP16 accumulator blend   │
+    └────────────────────────────────────────────────────────────────────┘
+```
+
+#### A. Fine-Grained Dynamic Work-Stealing Tile Queue
+- Replace static viewport splits with a pool of $64 \times 64$ or $32 \times 32$ pixel workgroup tiles.
+- Workgroups atomically claim tile indices via an atomic counter located in PCIe peer-to-peer or host-pinned memory (`VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`).
+- The GPU handling simpler regions naturally processes more tiles, while the GPU encountering heavy dielectric ray bounces processes fewer tiles, automatically balancing active compute time to within 2–3% variance.
+
+#### B. Online Adaptive Split-Boundary Feedback
+- For split-frame rendering without dynamic work stealing:
+  - Query hardware execution timestamps (`vkGetQueryPoolResults`) on GPU 0 and GPU 1.
+  - Dynamically slide the split-screen dividing line per frame:
+    $$\Delta X_{\text{split}} = k \cdot (t_{\text{GPU1}} - t_{\text{GPU0}})$$
+  - Shifts screen area away from the overburdened GPU until both GPUs finish ray tracing simultaneously.
+
+#### C. Asymmetric Sample-Parallel Rendering (`MultiGpuMode::SampleParallel`)
+- For interactive rendering when SPP $\ge 2$ (or when paired with the Dynamic Quality Governor):
+  - Each GPU renders the full screen using half the total sample budget (e.g. 1 SPP on GPU 0, 1 SPP on GPU 1).
+  - Because both GPUs traverse identical spatial rays across the entire scene, load imbalance drops to 0.0%.
+  - High-bandwidth P2P blending merges the two FP16 HDR buffers with near 2.0x linear scaling.
+
+#### D. Overlapped Async Transfer & P2P Compositing
+- Double-buffer the inter-GPU transfer staging buffers.
+- Overlap the PCIe transfer of bounce $k-1$ results with the primary ray generation of bounce $k$, hiding the 0.4–0.6 ms transfer latency beneath compute passes.
+
+---
+
+### 5.3 Implementation Roadmap & Action Items
+
+- [ ] **1. Per-GPU Execution Telemetry in ImGui (`src/ui/GuiManager.cpp`, `src/mgpu/MultiGpuManager.cpp`):**
+  - Expose individual GPU 0 and GPU 1 ray tracing timestamps side-by-side in Dear ImGui.
+  - Display real-time workload imbalance metric: $\Delta t_{\text{imbalance}} = |t_{\text{GPU0}} - t_{\text{GPU1}}|$.
+- [ ] **2. Adaptive Split-Boundary Governor (`src/mgpu/MultiGpuManager.cpp`):**
+  - Implement EMA-smoothed split-line adjustment based on previous frame's GPU execution delta.
+  - Evaluate scaling improvement on *Kitchen Extended* and *Dragon Attenuation*.
+- [ ] **3. Atomic Dynamic Tile Dispatcher (`shaders/compute/wavefront_tile_dispatch.comp`):**
+  - Implement a persistent thread workgroup dispatcher that fetches $64 \times 64$ screen tiles from a shared atomic counter.
+  - Measure overhead vs static dispatch.
+- [ ] **4. P2P Direct Transfer Optimization:**
+  - Utilize `VK_KHR_external_memory` / PCIe P2P direct BAR access between the two R9700 cards to eliminate host staging memory copies.
+  - Target composite latency reduction from 0.5 ms to $<0.15\text{ ms}$ for *Bistro Interior*.
+- [ ] **5. Verification & Scaling Benchmark Battery:**
+  - Re-run the 4K native benchmark battery on *Kitchen Extended*, *Dragon Attenuation*, and *Bistro Interior*.
+  - Target: $>1.85\times$ scaling efficiency across all 8 test scenes.
+
+
 
