@@ -745,26 +745,35 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     vkCmdPipelineBarrier2(cmd, &finalDep);
 }
 
-void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces) {
-    if (frameSlot >= 2 || !m_queryPools[frameSlot]) return;
+double WavefrontPipeline::getQueueMemoryFootprintMb() const {
+    double bytes = static_cast<double>(m_maxCapacity) * 624.0 + 256.0 + 4096.0 + 4096.0;
+    return bytes / (1024.0 * 1024.0);
+}
+
+WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces) {
+    WavefrontProfilingData data{};
+    if (frameSlot >= 2 || !m_queryPools[frameSlot]) return data;
+
     uint64_t ts[64] = {0};
     uint32_t endQuery = 3 + maxBounces * 6;
     uint32_t numQueries = endQuery + 1;
+    if (numQueries > 64) numQueries = 64;
+
     VkResult res = vkGetQueryPoolResults(m_device, m_queryPools[frameSlot], 0, numQueries, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
     if (res != VK_SUCCESS) {
-        Logger::warn("WavefrontPipeline::printProfilingBreakdown vkGetQueryPoolResults returned {}", (int)res);
-        return;
+        return data;
     }
 
     auto toMs = [&](uint64_t t1, uint64_t t0) -> double {
         return (t1 > t0) ? (t1 - t0) * timestampPeriodNs * 1e-6 : 0.0;
     };
 
-    double totalMs = toMs(ts[endQuery], ts[0]);
-    double classifyMs = toMs(ts[2], ts[1]);
-
-    Logger::info("    --- Wavefront Sub-Pass GPU Timing Breakdown (Frame Total: {:.3f} ms) ---", totalMs);
-    Logger::info("      [Primary] Classify: {:.3f} ms | Resolve: 0.000 ms (atomic retirement)", classifyMs);
+    data.valid = true;
+    data.totalMs = toMs(ts[endQuery], ts[0]);
+    data.classifyMs = toMs(ts[2], ts[1]);
+    data.resolveMs = 0.0;
+    data.sortMode = m_sortMode;
+    data.queueMemoryFootprintMb = getQueueMemoryFootprintMb();
 
     struct BounceDispatchCPU {
         uint32_t shadeX, shadeY, shadeZ, activeCount;
@@ -785,29 +794,73 @@ void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double times
     const BounceMaterialDispatchCPU* matDispatches = reinterpret_cast<const BounceMaterialDispatchCPU*>(pMapped);
     bool isMaterialMode = (m_shadeDiffusePipeline != VK_NULL_HANDLE && m_sortMode != 0);
 
+    double totalTrafficBytes = 0.0;
+
     for (uint32_t b = 0; b < maxBounces && b < 4; ++b) {
         uint32_t base = 3 + b * 6;
-        double shadeMs = toMs(ts[base + 1], ts[base + 0]);
-        double shadowMs = toMs(ts[base + 3], ts[base + 2]);
-        double intersectMs = (b + 1 < maxBounces) ? toMs(ts[base + 5], ts[base + 4]) : 0.0;
+        BounceProfilingData bp{};
+        bp.bounce = b;
+        bp.shadeMs = toMs(ts[base + 1], ts[base + 0]);
+        bp.shadowMs = toMs(ts[base + 3], ts[base + 2]);
+        bp.intersectMs = (b + 1 < maxBounces) ? toMs(ts[base + 5], ts[base + 4]) : 0.0;
+
         if (isMaterialMode && matDispatches) {
-            uint32_t diff = matDispatches[b].diffCount;
-            uint32_t diel = matDispatches[b].dielCount;
-            uint32_t cond = matDispatches[b].condCount;
-            uint32_t comp = matDispatches[b].compCount;
-            uint32_t shd = matDispatches[b].shadowCount;
-            uint32_t nxt = matDispatches[b].nextCount;
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms (diff: {}, diel: {}, cond: {}, comp: {}) | Shadow: {:.3f} ms ({} rays) | Intersect: {:.3f} ms ({} rays)",
-                         b, shadeMs, diff, diel, cond, comp, shadowMs, shd, intersectMs, nxt);
-        } else {
-            uint32_t act = dispatches ? dispatches[b].activeCount : 0;
-            uint32_t shd = dispatches ? dispatches[b].shadowCount : 0;
-            uint32_t nxt = dispatches ? dispatches[b].nextCount : 0;
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | Shadow: {:.3f} ms ({} rays) | Intersect: {:.3f} ms ({} rays) | Resolve: 0.000 ms",
-                         b, shadeMs, act, shadowMs, shd, intersectMs, nxt);
+            bp.diffCount = matDispatches[b].diffCount;
+            bp.dielCount = matDispatches[b].dielCount;
+            bp.condCount = matDispatches[b].condCount;
+            bp.compCount = matDispatches[b].compCount;
+            bp.activeCount = bp.diffCount + bp.dielCount + bp.condCount + bp.compCount;
+            bp.shadowCount = matDispatches[b].shadowCount;
+            bp.nextCount = matDispatches[b].nextCount;
+        } else if (dispatches) {
+            bp.activeCount = dispatches[b].activeCount;
+            bp.shadowCount = dispatches[b].shadowCount;
+            bp.nextCount = dispatches[b].nextCount;
+            bp.diffCount = bp.activeCount;
         }
+
+        // Memory Traffic Estimation:
+        // Shade reads Geom(32B) + State(32B) + Hit(16B) = 80B
+        // Shade writes Shadow(48B) if shadow ray, NextGeom(32B) + NextState(32B) = 64B if active
+        // Shadow reads Shadow(48B)
+        // Intersect reads Geom(32B) and writes Hit(16B) = 48B
+        double shadeRead = bp.activeCount * 80.0;
+        double shadeWrite = (bp.shadowCount * 48.0) + (bp.nextCount * 64.0);
+        double shadowRead = bp.shadowCount * 48.0;
+        double intersectTraffic = bp.nextCount * 48.0;
+        totalTrafficBytes += (shadeRead + shadeWrite + shadowRead + intersectTraffic);
+
+        data.bounces.push_back(bp);
     }
     if (pMapped) m_indirectArgs->unmap();
+
+    // Primary Classify traffic: writes primary active rays (Geom 32B + State 32B + Hit 16B = 80B)
+    uint32_t primaryRays = (m_width * m_height);
+    totalTrafficBytes += primaryRays * 80.0;
+    data.estimatedVramTrafficMb = totalTrafficBytes / (1024.0 * 1024.0);
+
+    return data;
+}
+
+void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces) {
+    WavefrontProfilingData data = getProfilingData(frameSlot, timestampPeriodNs, maxBounces);
+    if (!data.valid) return;
+
+    Logger::info("    --- Wavefront Sub-Pass GPU Timing Breakdown (Frame Total: {:.3f} ms) ---", data.totalMs);
+    Logger::info("      [Primary] Classify: {:.3f} ms | Resolve: 0.000 ms | VRAM Traffic: {:.1f} MB",
+                 data.classifyMs, data.estimatedVramTrafficMb);
+
+    bool isMaterialMode = (m_shadeDiffusePipeline != VK_NULL_HANDLE && m_sortMode != 0);
+    for (const auto& bp : data.bounces) {
+        if (isMaterialMode) {
+            Logger::info("      [Bounce {}] Shade: {:.3f} ms (diff: {}, diel: {}, cond: {}, comp: {}) | Shadow: {:.3f} ms ({} rays) | Intersect: {:.3f} ms ({} rays)",
+                         bp.bounce, bp.shadeMs, bp.diffCount, bp.dielCount, bp.condCount, bp.compCount,
+                         bp.shadowMs, bp.shadowCount, bp.intersectMs, bp.nextCount);
+        } else {
+            Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | Shadow: {:.3f} ms ({} rays) | Intersect: {:.3f} ms ({} rays) | Resolve: 0.000 ms",
+                         bp.bounce, bp.shadeMs, bp.activeCount, bp.shadowMs, bp.shadowCount, bp.intersectMs, bp.nextCount);
+        }
+    }
 }
 
 } // namespace pathways

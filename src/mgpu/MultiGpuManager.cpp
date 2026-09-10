@@ -1,6 +1,7 @@
 #include "mgpu/MultiGpuManager.hpp"
 #include "core/Logger.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <cstring>

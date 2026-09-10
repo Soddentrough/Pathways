@@ -82,8 +82,9 @@ std::string ImageDumper::generateDefaultTelemetryPath() {
 
 bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& stats) {
     std::filesystem::path p(filepath);
-    if (p.has_parent_path()) {
-        std::filesystem::create_directories(p.parent_path());
+    if (p.has_parent_path() && !p.parent_path().empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(p.parent_path(), ec);
     }
 
     std::ofstream out(filepath);
@@ -254,8 +255,40 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"secondary_gpu_time_ms\": {:.3f},\n", stats.secondary_gpu_time_ms)
         << std::format("      \"tonemap_and_merge_time_ms\": {:.3f},\n", stats.tonemap_time_ms)
         << std::format("      \"pcie_transfer_time_ms\": {:.3f}\n", stats.pcie_transfer_time_ms)
-        << "    },\n"
-        << std::format("    \"total_frames\": {},\n", stats.total_frames)
+        << "    },\n";
+
+    if (stats.wavefront_stats.valid) {
+        out << "    \"wavefront_profiler_breakdown\": {\n"
+            << std::format("      \"total_wavefront_time_ms\": {:.3f},\n", stats.wavefront_stats.total_ms)
+            << std::format("      \"classify_time_ms\": {:.3f},\n", stats.wavefront_stats.classify_ms)
+            << std::format("      \"resolve_time_ms\": {:.3f},\n", stats.wavefront_stats.resolve_ms)
+            << std::format("      \"material_sort_mode\": \"{}\",\n", stats.wavefront_stats.sort_mode_str)
+            << std::format("      \"queue_memory_footprint_mb\": {:.2f},\n", stats.wavefront_stats.queue_memory_footprint_mb)
+            << std::format("      \"estimated_vram_traffic_mb\": {:.2f},\n", stats.wavefront_stats.estimated_vram_traffic_mb)
+            << "      \"bounces\": [\n";
+        for (size_t b = 0; b < stats.wavefront_stats.bounces.size(); ++b) {
+            const auto& bp = stats.wavefront_stats.bounces[b];
+            out << "        {\n"
+                << std::format("          \"bounce\": {},\n", bp.bounce)
+                << std::format("          \"shade_ms\": {:.3f},\n", bp.shade_ms)
+                << std::format("          \"shadow_ms\": {:.3f},\n", bp.shadow_ms)
+                << std::format("          \"intersect_ms\": {:.3f},\n", bp.intersect_ms)
+                << std::format("          \"active_rays\": {},\n", bp.active_rays)
+                << std::format("          \"shadow_rays\": {},\n", bp.shadow_rays)
+                << std::format("          \"next_rays\": {},\n", bp.next_rays)
+                << "          \"materials\": {\n"
+                << std::format("            \"diffuse_rays\": {},\n", bp.diff_rays)
+                << std::format("            \"dielectric_rays\": {},\n", bp.diel_rays)
+                << std::format("            \"conductor_rays\": {},\n", bp.cond_rays)
+                << std::format("            \"complex_rays\": {}\n", bp.comp_rays)
+                << "          }\n"
+                << (b + 1 < stats.wavefront_stats.bounces.size() ? "        },\n" : "        }\n");
+        }
+        out << "      ]\n"
+            << "    },\n";
+    }
+
+    out << std::format("    \"total_frames\": {},\n", stats.total_frames)
         << std::format("    \"total_accumulated_samples\": {},\n", stats.total_samples)
         << std::format("    \"validation_errors\": {},\n", stats.validation_errors)
         << "    \"configurations_breakdown\": [\n";

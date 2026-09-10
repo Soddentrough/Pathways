@@ -5,6 +5,7 @@
 #include "cgltf.h"
 #include "stb_image.h"
 
+#include <algorithm>
 #include <glm/gtc/type_ptr.hpp>
 #include <filesystem>
 #include <cstring>

@@ -131,6 +131,7 @@ private:
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
+    WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;

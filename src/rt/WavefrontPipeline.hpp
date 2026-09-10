@@ -62,7 +62,34 @@ public:
                      uint32_t spp, uint32_t maxBounces,
                      const WavefrontSceneData& sceneData);
 
+    struct BounceProfilingData {
+        uint32_t bounce = 0;
+        double shadeMs = 0.0;
+        double shadowMs = 0.0;
+        double intersectMs = 0.0;
+        uint32_t activeCount = 0;
+        uint32_t shadowCount = 0;
+        uint32_t nextCount = 0;
+        uint32_t diffCount = 0;
+        uint32_t dielCount = 0;
+        uint32_t condCount = 0;
+        uint32_t compCount = 0;
+    };
+
+    struct WavefrontProfilingData {
+        bool valid = false;
+        double totalMs = 0.0;
+        double classifyMs = 0.0;
+        double resolveMs = 0.0;
+        std::vector<BounceProfilingData> bounces;
+        double queueMemoryFootprintMb = 0.0;
+        double estimatedVramTrafficMb = 0.0;
+        uint32_t sortMode = 0;
+    };
+
     void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+    WavefrontProfilingData getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+    double getQueueMemoryFootprintMb() const;
 
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
     DGCManager* getDGCManager() const { return m_dgcManager.get(); }
