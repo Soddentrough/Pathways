@@ -26,8 +26,8 @@ fi
 
 # 2. Build / ensure binaries are up to date (limiting threads for Threadripper 3750X)
 echo ""
-echo "[2/4] Verifying build with ninja (-j8)..."
-ninja -C build -j8
+echo "[2/4] Verifying build with ninja (-j16)..."
+ninja -C build -j16
 
 # Create output directory
 mkdir -p output
@@ -117,9 +117,10 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 150 \
-    --warmup-frames 30 \
+    --frames 100 \
+    --warmup-frames 20 \
     --no-accumulation \
+    --scene scenes/DamagedHelmet.glb \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -129,9 +130,10 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 150 \
-    --warmup-frames 30 \
+    --frames 100 \
+    --warmup-frames 20 \
     --no-accumulation \
+    --scene scenes/DamagedHelmet.glb \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 

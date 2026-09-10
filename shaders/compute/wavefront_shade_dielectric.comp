@@ -190,63 +190,77 @@ void main() {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
-            float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
-            float eta = frontFace ? (1.0 / iorVal) : iorVal;
-            vec3 V = -rayDir;
-            float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);
-            float fresnel = fresnelSchlick(cosTheta, iorVal);
-
-            vec3 nextDirection;
-            vec3 nextOrigin;
-
-            if (randFloat(seed) < fresnel) {
-                // Specular reflection
-                nextDirection = reflect(rayDir, hitNormal);
-                nextOrigin = hitPoint + hitNormal * EPSILON;
-            } else {
-                // Snell's law refraction
-                vec3 refracted = refract(rayDir, hitNormal, eta);
-                if (length(refracted) > 1e-4) {
-                    nextDirection = normalize(refracted);
-                    nextOrigin = hitPoint - hitNormal * EPSILON;
-                } else {
-                    // Total internal reflection (TIR)
-                    nextDirection = reflect(rayDir, hitNormal);
-                    nextOrigin = hitPoint + hitNormal * EPSILON;
-                }
+            vec3 emissive = mat.emissive.rgb;
+            if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
+                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
-            throughput *= baseColor.rgb;
-
-            // Volumetric Beer-Lambert absorption (physical ray traversal distance)
-            float mediumDist = !frontFace ? hitT : 0.0;
-            if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
-                vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
-                throughput *= exp(-sigma_a * mediumDist);
+            if (length(emissive) > 1e-3) {
+                accumRadiance += throughput * emissive;
             }
 
             bool pathTerminated = false;
-            if (bounce + 1u >= pc.maxBounces) {
+            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
                 pathTerminated = true;
-            } else {
-                float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                if (lum < 0.001) {
-                    pathTerminated = true;
-                } else if (bounce >= 1u) {
-                    float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                    float p = clamp(lum, minP, 0.95);
-                    if (randFloat(seed) > p) {
-                        pathTerminated = true;
+            }
+
+            if (!pathTerminated) {
+                float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+                float eta = frontFace ? (1.0 / iorVal) : iorVal;
+                vec3 V = -rayDir;
+                float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);
+                float fresnel = fresnelSchlick(cosTheta, iorVal);
+
+                vec3 nextDirection;
+                vec3 nextOrigin;
+
+                if (randFloat(seed) < fresnel) {
+                    // Specular reflection
+                    nextDirection = reflect(rayDir, hitNormal);
+                    nextOrigin = hitPoint + hitNormal * EPSILON;
+                } else {
+                    // Snell's law refraction
+                    vec3 refracted = refract(rayDir, hitNormal, eta);
+                    if (length(refracted) > 1e-4) {
+                        nextDirection = normalize(refracted);
+                        nextOrigin = hitPoint - hitNormal * EPSILON;
                     } else {
-                        throughput /= p;
+                        // Total internal reflection (TIR)
+                        nextDirection = reflect(rayDir, hitNormal);
+                        nextOrigin = hitPoint + hitNormal * EPSILON;
                     }
                 }
+                throughput *= baseColor.rgb;
 
-                if (!pathTerminated) {
-                    survivesToNext = true;
-                    nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
-                    nextGeom.dirAndTMax = vec4(nextDirection, 10000.0);
-                    nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                    nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                // Volumetric Beer-Lambert absorption (physical ray traversal distance)
+                float mediumDist = !frontFace ? hitT : 0.0;
+                if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
+                    vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+                    throughput *= exp(-sigma_a * mediumDist);
+                }
+
+                if (bounce + 1u >= pc.maxBounces) {
+                    pathTerminated = true;
+                } else {
+                    float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
+                    if (lum < 0.001) {
+                        pathTerminated = true;
+                    } else if (bounce >= 1u) {
+                        float minP = (bounce >= 2u) ? 0.02 : 0.05;
+                        float p = clamp(lum, minP, 0.95);
+                        if (randFloat(seed) > p) {
+                            pathTerminated = true;
+                        } else {
+                            throughput /= p;
+                        }
+                    }
+
+                    if (!pathTerminated) {
+                        survivesToNext = true;
+                        nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
+                        nextGeom.dirAndTMax = vec4(nextDirection, 10000.0);
+                        nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
+                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                    }
                 }
             }
 

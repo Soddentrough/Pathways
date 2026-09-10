@@ -210,6 +210,19 @@ void main() {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
+            vec3 emissive = mat.emissive.rgb;
+            if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
+                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
+            }
+            if (length(emissive) > 1e-3) {
+                accumRadiance += throughput * emissive;
+            }
+
+            bool pathTerminated = false;
+            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
+                pathTerminated = true;
+            }
+
             float roughness = mat.roughness;
             float metallic = mat.metallic;
             if (mat.mrTex > 0u && mat.mrTex <= 64u) {
@@ -230,7 +243,7 @@ void main() {
             bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
 
             // Direct Lighting (1-candidate stochastic NEE for microfacet GGX)
-            if (enableDirect && enableSpecular && pc.numLights > 0u) {
+            if (!pathTerminated && enableDirect && enableSpecular && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
                 if (pc.numLights > 1u) {
@@ -292,7 +305,7 @@ void main() {
                     float misWeight = 1.0;
                     if (uint(light.position.w) == 0u) {
                         float lightPdfEff = lightPdf * lightSelectPdf;
-                        misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + specPdf * specPdf, 1e-6);
+                        misWeight = lightPdfEff / (lightPdfEff + specPdf);
                     }
 
                     vec3 unshadowed = throughput * specBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
@@ -307,10 +320,10 @@ void main() {
             }
 
             // Indirect Bounce: GGX importance sampling
-            bool pathTerminated = false;
-            if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
-                pathTerminated = true;
-            } else {
+            if (!pathTerminated) {
+                if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
+                    pathTerminated = true;
+                } else {
                 vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
                 vec3 nextDirection = reflect(-V, H);
                 vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
@@ -349,14 +362,15 @@ void main() {
                     }
                 }
             }
+        }
 
-            if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
-                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
-            }
+        if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
         }
     }
+}
 
     // Subgroup Wave Ballot Compaction into downstream surviving secondary ray queue
     uvec4 ballot = subgroupBallot(survivesToNext);

@@ -137,7 +137,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
     ${SHADER_DIR}/compute/wavefront_shade_complex.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
-    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss

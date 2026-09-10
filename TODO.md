@@ -219,21 +219,21 @@ For scenes with large light counts ($N \in [10^2, 10^5]$), Pathways will constru
 
 ---
 
-## 3. Meshlets & Virtualized Geometry Pipeline (Cluster DAG & Hybrid RT)
+## 3. Cluster DAG & Virtualized Geometry Ray Traversal (Pure Path Traced Micro-BVH)
 
 - **Status:** Proposed / Long-Term Technical Architecture
-- **Target Hardware:** Dual AMD Radeon AI PRO R9700 (RDNA 4 / gfx1201), Vulkan 1.4 (`VK_EXT_mesh_shader`)
-- **Priority:** High-Yield Architectural Evolution (Enables billion-triangle cinematic CAD/film assets)
+- **Target Hardware:** Dual AMD Radeon AI PRO R9700 (RDNA 4 / gfx1201), Vulkan 1.4 (`VK_KHR_acceleration_structure`, `VK_KHR_ray_query`)
+- **Priority:** High-Yield Architectural Evolution (Enables billion-triangle cinematic CAD/film assets in a pure path tracer)
 
 ### 3.1 Motivation & Problem Statement
 
 Modern offline film assets, digital twins, and photogrammetry models easily exceed tens of millions of triangles. Traditional hardware ray tracing with static monolithic BLAS structures faces fundamental scalability walls:
 
 1. **VRAM Footprint & Build Times:** Monolithic BLAS structures require $\sim 64\text{--}128\text{ bytes}$ per triangle in acceleration structure memory. A 100-million triangle scene consumes 6–12 GB solely for BVH storage, creating extreme memory pressure and stalling GPU scene builds.
-2. **Sub-Pixel Ray Tracing Divergence:** Tracing primary camera rays against dense sub-pixel geometry causes extreme warp/wavefront divergence on RDNA 4 (Wave32), as adjacent rays hit different micro-triangles within the same pixel footprint.
-3. **Absence of Continuous Geometric LOD:** Traditional level-of-detail relies on discrete mesh switches, which produce noticeable silhouette popping, shadow discontinuities, and costly BLAS rebuilds.
+2. **Sub-Pixel Ray Tracing Divergence:** Tracing rays against dense sub-pixel geometry causes extreme warp/wavefront divergence on RDNA 4 (Wave32), as adjacent rays traverse deep monolithic BVH hierarchies with inconsistent leaf sizes.
+3. **Absence of Continuous Geometric LOD:** Traditional level-of-detail relies on discrete mesh switches, which produce noticeable silhouette popping, shadow discontinuities, and costly full-BLAS rebuilds.
 
-By adopting **Meshlets (Cluster DAGs)** and pairing **Virtualized Geometry** with **Hybrid Hardware Ray Tracing**, Pathways can achieve seamless continuous LOD with sub-pixel fidelity and bounded BVH memory overhead.
+By adopting a **Pure Path-Traced Cluster DAG Architecture** with **Dynamic Micro-BVH Allocation**, Pathways preserves its 100% path-traced foundation across all camera and indirect bounces while achieving continuous LOD, sub-pixel fidelity, and bounded BVH memory overhead without rasterization or screen-space compromises.
 
 ---
 
@@ -249,28 +249,26 @@ By adopting **Meshlets (Cluster DAGs)** and pairing **Virtualized Geometry** wit
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                   GPU Cluster Culling & LOD Selection Pass             │
-│   - Compute / Task Shader evaluates active DAG frontier per frame:     │
-│       * Frustum culling (6 camera planes)                              │
-│       * Backface cone culling (dot(viewDir, coneAxis) > coneAngle)     │
-│       * Screen-space error metric: project(error_world) < 1.0 pixel    │
-│       * Two-Phase Occlusion Culling via previous frame's Hi-Z Pyramid  │
+│             GPU Cluster Continuous LOD Selection & Compaction          │
+│   - Compute Shader evaluates active DAG frontier per frame:            │
+│       * Ray footprint & projected geometric error metric               │
+│       * Continuous LOD transition blending without crack artifacts     │
+│       * Hierarchical cluster frustum & backface bounding-cone culling  │
 │   - Surviving clusters compacted via Vulkan 1.4 DGC token stream       │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
 ┌───────────────────────────────────┴────────────────────────────────────┐
-│                    Hybrid Dual-Path Geometry Pipeline                  │
+│              Pure Path Traced Acceleration Hierarchy                   │
 ├───────────────────────────────────────┬────────────────────────────────┤
-│    PRIMARY RAYS: Raster / Mesh Shader │   SECONDARY / INDIRECT RAYS:   │
-│         (VK_EXT_mesh_shader)          │    Hardware RT (VK_KHR_rt)     │
+│    PRIMARY & SPECULAR RAYS:           │   DIFFUSE & SHADOW RAYS:       │
+│    Active Cluster Micro-BVH (Fast)    │   Coarse Proxy Cluster BLAS    │
 ├───────────────────────────────────────┼────────────────────────────────┤
-│ - Sub-pixel rasterization of active   │ - Dynamic Micro-BLAS built for │
-│   LOD meshlet clusters                │   active cluster LODs (fast)   │
-│ - Zero ray traversal divergence       │ - Coarse proxy BLAS for        │
-│ - Outputs high-precision G-Buffer:    │   distant GI / reflections     │
-│   HitPoint, Normal, Material, Depth   │ - Evaluates indirect diffuse,  │
-│ - Direct feeding into ReSTIR DI       │   specular, and shadow rays    │
+│ - Dynamic Micro-BLAS built for active │ - Compact fixed-LOD proxy BLAS │
+│   fine-LOD clusters (linear scratch)  │   for incoherent secondary GI  │
+│ - Hardware ray queries / RTP traversal│ - Drastically cuts traversal   │
+│ - 100% physically correct primary hits│   divergence on secondary rays │
+│ - Direct input to ReSTIR DI reservoirs│ - Evaluates MIS NEE & shadows  │
 └───────────────────────────────────────┴────────────────────────────────┘
 ```
 
@@ -283,18 +281,17 @@ By adopting **Meshlets (Cluster DAGs)** and pairing **Virtualized Geometry** wit
   3. Recursion continues until the root cluster is formed.
   4. Each cluster stores an error sphere $(c, r)$ and bounding cone $(\mathbf{a}, \theta)$ ensuring crack-free boundary matching between adjacent LODs.
 
-#### B. Two-Phase GPU Culling with Hi-Z
-To eliminate invisible geometry prior to rendering:
-- **Phase 1 (Conservative Visibility):** Cull clusters against previous frame's Hierarchical-Z (Hi-Z) pyramid. Visible clusters are dispatched immediately.
-- **Phase 2 (Depth Verification):** Once Phase 1 renders new depth, clusters previously marked occluded are re-tested against the new Hi-Z. Newly disoccluded clusters are rendered in a secondary pass.
+#### B. GPU Continuous LOD Selection Pass
+To eliminate unneeded geometry and preserve uniform ray traversal depth:
+- Compute shaders evaluate the cluster DAG frontier against camera view parameters and ray footprints.
+- Active LOD clusters are compacted into dynamic linear GPU buffers via device-generated commands, ensuring only visible, perceptually necessary detail is built into the acceleration hierarchy.
 
-#### C. Hybrid Virtualized Geometry + Hardware Ray Tracing
-To bridge meshlets with hardware ray tracing:
-1. **Primary Ray Optimization:** Primary camera visibility is evaluated via **Mesh Shaders (`VK_EXT_mesh_shader`)** directly writing into the primary G-buffer (position, normal, depth, material). This circumvents primary ray BVH traversal overhead and resolves sub-pixel geometry without aliasing.
-2. **ReSTIR DI Integration:** The ReSTIR DI temporal and spatial resampling passes consume the high-precision G-buffer directly, utilizing the packed geometry format in `ReservoirGPU.pad`.
-3. **Secondary Ray Acceleration:**
-   - **Dynamic Cluster BLAS:** For reflections and GI, active cluster subsets are packed into localized micro-BLAS instances built with `VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR`.
-   - **Coarse Proxy BLAS:** Distant geometry uses a compact fixed-LOD proxy BLAS for ray tracing queries, reducing total BVH memory by over $80\%$.
+#### C. Pure Path Traced Cluster BVH Traversal
+Preserving Pathways' pure path tracer principles:
+1. **No Rasterization or Screen-Space Buffers:** All primary camera visibility, secondary bounces, and shadows are resolved exclusively via pure ray tracing (`VK_KHR_ray_query` and hardware ray tracing pipelines).
+2. **Dynamic Cluster BLAS:** Active cluster subsets are packed into localized micro-BLAS instances built per frame with `VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR` using linear GPU scratch memory.
+3. **Coarse Proxy BLAS:** Incoherent diffuse and distant GI rays traverse a compact, simplified cluster proxy BLAS, reducing BVH memory footprint by over $80\%$ without visual divergence.
+4. **ReSTIR DI Integration:** Direct lighting candidates and temporal/spatial resampling operate directly on ray-hit surfaces and surface interactions.
 
 ---
 
@@ -303,20 +300,18 @@ To bridge meshlets with hardware ray tracing:
 - [ ] **1. Meshlet Pre-Processing Pipeline (`tools/meshlet_converter` / `third_party/meshoptimizer`):**
   - Integrate cluster decomposition: vertex cache optimization, cluster splitting, cone normal computation.
   - Implement Quadric Error Metric (QEM) simplification for multi-level cluster DAG generation.
-- [ ] **2. Vulkan Mesh Shader Pipeline (`shaders/mesh/` & `vulkan/MeshletPipeline.cpp`):**
-  - Enable `VK_EXT_mesh_shader` extension on AMD Radeon AI PRO R9700.
-  - Implement Task Shader (`.task`) for cluster-level frustum, backface cone, and projected error culling.
-  - Implement Mesh Shader (`.mesh`) for Wave32 vertex/primitive emission into framebuffer attachments.
-- [ ] **3. Hierarchical-Z Pyramid Generator (`shaders/compute/hiz_generate.comp`):**
-  - Parallel depth downsampling compute shader creating min-depth mipmaps for occlusion culling.
-- [ ] **4. Virtualized Geometry G-Buffer Integration with Pathways Core:**
-  - Connect mesh shader G-buffer output directly to ReSTIR DI reservoir allocation.
-- [ ] **5. Dynamic Cluster BLAS Builder for Hardware Ray Tracing:**
-  - Allocate linear GPU scratch pool for fast per-frame micro-BLAS instantiation.
-  - Support hybrid ray tracing with `VK_KHR_ray_query` in compute shaders for indirect bounce calculations.
-- [ ] **6. Benchmarking & Validation:**
+- [ ] **2. GPU Cluster Selection Compute Shader (`shaders/compute/cluster_select.comp`):**
+  - Implement continuous LOD selection, projected error evaluation, and cluster compaction.
+  - Generate DGC indirect dispatch tokens for BVH building and ray traversal.
+- [ ] **3. Dynamic Micro-BLAS Acceleration Structure Builder:**
+  - Allocate linear GPU scratch pool for fast per-frame micro-BLAS instantiation with Vulkan 1.4 acceleration structures.
+  - Streamline TLAS updates referencing active cluster BLAS instances.
+- [ ] **4. Dual-Scale BVH Traversal in Megakernel & Wavefront Pipelines:**
+  - Integrate cluster micro-BVH ray queries for primary and coherent secondary rays.
+  - Integrate coarse proxy traversal for incoherent multi-bounce diffuse GI.
+- [ ] **5. Benchmarking & Validation:**
   - Benchmark on multi-million polygon datasets (e.g. Stanford Lucy, high-detail CAD scans).
-  - Verify sustained sub-8ms 120 FPS performance on Dual R9700 hardware.
+  - Verify sustained 60+ FPS performance on Dual R9700 hardware under 100% path tracing.
 
 ---
 

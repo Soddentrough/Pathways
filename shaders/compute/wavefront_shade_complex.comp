@@ -346,7 +346,7 @@ void main() {
                             float misWeight = 1.0;
                             if (uint(light.position.w) == 0u) {
                                 float lightPdfEff = lightPdf * lightSelectPdf;
-                                misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + bsdfPdf * bsdfPdf, 1e-6);
+                                misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                             }
 
                             vec3 H = normalize(V + lightDir);

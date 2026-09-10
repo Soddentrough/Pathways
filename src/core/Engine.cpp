@@ -1090,7 +1090,6 @@ void Engine::initPipelines() {
     auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
     auto wfShadeCode = loadShaderSPIRV("wavefront_shade.comp.spv");
     auto wfShadowCode = loadShaderSPIRV("wavefront_shadow.comp.spv");
-    auto wfResolveCode = loadShaderSPIRV("wavefront_resolve.comp.spv");
     auto wfShadeDiffuseCode = loadShaderSPIRV("wavefront_shade_diffuse.comp.spv");
     auto wfShadeDielectricCode = loadShaderSPIRV("wavefront_shade_dielectric.comp.spv");
     auto wfShadeConductorCode = loadShaderSPIRV("wavefront_shade_conductor.comp.spv");
@@ -1100,7 +1099,7 @@ void Engine::initPipelines() {
         device, allocator,
         m_config.width, m_config.height,
         m_config.wavefront_tile_size,
-        wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode, wfResolveCode,
+        wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
@@ -2364,10 +2363,12 @@ void Engine::renderFrame() {
 
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
         if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
-            m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
-            static int wfProfCount = 0;
-            if ((m_config.benchmark && (++wfProfCount == 10)) || getenv("PATHWAYS_PROFILE_WF")) {
-                m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+            if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
+                m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                static int wfProfCount = 0;
+                if ((m_config.benchmark && (++wfProfCount == 10)) || getenv("PATHWAYS_PROFILE_WF")) {
+                    m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                }
             }
         }
 
@@ -3642,8 +3643,9 @@ void Engine::dumpOutputFiles() {
         }
     }
 
-    if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
-        m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+    if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
+        uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
+        m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
     }
 
     // 1. Dump LDR PNG
