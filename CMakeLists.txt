@@ -337,8 +337,9 @@ target_include_directories(test_pipeline_comparison PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${THIRD_PARTY_DIR}/glm
 )
+target_link_libraries(test_pipeline_comparison PRIVATE Threads::Threads ZLIB::ZLIB)
 if(UNIX)
-    target_link_libraries(test_pipeline_comparison PRIVATE m Threads::Threads ZLIB::ZLIB)
+    target_link_libraries(test_pipeline_comparison PRIVATE m)
 endif()
 add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
 
