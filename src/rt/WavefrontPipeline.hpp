@@ -22,10 +22,14 @@ struct WavefrontSceneData {
     uint32_t useMorton = 1;
     uint32_t accumulateHistory = 1;
     uint32_t sortMode = 0; // 0: None, 1: Archetype, 2: BDA, 3: Dual
+    uint32_t numOpaqueTriangles = 0;
+    uint32_t secondarySortMode = 0; // 0: None, 1: Directional DGC, 2: Spatial Index
 };
 
 class WavefrontPipeline {
 public:
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
+
     WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                       uint32_t width, uint32_t height,
                       uint32_t tileSize,
@@ -36,7 +40,10 @@ public:
                       const std::vector<char>& shadeDiffuseCode = {},
                       const std::vector<char>& shadeDielectricCode = {},
                       const std::vector<char>& shadeConductorCode = {},
-                      const std::vector<char>& shadeComplexCode = {});
+                      const std::vector<char>& shadeComplexCode = {},
+                      const std::vector<char>& shadeEmissiveCode = {},
+                      const std::vector<char>& shadePassthroughCode = {},
+                      const std::vector<char>& raySortCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -73,6 +80,8 @@ public:
         uint32_t dielCount = 0;
         uint32_t condCount = 0;
         uint32_t compCount = 0;
+        uint32_t emisCount = 0;
+        uint32_t passCount = 0;
     };
 
     struct WavefrontProfilingData {
@@ -84,6 +93,7 @@ public:
         double queueMemoryFootprintMb = 0.0;
         double estimatedVramTrafficMb = 0.0;
         uint32_t sortMode = 0;
+        uint32_t secondarySortMode = 0;
     };
 
     void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
@@ -92,6 +102,7 @@ public:
 
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
     DGCManager* getDGCManager() const { return m_dgcManager.get(); }
+    bool supportsExecutionSet() const { return m_supportsExecutionSet; }
 
 private:
     void createDescriptorLayout();
@@ -105,7 +116,10 @@ private:
                          const std::vector<char>& shadeDiffuseCode,
                          const std::vector<char>& shadeDielectricCode,
                          const std::vector<char>& shadeConductorCode,
-                         const std::vector<char>& shadeComplexCode);
+                         const std::vector<char>& shadeComplexCode,
+                         const std::vector<char>& shadeEmissiveCode,
+                         const std::vector<char>& shadePassthroughCode,
+                         const std::vector<char>& raySortCode);
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -117,6 +131,8 @@ private:
     uint32_t m_tileSize = 256;
     uint32_t m_maxCapacity = 0;
     uint32_t m_sortMode = 0;
+    uint32_t m_secondarySortMode = 0;
+    bool m_supportsExecutionSet = false;
 
     // Ray Work Queues & Counter SSBOs (SoA Layout)
     std::unique_ptr<Buffer> m_rayGeomQueueA;  // 32B RayGeometry
@@ -124,7 +140,9 @@ private:
     std::unique_ptr<Buffer> m_rayStateQueueA; // 32B RayState
     std::unique_ptr<Buffer> m_rayStateQueueB; // 32B RayState
     std::unique_ptr<Buffer> m_rayHitQueue;    // 16B RayHit
-    std::unique_ptr<Buffer> m_shadowQueue;    // 48B PackedShadowRay
+    std::unique_ptr<Buffer> m_materialIndexQueue; // 4B index * 4 archetypes (Index-Based Material Queues)
+    std::unique_ptr<Buffer> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
+    std::unique_ptr<Buffer> m_shadowQueue;    // 32B PackedShadowRay
     std::unique_ptr<Buffer> m_queueCounters;
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs; // Double-buffered per in-flight frame slot
     std::unique_ptr<Buffer> m_dgcStream;
@@ -145,6 +163,9 @@ private:
     VkPipeline m_shadeDielectricPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeConductorPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
+    VkPipeline m_raySortPipeline = VK_NULL_HANDLE;
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };

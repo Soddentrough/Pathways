@@ -37,7 +37,7 @@ int main() {
         // Default pipeline configuration
         Config cfgDef;
         check_true(cfgDef.pipeline_type == PipelineType::Wavefront, "Default pipeline is Wavefront");
-        check_true(cfgDef.wavefront_sort_mode == WavefrontSortMode::None, "Default sort mode is None");
+        check_true(cfgDef.wavefront_sort_mode == WavefrontSortMode::Dual, "Default sort mode is Dual");
 
         // Explicit --pipeline rtp
         const char* argv1[] = { "pathways", "--pipeline", "rtp" };

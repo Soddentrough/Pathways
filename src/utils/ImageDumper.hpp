@@ -142,6 +142,8 @@ struct FrameStats {
         uint32_t diel_rays = 0;
         uint32_t cond_rays = 0;
         uint32_t comp_rays = 0;
+        uint32_t emis_rays = 0;
+        uint32_t pass_rays = 0;
     };
 
     struct WavefrontProfilingStats {
@@ -153,6 +155,7 @@ struct FrameStats {
         double queue_memory_footprint_mb = 0.0;
         double estimated_vram_traffic_mb = 0.0;
         std::string sort_mode_str = "none";
+        std::string secondary_sort_mode_str = "none";
     };
     WavefrontProfilingStats wavefront_stats;
 

@@ -4,6 +4,7 @@ Name=Pathways
 GenericName=Vulkan Path Tracer
 Comment=Pure Vulkan 1.4 Real-Time Path Tracer with Multi-GPU & Hardware RT
 Exec=pathways
+Icon=pathways
 Terminal=false
 Categories=Graphics;3DGraphics;Science;
 Keywords=vulkan;raytracing;pathtracing;rdna4;gpu;

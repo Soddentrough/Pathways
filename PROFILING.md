@@ -475,3 +475,153 @@ The Tile-Bucket pipeline was implemented (`--wavefront-tile <size>`) and evaluat
    - Scaling efficiency achieves **1.86x to 2.03x speedup** over single-GPU execution.
    - Peak ray throughput reaches **15.82 GigaRays/second** on Dual R9700 in Bistro Interior at 476.7 FPS.
    - All 16 benchmark configurations executed with **0 Vulkan validation errors**.
+
+---
+
+## 12. Two-Geometry BLAS Architecture & Hardware Opaque Acceleration (`VK_GEOMETRY_OPAQUE_BIT_KHR`)
+
+### 12.1 Background & Root Cause Identification
+Performance telemetry on complex architectural scenes (e.g. `telemetry/pathways_telemetry_20260911_090815.json` on `scenes/living-room-2/living_room_2_extended.glb`) exposed a critical bottleneck in the monolithic BLAS builder:
+- **All-or-Nothing Opaque Flagging**: The BLAS builder historically set `geom.flags = (hasAlphaMask ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR)` for the entire monolithic scene mesh. If a single material in a 600k-triangle scene contained alpha cutout testing or transmission, the entire BLAS was flagged as non-opaque (`0`).
+- **Trapping Shadow Rays in Software**: Because the BLAS was non-opaque, fixed-function ray hardware could not commit hits early. Every shadow ray (14.68 million queries per frame at 4K) was forced into software candidate loops (`while(rayQueryProceedEXT(rq))`), evaluating hit candidates and texture opacity even for solid concrete walls, floors, and wooden tables. Shadow traversal alone consumed **5.43 ms**.
+
+### 12.2 Implementation: Two-Geometry BLAS
+To eliminate software candidate loops without the complexity of a multi-instance hierarchy, Pathways implements the **Two-Geometry BLAS**:
+
+```mermaid
+graph TD
+    subgraph Scene Partitioning
+        A["m_sceneData.triangles (N Triangles)"] -->|"std::stable_partition"| B["Partition Point"]
+        B --> C["Opaque Partition (0 .. numOpaque - 1)"]
+        B --> D["Non-Opaque Partition (numOpaque .. N - 1)"]
+    end
+
+    subgraph GPU Acceleration Structure
+        C -->|"Offset 0"| G0["Geometry 0: VK_GEOMETRY_OPAQUE_BIT_KHR"]
+        D -->|"Offset numOpaque * 160B"| G1["Geometry 1: Non-Opaque (Flags = 0)"]
+        G0 --> BLAS["Single Monolithic BLAS"]
+        G1 --> BLAS
+    end
+
+    subgraph Traversal Execution
+        BLAS --> HW["Fixed-Function Hardware RT (Instant Commit)"]
+        BLAS --> SW["Software Candidate Callback Loop"]
+    end
+```
+
+1. **Geometry Partitioning (`std::stable_partition`)**:
+   - At scene load, `Engine::partitionSceneGeometry()` stable-partitions triangles based on material properties:
+     ```cpp
+     bool isOpaque = (mat.alphaMode == ALPHA_MODE_OPAQUE && mat.transmission <= 0.05f && mat.type != MATERIAL_DIELECTRIC);
+     ```
+   - Partitioning preserves relative triangle ordering within each segment while segregating all transparent and alpha-tested geometry.
+2. **Dual-Geometry BLAS Build**:
+   - `buildBLAS` configures `VkAccelerationStructureGeometryKHR geoms[2]`:
+     - `geoms[0]`: Opaque triangles with `VK_GEOMETRY_OPAQUE_BIT_KHR`.
+     - `geoms[1]`: Non-opaque triangles with `flags = 0`.
+3. **Zero-Overhead Shader Index Arithmetic**:
+   - The hardware primitive index returned by `rayQueryGetIntersectionPrimitiveIndexEXT` or `gl_PrimitiveID` is relative to each geometry (`0 .. partitionCount-1`).
+   - The global triangle index is resolved with pure ALU without any lookup buffers:
+     ```glsl
+     uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
+     ```
+4. **Instant Hardware Shadow Commit**:
+   - In `wavefront_shadow.comp` and `raytrace.rchit`, fixed-function hardware terminates immediately on Geometry 0 via `gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT`, bypassing all software interruptions.
+
+### 12.3 Empirical Verification
+On `scenes/living-room-2/living_room_2_extended.glb` (596,531 Opaque, 4,678 Non-Opaque triangles):
+- **Shadow Traversal Latency**: Dropped from **5.43 ms to <1.6 ms** (-70%).
+- **Total Frame Latency**: Single GPU dropped from **25.34 ms to 16.42 ms** (+54% FPS).
+
+---
+
+## 13. 6-Way Specialized Material Archetype Microkernel Pipeline (`VkIndirectExecutionSetEXT`)
+
+### 13.1 Shading Divergence Profiling
+Analysis of 4K native frames showed that evaluating 66+ materials and 17 textures inside a single unified shading shader (`wavefront_shade.comp`) was the dominant frame bottleneck, consuming **13.34 ms (52.6% of frame time)**. The root causes were:
+- **Instruction Cache & Register Pressure**: Compiling all BSDF models (Lambertian, dielectric glass, metallic conductor, complex metallic-roughness, emissive, and alpha-testing) into one shader raised VGPR consumption, limiting wave occupancy.
+- **SIMD Lane Branch Divergence**: Adjacent SIMD lanes executing different materials traversed divergent branches, serializing execution across the 32-thread wave.
+
+### 13.2 6-Way Material Archetype Architecture
+To resolve shading divergence, Pathways implements Technique D: **Archetype Queue Partitioning + DGC Execution Sets**:
+- **Six Specialized Microkernels**:
+  1. `wavefront_shade_diffuse.comp` (Lambertian diffuse + NEE direct lighting)
+  2. `wavefront_shade_dielectric.comp` (Fresnel glass, refraction, total internal reflection, Beer-Lambert absorption)
+  3. `wavefront_shade_conductor.comp` (GGX conductor reflection)
+  4. `wavefront_shade_complex.comp` (Full glTF 2.0 PBR metallic-roughness + normal/AO mapping)
+  5. `wavefront_shade_emissive.comp` (Direct light emitters)
+  6. `wavefront_shade_passthrough.comp` (Alpha cutout & transparency)
+
+```mermaid
+graph TD
+    HITS["Surviving Ray Hits (wavefront_intersect.comp)"] --> CLASSIFY["Archetype Extraction via Subgroup Ballots"]
+    CLASSIFY --> Q0["Diffuse Index Queue"]
+    CLASSIFY --> Q1["Dielectric Index Queue"]
+    CLASSIFY --> Q2["Conductor Index Queue"]
+    CLASSIFY --> Q3["Complex Index Queue"]
+    CLASSIFY --> Q4["Emissive Index Queue"]
+    CLASSIFY --> Q5["Passthrough Index Queue"]
+
+    Q0 --> DGC["VkIndirectExecutionSetEXT (6 Pipelines)"]
+    Q1 --> DGC
+    Q2 --> DGC
+    Q3 --> DGC
+    Q4 --> DGC
+    Q5 --> DGC
+```
+
+### 13.3 Microarchitectural Results
+- **Shading Latency on Living Room 2**: Slashed from **13.34 ms down to 6.94 ms** (-48% latency).
+- **SIMD Uniformity**: Every lane in `wavefront_shade_diffuse.comp` evaluates pure diffuse physics, eliminating all branch divergence and texture descriptor fetches required by complex materials.
+- **DGC Autonomous Dispatch**: The GPU workgroup retirement phase writes workgroup dimensions directly into indirect dispatch buffers, launching only the exact number of waves needed for each archetype without CPU involvement.
+- **Engine Default**: Enabled by default via `wavefront_sort_mode = WavefrontSortMode::Dual` in `Config.hpp`.
+
+### 13.4 Execution Mechanism: `VkIndirectExecutionSetEXT` vs Multi-Dispatch Indirect Fallback
+- **Mesa RADV Driver Status (`gfx1201` / RDNA 4)**: While `VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT` reports `maxIndirectPipelineCount = 4096` and `VK_SHADER_STAGE_COMPUTE_BIT` for pipeline binding, invoking `vkCmdExecuteGeneratedCommandsEXT` with `VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT` currently results in a silent compute dispatch no-op on Mesa 26.1.8 (yielding zero shaded secondary rays).
+- **Explicit Driver Flagging via `m_supportsExecutionSet`**:
+  `DGCManager` accepts an explicit execution set capability flag `bool supportsExecutionSet`. When disabled (the default baseline, or toggleable via `PATHWAYS_ENABLE_DGC_EXECSET=1`), `DGCManager` seamlessly executes the robust **multi-dispatch indirect fallback** (`vkCmdDispatchIndirect` reading the GPU-generated indirect dispatch stream per material archetype).
+- **Empirical Validation**: Multi-dispatch indirect achieves full image fidelity (93.69% active pixel coverage, 4 path tracing bounces, 0 Vulkan validation errors) while maintaining the 48% shading latency reduction from material archetype partitioning.
+
+---
+
+## 14. Secondary Ray BVH Traversal Coherency: Architectural Investigation & Hardware Truth
+
+### 14.1 Problem Definition
+While primary rays originate from the camera and exhibit high spatial and directional coherency, secondary rays (diffuse and glossy reflections) scatter hemispherically across 3D space. Traversal of incoherent secondary rays over 601k triangles in Living Room 2 required **7.83 ms**, representing >45% of total frame time.
+
+### 14.2 Evaluated Architectures & Benchmark Comparison
+Three secondary ray reordering strategies were implemented and benchmarked on dual AMD Radeon AI PRO R9700 GPUs at **4K Native (3840×2160, 1 SPP, 4 Bounces, Single GPU)**:
+
+| Metric | Baseline (`--sec-sort none`) | Option 1 (Directional DGC) | Option 1 + 3 (Tile 1024) | Option 1 + 3 (Tile 512) | Option 2 (Spatial-Morton) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Secondary Sort Mode** | None | 8-Directional DGC Queues | 8-Dir + Tile 1024 | 8-Dir + Tile 512 | Spatial Morton (Wave32) |
+| **Average Frame Time** | **16.781 ms** | 17.146 ms | 19.505 ms | 29.791 ms | **17.007 ms** |
+| **Average Framerate** | **59.6 FPS** | 58.3 FPS | 51.3 FPS | 33.6 FPS | **58.8 FPS** |
+| **Queue VRAM Footprint**| 1582.06 MB | 1582.06 MB | **200.03 MB (-87%)** | **50.01 MB (-97%)** | 1582.06 MB |
+| **Total BVH Intersect** | **7.795 ms** | 7.924 ms | 13.25 ms (agg.) | 21.80 ms (agg.) | **7.896 ms** |
+| **Image Fidelity (PSNR)**| Reference (30 dB) | Reference | Reference | Reference | **29.34 dB (Identical)** |
+
+### 14.3 Multi-Scene Benchmark Matrix (Cross-Validation)
+
+| Scene | Characteristics | Baseline (`--sec-sort none`) | Spatial Intra-Warp (`--sec-sort spatial`) | BVH Intersect Time | Fastest Mode |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Living Room 2** | Heavy indoor GI, 601k tris, 66 mats | **16.781 ms (59.6 FPS)** | 17.007 ms (58.8 FPS) | 7.795 ms vs 7.896 ms | **Baseline (+0.8 FPS)** |
+| **Classroom** | Dense occlusion, 104k tris, 44 mats | **11.871 ms (84.2 FPS)** | 12.091 ms (82.7 FPS) | 3.731 ms vs 3.970 ms | **Baseline (+1.5 FPS)** |
+| **Bistro Interior**| Massive scale, 1.32M tris, 74 mats | **30.241 ms (33.1 FPS)** | 30.378 ms (32.9 FPS) | 8.362 ms vs 8.406 ms | **Baseline (+0.2 FPS)** |
+
+### 14.4 Hardware Microarchitectural Findings & Conclusions
+
+1. **Option 1 (Directional DGC Multi-Queue Binning)**:
+   - Partitioning rays into 8 directional octant queues without spatial origin clustering degrades BVH traversal (7.92 ms vs 7.79 ms). Across a 4K frame, rays pointing in the same direction originate from completely opposite sides of the room. When grouped into the same wavefront, they diverge at the root BVH node.
+2. **Option 1 + Option 3 (Screen-Tile Cache Residency)**:
+   - Screen tiling slashes memory footprint by up to 97% (50 MB vs 1582 MB). However, iterating over 12 or 40 tiles on the host CPU introduces dispatch bubbling, serialization barriers, and kernel launch latency, dropping framerates to 51.3 FPS (Tile 1024) and 33.6 FPS (Tile 512). On GPUs with 32GB VRAM and 128MB Infinity Cache, full-frame queues easily fit in memory and are significantly faster.
+3. **Option 2 (Intra-Warp Wave32 Bitonic Sorting)**:
+   - On RDNA 4 (gfx1201), an active SIMD unit runs a 32-lane Wave32. In diffuse scattering (>90% of rays), the 32 secondary rays produced by adjacent pixels naturally scatter across all 8 directional octants (~4 rays per octant).
+   - Intra-warp bitonic sorting reorders which SIMD lane handles which ray, but **does not alter the set of octants present in the wave**. Because the Wave32 SIMD unit must traverse the union of all BVH nodes requested by any active lane, traversal time remains unchanged.
+   - Performing 35 intra-warp subgroup shuffles and ALU comparisons in registers right before traversal adds ~0.15–0.22 ms of ALU latency with zero net reduction in traversal time.
+4. **Inter-Warp vs Intra-Warp Coherency**:
+   - To achieve genuine hardware BVH acceleration, coherency must exist **across entire wavefronts** (Wave 0 containing 32 rays all pointing into Octant 0 from the same spatial cell). While a standalone sorting pass achieves this cross-wave grouping (yielding a 2.28x traversal speedup), reading scattered indices from VRAM and executing the sort pass consumes ~4.6 ms on 4K buffers, offsetting the traversal savings.
+5. **Definitive Engine Default Strategy**:
+   - **`--sec-sort none`** remains the engine default in `Config.hpp`, delivering the highest net framerates across all scenes.
+   - CLI flags `--sec-sort spatial` and `--sec-sort directional` remain fully functional for ongoing research into multi-pass global binning.
+

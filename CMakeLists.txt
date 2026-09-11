@@ -136,7 +136,10 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_dielectric.comp
     ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
     ${SHADER_DIR}/compute/wavefront_shade_complex.comp
+    ${SHADER_DIR}/compute/wavefront_shade_emissive.comp
+    ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
+    ${SHADER_DIR}/compute/wavefront_raysort.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -163,7 +166,7 @@ endforeach()
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 
 # Engine sources
-file(GLOB_RECURSE SRC_FILES
+file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
 )
 
@@ -342,6 +345,23 @@ if(UNIX)
 endif()
 add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
 
+# Multi-GPU Frame Pacing & Host Zero-Copy Unit Test Target
+add_executable(test_mgpu_frame_pacing
+    tests/test_mgpu_frame_pacing.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_mgpu_frame_pacing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_mgpu_frame_pacing PRIVATE Vulkan::Vulkan)
+if(UNIX)
+    target_link_libraries(test_mgpu_frame_pacing PRIVATE m Threads::Threads)
+endif()
+add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing)
+
+
 
 
 # ==============================================================================
@@ -351,11 +371,42 @@ include(GNUInstallDirs)
 
 install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes")
-    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/scenes/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
-endif()
+
+# Install curated Tier 1 research scenes only (excludes heavy/untracked assets like bistro)
+set(CURATED_SCENE_FILES
+    scenes/DamagedHelmet.glb
+    scenes/DragonAttenuation.glb
+)
+foreach(SCENE_FILE ${CURATED_SCENE_FILES})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
+    endif()
+endforeach()
+
+set(CURATED_SCENE_DIRS
+    classroom
+    coffee-maker
+    living-room
+)
+foreach(SCENE_DIR ${CURATED_SCENE_DIRS})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}")
+        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}/"
+                DESTINATION "${CMAKE_INSTALL_DATADIR}/pathways/scenes/${SCENE_DIR}"
+                FILES_MATCHING
+                PATTERN "*_extended.glb"
+                PATTERN "LICENSE.txt"
+                PATTERN "conversion.yaml")
+    endif()
+endforeach()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop")
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg")
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)
 endif()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION ${CMAKE_INSTALL_DOCDIR} OPTIONAL)
 
@@ -367,10 +418,13 @@ set(CPACK_PACKAGE_VERSION_MINOR "${PROJECT_VERSION_MINOR}")
 set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
 set(CPACK_PACKAGE_CONTACT "https://github.com/Soddentrough/Pathways")
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+endif()
 
 # RPM Generator options (Fedora / RHEL)
 set(CPACK_RPM_PACKAGE_LICENSE "MIT")
-set(CPACK_RPM_PACKAGE_GROUP "Amusements/Graphics")
+set(CPACK_RPM_PACKAGE_GROUP "Graphics")
 set(CPACK_RPM_PACKAGE_URL "https://github.com/Soddentrough/Pathways")
 set(CPACK_RPM_PACKAGE_AUTOREQ "yes")
 set(CPACK_RPM_PACKAGE_AUTOPROV "yes")
@@ -379,6 +433,7 @@ if(NOT CPACK_RPM_PACKAGE_RELEASE)
     set(CPACK_RPM_PACKAGE_RELEASE "1.fc44")
 endif()
 set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
+set(CPACK_RPM_PACKAGE_DESCRIPTION "Pathways is a high-performance, real-time Vulkan 1.4 path tracer optimized for modern AMD RDNA architectures (e.g. Dual Radeon AI PRO R9700). Features include pure Wave32 wavefront dispatch via Device Generated Commands (DGC), hardware ray tracing, multi-GPU scaling (interleaved scanlines and sample parallelism), and canonical Tier 1 PBR research assets.")
 
 # Default generators
 set(CPACK_GENERATOR "RPM;TGZ")

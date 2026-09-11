@@ -7,8 +7,8 @@
 
 namespace pathways {
 
-DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout)
-    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout) {
+DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet)
+    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout), m_materialDGCSupported(supportsExecutionSet) {
 
     loadFunctionPointers();
     if (getenv("PATHWAYS_DISABLE_DGC")) {
@@ -46,7 +46,7 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         m_supported = false;
     }
 
-    if (m_supported) {
+    if (m_supported && supportsExecutionSet) {
         VkIndirectCommandsExecutionSetTokenEXT execSetToken{};
         execSetToken.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
         execSetToken.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -74,10 +74,15 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         if (matRes == VK_SUCCESS) {
             Logger::info("Created DGC Material indirect commands layout (ExecutionSet + Dispatch, stride: {} bytes).",
                          matCreateInfo.indirectStride);
-            m_materialDGCSupported = false;
+            m_materialDGCSupported = true;
         } else {
             Logger::warn("Note: DGC Material indirect commands layout not supported by driver (code: {}). Using multi-dispatch indirect.", (int)matRes);
             m_materialDGCSupported = false;
+        }
+    } else {
+        m_materialDGCSupported = false;
+        if (!supportsExecutionSet && m_supported) {
+            Logger::info("DGC Execution Sets disabled. Using multi-dispatch indirect fallback.");
         }
     }
 }
@@ -256,7 +261,7 @@ void DGCManager::recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuf
 }
 
 void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines) {
-    if (!m_supported || materialPipelines.empty()) return;
+    if (!m_supported || !m_materialDGCSupported || materialPipelines.empty()) return;
 
     if (m_materialExecutionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
         pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);

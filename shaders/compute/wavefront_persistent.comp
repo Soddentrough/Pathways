@@ -98,7 +98,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[64];
+layout(binding = 8) uniform sampler2D sceneTextures[512];
 
 layout(std430, binding = 9) buffer WorkQueueBuffer {
     uint currentWorkTileIndex;
@@ -118,6 +118,7 @@ layout(push_constant) uniform PushConstants {
     uint hasEnvMap;
     float envMapIntensity;
     uint accumulateHistory; // 1: accumulate with history, 0: overwrite accum buffer (per-frame fresh)
+    uint numOpaqueTriangles;
 } pc;
 
 #define PI 3.14159265358979323846
@@ -219,7 +220,9 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
 
     while (rayQueryProceedEXT(rq)) {
         if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
+            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             Material candMat = materials[triangles[triIdx].materialId];
             if (candMat.alphaMode == 1u /* MASK */) {
                 vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
@@ -229,7 +232,7 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
                            cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
                            cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
                 float calpha = candMat.albedo.a;
-                if (candMat.albedoTex > 0u && candMat.albedoTex <= 64u) {
+                if (candMat.albedoTex > 0u && candMat.albedoTex <= 512u) {
                     calpha *= texture(sceneTextures[candMat.albedoTex - 1u], cuv).a;
                 }
                 if (calpha < candMat.alphaCutoff) {
@@ -242,7 +245,9 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
         float t = rayQueryGetIntersectionTEXT(rq, true);
-        uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
 
         closestT = t;
@@ -285,7 +290,7 @@ bool traceScene(Ray ray, float tMin, float tMax, out HitInfo closestHit) {
         closestHit.materialId = tri.materialId;
 
         Material hitMat = materials[tri.materialId];
-        if (hitMat.normalTex > 0u && hitMat.normalTex <= 64u) {
+        if (hitMat.normalTex > 0u && hitMat.normalTex <= 512u) {
             vec4 tan0 = tri.v0.tangent;
             vec4 tan1 = tri.v1.tangent;
             vec4 tan2 = tri.v2.tangent;
@@ -331,7 +336,9 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
 
     while (rayQueryProceedEXT(rq)) {
         if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
+            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             Material mat = materials[triangles[triIdx].materialId];
             if (mat.type == 3 /* EMISSIVE */) {
                 continue;
@@ -344,7 +351,7 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
                           u * vec2(tri.v1.position.w, tri.v1.normal.w) +
                           v * vec2(tri.v2.position.w, tri.v2.normal.w);
                 float alpha = mat.albedo.a;
-                if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                     alpha *= texture(sceneTextures[mat.albedoTex - 1u], uv).a;
                 }
                 if (alpha < mat.alphaCutoff) {
@@ -357,7 +364,9 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
     }
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
         if (materials[triangles[triIdx].materialId].type != 3) {
             return true;
         }
@@ -498,13 +507,13 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
 
         // 1. Sample Material Textures & Factors
         vec4 baseColor = mat.albedo;
-        if (mat.albedoTex > 0 && mat.albedoTex <= 64) {
+        if (mat.albedoTex > 0 && mat.albedoTex <= 512) {
             baseColor *= texture(sceneTextures[mat.albedoTex - 1], hit.uv);
         }
 
         float roughness = mat.roughness;
         float metallic = mat.metallic;
-        if (mat.mrTex > 0 && mat.mrTex <= 64) {
+        if (mat.mrTex > 0 && mat.mrTex <= 512) {
             vec4 mrSample = texture(sceneTextures[mat.mrTex - 1], hit.uv);
             roughness *= mrSample.g;
             metallic *= mrSample.b;
@@ -514,12 +523,12 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         float alphaRoughness = roughness * roughness;
 
         float transmission = mat.transmission;
-        if (mat.transmissionTex > 0 && mat.transmissionTex <= 64) {
+        if (mat.transmissionTex > 0 && mat.transmissionTex <= 512) {
             transmission *= texture(sceneTextures[mat.transmissionTex - 1], hit.uv).r;
         }
 
         vec3 emissive = mat.emissive.rgb;
-        if (mat.emissiveTex > 0 && mat.emissiveTex <= 64) {
+        if (mat.emissiveTex > 0 && mat.emissiveTex <= 512) {
             emissive *= texture(sceneTextures[mat.emissiveTex - 1], hit.uv).rgb;
         }
 
@@ -560,7 +569,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
         float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
         float specFactor = mat.specularFactor;
-        if (mat.specularTex > 0 && mat.specularTex <= 64) {
+        if (mat.specularTex > 0 && mat.specularTex <= 512) {
             specFactor *= texture(sceneTextures[mat.specularTex - 1], hit.uv).a;
         }
         vec3 dielectricF0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
@@ -570,18 +579,18 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
 
         // Clearcoat properties
         float clearcoat = mat.clearcoat;
-        if (mat.clearcoatTex > 0 && mat.clearcoatTex <= 64) {
+        if (mat.clearcoatTex > 0 && mat.clearcoatTex <= 512) {
             clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1], hit.uv).r;
         }
         float clearcoatRoughness = mat.clearcoatRoughness;
-        if (mat.clearcoatRoughnessTex > 0 && mat.clearcoatRoughnessTex <= 64) {
+        if (mat.clearcoatRoughnessTex > 0 && mat.clearcoatRoughnessTex <= 512) {
             clearcoatRoughness *= texture(sceneTextures[mat.clearcoatRoughnessTex - 1], hit.uv).g;
         }
         clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
         float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
         vec3 clearcoatNormal = hitNormal;
-        if (mat.clearcoatNormalTex > 0 && mat.clearcoatNormalTex <= 64) {
+        if (mat.clearcoatNormalTex > 0 && mat.clearcoatNormalTex <= 512) {
             vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
             vec3 cTan = normalize(cross(up, hitNormal));
             vec3 cBitan = cross(hitNormal, cTan);

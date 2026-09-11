@@ -447,14 +447,20 @@ void MultiGpuManager::destroySharedHostBuffer() {
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     destroySharedHostBuffer();
 
-    // Priority 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF
-    if (initSharedP2PBuffer(bufferSize)) {
-        return;
+    // Option 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF (Opt-in via --mgpu-transfer p2p)
+    if (m_config.mgpu_transfer_mode == Config::MgpuTransferMode::P2P) {
+        if (initSharedP2PBuffer(bufferSize)) {
+            Logger::warn("Active Inter-GPU Transfer: P2P Direct BAR via Linux DMA-BUF (Warning: Shader loads across PCIe BAR without coherent inter-GPU fabric may degrade interactive frame pacing).");
+            return;
+        }
+        Logger::warn("P2P Direct BAR initialization failed. Falling back to Zero-Copy Host Memory.");
     }
 
-    // Priority 2: Zero-Copy Host Memory fallback via VK_EXT_external_memory_host
-    if (!m_primaryContext || !m_primaryContext->hasExternalMemoryHost() ||
-        m_devices.empty() || !m_devices[0]->context || !m_devices[0]->context->hasExternalMemoryHost()) {
+    // Option 2 (Default): High-Performance Zero-Copy Host Memory via VK_EXT_external_memory_host
+    if (m_config.mgpu_transfer_mode != Config::MgpuTransferMode::Staging &&
+        m_primaryContext && m_primaryContext->hasExternalMemoryHost() &&
+        !m_devices.empty() && m_devices[0]->context && m_devices[0]->context->hasExternalMemoryHost()) {
+    } else {
         Logger::warn("P2P Direct BAR and external_memory_host unavailable. Falling back to CPU staging copy.");
         m_useZeroCopyHost = false;
         m_transferMode = InterGpuTransferMode::CpuStaging;
@@ -747,23 +753,47 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             secNode->context->getGraphicsQueue(), secNode->context->getGraphicsQueueFamily()
         );
 
-        ASGeometryInput geom{};
-        geom.vertexBufferAddress = secNode->asVertexBuffer->getDeviceAddress(secDevice);
-        geom.indexBufferAddress = 0;
-        geom.vertexCount = static_cast<uint32_t>(asVertices.size());
-        geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
-        geom.vertexStride = sizeof(Vertex);
-        geom.indexType = VK_INDEX_TYPE_NONE_KHR;
-        bool hasAlphaMask = false;
-        for (const auto& mat : scene.materials) {
-            if (mat.alphaMode == ALPHA_MODE_MASK) {
-                hasAlphaMask = true;
-                break;
-            }
-        }
-        geom.isOpaque = !hasAlphaMask;
+        std::vector<ASGeometryInput> geoms;
+        VkDeviceAddress vertexBaseAddr = secNode->asVertexBuffer->getDeviceAddress(secDevice);
 
-        secNode->blas = secNode->asManager->buildBLAS({ geom });
+        if (scene.numOpaqueTriangles > 0) {
+            ASGeometryInput geomOpaque{};
+            geomOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomOpaque.indexBufferAddress = 0;
+            geomOpaque.vertexCount = scene.numOpaqueTriangles * 3;
+            geomOpaque.triangleCount = scene.numOpaqueTriangles;
+            geomOpaque.vertexStride = sizeof(Vertex);
+            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
+            geomOpaque.isOpaque = true;
+            geoms.push_back(geomOpaque);
+        }
+
+        uint32_t numNonOpaque = static_cast<uint32_t>(scene.triangles.size()) - scene.numOpaqueTriangles;
+        if (numNonOpaque > 0) {
+            ASGeometryInput geomNonOpaque{};
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles * 3) * sizeof(Vertex);
+            geomNonOpaque.indexBufferAddress = 0;
+            geomNonOpaque.vertexCount = numNonOpaque * 3;
+            geomNonOpaque.triangleCount = numNonOpaque;
+            geomNonOpaque.vertexStride = sizeof(Vertex);
+            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
+            geomNonOpaque.isOpaque = false;
+            geoms.push_back(geomNonOpaque);
+        }
+
+        if (geoms.empty()) {
+            ASGeometryInput dummyGeom{};
+            dummyGeom.vertexBufferAddress = vertexBaseAddr;
+            dummyGeom.indexBufferAddress = 0;
+            dummyGeom.vertexCount = 3;
+            dummyGeom.triangleCount = 1;
+            dummyGeom.vertexStride = sizeof(Vertex);
+            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
+            dummyGeom.isOpaque = true;
+            geoms.push_back(dummyGeom);
+        }
+
+        secNode->blas = secNode->asManager->buildBLAS(geoms);
 
         ASInstanceInput inst{};
         inst.blasAddress = secNode->blas->getDeviceAddress();
@@ -815,7 +845,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 }
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 }
     };
     VkDescriptorPoolCreateInfo descPoolInfo{};
     descPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -841,7 +871,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -857,6 +888,15 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descAllocInfo.descriptorSetCount = GpuDeviceNode::NUM_IN_FLIGHT;
     descAllocInfo.pSetLayouts = descLayouts.data();
     vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
+
+    // Allocate secondary training tensor buffer (Binding 15)
+    VkDeviceSize trainBufferSize = config.capture_training_data ?
+        (static_cast<VkDeviceSize>(config.width) * config.height * 16 * sizeof(uint16_t)) : 256;
+    secNode->trainingTensorBuffer = std::make_unique<Buffer>(
+        secAlloc, trainBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
 
     // Allocate secondary ReSTIR reservoir ping-pong buffers
     VkDeviceSize resSize = static_cast<VkDeviceSize>(config.width) * config.height * sizeof(ReservoirGPU);
@@ -917,6 +957,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
     VkDescriptorBufferInfo res0Info{ secNode->restirReservoirs[0]->getBuffer(), 0, resSize };
     VkDescriptorBufferInfo res1Info{ secNode->restirReservoirs[1]->getBuffer(), 0, resSize };
+    VkDescriptorBufferInfo trainInfo{};
+    if (secNode->trainingTensorBuffer) {
+        trainInfo = { secNode->trainingTensorBuffer->getBuffer(), 0, secNode->trainingTensorBuffer->getSize() };
+    }
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -953,7 +997,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainInfo, nullptr }
         };
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -1481,7 +1526,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         packet.accumulateHistory,
         fracBits,
         packet.totalCompositeSpp,
-        0, 0
+        packet.numOpaqueTriangles, 0
     };
 
     uint32_t dispatchWidth = packet.tileWidth;
@@ -1762,7 +1807,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          float fractionalSpp,
                                          void* dstHostPtr,
                                          size_t transferBytes,
-                                         uint32_t totalCompositeSpp) {
+                                         uint32_t totalCompositeSpp,
+                                         uint32_t numOpaqueTriangles) {
     if (!m_active || m_devices.empty()) return;
 
     {
@@ -1787,6 +1833,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.dstHostPtr = dstHostPtr;
         m_pendingWork.transferBytes = transferBytes;
         m_pendingWork.totalCompositeSpp = totalCompositeSpp;
+        m_pendingWork.numOpaqueTriangles = numOpaqueTriangles;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
         m_waitingSlot = slot;
@@ -2032,6 +2079,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             );
         }
 
+        if (node->trainingTensorBuffer) {
+            VkDeviceSize trainBufferSize = m_config.capture_training_data ?
+                (static_cast<VkDeviceSize>(width) * height * 16 * sizeof(uint16_t)) : 256;
+            node->trainingTensorBuffer = std::make_unique<Buffer>(
+                secAlloc, trainBufferSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+            );
+        }
+
         VkDescriptorImageInfo accumImageInfo{};
         accumImageInfo.imageView = node->accumTarget->getImageView();
         accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2042,6 +2099,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         VkDescriptorBufferInfo res0Info{ node->restirReservoirs[0]->getBuffer(), 0, resSize };
         VkDescriptorBufferInfo res1Info{ node->restirReservoirs[1]->getBuffer(), 0, resSize };
+        VkDescriptorBufferInfo trainInfo{};
+        if (node->trainingTensorBuffer) {
+            trainInfo = { node->trainingTensorBuffer->getBuffer(), 0, node->trainingTensorBuffer->getSize() };
+        }
 
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
             std::vector<VkWriteDescriptorSet> writes = {
@@ -2052,6 +2113,9 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
             };
+            if (node->trainingTensorBuffer) {
+                writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainInfo, nullptr });
+            }
             vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
             node->slotHasExecuted[slot] = false;
@@ -2156,23 +2220,47 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
             secNode->context->getGraphicsQueue(), secNode->context->getGraphicsQueueFamily()
         );
 
-        ASGeometryInput geom{};
-        geom.vertexBufferAddress = secNode->asVertexBuffer->getDeviceAddress(secDevice);
-        geom.indexBufferAddress = 0;
-        geom.vertexCount = static_cast<uint32_t>(asVertices.size());
-        geom.triangleCount = static_cast<uint32_t>(asVertices.size() / 3);
-        geom.vertexStride = sizeof(Vertex);
-        geom.indexType = VK_INDEX_TYPE_NONE_KHR;
-        bool hasAlphaMask = false;
-        for (const auto& mat : scene.materials) {
-            if (mat.alphaMode == ALPHA_MODE_MASK) {
-                hasAlphaMask = true;
-                break;
-            }
-        }
-        geom.isOpaque = !hasAlphaMask;
+        std::vector<ASGeometryInput> geoms;
+        VkDeviceAddress vertexBaseAddr = secNode->asVertexBuffer->getDeviceAddress(secDevice);
 
-        secNode->blas = secNode->asManager->buildBLAS({ geom });
+        if (scene.numOpaqueTriangles > 0) {
+            ASGeometryInput geomOpaque{};
+            geomOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomOpaque.indexBufferAddress = 0;
+            geomOpaque.vertexCount = scene.numOpaqueTriangles * 3;
+            geomOpaque.triangleCount = scene.numOpaqueTriangles;
+            geomOpaque.vertexStride = sizeof(Vertex);
+            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
+            geomOpaque.isOpaque = true;
+            geoms.push_back(geomOpaque);
+        }
+
+        uint32_t numNonOpaque = static_cast<uint32_t>(scene.triangles.size()) - scene.numOpaqueTriangles;
+        if (numNonOpaque > 0) {
+            ASGeometryInput geomNonOpaque{};
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles * 3) * sizeof(Vertex);
+            geomNonOpaque.indexBufferAddress = 0;
+            geomNonOpaque.vertexCount = numNonOpaque * 3;
+            geomNonOpaque.triangleCount = numNonOpaque;
+            geomNonOpaque.vertexStride = sizeof(Vertex);
+            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
+            geomNonOpaque.isOpaque = false;
+            geoms.push_back(geomNonOpaque);
+        }
+
+        if (geoms.empty()) {
+            ASGeometryInput dummyGeom{};
+            dummyGeom.vertexBufferAddress = vertexBaseAddr;
+            dummyGeom.indexBufferAddress = 0;
+            dummyGeom.vertexCount = 3;
+            dummyGeom.triangleCount = 1;
+            dummyGeom.vertexStride = sizeof(Vertex);
+            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
+            dummyGeom.isOpaque = true;
+            geoms.push_back(dummyGeom);
+        }
+
+        secNode->blas = secNode->asManager->buildBLAS(geoms);
 
         ASInstanceInput inst{};
         inst.blasAddress = secNode->blas->getDeviceAddress();

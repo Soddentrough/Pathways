@@ -40,7 +40,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 };
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[64];
+layout(binding = 8) uniform sampler2D sceneTextures[512];
 
 layout(std430, binding = 9) readonly buffer InRayStateQueue {
     RayState inStates[];
@@ -57,8 +57,25 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint pad1;
-    uint pad2;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint emissiveCount;
+    uint alphamaskCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint nextEmissiveCount;
+    uint nextAlphamaskCount;
+    uint currentMaterialCounts[6];
+    uint totalShadeWorkgroups;
+    uint octantCounts[8];
+    uint currentOctantCounts[8];
+    uint totalIntersectWorkgroups;
+    uint secondaryRayCount;
+    uint pad[21];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -85,6 +102,10 @@ layout(std430, binding = 17) readonly buffer InRayHitQueue {
     RayHit inHits[];
 };
 
+layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
+    uint secondaryIndices[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -99,6 +120,7 @@ layout(push_constant) uniform PushConstants {
     uint hasEnvMap;
     float envMapIntensity;
     uint useHardwareRT;
+    uint secondarySortMode;
 } pc;
 
 void main() {
@@ -106,6 +128,7 @@ void main() {
     bool inRange = (idx < queueCounters.activeRayCount);
     bool survivesToNext = false;
     bool hasShadowRay = false;
+    vec3 nextDirection = vec3(0.0);
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
@@ -115,8 +138,8 @@ void main() {
         RayHit hit = inHits[idx];
         RayState state = inStates[idx];
 
-        vec3 origin = geom.originAndTMin.xyz;
-        vec3 rayDir = geom.dirAndTMax.xyz;
+        vec3 origin = geom.originPackedDir.xyz;
+        vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
         float hitT = hit.hitData.x;
         uint primId = floatBitsToUint(hit.hitData.y);
         vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
@@ -173,7 +196,7 @@ void main() {
                 Material mat = materials[matId];
 
                 // Tangent frame & Normal mapping: load tangents only when normal texture is active
-                if (mat.normalTex > 0u && mat.normalTex <= 64u) {
+                if (mat.normalTex > 0u && mat.normalTex <= 512u) {
                     vec4 tan0 = triangles[primId].v0.tangent;
                     vec4 tan1 = triangles[primId].v1.tangent;
                     vec4 tan2 = triangles[primId].v2.tangent;
@@ -202,7 +225,7 @@ void main() {
 
             // 1. Sample glTF 2.0 Material Textures & Factors
             vec4 baseColor = mat.albedo;
-            if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+            if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
@@ -211,14 +234,13 @@ void main() {
                 (mat.alphaMode == 2u && randFloat(seed) > baseColor.a)) {
                 // Transparent / masked pixel - passthrough ray
                 survivesToNext = true;
-                nextGeom.originAndTMin = vec4(hitPoint + rayDir * EPSILON, EPSILON);
-                nextGeom.dirAndTMax = vec4(rayDir, 10000.0);
+                nextGeom.originPackedDir = vec4(hitPoint + rayDir * EPSILON, uintBitsToFloat(packOct32(rayDir)));
                 nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
                 nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
             } else {
                 // Emissive radiance evaluation
                 vec3 emissive = mat.emissive.rgb;
-                if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
+                if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                     emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
                 }
                 if (length(emissive) > 1e-3) {
@@ -231,7 +253,7 @@ void main() {
                 } else {
                     float roughness = mat.roughness;
                     float metallic = mat.metallic;
-                    if (mat.mrTex > 0u && mat.mrTex <= 64u) {
+                    if (mat.mrTex > 0u && mat.mrTex <= 512u) {
                         vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
                         roughness *= mrSample.g; // Green = roughness
                         metallic *= mrSample.b;  // Blue = metallic
@@ -241,14 +263,14 @@ void main() {
                     float alphaRoughness = roughness * roughness;
 
                     float transmission = mat.transmission;
-                    if (mat.transmissionTex > 0u && mat.transmissionTex <= 64u) {
+                    if (mat.transmissionTex > 0u && mat.transmissionTex <= 512u) {
                         transmission *= texture(sceneTextures[mat.transmissionTex - 1u], hitUv).r;
                     }
 
                     float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
                     float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
                     float specFactor = mat.specularFactor;
-                    if (mat.specularTex > 0u && mat.specularTex <= 64u) {
+                    if (mat.specularTex > 0u && mat.specularTex <= 512u) {
                         specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
                     }
                     vec3 dielectricF0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
@@ -258,18 +280,18 @@ void main() {
 
                     // Clearcoat properties
                     float clearcoat = mat.clearcoat;
-                    if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 64u) {
+                    if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
                         clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1u], hitUv).r;
                     }
                     float clearcoatRoughness = mat.clearcoatRoughness;
-                    if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 64u) {
+                    if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 512u) {
                         clearcoatRoughness *= texture(sceneTextures[mat.clearcoatRoughnessTex - 1u], hitUv).g;
                     }
                     clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
                     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
                     vec3 clearcoatNormal = hitNormal;
-                    if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 64u) {
+                    if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
                         vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
                         vec3 cTan = normalize(cross(up, hitNormal));
                         vec3 cBitan = cross(hitNormal, cTan);
@@ -395,8 +417,7 @@ void main() {
                                     if (enableShadows) {
                                         hasShadowRay = true;
                                         shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                                        shadowCandidate.dirPixel = vec4(lightDir, uintBitsToFloat(pixelIndex));
-                                        shadowCandidate.unshadowedRadiance = vec4(unshadowed, uintBitsToFloat(bounce));
+                                        shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
                                     } else {
                                         accumRadiance += unshadowed;
                                     }
@@ -522,8 +543,7 @@ void main() {
                     // 5. Emit Surviving Secondary Ray
                     if (!pathTerminated) {
                         survivesToNext = true;
-                        nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
-                        nextGeom.dirAndTMax = vec4(nextDirection, 10000.0);
+                        nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                         nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
                         nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
                     }
@@ -550,11 +570,36 @@ void main() {
     }
     waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
 
+    uint targetIdx = 0u;
     if (survivesToNext) {
-        uint targetIdx = waveGlobalOffset + laneSlot;
+        targetIdx = waveGlobalOffset + laneSlot;
         if (targetIdx < pc.maxQueueCapacity) {
             outGeoms[targetIdx] = nextGeom;
             outStates[targetIdx] = nextState;
+        }
+    }
+
+    // Option 1: On-Chip Directional Multi-Queue Binning via Subgroup Ballots
+    if (pc.secondarySortMode == 1u) {
+        uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
+        for (uint k = 0u; k < 8u; ++k) {
+            bool isOct = survivesToNext && (oct == k);
+            uvec4 octBallot = subgroupBallot(isOct);
+            uint octCount = subgroupBallotBitCount(octBallot);
+            if (octCount > 0u) {
+                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+                uint octBase = 0u;
+                if (subgroupElect()) {
+                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
+                }
+                octBase = subgroupBroadcastFirst(octBase);
+                if (isOct) {
+                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                    if (octBase + octSlot < pc.maxQueueCapacity) {
+                        secondaryIndices[dest] = targetIdx;
+                    }
+                }
+            }
         }
     }
 
@@ -570,9 +615,9 @@ void main() {
     shadowGlobalOffset = subgroupBroadcastFirst(shadowGlobalOffset);
 
     if (hasShadowRay) {
-        uint targetIdx = shadowGlobalOffset + shadowLaneSlot;
-        if (targetIdx < pc.maxQueueCapacity) {
-            shadowRays[targetIdx] = shadowCandidate;
+        uint targetIdxShadow = shadowGlobalOffset + shadowLaneSlot;
+        if (targetIdxShadow < pc.maxQueueCapacity) {
+            shadowRays[targetIdxShadow] = shadowCandidate;
         }
     }
 
@@ -620,6 +665,7 @@ void main() {
                 dgcStream.bounceDGC[b + 1u].shadeCmd.z = 1u;
             }
 
+            queueCounters.totalIntersectWorkgroups = intersectGroups;
             queueCounters.currentShadowCount = shadowCount;
             queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
             queueCounters.nextActiveCount = 0u;

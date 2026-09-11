@@ -32,9 +32,16 @@ enum class WavefrontSortMode {
     Dual       // Technique D: 2D Spatial-Morton + Material Dual-Binning
 };
 
+enum class SecondarySortMode {
+    None,           // Standard unsorted secondary rays
+    DirectionalDGC, // Option 1: On-Chip Directional Multi-Queue Binning via DGC & subgroup ballots
+    SpatialIndex    // Option 2: 4-Byte Index-Only Spatial-Morton Reordering
+};
+
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
-    WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::None; // Default: Monolithic
+    WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
+    SecondarySortMode secondary_sort_mode = SecondarySortMode::None; // Secondary ray BVH traversal coherency mode
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -44,6 +51,7 @@ struct Config {
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;
+    float exposure = 1.0f;
 
     // Dynamic Quality Governor & Target Frame Rate Limiter
     uint32_t target_fps = 0;          // 0 = uncapped [Default]
@@ -79,6 +87,12 @@ struct Config {
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
+    enum class MgpuTransferMode {
+        Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory, high performance default)
+        P2P,      // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR)
+        Staging   // CPU memcpy staging (Fallback)
+    };
+    MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::Host;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
@@ -87,6 +101,12 @@ struct Config {
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
+
+    // Neural Denoiser & Continuous Upscaler (NDCU) Training Capture
+    bool capture_training_data = false;
+    std::string training_data_dir = "";
+    uint32_t training_capture_frames = 60;
+    uint32_t training_reference_spp = 512;
 
     // Camera view overrides (useful for headless testing & reproducible framing)
     std::optional<glm::vec3> camera_pos;

@@ -1,6 +1,6 @@
 # Pathways
 
-Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4**. Clean sheet design to use **Device Generated Commands** (`VK_EXT_device_generated_commands`), **Wavefront Path Tracing**, and direct **Peer-to-Peer (P2P) Multi-GPU scaling**. 
+Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4**. Clean sheet design to use **Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Binning, **Wavefront Path Tracing**, and high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**. 
 
 > **Design Philosophy**: No megakernel — only efficient, GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and modern real-time rendering principles. Pathways uses strictly standard Vulkan 1.4, KHR, and EXT specifications with **no proprietary extensions**.
 
@@ -19,10 +19,15 @@ Pathways is a high-performance, real-time path tracing and renderer engine built
 - **Hardware Ray Tracing**: Full support for dedicated hardware BVH traversal via `VK_KHR_ray_tracing_pipeline` (RTP) and inline `VK_KHR_ray_query`.
 
 ### 2. Real-Time Multi-GPU Scaling
-- **P2P Direct BAR DMA-BUF Transfer**: Exports secondary GPU accumulation buffers via Linux DMA-BUF (`VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd`) and imports them directly into primary GPU VRAM over PCIe BAR, slashing inter-GPU transfer/compositing latency to **<0.1 ms** (~80% reduction over host staging).
+- **Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`)**: Secondary GPU streams tiled render buffers into pinned host memory via high-speed CP DMA posted writes at PCIe bus line rate (~25 GB/s, <0.5 ms). Primary GPU merges and resolves tiles in ~0.12 ms without PCIe bus contention, ensuring jitter-free, consistent 250+ FPS camera motion.
+- **Configurable Inter-GPU Transfer Modes (`--mgpu-transfer`)**:
+  - `host` (Default): Pinned zero-copy host memory. Highly recommended for discrete PCIe topologies without dedicated inter-GPU fabric bridges.
+  - `p2p`: Direct Linux DMA-BUF export/import (`VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd`). Ideal on hardware architectures with coherent inter-GPU links (e.g., Infinity Fabric bridges); on discrete PCIe slots, direct shader reads across PCIe BAR encounter non-posted read latency.
+  - `staging`: Dedicated asynchronous transfer queues with CPU staging buffers.
 - **Fine-Grained 2D Checkerboard Tiling**: Dynamically distributes screen space across $64\times 64$ alternating tiles (2,040 tiles at 4K) for balanced spatial and shading workload division across dual GPUs.
 - **Sample Parallelism**: Temporal sample division mode for multi-SPP scenarios.
 - **Cross-Platform Fallback**: Automatic detection and transparent fallback to double-buffered shared host memory for platforms without DMA-BUF (such as Windows).
+
 
 ### 3. Pure Path-Traced Lighting & Physical Materials
 - **glTF 2.0 PBR & Extensions**: Physically-based materials with metallic-roughness, normal mapping, emissive meshes, and advanced Khronos extensions:
@@ -66,6 +71,21 @@ Load any glTF 2.0 or procedural scene and fly through it in real time with high-
 - **Compression**: zlib / zlib-ng
 - **Math**: GLM (header-only, bundled in `third_party/glm`)
 - **GPU**: AMD Radeon RDNA4 / RDNA3 (or any modern GPU with Vulkan 1.4, ray queries, and DGC support)
+
+### Hardware & Extension Support Note
+
+Pathways is designed for modern desktop workstations and gaming PCs with hardware-accelerated ray tracing and autonomous GPU execution. Coverage statistics from the Vulkan Hardware Database ([vulkan.gpuinfo.org](https://vulkan.gpuinfo.org/)) illustrate adoption levels across desktop platforms (Windows and Linux PCs) compared to the mobile-skewed global database:
+
+| Extension / Feature | Spec Date | Desktop Coverage (Win + Linux) | Mobile Coverage (Android) | Global Coverage (All Devices) | Role & Status in Pathways |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Enables GPU-autonomous material binning and kernel dispatch directly on the device with zero CPU intervention. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). Fallback via monolithic compute is supported (`--pipeline wavefront --wavefront-sort none`). |
+| **`VK_KHR_acceleration_structure`** | Nov 20, 2020 | **~52.9%** | **~26.6%** | **~34.1%** | **BVH Management**: Required for building and querying hardware Top-Level (TLAS) and Bottom-Level (BLAS) ray tracing acceleration structures. |
+| **`VK_KHR_ray_tracing_pipeline`** | Nov 20, 2020 | **~51.3%** | **~7.6%** | **~21.8%** | **Hardware RTP**: Powers the dedicated hardware ray tracing pipeline (`--pipeline rtp` megakernel mode). |
+| **`VK_EXT_external_memory_host`** | Jan 17, 2018 | **~84.9%** | **~6.5%** | **~36.1%** | **Multi-GPU Zero-Copy**: Enables secondary GPU to stream rendered HDR tiles directly into pinned host RAM at PCIe line rate (~25 GB/s), eliminating peer PCIe BAR read stalls. |
+| **Vulkan 1.4 Core** | Jan 15, 2025 | **~61.2%** | **~7.9%** | **~28.2%** | **Engine Baseline**: Core driver version requirement (72.6% on Linux Mesa, 53.2% on Windows). |
+
+> [!NOTE]
+> **Desktop vs. Global Metrics**: Over 61.7% of all devices recorded in the Vulkan Hardware Database are low-power Android mobile phones and embedded SoCs (1,467 out of 2,376 devices), which drastically pulls down global percentages for high-end rendering features. Among desktop PCs (976 reported Windows and Linux devices), hardware ray tracing and DGC achieve ~50–53% coverage across all recorded hardware generations, and approach ~100% on contemporary discrete gaming GPUs (AMD RDNA2+, NVIDIA RTX 20+). For a complete breakdown and call-site citations across the entire engine, see [VULKAN_API_AUDIT.md](VULKAN_API_AUDIT.md) or run `python3 scripts/audit_vulkan_api.py --compare-platforms`.
 
 ---
 
@@ -146,6 +166,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--max-bounces` | `<int>` | Maximum path depth / bounce limit | `4` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU distribution strategy | `tile` |
+| `--mgpu-transfer` | `host` \| `p2p` \| `staging` | Inter-GPU transfer mechanism: zero-copy host pinned memory (default), direct DMA-BUF P2P BAR, or staging buffers | `host` |
 | `--tile-size` | `16` \| `32` \| `64` \| `128` | Checkerboard tile dimensions in pixels | `64` |
 | `--visualize-split` | *(flag)* | Show colored overlay indicating GPU assignment | Off |
 | `--wavefront-sort` | `none` \| `archetype` \| `bda` \| `dual` | Material sorting mode for DGC wavefront | `none` |
@@ -171,7 +192,7 @@ Pathways is continuously tested and profiled on modern high-end multi-GPU AMD ha
 - **System Memory**: 64 GB DDR4 Quad-Channel
 - **Primary GPU (GPU 0)**: AMD Radeon AI PRO R9700 (32 GB GDDR6, 256-bit, PCIe 4.0 x16, RDNA 4 `gfx1201`)
 - **Secondary GPU (GPU 1)**: AMD Radeon AI PRO R9700 (32 GB GDDR6, 256-bit, PCIe 4.0 x8, RDNA 4 `gfx1201`)
-- **Interconnect**: P2P Direct BAR transfer over PCIe via Linux DMA-BUF (`VK_EXT_external_memory_dma_buf`), synchronized via `VK_KHR_external_semaphore_fd`
+- **Interconnect**: Zero-Copy Host Memory (`VK_EXT_external_memory_host`) and DMA-BUF P2P over PCIe 4.0, synchronized via `VK_KHR_external_semaphore_fd`
 - **OS & Driver**: Fedora Linux 44 (Kernel 7.1), Mesa RADV 26.1.8, Vulkan 1.4.354
 
 ---
@@ -180,11 +201,13 @@ Pathways is continuously tested and profiled on modern high-end multi-GPU AMD ha
 
 | Scene / Workload | Resolution & Settings | Single-GPU (ms / FPS) | Dual-GPU (ms / FPS) | Multi-GPU Mode | Speedup / Scaling | Throughput Gain |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Procedural Cornell Box** | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 7.35 ms (136.0 FPS) | **4.30 ms** (232.7 FPS) | Interleaved Scanlines | **1.71x** (Sub-8ms Budget) | 7.72 GigaRays/s |
+| **Procedural Cornell Box** | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 7.35 ms (136.0 FPS) | **3.87 ms** (258.1 FPS) | Checkerboard ($64\times 64$) | **1.90x** (Smooth Camera Motion) | 8.56 GigaRays/s |
 | **Damaged Helmet (`.glb`)** | **1080p** (1920x1080), 16 SPP, 4 Bounces | 7.79 ms (128.5 FPS) | **3.41 ms** (293.0 FPS) | Sample Parallelism | **2.28x** (>100% Efficiency) | 1.88x ($3.86 \times 10^{10}$ rays/s) |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **5.82 ms** (171.8 FPS) | Checkerboard ($64\times 64$) | **1.99x** (99.3% Efficiency) | 5.70 GigaRays/s |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **6.97 ms** (143.4 FPS) | Sample Parallelism | **1.66x** (83.0% Efficiency) | 4.76 GigaRays/s |
-| **P2P Direct BAR Transfer** | 4K HDR Accumulation Buffer (63.3 MB) | — | **<0.08 ms** (<80 µs) | Linux DMA-BUF | **>85% reduction** vs Host Staging | Zero Host RAM Contention |
+| **Zero-Copy Host Compositing** | 4K HDR Tile Merge (63.3 MB) | — | **0.12 ms** (8.3 kHz) | Host DMA (`VK_EXT_external_memory_host`) | **Zero PCIe BAR Stalls** | Smooth 258 FPS Motion |
+
+> **Discrete PCIe vs. Coherent Fabric Note**: On dual discrete GPUs connected across standard PCIe slots, reading directly across peer PCIe BAR via compute shaders issues uncached, non-posted PCIe reads which incur high per-transaction latency (stalling GPU compute queues for up to 28 ms per frame under heavy traffic). Pathways solves this by defaulting to `VK_EXT_external_memory_host`, where the secondary GPU writes to pinned host memory via high-speed DMA posted writes at full bus line rate (~25 GB/s, <0.5 ms), allowing the primary GPU to composite in 0.12 ms without bus stalls. Direct P2P BAR remains selectable via `--mgpu-transfer p2p` for systems equipped with hardware-coherent interconnects.
 
 ---
 
@@ -220,7 +243,7 @@ RADV_PERFTEST=cswave32,nogttspill ./build/bin/pathways --res 4k
 | **`cswave32`** | Wave Scheduling | Forces Wave32 execution mode for all compute shaders on RDNA (GFX10+). | **Recommended**: Pathways defaults to Wave32 for ray sorting and compaction to reduce register pressure and SIMD divergence. |
 | **`rtwave64`** | Ray Tracing | Forces Wave64 execution mode for ray tracing shaders instead of Wave32. | **Experimental / Benchmarking**: Test when evaluating ray tracing SIMD divergence vs. VGPR occupancy trade-offs. |
 | **`nogttspill`** | Memory Allocation | Strictly prioritizes on-card VRAM allocations and disables GTT (system RAM) spilling. | **Recommended for Benchmarks**: Prevents memory thrashing across PCIe bus during high-resolution ray queue staging. |
-| **`transfer_queue`** | Queues & DMA | Enables dedicated SDMA transfer queues for asynchronous DMA operations. | **Recommended for Multi-GPU**: Offloads cross-device image copies and DMA-BUF imports from primary compute queues. |
+| **`transfer_queue`** | Queues & DMA | Enables dedicated SDMA transfer queues for asynchronous DMA operations. | **Recommended for Multi-GPU**: Offloads cross-device image copies and DMA-BUF / host memory transfers from primary compute queues. |
 | **`dmashaders`** | Memory Placement | Uploads compiled shaders to invisible/device VRAM using DMA. | Useful for systems where Resizable BAR (ReBAR) is constrained or disabled. |
 | **`dccmsaa`** | Compression | Enables Delta Color Compression (DCC) for multi-sample images. | Useful if running MSAA passes or resolve blits. |
 | **`localbos`** | Command Submission | Uses local buffer object lists per queue submission, minimizing driver mutex contention. | Beneficial during high-frequency DGC execution dispatches. |
@@ -260,6 +283,15 @@ RADV_DEBUG=syncshaders ./build/bin/pathways
   ```bash
   python3 scripts/benchmark_megakernel_vs_wavefront.py
   python3 scripts/deep_profile_scenes.py
+  ```
+- **Vulkan API & Platform Support Auditor**:
+  ```bash
+  # View multi-platform comparison (Desktop vs Mobile vs Global)
+  python3 scripts/audit_vulkan_api.py -w raytracing --compare-platforms
+  # Filter out mobile devices to view desktop PC metrics
+  python3 scripts/audit_vulkan_api.py -w dgc --exclude-mobile
+  # Generate interactive HTML dashboard
+  python3 scripts/audit_vulkan_api.py --format html -o output/vulkan_api_dashboard.html
   ```
 
 ---

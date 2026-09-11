@@ -576,7 +576,49 @@ Three scenes in particular demonstrated sub-80% scaling efficiency: **`Kitchen E
   - Evaluated cross-GPU atomic queue architecture via imported DMA-BUF storage buffers (`scratch/test_p2p_atomic.cpp`).
   - Finding: Discrete PCIe 4.0/5.0 interfaces without coherent xGMI/CXL fabric lack hardware-snooped atomic caches across separate physical GPUs; remote atomic contention induces substantial memory bus serialization. Discarded in favor of static checkerboard + DMA-BUF P2P.
 
+---
 
+## 6. Full Multi-Instance Object-Space Graph & Per-Asset BLAS Instancing
 
+- **Status:** Proposed / Architectural Roadmap
+- **Target Hardware:** Dual AMD Radeon AI PRO R9700 (RDNA 4 / `gfx1201`), Vulkan 1.4
+- **Priority:** High (Next-generation scene scalability and dynamic asset support)
 
+### 6.1 Motivation & Architectural Evolution
 
+Pathways currently employs a pre-transformed world-space BLAS design: during scene loading, all mesh primitives are baked into global world coordinates and merged into a monolithic vertex buffer. While this enables direct 1:1 hardware primitive indexing (`triangles[primId]`), it introduces two fundamental architectural limitations at scale:
+1. **No Geometry Deduplication (VRAM Inflation):** In complex architectural and game environments containing repeated assets (e.g. 50 identical dining chairs, 20 light fixtures, 10,000 screws or fence links), vertices and acceleration structures are fully duplicated in VRAM, increasing memory footprint by $5\times$ to $20\times$.
+2. **Static Geometry Lock-In:** Because vertices are baked in world space, moving or animating any object requires rebuilding or refitting the global BLAS ($O(N \log N)$), which is prohibitive for real-time framerates.
+
+### 6.2 Target Architecture: Multi-BLAS Asset Cache & TLAS Instance Graph
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│             Asset Cache (Unique Local-Space BLASes)         │
+│  - BLAS 0: Table Asset (Local Object Space)                 │
+│  - BLAS 1: Chair Asset (Local Object Space)                 │
+│  - BLAS 2: Glass Cup (Non-Opaque / Transmission)            │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Referenced by device address
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│          Top-Level Acceleration Structure (TLAS)            │
+│  - Instance 0: Chair #1 -> Transform M0, customIndex = 0    │
+│  - Instance 1: Chair #2 -> Transform M1, customIndex = 0    │
+│  - Instance 2: Table    -> Transform M2, customIndex = 1    │
+│  - Instance 3: Cup      -> Transform M3, customIndex = 2    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Key Technical Requirements:
+1. **Local Object-Space BLAS Cache:**
+   - Unique mesh primitives are built into dedicated local-space BLASes once upon load.
+   - Opaque assets set `VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR`; transparent/alpha assets are flagged accordingly.
+2. **TLAS Instance Transform Matrix:**
+   - Instances carry dynamic $3 \times 4$ affine transforms (`VkTransformMatrixKHR`), enabling real-time rigid body movement, physics, and camera-independent motion by simply writing 64 bytes to the instance buffer.
+3. **Shader World-Space Reconstruction:**
+   - Shaders utilize `rayQueryGetIntersectionObjectToWorldEXT` or `gl_ObjectToWorld3x4EXT` to dynamically transform local surface normals and tangents into world space:
+     $$\mathbf{N}_{\text{world}} = \text{normalize}\left(\mathbf{M}^{-T} \mathbf{N}_{\text{local}}\right)$$
+   - Primitive indexing is resolved via `customIndex` (asset descriptor index) + `gl_PrimitiveID`.
+4. **Hardware Ray Masking:**
+   - Utilize 8-bit TLAS instance masks (`mask = 0x01` for opaque, `0x02` for non-opaque) to cull non-opaque objects completely from primary or shadow ray traversal when appropriate.
