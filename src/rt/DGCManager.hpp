@@ -4,6 +4,7 @@
 #include "vulkan/Buffer.hpp"
 #include <memory>
 #include <vector>
+#include <array>
 
 namespace pathways {
 

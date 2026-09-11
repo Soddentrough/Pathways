@@ -58,7 +58,7 @@ void main() {
 
         imageStore(uPrimaryAccum, pixelCoord, secVal);
     } else {
-        // --- Mode 1: Sample Parallelism (Temporal Sample Accumulation) ---
+        // --- Mode 2: Sample Parallelism (Temporal Sample Accumulation) ---
         ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
         if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
             return;

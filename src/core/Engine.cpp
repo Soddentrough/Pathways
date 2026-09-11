@@ -1091,7 +1091,6 @@ void Engine::initPipelines() {
     auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
     auto wfShadeCode = loadShaderSPIRV("wavefront_shade.comp.spv");
     auto wfShadowCode = loadShaderSPIRV("wavefront_shadow.comp.spv");
-    auto wfResolveCode = loadShaderSPIRV("wavefront_resolve.comp.spv");
     auto wfShadeDiffuseCode = loadShaderSPIRV("wavefront_shade_diffuse.comp.spv");
     auto wfShadeDielectricCode = loadShaderSPIRV("wavefront_shade_dielectric.comp.spv");
     auto wfShadeConductorCode = loadShaderSPIRV("wavefront_shade_conductor.comp.spv");
@@ -1101,7 +1100,7 @@ void Engine::initPipelines() {
         device, allocator,
         m_config.width, m_config.height,
         m_config.wavefront_tile_size,
-        wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode, wfResolveCode,
+        wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         m_context->hasDgcExecutionSet()
     );
@@ -2366,9 +2365,12 @@ void Engine::renderFrame() {
 
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
         if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
-            static int wfProfCount = 0;
-            if ((m_config.benchmark && (++wfProfCount == 10)) || getenv("PATHWAYS_PROFILE_WF")) {
-                m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+            if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
+                m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                static int wfProfCount = 0;
+                if ((m_config.benchmark && (++wfProfCount == 10)) || getenv("PATHWAYS_PROFILE_WF")) {
+                    m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                }
             }
         }
 
@@ -3643,6 +3645,11 @@ void Engine::dumpOutputFiles() {
         }
     }
 
+    if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
+        uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
+        m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
+    }
+
     // 1. Dump LDR PNG
     if (!m_config.dump_frame_path.empty()) {
         VkDeviceSize bufferSize = m_config.width * m_config.height * 4;
@@ -3774,6 +3781,7 @@ FrameStats Engine::getStats() const {
     stats.height = m_config.height;
     stats.spp = m_config.spp;
     stats.total_frames = m_totalFramesRendered;
+    stats.total_samples = m_accumulatedSamples;
     stats.validation_errors = m_context->getValidationErrors();
 
     stats.current_frame_time_ms = m_lastFrameTimeMs;
@@ -3810,7 +3818,43 @@ FrameStats Engine::getStats() const {
         default: stats.mgpu_mode_str = "single_gpu"; break;
     }
 
+    if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+        stats.mgpu_transfer_mode_str = m_mgpu->getTransferModeString();
+    }
+
     stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "rtp";
+
+    if (m_config.pipeline_type == PipelineType::Wavefront) {
+        switch (m_config.wavefront_sort_mode) {
+            case WavefrontSortMode::Archetype: stats.wavefront_stats.sort_mode_str = "archetype"; break;
+            case WavefrontSortMode::BDA: stats.wavefront_stats.sort_mode_str = "bda"; break;
+            case WavefrontSortMode::Dual: stats.wavefront_stats.sort_mode_str = "dual"; break;
+            default: stats.wavefront_stats.sort_mode_str = "none"; break;
+        }
+        if (m_lastWavefrontProfile.valid) {
+            stats.wavefront_stats.valid = true;
+            stats.wavefront_stats.total_ms = m_lastWavefrontProfile.totalMs;
+            stats.wavefront_stats.classify_ms = m_lastWavefrontProfile.classifyMs;
+            stats.wavefront_stats.resolve_ms = m_lastWavefrontProfile.resolveMs;
+            stats.wavefront_stats.queue_memory_footprint_mb = m_lastWavefrontProfile.queueMemoryFootprintMb;
+            stats.wavefront_stats.estimated_vram_traffic_mb = m_lastWavefrontProfile.estimatedVramTrafficMb;
+            for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                FrameStats::BounceProfile bProf{};
+                bProf.bounce = bp.bounce;
+                bProf.shade_ms = bp.shadeMs;
+                bProf.shadow_ms = bp.shadowMs;
+                bProf.intersect_ms = bp.intersectMs;
+                bProf.active_rays = bp.activeCount;
+                bProf.shadow_rays = bp.shadowCount;
+                bProf.next_rays = bp.nextCount;
+                bProf.diff_rays = bp.diffCount;
+                bProf.diel_rays = bp.dielCount;
+                bProf.cond_rays = bp.condCount;
+                bProf.comp_rays = bp.compCount;
+                stats.wavefront_stats.bounces.push_back(bProf);
+            }
+        }
+    }
 
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;

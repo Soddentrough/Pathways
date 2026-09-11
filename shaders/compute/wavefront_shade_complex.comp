@@ -240,12 +240,6 @@ void main() {
                     metallic = clamp(metallic, 0.0, 1.0);
                     float alphaRoughness = roughness * roughness;
 
-                    float ao = 1.0;
-                    if (mat.occlusionTex > 0u && mat.occlusionTex <= 64u) {
-                        float occSample = texture(sceneTextures[mat.occlusionTex - 1u], hitUv).r;
-                        ao = 1.0 + mat.occlusionStrength * (occSample - 1.0);
-                    }
-
                     float transmission = mat.transmission;
                     if (mat.transmissionTex > 0u && mat.transmissionTex <= 64u) {
                         transmission *= texture(sceneTextures[mat.transmissionTex - 1u], hitUv).r;
@@ -282,6 +276,7 @@ void main() {
                         clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
                     }
 
+                    // Volumetric Beer-Lambert absorption (physical ray traversal distance)
                     float mediumDist = !frontFace ? hitT : 0.0;
                     if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
                         vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
@@ -351,7 +346,7 @@ void main() {
                             float misWeight = 1.0;
                             if (uint(light.position.w) == 0u) {
                                 float lightPdfEff = lightPdf * lightSelectPdf;
-                                misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + bsdfPdf * bsdfPdf, 1e-6);
+                                misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                             }
 
                             vec3 H = normalize(V + lightDir);

@@ -240,12 +240,6 @@ void main() {
                     metallic = clamp(metallic, 0.0, 1.0);
                     float alphaRoughness = roughness * roughness;
 
-                    float ao = 1.0;
-                    if (mat.occlusionTex > 0u && mat.occlusionTex <= 64u) {
-                        float occSample = texture(sceneTextures[mat.occlusionTex - 1u], hitUv).r;
-                        ao = 1.0 + mat.occlusionStrength * (occSample - 1.0);
-                    }
-
                     float transmission = mat.transmission;
                     if (mat.transmissionTex > 0u && mat.transmissionTex <= 64u) {
                         transmission *= texture(sceneTextures[mat.transmissionTex - 1u], hitUv).r;
@@ -283,7 +277,7 @@ void main() {
                         clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
                     }
 
-                    // Volumetric Beer-Lambert absorption
+                    // Volumetric Beer-Lambert absorption (physical ray traversal distance)
                     float mediumDist = !frontFace ? hitT : 0.0;
                     if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
                         vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
@@ -391,7 +385,8 @@ void main() {
                                     float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
                                     float clearcoatPdf = (clearcoat > 0.001 && NcDotL > 0.0) ? ((Dc * NcDotH) / max(4.0 * VDotHc, 1e-4)) : 0.0;
                                     float bsdfPdf = diffProb * diffPdf + baseSpecProb * specPdf + clearcoatProb * clearcoatPdf;
-                                    misWeightLight = lightPdf / (lightPdf + bsdfPdf);
+                                    float lightPdfTotal = lightPdf * lightSelectPdf;
+                                    misWeightLight = lightPdfTotal / (lightPdfTotal + bsdfPdf);
                                 }
 
                                 vec3 unshadowed = (throughput * lightEmission * brdf * NdotL * misWeightLight) / (max(lightPdf, 1e-4) * lightSelectPdf);

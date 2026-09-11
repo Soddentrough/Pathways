@@ -126,7 +126,8 @@ struct RayState {
 #define NUM_MATERIAL_ARCHETYPES       4u
 
 uint getMaterialArchetype(Material mat) {
-    if (mat.clearcoat > 0.001 || mat.alphaMode != 0u || mat.type == 3u /* emissive */) {
+    if (mat.clearcoat > 0.001 || mat.alphaMode != 0u || mat.type == 3u /* emissive */ ||
+        mat.emissiveTex > 0u || length(mat.emissive.rgb) > 0.001) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
     if (mat.transmission > 0.0 || mat.type == 2u /* dielectric */) {

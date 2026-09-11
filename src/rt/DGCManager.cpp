@@ -3,6 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <array>
 
 namespace pathways {
 

@@ -5,6 +5,7 @@
 #include "cgltf.h"
 #include "stb_image.h"
 
+#include <algorithm>
 #include <glm/gtc/type_ptr.hpp>
 #include <filesystem>
 #include <cstring>
@@ -167,39 +168,6 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             }
             if (gpuMat.transmission > 0.05f) {
                 gpuMat.type = MATERIAL_DIELECTRIC;
-            }
-        }
-
-        // Transmission / Glass fallbacks for glTF models without explicit KHR_materials_transmission
-        std::string matNameLower = mat.name ? mat.name : "";
-        for (auto& c : matNameLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-        if (!mat.has_transmission) {
-            // Check alpha mode blend with partial opacity (typical glass encoding in basic glTF)
-            if (mat.alpha_mode == cgltf_alpha_mode_blend && gpuMat.albedo.a < 0.99f) {
-                gpuMat.transmission = 1.0f - gpuMat.albedo.a;
-                if (gpuMat.transmission > 0.05f) {
-                    gpuMat.type = MATERIAL_DIELECTRIC;
-                    if (gpuMat.ior < 1.05f) gpuMat.ior = 1.5f;
-                }
-            }
-            // Check name hints for dielectric glass
-            else if (matNameLower.find("glass") != std::string::npos ||
-                     matNameLower.find("window") != std::string::npos ||
-                     matNameLower.find("bottle") != std::string::npos ||
-                     matNameLower.find("pane") != std::string::npos) {
-                gpuMat.transmission = 1.0f;
-                gpuMat.type = MATERIAL_DIELECTRIC;
-                if (gpuMat.ior < 1.05f) gpuMat.ior = 1.5f;
-                gpuMat.roughness = std::min(gpuMat.roughness, 0.05f);
-            }
-            // Check name hints for metallic conductors (mirror, chrome, stainless)
-            else if (matNameLower.find("mirror") != std::string::npos ||
-                     matNameLower.find("chrome") != std::string::npos ||
-                     matNameLower.find("stainless") != std::string::npos) {
-                gpuMat.metallic = 1.0f;
-                gpuMat.roughness = std::min(gpuMat.roughness, 0.05f);
-                gpuMat.type = MATERIAL_METALLIC;
             }
         }
 

@@ -33,7 +33,6 @@ public:
                       const std::vector<char>& intersectCode,
                       const std::vector<char>& shadeCode,
                       const std::vector<char>& shadowCode,
-                      const std::vector<char>& resolveCode,
                       const std::vector<char>& shadeDiffuseCode = {},
                       const std::vector<char>& shadeDielectricCode = {},
                       const std::vector<char>& shadeConductorCode = {},
@@ -63,7 +62,34 @@ public:
                      uint32_t spp, uint32_t maxBounces,
                      const WavefrontSceneData& sceneData);
 
+    struct BounceProfilingData {
+        uint32_t bounce = 0;
+        double shadeMs = 0.0;
+        double shadowMs = 0.0;
+        double intersectMs = 0.0;
+        uint32_t activeCount = 0;
+        uint32_t shadowCount = 0;
+        uint32_t nextCount = 0;
+        uint32_t diffCount = 0;
+        uint32_t dielCount = 0;
+        uint32_t condCount = 0;
+        uint32_t compCount = 0;
+    };
+
+    struct WavefrontProfilingData {
+        bool valid = false;
+        double totalMs = 0.0;
+        double classifyMs = 0.0;
+        double resolveMs = 0.0;
+        std::vector<BounceProfilingData> bounces;
+        double queueMemoryFootprintMb = 0.0;
+        double estimatedVramTrafficMb = 0.0;
+        uint32_t sortMode = 0;
+    };
+
     void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+    WavefrontProfilingData getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+    double getQueueMemoryFootprintMb() const;
 
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
     DGCManager* getDGCManager() const { return m_dgcManager.get(); }
@@ -77,7 +103,6 @@ private:
                          const std::vector<char>& intersectCode,
                          const std::vector<char>& shadeCode,
                          const std::vector<char>& shadowCode,
-                         const std::vector<char>& resolveCode,
                          const std::vector<char>& shadeDiffuseCode,
                          const std::vector<char>& shadeDielectricCode,
                          const std::vector<char>& shadeConductorCode,
@@ -103,7 +128,7 @@ private:
     std::unique_ptr<Buffer> m_rayHitQueue;    // 16B RayHit
     std::unique_ptr<Buffer> m_shadowQueue;    // 48B PackedShadowRay
     std::unique_ptr<Buffer> m_queueCounters;
-    std::unique_ptr<Buffer> m_indirectArgs;
+    std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs; // Double-buffered per in-flight frame slot
     std::unique_ptr<Buffer> m_dgcStream;
 
     // Descriptors
@@ -118,13 +143,13 @@ private:
     VkPipeline m_intersectPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
-    VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffusePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDielectricPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeConductorPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<bool, 2> m_hasRecordedSlot = { false, false };
 
     std::unique_ptr<DGCManager> m_dgcManager;
 };

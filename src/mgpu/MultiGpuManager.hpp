@@ -11,6 +11,7 @@
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
+#include <array>
 #include <string>
 #include <future>
 #include <thread>
@@ -154,15 +155,41 @@ public:
     // Wait for secondary GPU to finish execution of a specific slot (discarding old in-flight work)
     void waitSecondarySlot(uint32_t slot);
 
-    bool isZeroCopyActive() const { return m_useZeroCopyHost; }
+    enum class InterGpuTransferMode {
+        P2P_Direct_BAR,       // Linux DMA-BUF direct PCIe P2P
+        ZeroCopy_HostMemory,  // VK_EXT_external_memory_host (fallback)
+        CpuStaging            // CPU memcpy staging (fallback)
+    };
+
+    InterGpuTransferMode getTransferMode() const { return m_transferMode; }
+    const char* getTransferModeString() const {
+        switch (m_transferMode) {
+            case InterGpuTransferMode::P2P_Direct_BAR: return "P2P Direct BAR (DMA-BUF)";
+            case InterGpuTransferMode::ZeroCopy_HostMemory: return "Zero-Copy Host Memory (external_memory_host)";
+            case InterGpuTransferMode::CpuStaging: return "CPU Staging Copy";
+        }
+        return "Unknown";
+    }
+    bool isP2PDirectBarActive() const { return m_transferMode == InterGpuTransferMode::P2P_Direct_BAR; }
+    bool isZeroCopyActive() const { return m_transferMode != InterGpuTransferMode::CpuStaging; }
     bool isCrossGpuSyncActive() const { return m_useCrossGpuSync; }
     VkSemaphore getImportedSemaphore(uint32_t slot = 0) const {
         if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
         return m_devices[0]->primImportedSemaphores[slot % GpuDeviceNode::NUM_IN_FLIGHT];
     }
     static constexpr uint32_t NUM_SHARED_BUFFERS = 2;
-    VkBuffer getPrimarySharedBuffer(uint32_t slot = 0) const { return m_sharedBufferPrimary[slot % NUM_SHARED_BUFFERS]; }
-    VkBuffer getSecondarySharedBuffer(uint32_t slot = 0) const { return m_sharedBufferSecondary[slot % NUM_SHARED_BUFFERS]; }
+    VkBuffer getPrimarySharedBuffer(uint32_t slot = 0) const {
+        if (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR) {
+            return m_p2pBufferPrimary[slot % NUM_SHARED_BUFFERS];
+        }
+        return m_sharedBufferPrimary[slot % NUM_SHARED_BUFFERS];
+    }
+    VkBuffer getSecondarySharedBuffer(uint32_t slot = 0) const {
+        if (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR) {
+            return m_p2pBufferSecondary[slot % NUM_SHARED_BUFFERS];
+        }
+        return m_sharedBufferSecondary[slot % NUM_SHARED_BUFFERS];
+    }
     void* getSharedHostPointer(uint32_t slot = 0) const { return m_sharedHostPtr[slot % NUM_SHARED_BUFFERS]; }
     size_t getSharedBufferSize() const { return m_sharedBufferSize; }
 
@@ -199,6 +226,8 @@ private:
     void destroySecondaryTaaResources(GpuDeviceNode* secNode);
     void destroySecondaryTaaPipelines(GpuDeviceNode* secNode);
     void updateSecondaryTaaDescriptors(GpuDeviceNode* secNode);
+    bool initSharedP2PBuffer(VkDeviceSize bufferSize);
+    void destroySharedP2PBuffer();
     void initSharedHostBuffer(VkDeviceSize bufferSize);
     void destroySharedHostBuffer();
     std::vector<char> loadShaderSPIRV(const std::string& filename);
@@ -222,7 +251,15 @@ private:
     std::array<bool, 2> m_slotSubmitted = { false, false };
     bool m_workerBusy = false;
 
-    // Zero-copy host allocation imported into both GPUs via VK_EXT_external_memory_host (Double-buffered)
+    InterGpuTransferMode m_transferMode = InterGpuTransferMode::CpuStaging;
+
+    // Direct P2P Device-Local BAR Buffers (Double-buffered via Linux DMA-BUF)
+    std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_p2pMemSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, NUM_SHARED_BUFFERS> m_p2pBufferSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_p2pMemPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, NUM_SHARED_BUFFERS> m_p2pBufferPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+    // Zero-copy host allocation imported into both GPUs via VK_EXT_external_memory_host (Double-buffered fallback)
     std::array<void*, NUM_SHARED_BUFFERS> m_sharedHostPtr = { nullptr, nullptr };
     size_t m_sharedBufferSize = 0;
     std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_sharedMemPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };

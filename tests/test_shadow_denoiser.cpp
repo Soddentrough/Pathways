@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <glm/glm.hpp>
 
 using namespace pathways;

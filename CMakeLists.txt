@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.10.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.11.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,7 +137,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
     ${SHADER_DIR}/compute/wavefront_shade_complex.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
-    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -317,6 +316,32 @@ if(UNIX)
     target_link_libraries(test_taa PRIVATE m)
 endif()
 add_test(NAME TemporalAntiAliasing COMMAND test_taa)
+
+if(UNIX)
+    # P2P Direct BAR DMA-BUF Unit Test Target
+    add_executable(test_p2p_direct_bar
+        tests/test_p2p_direct_bar.cpp
+    )
+    target_link_libraries(test_p2p_direct_bar PRIVATE Vulkan::Vulkan)
+    add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
+endif()
+
+# Pipeline Comparison & Telemetry Unit Test Target
+add_executable(test_pipeline_comparison
+    tests/test_pipeline_comparison.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+    src/utils/ImageDumper.cpp
+)
+target_include_directories(test_pipeline_comparison PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_pipeline_comparison PRIVATE m Threads::Threads ZLIB::ZLIB)
+endif()
+add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
+
 
 
 # ==============================================================================

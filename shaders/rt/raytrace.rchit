@@ -533,6 +533,14 @@ void main() {
         emissive *= texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
     }
 
+    // Volumetric Beer-Lambert absorption (physical ray traversal distance)
+    float mediumDist = !frontFace ? gl_HitTEXT : 0.0;
+    vec3 transmittance = vec3(1.0);
+    if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
+        vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+        transmittance = exp(-sigma_a * mediumDist);
+    }
+
     bool enableDirect = (ubo.flags & (1 << 0)) != 0;
     bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
     bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
@@ -583,7 +591,7 @@ void main() {
                 emptyR.pad = 0u;
                 currentReservoirs[prd.pad] = emptyR;
             }
-            prd.radiance = accumRadiance;
+            prd.radiance = accumRadiance * transmittance;
             prd.packedThroughputRG = 0u;
             uint flags = 1u; // hit = true, isDelta = false
             prd.packedThroughputB_Flags = flags << 16u;
@@ -1021,6 +1029,8 @@ void main() {
         currentReservoirs[prd.pad] = emptyR;
     }
 
+    accumRadiance *= transmittance;
+
     // 3. BSDF Sampling for Next Direction
     vec3 nextDirection;
     vec3 throughputFactor;
@@ -1052,9 +1062,9 @@ void main() {
                 imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
             }
             prd.radiance = accumRadiance;
-            prd.packedThroughputRG = packHalf2x16(baseColor.rg);
+            prd.packedThroughputRG = packHalf2x16(baseColor.rg * transmittance.rg);
             uint flags = 1u | 2u; // hit = true, isDelta = true
-            prd.packedThroughputB_Flags = (packHalf2x16(vec2(baseColor.b, 0.0)) & 0xFFFFu) | (flags << 16u);
+            prd.packedThroughputB_Flags = (packHalf2x16(vec2(baseColor.b * transmittance.b, 0.0)) & 0xFFFFu) | (flags << 16u);
             prd.packedNextDir = packOct32(normalize(nextDirection));
             prd.lastBsdfPdf = 1.0;
             prd.pad = 0u;
@@ -1123,9 +1133,9 @@ void main() {
     prd.radiance = accumRadiance;
     prd.nextOrigin = hitPoint + hitNormal * EPSILON;
     prd.packedNextDir = packOct32(normalize(nextDirection));
-    prd.packedThroughputRG = packHalf2x16(throughputFactor.rg);
+    prd.packedThroughputRG = packHalf2x16(throughputFactor.rg * transmittance.rg);
     uint flags = 1u; // hit = true, isDelta = false
-    prd.packedThroughputB_Flags = (packHalf2x16(vec2(throughputFactor.b, 0.0)) & 0xFFFFu) | (flags << 16u);
+    prd.packedThroughputB_Flags = (packHalf2x16(vec2(throughputFactor.b * transmittance.b, 0.0)) & 0xFFFFu) | (flags << 16u);
     prd.lastBsdfPdf = evalBSDFPdf(V, normalize(nextDirection), hitNormal, clearcoatNormal, alphaRoughness, clearcoatAlpha, clearcoatProb, baseSpecProb, clearcoat);
     prd.pad = 0u;
 }

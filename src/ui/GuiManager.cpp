@@ -393,6 +393,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (stats.secondary_gpu_clock_mhz > 0 || stats.secondary_gpu_temp_c > 0) {
                     ImGui::Text("  Sensors: %u MHz | %u C", stats.secondary_gpu_clock_mhz, stats.secondary_gpu_temp_c);
                 }
+                if (!stats.mgpu_transfer_mode_str.empty() && stats.mgpu_transfer_mode_str != "N/A") {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.7f, 1.0f), "  Link:    %s", stats.mgpu_transfer_mode_str.c_str());
+                }
             }
 
             if (ImGui::SmallButton("Re-check PCIe Status")) {

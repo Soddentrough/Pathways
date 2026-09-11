@@ -35,6 +35,7 @@ struct FrameStats {
     std::string secondary_arch_name = "";
     std::string mgpu_interconnect_str = "PCIe 5.0 x16 (32 GT/s / ~64 GB/s Full-Duplex)";
     std::string mgpu_mode_str = "off";
+    std::string mgpu_transfer_mode_str = "N/A";
     bool is_mgpu_active = false;
     bool visualize_mgpu_split = false;
 
@@ -127,6 +128,33 @@ struct FrameStats {
     double secondary_gpu_time_ms = 0.0;
     double tonemap_time_ms = 0.0;
     double pcie_transfer_time_ms = 0.0;
+
+    // Wavefront Sub-Pass & Bounce Breakdown
+    struct BounceProfile {
+        uint32_t bounce = 0;
+        double shade_ms = 0.0;
+        double shadow_ms = 0.0;
+        double intersect_ms = 0.0;
+        uint32_t active_rays = 0;
+        uint32_t shadow_rays = 0;
+        uint32_t next_rays = 0;
+        uint32_t diff_rays = 0;
+        uint32_t diel_rays = 0;
+        uint32_t cond_rays = 0;
+        uint32_t comp_rays = 0;
+    };
+
+    struct WavefrontProfilingStats {
+        bool valid = false;
+        double total_ms = 0.0;
+        double classify_ms = 0.0;
+        double resolve_ms = 0.0;
+        std::vector<BounceProfile> bounces;
+        double queue_memory_footprint_mb = 0.0;
+        double estimated_vram_traffic_mb = 0.0;
+        std::string sort_mode_str = "none";
+    };
+    WavefrontProfilingStats wavefront_stats;
 
     // Tallied unique configurations breakdown
     struct ConfigTallySummary {

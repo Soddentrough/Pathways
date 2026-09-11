@@ -1,5 +1,6 @@
 #include "core/Config.hpp"
 #include "core/Logger.hpp"
+#include <algorithm>
 #include <iostream>
 #include <cstring>
 #include <cctype>

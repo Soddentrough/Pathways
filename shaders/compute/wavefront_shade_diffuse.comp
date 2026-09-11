@@ -210,17 +210,26 @@ void main() {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
-            vec3 diffuseColor = baseColor.rgb;
-            if (mat.occlusionTex > 0u && mat.occlusionTex <= 64u) {
-                float occSample = texture(sceneTextures[mat.occlusionTex - 1u], hitUv).r;
-                diffuseColor *= (1.0 + mat.occlusionStrength * (occSample - 1.0));
+            vec3 emissive = mat.emissive.rgb;
+            if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
+                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
+            if (length(emissive) > 1e-3) {
+                accumRadiance += throughput * emissive;
+            }
+
+            vec3 diffuseColor = baseColor.rgb;
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
 
+            bool pathTerminated = false;
+            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
+                pathTerminated = true;
+            }
+
             // Direct Lighting (1-candidate stochastic NEE for diffuse)
-            if (enableDirect && pc.numLights > 0u) {
+            if (!pathTerminated && enableDirect && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
                 if (pc.numLights > 1u) {
@@ -272,7 +281,7 @@ void main() {
                     float misWeight = 1.0;
                     if (uint(light.position.w) == 0u) {
                         float lightPdfEff = lightPdf * lightSelectPdf;
-                        misWeight = (lightPdfEff * lightPdfEff) / max(lightPdfEff * lightPdfEff + bsdfPdf * bsdfPdf, 1e-6);
+                        misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                     }
 
                     vec3 diffuseBrdf = diffuseColor * INV_PI;
@@ -288,10 +297,10 @@ void main() {
             }
 
             // Indirect Bounce: Cosine-weighted hemisphere sampling
-            bool pathTerminated = false;
-            if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
-                pathTerminated = true;
-            } else {
+            if (!pathTerminated) {
+                if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
+                    pathTerminated = true;
+                } else {
                 vec3 nextDirection = sampleCosineHemisphere(hitNormal, seed);
                 vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
                 throughput *= diffuseColor;
@@ -317,6 +326,7 @@ void main() {
                     nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
                 }
             }
+        }
 
             if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
