@@ -39,6 +39,8 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -420,7 +422,37 @@ void main() {
                         vec3 unshadowed = throughput * secDirectL;
 
                         if (enableReSTIR_GI && pc.currentBounce == 1u) {
-                            vec3 incomingRad = emissive + secDirectL;
+                            bool occluded = false;
+                            if (length(secDirectL) > 1e-4) {
+                                rayQueryEXT rq;
+                                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+                                                      hitPoint + hitNormal * EPSILON, EPSILON, lightDir, lightDist - EPSILON * 2.0);
+                                while (rayQueryProceedEXT(rq)) {
+                                    if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+                                    uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                                    Material m = materials[triangles[triIdx].materialId];
+                                    if (m.type == 3u || m.type == 2u || m.transmission > 0.05) continue;
+                                    rayQueryConfirmIntersectionEXT(rq);
+                                    rayQueryTerminateEXT(rq);
+                                }
+                                if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                                    occluded = true;
+                                }
+                                if (!occluded && pc.numSpheres > 0u) {
+                                    for (uint si = 0; si < pc.numSpheres; ++si) {
+                                        if (materials[spheres[si].materialId].type == 3u ||
+                                            materials[spheres[si].materialId].type == 2u ||
+                                            materials[spheres[si].materialId].transmission > 0.05) continue;
+                                        float spT;
+                                        vec3 spNorm;
+                                        if (intersectSphere(hitPoint + hitNormal * EPSILON, lightDir, spheres[si], EPSILON, lightDist - EPSILON * 2.0, spT, spNorm)) {
+                                            occluded = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            vec3 incomingRad = emissive + (occluded ? vec3(0.0) : secDirectL);
                             storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), max(hitT, 1e-4), incomingRad, hitNormal);
                             giRecorded = true;
                         } else if (length(unshadowed) > 1e-5) {

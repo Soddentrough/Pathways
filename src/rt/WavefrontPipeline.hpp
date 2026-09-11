@@ -101,6 +101,7 @@ public:
         bool valid = false;
         double totalMs = 0.0;
         double classifyMs = 0.0;
+        double restirGiMs = 0.0;
         double resolveMs = 0.0;
         std::vector<BounceProfilingData> bounces;
         double queueMemoryFootprintMb = 0.0;

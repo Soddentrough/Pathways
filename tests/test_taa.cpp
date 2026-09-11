@@ -61,19 +61,31 @@ int main() {
         check_true(c2.enable_atrous, "--atrous enabled");
         check_true(c2.atrous_passes == 4, "--atrous-passes sets count");
 
-        // Test default ReSTIR state (enabled by default) and --no-restir / deprecated legacy flags
+        // Test default ReSTIR state (disabled by default for pure reference Wavefront path tracing) and CLI flags
         Config cDefault;
-        check_true(cDefault.enable_restir_di, "ReSTIR DI enabled by default");
+        check_true(!cDefault.enable_restir_di, "ReSTIR DI disabled by default (pure reference Wavefront)");
+        check_true(!cDefault.enable_restir_gi, "ReSTIR GI disabled by default");
+
+        const char* argvRestir[] = { "pathways", "--restir" };
+        Config cRestir = Config::parse(2, const_cast<char**>(argvRestir));
+        check_true(cRestir.enable_restir_di, "--restir enables ReSTIR DI");
+        check_true(cRestir.enable_restir_gi, "--restir enables ReSTIR GI");
 
         const char* argv3[] = { "pathways", "--taa", "--no-restir", "--shadow-denoiser" };
         Config c3 = Config::parse(4, const_cast<char**>(argv3));
         check_true(!c3.enable_taa, "Deprecated TAA remains disabled");
-        check_true(!c3.enable_restir_di, "--no-restir disables ReSTIR");
+        check_true(!c3.enable_restir_di, "--no-restir disables ReSTIR DI");
+        check_true(!c3.enable_restir_gi, "--no-restir disables ReSTIR GI");
         check_true(!c3.enable_shadow_denoiser, "Deprecated Shadow Denoiser remains disabled");
 
         const char* argv4[] = { "pathways", "--no-restir-di" };
         Config c4 = Config::parse(2, const_cast<char**>(argv4));
-        check_true(!c4.enable_restir_di, "--no-restir-di also disables ReSTIR");
+        check_true(!c4.enable_restir_di, "--no-restir-di disables ReSTIR DI");
+
+        const char* argv5[] = { "pathways", "--restir-gi" };
+        Config c5 = Config::parse(2, const_cast<char**>(argv5));
+        check_true(c5.enable_restir_gi, "--restir-gi enables ReSTIR GI");
+        check_true(!c5.enable_restir_di, "--restir-gi leaves ReSTIR DI disabled");
 
         std::cout << "  -> CLI flags, A-Trous configuration, and ReSTIR flags successfully verified." << std::endl;
     }

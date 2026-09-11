@@ -114,6 +114,7 @@ int main() {
 
         stats.wavefront_stats.valid = true;
         stats.wavefront_stats.classify_ms = 0.175;
+        stats.wavefront_stats.restir_gi_ms = 0.250;
         stats.wavefront_stats.queue_memory_footprint_mb = 1233.99;
         stats.wavefront_stats.estimated_vram_traffic_mb = 861.29;
 
@@ -129,6 +130,17 @@ int main() {
         bp0.comp_rays = 39976;
         stats.wavefront_stats.bounces.push_back(bp0);
 
+        FrameStats::ConfigTallySummary cfgSummary{};
+        cfgSummary.label = "Test Configuration";
+        cfgSummary.frame_count = 100;
+        cfgSummary.avg_frame_time_ms = 12.5;
+        cfgSummary.pipeline_stages.is_wavefront = true;
+        cfgSummary.pipeline_stages.classify_ms = 0.175;
+        cfgSummary.pipeline_stages.restir_gi_ms = 0.250;
+        cfgSummary.pipeline_stages.bounces.push_back({0, 0.575, 0.151, 0.535, 1.261});
+        cfgSummary.pipeline_stages.tonemap_ms = 0.120;
+        stats.configurations_breakdown.push_back(cfgSummary);
+
         std::string testJsonPath = "output/test_telemetry_dump.json";
         std::error_code ec;
         std::filesystem::create_directories("output", ec);
@@ -140,8 +152,10 @@ int main() {
         std::ifstream inFile(testJsonPath);
         std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
         check_true(content.find("wavefront_profiler_breakdown") != std::string::npos, "JSON contains wavefront_profiler_breakdown");
+        check_true(content.find("restir_gi_time_ms") != std::string::npos, "JSON contains restir_gi_time_ms");
         check_true(content.find("estimated_vram_traffic_mb") != std::string::npos, "JSON contains estimated_vram_traffic_mb");
         check_true(content.find("dielectric_rays") != std::string::npos, "JSON contains dielectric_rays");
+        check_true(content.find("pipeline_stages_ms") != std::string::npos, "JSON contains pipeline_stages_ms");
 
         // Clean up test file
         std::filesystem::remove(testJsonPath, ec);

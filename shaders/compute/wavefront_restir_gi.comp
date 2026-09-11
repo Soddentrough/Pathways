@@ -43,6 +43,8 @@ void main() {
     bool enableReSTIR_GI = (ubo.flags & (1u << 22)) != 0u;
     if (!enableReSTIR_GI || pc.maxBounces <= 1u) return;
 
+    bool cameraMoved = (ubo.flags & (1u << 23)) != 0u;
+
     // 1. Retrieve Primary Surface Geometry and Albedo from rawGISamples buffer
     uvec4 rawD1 = rawGISamples[pixelIndex];
     if (rawD1.w != ubo.frameIndex + 1u) return; // Discard invalid or stale sample from previous frame / non-diffuse
@@ -98,7 +100,7 @@ void main() {
         winnerTarget = p_hat;
     }
 
-    // 3. Temporal Resampling (History Reprojection + Jacobian Shift)
+    // 3. Temporal Resampling (History Reprojection onto previous frame)
     vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPoint, 1.0);
     if (prevClip.w > 0.0) {
         vec2 prevNDC = prevClip.xy / prevClip.w;
@@ -115,58 +117,42 @@ void main() {
                 unpackGeom(R_prev.primaryGeom, prevNorm, prevDepth);
 
                 float normDot = dot(primaryNormal, prevNorm);
-                float depthDiff = abs(primaryDepth - prevDepth) / max(primaryDepth, 1e-3);
+                bool depthValid = !cameraMoved ? (abs(primaryDepth - prevDepth) / max(primaryDepth, 1e-3) < 0.10) : (normDot > 0.95);
 
-                if (normDot > 0.90 && depthDiff < 0.10) {
+                if (normDot > 0.90 && depthValid) {
                     vec3 histDir = unpackOct32(R_prev.packedDir);
                     vec3 histRad;
                     vec3 histNormS;
                     unpackRadianceAndNorm(R_prev.packedRadRG, R_prev.packedRadB_normS, histRad, histNormS);
 
-                    vec3 w_shifted;
-                    float dist_shifted;
-                    float J;
+                    // For the same world surface point across frames, the direction to secondary hit is identical
+                    vec3 w_shifted = histDir;
+                    float dist_shifted = R_prev.hitDist;
+                    float J = 1.0;
 
-                    if (prevPx == pixelCoord.x && prevPy == pixelCoord.y && abs(primaryDepth - prevDepth) < 0.05) {
-                        w_shifted = histDir;
-                        dist_shifted = R_prev.hitDist;
-                        J = 1.0;
-                    } else if (R_prev.hitDist >= 1e4) {
-                        w_shifted = histDir;
-                        dist_shifted = R_prev.hitDist;
-                        J = 1.0;
-                    } else {
-                        // Reconstruct historical primary hit position x_prev
-                        vec2 h_uv = (vec2(prevPx, prevPy) + vec2(0.5)) / vec2(float(pc.width), float(pc.height));
-                        vec2 h_d = h_uv * 2.0 - 1.0;
-                        vec4 h_target = s_invVP * vec4(h_d.x, h_d.y, 1.0, 1.0);
-                        vec3 x_prev = ubo.position.xyz + normalize(h_target.xyz) * prevDepth;
-                        J = evalGIJacobian(primaryHitPoint, x_prev, histDir, R_prev.hitDist, histNormS, w_shifted, dist_shifted);
-                    }
+                    float p_hat_hist = evalGITarget(histRad, primaryAlbedo, primaryNormal, w_shifted);
+                    // When camera is moving, clamp historical sample weight to 2.0 to eliminate trailing/ghosting
+                    float maxHistM = cameraMoved ? 2.0 : 20.0;
+                    float histM = min(R_prev.M, maxHistM);
+                    float w_temp = p_hat_hist * R_prev.W * histM * J;
 
-                    if (J > 0.0) {
-                        float p_hat_hist = evalGITarget(histRad * J, primaryAlbedo, primaryNormal, w_shifted);
-                        float histM = min(R_prev.M, 20.0);
-                        float w_temp = p_hat_hist * R_prev.W * histM;
+                    R.wSum += w_temp;
+                    R.M += histM;
 
-                        R.wSum += w_temp;
-                        R.M += histM;
-
-                        if (randFloat(seed) * R.wSum < w_temp) {
-                            R.packedDir = packOct32(w_shifted);
-                            R.hitDist = dist_shifted;
-                            packRadianceAndNorm(histRad * J, histNormS, R.packedRadRG, R.packedRadB_normS);
-                            winnerRad = histRad * J;
-                            winnerDir = w_shifted;
-                            winnerTarget = p_hat_hist;
-                        }
+                    if (randFloat(seed) * R.wSum < w_temp) {
+                        R.packedDir = packOct32(w_shifted);
+                        R.hitDist = dist_shifted;
+                        packRadianceAndNorm(histRad, histNormS, R.packedRadRG, R.packedRadB_normS);
+                        winnerRad = histRad;
+                        winnerDir = w_shifted;
+                        winnerTarget = p_hat_hist;
                     }
                 }
             }
         }
     }
 
-    // 4. Spatial Resampling (Cross-Bilateral Neighbor Pooling)
+    // 4. Spatial Resampling (Cross-Bilateral Neighbor Pooling from Current Frame)
     bool enableSpatial = (ubo.flags & (1u << 7)) != 0u;
     if (enableSpatial) {
         const ivec2 kSpatialOffsets[8] = ivec2[8](
@@ -178,54 +164,60 @@ void main() {
         ivec2 nbrCoord = clamp(pixelCoord + offset, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
         uint nbrIdx = uint(nbrCoord.y * int(pc.width) + nbrCoord.x);
 
-            ReservoirGI R_nbr = historyGIReservoirs[nbrIdx];
-            if (R_nbr.primaryGeom != 0u && R_nbr.M > 0.0 && R_nbr.hitDist > 0.0) {
-                vec3 nbrNorm;
-                float nbrDepth;
-                unpackGeom(R_nbr.primaryGeom, nbrNorm, nbrDepth);
+        uvec4 nbrRawD1 = rawGISamples[nbrIdx];
+        if (nbrRawD1.w == ubo.frameIndex + 1u) {
+            vec3 nbrNormal;
+            float nbrDepth;
+            unpackGeom(nbrRawD1.x, nbrNormal, nbrDepth);
 
-                float normDot = dot(primaryNormal, nbrNorm);
-                float depthDiff = abs(primaryDepth - nbrDepth) / max(primaryDepth, 1e-3);
+            float normDot = dot(primaryNormal, nbrNormal);
+            float depthDiff = abs(primaryDepth - nbrDepth) / max(primaryDepth, 1e-3);
 
-                if (normDot > 0.90 && depthDiff < 0.10) {
-                    vec3 nbrDir = unpackOct32(R_nbr.packedDir);
+            if (normDot > 0.90 && depthDiff < 0.10) {
+                uvec4 nbrRawD0 = rawGISamples[pc.width * pc.height + nbrIdx];
+                float nbrHitDist = uintBitsToFloat(nbrRawD0.y);
+
+                if (nbrHitDist > 0.0) {
+                    vec3 nbrDir = unpackOct32(nbrRawD0.x);
                     vec3 nbrRad;
                     vec3 nbrNormS;
-                    unpackRadianceAndNorm(R_nbr.packedRadRG, R_nbr.packedRadB_normS, nbrRad, nbrNormS);
+                    unpackRadianceAndNorm(nbrRawD0.z, nbrRawD0.w, nbrRad, nbrNormS);
 
                     vec3 w_shifted;
                     float dist_shifted;
                     float J;
 
-                    if (R_nbr.hitDist >= 1e4) {
+                    if (nbrHitDist >= 1e4) {
                         w_shifted = nbrDir;
-                        dist_shifted = R_nbr.hitDist;
+                        dist_shifted = nbrHitDist;
                         J = 1.0;
                     } else {
-                        // Reconstruct neighbor primary hit position x_nbr
+                        // Reconstruct neighbor primary hit position x_nbr in CURRENT camera space
                         vec2 n_uv = (vec2(nbrCoord) + vec2(0.5)) / vec2(float(pc.width), float(pc.height));
                         vec2 n_d = n_uv * 2.0 - 1.0;
                         vec4 n_target = s_invVP * vec4(n_d.x, n_d.y, 1.0, 1.0);
                         vec3 x_nbr = ubo.position.xyz + normalize(n_target.xyz) * nbrDepth;
-                        J = evalGIJacobian(primaryHitPoint, x_nbr, nbrDir, R_nbr.hitDist, nbrNormS, w_shifted, dist_shifted);
+                        J = evalGIJacobian(primaryHitPoint, x_nbr, nbrDir, nbrHitDist, nbrNormS, w_shifted, dist_shifted);
                     }
 
                     if (J > 0.0) {
-                        float p_hat_nbr = evalGITarget(nbrRad * J, primaryAlbedo, primaryNormal, w_shifted);
-                        float nbrM = min(R_nbr.M, 20.0);
-                        float w_spat = p_hat_nbr * R_nbr.W * nbrM;
+                        float p_hat_nbr = evalGITarget(nbrRad, primaryAlbedo, primaryNormal, w_shifted);
+                        float q_pdf_nbr = max(dot(nbrNormal, nbrDir), 0.0) * INV_PI;
+                        float w_nbr_init = (q_pdf_nbr > 1e-5) ? (p_hat_nbr / q_pdf_nbr) : 0.0;
+                        float w_spat = w_nbr_init * J;
 
                         R.wSum += w_spat;
-                        R.M += nbrM;
+                        R.M += 1.0;
 
                         if (randFloat(seed) * R.wSum < w_spat) {
                             R.packedDir = packOct32(w_shifted);
                             R.hitDist = dist_shifted;
-                            packRadianceAndNorm(nbrRad * J, nbrNormS, R.packedRadRG, R.packedRadB_normS);
-                            winnerRad = nbrRad * J;
+                            packRadianceAndNorm(nbrRad, nbrNormS, R.packedRadRG, R.packedRadB_normS);
+                            winnerRad = nbrRad;
                             winnerDir = w_shifted;
                             winnerTarget = p_hat_nbr;
                         }
+                    }
                 }
             }
         }

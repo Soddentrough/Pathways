@@ -202,6 +202,11 @@ python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cor
 
 python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glass_of_water.json 1920 1080 30.0
 
+# 9. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
+echo ""
+echo "[7/7] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."
+python3 tests/test_image_quality.py
+
 echo ""
 echo "=========================================================="
 echo "  Pathways: All Automated Headless Tests Passed Successfully!"

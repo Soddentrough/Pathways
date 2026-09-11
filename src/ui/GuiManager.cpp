@@ -587,6 +587,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 } else {
                     ImGui::BulletText("GPU 0: %.2f ms | Tonemap: %.2f ms | GPU 1: Standby", c.primary_gpu_time_ms, c.tonemap_time_ms);
                 }
+                if (c.pipeline_stages.is_wavefront && !c.pipeline_stages.bounces.empty()) {
+                    ImGui::Indent(15.0f);
+                    ImGui::TextDisabled("Stages: Classify: %.2f ms | GI: %.2f ms",
+                                        c.pipeline_stages.classify_ms, c.pipeline_stages.restir_gi_ms);
+                    for (const auto& b : c.pipeline_stages.bounces) {
+                        ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | Intersect: %.2f ms",
+                                            b.bounce, b.shade_ms, b.shadow_ms, b.intersect_ms);
+                    }
+                    ImGui::Unindent(15.0f);
+                }
                 ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED (<8ms)" : "EXCEEDED");
             }
         }

@@ -269,6 +269,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         out << "    \"wavefront_profiler_breakdown\": {\n"
             << std::format("      \"total_wavefront_time_ms\": {:.3f},\n", stats.wavefront_stats.total_ms)
             << std::format("      \"classify_time_ms\": {:.3f},\n", stats.wavefront_stats.classify_ms)
+            << std::format("      \"restir_gi_time_ms\": {:.3f},\n", stats.wavefront_stats.restir_gi_ms)
             << std::format("      \"resolve_time_ms\": {:.3f},\n", stats.wavefront_stats.resolve_ms)
             << std::format("      \"material_sort_mode\": \"{}\",\n", stats.wavefront_stats.sort_mode_str)
             << std::format("      \"secondary_sort_mode\": \"{}\",\n", stats.wavefront_stats.secondary_sort_mode_str)
@@ -319,7 +320,31 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
              << std::format("        \"secondary_gpu_time_ms\": {:.3f},\n", c.secondary_gpu_time_ms)
              << std::format("        \"tonemap_time_ms\": {:.3f},\n", c.tonemap_time_ms)
              << std::format("        \"gigarays_per_second\": {:.3f},\n", c.gigarays_per_second)
-             << std::format("        \"target_achieved_sub_8ms\": {}\n", c.target_achieved ? "true" : "false")
+             << std::format("        \"target_achieved_sub_8ms\": {},\n", c.target_achieved ? "true" : "false")
+             << "        \"pipeline_stages_ms\": {\n";
+        if (c.pipeline_stages.is_wavefront) {
+            out << std::format("          \"classify_ms\": {:.3f},\n", c.pipeline_stages.classify_ms)
+                << "          \"bounces\": [\n";
+            for (size_t b = 0; b < c.pipeline_stages.bounces.size(); ++b) {
+                const auto& bp = c.pipeline_stages.bounces[b];
+                out << "            {\n"
+                    << std::format("              \"bounce\": {},\n", bp.bounce)
+                    << std::format("              \"shade_ms\": {:.3f},\n", bp.shade_ms)
+                    << std::format("              \"shadow_ms\": {:.3f},\n", bp.shadow_ms)
+                    << std::format("              \"intersect_ms\": {:.3f},\n", bp.intersect_ms)
+                    << std::format("              \"total_bounce_ms\": {:.3f}\n", bp.total_bounce_ms)
+                    << (b + 1 < c.pipeline_stages.bounces.size() ? "            },\n" : "            }\n");
+            }
+            out << "          ],\n";
+            if (c.pipeline_stages.restir_gi_ms > 0.005) {
+                out << std::format("          \"restir_gi_ms\": {:.3f},\n", c.pipeline_stages.restir_gi_ms);
+            }
+            out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
+        } else {
+            out << std::format("          \"ray_tracing_pass_ms\": {:.3f},\n", c.pipeline_stages.ray_tracing_pass_ms)
+                << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
+        }
+        out << "        }\n"
              << (i + 1 < stats.configurations_breakdown.size() ? "      },\n" : "      }\n");
     }
 

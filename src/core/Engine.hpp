@@ -274,7 +274,8 @@ private:
 
     // Per-configuration tallied statistics
     std::vector<ConfigStatsTally> m_configTallies;
-    void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs);
+    void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
+                          const WavefrontStageSample* wfSample = nullptr);
 
     // Training Data Capture (Neural Denoiser / Continuous Upscaler)
     void runTrainingCapture();

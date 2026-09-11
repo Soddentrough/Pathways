@@ -7,9 +7,11 @@ Validates rendered PNG/EXR frame captures and JSON performance metrics.
 import sys
 import os
 import json
+import numpy as np
 from PIL import Image
 
-def verify_frame(png_path, expected_width=None, expected_height=None):
+def verify_frame(png_path, expected_width=None, expected_height=None, reference_path=None,
+                 min_shadow_pct=None, max_mean_lum=None, max_mae=None, min_psnr=None):
     if not os.path.exists(png_path):
         print(f"\033[31m[FAIL]\033[0m Image file not found: {png_path}")
         return False
@@ -25,22 +27,57 @@ def verify_frame(png_path, expected_width=None, expected_height=None):
                 return False
             print(f"\033[32m[PASS]\033[0m Resolution matches expected: {w}x{h}")
 
-        # Statistical analysis of pixel intensity
         rgb_img = img.convert("RGB")
-        extrema = rgb_img.getextrema()
-        # extrema is ((r_min, r_max), (g_min, g_max), (b_min, b_max))
-        max_val = max(e[1] for e in extrema)
-        min_val = min(e[0] for e in extrema)
+        arr = np.array(rgb_img, dtype=np.float32) / 255.0
+        max_val = float(arr.max())
+        min_val = float(arr.min())
 
-        if max_val == 0:
+        if max_val == 0.0:
             print(f"\033[31m[FAIL]\033[0m Image is completely black (zero radiance rendered)")
             return False
 
-        if min_val == 255 and max_val == 255:
+        if min_val >= 0.999 and max_val >= 0.999:
             print(f"\033[31m[FAIL]\033[0m Image is completely blown out / saturated white")
             return False
 
-        print(f"\033[32m[PASS]\033[0m Pixel intensity range: R={extrema[0]}, G={extrema[1]}, B={extrema[2]} (valid dynamic range)")
+        lum = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
+        mean_lum = float(np.mean(lum))
+        shadow_mask = lum < 0.05
+        shadow_pct = float(np.mean(shadow_mask) * 100.0)
+
+        print(f"\033[32m[PASS]\033[0m Luminance stats: Mean={mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Range: [{min_val:.3f}, {max_val:.3f}]")
+
+        if max_mean_lum is not None and mean_lum > max_mean_lum:
+            print(f"\033[31m[FAIL]\033[0m Mean luminance {mean_lum:.4f} exceeds ceiling {max_mean_lum:.4f} (overexposed / bleached)")
+            return False
+
+        if min_shadow_pct is not None and shadow_pct < min_shadow_pct:
+            print(f"\033[31m[FAIL]\033[0m Deep shadow percentage {shadow_pct:.2f}% below floor {min_shadow_pct:.2f}% (shadows destroyed)")
+            return False
+
+        if reference_path:
+            if not os.path.exists(reference_path):
+                print(f"\033[33m[WARN]\033[0m Reference image not found: {reference_path}, skipping GT comparison")
+            else:
+                ref_img = Image.open(reference_path).convert("RGB")
+                if ref_img.size != (w, h):
+                    ref_img = ref_img.resize((w, h), Image.Resampling.LANCZOS)
+                ref_arr = np.array(ref_img, dtype=np.float32) / 255.0
+
+                mae = float(np.mean(np.abs(arr - ref_arr)))
+                mse = float(np.mean((arr - ref_arr) ** 2))
+                psnr = float(20.0 * np.log10(1.0 / np.sqrt(mse))) if mse > 1e-10 else 99.0
+
+                print(f"\033[32m[PASS]\033[0m Ground Truth Comparison against {os.path.basename(reference_path)}: MAE={mae:.4f}, PSNR={psnr:.2f} dB")
+
+                if max_mae is not None and mae > max_mae:
+                    print(f"\033[31m[FAIL]\033[0m MAE {mae:.4f} exceeds tolerance {max_mae:.4f}")
+                    return False
+
+                if min_psnr is not None and psnr < min_psnr:
+                    print(f"\033[31m[FAIL]\033[0m PSNR {psnr:.2f} dB below threshold {min_psnr:.2f} dB")
+                    return False
+
         return True
 
     except Exception as e:
@@ -77,7 +114,7 @@ def verify_stats(json_path, max_target_ms=8.0):
         if avg_ms <= max_target_ms:
             print(f"\033[32m[PASS]\033[0m Frame time target achieved: {avg_ms:.3f} ms <= {max_target_ms:.1f} ms")
         else:
-            print(f"\033[33m[INFO]\033[0m Single-GPU baseline frame time: {avg_ms:.3f} ms (Multi-GPU target: <{max_target_ms:.1f} ms)")
+            print(f"\033[33m[INFO]\033[0m Baseline frame time: {avg_ms:.3f} ms (Target: <{max_target_ms:.1f} ms)")
 
         return True
 
@@ -86,22 +123,36 @@ def verify_stats(json_path, max_target_ms=8.0):
         return False
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: verify_frame.py <image.png> <stats.json> [expected_width] [expected_height] [max_ms]")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description="Pathways Frame & Performance Verifier")
+    parser.add_argument("image", help="Rendered PNG file path")
+    parser.add_argument("stats", help="Stats JSON file path")
+    parser.add_argument("expected_width", nargs="?", type=int, default=None, help="Expected image width")
+    parser.add_argument("expected_height", nargs="?", type=int, default=None, help="Expected image height")
+    parser.add_argument("max_ms", nargs="?", type=float, default=8.0, help="Maximum allowed average frame time (ms)")
+    parser.add_argument("--reference", type=str, default=None, help="Ground-truth reference image path")
+    parser.add_argument("--min-shadow-pct", type=float, default=None, help="Minimum percentage of pixels with lum < 0.05")
+    parser.add_argument("--max-mean-lum", type=float, default=None, help="Maximum allowed mean luminance")
+    parser.add_argument("--max-mae", type=float, default=None, help="Maximum allowed MAE against reference")
+    parser.add_argument("--min-psnr", type=float, default=None, help="Minimum allowed PSNR against reference")
 
-    png_path = sys.argv[1]
-    json_path = sys.argv[2]
-    expected_w = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    expected_h = int(sys.argv[4]) if len(sys.argv) > 4 else None
-    max_ms = float(sys.argv[5]) if len(sys.argv) > 5 else 8.0
+    args = parser.parse_args()
 
     print("==========================================================")
     print("  Pathways Automated Test Verification")
     print("==========================================================")
 
-    img_ok = verify_frame(png_path, expected_w, expected_h)
-    stats_ok = verify_stats(json_path, max_ms)
+    img_ok = verify_frame(
+        args.image,
+        args.expected_width,
+        args.expected_height,
+        reference_path=args.reference,
+        min_shadow_pct=args.min_shadow_pct,
+        max_mean_lum=args.max_mean_lum,
+        max_mae=args.max_mae,
+        min_psnr=args.min_psnr
+    )
+    stats_ok = verify_stats(args.stats, args.max_ms)
 
     print("----------------------------------------------------------")
     if img_ok and stats_ok:

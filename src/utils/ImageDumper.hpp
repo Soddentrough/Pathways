@@ -160,6 +160,7 @@ struct FrameStats {
         bool valid = false;
         double total_ms = 0.0;
         double classify_ms = 0.0;
+        double restir_gi_ms = 0.0;
         double resolve_ms = 0.0;
         std::vector<BounceProfile> bounces;
         double queue_memory_footprint_mb = 0.0;
@@ -170,6 +171,23 @@ struct FrameStats {
     WavefrontProfilingStats wavefront_stats;
 
     // Tallied unique configurations breakdown
+    struct StageBounceSummary {
+        uint32_t bounce = 0;
+        double shade_ms = 0.0;
+        double shadow_ms = 0.0;
+        double intersect_ms = 0.0;
+        double total_bounce_ms = 0.0;
+    };
+
+    struct PipelineStagesSummary {
+        bool is_wavefront = false;
+        double ray_tracing_pass_ms = 0.0;
+        double classify_ms = 0.0;
+        std::vector<StageBounceSummary> bounces;
+        double restir_gi_ms = 0.0;
+        double tonemap_ms = 0.0;
+    };
+
     struct ConfigTallySummary {
         std::string label;
         uint32_t frame_count = 0;
@@ -182,6 +200,7 @@ struct FrameStats {
         double tonemap_time_ms = 0.0;
         double gigarays_per_second = 0.0;
         bool target_achieved = false;
+        PipelineStagesSummary pipeline_stages;
     };
     std::vector<ConfigTallySummary> configurations_breakdown;
 };

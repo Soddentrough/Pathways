@@ -538,7 +538,9 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     if (frameSlot >= 2) frameSlot = 0;
     m_hasRecordedSlot[frameSlot] = true;
 
-    uint32_t endQuery = 3 + maxBounces * 6;
+    uint32_t giQueryStart = 3 + maxBounces * 6;
+    uint32_t giQueryEnd = giQueryStart + 1;
+    uint32_t endQuery = giQueryEnd + 1;
     vkCmdResetQueryPool(cmd, m_queryPools[frameSlot], 0, 64);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 0);
 
@@ -880,6 +882,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
     // 4d. ReSTIR GI pass: Spatio-temporal reservoir resampling after all primary and secondary bounces complete
     if ((sceneData.cameraFlags & (1u << 22)) && m_restirGIPipeline != VK_NULL_HANDLE && maxBounces > 1) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], giQueryStart);
+
         VkBufferMemoryBarrier2 giBarrier = makeBufferBarrier2(m_rawGISampleBuffer->getBuffer(),
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
@@ -900,6 +904,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         };
         vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(giPC), giPC);
         vkCmdDispatch(cmd, (width + 7) / 8, (height + 3) / 4, 1);
+
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], giQueryEnd);
+    } else {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], giQueryStart);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], giQueryEnd);
     }
 
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], endQuery);
@@ -928,7 +937,9 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     if (frameSlot >= 2 || !m_queryPools[frameSlot] || !m_hasRecordedSlot[frameSlot]) return data;
 
     uint64_t ts[64] = {0};
-    uint32_t endQuery = 3 + maxBounces * 6;
+    uint32_t giQueryStart = 3 + maxBounces * 6;
+    uint32_t giQueryEnd = giQueryStart + 1;
+    uint32_t endQuery = giQueryEnd + 1;
     uint32_t numQueries = endQuery + 1;
     if (numQueries > 64) numQueries = 64;
 
@@ -944,6 +955,8 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     data.valid = true;
     data.totalMs = toMs(ts[endQuery], ts[0]);
     data.classifyMs = toMs(ts[2], ts[1]);
+    double giRawMs = toMs(ts[giQueryEnd], ts[giQueryStart]);
+    data.restirGiMs = (giRawMs > 0.005) ? giRawMs : 0.0;
     data.resolveMs = 0.0;
     data.sortMode = m_sortMode;
     data.secondarySortMode = m_secondarySortMode;
@@ -1045,6 +1058,9 @@ void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double times
             Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | Shadow: {:.3f} ms ({} rays) | Intersect: {:.3f} ms ({} rays)",
                          bp.bounce, bp.shadeMs, bp.activeCount, bp.shadowMs, bp.shadowCount, bp.intersectMs, bp.nextCount);
         }
+    }
+    if (data.restirGiMs > 0.001) {
+        Logger::info("      [Post-Bounce] ReSTIR GI Resample: {:.3f} ms", data.restirGiMs);
     }
 }
 

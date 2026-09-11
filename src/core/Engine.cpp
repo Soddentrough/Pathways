@@ -2614,17 +2614,6 @@ void Engine::renderFrame() {
         m_lastGpuRtMs = gpuRtMs;
         m_lastSecGpuMs = secGpuMs;
         m_lastTonemapMs = gpuTonemapMs;
-        if (totalGpuMs > 0.01) {
-            m_lastFrameTimeMs = totalGpuMs;
-            if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
-                m_frameTimesMs.push_back(m_lastFrameTimeMs);
-                if (!m_config.headless && m_frameTimesMs.size() > 60) {
-                    m_frameTimesMs.erase(m_frameTimesMs.begin());
-                }
-                recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
-            }
-        }
-
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
         if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
             if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -2634,6 +2623,25 @@ void Engine::renderFrame() {
                 if (isBenchmarkMilestone || getenv("PATHWAYS_PROFILE_WF")) {
                     m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                 }
+            }
+        }
+
+        if (totalGpuMs > 0.01) {
+            m_lastFrameTimeMs = totalGpuMs;
+            if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
+                m_frameTimesMs.push_back(m_lastFrameTimeMs);
+                if (!m_config.headless && m_frameTimesMs.size() > 60) {
+                    m_frameTimesMs.erase(m_frameTimesMs.begin());
+                }
+                WavefrontStageSample wfSample;
+                if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
+                    wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                    wfSample.restirGiMs = m_lastWavefrontProfile.restirGiMs;
+                    for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                        wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs});
+                    }
+                }
+                recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
             }
         }
 
@@ -2823,6 +2831,9 @@ void Engine::renderFrame() {
     }
     if (m_config.enable_restir_gi) {
         flags |= (1 << 22);
+    }
+    if (accumReset || m_cameraMovedLastFrame) {
+        flags |= (1 << 23); // Camera motion / history reset flag
     }
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
@@ -3922,19 +3933,28 @@ void Engine::dumpOutputFiles() {
         }
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
 
+        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
+            uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
+            m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
+        }
+
         if (totalGpuMs > 0.01) {
             m_lastGpuRtMs = gpuRtMs;
             m_lastSecGpuMs = secGpuMs;
             m_lastTonemapMs = gpuTonemapMs;
             m_lastFrameTimeMs = totalGpuMs;
             m_frameTimesMs.push_back(m_lastFrameTimeMs);
-            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
-        }
-    }
 
-    if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
-        uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
-        m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
+            WavefrontStageSample wfSample;
+            if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
+                wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                wfSample.restirGiMs = m_lastWavefrontProfile.restirGiMs;
+                for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs});
+                }
+            }
+            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
+        }
     }
 
     // 1. Dump LDR PNG
@@ -4140,6 +4160,7 @@ FrameStats Engine::getStats() const {
             stats.wavefront_stats.valid = true;
             stats.wavefront_stats.total_ms = m_lastWavefrontProfile.totalMs;
             stats.wavefront_stats.classify_ms = m_lastWavefrontProfile.classifyMs;
+            stats.wavefront_stats.restir_gi_ms = m_lastWavefrontProfile.restirGiMs;
             stats.wavefront_stats.resolve_ms = m_lastWavefrontProfile.resolveMs;
             stats.wavefront_stats.queue_memory_footprint_mb = m_lastWavefrontProfile.queueMemoryFootprintMb;
             stats.wavefront_stats.estimated_vram_traffic_mb = m_lastWavefrontProfile.estimatedVramTrafficMb;
@@ -4326,6 +4347,28 @@ FrameStats Engine::getStats() const {
         s.tonemap_time_ms = tally.getAvgTonemapMs();
         s.gigarays_per_second = tally.getRayThroughput() * 1e-9;
         s.target_achieved = tally.isTargetAchieved();
+
+        if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
+            s.pipeline_stages.is_wavefront = true;
+            s.pipeline_stages.classify_ms = tally.getAvgClassifyMs();
+            s.pipeline_stages.restir_gi_ms = tally.getAvgRestirGiMs();
+            s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
+            auto bounces = tally.getAvgBounces();
+            for (const auto& b : bounces) {
+                FrameStats::StageBounceSummary sb;
+                sb.bounce = b.bounce;
+                sb.shade_ms = b.shadeMs;
+                sb.shadow_ms = b.shadowMs;
+                sb.intersect_ms = b.intersectMs;
+                sb.total_bounce_ms = b.totalMs;
+                s.pipeline_stages.bounces.push_back(sb);
+            }
+        } else {
+            s.pipeline_stages.is_wavefront = false;
+            s.pipeline_stages.ray_tracing_pass_ms = tally.getAvgPrimaryRtMs();
+            s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
+        }
+
         stats.configurations_breakdown.push_back(std::move(s));
     }
 
@@ -4514,7 +4557,8 @@ std::string Engine::getActiveSceneName() const {
     return SceneRegistry::formatSceneName(p.stem().string());
 }
 
-void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs) {
+void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
+                              const WavefrontStageSample* wfSample) {
     ConfigKey key;
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
@@ -4528,12 +4572,12 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
 
     for (auto& tally : m_configTallies) {
         if (tally.key == key) {
-            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
             return;
         }
     }
     ConfigStatsTally newTally(key);
-    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
     m_configTallies.push_back(std::move(newTally));
 }
 
@@ -4588,6 +4632,29 @@ void Engine::printExecutionSummary() const {
         } else {
             Logger::info("    GPU Breakdown:       GPU 0 (Primary RT): {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
                          tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+        }
+
+        if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
+            Logger::info("    Pipeline Stages:");
+            Logger::info("      - Classify (Primary RayGen): {:.3f} ms", tally.getAvgClassifyMs());
+            auto bounces = tally.getAvgBounces();
+            for (const auto& b : bounces) {
+                if (b.intersectMs > 0.0001) {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms | Intersect: {:.3f} ms (Total: {:.3f} ms)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.intersectMs, b.totalMs);
+                } else {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms (Total: {:.3f} ms)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.totalMs);
+                }
+            }
+            if (tally.getAvgRestirGiMs() > 0.005) {
+                Logger::info("      - ReSTIR GI Resampling:      {:.3f} ms", tally.getAvgRestirGiMs());
+            }
+            Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
+        } else if (tally.key.pipeline_type == PipelineType::RTP) {
+            Logger::info("    Pipeline Stages:");
+            Logger::info("      - Ray Tracing Pass:          {:.3f} ms", tally.getAvgPrimaryRtMs());
+            Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
         }
 
         Logger::info("    Ray Throughput:      {:.2f} GigaRays/sec", tally.getRayThroughput() * 1e-9);

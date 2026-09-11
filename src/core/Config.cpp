@@ -151,9 +151,12 @@ void Config::printUsage(const char* progName) {
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
               << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
-              << "  --atrous-passes <int>   Number of A-Trous filter iterations (1..5, default: 3)\n"
-              << "  --no-restir             Disable ReSTIR DI spatio-temporal reservoir resampling [default: enabled]\n"
-              << "  --no-restir-gi          Disable ReSTIR GI secondary path reservoir resampling [default: enabled]\n"
+              << "  --restir                Enable all ReSTIR (both DI and GI reservoir resampling) [default: disabled]\n"
+              << "  --no-restir             Disable all ReSTIR (both DI and GI reservoir resampling)\n"
+              << "  --restir-di             Enable ReSTIR DI spatio-temporal direct illumination resampling\n"
+              << "  --no-restir-di          Disable ReSTIR DI spatio-temporal direct illumination resampling\n"
+              << "  --restir-gi             Enable ReSTIR GI secondary path reservoir resampling\n"
+              << "  --no-restir-gi          Disable ReSTIR GI secondary path reservoir resampling\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
               << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
@@ -520,14 +523,16 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
-        } else if (arg == "--restir-di" || arg == "--restir") {
+        } else if (arg == "--restir") {
             cfg.enable_restir_di = true;
-        } else if (arg == "--no-restir-di" || arg == "--no-restir") {
+            cfg.enable_restir_gi = true;
+        } else if (arg == "--no-restir") {
             cfg.enable_restir_di = false;
-        } else if (arg == "--restir-spatial") {
-            cfg.enable_restir_spatial = true;
-        } else if (arg == "--no-restir-spatial") {
-            cfg.enable_restir_spatial = false;
+            cfg.enable_restir_gi = false;
+        } else if (arg == "--restir-di") {
+            cfg.enable_restir_di = true;
+        } else if (arg == "--no-restir-di") {
+            cfg.enable_restir_di = false;
         } else if (arg == "--restir-gi") {
             cfg.enable_restir_gi = true;
         } else if (arg == "--no-restir-gi") {

@@ -68,11 +68,11 @@ struct Config {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool enable_direct_light = true;
-    bool enable_restir_di = true; // Default: true (enabled by default)
-    bool enable_restir_spatial = true;
+    bool enable_restir_di = false; // Default: false (pure reference Wavefront path tracing by default)
+    bool enable_restir_spatial = false;
     uint32_t restir_spatial_samples = 3;
     float restir_spatial_radius = 8.0f;
-    bool enable_restir_gi = true; // Spatio-Temporal Secondary Path Resampling for Global Illumination
+    bool enable_restir_gi = false; // Default: false (pure reference Wavefront path tracing by default)
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;

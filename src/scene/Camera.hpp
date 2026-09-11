@@ -49,7 +49,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI, 7: restirSpatial, bits 8..11: spatialSamples, bits 12..19: spatialRadius, bit 20: shadowDenoiser, bit 21: taa, bit 22: restirGI
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI, 7: restirSpatial, bits 8..11: spatialSamples, bits 12..19: spatialRadius, bit 20: shadowDenoiser, bit 21: taa, bit 22: restirGI, bit 23: cameraMoved / history reset
     glm::mat4 unjitteredViewProj;
     glm::vec4 jitterOffset; // xy = pixel jitter [-0.5, 0.5], zw = NDC jitter
 };
