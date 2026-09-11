@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.13.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.14.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -140,6 +140,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
     ${SHADER_DIR}/compute/wavefront_raysort.comp
+    ${SHADER_DIR}/compute/wavefront_restir_gi.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss

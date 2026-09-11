@@ -102,6 +102,7 @@ struct FrameStats {
     bool restir_spatial_enabled = true;
     uint32_t restir_spatial_samples = 3;
     float restir_spatial_radius = 8.0f;
+    bool restir_gi_enabled = false;
     std::string scene_path = "";
     uint32_t num_triangles = 0;
     uint32_t num_spheres = 0;

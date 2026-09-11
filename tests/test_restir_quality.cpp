@@ -277,6 +277,107 @@ static void test_reservoir_layout_and_math() {
 }
 
 // -----------------------------------------------------------------------------
+// 5. ReSTIR GI Data Structure Layout, VRAM Footprint, and Jacobian Math Tests
+// -----------------------------------------------------------------------------
+static void test_restir_gi_layout_and_jacobian() {
+    std::cout << "[RUN] Testing ReSTIR GI GPU layout, VRAM footprint, and Jacobian identities..." << std::endl;
+
+    // A. GPU struct size & alignment for ReservoirGIGPU
+    check_true(sizeof(ReservoirGIGPU) == 32, "ReservoirGIGPU must be exactly 32 bytes (2 x uvec4)");
+    check_true(alignof(ReservoirGIGPU) == 4, "ReservoirGIGPU alignment must be 4 bytes");
+
+    check_true(offsetof(ReservoirGIGPU, packedDir) == 0,        "ReservoirGIGPU.packedDir offset must be 0");
+    check_true(offsetof(ReservoirGIGPU, hitDist) == 4,          "ReservoirGIGPU.hitDist offset must be 4");
+    check_true(offsetof(ReservoirGIGPU, packedRadRG) == 8,      "ReservoirGIGPU.packedRadRG offset must be 8");
+    check_true(offsetof(ReservoirGIGPU, packedRadB_normS) == 12,"ReservoirGIGPU.packedRadB_normS offset must be 12");
+    check_true(offsetof(ReservoirGIGPU, wSum) == 16,            "ReservoirGIGPU.wSum offset must be 16");
+    check_true(offsetof(ReservoirGIGPU, M) == 20,               "ReservoirGIGPU.M offset must be 20");
+    check_true(offsetof(ReservoirGIGPU, W) == 24,               "ReservoirGIGPU.W offset must be 24");
+    check_true(offsetof(ReservoirGIGPU, primaryGeom) == 28,     "ReservoirGIGPU.primaryGeom offset must be 28");
+
+    // B. GPU struct size & alignment for RawGISampleGPU
+    check_true(sizeof(RawGISampleGPU) == 32, "RawGISampleGPU must be exactly 32 bytes (2 x uvec4)");
+    check_true(alignof(RawGISampleGPU) == 4, "RawGISampleGPU alignment must be 4 bytes");
+
+    check_true(offsetof(RawGISampleGPU, packedDir) == 0,          "RawGISampleGPU.packedDir offset must be 0");
+    check_true(offsetof(RawGISampleGPU, hitDist) == 4,            "RawGISampleGPU.hitDist offset must be 4");
+    check_true(offsetof(RawGISampleGPU, packedRadRG) == 8,        "RawGISampleGPU.packedRadRG offset must be 8");
+    check_true(offsetof(RawGISampleGPU, packedRadB_normS) == 12,  "RawGISampleGPU.packedRadB_normS offset must be 12");
+    check_true(offsetof(RawGISampleGPU, primaryGeom) == 16,       "RawGISampleGPU.primaryGeom offset must be 16");
+    check_true(offsetof(RawGISampleGPU, primaryAlbedo) == 20,     "RawGISampleGPU.primaryAlbedo offset must be 20");
+    check_true(offsetof(RawGISampleGPU, primaryAlbedoB_pad) == 24,"RawGISampleGPU.primaryAlbedoB_pad offset must be 24");
+    check_true(offsetof(RawGISampleGPU, pad) == 28,               "RawGISampleGPU.pad offset must be 28");
+
+    // C. VRAM footprint calculation for 1080p and 4K ReSTIR GI
+    const size_t pixels1080p = 1920 * 1080;
+    const size_t vram1080pGI = pixels1080p * (sizeof(ReservoirGIGPU) * 2 + sizeof(RawGISampleGPU));
+    // 1920 * 1080 * 96 = 199,065,600 bytes (~189.84 MiB)
+    check_true(vram1080pGI == 199065600ULL,
+               "1080p ReSTIR GI (ping-pong + raw buffer) must be exactly 199,065,600 bytes (189.84 MiB)");
+
+    const size_t pixels4K = 3840 * 2160;
+    const size_t vram4KGI = pixels4K * (sizeof(ReservoirGIGPU) * 2 + sizeof(RawGISampleGPU));
+    // 3840 * 2160 * 96 = 796,262,400 bytes (~759.38 MiB)
+    check_true(vram4KGI == 796262400ULL,
+               "4K ReSTIR GI (ping-pong + raw buffer) must be exactly 796,262,400 bytes (759.38 MiB)");
+
+    // D. Mathematical Jacobian Determinant Evaluation
+    auto evalJacobian = [](glm::vec3 x_new, glm::vec3 x_orig, glm::vec3 w_orig, float dist_orig, glm::vec3 n_s) -> float {
+        if (dist_orig >= 1e4f) return 1.0f;
+        glm::vec3 x_s = x_orig + w_orig * dist_orig;
+        glm::vec3 to_s_new = x_s - x_new;
+        float dist_new = glm::length(to_s_new);
+        if (dist_new < 1e-4f) return 0.0f;
+        glm::vec3 w_new = to_s_new / dist_new;
+
+        float cos_s_orig = std::abs(glm::dot(n_s, -w_orig));
+        float cos_s_new  = std::abs(glm::dot(n_s, -w_new));
+
+        float distRatio = dist_orig / dist_new;
+        float J = (distRatio * distRatio) * (cos_s_new / std::max(cos_s_orig, 1e-3f));
+        return std::clamp(J, 0.05f, 10.0f);
+    };
+
+    // Test 1: Identity shift (x_new == x_orig) -> J == 1.0
+    glm::vec3 x0(0.0f, 0.0f, 0.0f);
+    glm::vec3 w0(0.0f, 0.0f, 1.0f);
+    float d0 = 2.0f;
+    glm::vec3 ns(0.0f, 0.0f, -1.0f);
+    float jIdentity = evalJacobian(x0, x0, w0, d0, ns);
+    assert_near(jIdentity, 1.0f, 1e-4f, "Jacobian of identity shift must equal 1.0");
+
+    // Test 2: Distance halving: x_new moves halfway closer to x_s (d_new = 1.0) -> J = (2/1)^2 = 4.0
+    glm::vec3 xHalf(0.0f, 0.0f, 1.0f);
+    float jHalf = evalJacobian(xHalf, x0, w0, d0, ns);
+    assert_near(jHalf, 4.0f, 1e-4f, "Jacobian must scale inversely with distance squared (J = 4.0)");
+
+    // Test 3: Distant sky hit (d0 = 1e4) -> J == 1.0
+    float jSky = evalJacobian(glm::vec3(1.0f, 1.0f, 0.0f), x0, w0, 1e4f, ns);
+    assert_near(jSky, 1.0f, 1e-4f, "Jacobian of distant environment hit must equal 1.0");
+
+    // Test 4: Extreme shift clamping (close singularity clamp at 10.0, far silhouette clamp at 0.05)
+    glm::vec3 xClose(0.0f, 0.0f, 1.99f); // d_new = 0.01 -> distRatio^2 = 40000 -> clamped to 10.0
+    float jClose = evalJacobian(xClose, x0, w0, d0, ns);
+    assert_near(jClose, 10.0f, 1e-4f, "Extreme close proximity Jacobian must clamp to 10.0");
+
+    glm::vec3 xFar(0.0f, 0.0f, -18.0f); // d_new = 20.0 -> distRatio^2 = 0.01 -> clamped to 0.05
+    float jFar = evalJacobian(xFar, x0, w0, d0, ns);
+    assert_near(jFar, 0.05f, 1e-4f, "Extreme far distance Jacobian must clamp to 0.05");
+
+    // E. Target function physical identity:
+    // p_hat = lum(radiance * albedo * INV_PI * cos(theta))
+    const float INV_PI = 0.31830988618379067154f;
+    glm::vec3 rad(2.0f, 2.0f, 2.0f);
+    glm::vec3 alb(0.5f, 0.5f, 0.5f);
+    float cosTheta = 1.0f;
+    glm::vec3 unshadowed = rad * alb * INV_PI * cosTheta;
+    float lum = glm::dot(unshadowed, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+    assert_near(lum, 1.0f * INV_PI, 1e-4f, "Target function luminance evaluation for diffuse bounce");
+
+    std::cout << "[PASS] ReSTIR GI GPU layout, VRAM footprint, and Jacobian identities verified." << std::endl;
+}
+
+// -----------------------------------------------------------------------------
 // Main Entry Point
 // -----------------------------------------------------------------------------
 int main() {
@@ -289,6 +390,7 @@ int main() {
     test_quality_governor_regulation();
     test_fractional_spp_regulation();
     test_reservoir_layout_and_math();
+    test_restir_gi_layout_and_jacobian();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  ALL TESTS PASSED!                                       " << std::endl;

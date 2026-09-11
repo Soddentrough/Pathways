@@ -128,6 +128,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 #include "wavefront_restir.glsl"
+#include "wavefront_restir_gi.glsl"
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -156,8 +157,12 @@ void main() {
         vec3 throughput = state.throughputSeed.rgb;
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
-        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
+        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
+        uint pixelIndex = rawPixel & 0x7FFFFFFFu;
+        bool isPrimaryGIDiffuse = (rawPixel & (1u << 31)) != 0u;
         uint bounce = pc.currentBounce;
+
+        bool enableReSTIR_GI = (ubo.flags & (1u << 22)) != 0u && (pc.currentBounce == 0u || isPrimaryGIDiffuse);
 
         if (hitType == 2u) {
             // Environment sky miss
@@ -169,10 +174,14 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            accumRadiance += throughput * skyColor;
-            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            if (enableReSTIR_GI && pc.currentBounce == 1u) {
+                storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), 1e4, skyColor, -rayDir);
+            } else {
+                accumRadiance += throughput * skyColor;
+                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            }
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             vec3 hitNormal = vec3(0.0, 1.0, 0.0);
@@ -235,7 +244,9 @@ void main() {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
             if (length(emissive) > 1e-3) {
-                accumRadiance += throughput * emissive;
+                if (!enableReSTIR_GI || pc.currentBounce != 1u) {
+                    accumRadiance += throughput * emissive;
+                }
             }
 
             vec3 diffuseColor = baseColor.rgb;
@@ -264,9 +275,13 @@ void main() {
             }
 
             vec3 V = -rayDir;
+            if (enableReSTIR_GI && pc.currentBounce == 0u) {
+                storePrimaryGISample(pixelIndex, packGeom(hitNormal, hitT), packHalf2x16(diffuseColor.rg), packHalf2x16(vec2(diffuseColor.b, 0.0)), ubo.frameIndex + 1u);
+            }
 
             // Direct Lighting (ReSTIR DI on Primary Bounce, Stochastic NEE on Secondary / Fallback)
             bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
+            bool giRecorded = false;
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
                 if (enableReSTIR && pc.numLights > 1u && pc.currentBounce == 0u) {
                     ivec2 pixelCoord = ivec2(pixelIndex % pc.width, pixelIndex / pc.width);
@@ -401,15 +416,24 @@ void main() {
                             misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                         }
 
-                        vec3 unshadowed = throughput * combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                        vec3 secDirectL = combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                        vec3 unshadowed = throughput * secDirectL;
 
-                        if (length(unshadowed) > 1e-5) {
+                        if (enableReSTIR_GI && pc.currentBounce == 1u) {
+                            vec3 incomingRad = emissive + secDirectL;
+                            storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), max(hitT, 1e-4), incomingRad, hitNormal);
+                            giRecorded = true;
+                        } else if (length(unshadowed) > 1e-5) {
                             hasShadowRay = true;
                             shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
                             shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
                         }
                     }
                 }
+            }
+
+            if (enableReSTIR_GI && pc.currentBounce == 1u && !giRecorded) {
+                storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), max(hitT, 1e-4), emissive, hitNormal);
             }
 
             // Indirect Bounce: Stochastic Lobe Selection (Dielectric Specular GGX vs Diffuse Cosine)
@@ -467,7 +491,8 @@ void main() {
                             survivesToNext = true;
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                             nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                            nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                            uint nextPixelTag = (pc.currentBounce == 0u) ? (pixelIndex | (1u << 31)) : rawPixel;
+                            nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPixelTag));
                         }
                     }
                 }

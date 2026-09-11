@@ -72,6 +72,7 @@ struct Config {
     bool enable_restir_spatial = true;
     uint32_t restir_spatial_samples = 3;
     float restir_spatial_radius = 8.0f;
+    bool enable_restir_gi = true; // Spatio-Temporal Secondary Path Resampling for Global Illumination
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;

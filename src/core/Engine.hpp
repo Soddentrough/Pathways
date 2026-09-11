@@ -101,6 +101,12 @@ private:
     void initReSTIRBuffers();
     void updateReSTIRDescriptors(uint32_t frameSlot);
 
+    // ReSTIR GI Secondary Path Reservoir Buffers (Bindings 22 & 23)
+    std::array<std::unique_ptr<Buffer>, 2> m_restirGIReservoirs;
+    uint32_t m_restirGIPingPongIndex = 0;
+    void initReSTIRGIBuffers();
+    void updateReSTIRGIDescriptors(uint32_t frameSlot);
+
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> m_asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;

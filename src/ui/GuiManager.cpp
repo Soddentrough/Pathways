@@ -535,6 +535,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             } else {
                 ImGui::Text("ReSTIR DI:    Disabled");
             }
+            if (config.enable_restir_gi) {
+                ImGui::Text("ReSTIR GI:    Enabled (Spatio-Temporal Secondary Resampling)");
+            } else {
+                ImGui::Text("ReSTIR GI:    Disabled");
+            }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
                 if (stats.accumulation_complete && config.max_accum_frames > 0) {
@@ -1250,6 +1255,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::Unindent();
+            }
+            if (ImGui::Checkbox("ReSTIR GI (Global Illumination)", &config.enable_restir_gi)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spatio-Temporal Secondary Path Resampling. Resamples bounce 1 indirect samples across space and time with Jacobian corrections for clean multi-bounce diffuse GI.");
             }
         }
 

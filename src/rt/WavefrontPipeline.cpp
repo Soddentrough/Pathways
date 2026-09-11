@@ -20,7 +20,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadeComplexCode,
                                      const std::vector<char>& shadeEmissiveCode,
                                      const std::vector<char>& shadePassthroughCode,
-                                     const std::vector<char>& raySortCode)
+                                     const std::vector<char>& raySortCode,
+                                     const std::vector<char>& restirGICode)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize) {
 
     if (m_tileSize > 0) {
@@ -35,7 +36,7 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     updateQueueDescriptors();
     createPipelines(classifyCode, intersectCode, shadeCode, shadowCode,
                     shadeDiffuseCode, shadeDielectricCode, shadeConductorCode, shadeComplexCode,
-                    shadeEmissiveCode, shadePassthroughCode, raySortCode);
+                    shadeEmissiveCode, shadePassthroughCode, raySortCode, restirGICode);
 
     VkQueryPoolCreateInfo qpInfo{};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -45,9 +46,10 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
         vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPools[i]);
     }
 
-    Logger::info("Pure WavefrontPipeline created successfully (tileSize: {}, capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, RaySort: {}).",
+    Logger::info("Pure WavefrontPipeline created successfully (tileSize: {}, capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, RaySort: {}, ReSTIR GI: {}).",
                  m_tileSize, m_maxCapacity, (m_shadeDiffusePipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
-                 (m_raySortPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"));
+                 (m_raySortPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
+                 (m_restirGIPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"));
 }
 
 WavefrontPipeline::~WavefrontPipeline() {
@@ -55,6 +57,7 @@ WavefrontPipeline::~WavefrontPipeline() {
         if (m_queryPools[i]) vkDestroyQueryPool(m_device, m_queryPools[i], nullptr);
     }
 
+    if (m_restirGIPipeline) vkDestroyPipeline(m_device, m_restirGIPipeline, nullptr);
     if (m_shadeDiffusePipeline) vkDestroyPipeline(m_device, m_shadeDiffusePipeline, nullptr);
     if (m_shadeDielectricPipeline) vkDestroyPipeline(m_device, m_shadeDielectricPipeline, nullptr);
     if (m_shadeConductorPipeline) vkDestroyPipeline(m_device, m_shadeConductorPipeline, nullptr);
@@ -109,7 +112,10 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // MaterialIndexQueue
         { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // SecondaryIndexQueue
         { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // CurrentReservoirsBuffer
-        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // HistoryReservoirsBuffer
+        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // HistoryReservoirsBuffer
+        { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // CurrentGIReservoirsBuffer
+        { 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // HistoryGIReservoirsBuffer
+        { 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // RawGISampleBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -126,7 +132,7 @@ void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 }
     };
@@ -186,6 +192,10 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
     VkDeviceSize shadowQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
     m_shadowQueue = std::make_unique<Buffer>(m_allocator, shadowQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
+    // RawGISampleBuffer = 32 bytes per pixel
+    VkDeviceSize rawGISampleSize = static_cast<VkDeviceSize>(m_width) * m_height * sizeof(RawGISampleGPU);
+    m_rawGISampleBuffer = std::make_unique<Buffer>(m_allocator, rawGISampleSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
     // MaterialIndexQueue = 6 archetypes * 4 bytes * maxCapacity (Index-Based Material Queues)
     VkDeviceSize matIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 6 * sizeof(uint32_t);
     m_materialIndexQueue = std::make_unique<Buffer>(m_allocator, matIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
@@ -226,6 +236,7 @@ void WavefrontPipeline::updateQueueDescriptors() {
     VkDescriptorBufferInfo secIndexInfo{ m_secondaryIndexQueue->getBuffer(), 0, m_secondaryIndexQueue->getSize() };
     VkDescriptorBufferInfo countersInfo{ m_queueCounters->getBuffer(), 0, m_queueCounters->getSize() };
     VkDescriptorBufferInfo shadowQueueInfo{ m_shadowQueue->getBuffer(), 0, m_shadowQueue->getSize() };
+    VkDescriptorBufferInfo rawGISampleInfo{ m_rawGISampleBuffer->getBuffer(), 0, m_rawGISampleBuffer->getSize() };
     VkDescriptorBufferInfo dgcStreamInfo{ m_dgcStream->getBuffer(), 0, m_dgcStream->getSize() };
 
     for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -243,7 +254,8 @@ void WavefrontPipeline::updateQueueDescriptors() {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &geomBInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hitInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matIndexInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rawGISampleInfo, nullptr }
         };
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writesEven.size()), writesEven.data(), 0, nullptr);
 
@@ -259,7 +271,8 @@ void WavefrontPipeline::updateQueueDescriptors() {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 16, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &geomAInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hitInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matIndexInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsOdd[slot], 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &rawGISampleInfo, nullptr }
         };
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writesOdd.size()), writesOdd.data(), 0, nullptr);
     }
@@ -340,6 +353,26 @@ void WavefrontPipeline::updateReservoirDescriptors(uint32_t frameSlot,
     }
 }
 
+void WavefrontPipeline::updateGIReservoirDescriptors(uint32_t frameSlot,
+                                                     VkBuffer curGIReservoir,
+                                                     VkBuffer histGIReservoir,
+                                                     VkDeviceSize giResSize) {
+    if (frameSlot >= 2 || curGIReservoir == VK_NULL_HANDLE || histGIReservoir == VK_NULL_HANDLE) return;
+
+    VkDescriptorBufferInfo curInfo{ curGIReservoir, 0, giResSize };
+    VkDescriptorBufferInfo histInfo{ histGIReservoir, 0, giResSize };
+
+    std::array<VkDescriptorSet, 2> targetSets = { m_descSetsEven[frameSlot], m_descSetsOdd[frameSlot] };
+    for (VkDescriptorSet dset : targetSets) {
+        if (dset == VK_NULL_HANDLE) continue;
+        std::vector<VkWriteDescriptorSet> writes = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+        };
+        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
 void WavefrontPipeline::resize(uint32_t width, uint32_t height, uint32_t tileSize) {
     if (m_width == width && m_height == height && m_tileSize == tileSize) return;
     m_width = width;
@@ -371,7 +404,8 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
                                         const std::vector<char>& shadeComplexCode,
                                         const std::vector<char>& shadeEmissiveCode,
                                         const std::vector<char>& shadePassthroughCode,
-                                        const std::vector<char>& raySortCode) {
+                                        const std::vector<char>& raySortCode,
+                                        const std::vector<char>& restirGICode) {
     // Pipeline Layout (128 bytes push constants for all stages)
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -448,6 +482,9 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     }
     if (!raySortCode.empty()) {
         m_raySortPipeline = buildComputePipeline(raySortCode, "wavefront_raysort");
+    }
+    if (!restirGICode.empty()) {
+        m_restirGIPipeline = buildComputePipeline(restirGICode, "wavefront_restir_gi");
     }
 
     // Initialize DGCManager with Execution Set support flag:
@@ -669,29 +706,30 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     Buffer* currentOutGeom = (b % 2 == 0) ? m_rayGeomQueueB.get() : m_rayGeomQueueA.get();
                     Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB.get() : m_rayStateQueueA.get();
 
-                    std::array<VkBufferMemoryBarrier2, 7> s2dBarriers = {
-                        makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT),
-                        makeBufferBarrier2(m_dgcStream->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                        makeBufferBarrier2(m_queueCounters->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(m_shadowQueue->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(currentOutGeom->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(currentOutState->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
-                    };
+                    std::vector<VkBufferMemoryBarrier2> s2dBarriers;
+                    s2dBarriers.reserve(8);
+                    s2dBarriers.push_back(makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_dgcStream->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_shadowQueue->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(currentOutGeom->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(currentOutState->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
+
 
                     VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     s2dDep.bufferMemoryBarrierCount = static_cast<uint32_t>(s2dBarriers.size());
@@ -839,6 +877,30 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             } // end tx
         } // end ty
     } // end sampleIdx
+
+    // 4d. ReSTIR GI pass: Spatio-temporal reservoir resampling after all primary and secondary bounces complete
+    if ((sceneData.cameraFlags & (1u << 22)) && m_restirGIPipeline != VK_NULL_HANDLE && maxBounces > 1) {
+        VkBufferMemoryBarrier2 giBarrier = makeBufferBarrier2(m_rawGISampleBuffer->getBuffer(),
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        VkDependencyInfo giDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        giDep.bufferMemoryBarrierCount = 1;
+        giDep.pBufferMemoryBarriers = &giBarrier;
+        vkCmdPipelineBarrier2(cmd, &giDep);
+
+        VkDescriptorSet shadeSet = m_descSetsEven[frameSlot];
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirGIPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
+
+        uint32_t giPC[4] = {
+            width,
+            height,
+            sceneData.frameIndex,
+            maxBounces
+        };
+        vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(giPC), giPC);
+        vkCmdDispatch(cmd, (width + 7) / 8, (height + 3) / 4, 1);
+    }
 
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], endQuery);
 

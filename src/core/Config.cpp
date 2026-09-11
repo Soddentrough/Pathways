@@ -153,6 +153,7 @@ void Config::printUsage(const char* progName) {
               << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
               << "  --atrous-passes <int>   Number of A-Trous filter iterations (1..5, default: 3)\n"
               << "  --no-restir             Disable ReSTIR DI spatio-temporal reservoir resampling [default: enabled]\n"
+              << "  --no-restir-gi          Disable ReSTIR GI secondary path reservoir resampling [default: enabled]\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
               << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
@@ -527,6 +528,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_restir_spatial = true;
         } else if (arg == "--no-restir-spatial") {
             cfg.enable_restir_spatial = false;
+        } else if (arg == "--restir-gi") {
+            cfg.enable_restir_gi = true;
+        } else if (arg == "--no-restir-gi") {
+            cfg.enable_restir_gi = false;
         } else if (arg == "--restir-spatial-samples" && i + 1 < argc) {
             cfg.restir_spatial_samples = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--restir-spatial-samples=")) {

@@ -26,6 +26,8 @@ layout(std430, binding = 21) readonly buffer HistoryReservoirBuffer {
 // -----------------------------------------------------------------------------
 // Geometric Normal & Depth Packing
 // -----------------------------------------------------------------------------
+#ifndef PACK_GEOM_DEFINED
+#define PACK_GEOM_DEFINED
 uint packGeom(vec3 norm, float depth) {
     vec2 oct = octEncode(norm);
     uint n16 = packSnorm4x8(vec4(oct, 0.0, 0.0)) & 0xFFFFu;
@@ -38,6 +40,7 @@ void unpackGeom(uint p, out vec3 norm, out float depth) {
     vec2 oct = unpackSnorm4x8(p & 0xFFFFu).xy;
     norm = octDecode(oct);
 }
+#endif
 
 // -----------------------------------------------------------------------------
 // Candidate Target Function Evaluation

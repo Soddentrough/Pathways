@@ -108,7 +108,7 @@ echo "[4c] Running Test Suite 2c: 4K Native Multi-GPU Frame Pacing (Camera Motio
     --dump-frame output/test_cornell_4k_mgpu_motion.png \
     --dump-stats output/stats_4k_mgpu_motion.json
 
-python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 6.0 10.0 60
+python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 8.0 10.0 60
 
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""

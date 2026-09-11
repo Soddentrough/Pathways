@@ -1104,8 +1104,9 @@ VkShaderModule Engine::createShaderModule(const std::vector<char>& code) {
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
-    // 0. Initialize ReSTIR DI Buffers
+    // 0. Initialize ReSTIR DI & GI Buffers
     initReSTIRBuffers();
+    initReSTIRGIBuffers();
 
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
@@ -1255,6 +1256,7 @@ void Engine::initPipelines() {
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
     auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
+    auto wfRestirGICode = loadShaderSPIRV("wavefront_restir_gi.comp.spv");
 
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
@@ -1262,7 +1264,7 @@ void Engine::initPipelines() {
         m_config.wavefront_tile_size,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
-        wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode
+        wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode, wfRestirGICode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -2190,6 +2192,15 @@ void Engine::updateWavefrontSceneDescriptors() {
                 resSize
             );
         }
+        if (m_restirGIReservoirs[0] && m_restirGIReservoirs[1]) {
+            VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
+            m_wavefrontPipeline->updateGIReservoirDescriptors(
+                slot,
+                m_restirGIReservoirs[m_restirGIPingPongIndex]->getBuffer(),
+                m_restirGIReservoirs[1 - m_restirGIPingPongIndex]->getBuffer(),
+                resSize
+            );
+        }
     }
 }
 
@@ -2223,6 +2234,35 @@ void Engine::initReSTIRBuffers() {
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 }
 
+void Engine::initReSTIRGIBuffers() {
+    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
+    VmaAllocator allocator = m_context->getAllocator();
+
+    for (uint32_t i = 0; i < 2; ++i) {
+        m_restirGIReservoirs[i] = std::make_unique<Buffer>(
+            allocator, resSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+    }
+    m_restirGIPingPongIndex = 0;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+    vkCmdFillBuffer(m_commandBuffers[0], m_restirGIReservoirs[0]->getBuffer(), 0, resSize, 0);
+    vkCmdFillBuffer(m_commandBuffers[0], m_restirGIReservoirs[1]->getBuffer(), 0, resSize, 0);
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
+    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+}
+
 void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
     if (!m_restirReservoirs[0] || !m_restirReservoirs[1]) {
         return;
@@ -2246,6 +2286,22 @@ void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
             frameSlot,
             m_restirReservoirs[m_restirPingPongIndex]->getBuffer(),
             m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(),
+            resSize
+        );
+    }
+}
+
+void Engine::updateReSTIRGIDescriptors(uint32_t frameSlot) {
+    if (!m_restirGIReservoirs[0] || !m_restirGIReservoirs[1]) {
+        return;
+    }
+    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
+
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->updateGIReservoirDescriptors(
+            frameSlot,
+            m_restirGIReservoirs[m_restirGIPingPongIndex]->getBuffer(),
+            m_restirGIReservoirs[1 - m_restirGIPingPongIndex]->getBuffer(),
             resSize
         );
     }
@@ -2765,6 +2821,9 @@ void Engine::renderFrame() {
     if (m_config.enable_taa) {
         flags |= (1 << 21);
     }
+    if (m_config.enable_restir_gi) {
+        flags |= (1 << 22);
+    }
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
                                                  m_config.enable_taa, m_config.width, m_config.height, 0);
@@ -2785,11 +2844,15 @@ void Engine::renderFrame() {
         }
     }
 
-    // Ping-pong ReSTIR DI reservoir buffers if enabled
+    // Ping-pong ReSTIR DI & GI reservoir buffers if enabled
     if (m_config.enable_restir_di) {
         m_restirPingPongIndex = 1 - m_restirPingPongIndex;
     }
     updateReSTIRDescriptors(m_currentFrame);
+    if (m_config.enable_restir_gi) {
+        m_restirGIPingPongIndex = 1 - m_restirGIPingPongIndex;
+    }
+    updateReSTIRGIDescriptors(m_currentFrame);
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -2887,6 +2950,7 @@ void Engine::renderFrame() {
             wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
             wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
             wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+            wfSceneData.cameraFlags = flags;
 
             m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                              activeSpp, activeBounces, wfSceneData);
@@ -4234,6 +4298,7 @@ FrameStats Engine::getStats() const {
     stats.restir_spatial_enabled = m_config.enable_restir_spatial;
     stats.restir_spatial_samples = m_config.restir_spatial_samples;
     stats.restir_spatial_radius = m_config.restir_spatial_radius;
+    stats.restir_gi_enabled = m_config.enable_restir_gi;
     stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
     stats.hdri_path = m_config.hdri_path;
 
@@ -4374,10 +4439,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
-    // 4. Recreate ReSTIR DI Buffers
+    // 4. Recreate ReSTIR DI & GI Buffers
     initReSTIRBuffers();
+    initReSTIRGIBuffers();
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         updateReSTIRDescriptors(i);
+        updateReSTIRGIDescriptors(i);
     }
 
     // 5. Resize secondary GPU if active before updating merge descriptor set

@@ -109,7 +109,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"timestamp_iso8601\": \"{}\",\n", timeBuf)
         << std::format("    \"timestamp_unix\": {},\n", static_cast<uint64_t>(now_c))
         << "    \"application\": \"Pathways Pure Vulkan 1.4 Path Tracer\",\n"
-        << "    \"engine_version\": \"1.13.0\"\n"
+        << "    \"engine_version\": \"1.14.0\"\n"
         << "  },\n"
         << "  \"platform\": {\n"
         << std::format("    \"os\": \"{}\",\n", stats.os_name)
@@ -220,7 +220,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"restir_di_enabled\": {},\n", stats.restir_di_enabled ? "true" : "false")
         << std::format("      \"restir_spatial_enabled\": {},\n", stats.restir_spatial_enabled ? "true" : "false")
         << std::format("      \"restir_spatial_samples\": {},\n", stats.restir_spatial_samples)
-        << std::format("      \"restir_spatial_radius\": {:.1f}\n", stats.restir_spatial_radius)
+        << std::format("      \"restir_spatial_radius\": {:.1f},\n", stats.restir_spatial_radius)
+        << std::format("      \"restir_gi_enabled\": {}\n", stats.restir_gi_enabled ? "true" : "false")
         << "    },\n";
 
     std::string safeScenePath = stats.scene_path;
