@@ -527,6 +527,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
+            if (config.enable_restir_di) {
+                ImGui::Text("ReSTIR DI:    Enabled (%s, %u Samples, R=%.0f)",
+                    config.enable_restir_spatial ? "Spatio-Temporal" : "Temporal Only",
+                    config.enable_restir_spatial ? config.restir_spatial_samples : 0u,
+                    config.restir_spatial_radius);
+            } else {
+                ImGui::Text("ReSTIR DI:    Disabled");
+            }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
                 if (stats.accumulation_complete && config.max_accum_frames > 0) {
@@ -1214,6 +1222,34 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::Checkbox("Soft Area Shadows", &config.enable_shadows)) {
                 settingsChanged = true;
+            }
+            if (ImGui::Checkbox("ReSTIR DI (Direct Illumination)", &config.enable_restir_di)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spatio-Temporal Direct Illumination Reservoir Resampling. Resolves complex many-light direct lighting with 1 shadow ray.");
+            }
+            if (config.enable_restir_di) {
+                ImGui::Indent();
+                if (ImGui::Checkbox("Spatial Resampling", &config.enable_restir_spatial)) {
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Gather candidate reservoirs from cross-bilateral neighbors in screen-space.");
+                }
+                if (config.enable_restir_spatial) {
+                    int samples = static_cast<int>(config.restir_spatial_samples);
+                    if (ImGui::SliderInt("Spatial Samples", &samples, 1, 8)) {
+                        config.restir_spatial_samples = static_cast<uint32_t>(samples);
+                        settingsChanged = true;
+                    }
+                    if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 1.0f, 32.0f, "%.1f px")) {
+                        settingsChanged = true;
+                    }
+                }
+                ImGui::Unindent();
             }
         }
 

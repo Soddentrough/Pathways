@@ -127,6 +127,8 @@ layout(push_constant) uniform PushConstants {
     uint secondarySortMode;
 } pc;
 
+#include "wavefront_restir.glsl"
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint activeCount = queueCounters.currentMaterialCounts[0]; // Diffuse queue
@@ -263,85 +265,149 @@ void main() {
 
             vec3 V = -rayDir;
 
-            // Direct Lighting (1-candidate stochastic NEE for Dual-Lobe PBR)
+            // Direct Lighting (ReSTIR DI on Primary Bounce, Stochastic NEE on Secondary / Fallback)
+            bool enableReSTIR = (ubo.flags & (1u << 6)) != 0u;
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
-                uint lightIdx = 0u;
-                float lightSelectPdf = 1.0;
-                if (pc.numLights > 1u) {
-                    lightIdx = uint(randFloat(seed) * float(pc.numLights));
-                    lightIdx = min(lightIdx, pc.numLights - 1u);
-                    lightSelectPdf = 1.0 / float(pc.numLights);
-                }
+                if (enableReSTIR && pc.numLights > 1u && pc.currentBounce == 0u) {
+                    ivec2 pixelCoord = ivec2(pixelIndex % pc.width, pixelIndex / pc.width);
+                    float hitDepth = length(hitPoint - ubo.position.xyz);
+                    ReservoirDI R;
+                    evalReSTIR_DI(pixelCoord, pixelIndex, hitPoint, hitNormal, hitDepth, V, diffuseColor, F0, alphaRoughness, true, seed, R);
 
-                Light light = lights[lightIdx];
-                vec3 lightPoint;
-                vec3 lightDir;
-                float lightDist = 0.0;
-                float lightPdf = 1.0;
-                vec3 lightEmission = light.emission.rgb;
-                bool validLightSample = false;
+                    if (R.W > 0.0 && R.lightIdx < pc.numLights) {
+                        Light wLight = lights[R.lightIdx];
+                        vec3 lightPoint;
+                        vec3 lightDir;
+                        float lightDist = 0.0;
+                        vec3 lightEmission = wLight.emission.rgb;
+                        bool validLightSample = false;
 
-                if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                    vec2 luv = randVec2(seed);
-                    lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                    vec3 toLight = lightPoint - hitPoint;
-                    lightDist = length(toLight);
-                    lightDir = toLight / max(lightDist, 1e-4);
+                        if (uint(wLight.position.w) == 0u /* AREA QUAD */) {
+                            lightPoint = wLight.position.xyz + R.uvX * wLight.u.xyz + R.uvY * wLight.v.xyz;
+                            vec3 toLight = lightPoint - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+                            float cosLight = clamp(dot(-lightDir, wLight.normal.xyz), 0.0, 1.0);
+                            if (cosLight > 0.0) {
+                                float geomFactor = cosLight / max(lightDist * lightDist, 1e-4);
+                                lightEmission *= geomFactor;
+                                validLightSample = true;
+                            }
+                        } else if (uint(wLight.position.w) == 1u /* SPOT */) {
+                            vec3 toLight = wLight.position.xyz - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+                            float cosSpot = dot(-lightDir, wLight.normal.xyz);
+                            if (cosSpot >= wLight.v.w) {
+                                float spotFactor = clamp((cosSpot - wLight.v.w) / max(wLight.u.w - wLight.v.w, 1e-4), 0.0, 1.0);
+                                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                                validLightSample = true;
+                            }
+                        }
 
-                    float cosLight = dot(-lightDir, light.normal.xyz);
-                    if (cosLight > 0.0) {
-                        float area = light.emission.w;
-                        lightPdf = (lightDist * lightDist) / (area * cosLight);
-                        validLightSample = true;
+                        float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
+                        float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                        if (validLightSample && NdotL > 0.0 && NdotV > 0.0) {
+                            vec3 H = normalize(V + lightDir);
+                            float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                            float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                            vec3 F = fresnelSchlickVec(VdotH, F0);
+                            float D = distributionGGX(NdotH, alphaRoughness);
+                            float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                            vec3 specBrdf = D * Vis * F;
+
+                            vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                            vec3 combinedBrdf = diffBrdf + specBrdf;
+
+                            vec3 unshadowed = throughput * combinedBrdf * lightEmission * NdotL * R.W;
+
+                            if (length(unshadowed) > 1e-5) {
+                                hasShadowRay = true;
+                                shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                            }
+                        }
                     }
-                } else if (uint(light.position.w) == 1u /* SPOT */) {
-                    vec3 toLight = light.position.xyz - hitPoint;
-                    lightDist = length(toLight);
-                    lightDir = toLight / max(lightDist, 1e-4);
-
-                    float cosSpot = dot(-lightDir, light.normal.xyz);
-                    float innerCos = light.u.w;
-                    float outerCos = light.v.w;
-                    if (cosSpot >= outerCos) {
-                        float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                        lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
-                        lightPdf = 1.0;
-                        validLightSample = true;
-                    }
-                }
-
-                float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
-                float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
-                if (validLightSample && NdotL > 0.0 && NdotV > 0.0) {
-                    vec3 H = normalize(V + lightDir);
-                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                    vec3 F = fresnelSchlickVec(VdotH, F0);
-                    float D = distributionGGX(NdotH, alphaRoughness);
-                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                    vec3 specBrdf = D * Vis * F;
-
-                    vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
-                    vec3 combinedBrdf = diffBrdf + specBrdf;
-
-                    float diffPdf = NdotL * INV_PI;
-                    float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                    float specProb = clamp(dot(F, vec3(0.3333)), 0.05, 0.95);
-                    float bsdfPdf = (1.0 - specProb) * diffPdf + specProb * specPdf;
-
-                    float misWeight = 1.0;
-                    if (uint(light.position.w) == 0u) {
-                        float lightPdfEff = lightPdf * lightSelectPdf;
-                        misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
+                } else {
+                    uint lightIdx = 0u;
+                    float lightSelectPdf = 1.0;
+                    if (pc.numLights > 1u) {
+                        lightIdx = uint(randFloat(seed) * float(pc.numLights));
+                        lightIdx = min(lightIdx, pc.numLights - 1u);
+                        lightSelectPdf = 1.0 / float(pc.numLights);
                     }
 
-                    vec3 unshadowed = throughput * combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    Light light = lights[lightIdx];
+                    vec3 lightPoint;
+                    vec3 lightDir;
+                    float lightDist = 0.0;
+                    float lightPdf = 1.0;
+                    vec3 lightEmission = light.emission.rgb;
+                    bool validLightSample = false;
 
-                    if (length(unshadowed) > 1e-5) {
-                        hasShadowRay = true;
-                        shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                        shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                    if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                        vec2 luv = randVec2(seed);
+                        lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                        vec3 toLight = lightPoint - hitPoint;
+                        lightDist = length(toLight);
+                        lightDir = toLight / max(lightDist, 1e-4);
+
+                        float cosLight = dot(-lightDir, light.normal.xyz);
+                        if (cosLight > 0.0) {
+                            float area = light.emission.w;
+                            lightPdf = (lightDist * lightDist) / (area * cosLight);
+                            validLightSample = true;
+                        }
+                    } else if (uint(light.position.w) == 1u /* SPOT */) {
+                        vec3 toLight = light.position.xyz - hitPoint;
+                        lightDist = length(toLight);
+                        lightDir = toLight / max(lightDist, 1e-4);
+
+                        float cosSpot = dot(-lightDir, light.normal.xyz);
+                        float innerCos = light.u.w;
+                        float outerCos = light.v.w;
+                        if (cosSpot >= outerCos) {
+                            float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                            lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                            lightPdf = 1.0;
+                            validLightSample = true;
+                        }
+                    }
+
+                    float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
+                    float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                    if (validLightSample && NdotL > 0.0 && NdotV > 0.0) {
+                        vec3 H = normalize(V + lightDir);
+                        float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        float D = distributionGGX(NdotH, alphaRoughness);
+                        float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                        vec3 specBrdf = D * Vis * F;
+
+                        vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                        vec3 combinedBrdf = diffBrdf + specBrdf;
+
+                        float diffPdf = NdotL * INV_PI;
+                        float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
+                        float specProb = clamp(dot(F, vec3(0.3333)), 0.05, 0.95);
+                        float bsdfPdf = (1.0 - specProb) * diffPdf + specProb * specPdf;
+
+                        float misWeight = 1.0;
+                        if (uint(light.position.w) == 0u) {
+                            float lightPdfEff = lightPdf * lightSelectPdf;
+                            misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
+                        }
+
+                        vec3 unshadowed = throughput * combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+
+                        if (length(unshadowed) > 1e-5) {
+                            hasShadowRay = true;
+                            shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                            shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                        }
                     }
                 }
             }

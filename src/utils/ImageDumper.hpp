@@ -98,6 +98,10 @@ struct FrameStats {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool aces_tonemap = true;
+    bool restir_di_enabled = false;
+    bool restir_spatial_enabled = true;
+    uint32_t restir_spatial_samples = 3;
+    float restir_spatial_radius = 8.0f;
     std::string scene_path = "";
     uint32_t num_triangles = 0;
     uint32_t num_spheres = 0;

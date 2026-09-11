@@ -61,14 +61,21 @@ int main() {
         check_true(c2.enable_atrous, "--atrous enabled");
         check_true(c2.atrous_passes == 4, "--atrous-passes sets count");
 
-        // Deprecated legacy flags should be safely accepted without crashing
-        const char* argv3[] = { "pathways", "--taa", "--restir-di", "--shadow-denoiser" };
+        // Test default ReSTIR state (enabled by default) and --no-restir / deprecated legacy flags
+        Config cDefault;
+        check_true(cDefault.enable_restir_di, "ReSTIR DI enabled by default");
+
+        const char* argv3[] = { "pathways", "--taa", "--no-restir", "--shadow-denoiser" };
         Config c3 = Config::parse(4, const_cast<char**>(argv3));
         check_true(!c3.enable_taa, "Deprecated TAA remains disabled");
-        check_true(!c3.enable_restir_di, "Deprecated ReSTIR remains disabled");
+        check_true(!c3.enable_restir_di, "--no-restir disables ReSTIR");
         check_true(!c3.enable_shadow_denoiser, "Deprecated Shadow Denoiser remains disabled");
 
-        std::cout << "  -> CLI flags, A-Trous configuration, and deprecations successfully verified." << std::endl;
+        const char* argv4[] = { "pathways", "--no-restir-di" };
+        Config c4 = Config::parse(2, const_cast<char**>(argv4));
+        check_true(!c4.enable_restir_di, "--no-restir-di also disables ReSTIR");
+
+        std::cout << "  -> CLI flags, A-Trous configuration, and ReSTIR flags successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

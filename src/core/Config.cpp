@@ -152,7 +152,8 @@ void Config::printUsage(const char* progName) {
               << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
               << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
               << "  --atrous-passes <int>   Number of A-Trous filter iterations (1..5, default: 3)\n"
-               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
+              << "  --no-restir             Disable ReSTIR DI spatio-temporal reservoir resampling [default: enabled]\n"
+              << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
               << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
               << "  --min-spp <int>         Minimum dynamic SPP floor (default: 1)\n"
@@ -518,13 +519,22 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
-        } else if (arg == "--restir-di" || arg == "--restir" || arg == "--no-restir-di" || arg == "--no-restir" ||
-                   arg == "--restir-spatial" || arg == "--no-restir-spatial") {
-            Logger::info("ReSTIR DI option is deprecated and has been removed from the active pipeline.");
-        } else if ((arg == "--restir-spatial-samples" || arg == "--restir-spatial-radius") && i + 1 < argc) {
-            ++i;
-        } else if (arg.starts_with("--restir-spatial-samples=") || arg.starts_with("--restir-spatial-radius=")) {
-            // Ignored deprecated flag
+        } else if (arg == "--restir-di" || arg == "--restir") {
+            cfg.enable_restir_di = true;
+        } else if (arg == "--no-restir-di" || arg == "--no-restir") {
+            cfg.enable_restir_di = false;
+        } else if (arg == "--restir-spatial") {
+            cfg.enable_restir_spatial = true;
+        } else if (arg == "--no-restir-spatial") {
+            cfg.enable_restir_spatial = false;
+        } else if (arg == "--restir-spatial-samples" && i + 1 < argc) {
+            cfg.restir_spatial_samples = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--restir-spatial-samples=")) {
+            cfg.restir_spatial_samples = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--restir-spatial-radius" && i + 1 < argc) {
+            cfg.restir_spatial_radius = std::stof(argv[++i]);
+        } else if (arg.starts_with("--restir-spatial-radius=")) {
+            cfg.restir_spatial_radius = std::stof(arg.substr(arg.find('=') + 1));
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;

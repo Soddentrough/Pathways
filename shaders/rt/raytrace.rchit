@@ -687,7 +687,7 @@ void main() {
     float hitDepth = length(hitPoint - ubo.position.xyz);
 
     if (enableDirect && pc.numLights > 0u && mat.type != 3u && transmission < 0.1 && mat.type != 2u) {
-        if (enableReSTIR && isPrimary) {
+        if (enableReSTIR && pc.numLights > 1u && isPrimary) {
             ReservoirDI R;
             R.lightIdx = 0u;
             R.uvX = 0.0;
@@ -698,8 +698,8 @@ void main() {
             R.targetPdf = 0.0;
             R.pad = 0u;
 
-            // 1. Initial Candidate Generation (M_init = 8 candidates with Chao's WRS)
-            const uint M_init = 8u;
+            // 1. Initial Candidate Generation (M_init = 4 candidates with Chao's WRS)
+            const uint M_init = 4u;
             for (uint c = 0u; c < M_init; ++c) {
                 uint candIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
                 vec2 cUv = randVec2(prd.seed);
@@ -771,6 +771,7 @@ void main() {
             if (enableSpatial) {
                 uint spatialSamples = (ubo.flags >> 8u) & 0xFu;
                 if (spatialSamples == 0u) spatialSamples = 4u;
+                spatialSamples = min(spatialSamples, 4u);
                 float spatialRadius = float((ubo.flags >> 12u) & 0xFFu);
                 if (spatialRadius < 1.0) spatialRadius = 16.0;
 

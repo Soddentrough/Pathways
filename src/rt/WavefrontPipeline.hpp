@@ -60,6 +60,11 @@ public:
                                 VkDescriptorImageInfo envMapInfo,
                                 const std::vector<VkDescriptorImageInfo>& sceneTexInfos);
 
+    void updateReservoirDescriptors(uint32_t frameSlot,
+                                    VkBuffer curReservoir,
+                                    VkBuffer histReservoir,
+                                    VkDeviceSize resSize);
+
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);
     uint32_t getTileSize() const { return m_tileSize; }

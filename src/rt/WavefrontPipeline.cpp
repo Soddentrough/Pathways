@@ -107,7 +107,9 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // OutRayGeomQueue
         { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // RayHitQueue
         { 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // MaterialIndexQueue
-        { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // SecondaryIndexQueue
+        { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // SecondaryIndexQueue
+        { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // CurrentReservoirsBuffer
+        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // HistoryReservoirsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -314,6 +316,26 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
             writes.push_back(texWrite);
         }
 
+        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void WavefrontPipeline::updateReservoirDescriptors(uint32_t frameSlot,
+                                                 VkBuffer curReservoir,
+                                                 VkBuffer histReservoir,
+                                                 VkDeviceSize resSize) {
+    if (frameSlot >= 2 || curReservoir == VK_NULL_HANDLE || histReservoir == VK_NULL_HANDLE) return;
+
+    VkDescriptorBufferInfo curInfo{ curReservoir, 0, resSize };
+    VkDescriptorBufferInfo histInfo{ histReservoir, 0, resSize };
+
+    std::array<VkDescriptorSet, 2> targetSets = { m_descSetsEven[frameSlot], m_descSetsOdd[frameSlot] };
+    for (VkDescriptorSet dset : targetSets) {
+        if (dset == VK_NULL_HANDLE) continue;
+        std::vector<VkWriteDescriptorSet> writes = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+        };
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 }

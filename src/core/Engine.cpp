@@ -2181,6 +2181,15 @@ void Engine::updateWavefrontSceneDescriptors() {
             envInfo,
             texInfos
         );
+        if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
+            VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
+            m_wavefrontPipeline->updateReservoirDescriptors(
+                slot,
+                m_restirReservoirs[m_restirPingPongIndex]->getBuffer(),
+                m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(),
+                resSize
+            );
+        }
     }
 }
 
@@ -2215,7 +2224,7 @@ void Engine::initReSTIRBuffers() {
 }
 
 void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
-    if (m_rtDescSets[frameSlot] == VK_NULL_HANDLE || !m_restirReservoirs[0] || !m_restirReservoirs[1]) {
+    if (!m_restirReservoirs[0] || !m_restirReservoirs[1]) {
         return;
     }
     VkDevice device = m_context->getDevice();
@@ -2224,11 +2233,22 @@ void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
     VkDescriptorBufferInfo curInfo{ m_restirReservoirs[m_restirPingPongIndex]->getBuffer(), 0, resSize };
     VkDescriptorBufferInfo histInfo{ m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(), 0, resSize };
 
-    std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
-    };
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (m_rtDescSets[frameSlot] != VK_NULL_HANDLE) {
+        std::vector<VkWriteDescriptorSet> writes = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
+        };
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->updateReservoirDescriptors(
+            frameSlot,
+            m_restirReservoirs[m_restirPingPongIndex]->getBuffer(),
+            m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(),
+            resSize
+        );
+    }
 }
 
 void Engine::updateMergeDescriptors() {
@@ -4210,6 +4230,10 @@ FrameStats Engine::getStats() const {
     stats.enable_refraction = m_config.enable_refraction;
     stats.enable_shadows = m_config.enable_shadows;
     stats.aces_tonemap = m_config.aces_tonemap;
+    stats.restir_di_enabled = m_config.enable_restir_di;
+    stats.restir_spatial_enabled = m_config.enable_restir_spatial;
+    stats.restir_spatial_samples = m_config.restir_spatial_samples;
+    stats.restir_spatial_radius = m_config.restir_spatial_radius;
     stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
     stats.hdri_path = m_config.hdri_path;
 

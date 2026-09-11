@@ -68,7 +68,7 @@ struct Config {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool enable_direct_light = true;
-    bool enable_restir_di = false;
+    bool enable_restir_di = true; // Default: true (enabled by default)
     bool enable_restir_spatial = true;
     uint32_t restir_spatial_samples = 3;
     float restir_spatial_radius = 8.0f;
