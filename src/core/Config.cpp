@@ -161,6 +161,7 @@ void Config::printUsage(const char* progName) {
               << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
+              << "  --accum-cutoff <int>    Maximum static accumulation frames (default: 2048, 0 = unlimited)\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
               << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
               << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
@@ -549,6 +550,11 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.progressive_accumulation = false;
         } else if (arg == "--accumulation") {
             cfg.progressive_accumulation = true;
+        } else if ((arg == "--accum-cutoff" || arg == "--max-accum-frames" || arg == "--accum-limit") && i + 1 < argc) {
+            cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") || arg.starts_with("--accum-limit=")) {
+            size_t eq = arg.find('=');
+            cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(arg.substr(eq + 1)));
         } else if (arg == "--no-indirect" || arg == "--direct-only") {
             cfg.enable_indirect_light = false;
         } else if (arg == "--indirect") {

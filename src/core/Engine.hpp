@@ -249,7 +249,11 @@ private:
     // Frame tracking & Quality Governor
     std::unique_ptr<QualityGovernor> m_governor;
     uint32_t m_accumulatedSamples = 0;
+    bool m_accumulationComplete = false;
     std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;
+    std::chrono::high_resolution_clock::time_point m_lastWallFrameStartTime;
+    double m_lastPresentationTimeMs = 0.0;
+    std::vector<double> m_presentationTimesMs;
     uint32_t m_frameIndex = 0;
     uint32_t m_totalFramesRendered = 0;
     MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;

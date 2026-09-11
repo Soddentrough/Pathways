@@ -608,8 +608,16 @@ void main() {
                 emptyR.pad = 0u;
                 currentReservoirs[prd.pad] = emptyR;
             }
+            vec3 specOut = accumRadiance * transmittance;
+            if (!isPrimary) {
+                const float MAX_INDIRECT_LUMINANCE = 35.0;
+                float eLum = dot(specOut, vec3(0.2126, 0.7152, 0.0722));
+                if (eLum > MAX_INDIRECT_LUMINANCE) {
+                    specOut *= (MAX_INDIRECT_LUMINANCE / eLum);
+                }
+            }
             prd.diffuseRadiance = vec3(0.0);
-            prd.specularRadiance = accumRadiance * transmittance;
+            prd.specularRadiance = specOut;
             if (isPrimary) {
                 prd.packedAlbedoRG = packHalf2x16(baseColor.rg);
                 prd.packedAlbedoB_Roughness = packHalf2x16(vec2(baseColor.b, roughness));
@@ -1172,6 +1180,18 @@ void main() {
     } else {
         prd.packedAlbedoRG = 0u;
         prd.packedAlbedoB_Roughness = 0u;
+    }
+
+    if (!isPrimary) {
+        const float MAX_INDIRECT_LUMINANCE = 35.0;
+        float dLum = dot(accumDiffuse, vec3(0.2126, 0.7152, 0.0722));
+        if (dLum > MAX_INDIRECT_LUMINANCE) {
+            accumDiffuse *= (MAX_INDIRECT_LUMINANCE / dLum);
+        }
+        float sLum = dot(accumSpecular, vec3(0.2126, 0.7152, 0.0722));
+        if (sLum > MAX_INDIRECT_LUMINANCE) {
+            accumSpecular *= (MAX_INDIRECT_LUMINANCE / sLum);
+        }
     }
 
     prd.diffuseRadiance = accumDiffuse;

@@ -404,7 +404,12 @@ void Engine::initScene() {
     std::filesystem::path scenesDir = "scenes";
     if (!std::filesystem::exists(scenesDir) || !std::filesystem::is_directory(scenesDir)) {
         std::filesystem::path exeDir;
-#if defined(__linux__) || defined(__unix__)
+#ifdef _WIN32
+        char exePathBuf[MAX_PATH] = {0};
+        if (GetModuleFileNameA(NULL, exePathBuf, MAX_PATH)) {
+            exeDir = std::filesystem::path(exePathBuf).parent_path();
+        }
+#elif defined(__linux__) || defined(__unix__)
         std::error_code ec;
         auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
         if (!ec && !p.empty()) {
@@ -415,9 +420,15 @@ void Engine::initScene() {
         }
 #endif
         if (!exeDir.empty()) {
+            auto adjacentScenes = exeDir / "scenes";
+            auto parentScenes = exeDir / ".." / "scenes";
             auto relShare = exeDir / ".." / "share" / "pathways" / "scenes";
             auto devScenes = exeDir / ".." / ".." / "scenes";
-            if (std::filesystem::exists(relShare) && std::filesystem::is_directory(relShare)) {
+            if (std::filesystem::exists(adjacentScenes) && std::filesystem::is_directory(adjacentScenes)) {
+                scenesDir = adjacentScenes;
+            } else if (std::filesystem::exists(parentScenes) && std::filesystem::is_directory(parentScenes)) {
+                scenesDir = parentScenes;
+            } else if (std::filesystem::exists(relShare) && std::filesystem::is_directory(relShare)) {
                 scenesDir = relShare;
             } else if (std::filesystem::exists(devScenes) && std::filesystem::is_directory(devScenes)) {
                 scenesDir = devScenes;
@@ -2483,7 +2494,19 @@ void Engine::updateInput() {
 }
 
 void Engine::renderFrame() {
-    m_currentFrameStartTime = std::chrono::high_resolution_clock::now();
+    auto frameNow = std::chrono::high_resolution_clock::now();
+    if (m_totalFramesRendered > 0) {
+        double wallIntervalMs = std::chrono::duration<double, std::milli>(frameNow - m_lastWallFrameStartTime).count();
+        if (wallIntervalMs > 0.01 && wallIntervalMs < 1000.0) {
+            m_lastPresentationTimeMs = wallIntervalMs;
+            m_presentationTimesMs.push_back(wallIntervalMs);
+            if (!m_config.headless && m_presentationTimesMs.size() > 60) {
+                m_presentationTimesMs.erase(m_presentationTimesMs.begin());
+            }
+        }
+    }
+    m_lastWallFrameStartTime = frameNow;
+    m_currentFrameStartTime = frameNow;
     VkDevice device = m_context->getDevice();
     VkQueue queue = m_context->getGraphicsQueue();
 
@@ -2686,8 +2709,14 @@ void Engine::renderFrame() {
         activeFractionalSpp = m_governor->getState().fractionalSpp;
         activeBounces = m_governor->getState().currentBounces;
     }
+    bool accumReachedCutoff = (m_config.progressive_accumulation &&
+                               m_config.max_accum_frames > 0 &&
+                               m_accumulatedSamples >= m_config.max_accum_frames);
+    m_accumulationComplete = accumReachedCutoff;
     if (m_config.progressive_accumulation) {
-        m_accumulatedSamples++;
+        if (!accumReachedCutoff) {
+            m_accumulatedSamples++;
+        }
     } else {
         m_accumulatedSamples = 1;
     }
@@ -2800,7 +2829,8 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
-        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+        if (!accumReachedCutoff) {
+            if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
             bool needAccumReset = accumReset || !m_config.progressive_accumulation;
             if (needAccumReset && m_accumImage) {
                 VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -3027,6 +3057,7 @@ void Engine::renderFrame() {
 
             m_taaPingPongIndex = 1 - m_taaPingPongIndex;
         }
+        } // end if (!accumReachedCutoff)
 
         VkMemoryBarrier2 memBarrier{};
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -3044,7 +3075,7 @@ void Engine::renderFrame() {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
         // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = dispatchAtrous(cmd);
+        uint32_t atrousOutputSlot = (!accumReachedCutoff) ? dispatchAtrous(cmd) : 0u;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
@@ -3156,10 +3187,12 @@ void Engine::renderFrame() {
         uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (ubo.spp + uboSec.spp) : 0u;
 
         // 1. Launch secondary GPU concurrently for current frame
-        m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
-                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
-                                   totalCompositeSpp, m_numOpaqueTriangles);
+        if (!accumReachedCutoff) {
+            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+                                       m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
+                                       hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
+                                       totalCompositeSpp, m_numOpaqueTriangles);
+        }
 
         // 2. Concurrently record and execute primary GPU ray tracing asynchronously
         vkResetCommandBuffer(cmd, 0);
@@ -3187,7 +3220,8 @@ void Engine::renderFrame() {
         };
 
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+        if (!accumReachedCutoff) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
         VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
         vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
@@ -3371,6 +3405,7 @@ void Engine::renderFrame() {
 
             m_taaPingPongIndex = 1 - m_taaPingPongIndex;
         }
+        } // end if (!accumReachedCutoff)
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
@@ -3405,15 +3440,17 @@ void Engine::renderFrame() {
         vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
         // Merge Pass
-        vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-        vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
+        if (!accumReachedCutoff) {
+            vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-        uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
-        vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
+            uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
+            vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
-        uint32_t mergeGroupsX = (m_config.width + 15) / 16;
-        uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
-        vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+            uint32_t mergeGroupsX = (m_config.width + 15) / 16;
+            uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
+            vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+        }
 
         VkMemoryBarrier2 mergeBarrier{};
         mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -3655,7 +3692,7 @@ void Engine::renderFrame() {
     vkEndCommandBuffer(activeCmd);
 
     // Wait for secondary GPU completion of slot and PCIe transfer (if MGPU)
-    if (isMgpu) {
+    if (isMgpu && !accumReachedCutoff) {
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         m_mgpu->syncAndTransfer(slot, dstHost, frameBytes);
     }
@@ -3673,7 +3710,7 @@ void Engine::renderFrame() {
         waitSemaphores.push_back(m_rtCompleteSemaphores[m_currentFrame]);
         waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-        if (m_mgpu->isCrossGpuSyncActive()) {
+        if (m_mgpu->isCrossGpuSyncActive() && !accumReachedCutoff) {
             uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
             VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
             if (secSem != VK_NULL_HANDLE) {
@@ -3948,10 +3985,23 @@ FrameStats Engine::getStats() const {
     stats.spp = m_config.spp;
     stats.total_frames = m_totalFramesRendered;
     stats.total_samples = m_accumulatedSamples;
+    stats.max_accum_frames = m_config.max_accum_frames;
+    stats.accumulation_complete = m_accumulationComplete;
     stats.validation_errors = m_context->getValidationErrors();
 
     stats.current_frame_time_ms = m_lastFrameTimeMs;
     stats.current_fps = m_lastFrameTimeMs > 0.0001 ? (1000.0 / m_lastFrameTimeMs) : 0.0;
+
+    stats.presentation_time_ms = m_lastPresentationTimeMs;
+    stats.presentation_fps = m_lastPresentationTimeMs > 0.0001 ? (1000.0 / m_lastPresentationTimeMs) : stats.current_fps;
+
+    if (!m_presentationTimesMs.empty()) {
+        double pSum = std::accumulate(m_presentationTimesMs.begin(), m_presentationTimesMs.end(), 0.0);
+        double avgPresTime = pSum / m_presentationTimesMs.size();
+        stats.avg_presentation_fps = avgPresTime > 0.0001 ? (1000.0 / avgPresTime) : stats.presentation_fps;
+    } else {
+        stats.avg_presentation_fps = stats.presentation_fps;
+    }
 
     stats.target_fps = m_config.target_fps;
     stats.adaptive_spp = m_config.adaptive_spp;
@@ -4651,7 +4701,7 @@ void Engine::runTrainingCapture() {
                 vkQueueWaitIdle(queue);
 
                 accumulated += currentSpp;
-                seedFrame++;
+                seedFrame += currentSpp;
             }
 
             // Copy m_accumImage to refStaging
@@ -4695,6 +4745,7 @@ void Engine::runTrainingCapture() {
 
             void* mappedRef = refStaging.map();
             if (mappedRef) {
+                TrainingDataWriter::normalizeReferenceBuffer(mappedRef, width, height, isFp16 ? 0 : 1);
                 TrainingDataWriter::writeTensor(refPath, width, height, 4, isFp16 ? 0 : 1,
                                                 frameIdx, targetRefSpp, mappedRef, static_cast<size_t>(refByteSize));
                 refStaging.unmap();

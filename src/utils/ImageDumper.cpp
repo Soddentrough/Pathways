@@ -243,6 +243,9 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << "  \"performance\": {\n"
         << std::format("    \"current_frame_time_ms\": {:.3f},\n", stats.current_frame_time_ms)
         << std::format("    \"current_fps\": {:.1f},\n", stats.current_fps)
+        << std::format("    \"presentation_time_ms\": {:.3f},\n", stats.presentation_time_ms)
+        << std::format("    \"presentation_fps\": {:.1f},\n", stats.presentation_fps)
+        << std::format("    \"avg_presentation_fps\": {:.1f},\n", stats.avg_presentation_fps)
         << std::format("    \"avg_frame_time_ms\": {:.3f},\n", stats.avg_frame_time_ms)
         << std::format("    \"min_frame_time_ms\": {:.3f},\n", stats.min_frame_time_ms)
         << std::format("    \"max_frame_time_ms\": {:.3f},\n", stats.max_frame_time_ms)
@@ -293,6 +296,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
 
     out << std::format("    \"total_frames\": {},\n", stats.total_frames)
         << std::format("    \"total_accumulated_samples\": {},\n", stats.total_samples)
+        << std::format("    \"max_accum_frames\": {},\n", stats.max_accum_frames)
+        << std::format("    \"accumulation_complete\": {},\n", stats.accumulation_complete ? "true" : "false")
         << std::format("    \"validation_errors\": {},\n", stats.validation_errors)
         << "    \"configurations_breakdown\": [\n";
 

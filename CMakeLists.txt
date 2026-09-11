@@ -170,10 +170,21 @@ file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
 )
 
+# Windows Resource File (Application Icon & Version Info)
+set(WINDOWS_RESOURCE_FILES "")
+if(WIN32)
+    set(WINDOWS_RESOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.rc)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.rc
+        PROPERTIES
+        COMPILE_FLAGS "-I ${CMAKE_CURRENT_SOURCE_DIR}/data"
+    )
+endif()
+
 # Executable target
 add_executable(pathways
     ${SRC_FILES}
     ${IMGUI_SOURCES}
+    ${WINDOWS_RESOURCE_FILES}
 )
 
 add_dependencies(pathways compile_shaders)
@@ -369,46 +380,88 @@ add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing)
 # ==============================================================================
 include(GNUInstallDirs)
 
-install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
-
-# Install curated Tier 1 research scenes only (excludes heavy/untracked assets like bistro)
 set(CURATED_SCENE_FILES
     scenes/DamagedHelmet.glb
     scenes/DragonAttenuation.glb
 )
-foreach(SCENE_FILE ${CURATED_SCENE_FILES})
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}")
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
-    endif()
-endforeach()
 
 set(CURATED_SCENE_DIRS
     classroom
     coffee-maker
     living-room
 )
-foreach(SCENE_DIR ${CURATED_SCENE_DIRS})
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}")
-        install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}/"
-                DESTINATION "${CMAKE_INSTALL_DATADIR}/pathways/scenes/${SCENE_DIR}"
-                FILES_MATCHING
-                PATTERN "*_extended.glb"
-                PATTERN "LICENSE.txt"
-                PATTERN "conversion.yaml")
-    endif()
-endforeach()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop")
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+if(WIN32)
+    # Windows runtime deployment and installation
+    install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    # Deploy required runtime DLLs
+    install(PROGRAMS $<TARGET_RUNTIME_DLLS:pathways> DESTINATION ${CMAKE_INSTALL_BINDIR})
+    if(EXTRA_RUNTIME_DLLS)
+        install(PROGRAMS ${EXTRA_RUNTIME_DLLS} DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+
+    # Install SPIR-V shaders directly adjacent to executable
+    install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_BINDIR}/shaders FILES_MATCHING PATTERN "*.spv")
+
+    # Install curated Tier 1 research scenes
+    foreach(SCENE_FILE ${CURATED_SCENE_FILES})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}")
+            install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}" DESTINATION scenes)
+        endif()
+    endforeach()
+
+    foreach(SCENE_DIR ${CURATED_SCENE_DIRS})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}")
+            install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}/"
+                    DESTINATION "scenes/${SCENE_DIR}"
+                    FILES_MATCHING
+                    PATTERN "*_extended.glb"
+                    PATTERN "LICENSE.txt"
+                    PATTERN "conversion.yaml")
+        endif()
+    endforeach()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION .)
+    endif()
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION . OPTIONAL)
+else()
+    # Standard Linux FHS installation
+    install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
+
+    foreach(SCENE_FILE ${CURATED_SCENE_FILES})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}")
+            install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
+        endif()
+    endforeach()
+
+    foreach(SCENE_DIR ${CURATED_SCENE_DIRS})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}")
+            install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scenes/${SCENE_DIR}/"
+                    DESTINATION "${CMAKE_INSTALL_DATADIR}/pathways/scenes/${SCENE_DIR}"
+                    FILES_MATCHING
+                    PATTERN "*_extended.glb"
+                    PATTERN "LICENSE.txt"
+                    PATTERN "conversion.yaml")
+        endif()
+    endforeach()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop")
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg")
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)
+    endif()
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION ${CMAKE_INSTALL_DOCDIR} OPTIONAL)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg")
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)
-endif()
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION ${CMAKE_INSTALL_DOCDIR} OPTIONAL)
 
 set(CPACK_PACKAGE_NAME "pathways")
 set(CPACK_PACKAGE_VENDOR "Soddentrough")
@@ -422,20 +475,46 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 endif()
 
-# RPM Generator options (Fedora / RHEL)
-set(CPACK_RPM_PACKAGE_LICENSE "MIT")
-set(CPACK_RPM_PACKAGE_GROUP "Graphics")
-set(CPACK_RPM_PACKAGE_URL "https://github.com/Soddentrough/Pathways")
-set(CPACK_RPM_PACKAGE_AUTOREQ "yes")
-set(CPACK_RPM_PACKAGE_AUTOPROV "yes")
-set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
-if(NOT CPACK_RPM_PACKAGE_RELEASE)
-    set(CPACK_RPM_PACKAGE_RELEASE "1.fc44")
-endif()
-set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
-set(CPACK_RPM_PACKAGE_DESCRIPTION "Pathways is a high-performance, real-time Vulkan 1.4 path tracer optimized for modern AMD RDNA architectures (e.g. Dual Radeon AI PRO R9700). Features include pure Wave32 wavefront dispatch via Device Generated Commands (DGC), hardware ray tracing, multi-GPU scaling (interleaved scanlines and sample parallelism), and canonical Tier 1 PBR research assets.")
+if(WIN32)
+    # Windows NSIS Installer & ZIP Distribution
+    set(CPACK_GENERATOR "NSIS;ZIP")
+    set(CPACK_NSIS_DISPLAY_NAME "Pathways")
+    set(CPACK_NSIS_PACKAGE_NAME "Pathways")
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "Pathways")
+    set(CPACK_NSIS_MODIFY_PATH ON)
 
-# Default generators
-set(CPACK_GENERATOR "RPM;TGZ")
+    # Shortcuts
+    set(CPACK_PACKAGE_EXECUTABLES "pathways" "Pathways Path Tracer")
+    set(CPACK_CREATE_DESKTOP_LINKS "pathways")
+
+    # Icon branding
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
+        set(CPACK_NSIS_MUI_ICON "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
+        set(CPACK_NSIS_MUI_UNIICON "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
+        set(CPACK_PACKAGE_ICON "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
+    endif()
+
+    set(CPACK_NSIS_MENU_LINKS
+        "bin/pathways.exe" "Pathways Path Tracer"
+        "https://github.com/Soddentrough/Pathways" "Pathways GitHub"
+    )
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+else()
+    # RPM Generator options (Fedora / RHEL)
+    set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+    set(CPACK_RPM_PACKAGE_GROUP "Graphics")
+    set(CPACK_RPM_PACKAGE_URL "https://github.com/Soddentrough/Pathways")
+    set(CPACK_RPM_PACKAGE_AUTOREQ "yes")
+    set(CPACK_RPM_PACKAGE_AUTOPROV "yes")
+    set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
+    if(NOT CPACK_RPM_PACKAGE_RELEASE)
+        set(CPACK_RPM_PACKAGE_RELEASE "1.fc44")
+    endif()
+    set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
+    set(CPACK_RPM_PACKAGE_DESCRIPTION "Pathways is a high-performance, real-time Vulkan 1.4 path tracer optimized for modern AMD RDNA architectures (e.g. Dual Radeon AI PRO R9700). Features include pure Wave32 wavefront dispatch via Device Generated Commands (DGC), hardware ray tracing, multi-GPU scaling (interleaved scanlines and sample parallelism), and canonical Tier 1 PBR research assets.")
+
+    # Default generators
+    set(CPACK_GENERATOR "RPM;TGZ")
+endif()
 
 include(CPack)

@@ -131,3 +131,25 @@ This runs:
 4. 4K native real-time benchmark (<8ms frame budget target)
 5. glTF scene ingestion tests (`DamagedHelmet.glb`)
 6. Frame integrity and radiance verification via PIL analysis
+
+---
+
+## 6. Packaging & Windows Installer (.exe)
+
+Pathways includes native CPack support for generating Windows `.exe` installers via NSIS as well as portable `.zip` archives:
+
+```powershell
+# From build/windows-clang-release (or build directory):
+cpack -G NSIS -C Release
+
+# Generate Portable ZIP Archive:
+cpack -G ZIP -C Release
+```
+
+The installer packages:
+- `pathways.exe` with embedded application icon (`data/pathways.ico`) and version metadata
+- Target runtime DLLs (`SDL3.dll`, `zlib1.dll`, `libwinpthread-1.dll`)
+- Compiled Vulkan 1.4 SPIR-V shaders (`bin/shaders/`)
+- Curated Tier 1 PBR research assets (`scenes/`)
+- Desktop and Start Menu shortcuts with uninstaller
+

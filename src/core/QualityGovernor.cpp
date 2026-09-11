@@ -195,6 +195,7 @@ void QualityGovernor::update(uint32_t slot, float measuredRtMs, float fixedOverh
 
     // 2. Safe Headroom Target Line: Require 15% margin for upgrades
     float targetRtMs = 0.85f * rtBudget;
+    uint32_t nominalBounces = std::clamp(4u, m_config.minBounces, m_config.maxBounces);
 
     // 3. Emergency Downscale if overshooting budget
     if (measuredRtMs > 1.01f * rtBudget) {
@@ -203,8 +204,8 @@ void QualityGovernor::update(uint32_t slot, float measuredRtMs, float fixedOverh
         m_failedBounces = dispBounces;
         m_failLockoutFrames = 90; // Lock out failed config for 90 frames (~1.5s)
 
-        // Downscale either bounces or SPP by exactly 1 step
-        if (m_state.currentBounces > m_config.minBounces && m_state.currentSpp <= m_config.minSpp) {
+        // If bounces were elevated above 4, step down bounces first
+        if (m_state.currentBounces > nominalBounces) {
             m_state.currentBounces--;
         } else if (m_state.currentSpp > m_config.minSpp) {
             m_state.currentSpp--;
@@ -212,7 +213,7 @@ void QualityGovernor::update(uint32_t slot, float measuredRtMs, float fixedOverh
             m_state.currentBounces--;
         }
 
-        m_cooldown = 3; // Drain 2 in-flight frames before any further decision
+        m_cooldown = 2; // Drain in-flight frames before any further decision
     } else if (m_emaCostPerSpp > 0.001f) {
         auto isConfigAllowed = [&](uint32_t spp, uint32_t bounces) -> bool {
             if (m_failLockoutFrames > 0 && spp >= m_failedSpp && bounces >= m_failedBounces) {
@@ -222,77 +223,65 @@ void QualityGovernor::update(uint32_t slot, float measuredRtMs, float fixedOverh
         };
 
         // 4. Model-Predictive Optimal Configuration Search
-        uint32_t bestSpp = m_state.currentSpp;
-        uint32_t bestBounces = m_state.currentBounces;
-
-        if (cameraMoving) {
-            // Motion Profile: Maximize Primary SPP to suppress spatial/temporal noise.
-            // Lock bounces to 3-4 so primary SPP has maximum headroom.
-            uint32_t motionBounces = std::clamp(3u, m_config.minBounces, std::min(4u, m_config.maxBounces));
-
-            uint32_t candidateSpp = m_config.minSpp;
-            for (uint32_t spp = m_config.minSpp; spp <= m_config.maxSpp; ++spp) {
-                if (!isConfigAllowed(spp, motionBounces)) break;
-                if (predictTime(spp, motionBounces, isMgpuSampleParallel) <= targetRtMs) {
-                    candidateSpp = spp;
-                } else {
-                    break;
-                }
+        // User Policy:
+        // - Adaptive SPP changes primary rays (SPP) and leaves bounces at 4.
+        // - If we are at 16 SPP (or maxSpp) and execution time remains lower than target FPS,
+        //   we can then also increase bounces.
+        uint32_t candidateSpp = m_config.minSpp;
+        for (uint32_t spp = m_config.minSpp; spp <= m_config.maxSpp; ++spp) {
+            if (!isConfigAllowed(spp, nominalBounces)) break;
+            if (predictTime(spp, nominalBounces, isMgpuSampleParallel) <= targetRtMs) {
+                candidateSpp = spp;
+            } else {
+                break;
             }
-            bestSpp = candidateSpp;
-            bestBounces = motionBounces;
-
-            // Extra headroom: check if bounce depth can be slightly increased (up to 5)
-            for (uint32_t b = motionBounces + 1; b <= std::min(5u, m_config.maxBounces); ++b) {
-                if (!isConfigAllowed(bestSpp, b)) break;
-                if (predictTime(bestSpp, b, isMgpuSampleParallel) <= targetRtMs) {
-                    bestBounces = b;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            // Stationary Profile: Progressive accumulation handles samples over static frames;
-            // prioritize high bounce transport and stable SPP without hunting or pulsing.
-            // Find highest bounce count at minSpp first
-            uint32_t optBounces = m_config.minBounces;
-            for (uint32_t b = m_config.minBounces; b <= m_config.maxBounces; ++b) {
-                if (!isConfigAllowed(m_config.minSpp, b)) break;
-                if (predictTime(m_config.minSpp, b, isMgpuSampleParallel) <= targetRtMs) {
-                    optBounces = b;
-                } else {
-                    break;
-                }
-            }
-
-            // Now check if higher SPP fits with that bounce depth
-            uint32_t optSpp = m_config.minSpp;
-            for (uint32_t spp = m_config.minSpp + 1; spp <= m_config.maxSpp; ++spp) {
-                if (!isConfigAllowed(spp, optBounces)) break;
-                if (predictTime(spp, optBounces, isMgpuSampleParallel) <= targetRtMs) {
-                    optSpp = spp;
-                } else {
-                    break;
-                }
-            }
-
-            bestSpp = optSpp;
-            bestBounces = optBounces;
         }
 
-        // Apply smooth, single-step rate-limiting
+        uint32_t candidateBounces = nominalBounces;
+        // If at maximum SPP (>= 16 SPP or >= maxSpp) and execution time remains lower than target budget,
+        // we can then also increase bounces beyond 4 up to maxBounces.
+        if (candidateSpp >= 16u || candidateSpp >= m_config.maxSpp) {
+            for (uint32_t b = nominalBounces + 1; b <= m_config.maxBounces; ++b) {
+                if (!isConfigAllowed(candidateSpp, b)) break;
+                if (predictTime(candidateSpp, b, isMgpuSampleParallel) <= targetRtMs) {
+                    candidateBounces = b;
+                } else {
+                    break;
+                }
+            }
+        } else if (candidateSpp == m_config.minSpp && predictTime(m_config.minSpp, nominalBounces, isMgpuSampleParallel) > targetRtMs) {
+            // If even minSpp with nominal bounces exceeds budget, step down bounces toward minBounces
+            for (uint32_t b = nominalBounces; b >= m_config.minBounces; --b) {
+                if (predictTime(m_config.minSpp, b, isMgpuSampleParallel) <= targetRtMs || b == m_config.minBounces) {
+                    candidateBounces = b;
+                    break;
+                }
+            }
+        }
+
+        uint32_t bestSpp = candidateSpp;
+        uint32_t bestBounces = candidateBounces;
+
+        // Apply rate-limiting with fast warmup
         if (bestSpp > m_state.currentSpp) {
-            m_state.currentSpp++;
-            m_cooldown = 6;
+            float predictedNext = predictTime(m_state.currentSpp + 1, m_state.currentBounces, isMgpuSampleParallel);
+            if (m_state.warmUpFrames <= 20 || predictedNext < 0.65f * targetRtMs) {
+                uint32_t step = std::min(bestSpp - m_state.currentSpp, 2u);
+                m_state.currentSpp += step;
+                m_cooldown = 1;
+            } else {
+                m_state.currentSpp++;
+                m_cooldown = 4;
+            }
         } else if (bestBounces > m_state.currentBounces) {
             m_state.currentBounces++;
-            m_cooldown = 6;
+            m_cooldown = 4;
         } else if (bestSpp < m_state.currentSpp) {
             m_state.currentSpp--;
-            m_cooldown = 3;
+            m_cooldown = 2;
         } else if (bestBounces < m_state.currentBounces) {
             m_state.currentBounces--;
-            m_cooldown = 3;
+            m_cooldown = 2;
         }
     }
 

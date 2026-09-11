@@ -10,12 +10,7 @@
 Never run `find /` or search commands to locate core profiling, monitoring, or compiler tools. Always use these exact paths:
 
 ### 1. GPU Monitoring & Metrics
-- **`amd-smi`**:
-  - Primary: `/opt/rocm/core-10.0/bin/amd-smi`
-  - User bin: `/home/naoki/.local/bin/amd-smi`
-- **`rocm-smi`**:
-  - Primary: `/opt/rocm/core-10.0/bin/rocm-smi`
-  - User bin: `/home/naoki/.local/bin/rocm-smi`
+- Metrics / Monitoring: `/opt/rocm/core-10.0/bin/amd-smi` (Always run outside sandbox / BypassSandbox: true to access /opt).
 - **Instruction**: Check VRAM utilization using `/opt/rocm/core-10.0/bin/amd-smi` directly before and during intensive GPU rendering or benchmarking. Do not probe the filesystem for SMI tools.
 
 ### 2. Radeon Developer Tool Suite (RDTS)

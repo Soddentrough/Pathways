@@ -119,9 +119,14 @@ struct FrameStats {
     double min_frame_time_ms = 0.0;
     double max_frame_time_ms = 0.0;
     double avg_fps = 0.0;
+    double presentation_time_ms = 0.0;
+    double presentation_fps = 0.0;
+    double avg_presentation_fps = 0.0;
     double rays_per_second = 0.0;
     uint32_t validation_errors = 0;
     bool target_achieved = false; // true if avg_frame_time_ms < 8.0
+    bool accumulation_complete = false;
+    uint32_t max_accum_frames = 2048;
 
     // GPU Timestamp Profiler Breakdown
     double primary_gpu_time_ms = 0.0;

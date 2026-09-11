@@ -210,7 +210,24 @@ void main() {
             isDelta = (flags & 2u) != 0u;
 
             vec3 stepRadiance = prd.diffuseRadiance + prd.specularRadiance;
-            radiance += throughput * stepRadiance;
+            if (bounce > 0u) {
+                const float MAX_INDIRECT_LUMINANCE = 35.0;
+                float stepLum = dot(stepRadiance, vec3(0.2126, 0.7152, 0.0722));
+                if (stepLum > MAX_INDIRECT_LUMINANCE) {
+                    stepRadiance *= (MAX_INDIRECT_LUMINANCE / stepLum);
+                }
+            }
+
+            vec3 bounceContrib = throughput * stepRadiance;
+            if (bounce > 0u) {
+                const float MAX_INDIRECT_LUMINANCE = 35.0;
+                float contribLum = dot(bounceContrib, vec3(0.2126, 0.7152, 0.0722));
+                if (contribLum > MAX_INDIRECT_LUMINANCE) {
+                    bounceContrib *= (MAX_INDIRECT_LUMINANCE / contribLum);
+                }
+            }
+
+            radiance += bounceContrib;
 
             if (bounce == 0u) {
                 primaryHit = hit;
@@ -265,15 +282,15 @@ void main() {
                     }
                 }
                 if (primaryIsSpecular) {
-                    accumSpec += throughput * stepRadiance;
+                    accumSpec += bounceContrib;
                 } else {
-                    accumDiff += throughput * stepRadiance;
+                    accumDiff += bounceContrib;
                 }
             } else {
                 if (primaryIsSpecular) {
-                    accumSpec += throughput * stepRadiance;
+                    accumSpec += bounceContrib;
                 } else {
-                    accumDiff += throughput * stepRadiance;
+                    accumDiff += bounceContrib;
                 }
             }
 
