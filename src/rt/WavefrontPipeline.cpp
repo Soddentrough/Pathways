@@ -23,7 +23,7 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& raySortCode,
                                      bool supportsExecutionSet)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize),
-      m_supportsExecutionSet(supportsExecutionSet) {
+      m_supportsExecutionSet(supportsExecutionSet && (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr)) {
 
     if (m_tileSize > 0) {
         m_maxCapacity = std::min(m_tileSize * m_tileSize, m_width * m_height);
@@ -530,15 +530,22 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
     vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_dgcStream->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, m_queueCounters->getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
-    VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    std::array<VkBufferMemoryBarrier2, 3> clearBarriers = {
+        makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+        makeBufferBarrier2(m_dgcStream->getBuffer(),
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+        makeBufferBarrier2(m_queueCounters->getBuffer(),
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
+    };
     VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    clearDep.memoryBarrierCount = 1;
-    clearDep.pMemoryBarriers = &clearBarrier;
+    clearDep.bufferMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size());
+    clearDep.pBufferMemoryBarriers = clearBarriers.data();
     vkCmdPipelineBarrier2(cmd, &clearDep);
 
     // 3. Tile Loop
@@ -612,15 +619,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
                 };
 
-                VkMemoryBarrier2 c2sImageBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                c2sImageBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                c2sImageBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                c2sImageBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                c2sImageBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
                 VkDependencyInfo c2sDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                c2sDep.memoryBarrierCount = 1;
-                c2sDep.pMemoryBarriers = &c2sImageBarrier;
                 c2sDep.bufferMemoryBarrierCount = static_cast<uint32_t>(c2sBarriers.size());
                 c2sDep.pBufferMemoryBarriers = c2sBarriers.data();
                 vkCmdPipelineBarrier2(cmd, &c2sDep);
@@ -641,7 +640,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
                     // 4a. Shading microkernel(s)
-                    uint32_t shadePC[18] = {
+                    uint32_t shadePC[19] = {
                         sceneData.numTriangles,
                         sceneData.numSpheres,
                         sceneData.numMaterials,
@@ -659,7 +658,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.enableNrc ? 1u : 0u,
                         sceneData.nrcBounce,
                         std::bit_cast<uint32_t>(sceneData.nrcTrainRatio),
-                        sceneData.frameIndex
+                        sceneData.frameIndex,
+                        sceneData.numOpaqueTriangles
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
@@ -682,13 +682,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 3 + 0) * 16;
-                        if (m_dgcManager->isSupported()) {
-                            m_dgcManager->recordPreprocess(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, 0 /* slice 0 */, 1);
-                            m_dgcManager->recordPreprocessBarrier(cmd);
-                            m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, 0 /* slice 0 */, 1, true /* isPreprocessed */);
-                        } else {
-                            m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadeOffset);
-                        }
+                        m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadeOffset);
                     }
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
 
@@ -697,14 +691,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB.get() : m_rayStateQueueA.get();
 
                     std::vector<VkBufferMemoryBarrier2> s2dBarriers;
-                    s2dBarriers.reserve(8);
+                    s2dBarriers.reserve(7);
                     s2dBarriers.push_back(makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
-                        VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
-                    s2dBarriers.push_back(makeBufferBarrier2(m_dgcStream->getBuffer(),
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                        VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT));
                     s2dBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
@@ -717,38 +708,21 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     s2dBarriers.push_back(makeBufferBarrier2(currentOutState->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
-                    s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
+                    if (sceneData.secondarySortMode != 0) {
+                        s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    }
 
                     VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     s2dDep.bufferMemoryBarrierCount = static_cast<uint32_t>(s2dBarriers.size());
                     s2dDep.pBufferMemoryBarriers = s2dBarriers.data();
                     vkCmdPipelineBarrier2(cmd, &s2dDep);
 
-                    // Tier 2 Optimization: Batched Preprocessing
-                    // Shade has written arguments for both Shadow and Intersect.
-                    // Preprocess both passes concurrently before executing Shadow (unless disabled via --no-dgc-batch-preprocess).
-                    bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
                     VkDeviceSize shadowOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 6) * 16
                                                                 : static_cast<VkDeviceSize>(b * 3 + 1) * 16;
                     VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
                                                                    : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
-
-                    if (m_dgcManager->isSupported()) {
-                        m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1);
-                        if (batchPreprocess && (b + 1 < maxBounces)) {
-                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
-                                for (uint32_t oct = 0; oct < 8; ++oct) {
-                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
-                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
-                                }
-                            } else {
-                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
-                            }
-                        }
-                        m_dgcManager->recordPreprocessBarrier(cmd);
-                    }
 
                     // 4b. Shadow microkernel (100% coherent hardware ray queries)
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
@@ -766,15 +740,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 2);
-                    if (m_dgcManager->isSupported()) {
-                        m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1, true /* isPreprocessed */);
-                    } else {
-                        m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadowOffset);
-                    }
+                    m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadowOffset);
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
 
                     // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
-                    // Note: Preprocessing was already executed in the batch above; dispatches launch immediately
+                    // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
                     if (b + 1 < maxBounces) {
                         uint32_t intersectPC[17] = {
                             sceneData.numTriangles,
@@ -795,17 +765,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             sceneData.secondarySortMode,
                             0 // octantBin
                         };
-                        if (!batchPreprocess && m_dgcManager->isSupported()) {
-                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
-                                for (uint32_t oct = 0; oct < 8; ++oct) {
-                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
-                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
-                                }
-                            } else {
-                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
-                            }
-                            m_dgcManager->recordPreprocessBarrier(cmd);
-                        }
 
                         if (sceneData.secondarySortMode == 1 && useMaterialSort) {
                             // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
@@ -818,11 +777,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                 intersectPC[16] = oct;
                                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                                 VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
-                                if (m_dgcManager->isSupported()) {
-                                    m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1, true /* isPreprocessed */);
-                                } else {
-                                    m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), octOffset);
-                                }
+                                m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), octOffset);
                             }
 
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
@@ -833,11 +788,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
-                            } else {
-                                m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
-                            }
+                            m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         } else {
                             // Secondary sort disabled / fallback
@@ -846,44 +797,29 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
-                            } else {
-                                m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
-                            }
+                            m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         }
 
                         // Barrier: Shadow & Intersect -> Next Bounce Shade (scoped buffer barriers)
-                        Buffer* nextInGeom = currentOutGeom;
-                        Buffer* nextInState = currentOutState;
-                        std::array<VkBufferMemoryBarrier2, 8> d2sBarriers = {
-                            makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
-                                VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                            makeBufferBarrier2(m_dgcStream->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                            makeBufferBarrier2(m_queueCounters->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
-                            makeBufferBarrier2(m_rayHitQueue->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                            makeBufferBarrier2(m_materialIndexQueue->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                            makeBufferBarrier2(nextInGeom->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                            makeBufferBarrier2(nextInState->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                            makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
-                        };
+                        std::vector<VkBufferMemoryBarrier2> d2sBarriers;
+                        d2sBarriers.reserve(5);
+                        d2sBarriers.push_back(makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                        d2sBarriers.push_back(makeBufferBarrier2(m_dgcStream->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                        d2sBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
+                        d2sBarriers.push_back(makeBufferBarrier2(m_rayHitQueue->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                        d2sBarriers.push_back(makeBufferBarrier2(m_materialIndexQueue->getBuffer(),
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
 
                         VkDependencyInfo d2sDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                         d2sDep.bufferMemoryBarrierCount = static_cast<uint32_t>(d2sBarriers.size());

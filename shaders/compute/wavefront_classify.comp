@@ -206,7 +206,7 @@ void main() {
             skyColor *= invSpp;
 
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(skyColor, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
         } else {
             // Hit! Setup SoA state
             isActive = true;

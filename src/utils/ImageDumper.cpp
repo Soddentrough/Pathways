@@ -41,6 +41,99 @@ bool ImageDumper::savePNG(const std::string& filepath, uint32_t width, uint32_t 
     }
 }
 
+bool ImageDumper::savePNG16(const std::string& filepath, uint32_t width, uint32_t height, const uint16_t* rgba16Pixels) {
+    if (!rgba16Pixels || width == 0 || height == 0) {
+        Logger::error("Invalid image buffer passed to savePNG16");
+        return false;
+    }
+
+    std::filesystem::path p(filepath);
+    if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path());
+    }
+
+    // Each row in PNG begins with a 1-byte filter type (0 = None), followed by width * 4 * 2 bytes of RGBA16 in Network Byte Order (Big-Endian).
+    const size_t rowBytes = 1 + static_cast<size_t>(width) * 4 * 2;
+    const size_t rawSize = rowBytes * height;
+    std::vector<uint8_t> rawData(rawSize);
+
+    for (uint32_t y = 0; y < height; ++y) {
+        size_t rowOffset = static_cast<size_t>(y) * rowBytes;
+        rawData[rowOffset] = 0; // Filter: None
+        uint8_t* dst = &rawData[rowOffset + 1];
+        const uint16_t* src = &rgba16Pixels[static_cast<size_t>(y) * width * 4];
+        for (uint32_t x = 0; x < width * 4; ++x) {
+            uint16_t val = src[x];
+            *dst++ = static_cast<uint8_t>((val >> 8) & 0xFF); // Big-endian high byte
+            *dst++ = static_cast<uint8_t>(val & 0xFF);        // Big-endian low byte
+        }
+    }
+
+    // Compress raw scanlines with zlib
+    uLongf destLen = compressBound(static_cast<uLong>(rawSize));
+    std::vector<uint8_t> compressedData(destLen);
+    if (compress(compressedData.data(), &destLen, rawData.data(), static_cast<uLong>(rawSize)) != Z_OK) {
+        Logger::error("zlib compression failed for 16-bit PNG");
+        return false;
+    }
+
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out.is_open()) {
+        Logger::error("Failed to open file for writing 16-bit PNG: {}", filepath);
+        return false;
+    }
+
+    auto toBigEndian32 = [](uint32_t v) -> uint32_t {
+        return ((v & 0x000000FFu) << 24) |
+               ((v & 0x0000FF00u) << 8)  |
+               ((v & 0x00FF0000u) >> 8)  |
+               ((v & 0xFF000000u) >> 24);
+    };
+
+    // 1. PNG Signature
+    const uint8_t pngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    out.write(reinterpret_cast<const char*>(pngSig), 8);
+
+    auto writeChunk = [&out, &toBigEndian32](const char type[4], const uint8_t* data, uint32_t length) {
+        uint32_t lenBE = toBigEndian32(length);
+        out.write(reinterpret_cast<const char*>(&lenBE), 4);
+        out.write(type, 4);
+        if (length > 0 && data) {
+            out.write(reinterpret_cast<const char*>(data), length);
+        }
+        uLong crc = crc32(0L, Z_NULL, 0);
+        crc = crc32(crc, reinterpret_cast<const Bytef*>(type), 4);
+        if (length > 0 && data) {
+            crc = crc32(crc, reinterpret_cast<const Bytef*>(data), length);
+        }
+        uint32_t crcBE = toBigEndian32(static_cast<uint32_t>(crc));
+        out.write(reinterpret_cast<const char*>(&crcBE), 4);
+    };
+
+    // 2. IHDR chunk (13 bytes)
+    uint8_t ihdr[13];
+    uint32_t wBE = toBigEndian32(width);
+    uint32_t hBE = toBigEndian32(height);
+    std::memcpy(&ihdr[0], &wBE, 4);
+    std::memcpy(&ihdr[4], &hBE, 4);
+    ihdr[8] = 16; // Bit depth: 16
+    ihdr[9] = 6;  // Color type: RGBA (Truecolor with alpha)
+    ihdr[10] = 0; // Compression method: Deflate
+    ihdr[11] = 0; // Filter method: Standard
+    ihdr[12] = 0; // Interlace: None
+    writeChunk("IHDR", ihdr, 13);
+
+    // 3. IDAT chunk
+    writeChunk("IDAT", compressedData.data(), static_cast<uint32_t>(destLen));
+
+    // 4. IEND chunk
+    writeChunk("IEND", nullptr, 0);
+
+    out.close();
+    Logger::info("Successfully dumped 10/16-bit PNG frame to: {}", filepath);
+    return true;
+}
+
 bool ImageDumper::saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels) {
     if (!rgbaFloatPixels || width == 0 || height == 0) {
         Logger::error("Invalid float image buffer passed to saveEXR");
@@ -217,6 +310,14 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"dielectric_refraction\": {},\n", stats.enable_refraction ? "true" : "false")
         << std::format("      \"soft_shadows\": {},\n", stats.enable_shadows ? "true" : "false")
         << std::format("      \"aces_tonemapping\": {}\n", stats.aces_tonemap ? "true" : "false")
+        << "    },\n"
+        << "    \"display_and_color\": {\n"
+        << std::format("      \"hdr_display_active\": {},\n", stats.is_hdr_display ? "true" : "false")
+        << std::format("      \"hdr_mode\": \"{}\",\n", stats.hdr_mode_str)
+        << std::format("      \"swapchain_format\": \"{}\",\n", stats.swapchain_format_str)
+        << std::format("      \"swapchain_color_space\": \"{}\",\n", stats.swapchain_color_space_str)
+        << std::format("      \"hdr_peak_nits\": {:.1f},\n", stats.hdr_peak_nits)
+        << std::format("      \"hdr_paper_white_nits\": {:.1f}\n", stats.hdr_paper_white_nits)
         << "    },\n";
 
     std::string safeScenePath = stats.scene_path;

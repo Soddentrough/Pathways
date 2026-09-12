@@ -95,6 +95,7 @@ void VulkanContext::createInstance(const Config& config) {
         instanceExtensions.push_back("VK_KHR_xcb_surface");
         instanceExtensions.push_back("VK_KHR_xlib_surface");
 #endif
+        instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     }
     if (config.validation_layers) {
         instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);

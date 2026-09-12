@@ -168,7 +168,7 @@ void main() {
             accumRadiance += throughput * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             vec3 hitNormal = vec3(0.0, 1.0, 0.0);
@@ -297,7 +297,7 @@ void main() {
             if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
             }
         }
     }

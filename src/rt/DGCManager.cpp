@@ -211,18 +211,20 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
 void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
     if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
 
-    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
-    barrier.srcAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT |
-                           VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
-                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
-                            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    VkBufferMemoryBarrier2 bufferBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+    bufferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
+    bufferBarrier.srcAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT;
+    bufferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT |
+                                 VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    bufferBarrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
+                                  VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    bufferBarrier.buffer = m_preprocessBuffer->getBuffer();
+    bufferBarrier.offset = 0;
+    bufferBarrier.size = VK_WHOLE_SIZE;
 
     VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    depInfo.memoryBarrierCount = 1;
-    depInfo.pMemoryBarriers = &barrier;
+    depInfo.bufferMemoryBarrierCount = 1;
+    depInfo.pBufferMemoryBarriers = &bufferBarrier;
 
     vkCmdPipelineBarrier2(cmd, &depInfo);
 }

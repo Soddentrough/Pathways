@@ -242,6 +242,21 @@ python3 scripts/verify_frame.py output/test_car_concept.png output/stats_car_con
 
 python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_breakfast_room.json 1920 1080 35.0 --max-mean-lum 0.35 --max-blown-pct 8.0
 
+# 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Alias Table & Local RIS)
+echo ""
+echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights)..."
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --scene many-lights \
+    --dump-frame output/test_many_lights.png \
+    --dump-stats output/stats_many_lights.json
+
+python3 scripts/verify_frame.py output/test_many_lights.png output/stats_many_lights.json 1920 1080 40.0
+
 # 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
 echo ""
 echo "[7/8] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."

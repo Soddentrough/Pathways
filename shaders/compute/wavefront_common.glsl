@@ -79,12 +79,36 @@ struct Material {
 };
 
 struct Light {
-    vec4 position; // xyz: pos/corner, w: type (0: area, 1: spot)
+    vec4 position; // xyz: pos/corner, w: type (0: area, 1: spot, 2: directional)
     vec4 emission; // rgb: color, w: area
     vec4 u;        // xyz: edge1, w: spot inner cos
     vec4 v;        // xyz: edge2, w: spot outer cos
     vec4 normal;   // xyz: normal/dir, w: padding
+    vec4 sampling; // x: q (prob threshold), y: as uint aliasIdx, z: discrete selection pdf, w: flux (96 bytes)
 };
+
+// O(1) Vose Alias Table sampling for discrete radiant flux distribution
+#define SAMPLE_LIGHT_ALIAS(numLights, seed, outIdx, outPdf) \
+    do { \
+        if ((numLights) <= 1u) { \
+            outIdx = 0u; \
+            outPdf = 1.0; \
+        } else { \
+            float u_alias_ = randFloat(seed); \
+            float f_alias_ = u_alias_ * float(numLights); \
+            uint b_alias_ = min(uint(f_alias_), (numLights) - 1u); \
+            float remap_alias_ = f_alias_ - float(b_alias_); \
+            vec4 samp_ = lights[b_alias_].sampling; \
+            if (remap_alias_ < samp_.x) { \
+                outIdx = b_alias_; \
+                outPdf = samp_.z; \
+            } else { \
+                outIdx = floatBitsToUint(samp_.y); \
+                outPdf = lights[outIdx].sampling.z; \
+            } \
+            outPdf = max(outPdf, 1e-6); \
+        } \
+    } while(false)
 
 // 32-bit Octahedral normal/direction encoding (Cigolle et al.)
 vec2 octSign(vec2 v) {
@@ -258,6 +282,16 @@ vec2 randVec2(inout uint seed) {
 
 vec3 randVec3(inout uint seed) {
     return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+// Unbiased stochastic rounding for FP16 HDR accumulation buffer.
+// Prevents floating-point precision exhaustion and colored contour banding under multi-frame progressive accumulation.
+vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (dot(val, val) < 1e-12) return accum;
+    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
+    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
+    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
+    return max(vec3(0.0), accum + val + dither);
 }
 
 vec2 directionToEquirectangular(vec3 dir) {

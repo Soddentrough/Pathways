@@ -71,8 +71,13 @@ struct Config {
     bool benchmark = false;
     bool validation_layers = true;
     bool aces_tonemap = true;
+    // High Dynamic Range (HDR) Display
+    bool enable_hdr = true;              // Auto-negotiate HDR display formats (scRGB Linear / HDR10 PQ) [Default: true]
+    float hdr_peak_nits = 1000.0f;       // Display peak luminance in cd/m^2 (nits) [Default: 1000.0]
+    float hdr_paper_white_nits = 200.0f; // Reference paper white luminance in cd/m^2 (nits) [Default: 200.0]
     bool enable_refraction = true;
     bool enable_shadows = true;
+    bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
     bool enable_direct_light = true;
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
@@ -124,6 +129,7 @@ struct Config {
     std::string dump_ui_path = "";
     std::string dump_hdr_path = "";
     std::string dump_stats_path = "";
+    bool dump_8bit_png = false; // Save dumped PNG frames as 8-bit instead of default 10/16-bit (conforms to single-negation rule)
 
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);

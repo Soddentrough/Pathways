@@ -105,7 +105,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 5. Test Suite 3: glTF 2.0 Ingestion Pipeline (Damaged Helmet)
-Write-Host "`n[5/5] Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
+Write-Host "`n[5/6] Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
@@ -119,6 +119,24 @@ Write-Host "`n[5/5] Running glTF Damaged Helmet scene test..." -ForegroundColor 
 & $Python scripts/verify_frame.py (Join-Path $OutputDir "test_gltf_helmet.png") (Join-Path $OutputDir "stats_gltf_helmet.json") 1920 1080 45.0
 if ($LASTEXITCODE -ne 0) {
     Write-Error "glTF Damaged Helmet verification failed!"
+    exit $LASTEXITCODE
+}
+
+# 6. Test Suite 4: Many-Lights Scene (64 Lights) Procedural Cornell Box
+Write-Host "`n[6/6] Running Many-Lights (64 Lights) Scene Test..." -ForegroundColor Cyan
+& $PathwaysExe `
+    --headless `
+    --width 1920 `
+    --height 1080 `
+    --spp 4 `
+    --max-bounces 4 `
+    --scene many-lights `
+    --dump-frame (Join-Path $OutputDir "test_many_lights.png") `
+    --dump-stats (Join-Path $OutputDir "stats_many_lights.json")
+
+& $Python scripts/verify_frame.py (Join-Path $OutputDir "test_many_lights.png") (Join-Path $OutputDir "stats_many_lights.json") 1920 1080 40.0
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Many-Lights scene verification failed!"
     exit $LASTEXITCODE
 }
 

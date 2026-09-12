@@ -906,6 +906,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     settingsChanged = true;
                 }
             }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Color Space & HDR Pipeline:");
+            ImGui::BulletText("Color Space: %s", stats.swapchain_color_space_str.c_str());
+            ImGui::BulletText("Swap Format: %s", stats.swapchain_format_str.c_str());
+            ImGui::BulletText("HDR Mode:    %s", stats.hdr_mode_str.c_str());
+            if (stats.is_hdr_display) {
+                if (ImGui::SliderFloat("Peak Luminance", &config.hdr_peak_nits, 400.0f, 4000.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+                if (ImGui::SliderFloat("Paper White", &config.hdr_paper_white_nits, 80.0f, 500.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+            }
             ImGui::Separator();
         }
 

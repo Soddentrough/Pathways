@@ -1,100 +1,7 @@
-#version 460
-#extension GL_EXT_ray_query : enable
-#extension GL_EXT_shader_image_load_formatted : require
+// Hybrid Inline Shadow Ray Evaluation for Primary Hit Points (Bounce 0)
+// Evaluates direct shadow occlusion via hardware rayQueryEXT directly on-chip.
 
-#include "wavefront_common.glsl"
-
-layout(local_size_x = 32) in;
-
-layout(binding = 0) uniform image2D uAccumImage;
-
-layout(binding = 1) uniform CameraUBO {
-    mat4 viewInverse;
-    mat4 projInverse;
-    mat4 prevViewProj;
-    vec4 position;
-    vec4 viewParams;
-    uint frameIndex;
-    uint spp;
-    uint maxBounces;
-    uint flags;
-} ubo;
-
-layout(std430, binding = 2) readonly buffer TrianglesBuffer {
-    Triangle triangles[];
-};
-
-layout(std430, binding = 3) readonly buffer SpheresBuffer {
-    Sphere spheres[];
-};
-
-layout(std430, binding = 4) readonly buffer MaterialsBuffer {
-    Material materials[];
-};
-
-layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
-
-layout(std430, binding = 12) readonly buffer ShadowRayQueue {
-    PackedShadowRay shadowRays[];
-};
-
-layout(std430, binding = 11) buffer QueueCounters {
-    uint activeRayCount;
-    uint nextActiveCount;
-    uint totalProcessed;
-    uint shadowRayCount;
-    uint retiredWorkgroups;
-    uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
-    uint complexCount;
-    uint emissiveCount;
-    uint alphamaskCount;
-    uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
-    uint nextComplexCount;
-    uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
-    uint totalShadeWorkgroups;
-    uint octantCounts[8];
-    uint currentOctantCounts[8];
-    uint totalIntersectWorkgroups;
-    uint secondaryRayCount;
-    uint pad[21];
-} queueCounters;
-
-layout(push_constant) uniform PushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint frameIndex;
-    uint sppSampleIndex;
-    uint numOpaqueTriangles;
-} pc;
-
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= queueCounters.currentShadowCount) return;
-
-    PackedShadowRay sRay = shadowRays[idx];
-    vec3 origin = sRay.originDist.xyz;
-    float maxDist = sRay.originDist.w;
-    vec3 dir = unpackOct32(sRay.dirPixelRad.x);
-    uint pixelIndex = sRay.dirPixelRad.y;
-    vec2 radRG = unpackHalf2x16(sRay.dirPixelRad.z);
-    vec2 radB_pad = unpackHalf2x16(sRay.dirPixelRad.w);
-    vec3 radiance = vec3(radRG, radB_pad.x);
-
-    if (length(radiance) <= 1e-5) return;
-
-    bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
+bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numSpheres, uint numOpaqueTriangles) {
     bool occluded = false;
 
     if (!hasNonOpaque) {
@@ -113,7 +20,7 @@ void main() {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
                 uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
                 uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
+                uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + numOpaqueTriangles);
                 uint matId = triangles[triIdx].materialId;
                 Material mat = materials[matId];
                 if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
@@ -142,7 +49,7 @@ void main() {
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
+            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + numOpaqueTriangles);
             Material m = materials[triangles[triIdx].materialId];
             if (m.type != 3u && m.type != 2u && m.transmission <= 0.05) {
                 occluded = true;
@@ -150,8 +57,8 @@ void main() {
         }
     }
 
-    if (!occluded && pc.numSpheres > 0u) {
-        for (uint i = 0; i < pc.numSpheres; ++i) {
+    if (!occluded && numSpheres > 0u) {
+        for (uint i = 0; i < numSpheres; ++i) {
             if (materials[spheres[i].materialId].type == 3u ||
                 materials[spheres[i].materialId].type == 2u ||
                 materials[spheres[i].materialId].transmission > 0.05) continue;
@@ -164,10 +71,5 @@ void main() {
         }
     }
 
-    if (!occluded) {
-        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-        uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (pc.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
-        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), 0.0));
-    }
+    return occluded;
 }

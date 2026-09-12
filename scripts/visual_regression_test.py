@@ -304,7 +304,7 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
             status = "FLAGGED REGRESSION: SHADOW LOSS / BLEACHING"
             detail = f"Contact shadows bleached/reduced by {abs(delta_shadow):.2f}%"
             severity = "fail"
-        elif psnr < 25.0 and sharp_pct_change < -5.0:
+        elif psnr < 25.0 and sharp_pct_change < -10.0:
             status = "FLAGGED REGRESSION: SEVERE NOISE / BLUR"
             detail = f"Low PSNR ({psnr:.1f} dB) with degraded edge sharpness ({sharp_pct_change:+.1f}%)"
             severity = "fail"

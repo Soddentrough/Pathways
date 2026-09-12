@@ -3,6 +3,7 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
+#include <glm/detail/type_half.hpp>
 
 #include <fstream>
 #include <filesystem>
@@ -137,7 +138,8 @@ Engine::Engine(const Config& config) : m_config(config) {
             m_surface,
             m_window->getWidth(),
             m_window->getHeight(),
-            m_context->getGraphicsQueueFamily()
+            m_context->getGraphicsQueueFamily(),
+            m_config.enable_hdr
         );
         m_config.width = m_swapchain->getExtent().width;
         m_config.height = m_swapchain->getExtent().height;
@@ -373,9 +375,23 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless) {
+        VkFormat swapFmt = m_swapchain->getFormat();
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            outputFmt = swapFmt;
+        } else if (m_swapchain->isHdr()) {
+            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+        } else {
+            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        }
+    }
+
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R8G8B8A8_UNORM,
+        outputFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -612,6 +628,7 @@ void Engine::initScene() {
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (!m_sceneData.lights.empty()) {
+        buildLightAliasTable(m_sceneData.lights);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
@@ -827,6 +844,7 @@ bool Engine::loadScene(const std::string& filepath) {
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (!m_sceneData.lights.empty()) {
+        buildLightAliasTable(m_sceneData.lights);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
@@ -3086,6 +3104,7 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
+    if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
@@ -3126,12 +3145,17 @@ void Engine::renderFrame() {
         uint32_t applyACES = 1;
         uint32_t visualizeSplit = 0;
         uint32_t tileSize = 64;
-        uint32_t padding[3] = {0, 0, 0};
+        uint32_t displayMode = 0;
+        float peakNits = 1000.0f;
+        float paperWhiteNits = 200.0f;
     } tonemapConstants;
     tonemapConstants.exposure = m_config.exposure;
     tonemapConstants.applyACES = m_config.aces_tonemap ? 1 : 0;
     tonemapConstants.visualizeSplit = 0;
     tonemapConstants.tileSize = m_config.tile_size;
+    tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+    tonemapConstants.peakNits = m_config.hdr_peak_nits;
+    tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
 
@@ -3708,6 +3732,9 @@ void Engine::renderFrame() {
 
         tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
         tonemapConstants.tileSize = m_config.tile_size;
+        tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+        tonemapConstants.peakNits = m_config.hdr_peak_nits;
+        tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(activeCmd, groupsX, groupsY, 1);
@@ -3869,8 +3896,10 @@ void Engine::renderFrame() {
             depToSrc.pImageMemoryBarriers = &toSrc;
             vkCmdPipelineBarrier2(activeCmd, &depToSrc);
 
+            VkFormat swapFmt = m_swapchain->getFormat();
+            size_t bpp = (swapFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
             if (!m_uiDumpBuffer) {
-                VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * 4;
+                VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * bpp;
                 m_uiDumpBuffer = std::make_unique<Buffer>(m_context->getAllocator(), size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
             }
@@ -4094,7 +4123,9 @@ void Engine::dumpOutputFiles() {
 
     // 1. Dump LDR PNG
     if (!m_config.dump_frame_path.empty()) {
-        VkDeviceSize bufferSize = m_config.width * m_config.height * 4;
+        VkFormat outFmt = m_outputImage->getFormat();
+        size_t bpp = (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
+        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bpp;
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
@@ -4131,9 +4162,80 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
-        const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
-        ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, pixels);
-        staging.unmap();
+        if (outFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
+            const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
+            bool isRgb = (outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+            bool force8bit = m_config.dump_8bit_png;
+            if (force8bit) {
+                std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    uint32_t px = src32[p];
+                    uint32_t c0 = (px >> 20) & 0x3FF;
+                    uint32_t c1 = (px >> 10) & 0x3FF;
+                    uint32_t c2 = px & 0x3FF;
+                    uint32_t a2 = (px >> 30) & 0x03;
+                    uint32_t r10 = isRgb ? c0 : c2;
+                    uint32_t g10 = c1;
+                    uint32_t b10 = isRgb ? c2 : c0;
+                    rgba8[p * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+                }
+                ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
+            } else {
+                std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    uint32_t px = src32[p];
+                    uint32_t c0 = (px >> 20) & 0x3FF;
+                    uint32_t c1 = (px >> 10) & 0x3FF;
+                    uint32_t c2 = px & 0x3FF;
+                    uint32_t a2 = (px >> 30) & 0x03;
+                    uint32_t r10 = isRgb ? c0 : c2;
+                    uint32_t g10 = c1;
+                    uint32_t b10 = isRgb ? c2 : c0;
+                    rgba16[p * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+                }
+                ImageDumper::savePNG16(m_config.dump_frame_path, m_config.width, m_config.height, rgba16.data());
+            }
+            staging.unmap();
+        } else if (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
+            const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
+            bool force8bit = m_config.dump_8bit_png;
+            if (force8bit) {
+                std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    for (int c = 0; c < 3; ++c) {
+                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                        rgba8[p * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+                    }
+                    rgba8[p * 4 + 3] = 255;
+                }
+                ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
+            } else {
+                std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    for (int c = 0; c < 3; ++c) {
+                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                        rgba16[p * 4 + c] = static_cast<uint16_t>(std::clamp(srgb * 65535.0f + 0.5f, 0.0f, 65535.0f));
+                    }
+                    rgba16[p * 4 + 3] = 65535;
+                }
+                ImageDumper::savePNG16(m_config.dump_frame_path, m_config.width, m_config.height, rgba16.data());
+            }
+            staging.unmap();
+        } else {
+            const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
+            ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, pixels);
+            staging.unmap();
+        }
     }
 
     // 2. Dump HDR OpenEXR
@@ -4184,23 +4286,74 @@ void Engine::dumpOutputFiles() {
     if (!m_config.dump_ui_path.empty() && m_uiDumpBuffer && m_swapchain) {
         uint32_t w = m_swapchain->getExtent().width;
         uint32_t h = m_swapchain->getExtent().height;
-        const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
-        std::vector<uint8_t> rgba(w * h * 4);
-        bool isBgra = (m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_UNORM || m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_SRGB);
-        for (size_t i = 0; i < w * h; ++i) {
-            if (isBgra) {
-                rgba[i * 4 + 0] = raw[i * 4 + 2];
-                rgba[i * 4 + 1] = raw[i * 4 + 1];
-                rgba[i * 4 + 2] = raw[i * 4 + 0];
-                rgba[i * 4 + 3] = raw[i * 4 + 3];
-            } else {
-                rgba[i * 4 + 0] = raw[i * 4 + 0];
-                rgba[i * 4 + 1] = raw[i * 4 + 1];
-                rgba[i * 4 + 2] = raw[i * 4 + 2];
-                rgba[i * 4 + 3] = raw[i * 4 + 3];
+        VkFormat fmt = m_swapchain->getFormat();
+        std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+
+        if (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+            const uint32_t* raw32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
+            bool isRgb = (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+            float invPaperWhite = 1.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+            const float m1 = 0.1593017578125f;
+            const float m2 = 78.84375f;
+            const float c1 = 0.8359375f;
+            const float c2 = 18.8515625f;
+            const float c3 = 18.6875f;
+
+            auto pqToSrgb = [&](float v) -> uint8_t {
+                float v_pow = std::pow(std::max(v, 0.0f), 1.0f / m2);
+                float num = std::max(v_pow - c1, 0.0f);
+                float den = std::max(c2 - c3 * v_pow, 1e-6f);
+                float linearNits = std::pow(num / den, 1.0f / m1) * 10000.0f;
+                float srgb = std::pow(std::clamp(linearNits * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                return static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+            };
+
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                uint32_t val = raw32[i];
+                float c0 = static_cast<float>((val >> 20) & 0x3FF) / 1023.0f;
+                float c1_val = static_cast<float>((val >> 10) & 0x3FF) / 1023.0f;
+                float c2_val = static_cast<float>(val & 0x3FF) / 1023.0f;
+
+                float r_norm = isRgb ? c0 : c2_val;
+                float g_norm = c1_val;
+                float b_norm = isRgb ? c2_val : c0;
+
+                rgba[i * 4 + 0] = pqToSrgb(r_norm);
+                rgba[i * 4 + 1] = pqToSrgb(g_norm);
+                rgba[i * 4 + 2] = pqToSrgb(b_norm);
+                rgba[i * 4 + 3] = 255;
             }
+            m_uiDumpBuffer->unmap();
+        } else if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
+            const uint16_t* raw16 = static_cast<const uint16_t*>(m_uiDumpBuffer->map());
+            float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    float val = glm::detail::toFloat32(raw16[i * 4 + c]);
+                    float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                    rgba[i * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+                }
+                rgba[i * 4 + 3] = 255;
+            }
+            m_uiDumpBuffer->unmap();
+        } else {
+            const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
+            bool isBgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                if (isBgra) {
+                    rgba[i * 4 + 0] = raw[i * 4 + 2];
+                    rgba[i * 4 + 1] = raw[i * 4 + 1];
+                    rgba[i * 4 + 2] = raw[i * 4 + 0];
+                    rgba[i * 4 + 3] = raw[i * 4 + 3];
+                } else {
+                    rgba[i * 4 + 0] = raw[i * 4 + 0];
+                    rgba[i * 4 + 1] = raw[i * 4 + 1];
+                    rgba[i * 4 + 2] = raw[i * 4 + 2];
+                    rgba[i * 4 + 3] = raw[i * 4 + 3];
+                }
+            }
+            m_uiDumpBuffer->unmap();
         }
-        m_uiDumpBuffer->unmap();
         ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
     }
 
@@ -4449,6 +4602,20 @@ FrameStats Engine::getStats() const {
     stats.enable_refraction = m_config.enable_refraction;
     stats.enable_shadows = m_config.enable_shadows;
     stats.aces_tonemap = m_config.aces_tonemap;
+    if (m_swapchain && !m_config.headless) {
+        stats.swapchain_format_str = m_swapchain->getFormatName();
+        stats.swapchain_color_space_str = m_swapchain->getColorSpaceName();
+        stats.is_hdr_display = m_swapchain->isHdr();
+        stats.hdr_mode_str = (m_swapchain->getHdrMode() == HdrDisplayMode::scRGB) ? "scRGB Linear (16-bit Float)" :
+                             ((m_swapchain->getHdrMode() == HdrDisplayMode::HDR10) ? "HDR10 PQ (10-bit Rec.2020)" : "SDR sRGB (8-bit)");
+    } else {
+        stats.swapchain_format_str = "R8G8B8A8_UNORM (Headless Offscreen)";
+        stats.swapchain_color_space_str = "SRGB_NONLINEAR";
+        stats.is_hdr_display = false;
+        stats.hdr_mode_str = "Headless SDR";
+    }
+    stats.hdr_peak_nits = m_config.hdr_peak_nits;
+    stats.hdr_paper_white_nits = m_config.hdr_paper_white_nits;
     stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
     stats.hdri_path = m_config.hdri_path;
 
@@ -4581,7 +4748,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_surface,
         m_config.width,
         m_config.height,
-        m_context->getGraphicsQueueFamily()
+        m_context->getGraphicsQueueFamily(),
+        m_config.enable_hdr
     );
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
@@ -4609,9 +4777,23 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless) {
+        VkFormat swapFmt = m_swapchain->getFormat();
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            outputFmt = swapFmt;
+        } else if (m_swapchain->isHdr()) {
+            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+        } else {
+            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        }
+    }
+
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R8G8B8A8_UNORM,
+        outputFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 

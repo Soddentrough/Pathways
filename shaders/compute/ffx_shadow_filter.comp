@@ -44,6 +44,28 @@ ivec2 getPixelCoord(ivec2 launchID) {
     return ivec2(int(tx * tileSize + localX), launchID.y);
 }
 
+uint pcg_hash(inout uint seed) {
+    seed = seed * 747796405u + 2891336453u;
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randFloat(inout uint seed) {
+    return float(pcg_hash(seed)) / 4294967296.0;
+}
+
+vec3 randVec3(inout uint seed) {
+    return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (dot(val, val) < 1e-12) return accum;
+    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
+    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
+    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
+    return max(vec3(0.0), accum + val + dither);
+}
+
 void main() {
     ivec2 launchID = ivec2(gl_GlobalInvocationID.xy);
     ivec2 pixelCoord = getPixelCoord(launchID);
@@ -61,7 +83,8 @@ void main() {
         vec3 directLight = imageLoad(uDirectLightImage, pixelCoord).rgb;
         ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
         vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
-        imageStore(uAccumImage, storeCoord, prevAccum + vec4(directLight, 0.0));
+        uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277) | 1u;
+        imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prevAccum.rgb, directLight, seed), 0.0));
         return;
     }
 
@@ -131,5 +154,6 @@ void main() {
     vec3 directLight = imageLoad(uDirectLightImage, pixelCoord).rgb;
     ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
     vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
-    imageStore(uAccumImage, storeCoord, prevAccum + vec4(directLight * filteredShadow, 0.0));
+    uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277) | 1u;
+    imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prevAccum.rgb, directLight * filteredShadow, seed), 0.0));
 }
