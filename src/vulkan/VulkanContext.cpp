@@ -260,6 +260,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if ((queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
             (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
             m_queueIndices.graphicsComputeFamily = i;
+        } else if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+                   !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            m_queueIndices.dedicatedComputeFamily = i;
         } else if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
                    !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
             m_queueIndices.transferFamily = i;
@@ -270,6 +273,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         // Fallback to graphics family for transfer if no dedicated transfer queue
         m_queueIndices.transferFamily = m_queueIndices.graphicsComputeFamily;
     }
+
+    Logger::info("Queue Families -> Graphics/Compute: {}, Transfer: {}, Dedicated Compute: {}",
+                 m_queueIndices.graphicsComputeFamily,
+                 m_queueIndices.transferFamily,
+                 m_queueIndices.dedicatedComputeFamily != UINT32_MAX ? std::to_string(m_queueIndices.dedicatedComputeFamily) : "None (shared)");
 
     // Query Device Extensions
     uint32_t extCount = 0;
@@ -574,6 +582,17 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         queueCreateInfos.push_back(transferQueueCreateInfo);
     }
 
+    if (m_queueIndices.dedicatedComputeFamily != UINT32_MAX &&
+        m_queueIndices.dedicatedComputeFamily != m_queueIndices.graphicsComputeFamily &&
+        m_queueIndices.dedicatedComputeFamily != m_queueIndices.transferFamily) {
+        VkDeviceQueueCreateInfo computeQueueCreateInfo{};
+        computeQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        computeQueueCreateInfo.queueFamilyIndex = m_queueIndices.dedicatedComputeFamily;
+        computeQueueCreateInfo.queueCount = 1;
+        computeQueueCreateInfo.pQueuePriorities = &queuePriority;
+        queueCreateInfos.push_back(computeQueueCreateInfo);
+    }
+
     // Device extensions
     std::vector<const char*> deviceExtensions;
     if (!config.headless) {
@@ -720,6 +739,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 
     vkGetDeviceQueue(m_device, m_queueIndices.graphicsComputeFamily, 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueIndices.transferFamily, 0, &m_transferQueue);
+    if (m_queueIndices.dedicatedComputeFamily != UINT32_MAX) {
+        vkGetDeviceQueue(m_device, m_queueIndices.dedicatedComputeFamily, 0, &m_computeQueue);
+    } else {
+        m_computeQueue = m_graphicsQueue;
+    }
 
     if (m_hasExternalSemaphoreFd) {
         pfnGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(m_device, "vkGetSemaphoreFdKHR");

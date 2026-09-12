@@ -528,6 +528,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     uint32_t numTilesX = (ts > 0) ? (width + ts - 1) / ts : 1;
     uint32_t numTilesY = (ts > 0) ? (height + ts - 1) / ts : 1;
 
+    if (m_dgcManager) {
+        m_dgcManager->resetSliceCounter();
+    }
+
     vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_dgcStream->getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
@@ -668,9 +672,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
-                            m_dgcManager->recordPreprocessBarrier(cmd);
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes, true /* isPreprocessed */);
+                            uint32_t slice = m_dgcManager->acquireSlice();
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, slice, numMatPipes);
+                            m_dgcManager->recordPreprocessBarrier(cmd, slice, 1);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, slice, numMatPipes, true /* isPreprocessed */);
                         } else {
                             m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes, false /* isPreprocessed */);
                         }

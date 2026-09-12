@@ -138,18 +138,30 @@ void DGCManager::loadFunctionPointers() {
                    pfn_vkCmdExecuteGeneratedCommandsEXT != nullptr);
 }
 
+uint32_t DGCManager::acquireSlice() {
+    uint32_t slice = m_currentSlice;
+    m_currentSlice = (m_currentSlice + 1) % m_sliceCount;
+    return slice;
+}
+
+void DGCManager::resetSliceCounter() {
+    m_currentSlice = 0;
+}
+
 void DGCManager::initExecutionSet(const std::vector<VkPipeline>& pipelines) {
     if (!m_supported || pipelines.empty()) return;
 
     // Single-dispatch DGC token layout does not require an Execution Set (uses VK_NULL_HANDLE).
-    // Pre-allocate preprocess buffer for the primary compute pipeline.
-    ensurePreprocessBuffer(pipelines[0], 1);
+    // Pre-allocate preprocess buffer with room for all sequences across the multi-slice ring buffer.
+    ensurePreprocessBuffer(pipelines[0], 16);
 }
 
 void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenceCount) {
     if (!m_supported || !m_indirectLayout) return;
 
     if (!m_preprocessBuffer) {
+        uint32_t targetSequenceCount = std::max(maxSequenceCount, 16u);
+
         VkGeneratedCommandsPipelineInfoEXT pipeInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
         pipeInfo.pipeline = pipeline;
 
@@ -157,7 +169,7 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
         memInfo.pNext = &pipeInfo;
         memInfo.indirectExecutionSet = VK_NULL_HANDLE;
         memInfo.indirectCommandsLayout = m_indirectLayout;
-        memInfo.maxSequenceCount = maxSequenceCount;
+        memInfo.maxSequenceCount = targetSequenceCount;
         memInfo.maxDrawCount = 0;
 
         VkMemoryRequirements2 memReqs{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
@@ -167,7 +179,7 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
         VkDeviceSize align = std::max<VkDeviceSize>(memReqs.memoryRequirements.alignment, 256);
         m_sliceSize = ((reqSize + align - 1) / align) * align;
         if (m_sliceSize < 4096) m_sliceSize = 4096;
-        VkDeviceSize totalSize = m_sliceSize * 16;
+        VkDeviceSize totalSize = m_sliceSize * m_sliceCount;
 
         m_preprocessBuffer = std::make_unique<Buffer>(
             m_allocator, totalSize,
@@ -175,8 +187,8 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, align,
             VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT
         );
-        Logger::info("Allocated DGC preprocess buffer (total: {} bytes, slice: {} bytes, align: {} bytes).",
-                     totalSize, m_sliceSize, align);
+        Logger::info("Allocated DGC preprocess buffer (total: {} bytes, {} slices @ {} bytes, align: {} bytes).",
+                     totalSize, m_sliceCount, m_sliceSize, align);
     }
 }
 
@@ -188,7 +200,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
     if (!m_preprocessBuffer) return;
 
-    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize;
 
     VkGeneratedCommandsPipelineInfoEXT pipeInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
     pipeInfo.pipeline = pipeline;
@@ -208,8 +220,15 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
-void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
+void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t firstSlice, uint32_t sliceCount) {
     if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
+
+    VkDeviceSize offset = (sliceCount == 0) ? 0 : static_cast<VkDeviceSize>(firstSlice % m_sliceCount) * m_sliceSize;
+    VkDeviceSize size = (sliceCount == 0) ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(sliceCount) * m_sliceSize;
+    if (size != VK_WHOLE_SIZE && (offset + size > m_preprocessBuffer->getSize())) {
+        offset = 0;
+        size = VK_WHOLE_SIZE;
+    }
 
     VkBufferMemoryBarrier2 bufferBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
     bufferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
@@ -219,8 +238,8 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
     bufferBarrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
                                   VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     bufferBarrier.buffer = m_preprocessBuffer->getBuffer();
-    bufferBarrier.offset = 0;
-    bufferBarrier.size = VK_WHOLE_SIZE;
+    bufferBarrier.offset = offset;
+    bufferBarrier.size = size;
 
     VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.bufferMemoryBarrierCount = 1;
@@ -243,7 +262,7 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
 
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
 
-    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize;
 
     VkGeneratedCommandsPipelineInfoEXT pipeInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT };
     pipeInfo.pipeline = pipeline;
@@ -323,7 +342,7 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
     // Bind initial pipeline before preprocessing
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
 
-    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize;
 
     VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
     genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -359,7 +378,7 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
     // Bind initial pipeline before executing generated commands as required by VUID-vkCmdExecuteGeneratedCommandsEXT-indirectCommandsLayout-11053
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
 
-    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize;
 
     VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
     genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;

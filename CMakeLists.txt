@@ -383,6 +383,17 @@ target_include_directories(test_nrc_wmma PRIVATE
 target_link_libraries(test_nrc_wmma PRIVATE Vulkan::Vulkan)
 add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 
+# DGC Multi-Slice Ring Buffer & Dedicated Compute Queue Unit Test Target
+add_executable(test_dgc_async_queue
+    tests/test_dgc_async_queue.cpp
+)
+target_include_directories(test_dgc_async_queue PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_dgc_async_queue PRIVATE Vulkan::Vulkan)
+add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue)
+
 
 
 

@@ -29,13 +29,20 @@ public:
     // [0] classify, [1] intersect, [2] shade, [3] shadow, [4] resolve
     void initExecutionSet(const std::vector<VkPipeline>& pipelines);
 
+    // Multi-slice ring buffer controls
+    uint32_t acquireSlice();
+    void resetSliceCounter();
+    uint32_t getSliceCount() const { return m_sliceCount; }
+    VkDeviceSize getSliceSize() const { return m_sliceSize; }
+    Buffer* getPreprocessBuffer() const { return m_preprocessBuffer.get(); }
+
     // Asynchronous preprocessing of indirect commands
     void recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                           VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0,
                           uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
 
-    // Synchronization barrier between preprocessing and execution
-    void recordPreprocessBarrier(VkCommandBuffer cmd);
+    // Synchronization barrier between preprocessing and execution (sliceCount = 0 synchronizes all active slices)
+    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t firstSlice = 0, uint32_t sliceCount = 0);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
@@ -73,6 +80,8 @@ private:
     VkIndirectExecutionSetEXT m_materialExecutionSet = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
+    uint32_t m_sliceCount = 32;
+    uint32_t m_currentSlice = 0;
     bool m_supported = false;
     bool m_explicitPreprocess = true;
     bool m_materialDGCSupported = false;
