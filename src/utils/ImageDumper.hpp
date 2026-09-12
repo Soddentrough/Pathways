@@ -229,6 +229,7 @@ struct FrameStats {
 class ImageDumper {
 public:
     static bool savePNG(const std::string& filepath, uint32_t width, uint32_t height, const uint8_t* rgbaPixels);
+    static bool savePNG16(const std::string& filepath, uint32_t width, uint32_t height, const uint16_t* rgba16Pixels);
     static bool saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels);
     static bool saveStatsJSON(const std::string& filepath, const FrameStats& stats);
     static std::string generateDefaultTelemetryPath();

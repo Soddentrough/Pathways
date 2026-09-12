@@ -130,6 +130,7 @@ struct Config {
     std::string dump_ui_path = "";
     std::string dump_hdr_path = "";
     std::string dump_stats_path = "";
+    bool dump_8bit_png = false; // Save dumped PNG frames as 8-bit instead of default 10/16-bit (conforms to single-negation rule)
 
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);

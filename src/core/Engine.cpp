@@ -4140,19 +4140,36 @@ void Engine::dumpOutputFiles() {
 
         if (m_outputImage->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
             const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
-            std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
-            for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
-                uint32_t px = src32[pIdx];
-                uint32_t r10 = (px >> 0) & 0x3FF;
-                uint32_t g10 = (px >> 10) & 0x3FF;
-                uint32_t b10 = (px >> 20) & 0x3FF;
-                uint32_t a2  = (px >> 30) & 0x03;
-                rgba8[pIdx * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
-                rgba8[pIdx * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
-                rgba8[pIdx * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
-                rgba8[pIdx * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+            bool force8bit = m_config.dump_8bit_png || (m_config.output_format == OutputFormat::RGBA8_UNORM);
+            if (force8bit) {
+                std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
+                    uint32_t px = src32[pIdx];
+                    uint32_t r10 = (px >> 0) & 0x3FF;
+                    uint32_t g10 = (px >> 10) & 0x3FF;
+                    uint32_t b10 = (px >> 20) & 0x3FF;
+                    uint32_t a2  = (px >> 30) & 0x03;
+                    rgba8[pIdx * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                    rgba8[pIdx * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                    rgba8[pIdx * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                    rgba8[pIdx * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+                }
+                ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
+            } else {
+                std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
+                    uint32_t px = src32[pIdx];
+                    uint32_t r10 = (px >> 0) & 0x3FF;
+                    uint32_t g10 = (px >> 10) & 0x3FF;
+                    uint32_t b10 = (px >> 20) & 0x3FF;
+                    uint32_t a2  = (px >> 30) & 0x03;
+                    rgba16[pIdx * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
+                    rgba16[pIdx * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
+                    rgba16[pIdx * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
+                    rgba16[pIdx * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+                }
+                ImageDumper::savePNG16(m_config.dump_frame_path, m_config.width, m_config.height, rgba16.data());
             }
-            ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
             staging.unmap();
         } else {
             const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
@@ -4210,22 +4227,43 @@ void Engine::dumpOutputFiles() {
         uint32_t w = m_swapchain->getExtent().width;
         uint32_t h = m_swapchain->getExtent().height;
         std::vector<uint8_t> rgba(w * h * 4);
+        bool force8bit = m_config.dump_8bit_png || (m_config.output_format == OutputFormat::RGBA8_UNORM);
         if (m_swapchain->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
             const uint32_t* src32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
-            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-                uint32_t px = src32[i];
-                uint32_t r10 = (px >> 0) & 0x3FF;
-                uint32_t g10 = (px >> 10) & 0x3FF;
-                uint32_t b10 = (px >> 20) & 0x3FF;
-                uint32_t a2  = (px >> 30) & 0x03;
-                rgba[i * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
-                rgba[i * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
-                rgba[i * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
-                rgba[i * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+            if (force8bit) {
+                std::vector<uint8_t> rgba(w * h * 4);
+                for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                    uint32_t px = src32[i];
+                    uint32_t r10 = (px >> 0) & 0x3FF;
+                    uint32_t g10 = (px >> 10) & 0x3FF;
+                    uint32_t b10 = (px >> 20) & 0x3FF;
+                    uint32_t a2  = (px >> 30) & 0x03;
+                    rgba[i * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                    rgba[i * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                    rgba[i * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                    rgba[i * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+                }
+                m_uiDumpBuffer->unmap();
+                ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
+            } else {
+                std::vector<uint16_t> rgba16(w * h * 4);
+                for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                    uint32_t px = src32[i];
+                    uint32_t r10 = (px >> 0) & 0x3FF;
+                    uint32_t g10 = (px >> 10) & 0x3FF;
+                    uint32_t b10 = (px >> 20) & 0x3FF;
+                    uint32_t a2  = (px >> 30) & 0x03;
+                    rgba16[i * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
+                    rgba16[i * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
+                    rgba16[i * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
+                    rgba16[i * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+                }
+                m_uiDumpBuffer->unmap();
+                ImageDumper::savePNG16(m_config.dump_ui_path, w, h, rgba16.data());
             }
-            m_uiDumpBuffer->unmap();
         } else {
             const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
+            std::vector<uint8_t> rgba(w * h * 4);
             bool isBgra = (m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_UNORM || m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_SRGB);
             for (size_t i = 0; i < w * h; ++i) {
                 if (isBgra) {
@@ -4241,8 +4279,8 @@ void Engine::dumpOutputFiles() {
                 }
             }
             m_uiDumpBuffer->unmap();
+            ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
         }
-        ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
     }
 
     // 4. Dump Stats JSON

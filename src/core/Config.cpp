@@ -183,7 +183,8 @@ void Config::printUsage(const char* progName) {
               << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
               << "  --warmup-frames <int>   Initial frames to exclude from benchmark stats (default: 0)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
-              << "  --dump-frame <path.png> Save tonemapped LDR frame to PNG\n"
+              << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
+              << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --capture-training-data <dir> Output directory for high-speed raw binary training tensors\n"
@@ -271,6 +272,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.hdri_path = argv[++i];
         } else if (arg == "--dump-frame" && i + 1 < argc) {
             cfg.dump_frame_path = argv[++i];
+        } else if (arg == "--dump-8bit" || arg == "--png-8bit") {
+            cfg.dump_8bit_png = true;
         } else if (arg == "--dump-ui" && i + 1 < argc) {
             cfg.dump_ui_path = argv[++i];
         } else if (arg == "--dump-hdr" && i + 1 < argc) {
