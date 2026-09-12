@@ -420,6 +420,8 @@ Config Config::parse(int argc, char* argv[]) {
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
         } else if (arg == "--no-dgc-batch-preprocess" || arg == "--no-dgc-tier2-batch") {
             setEnvVar("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1");
+        } else if (arg == "--no-inline-shadows") {
+            cfg.inline_primary_shadows = false;
         } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
             setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
         } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {

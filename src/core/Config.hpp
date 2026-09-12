@@ -78,6 +78,7 @@ struct Config {
     bool aces_tonemap = true;
     bool enable_refraction = true;
     bool enable_shadows = true;
+    bool inline_primary_shadows = true;   // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
     bool enable_direct_light = true;
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;

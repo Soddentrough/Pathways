@@ -636,7 +636,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
                     // 4a. Shading microkernel(s)
-                    uint32_t shadePC[18] = {
+                    uint32_t shadePC[19] = {
                         sceneData.numTriangles,
                         sceneData.numSpheres,
                         sceneData.numMaterials,
@@ -654,7 +654,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.enableNrc ? 1u : 0u,
                         sceneData.nrcBounce,
                         std::bit_cast<uint32_t>(sceneData.nrcTrainRatio),
-                        sceneData.frameIndex
+                        sceneData.frameIndex,
+                        sceneData.numOpaqueTriangles
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 

@@ -39,6 +39,8 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -110,6 +112,8 @@ layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
     uint secondaryIndices[];
 };
 
+#include "wavefront_shadow_inline.glsl"
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -125,6 +129,11 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint useHardwareRT;
     uint secondarySortMode;
+    uint enableNrc;
+    uint nrcBounce;
+    float nrcTrainRatio;
+    uint frameIndex;
+    uint numOpaqueTriangles;
 } pc;
 
 void main() {
@@ -242,76 +251,126 @@ void main() {
                 vec3 diffuseColor = baseColor.rgb;
                 bool enableDirect = (ubo.flags & (1 << 0)) != 0;
                 bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
+                bool enableShadows = (ubo.flags & (1 << 4)) != 0;
+                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
                 bool pathTerminated = false;
 
-                // Direct Lighting (1-candidate stochastic NEE)
+                // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
                 if (enableDirect && pc.numLights > 0u) {
-                    uint lightIdx = 0u;
-                    float lightSelectPdf = 1.0;
-                    if (pc.numLights > 1u) {
-                        lightIdx = uint(randFloat(seed) * float(pc.numLights));
-                        lightIdx = min(lightIdx, pc.numLights - 1u);
-                        lightSelectPdf = 1.0 / float(pc.numLights);
-                    }
+                    uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
-                    Light light = lights[lightIdx];
-                    vec3 lightPoint;
-                    vec3 lightDir;
-                    float lightDist = 0.0;
-                    float lightPdf = 1.0;
-                    vec3 lightEmission = light.emission.rgb;
-                    bool validLightSample = false;
+                    uint selectedLightIdx = 0u;
+                    vec3 selectedLightDir = vec3(0.0);
+                    float selectedLightDist = 0.0;
+                    vec3 selectedLightEmission = vec3(0.0);
+                    float selectedLightPdf = 1.0;
+                    float selectedNdotL = 0.0;
+                    float selectedMisWeight = 1.0;
+                    float selectedTarget = 0.0;
+                    float totalWeightSum = 0.0;
+                    bool hasCandidate = false;
 
-                    if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                        vec2 luv = randVec2(seed);
-                        lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                        vec3 toLight = lightPoint - hitPoint;
-                        lightDist = length(toLight);
-                        lightDir = toLight / max(lightDist, 1e-4);
+                    for (uint c = 0u; c < M; ++c) {
+                        uint lightIdx = 0u;
+                        float lightSelectPdf = 1.0;
+                        SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
 
-                        float cosLight = dot(-lightDir, light.normal.xyz);
-                        if (cosLight > 0.0) {
-                            float area = light.emission.w;
-                            lightPdf = (lightDist * lightDist) / (area * cosLight);
-                            validLightSample = true;
-                        }
-                    } else if (uint(light.position.w) == 1u /* SPOT */) {
-                        vec3 toLight = light.position.xyz - hitPoint;
-                        lightDist = length(toLight);
-                        lightDir = toLight / max(lightDist, 1e-4);
+                        Light light = lights[lightIdx];
+                        vec3 lightPoint;
+                        vec3 lightDir;
+                        float lightDist = 0.0;
+                        float lightPdf = 1.0;
+                        vec3 lightEmission = light.emission.rgb;
+                        bool validLightSample = false;
 
-                        float cosSpot = dot(-lightDir, light.normal.xyz);
-                        float innerCos = light.u.w;
-                        float outerCos = light.v.w;
-                        if (cosSpot >= outerCos) {
-                            float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                            lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                        if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                            vec2 luv = randVec2(seed);
+                            lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                            vec3 toLight = lightPoint - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+
+                            float cosLight = dot(-lightDir, light.normal.xyz);
+                            if (cosLight > 0.0) {
+                                float area = light.emission.w;
+                                lightPdf = (lightDist * lightDist) / (area * cosLight);
+                                validLightSample = true;
+                            }
+                        } else if (uint(light.position.w) == 1u /* SPOT */) {
+                            vec3 toLight = light.position.xyz - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+
+                            float cosSpot = dot(-lightDir, light.normal.xyz);
+                            float innerCos = light.u.w;
+                            float outerCos = light.v.w;
+                            if (cosSpot >= outerCos) {
+                                float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                                lightPdf = 1.0;
+                                validLightSample = true;
+                            }
+                        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                            lightDir = normalize(light.normal.xyz);
+                            lightDist = 10000.0;
                             lightPdf = 1.0;
                             validLightSample = true;
                         }
-                    } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
-                        lightDir = normalize(light.normal.xyz);
-                        lightDist = 10000.0;
-                        lightPdf = 1.0;
-                        validLightSample = true;
+
+                        float NdotL = dot(hitNormal, lightDir);
+                        if (validLightSample && NdotL > 0.0) {
+                            float bsdfPdf = NdotL * INV_PI;
+                            float misWeight = 1.0;
+                            if (uint(light.position.w) == 0u) {
+                                float lightPdfEff = lightPdf * lightSelectPdf;
+                                misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
+                            }
+
+                            vec3 candidateContrib = diffuseColor * INV_PI * lightEmission * NdotL * misWeight;
+                            float target = dot(candidateContrib, vec3(0.2126, 0.7152, 0.0722));
+                            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
+                            float weight = target / sourcePdf;
+
+                            totalWeightSum += weight;
+                            if (randFloat(seed) * totalWeightSum < weight) {
+                                selectedLightIdx = lightIdx;
+                                selectedLightDir = lightDir;
+                                selectedLightDist = lightDist;
+                                selectedLightEmission = lightEmission;
+                                selectedLightPdf = lightPdf;
+                                selectedNdotL = NdotL;
+                                selectedMisWeight = misWeight;
+                                selectedTarget = target;
+                                hasCandidate = true;
+                            }
+                        }
                     }
 
-                    float NdotL = dot(hitNormal, lightDir);
-                    if (validLightSample && NdotL > 0.0) {
-                        float bsdfPdf = NdotL * INV_PI;
-                        float misWeight = 1.0;
-                        if (uint(light.position.w) == 0u) {
-                            float lightPdfEff = lightPdf * lightSelectPdf;
-                            misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
-                        }
-
+                    if (hasCandidate && selectedTarget > 1e-6) {
+                        float risWeight = totalWeightSum / (float(M) * selectedTarget);
                         vec3 diffuseBrdf = diffuseColor * INV_PI;
-                        vec3 unshadowed = throughput * diffuseBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                        vec3 secDirectL = diffuseBrdf * selectedLightEmission * selectedNdotL * selectedMisWeight * risWeight;
+                        vec3 unshadowed = throughput * secDirectL;
 
                         if (length(unshadowed) > 1e-5) {
-                            hasShadowRay = true;
-                            shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                            shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                            if (enableShadows) {
+                                bool occluded = false;
+                                if (bounce == 0u && enableInlineShadows && pc.useHardwareRT == 1u) {
+                                    occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
+                                                                    (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                    if (!occluded) {
+                                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                        imageStore(uAccumImage, pixelCoord, prev + vec4(unshadowed, 0.0));
+                                    }
+                                } else {
+                                    hasShadowRay = true;
+                                    shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
+                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                }
+                            } else {
+                                accumRadiance += unshadowed;
+                            }
                         }
                     }
                 }

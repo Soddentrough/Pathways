@@ -90,6 +90,7 @@ struct Light {
     vec4 u;        // xyz: edge1, w: spot inner cos
     vec4 v;        // xyz: edge2, w: spot outer cos
     vec4 normal;   // xyz: normal/dir, w: padding
+    vec4 sampling; // x: q, y: aliasIdx, z: pdf, w: flux
 };
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {

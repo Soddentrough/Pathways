@@ -619,6 +619,7 @@ void Engine::initScene() {
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (!m_sceneData.lights.empty()) {
+        buildLightAliasTable(m_sceneData.lights);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
@@ -834,6 +835,7 @@ bool Engine::loadScene(const std::string& filepath) {
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (!m_sceneData.lights.empty()) {
+        buildLightAliasTable(m_sceneData.lights);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
@@ -3093,6 +3095,7 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
+    if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
