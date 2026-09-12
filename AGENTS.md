@@ -41,7 +41,7 @@ Suite root: `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`
 
 ## Command-Line Option & CLI Guidelines
 - **Binary / Mutually Exclusive Options Rule**: When an option represents a mutually exclusive binary condition, there must be only **ONE** option, which is to negate the default state.
-  - If a feature is **disabled by default**, provide only the flag to enable it (e.g., `--atrous`). Do NOT add a redundant `--no-<feature>` flag.
-  - If a feature is **enabled by default**, provide only the flag to disable/negate it (e.g., `--no-double-buffer`). Do NOT add a redundant positive flag.
-  - Never introduce redundant pairs of opposing flags (e.g., having both `--atrous` and `--no-atrous` when A-Trous is disabled by default).
+  - If a feature is **disabled by default**, provide only the flag to enable it (e.g., `--bmfr`). Do NOT add a redundant `--no-<feature>` flag.
+  - If a feature is **enabled by default**, provide only the flag to disable/negate it (e.g., `--no-double-buffer`, `--no-temporal-accum`). Do NOT add a redundant positive flag.
+  - Never introduce redundant pairs of opposing flags (e.g., having both `--bmfr` and `--no-bmfr` when BMFR is disabled by default).
 

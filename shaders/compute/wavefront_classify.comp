@@ -11,6 +11,7 @@
 layout(local_size_x = 8, local_size_y = 4) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 23, rg16f) uniform image2D uMotionVectorImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -22,6 +23,8 @@ layout(binding = 1) uniform CameraUBO {
     uint spp;
     uint maxBounces;
     uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
 } ubo;
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
@@ -234,6 +237,26 @@ void main() {
 
             state.throughputSeed = vec4(vec3(invSpp), uintBitsToFloat(seed));
             state.radiancePixel = vec4(0.0, 0.0, 0.0, uintBitsToFloat(pixelIndex));
+        }
+
+        if (pc.sppSampleIndex == 0u) {
+            vec2 vSurface = vec2(0.0);
+            if (closestTri >= 0 || closestSphere >= 0) {
+                vec3 primaryHitPoint = origin + direction * closestT;
+                vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
+                vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPoint, 1.0);
+                if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
+                    vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
+                }
+            } else {
+                vec3 skyDirPt = origin + direction * 1000.0;
+                vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
+                vec4 prevClip = ubo.prevViewProj * vec4(skyDirPt, 1.0);
+                if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
+                    vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
+                }
+            }
+            imageStore(uMotionVectorImage, pixelCoord, vec4(vSurface, 0.0, 0.0));
         }
     }
 

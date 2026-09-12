@@ -40,7 +40,7 @@ enum class SecondarySortMode {
 
 enum class DenoiserMode {
     None,    // Raw noisy path traced output
-    Atrous   // Edge-avoiding A-Trous Wavelet diffuse denoiser
+    BMFR     // Blockwise Multi-Order Feature Regression
 };
 
 struct Config {
@@ -80,10 +80,11 @@ struct Config {
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
     DenoiserMode denoiser_mode = DenoiserMode::None;
-    bool enable_atrous = false;           // Hierarchical Edge-Avoiding A-Trous Wavelet Diffuse Denoiser [Default: disabled]
-    uint32_t atrous_passes = 3;           // Number of A-Trous filter iterations (1-5, default: 3 passes: s=1,2,4)
-    float atrous_normal_power = 32.0f;    // Normal edge-stopping sensitivity
-    float atrous_depth_sigma = 0.03f;     // Depth edge-stopping sensitivity
+    bool enable_temporal_accum = true;    // Motion-vector guided temporal accumulation [Default: enabled]
+    bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled]
+    float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
+    float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth
+    float temporal_max_history = 32.0f;   // Maximum temporal history sample accumulation limit
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
     uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)

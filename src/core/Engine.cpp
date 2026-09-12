@@ -232,9 +232,11 @@ Engine::~Engine() {
     m_rtpKhrPipeline.reset();
     destroyShadowDenoiserResources();
     destroyShadowDenoiserPipelines();
+    destroyTemporalAccumResources();
+    destroyTemporalAccumPipelines();
+    destroyBmfrResources();
+    destroyBmfrPipelines();
     m_motionVectorImage.reset();
-    destroyAtrousResources();
-    destroyAtrousPipelines();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
 
@@ -1364,11 +1366,13 @@ void Engine::initPipelines() {
     createShadowDenoiserPipelines();
     createShadowDenoiserResources();
 
-    // 9. A-Trous Wavelet Diffuse Denoiser Resources & Pipelines (Lazy-loaded on demand)
-    if (m_config.enable_atrous) {
-        createAtrousPipelines();
-        createAtrousResources();
-    }
+    // 9. Temporal Radiance Accumulation & wRLS Outlier Rejection
+    createTemporalAccumPipelines();
+    createTemporalAccumResources();
+
+    // 10. Blockwise Multi-Order Feature Regression (BMFR)
+    createBmfrPipelines();
+    createBmfrResources();
 
     // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
     initTlasUpdatePipeline();
@@ -1465,8 +1469,9 @@ void Engine::updateAllImageDescriptors() {
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
-    updateAtrousDescriptors();
     updateWavefrontSceneDescriptors();
+    updateTemporalAccumDescriptors();
+    updateBmfrDescriptors();
 }
 
 void Engine::createShadowDenoiserPipelines() {
@@ -1693,215 +1698,516 @@ void Engine::updateShadowDenoiserDescriptors() {
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-
-
-void Engine::createAtrousPipelines() {
+void Engine::createTemporalAccumPipelines() {
     VkDevice device = m_context->getDevice();
 
-    // 1. Create Descriptor Set Layout
+    // 1. Descriptor Set Layout
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentRadiance
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uMotionVectors
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uHistoryRadiance
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uOutputRadiance
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
-    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_atrousDescLayout);
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_temporalAccumDescSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation descriptor set layout");
+    }
 
-    // 2. Allocate Ping-Pong and Tonemap Descriptor Sets
-    std::array<VkDescriptorSetLayout, 3> atrousLayouts = { m_atrousDescLayout, m_atrousDescLayout, m_atrousDescLayout };
+    // 2. Descriptor Pool (2 temporal sets + 2 tonemap temporal sets)
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = 4;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_temporalAccumDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation descriptor pool");
+    }
+
+    // Allocate temporal sets
+    std::array<VkDescriptorSetLayout, 2> tempLayouts = { m_temporalAccumDescSetLayout, m_temporalAccumDescSetLayout };
     VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 3;
-    allocInfo.pSetLayouts = atrousLayouts.data();
-    vkAllocateDescriptorSets(device, &allocInfo, m_atrousDescSets.data());
+    allocInfo.descriptorPool = m_temporalAccumDescPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = tempLayouts.data();
+    if (vkAllocateDescriptorSets(device, &allocInfo, m_temporalAccumDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Temporal Accumulation descriptor sets");
+    }
 
-    std::array<VkDescriptorSetLayout, 2> tonemapLayouts = { m_tonemapDescLayout, m_tonemapDescLayout };
-    VkDescriptorSetAllocateInfo tonemapAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    tonemapAllocInfo.descriptorPool = m_descriptorPool;
-    tonemapAllocInfo.descriptorSetCount = 2;
-    tonemapAllocInfo.pSetLayouts = tonemapLayouts.data();
-    vkAllocateDescriptorSets(device, &tonemapAllocInfo, m_tonemapAtrousDescSets.data());
+    // Allocate tonemap descriptor sets
+    std::array<VkDescriptorSetLayout, 2> tmLayouts = { m_tonemapDescLayout, m_tonemapDescLayout };
+    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    tmAllocInfo.descriptorPool = m_temporalAccumDescPool;
+    tmAllocInfo.descriptorSetCount = 2;
+    tmAllocInfo.pSetLayouts = tmLayouts.data();
+    if (vkAllocateDescriptorSets(device, &tmAllocInfo, m_tonemapTemporalDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Tonemap Temporal descriptor sets");
+    }
 
-    // 3. Create Pipeline Layout
+    // 3. Pipeline Layout
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 3 + sizeof(float) * 3 + sizeof(uint32_t) * 2;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 3 + sizeof(uint32_t) * 3;
 
-    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plInfo.setLayoutCount = 1;
-    plInfo.pSetLayouts = &m_atrousDescLayout;
-    plInfo.pushConstantRangeCount = 1;
-    plInfo.pPushConstantRanges = &pcRange;
-    vkCreatePipelineLayout(device, &plInfo, nullptr, &m_atrousPipelineLayout);
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_temporalAccumDescSetLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_temporalAccumPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation pipeline layout");
+    }
 
-    // 4. Create Compute Pipeline
-    auto shaderCode = loadShaderSPIRV("atrous_denoise.comp.spv");
-    VkShaderModule shaderModule = createShaderModule(shaderCode);
+    // 4. Compute Pipeline
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+    };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto code = loadShaderSPIRV("temporal_accum.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(code);
+
     VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-    pipeInfo.layout = m_atrousPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_atrousPipeline);
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_temporalAccumPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_temporalAccumPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, shaderModule, nullptr);
+        throw std::runtime_error("Failed to create Temporal Accumulation pipeline");
+    }
     vkDestroyShaderModule(device, shaderModule, nullptr);
 
-    Logger::info("A-Trous Wavelet diffuse denoiser pipeline created successfully.");
+    Logger::info("Temporal Radiance Accumulation pipeline (Wave32) created successfully.");
 }
 
-void Engine::destroyAtrousPipelines() {
+void Engine::destroyTemporalAccumPipelines() {
     VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
     if (!device) return;
 
-    if (m_atrousPipeline) { vkDestroyPipeline(device, m_atrousPipeline, nullptr); m_atrousPipeline = VK_NULL_HANDLE; }
-    if (m_atrousPipelineLayout) { vkDestroyPipelineLayout(device, m_atrousPipelineLayout, nullptr); m_atrousPipelineLayout = VK_NULL_HANDLE; }
-    if (m_atrousDescLayout) { vkDestroyDescriptorSetLayout(device, m_atrousDescLayout, nullptr); m_atrousDescLayout = VK_NULL_HANDLE; }
-    m_atrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
-    m_tonemapAtrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    if (m_temporalAccumPipeline) {
+        vkDestroyPipeline(device, m_temporalAccumPipeline, nullptr);
+        m_temporalAccumPipeline = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_temporalAccumPipelineLayout, nullptr);
+        m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumDescPool) {
+        vkDestroyDescriptorPool(device, m_temporalAccumDescPool, nullptr);
+        m_temporalAccumDescPool = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumDescSetLayout) {
+        vkDestroyDescriptorSetLayout(device, m_temporalAccumDescSetLayout, nullptr);
+        m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
+    }
+    m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 }
 
-void Engine::createAtrousResources() {
+void Engine::createTemporalAccumResources() {
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
     uint32_t w = m_config.width;
     uint32_t h = m_config.height;
 
-    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
 
     for (int i = 0; i < 2; ++i) {
-        m_atrousPingPong[i] = std::make_unique<Image>(device, allocator, w, h,
-            accumFmt,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        m_temporalHistory[i] = std::make_unique<Image>(
+            device, allocator, w, h,
+            format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
     }
 
-    VkCommandBuffer cmd = m_commandBuffers[0];
-    vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
     for (int i = 0; i < 2; ++i) {
-        m_atrousPingPong[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        m_temporalHistory[i]->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
     }
-    vkEndCommandBuffer(cmd);
+
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
-    updateAtrousDescriptors();
-    Logger::info("A-Trous Wavelet diffuse denoiser resources allocated successfully.");
+    m_temporalPingPong = 0;
+    m_temporalResetRequested = true;
+
+    updateTemporalAccumDescriptors();
 }
 
-void Engine::destroyAtrousResources() {
-    m_atrousPingPong[0].reset();
-    m_atrousPingPong[1].reset();
+void Engine::destroyTemporalAccumResources() {
+    m_temporalHistory[0].reset();
+    m_temporalHistory[1].reset();
 }
 
-void Engine::updateAtrousDescriptors() {
-    if (m_atrousDescSets[0] == VK_NULL_HANDLE || !m_atrousPingPong[0] || !m_atrousPingPong[1] ||
-        !m_accumImage || !m_normalDepthImage || !m_outputImage) {
+void Engine::updateTemporalAccumDescriptors() {
+    if (!m_temporalAccumDescPool || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_motionVectorImage || !m_outputImage) {
         return;
     }
 
     VkDevice device = m_context->getDevice();
 
     VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pingInfo{ VK_NULL_HANDLE, m_atrousPingPong[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pongInfo{ VK_NULL_HANDLE, m_atrousPingPong[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
     std::vector<VkWriteDescriptorSet> writes;
 
-    // Set 0: accum -> ping
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
+    // Set 0: accum + mv + hist0 (in) -> hist1 (out)
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
 
-    // Set 1: ping -> pong
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
+    // Set 1: accum + mv + hist1 (in) -> hist0 (out)
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
 
-    // Set 2: pong -> ping
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
+    // Tonemap Set 0: hist0 -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
 
-    // Tonemap descriptor sets:
-    // [0]: ping -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
-
-    // [1]: pong -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
+    // Tonemap Set 1: hist1 -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-uint32_t Engine::dispatchAtrous(VkCommandBuffer cmd) {
-    if (!m_config.enable_atrous || !m_atrousPipeline || m_config.atrous_passes == 0) {
-        return 0; // indicates A-Trous not run
+uint32_t Engine::dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory) {
+    if (!m_config.enable_temporal_accum || !m_temporalAccumPipeline) {
+        return 0; // indicates temporal accum not run
     }
 
-    uint32_t passes = std::clamp(m_config.atrous_passes, 1u, 5u);
-    uint32_t groupsX = (m_config.width + 15) / 16;
-    uint32_t groupsY = (m_config.height + 15) / 16;
+    uint32_t inSlot = m_temporalPingPong;
+    uint32_t outSlot = 1 - m_temporalPingPong;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipelineLayout, 0, 1, &m_temporalAccumDescSets[inSlot], 0, nullptr);
 
-    struct AtrousPushConstants {
-        int32_t imageWidth;
-        int32_t imageHeight;
-        int32_t stepSize;
-        float normalPower;
-        float depthSigma;
-        float colorPhi;
+    struct TemporalAccumPushConstants {
+        int32_t imageSize[2];
+        float invImageSize[2];
+        float clampingGamma;
+        float outlierH;
+        float maxHistorySamples;
+        uint32_t resetHistory;
+        uint32_t cameraMoved;
         uint32_t totalSamples;
-        uint32_t isFirstPass;
     } pc;
 
-    pc.imageWidth = static_cast<int32_t>(m_config.width);
-    pc.imageHeight = static_cast<int32_t>(m_config.height);
-    pc.normalPower = m_config.atrous_normal_power;
-    pc.depthSigma = m_config.atrous_depth_sigma;
-    pc.colorPhi = 4.0f;
+    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
+    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
+    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
+    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
+    pc.clampingGamma = m_config.temporal_clamping_gamma;
+    pc.outlierH = m_config.temporal_outlier_h;
+    pc.maxHistorySamples = static_cast<float>(m_config.temporal_max_history);
+    pc.resetHistory = resetHistory ? 1u : 0u;
+    pc.cameraMoved = m_cameraMovedLastFrame ? 1u : 0u;
+    pc.totalSamples = m_accumulatedSamples;
 
-    VkMemoryBarrier2 passBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    passBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    passBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    passBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    passBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    vkCmdPushConstants(cmd, m_temporalAccumPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    VkDependencyInfo passDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    passDep.memoryBarrierCount = 1;
-    passDep.pMemoryBarriers = &passBarrier;
+    uint32_t groupsX = (m_config.width + 15) / 16;
+    uint32_t groupsY = (m_config.height + 15) / 16;
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-    for (uint32_t k = 0; k < passes; ++k) {
-        pc.stepSize = 1 << k;
-        pc.isFirstPass = (k == 0) ? 1u : 0u;
-        pc.totalSamples = (k == 0) ? m_accumulatedSamples : 1u;
+    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.image = m_temporalHistory[outSlot]->getImage();
+    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        uint32_t descSetIdx;
-        if (k == 0) {
-            descSetIdx = 0; // m_accumImage -> pingPong[0]
-        } else if (k % 2 == 1) {
-            descSetIdx = 1; // pingPong[0] -> pingPong[1]
-        } else {
-            descSetIdx = 2; // pingPong[1] -> pingPong[0]
-        }
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
 
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipelineLayout, 0, 1, &m_atrousDescSets[descSetIdx], 0, nullptr);
-        vkCmdPushConstants(cmd, m_atrousPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    m_temporalPingPong = outSlot;
+    return outSlot + 1; // 1 => history[0], 2 => history[1]
+}
 
-        vkCmdPipelineBarrier2(cmd, &passDep);
+void Engine::createBmfrPipelines() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Descriptor Set Layout
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uInputRadiance
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uNormalDepth
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uOutputRadiance
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_bmfrDescSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR descriptor set layout");
     }
 
-    uint32_t finalIdx = (passes - 1) % 2;
-    return finalIdx + 1; // 1 => pingPong[0], 2 => pingPong[1]
+    // 2. Descriptor Pool (2 temporal sets + 1 raw set + 1 tonemap set)
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = 4;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_bmfrDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR descriptor pool");
+    }
+
+    // Allocate BMFR sets (2 for history ping-pong)
+    std::array<VkDescriptorSetLayout, 2> bmfrLayouts = { m_bmfrDescSetLayout, m_bmfrDescSetLayout };
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_bmfrDescPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = bmfrLayouts.data();
+    if (vkAllocateDescriptorSets(device, &allocInfo, m_bmfrDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate BMFR descriptor sets");
+    }
+
+    VkDescriptorSetAllocateInfo rawAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    rawAllocInfo.descriptorPool = m_bmfrDescPool;
+    rawAllocInfo.descriptorSetCount = 1;
+    rawAllocInfo.pSetLayouts = &m_bmfrDescSetLayout;
+    if (vkAllocateDescriptorSets(device, &rawAllocInfo, &m_bmfrRawDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate BMFR raw descriptor set");
+    }
+
+    // Allocate Tonemap BMFR set
+    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    tmAllocInfo.descriptorPool = m_bmfrDescPool;
+    tmAllocInfo.descriptorSetCount = 1;
+    tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
+    if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapBmfrDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Tonemap BMFR descriptor set");
+    }
+
+    // 3. Pipeline Layout
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 2;
+
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_bmfrDescSetLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_bmfrPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR pipeline layout");
+    }
+
+    // 4. Compute Pipeline
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+    };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto code = loadShaderSPIRV("bmfr_regression.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(code);
+
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_bmfrPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_bmfrPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, shaderModule, nullptr);
+        throw std::runtime_error("Failed to create BMFR pipeline");
+    }
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    Logger::info("Blockwise Multi-Order Feature Regression (BMFR) pipeline (Wave32) created successfully.");
+}
+
+void Engine::destroyBmfrPipelines() {
+    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
+    if (!device) return;
+
+    if (m_bmfrPipeline) {
+        vkDestroyPipeline(device, m_bmfrPipeline, nullptr);
+        m_bmfrPipeline = VK_NULL_HANDLE;
+    }
+    if (m_bmfrPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_bmfrPipelineLayout, nullptr);
+        m_bmfrPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_bmfrDescPool) {
+        vkDestroyDescriptorPool(device, m_bmfrDescPool, nullptr);
+        m_bmfrDescPool = VK_NULL_HANDLE;
+    }
+    if (m_bmfrDescSetLayout) {
+        vkDestroyDescriptorSetLayout(device, m_bmfrDescSetLayout, nullptr);
+        m_bmfrDescSetLayout = VK_NULL_HANDLE;
+    }
+    m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_bmfrRawDescSet = VK_NULL_HANDLE;
+    m_tonemapBmfrDescSet = VK_NULL_HANDLE;
+}
+
+void Engine::createBmfrResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    uint32_t w = m_config.width;
+    uint32_t h = m_config.height;
+
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+
+    m_bmfrOutputImage = std::make_unique<Image>(
+        device, allocator, w, h,
+        format,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+    m_bmfrOutputImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
+    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+
+    updateBmfrDescriptors();
+}
+
+void Engine::destroyBmfrResources() {
+    m_bmfrOutputImage.reset();
+}
+
+void Engine::updateBmfrDescriptors() {
+    if (!m_bmfrDescPool || !m_bmfrOutputImage || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_normalDepthImage || !m_outputImage) {
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+
+    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo rawInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo ndInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo bmfrOutInfo{ VK_NULL_HANDLE, m_bmfrOutputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::vector<VkWriteDescriptorSet> writes;
+
+    // BMFR Set 0: hist0 -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // BMFR Set 1: hist1 -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // BMFR Raw Set: accumImage -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // Tonemap BMFR Set: bmfrOut -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
+    if (!m_config.enable_bmfr || !m_bmfrPipeline || !m_bmfrOutputImage || !m_normalDepthImage) {
+        return false;
+    }
+
+    VkDescriptorSet targetDescSet = VK_NULL_HANDLE;
+    if (temporalSlot == 1) {
+        targetDescSet = m_bmfrDescSets[0];
+    } else if (temporalSlot == 2) {
+        targetDescSet = m_bmfrDescSets[1];
+    } else {
+        targetDescSet = m_bmfrRawDescSet;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipelineLayout, 0, 1, &targetDescSet, 0, nullptr);
+
+    struct BmfrPushConstants {
+        int32_t imageSize[2];
+        float invImageSize[2];
+        float lambda;
+        float maxDepth;
+        uint32_t tileSize;
+        uint32_t pad;
+    } pc;
+
+    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
+    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
+    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
+    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
+    pc.lambda = 0.01f;
+    pc.maxDepth = 50.0f;
+    pc.tileSize = 8;
+    pc.pad = 0;
+
+    vkCmdPushConstants(cmd, m_bmfrPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groupsX = (m_config.width + 7) / 8;
+    uint32_t groupsY = (m_config.height + 7) / 8;
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.image = m_bmfrOutputImage->getImage();
+    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    return true;
 }
 
 void Engine::updateSceneDescriptors() {
@@ -1983,7 +2289,8 @@ void Engine::updateWavefrontSceneDescriptors() {
             texInfos,
             nrcQueryBuf,
             nrcTrainBuf,
-            nrcCountBuf
+            nrcCountBuf,
+            m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE
         );
     }
 
@@ -2481,12 +2788,6 @@ void Engine::renderFrame() {
     vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
 
-    if (m_config.enable_atrous && !m_atrousPipeline) {
-        vkDeviceWaitIdle(device);
-        createAtrousPipelines();
-        createAtrousResources();
-    }
-
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
         uint32_t qBase = m_currentFrame * 4;
@@ -2667,7 +2968,8 @@ void Engine::renderFrame() {
 
     // Reset accumulation if camera moved or UI settings changed
     m_cameraMovedLastFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
-    bool accumReset = m_cameraMovedLastFrame || m_resetAccumulation || (m_totalFramesRendered == 0);
+    bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
+    bool accumReset = m_cameraMovedLastFrame || hardReset;
     if (accumReset) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
@@ -2994,13 +3296,21 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
-        // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = !accumReachedCutoff ? dispatchAtrous(cmd) : 0u;
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        bool resetTemporal = hardReset || m_temporalResetRequested;
+        m_temporalResetRequested = false;
+        uint32_t temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+
+        // Blockwise Multi-Order Feature Regression (BMFR)
+        bool bmfrRun = !accumReachedCutoff ? dispatchBmfr(cmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (atrousOutputSlot > 0) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapAtrousDescSets[atrousOutputSlot - 1], 0, nullptr);
+        if (bmfrRun) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (temporalOutputSlot > 0) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
@@ -3301,13 +3611,21 @@ void Engine::renderFrame() {
         mergeDep.pMemoryBarriers = &mergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-        // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = dispatchAtrous(activeCmd);
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        bool resetTemporal = hardReset || m_temporalResetRequested;
+        m_temporalResetRequested = false;
+        uint32_t temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
+
+        // Blockwise Multi-Order Feature Regression (BMFR)
+        bool bmfrRun = dispatchBmfr(activeCmd, temporalOutputSlot);
 
         // Tonemapping
         vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (atrousOutputSlot > 0) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapAtrousDescSets[atrousOutputSlot - 1], 0, nullptr);
+        if (bmfrRun) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (temporalOutputSlot > 0) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
@@ -4271,10 +4589,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     destroyShadowDenoiserResources();
     createShadowDenoiserResources();
-    if (m_atrousPipeline) {
-        destroyAtrousResources();
-        createAtrousResources();
-    }
+    destroyTemporalAccumResources();
+    createTemporalAccumResources();
+    destroyBmfrResources();
+    createBmfrResources();
     updateAllImageDescriptors();
     updateMergeDescriptors();
 

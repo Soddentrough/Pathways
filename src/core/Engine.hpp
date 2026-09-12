@@ -201,24 +201,43 @@ private:
     void updateShadowDenoiserDescriptors();
     double m_lastShadowDenoiserTimeMs = 0.0;
 
-    // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
+    // Screen-Space Motion Vectors (used by ray tracer and temporal reconstruction passes)
     std::unique_ptr<Image> m_motionVectorImage;
 
-    // A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
-    std::unique_ptr<Image> m_atrousPingPong[2];
-    VkDescriptorSetLayout m_atrousDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 3> m_atrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, 2> m_tonemapAtrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_atrousPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_atrousPipeline = VK_NULL_HANDLE;
+    // Temporal Radiance Accumulation & wRLS Outlier Rejection
+    std::array<std::unique_ptr<Image>, 2> m_temporalHistory;
+    uint32_t m_temporalPingPong = 0;
+    bool m_temporalResetRequested = true;
+    VkDescriptorSetLayout m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_temporalAccumDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_temporalAccumPipeline = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    void createAtrousPipelines();
-    void createAtrousResources();
-    void destroyAtrousResources();
-    void destroyAtrousPipelines();
-    void updateAtrousDescriptors();
-    uint32_t dispatchAtrous(VkCommandBuffer cmd);
-    double m_lastAtrousTimeMs = 0.0;
+    void createTemporalAccumPipelines();
+    void createTemporalAccumResources();
+    void destroyTemporalAccumResources();
+    void destroyTemporalAccumPipelines();
+    void updateTemporalAccumDescriptors();
+    uint32_t dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory);
+
+    // Blockwise Multi-Order Feature Regression (BMFR)
+    std::unique_ptr<Image> m_bmfrOutputImage;
+    VkDescriptorSetLayout m_bmfrDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_bmfrDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_bmfrRawDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_tonemapBmfrDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_bmfrPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_bmfrPipeline = VK_NULL_HANDLE;
+
+    void createBmfrPipelines();
+    void createBmfrResources();
+    void destroyBmfrResources();
+    void destroyBmfrPipelines();
+    void updateBmfrDescriptors();
+    bool dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot);
 
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;

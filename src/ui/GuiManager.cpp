@@ -519,8 +519,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
-            if (config.enable_atrous) {
-                ImGui::Text("Denoising:    A-Trous Wavelet (%u Passes)", config.atrous_passes);
+            if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
+                ImGui::Text("Denoising:    BMFR (Feature Regression)");
+            } else if (config.enable_temporal_accum) {
+                ImGui::Text("Denoising:    Temporal Accumulation (wRLS)");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
@@ -1281,21 +1283,18 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 5. Post-Processing & Tonemapping
+        // 5. Post-Processing & Denoising
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const char* denoiserModes[] = { "None (Raw 1-SPP)", "A-Trous Wavelet" };
-            int currentDenoiser = 0;
-            if (config.denoiser_mode == DenoiserMode::Atrous || config.enable_atrous) {
-                currentDenoiser = 1;
-            }
+            const char* denoiserModes[] = { "None (Pure Monte Carlo)", "BMFR (Feature Regression)" };
+            int currentDenoiser = (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) ? 1 : 0;
 
             if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
                 if (currentDenoiser == 0) {
                     config.denoiser_mode = DenoiserMode::None;
-                    config.enable_atrous = false;
+                    config.enable_bmfr = false;
                 } else if (currentDenoiser == 1) {
-                    config.denoiser_mode = DenoiserMode::Atrous;
-                    config.enable_atrous = true;
+                    config.denoiser_mode = DenoiserMode::BMFR;
+                    config.enable_bmfr = true;
                 }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -1304,23 +1303,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::SetTooltip("Pluggable real-time denoiser architecture.");
             }
 
-            if (config.enable_atrous || config.denoiser_mode == DenoiserMode::Atrous) {
-                ImGui::Indent();
-                int passes = static_cast<int>(config.atrous_passes);
-                if (ImGui::SliderInt("Filter Passes", &passes, 1, 5)) {
-                    config.atrous_passes = static_cast<uint32_t>(passes);
-                    settingsChanged = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Number of dyadic wavelet iterations (step sizes 2^k). 3 passes covers 17x17 px, 4 passes covers 33x33 px.");
-                }
-                if (ImGui::SliderFloat("Normal Sensitivity", &config.atrous_normal_power, 4.0f, 64.0f, "%.1f")) {
-                    settingsChanged = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Exponent for normal similarity weighting (higher = sharper normal edge preservation).");
-                }
-                ImGui::Unindent();
+            if (ImGui::Checkbox("Temporal Accumulation (Motion-Vector Guided)", &config.enable_temporal_accum)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Motion-vector guided temporal accumulation with neighborhood clamping and wRLS outlier rejection.");
             }
 
             if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {

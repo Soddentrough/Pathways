@@ -67,7 +67,8 @@ public:
                                 const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
                                 VkBuffer nrcQueryBuffer = VK_NULL_HANDLE,
                                 VkBuffer nrcTrainBuffer = VK_NULL_HANDLE,
-                                VkBuffer nrcCountersBuffer = VK_NULL_HANDLE);
+                                VkBuffer nrcCountersBuffer = VK_NULL_HANDLE,
+                                VkImageView motionVectorImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);

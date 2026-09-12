@@ -134,7 +134,8 @@ void Config::printUsage(const char* progName) {
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
+              << "  --no-temporal-accum     Disable motion-vector guided temporal accumulation [default: enabled]\n"
+              << "  --bmfr                  Enable Blockwise Multi-Order Feature Regression denoiser [default: disabled]\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n\n"
@@ -299,29 +300,29 @@ Config Config::parse(int argc, char* argv[]) {
             ++i;
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
-            if (mode == "atrous") {
-                cfg.enable_atrous = true;
-                cfg.denoiser_mode = DenoiserMode::Atrous;
+            if (mode == "bmfr") {
+                cfg.enable_bmfr = true;
+                cfg.denoiser_mode = DenoiserMode::BMFR;
             } else if (mode == "none" || mode == "off") {
-                cfg.enable_atrous = false;
+                cfg.enable_bmfr = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
-            if (mode == "atrous") {
-                cfg.enable_atrous = true;
-                cfg.denoiser_mode = DenoiserMode::Atrous;
+            if (mode == "bmfr") {
+                cfg.enable_bmfr = true;
+                cfg.denoiser_mode = DenoiserMode::BMFR;
             } else if (mode == "none" || mode == "off") {
-                cfg.enable_atrous = false;
+                cfg.enable_bmfr = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
-        } else if (arg == "--atrous") {
-            cfg.enable_atrous = true;
-            cfg.denoiser_mode = DenoiserMode::Atrous;
-        } else if (arg == "--atrous-passes" && i + 1 < argc) {
-            cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 5));
-        } else if (arg.starts_with("--atrous-passes=")) {
-            cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(arg.substr(arg.find('=') + 1)), 1, 5));
+        } else if (arg == "--bmfr") {
+            cfg.enable_bmfr = true;
+            cfg.denoiser_mode = DenoiserMode::BMFR;
+        } else if (arg == "--no-temporal-accum") {
+            cfg.enable_temporal_accum = false;
+        } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
+            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr instead.");
         } else if (arg == "--nrc") {
             cfg.enable_nrc = true;
         } else if (arg == "--nrc-bounce" && i + 1 < argc) {

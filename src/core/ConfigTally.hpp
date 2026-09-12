@@ -53,8 +53,8 @@ struct ConfigKey {
         }
         std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";
         std::string denoiserStr = "";
-        if (denoiser == DenoiserMode::Atrous) {
-            denoiserStr = " [A-Trous]";
+        if (denoiser == DenoiserMode::BMFR) {
+            denoiserStr = " [BMFR]";
         }
         return std::format("[{}]{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
     }

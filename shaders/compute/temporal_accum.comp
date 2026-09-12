@@ -1,0 +1,129 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Binding 0: Current frame raw radiance (from Ray Tracing / Wavefront accumulation image)
+layout(binding = 0) readonly uniform image2D uCurrentRadiance;
+
+// Binding 1: Screen-space motion vectors (RG16F, containing surface delta UV = currUV - prevUV)
+layout(binding = 1) readonly uniform image2D uMotionVectors;
+
+// Binding 2: Previous frame history (RGBA16F or RGBA32F, RGB: accumulated radiance, A: sample count N)
+layout(binding = 2) readonly uniform image2D uHistoryRadiance;
+
+// Binding 3: Output accumulated radiance (RGBA16F or RGBA32F, RGB: accumulated radiance, A: sample count N)
+layout(binding = 3) writeonly uniform image2D uOutputRadiance;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 imageSize;
+    vec2 invImageSize;
+    float clampingGamma;     // Neighborhood variance clamping box multiplier (e.g. 1.25)
+    float outlierH;          // wRLS outlier rejection bandwidth (e.g. 0.75)
+    float maxHistorySamples; // Maximum history sample accumulation limit (e.g. 32.0)
+    uint resetHistory;       // 1 if history must be cleared (e.g. scene load / cut)
+    uint cameraMoved;        // 1 if camera moved this frame, 0 if static
+    uint totalSamples;       // Total static accumulation samples if stationary (for scaling)
+} pc;
+
+bool isInvalid(vec3 v) {
+    return isnan(v.r) || isnan(v.g) || isnan(v.b) || isinf(v.r) || isinf(v.g) || isinf(v.b);
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= pc.imageSize.x || pixelCoord.y >= pc.imageSize.y) {
+        return;
+    }
+
+    // 1. Fetch current frame radiance
+    vec4 currData = imageLoad(uCurrentRadiance, pixelCoord);
+    vec3 C_curr = currData.rgb;
+    if (pc.totalSamples > 1u) {
+        C_curr /= float(pc.totalSamples);
+    }
+    if (isInvalid(C_curr)) {
+        C_curr = vec3(0.0);
+    }
+
+    // 2. Compute 3x3 local color statistics for neighborhood clamping (Salvi 2016 / Karis 2014)
+    vec3 m1 = vec3(0.0);
+    vec3 m2 = vec3(0.0);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 tapCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), pc.imageSize - 1);
+            vec3 tap = imageLoad(uCurrentRadiance, tapCoord).rgb;
+            if (isInvalid(tap)) tap = C_curr;
+            m1 += tap;
+            m2 += tap * tap;
+        }
+    }
+    vec3 mean = m1 / 9.0;
+    vec3 variance = max(vec3(0.0), (m2 / 9.0) - (mean * mean));
+    vec3 stdDev = sqrt(variance);
+    vec3 boxMin = max(vec3(0.0), mean - pc.clampingGamma * stdDev);
+    vec3 boxMax = mean + pc.clampingGamma * stdDev;
+
+    // 3. Motion Vector Reprojection
+    vec2 mv = imageLoad(uMotionVectors, pixelCoord).xy;
+    vec2 currUV = (vec2(pixelCoord) + 0.5) * pc.invImageSize;
+    vec2 prevUV = currUV - mv;
+
+    bool validHistory = (pc.resetHistory == 0u);
+    if (prevUV.x < 0.0 || prevUV.x > 1.0 || prevUV.y < 0.0 || prevUV.y > 1.0) {
+        validHistory = false;
+    }
+
+    vec4 historyVal = vec4(C_curr, 1.0);
+    if (validHistory) {
+        // Bilinear interpolation of historical radiance and sample count
+        vec2 prevPx = prevUV * vec2(pc.imageSize) - 0.5;
+        ivec2 p0 = ivec2(floor(prevPx));
+        vec2 f = fract(prevPx);
+
+        ivec2 p00 = clamp(p0, ivec2(0), pc.imageSize - 1);
+        ivec2 p10 = clamp(p0 + ivec2(1, 0), ivec2(0), pc.imageSize - 1);
+        ivec2 p01 = clamp(p0 + ivec2(0, 1), ivec2(0), pc.imageSize - 1);
+        ivec2 p11 = clamp(p0 + ivec2(1, 1), ivec2(0), pc.imageSize - 1);
+
+        vec4 h00 = imageLoad(uHistoryRadiance, p00);
+        vec4 h10 = imageLoad(uHistoryRadiance, p10);
+        vec4 h01 = imageLoad(uHistoryRadiance, p01);
+        vec4 h11 = imageLoad(uHistoryRadiance, p11);
+
+        historyVal = mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+        if (isInvalid(historyVal.rgb)) {
+            historyVal = vec4(C_curr, 1.0);
+            validHistory = false;
+        }
+    }
+
+    // 4. Neighborhood Clamping (eliminates ghosting under camera motion)
+    vec3 C_clamped = clamp(historyVal.rgb, boxMin, boxMax);
+    float N_prev = historyVal.a;
+
+    // 5. Weighted RLS (wRLS) Outlier Rejection (Han et al., arXiv:2106.08034)
+    // Down-weights extreme fireflies / noise spikes to prevent polluting history during motion
+    vec3 diff = abs(C_curr - C_clamped);
+    vec3 denom = min(C_curr, C_clamped) + vec3(0.01);
+    vec3 relDiff = diff / denom;
+    float d2 = dot(relDiff, relDiff);
+    float outlierWeight = exp(-d2 / max(pc.outlierH * pc.outlierH, 1e-4));
+    vec3 C_curr_clean = mix(C_clamped, C_curr, clamp(outlierWeight, 0.05, 1.0));
+
+    // 6. Sample-Count Adaptive Blending (Tong et al., BMFR)
+    // Disoccluded / newly exposed pixels converge rapidly via arithmetic average (1/N);
+    // Converged pixels use an exponential moving average (alpha ~ 0.12 - 0.15) for high stability.
+    float N_curr = validHistory ? min(N_prev + 1.0, pc.maxHistorySamples) : 1.0;
+    float alpha;
+    if (N_curr < 5.0) {
+        alpha = 1.0 / N_curr;
+    } else {
+        alpha = max(1.0 / N_curr, 0.12);
+    }
+
+    vec3 C_final = validHistory ? mix(C_clamped, C_curr_clean, alpha) : C_curr;
+
+    // 7. Store accumulated radiance (RGB) and tracked sample count (A)
+    imageStore(uOutputRadiance, pixelCoord, vec4(C_final, N_curr));
+}

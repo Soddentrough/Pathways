@@ -620,3 +620,16 @@ Pathways currently employs a pre-transformed world-space BLAS design: during sce
    - Primitive indexing is resolved via `customIndex` (asset descriptor index) + `gl_PrimitiveID`.
 4. **Hardware Ray Masking:**
    - Utilize 8-bit TLAS instance masks (`mask = 0x01` for opaque, `0x02` for non-opaque) to cull non-opaque objects completely from primary or shadow ray traversal when appropriate.
+
+# ANIMATIONS
+
+1. We should support animated geometry:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AnimatedColorsCube
+
+2. Animated UVs:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AnimationPointerUVs
+
+# COMPRESSION
+
+1. KHR_mesh_quantization
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/MeshoptCubeTest

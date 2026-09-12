@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.18.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.19.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -127,7 +127,8 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/accum_merge.comp
     ${SHADER_DIR}/compute/ffx_shadow_tileclassify.comp
     ${SHADER_DIR}/compute/ffx_shadow_filter.comp
-    ${SHADER_DIR}/compute/atrous_denoise.comp
+    ${SHADER_DIR}/compute/temporal_accum.comp
+    ${SHADER_DIR}/compute/bmfr_regression.comp
     ${SHADER_DIR}/compute/wavefront_classify.comp
     ${SHADER_DIR}/compute/wavefront_intersect.comp
     ${SHADER_DIR}/compute/wavefront_shade.comp

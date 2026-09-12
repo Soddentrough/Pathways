@@ -43,30 +43,31 @@ int main() {
     std::cout << "==========================================================" << std::endl;
 
     // -------------------------------------------------------------------------
-    // 1. Test CLI Config Parsing & A-Trous / Deprecated Flags
+    // 1. Test CLI Config Parsing & BMFR / Temporal Accum / Deprecated Flags
     // -------------------------------------------------------------------------
     {
         std::cout << "[TEST 1] Command-Line Configuration & Flag Parsing..." << std::endl;
         Config configDefault;
         check_true(!configDefault.enable_taa, "Default TAA is off");
-        check_true(!configDefault.enable_atrous, "Default A-Trous is off");
-        check_true(configDefault.atrous_passes == 3, "Default A-Trous passes = 3");
+        check_true(configDefault.enable_temporal_accum, "Default Temporal Accum is on");
+        check_true(!configDefault.enable_bmfr, "Default BMFR is off");
 
-        const char* argv1[] = { "pathways", "--atrous" };
+        const char* argv1[] = { "pathways", "--bmfr" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
-        check_true(c1.enable_atrous, "--atrous enables");
+        check_true(c1.enable_bmfr, "--bmfr enables");
+        check_true(c1.denoiser_mode == DenoiserMode::BMFR, "--bmfr sets mode");
 
-        const char* argv2[] = { "pathways", "--atrous", "--atrous-passes", "4" };
-        Config c2 = Config::parse(4, const_cast<char**>(argv2));
-        check_true(c2.enable_atrous, "--atrous enabled");
-        check_true(c2.atrous_passes == 4, "--atrous-passes sets count");
+        const char* argv2[] = { "pathways", "--no-temporal-accum" };
+        Config c2 = Config::parse(2, const_cast<char**>(argv2));
+        check_true(!c2.enable_temporal_accum, "--no-temporal-accum disables");
 
-        const char* argv3[] = { "pathways", "--taa", "--shadow-denoiser" };
-        Config c3 = Config::parse(3, const_cast<char**>(argv3));
+        const char* argv3[] = { "pathways", "--taa", "--shadow-denoiser", "--atrous" };
+        Config c3 = Config::parse(4, const_cast<char**>(argv3));
         check_true(!c3.enable_taa, "Deprecated TAA remains disabled");
         check_true(!c3.enable_shadow_denoiser, "Deprecated Shadow Denoiser remains disabled");
+        check_true(!c3.enable_bmfr, "Deprecated A-Trous does not enable BMFR");
 
-        std::cout << "  -> CLI flags and A-Trous configuration successfully verified." << std::endl;
+        std::cout << "  -> CLI flags, BMFR, and Temporal Accumulation successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------
