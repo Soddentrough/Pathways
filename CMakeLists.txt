@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.16.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.17.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -140,6 +140,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
     ${SHADER_DIR}/compute/wavefront_raysort.comp
+    ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -356,6 +357,17 @@ if(UNIX)
     target_link_libraries(test_mgpu_frame_pacing PRIVATE m Threads::Threads)
 endif()
 add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing)
+
+# Tier 3 GPU TLAS Refit & Structure Layout Unit Test Target
+add_executable(test_tlas_gpu_refit
+    tests/test_tlas_gpu_refit.cpp
+)
+target_include_directories(test_tlas_gpu_refit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_tlas_gpu_refit PRIVATE Vulkan::Vulkan)
+add_test(NAME TlasGpuRefit COMMAND test_tlas_gpu_refit)
 
 
 

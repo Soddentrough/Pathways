@@ -27,6 +27,19 @@ struct ASInstanceInput {
     VkGeometryInstanceFlagsKHR flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 };
 
+// 96-byte GPU input struct matching compute shader update_tlas_instances.comp
+struct ASInstanceGPUData {
+    glm::mat4 transform = glm::mat4(1.0f); // 64 bytes (column-major transform)
+    uint32_t customIndex = 0;              // 4 bytes
+    uint32_t mask = 0xFF;                  // 4 bytes
+    uint32_t hitGroupId = 0;               // 4 bytes
+    uint32_t flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR; // 4 bytes
+    uint64_t blasAddress = 0;              // 8 bytes
+    uint32_t pad0 = 0;                     // 4 bytes
+    uint32_t pad1 = 0;                     // 4 bytes
+};
+static_assert(sizeof(ASInstanceGPUData) == 96, "ASInstanceGPUData must be exactly 96 bytes (std430 aligned)");
+
 class AccelerationStructure {
 public:
     AccelerationStructure(VkDevice device, VmaAllocator allocator);
@@ -61,6 +74,16 @@ public:
 
     std::unique_ptr<AccelerationStructure> buildBLAS(const std::vector<ASGeometryInput>& geometries);
     std::unique_ptr<AccelerationStructure> buildTLAS(const std::vector<ASInstanceInput>& instances);
+
+    // GPU-timeline TLAS sizing, allocation, and build / update (refit)
+    VkAccelerationStructureBuildSizesInfoKHR getTLASBuildSizes(uint32_t instanceCount);
+    std::unique_ptr<AccelerationStructure> createTLAS(uint32_t instanceCount);
+    void recordBuildTLAS(VkCommandBuffer cmd,
+                         Buffer* instanceBuffer,
+                         uint32_t instanceCount,
+                         Buffer* scratchBuffer,
+                         AccelerationStructure* dstTlas,
+                         bool updateMode = false);
 
 private:
     void loadFunctionPointers();

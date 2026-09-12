@@ -59,7 +59,7 @@ Window::Window(const Config& config)
         throw std::runtime_error(std::string("Failed to initialize SDL3: ") + SDL_GetError());
     }
 
-    SDL_SetAppMetadata("Pathways", "1.16.0", "pathways");
+    SDL_SetAppMetadata("Pathways", "1.17.0", "pathways");
 
     // 1. Detect Physical Display & Resolution Characteristics
     SDL_DisplayID displayID = SDL_GetPrimaryDisplay();

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <thread>
 #include <bit>
+#include <cstring>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -245,6 +246,14 @@ Engine::~Engine() {
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
+
+    if (m_updateTlasPipeline) vkDestroyPipeline(device, m_updateTlasPipeline, nullptr);
+    if (m_updateTlasPipelineLayout) vkDestroyPipelineLayout(device, m_updateTlasPipelineLayout, nullptr);
+    if (m_updateTlasDescLayout) vkDestroyDescriptorSetLayout(device, m_updateTlasDescLayout, nullptr);
+    if (m_updateTlasDescPool) vkDestroyDescriptorPool(device, m_updateTlasDescPool, nullptr);
+    m_tlasInstanceBuffer.reset();
+    m_tlasInputInstancesBuffer.reset();
+    m_tlasScratchBuffer.reset();
 
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     m_secTransferBuffer.reset();
@@ -685,6 +694,7 @@ void Engine::initScene() {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
         }
+        initTlasBuffers(1);
         Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (BLAS & TLAS).");
         Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
     }
@@ -893,6 +903,7 @@ bool Engine::loadScene(const std::string& filepath) {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS rebuild failed.");
         }
+        initTlasBuffers(1);
     }
 
     // Reload scene textures
@@ -1334,6 +1345,9 @@ void Engine::initPipelines() {
     // 10. A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
     createAtrousPipelines();
     createAtrousResources();
+
+    // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
+    initTlasUpdatePipeline();
 
     updateAllImageDescriptors();
 }
@@ -2171,6 +2185,212 @@ void Engine::updateMergeDescriptors() {
     }
 }
 
+void Engine::initTlasBuffers(uint32_t instanceCount) {
+    if (!m_asManager || instanceCount == 0) return;
+    m_tlasInstanceCount = instanceCount;
+    VmaAllocator allocator = m_context->getAllocator();
+    VkDevice device = m_context->getDevice();
+
+    // 1. Device-local TLAS Instance Buffer (64 bytes per VkAccelerationStructureInstanceKHR)
+    VkDeviceSize instanceBufferSize = sizeof(VkAccelerationStructureInstanceKHR) * instanceCount;
+    m_tlasInstanceBuffer = std::make_unique<Buffer>(
+        allocator, instanceBufferSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // 2. Host-visible GPU Instance Data Buffer (96 bytes per ASInstanceGPUData)
+    VkDeviceSize inputBufferSize = sizeof(ASInstanceGPUData) * instanceCount;
+    m_tlasInputInstancesBuffer = std::make_unique<Buffer>(
+        allocator, inputBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    // 3. Device-local Scratch Buffer (aligned to 256 bytes)
+    auto sizeInfo = m_asManager->getTLASBuildSizes(instanceCount);
+    VkDeviceSize scratchSize = std::max(sizeInfo.buildScratchSize, sizeInfo.updateScratchSize);
+    if (scratchSize > 0) {
+        scratchSize = (scratchSize + 255) & ~VkDeviceSize(255);
+        m_tlasScratchBuffer = std::make_unique<Buffer>(
+            allocator, scratchSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            0,
+            256
+        );
+    }
+
+    // 4. Initialize instance 0 with default transform and BLAS address
+    if (m_blas && m_tlasInputInstancesBuffer) {
+        ASInstanceGPUData initData{};
+        initData.transform = glm::mat4(1.0f);
+        initData.customIndex = 0;
+        initData.mask = 0xFF;
+        initData.hitGroupId = 0;
+        initData.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        initData.blasAddress = m_blas->getDeviceAddress();
+        initData.pad0 = 0;
+        initData.pad1 = 0;
+        m_tlasInputInstancesBuffer->copyFrom(&initData, sizeof(ASInstanceGPUData));
+    }
+
+    // 5. Update descriptor set if already created
+    if (m_updateTlasDescSet != VK_NULL_HANDLE && m_tlasInputInstancesBuffer && m_tlasInstanceBuffer) {
+        VkDescriptorBufferInfo inInfo{ m_tlasInputInstancesBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo outInfo{ m_tlasInstanceBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_updateTlasDescSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &inInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_updateTlasDescSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &outInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::initTlasUpdatePipeline() {
+    VkDevice device = m_context->getDevice();
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_updateTlasDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update descriptor set layout!");
+    }
+
+    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 1;
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_updateTlasDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update descriptor pool!");
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_updateTlasDescPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_updateTlasDescLayout;
+    if (vkAllocateDescriptorSets(device, &allocInfo, &m_updateTlasDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate TLAS update descriptor set!");
+    }
+
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(uint32_t) * 2;
+
+    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &m_updateTlasDescLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &plInfo, nullptr, &m_updateTlasPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update pipeline layout!");
+    }
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto compCode = loadShaderSPIRV("update_tlas_instances.comp.spv");
+    VkShaderModule compModule = createShaderModule(compCode);
+
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeInfo.stage.module = compModule;
+    pipeInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_updateTlasPipelineLayout;
+
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_updateTlasPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, compModule, nullptr);
+        throw std::runtime_error("Failed to create TLAS update compute pipeline!");
+    }
+    vkDestroyShaderModule(device, compModule, nullptr);
+
+    if (m_tlasInputInstancesBuffer && m_tlasInstanceBuffer) {
+        VkDescriptorBufferInfo inInfo{ m_tlasInputInstancesBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo outInfo{ m_tlasInstanceBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_updateTlasDescSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &inInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_updateTlasDescSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &outInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+
+    Logger::info("GPU TLAS Instance Writer & Refit Pipeline initialized successfully.");
+}
+
+void Engine::recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode) {
+    if (!m_updateTlasPipeline || !m_tlasInstanceBuffer || !m_tlasScratchBuffer || !m_tlas || m_tlasInstanceCount == 0) {
+        return;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateTlasPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateTlasPipelineLayout, 0, 1, &m_updateTlasDescSet, 0, nullptr);
+
+    struct {
+        uint32_t instanceCount;
+        uint32_t updateMode;
+    } pc = { m_tlasInstanceCount, updateMode ? 1u : 0u };
+    vkCmdPushConstants(cmd, m_updateTlasPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groupCountX = (m_tlasInstanceCount + 63) / 64;
+    vkCmdDispatch(cmd, groupCountX, 1, 1);
+
+    m_asManager->recordBuildTLAS(cmd, m_tlasInstanceBuffer.get(), m_tlasInstanceCount, m_tlasScratchBuffer.get(), m_tlas.get(), updateMode);
+}
+
+void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform) {
+    if (!m_tlasInputInstancesBuffer || index >= m_tlasInstanceCount) {
+        return;
+    }
+    VkDeviceSize offset = index * sizeof(ASInstanceGPUData) + offsetof(ASInstanceGPUData, transform);
+    void* mapped = m_tlasInputInstancesBuffer->map();
+    if (mapped) {
+        std::memcpy(static_cast<char*>(mapped) + offset, &transform, sizeof(glm::mat4));
+        vmaFlushAllocation(m_context->getAllocator(), m_tlasInputInstancesBuffer->getAllocation(), offset, sizeof(glm::mat4));
+        m_tlasNeedsGpuUpdate = true;
+    }
+}
+
 
 
 void Engine::initSyncObjects() {
@@ -2722,6 +2942,12 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
+        // GPU-Timeline TLAS Update / Refit (Tier 3)
+        if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
+            recordGpuTlasUpdate(cmd, true);
+            m_tlasNeedsGpuUpdate = false;
+        }
+
         if (!accumReachedCutoff) {
             bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
             if (useWavefront) {
@@ -3101,6 +3327,12 @@ void Engine::renderFrame() {
         uint32_t qBase = m_currentFrame * 4;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
+
+        // GPU-Timeline TLAS Update / Refit (Tier 3)
+        if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
+            recordGpuTlasUpdate(cmd, true);
+            m_tlasNeedsGpuUpdate = false;
+        }
 
         uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
         uint32_t rtPushConstants[16] = {

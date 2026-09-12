@@ -1,0 +1,72 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 96-byte input struct matching C++ ASInstanceGPUData
+struct ASInstanceInputGPU {
+    mat4 transform;       // 64 bytes (column-major world transform)
+    uint customIndex;     // 4 bytes
+    uint mask;            // 4 bytes
+    uint hitGroupId;      // 4 bytes
+    uint flags;           // 4 bytes
+    uint64_t blasAddress; // 8 bytes
+    uint pad0;            // 4 bytes
+    uint pad1;            // 4 bytes
+};
+
+// 64-byte layout matching VkAccelerationStructureInstanceKHR (Vulkan spec)
+struct VkAccelerationStructureInstanceKHR {
+    vec4 transformRow0;
+    vec4 transformRow1;
+    vec4 transformRow2;
+    uint instanceCustomIndexAndMask;
+    uint instanceShaderBindingTableRecordOffsetAndFlags;
+    uint64_t accelerationStructureReference;
+};
+
+layout(std430, binding = 0) readonly buffer InputInstancesBuffer {
+    ASInstanceInputGPU inInstances[];
+};
+
+layout(std430, binding = 1) buffer OutputInstancesBuffer {
+    VkAccelerationStructureInstanceKHR outInstances[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint instanceCount;
+    uint updateMode; // 0 = full init (transform + metadata + BLAS), 1 = refit transform only
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.instanceCount) {
+        return;
+    }
+
+    mat4 worldMat = inInstances[idx].transform;
+    mat4 T = transpose(worldMat);
+
+    if (pc.updateMode == 1u) {
+        // Refit / dynamic transform update mode: update transform rows only
+        outInstances[idx].transformRow0 = T[0];
+        outInstances[idx].transformRow1 = T[1];
+        outInstances[idx].transformRow2 = T[2];
+    } else {
+        // Full initialization mode: write transform + packed customIndex/mask + flags + BLAS address
+        outInstances[idx].transformRow0 = T[0];
+        outInstances[idx].transformRow1 = T[1];
+        outInstances[idx].transformRow2 = T[2];
+
+        uint customIndex = inInstances[idx].customIndex & 0x00FFFFFFu;
+        uint mask = (inInstances[idx].mask & 0xFFu) << 24u;
+        outInstances[idx].instanceCustomIndexAndMask = customIndex | mask;
+
+        uint sbtOffset = inInstances[idx].hitGroupId & 0x00FFFFFFu;
+        uint flags = (inInstances[idx].flags & 0xFFu) << 24u;
+        outInstances[idx].instanceShaderBindingTableRecordOffsetAndFlags = sbtOffset | flags;
+
+        outInstances[idx].accelerationStructureReference = inInstances[idx].blasAddress;
+    }
+}

@@ -99,6 +99,13 @@ private:
     std::unique_ptr<AccelerationStructure> m_blas;
     std::unique_ptr<AccelerationStructure> m_tlas;
 
+    // GPU-Timeline TLAS Instance & Scratch Buffers (Tier 3)
+    std::unique_ptr<Buffer> m_tlasInstanceBuffer;
+    std::unique_ptr<Buffer> m_tlasInputInstancesBuffer;
+    std::unique_ptr<Buffer> m_tlasScratchBuffer;
+    uint32_t m_tlasInstanceCount = 0;
+    bool m_tlasNeedsGpuUpdate = false;
+
 
 
     // Textures & Environment Map (Bindings 7 & 8)
@@ -126,6 +133,18 @@ private:
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
     WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
+
+    // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
+    VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_updateTlasDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet m_updateTlasDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_updateTlasPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_updateTlasPipeline = VK_NULL_HANDLE;
+    void initTlasBuffers(uint32_t instanceCount);
+    void initTlasUpdatePipeline();
+    void recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode = true);
+    void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
+    void markTlasDirty() { m_tlasNeedsGpuUpdate = true; }
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;

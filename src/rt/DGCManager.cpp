@@ -211,7 +211,8 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
 }
 
 void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                                  VkDeviceSize argumentOffset, uint32_t sliceIndex, uint32_t maxSequenceCount) {
+                                  VkDeviceSize argumentOffset, uint32_t sliceIndex,
+                                  uint32_t maxSequenceCount, VkDeviceAddress sequenceCountAddress) {
     if (!m_supported || !m_explicitPreprocess || !argumentBuffer) return;
 
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
@@ -232,6 +233,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
@@ -257,7 +259,8 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
 
 void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                               VkDeviceSize argumentOffset, uint32_t sliceIndex,
-                              uint32_t maxSequenceCount, bool isPreprocessed) {
+                              uint32_t maxSequenceCount, bool isPreprocessed,
+                              VkDeviceAddress sequenceCountAddress) {
     if (!argumentBuffer) return;
 
     if (!m_supported || !m_indirectLayout) {
@@ -285,6 +288,7 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
         genInfo.preprocessSize = m_sliceSize;
     }
     genInfo.maxSequenceCount = maxSequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
     bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
     pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
@@ -332,7 +336,8 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
 
 void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                         Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                        uint32_t sliceIndex, uint32_t sequenceCount) {
+                                        uint32_t sliceIndex, uint32_t sequenceCount,
+                                        VkDeviceAddress sequenceCountAddress) {
     if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipelines.empty()) return;
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) return;
 
@@ -353,13 +358,15 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = sequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                       Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                      uint32_t sliceIndex, uint32_t sequenceCount, bool isPreprocessed) {
+                                      uint32_t sliceIndex, uint32_t sequenceCount,
+                                      bool isPreprocessed, VkDeviceAddress sequenceCountAddress) {
     if (!argumentBuffer || pipelines.empty()) return;
 
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) {
@@ -389,6 +396,7 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
         genInfo.preprocessSize = m_sliceSize;
     }
     genInfo.maxSequenceCount = sequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
     bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
     pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
