@@ -135,7 +135,8 @@ void Config::printUsage(const char* progName) {
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
               << "  --no-temporal-accum     Disable motion-vector guided temporal accumulation [default: enabled]\n"
-              << "  --bmfr                  Enable Blockwise Multi-Order Feature Regression denoiser [default: disabled]\n"
+              << "  --bmfr                  Enable experimental Blockwise Multi-Order Feature Regression [default: disabled]\n"
+              << "  --denoiser <mode>       Denoising mode: 'temporal' (Temporal Accumulation [default]), 'none' (Pure MC), or 'bmfr'\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n\n"
@@ -302,27 +303,43 @@ Config Config::parse(int argc, char* argv[]) {
             std::string mode = argv[++i];
             if (mode == "bmfr") {
                 cfg.enable_bmfr = true;
+                cfg.enable_temporal_accum = true;
                 cfg.denoiser_mode = DenoiserMode::BMFR;
+            } else if (mode == "temporal" || mode == "tra") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = true;
+                cfg.denoiser_mode = DenoiserMode::Temporal;
             } else if (mode == "none" || mode == "off") {
                 cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             if (mode == "bmfr") {
                 cfg.enable_bmfr = true;
+                cfg.enable_temporal_accum = true;
                 cfg.denoiser_mode = DenoiserMode::BMFR;
+            } else if (mode == "temporal" || mode == "tra") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = true;
+                cfg.denoiser_mode = DenoiserMode::Temporal;
             } else if (mode == "none" || mode == "off") {
                 cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg == "--bmfr") {
             cfg.enable_bmfr = true;
+            cfg.enable_temporal_accum = true;
             cfg.denoiser_mode = DenoiserMode::BMFR;
         } else if (arg == "--no-temporal-accum") {
             cfg.enable_temporal_accum = false;
+            if (cfg.denoiser_mode == DenoiserMode::Temporal) {
+                cfg.denoiser_mode = DenoiserMode::None;
+            }
         } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
-            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr instead.");
+            Logger::warn("A-Trous Wavelet denoiser has been removed. Use default Temporal Accumulation or --bmfr.");
         } else if (arg == "--nrc") {
             cfg.enable_nrc = true;
         } else if (arg == "--nrc-bounce" && i + 1 < argc) {

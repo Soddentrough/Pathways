@@ -520,9 +520,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
             if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
-                ImGui::Text("Denoising:    BMFR (Feature Regression)");
-            } else if (config.enable_temporal_accum) {
-                ImGui::Text("Denoising:    Temporal Accumulation (wRLS)");
+                ImGui::Text("Denoising:    BMFR (Feature Regression) [Experimental]");
+            } else if (config.enable_temporal_accum && config.denoiser_mode != DenoiserMode::None) {
+                ImGui::Text("Denoising:    Temporal Accumulation (wRLS) [Default]");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
@@ -1285,25 +1285,56 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 5. Post-Processing & Denoising
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const char* denoiserModes[] = { "None (Pure Monte Carlo)", "BMFR (Feature Regression)" };
-            int currentDenoiser = (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) ? 1 : 0;
+            const char* denoiserModes[] = {
+                "Temporal Radiance Accumulation (Motion-Vector Guided) [Default]",
+                "None (Pure Monte Carlo)",
+                "BMFR (Blockwise Feature Regression) [Experimental]"
+            };
+            int currentDenoiser = 0;
+            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
+                currentDenoiser = 2;
+            } else if (config.denoiser_mode == DenoiserMode::None || !config.enable_temporal_accum) {
+                currentDenoiser = 1;
+            } else {
+                currentDenoiser = 0;
+            }
 
             if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
                 if (currentDenoiser == 0) {
-                    config.denoiser_mode = DenoiserMode::None;
+                    config.denoiser_mode = DenoiserMode::Temporal;
+                    config.enable_temporal_accum = true;
                     config.enable_bmfr = false;
                 } else if (currentDenoiser == 1) {
+                    config.denoiser_mode = DenoiserMode::None;
+                    config.enable_temporal_accum = false;
+                    config.enable_bmfr = false;
+                } else if (currentDenoiser == 2) {
                     config.denoiser_mode = DenoiserMode::BMFR;
+                    config.enable_temporal_accum = true;
                     config.enable_bmfr = true;
                 }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Pluggable real-time denoiser architecture.");
+                ImGui::SetTooltip("Select active denoising architecture. Temporal Accumulation is default for artifact-free motion.");
+            }
+
+            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                    "Warning: BMFR uses discrete 8x8 blocks which may exhibit tile seams and edge artifacts during camera motion.");
             }
 
             if (ImGui::Checkbox("Temporal Accumulation (Motion-Vector Guided)", &config.enable_temporal_accum)) {
+                if (config.enable_temporal_accum) {
+                    if (config.denoiser_mode == DenoiserMode::None) {
+                        config.denoiser_mode = DenoiserMode::Temporal;
+                    }
+                } else {
+                    if (config.denoiser_mode == DenoiserMode::Temporal) {
+                        config.denoiser_mode = DenoiserMode::None;
+                    }
+                }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }

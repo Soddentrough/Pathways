@@ -1901,7 +1901,7 @@ void Engine::updateTemporalAccumDescriptors() {
 }
 
 uint32_t Engine::dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory) {
-    if (!m_config.enable_temporal_accum || !m_temporalAccumPipeline) {
+    if (!m_config.enable_temporal_accum || m_config.denoiser_mode == DenoiserMode::None || !m_temporalAccumPipeline) {
         return 0; // indicates temporal accum not run
     }
 
@@ -2156,7 +2156,7 @@ void Engine::updateBmfrDescriptors() {
 }
 
 bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
-    if (!m_config.enable_bmfr || !m_bmfrPipeline || !m_bmfrOutputImage || !m_normalDepthImage) {
+    if ((!m_config.enable_bmfr && m_config.denoiser_mode != DenoiserMode::BMFR) || !m_bmfrPipeline || !m_bmfrOutputImage || !m_normalDepthImage) {
         return false;
     }
 
@@ -2185,7 +2185,7 @@ bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
     pc.imageSize[1] = static_cast<int32_t>(m_config.height);
     pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
     pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
-    pc.lambda = 0.01f;
+    pc.lambda = 0.05f;
     pc.maxDepth = 50.0f;
     pc.tileSize = 8;
     pc.pad = 0;
@@ -4645,7 +4645,8 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
-    key.denoiser = (m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR : DenoiserMode::None;
+    key.denoiser = (m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR :
+                   (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None ? DenoiserMode::Temporal : DenoiserMode::None);
     key.enable_nrc = m_config.enable_nrc;
     key.width = m_config.width;
     key.height = m_config.height;

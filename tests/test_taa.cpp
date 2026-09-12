@@ -51,15 +51,36 @@ int main() {
         check_true(!configDefault.enable_taa, "Default TAA is off");
         check_true(configDefault.enable_temporal_accum, "Default Temporal Accum is on");
         check_true(!configDefault.enable_bmfr, "Default BMFR is off");
+        check_true(configDefault.denoiser_mode == DenoiserMode::Temporal, "Default DenoiserMode is Temporal");
 
         const char* argv1[] = { "pathways", "--bmfr" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
         check_true(c1.enable_bmfr, "--bmfr enables");
-        check_true(c1.denoiser_mode == DenoiserMode::BMFR, "--bmfr sets mode");
+        check_true(c1.enable_temporal_accum, "--bmfr keeps temporal accum enabled");
+        check_true(c1.denoiser_mode == DenoiserMode::BMFR, "--bmfr sets mode to BMFR");
 
         const char* argv2[] = { "pathways", "--no-temporal-accum" };
         Config c2 = Config::parse(2, const_cast<char**>(argv2));
-        check_true(!c2.enable_temporal_accum, "--no-temporal-accum disables");
+        check_true(!c2.enable_temporal_accum, "--no-temporal-accum disables temporal accum");
+        check_true(c2.denoiser_mode == DenoiserMode::None, "--no-temporal-accum sets mode to None");
+
+        const char* argvDenNone[] = { "pathways", "--denoiser", "none" };
+        Config cDenNone = Config::parse(3, const_cast<char**>(argvDenNone));
+        check_true(cDenNone.denoiser_mode == DenoiserMode::None, "--denoiser none sets None");
+        check_true(!cDenNone.enable_temporal_accum, "--denoiser none disables temporal accum");
+        check_true(!cDenNone.enable_bmfr, "--denoiser none disables bmfr");
+
+        const char* argvDenTemp[] = { "pathways", "--denoiser", "temporal" };
+        Config cDenTemp = Config::parse(3, const_cast<char**>(argvDenTemp));
+        check_true(cDenTemp.denoiser_mode == DenoiserMode::Temporal, "--denoiser temporal sets Temporal");
+        check_true(cDenTemp.enable_temporal_accum, "--denoiser temporal enables temporal accum");
+        check_true(!cDenTemp.enable_bmfr, "--denoiser temporal keeps bmfr off");
+
+        const char* argvDenBmfr[] = { "pathways", "--denoiser", "bmfr" };
+        Config cDenBmfr = Config::parse(3, const_cast<char**>(argvDenBmfr));
+        check_true(cDenBmfr.denoiser_mode == DenoiserMode::BMFR, "--denoiser bmfr sets BMFR");
+        check_true(cDenBmfr.enable_bmfr, "--denoiser bmfr enables bmfr");
+        check_true(cDenBmfr.enable_temporal_accum, "--denoiser bmfr enables temporal accum");
 
         const char* argv3[] = { "pathways", "--taa", "--shadow-denoiser", "--atrous" };
         Config c3 = Config::parse(4, const_cast<char**>(argv3));

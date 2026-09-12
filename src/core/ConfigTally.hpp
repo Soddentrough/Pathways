@@ -18,7 +18,7 @@ struct ConfigKey {
     uint32_t height = 2160;
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
-    DenoiserMode denoiser = DenoiserMode::None;
+    DenoiserMode denoiser = DenoiserMode::Temporal;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
     uint32_t tile_size = 64;
     bool enable_nrc = false;
@@ -57,6 +57,8 @@ struct ConfigKey {
         std::string denoiserStr = "";
         if (denoiser == DenoiserMode::BMFR) {
             denoiserStr = " [BMFR]";
+        } else if (denoiser == DenoiserMode::None) {
+            denoiserStr = " [Pure MC]";
         }
         std::string nrcStr = enable_nrc ? " [NRC]" : "";
         return std::format("[{}]{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);

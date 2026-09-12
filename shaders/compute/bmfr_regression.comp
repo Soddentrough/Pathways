@@ -206,7 +206,7 @@ void main() {
             recon = max(vec3(0.0), recon);
             if (isInvalid(recon)) recon = C;
 
-            vec3 finalColor = mix(C, recon, 0.90);
+            vec3 finalColor = mix(C, recon, 0.65);
             imageStore(uOutputRadiance, pixelCoord, vec4(finalColor, 1.0));
         }
     }
