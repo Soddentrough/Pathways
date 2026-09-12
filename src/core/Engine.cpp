@@ -232,8 +232,7 @@ Engine::~Engine() {
     m_rtpKhrPipeline.reset();
     destroyShadowDenoiserResources();
     destroyShadowDenoiserPipelines();
-    destroyTaaResources();
-    destroyTaaPipelines();
+    m_motionVectorImage.reset();
     destroyAtrousResources();
     destroyAtrousPipelines();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
@@ -377,6 +376,12 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    m_motionVectorImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
     // Transition layouts to GENERAL
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -393,6 +398,13 @@ void Engine::initVulkan() {
         m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
+    m_motionVectorImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
     vkEndCommandBuffer(m_commandBuffers[0]);
@@ -1245,6 +1257,20 @@ void Engine::initPipelines() {
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
+    // 6c. Neural Radiance Caching (NRC) Manager (Wave32 WMMA)
+    try {
+        auto nrcInferCode = loadShaderSPIRV("nrc_encode_infer.comp.spv");
+        auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
+        m_nrcManager = std::make_unique<NRCManager>(
+            device, allocator,
+            m_config.width, m_config.height,
+            nrcInferCode, nrcTrainCode
+        );
+        Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA) initialized successfully.");
+    } catch (const std::exception& e) {
+        Logger::warn("NRCManager initialization failed: {}", e.what());
+    }
+
     // 7. ACES Tonemapping Compute Pipeline (Wave32 execution mode on RDNA4)
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1338,13 +1364,11 @@ void Engine::initPipelines() {
     createShadowDenoiserPipelines();
     createShadowDenoiserResources();
 
-    // 9. Temporal Anti-Aliasing (TAA) Resources & Pipelines
-    createTaaPipelines();
-    createTaaResources();
-
-    // 10. A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
-    createAtrousPipelines();
-    createAtrousResources();
+    // 9. A-Trous Wavelet Diffuse Denoiser Resources & Pipelines (Lazy-loaded on demand)
+    if (m_config.enable_atrous) {
+        createAtrousPipelines();
+        createAtrousResources();
+    }
 
     // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
     initTlasUpdatePipeline();
@@ -1669,191 +1693,7 @@ void Engine::updateShadowDenoiserDescriptors() {
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void Engine::createTaaPipelines() {
-    VkDevice device = m_context->getDevice();
 
-    // 1. Create Sampler for history reprojection (bilinear clamp-to-edge)
-    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipLodBias = 0.0f;
-    samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 1.0f;
-    samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 0.0f;
-    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    vkCreateSampler(device, &samplerInfo, nullptr, &m_taaHistorySampler);
-
-    // 2. Create Descriptor Set Layout
-    std::vector<VkDescriptorSetLayoutBinding> taaBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = static_cast<uint32_t>(taaBindings.size());
-    layoutInfo.pBindings = taaBindings.data();
-    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_taaDescLayout);
-
-    // 3. Allocate Ping-Pong Descriptor Sets
-    std::array<VkDescriptorSetLayout, 2> layouts = { m_taaDescLayout, m_taaDescLayout };
-    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 2;
-    allocInfo.pSetLayouts = layouts.data();
-    vkAllocateDescriptorSets(device, &allocInfo, m_taaDescSets);
-
-    // 4. Create Pipeline Layout
-    VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 3 + sizeof(float) * 2 + sizeof(uint32_t) * 3;
-
-    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plInfo.setLayoutCount = 1;
-    plInfo.pSetLayouts = &m_taaDescLayout;
-    plInfo.pushConstantRangeCount = 1;
-    plInfo.pPushConstantRanges = &pcRange;
-    vkCreatePipelineLayout(device, &plInfo, nullptr, &m_taaPipelineLayout);
-
-    // 5. Create Compute Pipeline
-    auto taaCode = loadShaderSPIRV("taa_resolve.comp.spv");
-    VkShaderModule taaShaderModule = createShaderModule(taaCode);
-    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, taaShaderModule, "main", nullptr };
-    pipeInfo.layout = m_taaPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_taaPipeline);
-    vkDestroyShaderModule(device, taaShaderModule, nullptr);
-
-    Logger::info("Temporal Anti-Aliasing (TAA) pipelines created successfully.");
-}
-
-void Engine::destroyTaaPipelines() {
-    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
-    if (!device) return;
-
-    if (m_taaPipeline) { vkDestroyPipeline(device, m_taaPipeline, nullptr); m_taaPipeline = VK_NULL_HANDLE; }
-    if (m_taaPipelineLayout) { vkDestroyPipelineLayout(device, m_taaPipelineLayout, nullptr); m_taaPipelineLayout = VK_NULL_HANDLE; }
-    if (m_taaDescLayout) { vkDestroyDescriptorSetLayout(device, m_taaDescLayout, nullptr); m_taaDescLayout = VK_NULL_HANDLE; }
-    if (m_taaHistorySampler) { vkDestroySampler(device, m_taaHistorySampler, nullptr); m_taaHistorySampler = VK_NULL_HANDLE; }
-    m_taaDescSets[0] = VK_NULL_HANDLE;
-    m_taaDescSets[1] = VK_NULL_HANDLE;
-}
-
-void Engine::createTaaResources() {
-    VkDevice device = m_context->getDevice();
-    VmaAllocator allocator = m_context->getAllocator();
-    uint32_t w = m_config.width;
-    uint32_t h = m_config.height;
-
-    // Allocate Motion Vector Image (RG16F)
-    m_motionVectorImage = std::make_unique<Image>(device, allocator, w, h,
-        VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-
-    // Allocate History Images (RGBA16F to match radiance)
-    for (int i = 0; i < 2; ++i) {
-        m_taaHistoryImages[i] = std::make_unique<Image>(device, allocator, w, h,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    }
-
-    // Transition layouts to GENERAL and clear memory
-    VkCommandBuffer cmd = m_commandBuffers[0];
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(cmd, &beginInfo);
-    m_motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    for (int i = 0; i < 2; ++i) {
-        m_taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    }
-
-    VkClearColorValue zeroColor{};
-    VkImageSubresourceRange range{};
-    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    range.baseMipLevel = 0;
-    range.levelCount = 1;
-    range.baseArrayLayer = 0;
-    range.layerCount = 1;
-
-    vkCmdClearColorImage(cmd, m_motionVectorImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
-    for (int i = 0; i < 2; ++i) {
-        vkCmdClearColorImage(cmd, m_taaHistoryImages[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
-    }
-
-    VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-
-    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    clearDep.memoryBarrierCount = 1;
-    clearDep.pMemoryBarriers = &clearBarrier;
-    vkCmdPipelineBarrier2(cmd, &clearDep);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-
-    m_taaPingPongIndex = 0;
-    updateTaaDescriptors();
-    Logger::info("Temporal Anti-Aliasing (TAA) resources allocated successfully.");
-}
-
-void Engine::destroyTaaResources() {
-    m_motionVectorImage.reset();
-    m_taaHistoryImages[0].reset();
-    m_taaHistoryImages[1].reset();
-}
-
-void Engine::updateTaaDescriptors() {
-    if (m_taaDescSets[0] == VK_NULL_HANDLE || m_taaDescSets[1] == VK_NULL_HANDLE ||
-        !m_motionVectorImage || !m_taaHistoryImages[0] || !m_taaHistoryImages[1] ||
-        !m_accumImage || !m_normalDepthImage || m_taaHistorySampler == VK_NULL_HANDLE) return;
-
-    VkDevice device = m_context->getDevice();
-
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    VkDescriptorImageInfo histInfo0{ m_taaHistorySampler, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo histInfo1{ m_taaHistorySampler, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    VkDescriptorImageInfo outInfo0{ VK_NULL_HANDLE, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outInfo1{ VK_NULL_HANDLE, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes = {
-        // Set 0: Read history from [0], resolve output into [1]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo1, nullptr, nullptr },
-
-        // Set 1: Read history from [1], resolve output into [0]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo0, nullptr, nullptr }
-    };
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
 
 void Engine::createAtrousPipelines() {
     VkDevice device = m_context->getDevice();
@@ -2124,6 +1964,10 @@ void Engine::updateWavefrontSceneDescriptors() {
         }
     }
 
+    VkBuffer nrcQueryBuf = m_nrcManager ? m_nrcManager->getQueryQueue()->getBuffer() : VK_NULL_HANDLE;
+    VkBuffer nrcTrainBuf = m_nrcManager ? m_nrcManager->getTrainQueue()->getBuffer() : VK_NULL_HANDLE;
+    VkBuffer nrcCountBuf = m_nrcManager ? m_nrcManager->getCounters()->getBuffer() : VK_NULL_HANDLE;
+
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         if (!m_cameraUBOs[slot]) continue;
         m_wavefrontPipeline->updateSceneDescriptors(
@@ -2136,8 +1980,15 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_lightBuffer->getBuffer(), m_lightBuffer->getSize(),
             tlasHandle,
             envInfo,
-            texInfos
+            texInfos,
+            nrcQueryBuf,
+            nrcTrainBuf,
+            nrcCountBuf
         );
+    }
+
+    if (m_nrcManager && m_accumImage) {
+        m_nrcManager->updateDescriptors(m_accumImage->getImageView());
     }
 }
 
@@ -2376,6 +2227,7 @@ void Engine::recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode) {
     vkCmdDispatch(cmd, groupCountX, 1, 1);
 
     m_asManager->recordBuildTLAS(cmd, m_tlasInstanceBuffer.get(), m_tlasInstanceCount, m_tlasScratchBuffer.get(), m_tlas.get(), updateMode);
+    m_tlasGpuUpdateCount++;
 }
 
 void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform) {
@@ -2628,6 +2480,12 @@ void Engine::renderFrame() {
 
     vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
+
+    if (m_config.enable_atrous && !m_atrousPipeline) {
+        vkDeviceWaitIdle(device);
+        createAtrousPipelines();
+        createAtrousResources();
+    }
 
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -2951,47 +2809,62 @@ void Engine::renderFrame() {
         if (!accumReachedCutoff) {
             bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
             if (useWavefront) {
-            bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-            if (needAccumReset && m_accumImage) {
-                VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-                VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->resetCounters(cmd);
+                }
 
-                VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                clearBarrier.image = m_accumImage->getImage();
-                clearBarrier.subresourceRange = clearRange;
+                bool needAccumReset = accumReset || !m_config.progressive_accumulation;
+                if (needAccumReset && m_accumImage) {
+                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
 
-                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                clearDep.imageMemoryBarrierCount = 1;
-                clearDep.pImageMemoryBarriers = &clearBarrier;
-                vkCmdPipelineBarrier2(cmd, &clearDep);
-            }
+                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.image = m_accumImage->getImage();
+                    clearBarrier.subresourceRange = clearRange;
 
-            WavefrontSceneData wfSceneData{};
-            wfSceneData.numTriangles = m_numTriangles;
-            wfSceneData.numSpheres = m_numSpheres;
-            wfSceneData.numMaterials = m_numMaterials;
-            wfSceneData.numLights = m_numLights;
-            wfSceneData.hasEnvMap = hasEnvMap;
-            wfSceneData.envMapIntensity = envIntensity;
-            wfSceneData.useHardwareRT = useHwRT;
-            wfSceneData.frameIndex = m_frameIndex;
-            wfSceneData.useMorton = 1u;
-            wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
-            wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
-            wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
-            wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
-            wfSceneData.cameraFlags = flags;
+                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    clearDep.imageMemoryBarrierCount = 1;
+                    clearDep.pImageMemoryBarriers = &clearBarrier;
+                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                }
 
-            m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
-                                             activeSpp, activeBounces, wfSceneData);
-        } else {
+                WavefrontSceneData wfSceneData{};
+                wfSceneData.numTriangles = m_numTriangles;
+                wfSceneData.numSpheres = m_numSpheres;
+                wfSceneData.numMaterials = m_numMaterials;
+                wfSceneData.numLights = m_numLights;
+                wfSceneData.hasEnvMap = hasEnvMap;
+                wfSceneData.envMapIntensity = envIntensity;
+                wfSceneData.useHardwareRT = useHwRT;
+                wfSceneData.frameIndex = m_frameIndex;
+                wfSceneData.useMorton = 1u;
+                wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+                wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+                wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+                wfSceneData.cameraFlags = flags;
+                wfSceneData.enableNrc = m_config.enable_nrc;
+                wfSceneData.nrcBounce = m_config.nrc_bounce;
+                wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
+                                                 activeSpp, activeBounces, wfSceneData);
+
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
+                                                  m_sceneData.boundsMin, m_sceneData.boundsMax);
+                    m_nrcManager->recordTraining(cmd, m_frameIndex,
+                                                 m_sceneData.boundsMin, m_sceneData.boundsMax,
+                                                 1e-3f, 1024);
+                }
+            } else {
             // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
@@ -3104,83 +2977,6 @@ void Engine::renderFrame() {
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
-        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
-            VkMemoryBarrier2 rtToTaaBarrier{};
-            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo taaDep{};
-            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaDep.memoryBarrierCount = 1;
-            taaDep.pMemoryBarriers = &rtToTaaBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaDep);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
-
-            struct TaaPushConstants {
-                int32_t imageWidth;
-                int32_t imageHeight;
-                float invImageWidth;
-                float invImageHeight;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-                float blendAlpha;
-                float clippingGamma;
-                uint32_t resetHistory;
-                uint32_t isSampleParallel;
-                uint32_t screenWidth;
-            } taaPC;
-            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
-            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
-            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
-            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
-            taaPC.tileOffsetX = 0;
-            taaPC.tileOffsetY = 0;
-            taaPC.tileSize = m_config.tile_size;
-            if (m_config.progressive_accumulation && m_accumulatedSamples > 1) {
-                taaPC.blendAlpha = 1.0f / static_cast<float>(m_accumulatedSamples);
-            } else {
-                taaPC.blendAlpha = m_config.taa_blend_alpha;
-            }
-            taaPC.clippingGamma = m_config.taa_clipping_gamma;
-            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
-            taaPC.isSampleParallel = 0u;
-            taaPC.screenWidth = m_config.width;
-
-            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { m_config.width, m_config.height, 1 };
-
-            VkMemoryBarrier2 taaToCopyBarrier{};
-            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-
-            VkDependencyInfo taaToCopyDep{};
-            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaToCopyDep.memoryBarrierCount = 1;
-            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
-
-            vkCmdCopyImage(cmd,
-                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                1, &copyRegion);
-
-            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
-        }
         } // end if (!accumReachedCutoff)
 
         VkMemoryBarrier2 memBarrier{};
@@ -3445,96 +3241,6 @@ void Engine::renderFrame() {
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
-        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
-            VkMemoryBarrier2 rtToTaaBarrier{};
-            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-
-            VkDependencyInfo taaDep{};
-            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaDep.memoryBarrierCount = 1;
-            taaDep.pMemoryBarriers = &rtToTaaBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaDep);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
-
-            struct TaaPushConstants {
-                int32_t imageWidth;
-                int32_t imageHeight;
-                float invImageWidth;
-                float invImageHeight;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-                float blendAlpha;
-                float clippingGamma;
-                uint32_t resetHistory;
-                uint32_t isSampleParallel;
-                uint32_t screenWidth;
-            } taaPC;
-            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
-            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
-            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
-            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
-            taaPC.tileOffsetX = tileOffsetX_prim;
-            taaPC.tileOffsetY = tileOffsetY_prim;
-            taaPC.tileSize = m_config.tile_size;
-            if (m_config.progressive_accumulation && m_accumulatedSamples > 1) {
-                taaPC.blendAlpha = 1.0f / static_cast<float>(m_accumulatedSamples);
-            } else {
-                taaPC.blendAlpha = m_config.taa_blend_alpha;
-            }
-            taaPC.clippingGamma = m_config.taa_clipping_gamma;
-            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
-            taaPC.isSampleParallel = (activeMode == MultiGpuMode::SampleParallel) ? 1u : 0u;
-            taaPC.screenWidth = m_config.width;
-
-            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { m_config.width, m_config.height, 1 };
-
-            VkMemoryBarrier2 taaToCopyBarrier{};
-            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-
-            VkDependencyInfo taaToCopyDep{};
-            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaToCopyDep.memoryBarrierCount = 1;
-            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
-
-            vkCmdCopyImage(cmd,
-                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                1, &copyRegion);
-
-            VkMemoryBarrier2 copyToMergeBarrier{};
-            copyToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            copyToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            copyToMergeBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            copyToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            copyToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo copyToMergeDep{};
-            copyToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            copyToMergeDep.memoryBarrierCount = 1;
-            copyToMergeDep.pMemoryBarriers = &copyToMergeBarrier;
-            vkCmdPipelineBarrier2(cmd, &copyToMergeDep);
-
-            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
-        }
         } // end if (!accumReachedCutoff)
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
@@ -4403,8 +4109,37 @@ FrameStats Engine::getStats() const {
             s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
         }
 
+        s.blas_build_time_ms = tally.blasBuildTimeMs;
+        s.blas_size_kb = tally.blasSizeKb;
+        s.blas_triangles = tally.blasTriangles;
+        s.tlas_build_time_ms = tally.tlasBuildTimeMs;
+        s.tlas_size_kb = tally.tlasSizeKb;
+        s.tlas_instances = tally.tlasInstances;
+        s.sec_blas_build_time_ms = tally.secBlasBuildTimeMs;
+        s.sec_blas_size_kb = tally.secBlasSizeKb;
+        s.sec_tlas_build_time_ms = tally.secTlasBuildTimeMs;
+        s.sec_tlas_size_kb = tally.secTlasSizeKb;
+        s.tlas_gpu_updates = tally.tlasGpuUpdateCount;
+
         stats.configurations_breakdown.push_back(std::move(s));
     }
+
+    if (m_asManager) {
+        stats.blas_build_time_ms = m_asManager->getLastBlasBuildTimeMs();
+        stats.blas_size_kb = m_asManager->getBlasSizeKb();
+        stats.blas_triangles = m_asManager->getBlasTriangles();
+        stats.tlas_build_time_ms = m_asManager->getLastTlasBuildTimeMs();
+        stats.tlas_size_kb = m_asManager->getTlasSizeKb();
+        stats.tlas_instances = m_asManager->getTlasInstances();
+    }
+    if (m_mgpu && m_mgpu->getSecondaryAsManager()) {
+        auto* secAs = m_mgpu->getSecondaryAsManager();
+        stats.sec_blas_build_time_ms = secAs->getLastBlasBuildTimeMs();
+        stats.sec_blas_size_kb = secAs->getBlasSizeKb();
+        stats.sec_tlas_build_time_ms = secAs->getLastTlasBuildTimeMs();
+        stats.sec_tlas_size_kb = secAs->getTlasSizeKb();
+    }
+    stats.tlas_gpu_updates = m_tlasGpuUpdateCount;
 
     return stats;
 }
@@ -4488,6 +4223,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    m_motionVectorImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
     // Transition images to GENERAL layout
     vkResetCommandBuffer(m_commandBuffers[0], 0);
     VkCommandBufferBeginInfo beginInfo{};
@@ -4507,6 +4248,13 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    m_motionVectorImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
     vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkSubmitInfo submitInfo{};
@@ -4523,12 +4271,16 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     destroyShadowDenoiserResources();
     createShadowDenoiserResources();
-    destroyTaaResources();
-    createTaaResources();
-    destroyAtrousResources();
-    createAtrousResources();
+    if (m_atrousPipeline) {
+        destroyAtrousResources();
+        createAtrousResources();
+    }
     updateAllImageDescriptors();
     updateMergeDescriptors();
+
+    if (m_nrcManager) {
+        m_nrcManager->resize(m_config.width, m_config.height);
+    }
 
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->resize(m_config.width, m_config.height, m_config.wavefront_tile_size);
@@ -4578,14 +4330,35 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.accum_format = m_config.accum_format;
     key.tile_size = m_config.tile_size;
 
+    auto updateAsMetrics = [this](ConfigStatsTally& t) {
+        if (m_asManager) {
+            t.blasBuildTimeMs = m_asManager->getLastBlasBuildTimeMs();
+            t.blasSizeKb = m_asManager->getBlasSizeKb();
+            t.blasTriangles = m_asManager->getBlasTriangles();
+            t.tlasBuildTimeMs = m_asManager->getLastTlasBuildTimeMs();
+            t.tlasSizeKb = m_asManager->getTlasSizeKb();
+            t.tlasInstances = m_asManager->getTlasInstances();
+        }
+        if (m_mgpu && m_mgpu->getSecondaryAsManager()) {
+            auto* secAs = m_mgpu->getSecondaryAsManager();
+            t.secBlasBuildTimeMs = secAs->getLastBlasBuildTimeMs();
+            t.secBlasSizeKb = secAs->getBlasSizeKb();
+            t.secTlasBuildTimeMs = secAs->getLastTlasBuildTimeMs();
+            t.secTlasSizeKb = secAs->getTlasSizeKb();
+        }
+        t.tlasGpuUpdateCount = m_tlasGpuUpdateCount;
+    };
+
     for (auto& tally : m_configTallies) {
         if (tally.key == key) {
             tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+            updateAsMetrics(tally);
             return;
         }
     }
     ConfigStatsTally newTally(key);
     newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+    updateAsMetrics(newTally);
     m_configTallies.push_back(std::move(newTally));
 }
 
@@ -4607,6 +4380,19 @@ void Engine::printExecutionSummary() const {
         Logger::info("    Frames Sampled:      {}", tally.frameCount);
         Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
         Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
+        Logger::info("    Acceleration Structures:");
+        Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
+                     tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        Logger::info("      - TLAS Build:        {:.3f} ms ({:.2f} KB, {} Instance{})",
+                     tally.tlasBuildTimeMs, tally.tlasSizeKb, tally.tlasInstances, tally.tlasInstances == 1 ? "" : "s");
+        if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.secBlasBuildTimeMs > 0.0) {
+            Logger::info("      - Secondary BLAS:    {:.3f} ms ({:.2f} KB)",
+                         tally.secBlasBuildTimeMs, tally.secBlasSizeKb);
+            Logger::info("      - Secondary TLAS:    {:.3f} ms ({:.2f} KB)",
+                         tally.secTlasBuildTimeMs, tally.secTlasSizeKb);
+        }
+        Logger::info("      - GPU TLAS Updates:  {} update{}",
+                     tally.tlasGpuUpdateCount, tally.tlasGpuUpdateCount == 1 ? "" : "s");
 
         if (tally.key.mgpu_mode != MultiGpuMode::Off) {
             Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms | Tonemap: {:.3f} ms",

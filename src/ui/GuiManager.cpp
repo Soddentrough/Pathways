@@ -1020,6 +1020,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 config.pipeline_type = PipelineType::RTP;
             }
             ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Acceleration Structure Telemetry:");
+            ImGui::BulletText("Primary BLAS: %.3f ms (%.2f KB, %u Triangles)", stats.blas_build_time_ms, stats.blas_size_kb, stats.blas_triangles);
+            ImGui::BulletText("Primary TLAS: %.3f ms (%.2f KB, %u Instance%s)", stats.tlas_build_time_ms, stats.tlas_size_kb, stats.tlas_instances, stats.tlas_instances == 1 ? "" : "s");
+            if (stats.is_mgpu_active && stats.sec_blas_build_time_ms > 0.0) {
+                ImGui::BulletText("Secondary BLAS: %.3f ms (%.2f KB)", stats.sec_blas_build_time_ms, stats.sec_blas_size_kb);
+                ImGui::BulletText("Secondary TLAS: %.3f ms (%.2f KB)", stats.sec_tlas_build_time_ms, stats.sec_tlas_size_kb);
+            }
+            ImGui::BulletText("GPU TLAS Updates: %u", stats.tlas_gpu_updates);
             ImGui::Separator();
         }
 
@@ -1236,6 +1246,38 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::Checkbox("Soft Area Shadows", &config.enable_shadows)) {
                 settingsChanged = true;
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Neural Radiance Caching (Wave32 WMMA):");
+            if (ImGui::Checkbox("Enable Neural Radiance Cache", &config.enable_nrc)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Accelerates multi-bounce indirect GI using on-chip cooperative matrix MLP.");
+            }
+            if (config.enable_nrc) {
+                ImGui::Indent();
+                int nrcBounce = static_cast<int>(config.nrc_bounce);
+                if (ImGui::SliderInt("NRC Cutoff Bounce", &nrcBounce, 1, 4)) {
+                    config.nrc_bounce = static_cast<uint32_t>(nrcBounce);
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Bounce index at which indirect rays query the neural radiance cache.");
+                }
+
+                float trainRatioPct = config.nrc_train_ratio * 100.0f;
+                if (ImGui::SliderFloat("Training Ray Ratio (%)", &trainRatioPct, 1.0f, 10.0f, "%.1f%%")) {
+                    config.nrc_train_ratio = trainRatioPct / 100.0f;
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Percentage of rays that continue tracing to provide real-time training samples.");
+                }
+                ImGui::Unindent();
             }
         }
 

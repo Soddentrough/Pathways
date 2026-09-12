@@ -26,11 +26,15 @@ struct WavefrontSceneData {
     uint32_t numOpaqueTriangles = 0;
     uint32_t secondarySortMode = 0; // 0: None, 1: Directional DGC, 2: Spatial Index
     uint32_t cameraFlags = 0;
+    bool enableNrc = false;
+    uint32_t nrcBounce = 2;
+    float nrcTrainRatio = 0.03f;
 };
 
 class WavefrontPipeline {
 public:
     static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
+    static constexpr uint32_t MAX_WAVEFRONT_TIMESTAMP_QUERIES = 512;
 
     WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                       uint32_t width, uint32_t height,
@@ -60,7 +64,10 @@ public:
                                 VkBuffer lightBuffer, VkDeviceSize lightSize,
                                 VkAccelerationStructureKHR tlas,
                                 VkDescriptorImageInfo envMapInfo,
-                                const std::vector<VkDescriptorImageInfo>& sceneTexInfos);
+                                const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
+                                VkBuffer nrcQueryBuffer = VK_NULL_HANDLE,
+                                VkBuffer nrcTrainBuffer = VK_NULL_HANDLE,
+                                VkBuffer nrcCountersBuffer = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);
@@ -98,8 +105,8 @@ public:
         uint32_t secondarySortMode = 0;
     };
 
-    void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
-    WavefrontProfilingData getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces);
+    void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces = 0);
+    WavefrontProfilingData getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces = 0);
     double getQueueMemoryFootprintMb() const;
 
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
@@ -171,6 +178,7 @@ private:
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };
+    std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
 
     std::unique_ptr<DGCManager> m_dgcManager;
 };

@@ -197,9 +197,33 @@ struct FrameStats {
         double tonemap_time_ms = 0.0;
         double gigarays_per_second = 0.0;
         bool target_achieved = false;
+        double blas_build_time_ms = 0.0;
+        double blas_size_kb = 0.0;
+        uint32_t blas_triangles = 0;
+        double tlas_build_time_ms = 0.0;
+        double tlas_size_kb = 0.0;
+        uint32_t tlas_instances = 0;
+        double sec_blas_build_time_ms = 0.0;
+        double sec_blas_size_kb = 0.0;
+        double sec_tlas_build_time_ms = 0.0;
+        double sec_tlas_size_kb = 0.0;
+        uint32_t tlas_gpu_updates = 0;
         PipelineStagesSummary pipeline_stages;
     };
     std::vector<ConfigTallySummary> configurations_breakdown;
+
+    // Acceleration Structure Telemetry
+    double blas_build_time_ms = 0.0;
+    double blas_size_kb = 0.0;
+    uint32_t blas_triangles = 0;
+    double tlas_build_time_ms = 0.0;
+    double tlas_size_kb = 0.0;
+    uint32_t tlas_instances = 0;
+    double sec_blas_build_time_ms = 0.0;
+    double sec_blas_size_kb = 0.0;
+    double sec_tlas_build_time_ms = 0.0;
+    double sec_tlas_size_kb = 0.0;
+    uint32_t tlas_gpu_updates = 0;
 };
 
 class ImageDumper {

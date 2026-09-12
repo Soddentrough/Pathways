@@ -14,6 +14,7 @@
 #include "rt/DGCManager.hpp"
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
+#include "rt/NRCManager.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
 #include "core/QualityGovernor.hpp"
@@ -53,6 +54,7 @@ public:
     Window* getWindow() const { return m_window.get(); }
     Swapchain* getSwapchain() const { return m_swapchain.get(); }
     QualityGovernor* getGovernor() const { return m_governor.get(); }
+    NRCManager* getNrcManager() const { return m_nrcManager.get(); }
 
 private:
     void initVulkan();
@@ -105,6 +107,7 @@ private:
     std::unique_ptr<Buffer> m_tlasScratchBuffer;
     uint32_t m_tlasInstanceCount = 0;
     bool m_tlasNeedsGpuUpdate = false;
+    uint32_t m_tlasGpuUpdateCount = 0;
 
 
 
@@ -132,6 +135,7 @@ private:
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
+    std::unique_ptr<NRCManager> m_nrcManager;
     WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
 
     // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
@@ -197,22 +201,8 @@ private:
     void updateShadowDenoiserDescriptors();
     double m_lastShadowDenoiserTimeMs = 0.0;
 
-    // Temporal Anti-Aliasing (TAA) Resources & Pipelines
+    // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
     std::unique_ptr<Image> m_motionVectorImage;
-    std::unique_ptr<Image> m_taaHistoryImages[2];
-    VkSampler m_taaHistorySampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_taaDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_taaDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    uint32_t m_taaPingPongIndex = 0;
-    VkPipelineLayout m_taaPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_taaPipeline = VK_NULL_HANDLE;
-
-    void createTaaPipelines();
-    void createTaaResources();
-    void destroyTaaResources();
-    void destroyTaaPipelines();
-    void updateTaaDescriptors();
-    double m_lastTaaTimeMs = 0.0;
 
     // A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
     std::unique_ptr<Image> m_atrousPingPong[2];

@@ -2,6 +2,7 @@
 #include "core/Logger.hpp"
 #include <stdexcept>
 #include <cstring>
+#include <chrono>
 
 namespace pathways {
 
@@ -216,7 +217,15 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     vkCmdPipelineBarrier2(cmd, &depInfo);
 
     vkEndCommandBuffer(cmd);
+    auto tStart = std::chrono::steady_clock::now();
     submitCommandBuffer(cmd);
+    auto tEnd = std::chrono::steady_clock::now();
+    m_lastBlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    m_blasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_blasTriangles = 0;
+    for (const auto& g : geometries) {
+        m_blasTriangles += g.triangleCount;
+    }
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 
     // Query device address
@@ -228,8 +237,8 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
     result->setHandle(blasHandle, blasAddr, std::move(blasBuffer));
 
-    Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x})",
-                 sizeInfo.accelerationStructureSize / 1024.0, blasAddr);
+    Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
+                 m_blasSizeKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
     return result;
 }
 
@@ -357,7 +366,12 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildTLAS(c
     vkCmdPipelineBarrier2(cmd, &depInfo);
 
     vkEndCommandBuffer(cmd);
+    auto tStart = std::chrono::steady_clock::now();
     submitCommandBuffer(cmd);
+    auto tEnd = std::chrono::steady_clock::now();
+    m_lastTlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    m_tlasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_tlasInstances = primitiveCount;
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
@@ -368,8 +382,8 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildTLAS(c
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
     result->setHandle(tlasHandle, tlasAddr, std::move(tlasBuffer));
 
-    Logger::info("Built TLAS successfully (size: {:.2f} KB, address: 0x{:x}, instances: {})",
-                 sizeInfo.accelerationStructureSize / 1024.0, tlasAddr, primitiveCount);
+    Logger::info("Built TLAS successfully (size: {:.2f} KB, address: 0x{:x}, instances: {}, time: {:.3f} ms)",
+                 m_tlasSizeKb, tlasAddr, primitiveCount, m_lastTlasBuildTimeMs);
     return result;
 }
 

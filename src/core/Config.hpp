@@ -88,6 +88,11 @@ struct Config {
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
     uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)
 
+    // Neural Radiance Caching (NRC) with Wave32 WMMA (gfx1201 / Vulkan 1.4)
+    bool enable_nrc = false;              // Neural Radiance Cache indirect query termination [Default: disabled]
+    uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
+    float nrc_train_ratio = 0.03f;        // Ratio of paths (2%-5%, default 0.03 = 3%) continuing tracing to ground truth depth for training
+
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
     enum class MgpuTransferMode {

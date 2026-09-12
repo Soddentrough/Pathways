@@ -1,0 +1,193 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "nrc_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Dual shared memory buffers for ping-ponging 16 queries x 64 features (2 KB each)
+shared float16_t s_layer0[16 * 64];
+shared float16_t s_layer1[16 * 64];
+shared float s_output[16 * 16];
+
+shared vec3 s_throughput[16];
+shared uint s_pixelIndex[16];
+shared bool s_valid[16];
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uAccumImage;
+
+layout(std430, set = 0, binding = 1) readonly buffer InQueryQueue {
+    NRCQuery queries[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer InHashTable {
+    uint packedFeatures[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer InWeights {
+    float16_t weights[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer InCounters {
+    NRCCountersBuffer counters;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint queryCount;
+    uint pad;
+    vec4 worldMin;
+    vec4 invWorldExtent;
+} pc;
+
+void main() {
+    uint queryBase = gl_WorkGroupID.x * 16u;
+    if (queryBase >= counters.queryCount) return;
+
+    uint tid = gl_LocalInvocationIndex;
+
+    // 1. Initialize shared memory feature vector for 16 queries
+    for (uint i = tid; i < 16u * 64u; i += 32u) {
+        s_layer0[i] = float16_t(0.0);
+    }
+    if (tid < 16u) {
+        s_valid[tid] = false;
+    }
+    barrier();
+
+    // 2. Hash Grid Feature Encoding (threads 0..15 handle 1 query each)
+    if (tid < 16u) {
+        uint qIdx = queryBase + tid;
+        uint actualCount = min(pc.queryCount, counters.queryCount);
+        if (qIdx < actualCount) {
+            NRCQuery q = queries[qIdx];
+            s_throughput[tid] = q.throughput.xyz;
+            s_pixelIndex[tid] = floatBitsToUint(q.dir_pixelIndex.w);
+            s_valid[tid] = true;
+
+            vec3 normPos = clamp((q.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+
+            // Multi-frequency spatial encoding (24 features, 0 VRAM memory stalls)
+            for (uint l = 0u; l < NRC_LEVELS; ++l) {
+                float freq = float(1 << l);
+                vec3 p = normPos * freq;
+                vec2 f = vec2(sin(p.x + p.y), cos(p.y + p.z));
+                s_layer0[tid * 64u + l * 2u + 0u] = float16_t(f.x);
+                s_layer0[tid * 64u + l * 2u + 1u] = float16_t(f.y);
+            }
+
+            // Normal (channels 24..26)
+            s_layer0[tid * 64u + 24u] = float16_t(q.normal_flags.x);
+            s_layer0[tid * 64u + 25u] = float16_t(q.normal_flags.y);
+            s_layer0[tid * 64u + 26u] = float16_t(q.normal_flags.z);
+
+            // View Direction (channels 27..29)
+            s_layer0[tid * 64u + 27u] = float16_t(q.dir_pixelIndex.x);
+            s_layer0[tid * 64u + 28u] = float16_t(q.dir_pixelIndex.y);
+            s_layer0[tid * 64u + 29u] = float16_t(q.dir_pixelIndex.z);
+
+            // Roughness (channel 30)
+            s_layer0[tid * 64u + 30u] = float16_t(q.pos_roughness.w);
+
+            // Base Color Albedo (channels 31..33)
+            s_layer0[tid * 64u + 31u] = float16_t(q.albedo_pad.x);
+            s_layer0[tid * 64u + 32u] = float16_t(q.albedo_pad.y);
+            s_layer0[tid * 64u + 33u] = float16_t(q.albedo_pad.z);
+            // Channels 34..63 remain 0.0 padding
+        }
+    }
+    barrier();
+
+    // ==========================================
+    // 3. LAYER 0: 64 -> 64 WMMA
+    // ==========================================
+    for (uint col = 0u; col < 4u; ++col) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
+        c0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+        for (uint k = 0u; k < 4u; ++k) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_layer0, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (col * 16u);
+            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            c0 = coopMatMulAdd(aTile, bTile, c0);
+        }
+
+        // LeakyReLU activation + store directly to s_layer1
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
+        for (int i = 0; i < c0.length(); ++i) {
+            float v = c0[i];
+            v = (v > 0.0) ? v : (0.01 * v);
+            outTile[i] = float16_t(v);
+        }
+        coopMatStore(outTile, s_layer1, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // ==========================================
+    // 4. LAYER 1: 64 -> 64 WMMA
+    // ==========================================
+    for (uint col = 0u; col < 4u; ++col) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
+        c1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+        for (uint k = 0u; k < 4u; ++k) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_layer1, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (col * 16u);
+            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            c1 = coopMatMulAdd(aTile, bTile, c1);
+        }
+
+        // LeakyReLU activation + store directly back to s_layer0
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
+        for (int i = 0; i < c1.length(); ++i) {
+            float v = c1[i];
+            v = (v > 0.0) ? v : (0.01 * v);
+            outTile[i] = float16_t(v);
+        }
+        coopMatStore(outTile, s_layer0, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // ==========================================
+    // 5. LAYER 2: 64 -> 16 WMMA (Output layer)
+    // ==========================================
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2;
+    c2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k = 0u; k < 4u; ++k) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+        coopMatLoad(aTile, s_layer0, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+        uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
+        coopMatLoad(bTile, weights, wOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+        c2 = coopMatMulAdd(aTile, bTile, c2);
+    }
+
+    // Store linear output to s_output
+    coopMatStore(c2, s_output, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // 6. Write final predicted radiance directly to uAccumImage
+    if (tid < 16u && s_valid[tid]) {
+        vec3 predRadiance = max(vec3(0.0), vec3(s_output[tid * 16u + 0u], s_output[tid * 16u + 1u], s_output[tid * 16u + 2u]));
+        vec3 radiance = s_throughput[tid] * predRadiance;
+
+        uint pixelIdx = s_pixelIndex[tid];
+        ivec2 pixelCoord = ivec2(int(pixelIdx % pc.width), int(pixelIdx / pc.width));
+
+        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+        imageStore(uAccumImage, pixelCoord, prev + vec4(radiance, 0.0));
+    }
+}

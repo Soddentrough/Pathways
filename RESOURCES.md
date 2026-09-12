@@ -25,6 +25,11 @@ https://graphics.stanford.edu/~boulos/papers/reorder_rt08.pdf
 https://dl.acm.org/doi/10.1145/3799818.3812105
 https://gpuopen.com/learn/why-multi-resolution-geometric-representation-bvh-ray-tracing/
 
+# Denoising - spatiotemporal filtering techniques that accumulate samples across frames using motion vectors
+https://arxiv.org/pdf/2106.08034
+https://github.com/gtong-nv/BMFR-DXR-Denoiser
+https://gpuopen.com/learn/neural_supersampling_and_denoising_for_real-time_path_tracing/
+
 # Other
 https://gpuopen.com/learn/publications/
 https://dl.acm.org/doi/10.1145/1618452.1618512

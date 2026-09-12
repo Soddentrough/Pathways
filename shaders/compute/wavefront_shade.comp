@@ -108,6 +108,18 @@ layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
     uint secondaryIndices[];
 };
 
+layout(std430, binding = 20) writeonly buffer OutNRCQueryQueue {
+    NRCQuery nrcQueries[];
+};
+
+layout(std430, binding = 21) buffer InOutNRCTrainQueue {
+    NRCTrainingRecord nrcTrainRecords[];
+};
+
+layout(std430, binding = 22) buffer InOutNRCCounters {
+    NRCCountersBuffer nrcCounters;
+};
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -123,6 +135,10 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint useHardwareRT;
     uint secondarySortMode;
+    uint enableNrc;
+    uint nrcBounce;
+    float nrcTrainRatio;
+    uint frameIndex;
 } pc;
 
 void main() {
@@ -319,6 +335,7 @@ void main() {
                     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
                     // 2. Direct Lighting (Stochastic NEE with MIS)
+                    vec3 secDirectL = vec3(0.0);
                     if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
                         uint lightIdx = 0u;
                         float lightSelectPdf = 1.0;
@@ -407,7 +424,7 @@ void main() {
                                 misWeightLight = lightPdfTotal / (lightPdfTotal + bsdfPdf);
                             }
 
-                            vec3 secDirectL = (lightEmission * brdf * NdotL * misWeightLight) / (max(lightPdf, 1e-4) * lightSelectPdf);
+                            secDirectL = (lightEmission * brdf * NdotL * misWeightLight) / (max(lightPdf, 1e-4) * lightSelectPdf);
                             vec3 unshadowed = throughput * secDirectL;
 
                             if (any(greaterThan(unshadowed, vec3(1e-5)))) {
@@ -425,6 +442,29 @@ void main() {
                     // 3. Sample BSDF for Secondary Bounce
                     if (bounce + 1u >= pc.maxBounces || (!enableIndirect && bounce > 0u)) {
                         pathTerminated = true;
+                    } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce) {
+                        bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
+                        if (isTrain) {
+                            uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
+                            if (trainIdx < pc.maxQueueCapacity) {
+                                nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
+                                nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
+                                nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                                nrcTrainRecords[trainIdx].albedo_pad = vec4(baseColor.rgb, 0.0);
+                                nrcTrainRecords[trainIdx].throughput = vec4(throughput, 0.0);
+                                nrcTrainRecords[trainIdx].targetRadiance = vec4(secDirectL, 0.0);
+                            }
+                        } else {
+                            uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
+                            if (qIdx < pc.maxQueueCapacity) {
+                                nrcQueries[qIdx].pos_roughness = vec4(hitPoint, roughness);
+                                nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
+                                nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                                nrcQueries[qIdx].albedo_pad = vec4(baseColor.rgb, 0.0);
+                                nrcQueries[qIdx].throughput = vec4(throughput, 0.0);
+                            }
+                            pathTerminated = true;
+                        }
                     }
 
                     vec3 nextDirection;

@@ -85,9 +85,24 @@ public:
                          AccelerationStructure* dstTlas,
                          bool updateMode = false);
 
+    // Telemetry stats
+    double getLastBlasBuildTimeMs() const { return m_lastBlasBuildTimeMs; }
+    double getBlasSizeKb() const { return m_blasSizeKb; }
+    uint32_t getBlasTriangles() const { return m_blasTriangles; }
+    double getLastTlasBuildTimeMs() const { return m_lastTlasBuildTimeMs; }
+    double getTlasSizeKb() const { return m_tlasSizeKb; }
+    uint32_t getTlasInstances() const { return m_tlasInstances; }
+
 private:
     void loadFunctionPointers();
     void submitCommandBuffer(VkCommandBuffer cmd);
+
+    double m_lastBlasBuildTimeMs = 0.0;
+    double m_blasSizeKb = 0.0;
+    uint32_t m_blasTriangles = 0;
+    double m_lastTlasBuildTimeMs = 0.0;
+    double m_tlasSizeKb = 0.0;
+    uint32_t m_tlasInstances = 0;
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;

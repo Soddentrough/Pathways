@@ -134,8 +134,10 @@ void Config::printUsage(const char* progName) {
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --accum-cutoff <int>    Maximum static accumulation frames (default: 2048, 0 = unlimited)\n"
-              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n\n"
+              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
+              << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
+              << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
+              << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor to track target FPS\n"
@@ -320,6 +322,16 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 5));
         } else if (arg.starts_with("--atrous-passes=")) {
             cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(arg.substr(arg.find('=') + 1)), 1, 5));
+        } else if (arg == "--nrc") {
+            cfg.enable_nrc = true;
+        } else if (arg == "--nrc-bounce" && i + 1 < argc) {
+            cfg.nrc_bounce = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--nrc-bounce=")) {
+            cfg.nrc_bounce = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--nrc-train-ratio" && i + 1 < argc) {
+            cfg.nrc_train_ratio = std::stof(argv[++i]);
+        } else if (arg.starts_with("--nrc-train-ratio=")) {
+            cfg.nrc_train_ratio = std::stof(arg.substr(arg.find('=') + 1));
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {

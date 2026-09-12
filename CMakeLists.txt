@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.17.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.18.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -127,7 +127,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/accum_merge.comp
     ${SHADER_DIR}/compute/ffx_shadow_tileclassify.comp
     ${SHADER_DIR}/compute/ffx_shadow_filter.comp
-    ${SHADER_DIR}/compute/taa_resolve.comp
     ${SHADER_DIR}/compute/atrous_denoise.comp
     ${SHADER_DIR}/compute/wavefront_classify.comp
     ${SHADER_DIR}/compute/wavefront_intersect.comp
@@ -141,6 +140,8 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shadow.comp
     ${SHADER_DIR}/compute/wavefront_raysort.comp
     ${SHADER_DIR}/compute/update_tlas_instances.comp
+    ${SHADER_DIR}/compute/nrc_encode_infer.comp
+    ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -157,7 +158,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl
+            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})
@@ -368,6 +369,17 @@ target_include_directories(test_tlas_gpu_refit PRIVATE
 )
 target_link_libraries(test_tlas_gpu_refit PRIVATE Vulkan::Vulkan)
 add_test(NAME TlasGpuRefit COMMAND test_tlas_gpu_refit)
+
+# Tier 4 Neural Radiance Caching (NRC) Wave32 WMMA Unit Test Target
+add_executable(test_nrc_wmma
+    tests/test_nrc_wmma.cpp
+)
+target_include_directories(test_nrc_wmma PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_nrc_wmma PRIVATE Vulkan::Vulkan)
+add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 
 
 

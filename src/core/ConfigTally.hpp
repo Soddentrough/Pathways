@@ -106,6 +106,19 @@ struct ConfigStatsTally {
     double sumSecondaryRtMs = 0.0;
     double sumTonemapMs = 0.0;
 
+    // Acceleration structures
+    double blasBuildTimeMs = 0.0;
+    double blasSizeKb = 0.0;
+    uint32_t blasTriangles = 0;
+    double tlasBuildTimeMs = 0.0;
+    double tlasSizeKb = 0.0;
+    uint32_t tlasInstances = 0;
+    double secBlasBuildTimeMs = 0.0;
+    double secBlasSizeKb = 0.0;
+    double secTlasBuildTimeMs = 0.0;
+    double secTlasSizeKb = 0.0;
+    uint32_t tlasGpuUpdateCount = 0;
+
     // Detailed pipeline stages
     bool hasWavefrontStages = false;
     uint32_t wavefrontSampleCount = 0;

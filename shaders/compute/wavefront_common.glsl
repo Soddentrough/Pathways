@@ -7,6 +7,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
 
+#include "nrc_common.glsl"
+
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
 #define INV_PI 0.31830988618379067154
