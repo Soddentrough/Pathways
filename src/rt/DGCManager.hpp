@@ -46,7 +46,7 @@ public:
     void initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines);
     void recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
-                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 4);
+                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 6);
 
 private:
     void loadFunctionPointers();

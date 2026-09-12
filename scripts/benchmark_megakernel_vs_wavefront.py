@@ -54,10 +54,10 @@ DEFAULT_SCENES = {
         "desc": "Complex specular/transmission reflection and refraction",
         "camera": None
     },
-    "pbr_showcase": {
-        "name": "PBR Material Showcase",
-        "path": "scenes/pbr_showcase.gltf",
-        "desc": "Synthetic multi-lobe BSDF stress test",
+    "helmet": {
+        "name": "Damaged Helmet",
+        "path": "scenes/DamagedHelmet.glb",
+        "desc": "Canonical metallic-roughness PBR model with normal, AO & emissive maps",
         "camera": None
     }
 }
@@ -489,7 +489,7 @@ def main():
         print("  - Aspect 3: Path Depth & Stream Compaction (Classroom @ 1, 2, 4, 8 bounces)")
 
         # Aspect 1: Scene Diversity
-        for s in ["cornell", "dragon", "living_room", "classroom", "coffee_maker", "pbr_showcase"]:
+        for s in ["cornell", "dragon", "living_room", "classroom", "coffee_maker", "helmet"]:
             comp = run_one(s, 1920, 1080, 4)
             if comp:
                 all_comparisons.append(comp)

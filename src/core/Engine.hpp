@@ -92,6 +92,8 @@ private:
     std::unique_ptr<Buffer> m_lightBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
+    std::unique_ptr<Buffer> m_trainingTensorBuffer;
+    std::unique_ptr<Buffer> m_trainingStagingBuffer;
 
     // ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
     std::array<std::unique_ptr<Buffer>, 2> m_restirReservoirs;
@@ -108,7 +110,7 @@ private:
 
 
     // Textures & Environment Map (Bindings 7 & 8)
-    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
     std::unique_ptr<Texture> m_dummyWhite;
     std::unique_ptr<Texture> m_dummyNormal;
     std::unique_ptr<Texture> m_blueNoiseTexture;
@@ -236,11 +238,13 @@ private:
     // Scene metadata
     SceneData m_sceneData;
     uint32_t m_numTriangles = 0;
+    uint32_t m_numOpaqueTriangles = 0;
     uint32_t m_numSpheres = 0;
     uint32_t m_numMaterials = 0;
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
     void updateSceneTransparencyFlag();
+    void partitionSceneGeometry();
 
     // Frame tracking & Quality Governor
     std::unique_ptr<QualityGovernor> m_governor;
@@ -261,6 +265,9 @@ private:
     // Per-configuration tallied statistics
     std::vector<ConfigStatsTally> m_configTallies;
     void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs);
+
+    // Training Data Capture (Neural Denoiser / Continuous Upscaler)
+    void runTrainingCapture();
 
     // Hardware Sensors & Telemetry (Infrequent background sampler)
     void startHwMonThread();

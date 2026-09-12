@@ -8,7 +8,7 @@
 namespace pathways {
 
 DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet)
-    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout) {
+    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout), m_materialDGCSupported(supportsExecutionSet) {
 
     loadFunctionPointers();
     if (getenv("PATHWAYS_DISABLE_DGC")) {
@@ -81,6 +81,9 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         }
     } else {
         m_materialDGCSupported = false;
+        if (!supportsExecutionSet && m_supported) {
+            Logger::info("DGC Execution Sets disabled. Using multi-dispatch indirect fallback.");
+        }
     }
 }
 

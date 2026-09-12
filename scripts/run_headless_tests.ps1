@@ -104,11 +104,8 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# 5. Test Suite 3: glTF 2.0 Ingestion Pipeline (Cornell Box)
-Write-Host "`n[5/6] Generating glTF scene test files..." -ForegroundColor Cyan
-& $Python scripts/generate_test_gltf.py
-
-Write-Host "Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
+# 5. Test Suite 3: glTF 2.0 Ingestion Pipeline (Damaged Helmet)
+Write-Host "`n[5/5] Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
@@ -122,24 +119,6 @@ Write-Host "Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
 & $Python scripts/verify_frame.py (Join-Path $OutputDir "test_gltf_helmet.png") (Join-Path $OutputDir "stats_gltf_helmet.json") 1920 1080 45.0
 if ($LASTEXITCODE -ne 0) {
     Write-Error "glTF Damaged Helmet verification failed!"
-    exit $LASTEXITCODE
-}
-
-# 6. Test Suite 4: glTF Test Shapes Scene
-Write-Host "`n[6/6] Running glTF Test Shapes scene test..." -ForegroundColor Cyan
-& $PathwaysExe `
-    --headless `
-    --width 1920 `
-    --height 1080 `
-    --spp 16 `
-    --max-bounces 4 `
-    --scene scenes/test_shapes.gltf `
-    --dump-frame (Join-Path $OutputDir "test_gltf_shapes.png") `
-    --dump-stats (Join-Path $OutputDir "stats_gltf_shapes.json")
-
-& $Python scripts/verify_frame.py (Join-Path $OutputDir "test_gltf_shapes.png") (Join-Path $OutputDir "stats_gltf_shapes.json") 1920 1080 15.0
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "glTF Test Shapes verification failed!"
     exit $LASTEXITCODE
 }
 

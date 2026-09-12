@@ -5,14 +5,17 @@
 #define TWO_PI 6.28318530717958647692
 
 struct HitPayload {
-    vec3 radiance;               // 12 bytes: direct emissive + accumulated direct light
-    uint packedThroughputRG;     //  4 bytes: packHalf2x16(throughputMod.rg)
-    vec3 nextOrigin;             // 12 bytes: next ray origin
-    uint packedThroughputB_Flags;//  4 bytes: packHalf2x16(vec2(b, 0.0)) & 0xFFFF | (flags << 16)
-    uint packedNextDir;          //  4 bytes: octahedral 32-bit (oct32) unit direction
-    float lastBsdfPdf;           //  4 bytes: BSDF PDF for next bounce MIS evaluation
-    uint seed;                   //  4 bytes: PCG RNG state
-    uint pad;                    //  4 bytes: 48-byte cache-line alignment
+    vec3 diffuseRadiance;         // 12 bytes: direct diffuse
+    uint packedThroughputRG;      //  4 bytes: packHalf2x16(throughputMod.rg)
+    vec3 specularRadiance;        // 12 bytes: direct specular + emissive
+    uint packedThroughputB_Flags; //  4 bytes: lower 16 bits = half(b), upper 16 bits = flags
+    vec3 nextOrigin;              // 12 bytes: next ray origin
+    uint packedNextDir;           //  4 bytes: octahedral 32-bit (oct32) unit direction
+    float lastBsdfPdf;            //  4 bytes: BSDF PDF for next bounce MIS evaluation
+    uint seed;                    //  4 bytes: PCG RNG state
+    uint pad;                     //  4 bytes: 48-byte cache-line alignment
+    uint packedAlbedoRG;          //  4 bytes: packHalf2x16(baseColor.rg)
+    uint packedAlbedoB_Roughness; //  4 bytes: packHalf2x16(vec2(baseColor.b, roughness))
 };
 
 layout(location = 0) rayPayloadInEXT HitPayload prd;
@@ -41,13 +44,17 @@ vec2 directionToEquirectangular(vec3 dir) {
 }
 
 void main() {
+    prd.diffuseRadiance = vec3(0.0);
     prd.packedThroughputB_Flags = 0u; // hit = false
+    prd.packedThroughputRG = 0u;
+    prd.packedAlbedoRG = 0u;
+    prd.packedAlbedoB_Roughness = 0u;
     vec3 unitDir = normalize(gl_WorldRayDirectionEXT);
     if (pc.hasEnvMap == 1u) {
         vec2 envUv = directionToEquirectangular(unitDir);
-        prd.radiance = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+        prd.specularRadiance = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
     } else {
         float t = 0.5 * (unitDir.y + 1.0);
-        prd.radiance = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+        prd.specularRadiance = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
     }
 }

@@ -54,6 +54,7 @@ struct SceneData {
     std::vector<LightGPU> lights;
     std::vector<TextureData> textures;
     std::vector<MeshRange> meshRanges;
+    uint32_t numOpaqueTriangles = 0;
 
     bool hasCamera = false;
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);

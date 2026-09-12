@@ -135,14 +135,19 @@ void Config::printUsage(const char* progName) {
               << "  --dump-frame <path.png> Save tonemapped LDR frame to PNG\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
+              << "  --capture-training-data <dir> Output directory for high-speed raw binary training tensors\n"
+              << "  --capture-frames <int>        Number of training sequence frames to capture (default: 60)\n"
+              << "  --capture-reference-spp <int> Sample count for stationary ground truth reference (default: 512)\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
+              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR), 'staging'\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
               << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
-              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'none' [default], 'archetype' (A & B), 'bda' (C), or 'dual' (D)\n"
+              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
               << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
               << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
@@ -228,6 +233,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.warmup_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--render-scale" && i + 1 < argc) {
             cfg.render_scale = std::stof(argv[++i]);
+        } else if (arg == "--exposure" && i + 1 < argc) {
+            cfg.exposure = std::stof(argv[++i]);
         } else if (arg == "--scene" && i + 1 < argc) {
             cfg.scene_path = argv[++i];
         } else if (arg == "--hdri" && i + 1 < argc) {
@@ -240,6 +247,20 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_hdr_path = argv[++i];
         } else if (arg == "--dump-stats" && i + 1 < argc) {
             cfg.dump_stats_path = argv[++i];
+        } else if (arg == "--capture-training-data" && i + 1 < argc) {
+            cfg.capture_training_data = true;
+            cfg.training_data_dir = argv[++i];
+        } else if (arg.starts_with("--capture-training-data=")) {
+            cfg.capture_training_data = true;
+            cfg.training_data_dir = arg.substr(arg.find('=') + 1);
+        } else if (arg == "--capture-frames" && i + 1 < argc) {
+            cfg.training_capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--capture-frames=")) {
+            cfg.training_capture_frames = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--capture-reference-spp" && i + 1 < argc) {
+            cfg.training_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--capture-reference-spp=")) {
+            cfg.training_reference_spp = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {
@@ -255,6 +276,15 @@ Config Config::parse(int argc, char* argv[]) {
             else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
+        } else if (arg == "--mgpu-transfer" && i + 1 < argc) {
+            std::string tmode = argv[++i];
+            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
+            } else if (tmode == "staging" || tmode == "cpu") {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Staging;
+            } else {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
+            }
         } else if (arg == "--shadow-denoiser" || arg == "--denoise-shadows") {
             Logger::info("FidelityFX Shadow Denoiser option is deprecated and has been removed from the active pipeline.");
         } else if (arg == "--taa" || arg == "--no-taa") {
@@ -295,6 +325,16 @@ Config Config::parse(int argc, char* argv[]) {
             else if (s == "bda" || s == "c") cfg.wavefront_sort_mode = WavefrontSortMode::BDA;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
+        } else if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
+            std::string s = argv[++i];
+            if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+            else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
+            else cfg.secondary_sort_mode = SecondarySortMode::None;
+        } else if (arg.starts_with("--sec-sort=") || arg.starts_with("--secondary-sort=") || arg.starts_with("-ss=")) {
+            std::string s = arg.substr(arg.find('=') + 1);
+            if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+            else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
+            else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {

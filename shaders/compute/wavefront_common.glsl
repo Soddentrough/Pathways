@@ -98,10 +98,14 @@ vec3 unpackOct32(uint p) {
     return octDecode(unpackSnorm2x16(p));
 }
 
-// 32-byte cache-line aligned ray geometry (read by intersect & shade)
+// Classify 3D ray direction into 8 octants based on sign
+uint getDirectionalOctant(vec3 dir) {
+    return (dir.x >= 0.0 ? 1u : 0u) | (dir.y >= 0.0 ? 2u : 0u) | (dir.z >= 0.0 ? 4u : 0u);
+}
+
+// 16-byte packed ray geometry (read by intersect & shade)
 struct RayGeometry {
-    vec4 originAndTMin; // xyz: origin, w: tMin (16 bytes)
-    vec4 dirAndTMax;    // xyz: direction, w: tMax (16 bytes)
+    vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
 // 16-byte cache-line aligned ray hit (written by intersect/classify, read by shade)
@@ -123,27 +127,40 @@ struct RayState {
 #define MATERIAL_ARCHETYPE_DIELECTRIC 1u
 #define MATERIAL_ARCHETYPE_CONDUCTOR  2u
 #define MATERIAL_ARCHETYPE_COMPLEX    3u
-#define NUM_MATERIAL_ARCHETYPES       4u
+#define MATERIAL_ARCHETYPE_EMISSIVE   4u
+#define MATERIAL_ARCHETYPE_ALPHAMASK  5u
+#define NUM_MATERIAL_ARCHETYPES       6u
 
 uint getMaterialArchetype(Material mat) {
-    if (mat.clearcoat > 0.001 || mat.alphaMode != 0u || mat.type == 3u /* emissive */ ||
-        mat.emissiveTex > 0u || length(mat.emissive.rgb) > 0.001) {
+    // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures
+    if (mat.alphaMode == 1u /* ALPHA_MODE_MASK */ && mat.albedoTex > 0u) {
+        return MATERIAL_ARCHETYPE_ALPHAMASK;
+    }
+    // 2. Pure emissive mesh lights: pure emitters without scattering BSDF
+    if (mat.type == 3u /* MATERIAL_EMISSIVE */ ||
+        (length(mat.emissive.rgb) > 0.1 && mat.albedoTex == 0u && length(mat.albedo.rgb) < 0.05 && mat.metallic < 0.01 && mat.transmission < 0.01)) {
+        return MATERIAL_ARCHETYPE_EMISSIVE;
+    }
+    // 3. Multi-layer complex PBR (Clearcoat on top of substrate)
+    if (mat.clearcoat > 0.001 || mat.clearcoatTex > 0u) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
-    if (mat.transmission > 0.0 || mat.type == 2u /* dielectric */) {
+    // 4. Pure dielectric transmission / refraction / glass
+    if (mat.transmission > 0.001 || mat.type == 2u /* MATERIAL_DIELECTRIC */) {
         return MATERIAL_ARCHETYPE_DIELECTRIC;
     }
-    if (mat.type == 1u /* metallic */ || mat.metallic > 0.5) {
+    // 5. Metallic conductors (GGX microfacet specular reflection)
+    if (mat.type == 1u /* MATERIAL_METALLIC */ || mat.metallic > 0.5) {
         return MATERIAL_ARCHETYPE_CONDUCTOR;
     }
+    // 6. Dielectric diffuse base + GGX specular dual-lobe PBR (plastics, wood, stone, cloth)
     return MATERIAL_ARCHETYPE_DIFFUSE;
 }
 
-// 48-byte clean aligned packed shadow ray (zero padding)
+// 32-byte clean aligned packed shadow ray
 struct PackedShadowRay {
-    vec4 originDist;        // xyz: origin, w: lightDist (16 bytes)
-    vec4 dirPixel;          // xyz: direction, w: uintBitsToFloat(pixelIndex) (16 bytes)
-    vec4 unshadowedRadiance;// rgb: unshadowed radiance, w: uintBitsToFloat(bounce) (16 bytes)
+    vec4 originDist;   // xyz: origin, w: lightDist (16 bytes)
+    uvec4 dirPixelRad; // x: packOct32(direction), y: pixelIndex, z: packHalf2x16(radiance.rg), w: packHalf2x16(vec2(radiance.b, 0.0)) (16 bytes)
 };
 
 // Legacy 96-byte ray payload preserved for compatibility
@@ -187,8 +204,10 @@ struct BounceMaterialDispatch {
     DispatchCommand shadeDielectric;   // Offset 16
     DispatchCommand shadeConductor;    // Offset 32
     DispatchCommand shadeComplex;      // Offset 48
-    DispatchCommand shadowDispatch;    // Offset 64
-    DispatchCommand intersectDispatch; // Offset 80
+    DispatchCommand shadeEmissive;     // Offset 64
+    DispatchCommand shadeAlphamask;    // Offset 80
+    DispatchCommand shadowDispatch;    // Offset 96
+    DispatchCommand intersectDispatch; // Offset 112
 };
 
 struct BounceMaterialDGC {
@@ -196,8 +215,10 @@ struct BounceMaterialDGC {
     DGCCommand shadeDielectric;   // Offset 16
     DGCCommand shadeConductor;    // Offset 32
     DGCCommand shadeComplex;      // Offset 48
-    DGCCommand shadowCmd;         // Offset 64
-    DGCCommand intersectCmd;      // Offset 80
+    DGCCommand shadeEmissive;     // Offset 64
+    DGCCommand shadeAlphamask;    // Offset 80
+    DGCCommand shadowCmd;         // Offset 96
+    DGCCommand intersectCmd;      // Offset 112
 };
 
 struct VkDispatchIndirectCommand {

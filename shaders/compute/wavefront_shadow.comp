@@ -33,7 +33,7 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
 };
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 8) uniform sampler2D sceneTextures[64];
+layout(binding = 8) uniform sampler2D sceneTextures[512];
 
 layout(std430, binding = 12) readonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
@@ -46,8 +46,25 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint pad1;
-    uint pad2;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint emissiveCount;
+    uint alphamaskCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint nextEmissiveCount;
+    uint nextAlphamaskCount;
+    uint currentMaterialCounts[6];
+    uint totalShadeWorkgroups;
+    uint octantCounts[8];
+    uint currentOctantCounts[8];
+    uint totalIntersectWorkgroups;
+    uint secondaryRayCount;
+    uint pad[21];
 } queueCounters;
 
 layout(push_constant) uniform PushConstants {
@@ -59,6 +76,7 @@ layout(push_constant) uniform PushConstants {
     uint height;
     uint frameIndex;
     uint sppSampleIndex;
+    uint numOpaqueTriangles;
 } pc;
 
 void main() {
@@ -68,9 +86,11 @@ void main() {
     PackedShadowRay sRay = shadowRays[idx];
     vec3 origin = sRay.originDist.xyz;
     float maxDist = sRay.originDist.w;
-    vec3 dir = sRay.dirPixel.xyz;
-    uint pixelIndex = floatBitsToUint(sRay.dirPixel.w);
-    vec3 radiance = sRay.unshadowedRadiance.rgb;
+    vec3 dir = unpackOct32(sRay.dirPixelRad.x);
+    uint pixelIndex = sRay.dirPixelRad.y;
+    vec2 radRG = unpackHalf2x16(sRay.dirPixelRad.z);
+    vec2 radB_pad = unpackHalf2x16(sRay.dirPixelRad.w);
+    vec3 radiance = vec3(radRG, radB_pad.x);
 
     if (length(radiance) <= 1e-5) return;
 
@@ -91,7 +111,9 @@ void main() {
                               0xFF, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         while (rayQueryProceedEXT(rq)) {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
+                uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
                 uint matId = triangles[triIdx].materialId;
                 Material mat = materials[matId];
                 if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
@@ -105,7 +127,7 @@ void main() {
                                cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
                                cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
                     float calpha = mat.albedo.a;
-                    if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+                    if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                         calpha *= texture(sceneTextures[mat.albedoTex - 1u], cuv).a;
                     }
                     float cutoff = (mat.alphaMode == 1u) ? mat.alphaCutoff : 0.5;
@@ -118,7 +140,9 @@ void main() {
             }
         }
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-            uint triIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             Material m = materials[triangles[triIdx].materialId];
             if (m.type != 3u && m.type != 2u && m.transmission <= 0.05) {
                 occluded = true;

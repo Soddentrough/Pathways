@@ -128,6 +128,10 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     manyLights.fileSizeBytes = 0;
     entries.push_back(manyLights);
 
+    if (scenesDir.empty()) {
+        return entries;
+    }
+
     if (!fs::exists(scenesDir) || !fs::is_directory(scenesDir)) {
         Logger::warn("SceneRegistry: Directory '{}' does not exist.", scenesDir);
         return entries;

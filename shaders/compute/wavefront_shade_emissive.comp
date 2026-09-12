@@ -129,15 +129,11 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint activeCount = queueCounters.currentMaterialCounts[1]; // Dielectric queue
+    uint activeCount = queueCounters.currentMaterialCounts[4]; // Emissive queue
     bool inRange = (idx < activeCount);
-    bool survivesToNext = false;
-    vec3 nextDirection = vec3(0.0);
-    RayGeometry nextGeom;
-    RayState nextState;
 
     if (inRange) {
-        uint rayIdx = materialIndices[1u * pc.maxQueueCapacity + idx];
+        uint rayIdx = materialIndices[4u * pc.maxQueueCapacity + idx];
         RayGeometry geom = inGeoms[rayIdx];
         RayHit hit = inHits[rayIdx];
         RayState state = inStates[rayIdx];
@@ -150,13 +146,11 @@ void main() {
         uint hitType = floatBitsToUint(hit.hitData.w);
 
         vec3 throughput = state.throughputSeed.rgb;
-        uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
         uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
-        uint bounce = pc.currentBounce;
 
         if (hitType == 2u) {
-            // Environment sky miss
+            // Sky miss fallback
             vec3 skyColor;
             if (pc.hasEnvMap == 1u) {
                 vec2 envUv = directionToEquirectangular(rayDir);
@@ -166,167 +160,36 @@ void main() {
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
             accumRadiance += throughput * skyColor;
-            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
         } else {
-            vec3 hitPoint = origin + hitT * rayDir;
-            vec3 hitNormal = vec3(0.0, 1.0, 0.0);
             vec2 hitUv = vec2(0.0);
             uint matId = 0u;
-            bool frontFace = true;
 
             if (hitType == 0u) {
                 float u = hitBary.x;
                 float v = hitBary.y;
                 float w = 1.0 - u - v;
 
-                vec3 n0 = triangles[primId].v0.normal.xyz;
-                vec3 n1 = triangles[primId].v1.normal.xyz;
-                vec3 n2 = triangles[primId].v2.normal.xyz;
-                hitNormal = normalize(w * n0 + u * n1 + v * n2);
-
                 vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
                 vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
                 vec2 uv2 = vec2(triangles[primId].v2.position.w, triangles[primId].v2.normal.w);
                 hitUv = w * uv0 + u * uv1 + v * uv2;
                 matId = triangles[primId].materialId;
-
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
             } else if (hitType == 1u) {
                 Sphere sp = spheres[primId];
-                hitNormal = (hitPoint - sp.centerRadius.xyz) / sp.centerRadius.w;
                 matId = sp.materialId;
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
             }
 
             Material mat = materials[matId];
-            vec4 baseColor = mat.albedo;
-            if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
-            }
-
             vec3 emissive = mat.emissive.rgb;
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
-            if (length(emissive) > 1e-3) {
-                accumRadiance += throughput * emissive;
-            }
-
-            bool pathTerminated = false;
-            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
-                pathTerminated = true;
-            }
-
-            if (!pathTerminated) {
-                float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
-                float eta = frontFace ? (1.0 / iorVal) : iorVal;
-                vec3 V = -rayDir;
-                float cosTheta = min(dot(V, hitNormal), 1.0);
-                float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-
-                bool cannotRefract = eta * sinTheta > 1.0;
-                float reflectProb = fresnelSchlick(cosTheta, eta);
-
-                vec3 nextDirection;
-                vec3 nextOrigin;
-
-                if (cannotRefract || randFloat(seed) < reflectProb) {
-                    // Specular reflection
-                    nextDirection = reflect(rayDir, hitNormal);
-                    nextOrigin = hitPoint + hitNormal * EPSILON;
-                } else {
-                    // Snell's law refraction
-                    nextDirection = normalize(refract(rayDir, hitNormal, eta));
-                    nextOrigin = hitPoint - hitNormal * EPSILON;
-                }
-                throughput *= baseColor.rgb;
-
-                // Volumetric Beer-Lambert absorption (physical ray traversal distance)
-                float mediumDist = !frontFace ? hitT : 0.0;
-                if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
-                    vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
-                    throughput *= exp(-sigma_a * mediumDist);
-                }
-
-                if (bounce + 1u >= pc.maxBounces) {
-                    pathTerminated = true;
-                } else {
-                    float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                    if (lum < 0.001) {
-                        pathTerminated = true;
-                    } else if (bounce >= 1u) {
-                        float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float p = clamp(lum, minP, 0.95);
-                        if (randFloat(seed) > p) {
-                            pathTerminated = true;
-                        } else {
-                            throughput /= p;
-                        }
-                    }
-
-                    if (!pathTerminated) {
-                        survivesToNext = true;
-                        nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
-                    }
-                }
-            }
-
-            if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
-                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
-            }
+            accumRadiance += throughput * emissive;
         }
-    }
 
-    // Subgroup Wave Ballot Compaction into downstream surviving secondary ray queue
-    uvec4 ballot = subgroupBallot(survivesToNext);
-    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-    uint waveActiveCount = subgroupBallotBitCount(ballot);
-
-    uint waveGlobalOffset = 0u;
-    if (subgroupElect()) {
-        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
-    }
-    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
-
-    uint targetIdx = 0u;
-    if (survivesToNext) {
-        targetIdx = waveGlobalOffset + laneSlot;
-        if (targetIdx < pc.maxQueueCapacity) {
-            outGeoms[targetIdx] = nextGeom;
-            outStates[targetIdx] = nextState;
-        }
-    }
-
-    // Option 1: On-Chip Directional Multi-Queue Binning via Subgroup Ballots
-    if (pc.secondarySortMode == 1u) {
-        uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
-        for (uint k = 0u; k < 8u; ++k) {
-            bool isOct = survivesToNext && (oct == k);
-            uvec4 octBallot = subgroupBallot(isOct);
-            uint octCount = subgroupBallotBitCount(octBallot);
-            if (octCount > 0u) {
-                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-                uint octBase = 0u;
-                if (subgroupElect()) {
-                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-                }
-                octBase = subgroupBroadcastFirst(octBase);
-                if (isOct) {
-                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                    if (octBase + octSlot < pc.maxQueueCapacity) {
-                        secondaryIndices[dest] = targetIdx;
-                    }
-                }
-            }
-        }
+        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+        imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
     }
 
     // Atomic workgroup retirement to prepare downstream dispatches directly

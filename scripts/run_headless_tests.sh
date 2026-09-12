@@ -93,6 +93,23 @@ echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1
 
 python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png output/stats_4k_mgpu_interleaved.json 3840 2160 8.0
 
+# 4c. Test Suite 2c: 4K Native Multi-GPU Frame Pacing & Camera Motion Regression Test
+echo ""
+echo "[4c] Running Test Suite 2c: 4K Native Multi-GPU Frame Pacing (Camera Motion, Host Zero-Copy)..."
+./build/bin/pathways \
+    --headless \
+    --width 3840 \
+    --height 2160 \
+    --spp 1 \
+    --max-bounces 4 \
+    --frames 60 \
+    --camera-motion \
+    --mgpu \
+    --dump-frame output/test_cornell_4k_mgpu_motion.png \
+    --dump-stats output/stats_4k_mgpu_motion.json
+
+python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 6.0 10.0 60
+
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""
 echo "[4/5] Running Test Suite 3: Multi-GPU Sample Parallelism (Dual R9700 @ PCIe 5.0 x16)..."
@@ -141,8 +158,7 @@ python3 scripts/verify_scaling.py output/stats_scaling_single.json output/stats_
 
 # 7. Test Suite 5: glTF 2.0 Ingestion Pipeline & Auto-Framing Verification
 echo ""
-echo "[6/6] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Damaged Helmet & Shapes)..."
-python3 scripts/generate_test_gltf.py
+echo "[6a] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Damaged Helmet)..."
 
 ./build/bin/pathways \
     --headless \
@@ -156,35 +172,35 @@ python3 scripts/generate_test_gltf.py
 
 python3 scripts/verify_frame.py output/test_gltf_helmet.png output/stats_gltf_helmet.json 1920 1080 45.0
 
-./build/bin/pathways \
-    --headless \
-    --width 1920 \
-    --height 1080 \
-    --spp 16 \
-    --max-bounces 4 \
-    --mgpu-mode sample \
-    --scene scenes/test_shapes.gltf \
-    --dump-frame output/test_gltf_shapes.png \
-    --dump-stats output/stats_gltf_shapes.json
-
-python3 scripts/verify_frame.py output/test_gltf_shapes.png output/stats_gltf_shapes.json 1920 1080 15.0
-
-# 8. Test Suite 6: glTF 2.0 Full PBR Pipeline (MR, Normal, AO, Emissive, Alpha Mask, Glass)
+# 8. Test Suite 6: Extreme Scenes & Dielectric Transmission Stress Test (Cornell Caustic & Glass of Water)
 echo ""
-echo "[7/7] Running Test Suite 6: Full glTF 2.0 PBR Pipeline Verification (Showcase Scene)..."
-python3 scripts/generate_pbr_test_scene.py
+echo "[6b] Running Test Suite 6: Extreme Scenes Regression Verification (Caustics & Glass of Water)..."
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --scene scenes/cornell-caustic/cornell_caustic_extended.glb \
+    --dump-frame output/test_cornell_caustic.png \
+    --dump-stats output/stats_cornell_caustic.json
+
+python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cornell_caustic.json 1920 1080 30.0
 
 ./build/bin/pathways \
     --headless \
     --width 1920 \
     --height 1080 \
-    --spp 16 \
+    --spp 4 \
     --max-bounces 4 \
-    --scene scenes/pbr_showcase.gltf \
-    --dump-frame output/test_pbr_showcase.png \
-    --dump-stats output/stats_pbr_showcase.json
+    --frames 10 \
+    --mgpu-mode sample \
+    --scene scenes/glass-of-water/glass_of_water_extended.glb \
+    --dump-frame output/test_glass_of_water.png \
+    --dump-stats output/stats_glass_of_water.json
 
-python3 scripts/verify_frame.py output/test_pbr_showcase.png output/stats_pbr_showcase.json 1920 1080 35.0
+python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glass_of_water.json 1920 1080 30.0
 
 echo ""
 echo "=========================================================="

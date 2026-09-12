@@ -64,7 +64,7 @@ struct GpuDeviceNode {
     std::unique_ptr<AccelerationStructure> tlas;
 
     // Secondary Textures & Environment Map (Bindings 7 & 8)
-    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
     std::unique_ptr<Texture> dummyWhite;
     std::unique_ptr<Texture> dummyNormal;
     std::unique_ptr<Texture> environmentMap;
@@ -107,12 +107,15 @@ struct GpuDeviceNode {
     VkPipelineLayout taaPipelineLayout = VK_NULL_HANDLE;
     VkPipeline taaPipeline = VK_NULL_HANDLE;
 
+    // Secondary Training Tensor Buffer (Binding 15)
+    std::unique_ptr<Buffer> trainingTensorBuffer;
+
     ~GpuDeviceNode();
 };
 
 class MultiGpuManager {
 public:
-    static constexpr uint32_t MAX_SCENE_TEXTURES = 64;
+    static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
     MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene);
     ~MultiGpuManager();
 
@@ -144,7 +147,8 @@ public:
                              float fractionalSpp = 0.0f,
                              void* dstHostPtr = nullptr,
                              size_t transferBytes = 0,
-                             uint32_t totalCompositeSpp = 0);
+                             uint32_t totalCompositeSpp = 0,
+                             uint32_t numOpaqueTriangles = 0);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
@@ -213,6 +217,7 @@ private:
         void* dstHostPtr = nullptr;
         size_t transferBytes = 0;
         uint32_t totalCompositeSpp = 0;
+        uint32_t numOpaqueTriangles = 0;
         bool valid = false;
     };
 

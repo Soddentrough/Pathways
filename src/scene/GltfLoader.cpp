@@ -235,6 +235,32 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             gpuMat.specularFactor = mat.specular.specular_factor;
             if (mat.specular.specular_texture.texture) {
                 gpuMat.specularTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.specular.specular_texture.texture)) + 1;
+                // If scene lacked a separate metallicRoughnessTexture, specularTexture contains
+                // Green = Roughness, Blue = Metallic (standard for Lumberyard / CryEngine specular export)
+                if (gpuMat.mrTex == 0 && gpuMat.specularTex > 0) {
+                    gpuMat.mrTex = gpuMat.specularTex;
+                    size_t texIdx = gpuMat.specularTex - 1;
+                    if (texIdx < outScene.textures.size() && !outScene.textures[texIdx].pixels.empty()) {
+                        const auto& px = outScene.textures[texIdx].pixels;
+                        uint8_t metalVal = (px.size() >= 3) ? px[2] : 0;
+                        uint8_t roughVal = (px.size() >= 2) ? px[1] : 189;
+                        gpuMat.roughness = static_cast<float>(roughVal) / 255.0f;
+                        if (metalVal >= 128) {
+                            gpuMat.metallic = static_cast<float>(metalVal) / 255.0f;
+                            gpuMat.type = MATERIAL_METALLIC;
+                        } else {
+                            gpuMat.metallic = 0.0f;
+                            if (gpuMat.transmission <= 0.05f) {
+                                gpuMat.type = MATERIAL_DIFFUSE;
+                            }
+                        }
+                    } else {
+                        gpuMat.metallic = 0.0f;
+                        if (gpuMat.transmission <= 0.05f) {
+                            gpuMat.type = MATERIAL_DIFFUSE;
+                        }
+                    }
+                }
             }
         }
 

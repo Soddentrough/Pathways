@@ -40,7 +40,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 };
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[64];
+layout(binding = 8) uniform sampler2D sceneTextures[512];
 
 layout(std430, binding = 9) readonly buffer InRayStateQueue {
     RayState inStates[];
@@ -61,13 +61,21 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint dielectricCount;
     uint conductorCount;
     uint complexCount;
+    uint emissiveCount;
+    uint alphamaskCount;
     uint nextDiffuseCount;
     uint nextDielectricCount;
     uint nextConductorCount;
     uint nextComplexCount;
-    uint currentMaterialCounts[4];
+    uint nextEmissiveCount;
+    uint nextAlphamaskCount;
+    uint currentMaterialCounts[6];
     uint totalShadeWorkgroups;
-    uint pad[13];
+    uint octantCounts[8];
+    uint currentOctantCounts[8];
+    uint totalIntersectWorkgroups;
+    uint secondaryRayCount;
+    uint pad[21];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -94,6 +102,14 @@ layout(std430, binding = 17) readonly buffer InRayHitQueue {
     RayHit inHits[];
 };
 
+layout(std430, binding = 18) readonly buffer MaterialIndexQueue {
+    uint materialIndices[];
+};
+
+layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
+    uint secondaryIndices[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -108,6 +124,7 @@ layout(push_constant) uniform PushConstants {
     uint hasEnvMap;
     float envMapIntensity;
     uint useHardwareRT;
+    uint secondarySortMode;
 } pc;
 
 void main() {
@@ -116,18 +133,19 @@ void main() {
     bool inRange = (idx < activeCount);
     bool survivesToNext = false;
     bool hasShadowRay = false;
+    vec3 nextDirection = vec3(0.0);
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
 
     if (inRange) {
-        uint queueIdx = 0u * pc.maxQueueCapacity + idx;
-        RayGeometry geom = inGeoms[queueIdx];
-        RayHit hit = inHits[queueIdx];
-        RayState state = inStates[queueIdx];
+        uint rayIdx = materialIndices[0u * pc.maxQueueCapacity + idx];
+        RayGeometry geom = inGeoms[rayIdx];
+        RayHit hit = inHits[rayIdx];
+        RayState state = inStates[rayIdx];
 
-        vec3 origin = geom.originAndTMin.xyz;
-        vec3 rayDir = geom.dirAndTMax.xyz;
+        vec3 origin = geom.originPackedDir.xyz;
+        vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
         float hitT = hit.hitData.x;
         uint primId = floatBitsToUint(hit.hitData.y);
         vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
@@ -180,7 +198,7 @@ void main() {
                 hitNormal = frontFace ? hitNormal : -hitNormal;
 
                 Material mat = materials[matId];
-                if (mat.normalTex > 0u && mat.normalTex <= 64u) {
+                if (mat.normalTex > 0u && mat.normalTex <= 512u) {
                     vec4 tan0 = triangles[primId].v0.tangent;
                     vec4 tan1 = triangles[primId].v1.tangent;
                     vec4 tan2 = triangles[primId].v2.tangent;
@@ -206,12 +224,12 @@ void main() {
 
             Material mat = materials[matId];
             vec4 baseColor = mat.albedo;
-            if (mat.albedoTex > 0u && mat.albedoTex <= 64u) {
+            if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
             }
 
             vec3 emissive = mat.emissive.rgb;
-            if (mat.emissiveTex > 0u && mat.emissiveTex <= 64u) {
+            if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
             if (length(emissive) > 1e-3) {
@@ -219,6 +237,21 @@ void main() {
             }
 
             vec3 diffuseColor = baseColor.rgb;
+
+            float roughness = mat.roughness;
+            if (mat.mrTex > 0u && mat.mrTex <= 512u) {
+                roughness *= texture(sceneTextures[mat.mrTex - 1u], hitUv).g;
+            }
+            roughness = clamp(roughness, 0.04, 1.0);
+            float alphaRoughness = roughness * roughness;
+
+            float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+            float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
+            float specFactor = mat.specularFactor;
+            if (mat.specularTex > 0u && mat.specularTex <= 512u) {
+                specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
+            }
+            vec3 F0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
@@ -228,7 +261,9 @@ void main() {
                 pathTerminated = true;
             }
 
-            // Direct Lighting (1-candidate stochastic NEE for diffuse)
+            vec3 V = -rayDir;
+
+            // Direct Lighting (1-candidate stochastic NEE for Dual-Lobe PBR)
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
@@ -275,58 +310,102 @@ void main() {
                     }
                 }
 
-                float NdotL = dot(hitNormal, lightDir);
-                if (validLightSample && NdotL > 0.0) {
-                    float bsdfPdf = NdotL * INV_PI;
+                float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
+                float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                if (validLightSample && NdotL > 0.0 && NdotV > 0.0) {
+                    vec3 H = normalize(V + lightDir);
+                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                    vec3 F = fresnelSchlickVec(VdotH, F0);
+                    float D = distributionGGX(NdotH, alphaRoughness);
+                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                    vec3 specBrdf = D * Vis * F;
+
+                    vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                    vec3 combinedBrdf = diffBrdf + specBrdf;
+
+                    float diffPdf = NdotL * INV_PI;
+                    float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
+                    float specProb = clamp(dot(F, vec3(0.3333)), 0.05, 0.95);
+                    float bsdfPdf = (1.0 - specProb) * diffPdf + specProb * specPdf;
+
                     float misWeight = 1.0;
                     if (uint(light.position.w) == 0u) {
                         float lightPdfEff = lightPdf * lightSelectPdf;
                         misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                     }
 
-                    vec3 diffuseBrdf = diffuseColor * INV_PI;
-                    vec3 unshadowed = throughput * diffuseBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    vec3 unshadowed = throughput * combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
 
                     if (length(unshadowed) > 1e-5) {
                         hasShadowRay = true;
                         shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                        shadowCandidate.dirPixel = vec4(lightDir, uintBitsToFloat(pixelIndex));
-                        shadowCandidate.unshadowedRadiance = vec4(unshadowed, uintBitsToFloat(bounce));
+                        shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
                     }
                 }
             }
 
-            // Indirect Bounce: Cosine-weighted hemisphere sampling
+            // Indirect Bounce: Stochastic Lobe Selection (Dielectric Specular GGX vs Diffuse Cosine)
             if (!pathTerminated) {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                     pathTerminated = true;
                 } else {
-                vec3 nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
-                throughput *= diffuseColor;
+                    float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                    vec3 Fview = fresnelSchlickVec(NdotV, F0);
+                    float specProb = clamp(dot(Fview, vec3(0.3333)), 0.05, 0.95);
 
-                float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                if (lum < 0.001) {
-                    pathTerminated = true;
-                } else if (bounce >= 1u) {
-                    float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                    float p = clamp(lum, minP, 0.95);
-                    if (randFloat(seed) > p) {
+                    vec3 nextDirection;
+                    vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
+                    bool validBounce = false;
+
+                    if (randFloat(seed) < specProb) {
+                        // Specular GGX Lobe
+                        vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
+                        nextDirection = reflect(-V, H);
+                        float NdotL = dot(hitNormal, nextDirection);
+                        if (NdotL > 0.0) {
+                            float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                            vec3 F = fresnelSchlickVec(VdotH, F0);
+                            float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                            throughput *= (F * (4.0 * VdotH * Vis * NdotL)) / specProb;
+                            validBounce = true;
+                        }
+                    } else {
+                        // Diffuse Cosine Lobe
+                        nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                        vec3 H = normalize(V + nextDirection);
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        throughput *= ((vec3(1.0) - F) * diffuseColor) / (1.0 - specProb);
+                        validBounce = true;
+                    }
+
+                    if (!validBounce) {
                         pathTerminated = true;
                     } else {
-                        throughput /= p;
+                        float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
+                        if (lum < 0.001) {
+                            pathTerminated = true;
+                        } else if (bounce >= 1u) {
+                            float minP = (bounce >= 2u) ? 0.02 : 0.05;
+                            float p = clamp(lum, minP, 0.95);
+                            if (randFloat(seed) > p) {
+                                pathTerminated = true;
+                            } else {
+                                throughput /= p;
+                            }
+                        }
+
+                        if (!pathTerminated) {
+                            survivesToNext = true;
+                            nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
+                            nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
+                            nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                        }
                     }
                 }
-
-                if (!pathTerminated) {
-                    survivesToNext = true;
-                    nextGeom.originAndTMin = vec4(nextOrigin, EPSILON);
-                    nextGeom.dirAndTMax = vec4(nextDirection, 10000.0);
-                    nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                    nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
-                }
             }
-        }
 
             if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -347,11 +426,36 @@ void main() {
     }
     waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
 
+    uint targetIdx = 0u;
     if (survivesToNext) {
-        uint targetIdx = waveGlobalOffset + laneSlot;
+        targetIdx = waveGlobalOffset + laneSlot;
         if (targetIdx < pc.maxQueueCapacity) {
             outGeoms[targetIdx] = nextGeom;
             outStates[targetIdx] = nextState;
+        }
+    }
+
+    // Option 1: On-Chip Directional Multi-Queue Binning via Subgroup Ballots
+    if (pc.secondarySortMode == 1u) {
+        uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
+        for (uint k = 0u; k < 8u; ++k) {
+            bool isOct = survivesToNext && (oct == k);
+            uvec4 octBallot = subgroupBallot(isOct);
+            uint octCount = subgroupBallotBitCount(octBallot);
+            if (octCount > 0u) {
+                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+                uint octBase = 0u;
+                if (subgroupElect()) {
+                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
+                }
+                octBase = subgroupBroadcastFirst(octBase);
+                if (isOct) {
+                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                    if (octBase + octSlot < pc.maxQueueCapacity) {
+                        secondaryIndices[dest] = targetIdx;
+                    }
+                }
+            }
         }
     }
 
@@ -367,9 +471,9 @@ void main() {
     shadowGlobalOffset = subgroupBroadcastFirst(shadowGlobalOffset);
 
     if (hasShadowRay) {
-        uint targetIdx = shadowGlobalOffset + shadowLaneSlot;
-        if (targetIdx < pc.maxQueueCapacity) {
-            shadowRays[targetIdx] = shadowCandidate;
+        uint targetIdxShadow = shadowGlobalOffset + shadowLaneSlot;
+        if (targetIdxShadow < pc.maxQueueCapacity) {
+            shadowRays[targetIdxShadow] = shadowCandidate;
         }
     }
 
@@ -382,28 +486,62 @@ void main() {
             uint shadowGroups = (shadowCount + 31u) / 32u;
             uint b = pc.currentBounce;
 
-            indirect.commands[b * 6u + 4u].x = shadowGroups;
-            indirect.commands[b * 6u + 4u].y = 1u;
-            indirect.commands[b * 6u + 4u].z = 1u;
-            indirect.commands[b * 6u + 4u].pad = shadowCount;
+            indirect.commands[b * 16u + 6u].x = shadowGroups;
+            indirect.commands[b * 16u + 6u].y = 1u;
+            indirect.commands[b * 16u + 6u].z = 1u;
+            indirect.commands[b * 16u + 6u].pad = shadowCount;
 
-            dgcStream.commands[b * 6u + 4u].pipelineIndex = 3u; // Shadow pipeline
-            dgcStream.commands[b * 6u + 4u].x = shadowGroups;
-            dgcStream.commands[b * 6u + 4u].y = 1u;
-            dgcStream.commands[b * 6u + 4u].z = 1u;
+            dgcStream.commands[b * 16u + 6u].pipelineIndex = 3u; // Shadow pipeline
+            dgcStream.commands[b * 16u + 6u].x = shadowGroups;
+            dgcStream.commands[b * 16u + 6u].y = 1u;
+            dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
             uint intersectGroups = (nextCount + 31u) / 32u;
 
-            indirect.commands[b * 6u + 5u].x = intersectGroups;
-            indirect.commands[b * 6u + 5u].y = 1u;
-            indirect.commands[b * 6u + 5u].z = 1u;
-            indirect.commands[b * 6u + 5u].pad = nextCount;
+            // Slot 7: Standard monolithic / Option 2 intersect dispatch
+            indirect.commands[b * 16u + 7u].x = intersectGroups;
+            indirect.commands[b * 16u + 7u].y = 1u;
+            indirect.commands[b * 16u + 7u].z = 1u;
+            indirect.commands[b * 16u + 7u].pad = nextCount;
 
-            dgcStream.commands[b * 6u + 5u].pipelineIndex = 1u; // Intersect pipeline
-            dgcStream.commands[b * 6u + 5u].x = intersectGroups;
-            dgcStream.commands[b * 6u + 5u].y = 1u;
-            dgcStream.commands[b * 6u + 5u].z = 1u;
+            dgcStream.commands[b * 16u + 7u].pipelineIndex = 1u; // Intersect pipeline
+            dgcStream.commands[b * 16u + 7u].x = intersectGroups;
+            dgcStream.commands[b * 16u + 7u].y = 1u;
+            dgcStream.commands[b * 16u + 7u].z = 1u;
+
+            // Slots 8..15: Option 1 Directional DGC intersect dispatches
+            uint totalIntersectWgs = 0u;
+            if (pc.secondarySortMode == 1u) {
+                for (uint k = 0u; k < 8u; ++k) {
+                    uint octCnt = queueCounters.octantCounts[k];
+                    queueCounters.currentOctantCounts[k] = octCnt;
+                    uint octGroups = (octCnt + 31u) / 32u;
+                    totalIntersectWgs += octGroups;
+
+                    indirect.commands[b * 16u + 8u + k].x = octGroups;
+                    indirect.commands[b * 16u + 8u + k].y = 1u;
+                    indirect.commands[b * 16u + 8u + k].z = 1u;
+                    indirect.commands[b * 16u + 8u + k].pad = octCnt;
+
+                    dgcStream.commands[b * 16u + 8u + k].pipelineIndex = 1u;
+                    dgcStream.commands[b * 16u + 8u + k].x = octGroups;
+                    dgcStream.commands[b * 16u + 8u + k].y = 1u;
+                    dgcStream.commands[b * 16u + 8u + k].z = 1u;
+
+                    queueCounters.octantCounts[k] = 0u;
+                }
+            } else {
+                totalIntersectWgs = intersectGroups;
+            }
+            queueCounters.totalIntersectWorkgroups = totalIntersectWgs;
+
+            if (pc.secondarySortMode == 2u) {
+                indirect.commands[b * 16u + 8u].x = intersectGroups;
+                indirect.commands[b * 16u + 8u].y = 1u;
+                indirect.commands[b * 16u + 8u].z = 1u;
+                indirect.commands[b * 16u + 8u].pad = nextCount;
+            }
 
             queueCounters.currentShadowCount = shadowCount;
             queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;

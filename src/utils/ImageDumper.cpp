@@ -263,6 +263,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
             << std::format("      \"classify_time_ms\": {:.3f},\n", stats.wavefront_stats.classify_ms)
             << std::format("      \"resolve_time_ms\": {:.3f},\n", stats.wavefront_stats.resolve_ms)
             << std::format("      \"material_sort_mode\": \"{}\",\n", stats.wavefront_stats.sort_mode_str)
+            << std::format("      \"secondary_sort_mode\": \"{}\",\n", stats.wavefront_stats.secondary_sort_mode_str)
             << std::format("      \"queue_memory_footprint_mb\": {:.2f},\n", stats.wavefront_stats.queue_memory_footprint_mb)
             << std::format("      \"estimated_vram_traffic_mb\": {:.2f},\n", stats.wavefront_stats.estimated_vram_traffic_mb)
             << "      \"bounces\": [\n";
@@ -280,7 +281,9 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
                 << std::format("            \"diffuse_rays\": {},\n", bp.diff_rays)
                 << std::format("            \"dielectric_rays\": {},\n", bp.diel_rays)
                 << std::format("            \"conductor_rays\": {},\n", bp.cond_rays)
-                << std::format("            \"complex_rays\": {}\n", bp.comp_rays)
+                << std::format("            \"complex_rays\": {},\n", bp.comp_rays)
+                << std::format("            \"emissive_rays\": {},\n", bp.emis_rays)
+                << std::format("            \"passthrough_rays\": {}\n", bp.pass_rays)
                 << "          }\n"
                 << (b + 1 < stats.wavefront_stats.bounces.size() ? "        },\n" : "        }\n");
         }

@@ -1,0 +1,97 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 11) readonly buffer QueueCountersBuffer {
+    uint activeRayCount;
+    uint nextActiveCount;
+    uint totalProcessed;
+    uint shadowRayCount;
+    uint retiredWorkgroups;
+    uint currentShadowCount;
+    uint diffuseCount;
+    uint dielectricCount;
+    uint conductorCount;
+    uint complexCount;
+    uint emissiveCount;
+    uint alphamaskCount;
+    uint nextDiffuseCount;
+    uint nextDielectricCount;
+    uint nextConductorCount;
+    uint nextComplexCount;
+    uint nextEmissiveCount;
+    uint nextAlphamaskCount;
+    uint currentMaterialCounts[6];
+    uint totalShadeWorkgroups;
+    uint octantCounts[8];
+    uint currentOctantCounts[8];
+    uint totalIntersectWorkgroups;
+    uint secondaryRayCount;
+    uint pad[21];
+} queueCounters;
+
+layout(std430, binding = 15) readonly buffer InRayGeomQueue {
+    RayGeometry inGeoms[];
+};
+
+layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
+    uint secondaryIndices[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint maxQueueCapacity;
+    uint activeCount;
+    uint currentBounce;
+    uint pad;
+} pc;
+
+void main() {
+    uint count = queueCounters.activeRayCount;
+    if (gl_WorkGroupID.x * 32u >= count) return;
+
+    uint gIdx = gl_GlobalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+
+    uint key = 0xFFFFFFFFu;
+    uint idx = gIdx;
+
+    if (gIdx < count) {
+        RayGeometry geom = inGeoms[gIdx];
+        vec3 origin = geom.originPackedDir.xyz;
+        vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
+
+        uint octant = getDirectionalOctant(dir);
+        vec3 pNorm = fract((origin * 0.05) + 0.5);
+        uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
+        uint morton = morton3D_10bit(qPos) & 0x0FFFFFu;
+
+        key = (octant << 20u) | morton;
+    }
+
+    // 32-element register-only Bitonic Sort via Subgroup Shuffle XOR (Zero LDS, Zero Barriers)
+    [[unroll]]
+    for (uint k = 2u; k <= 32u; k <<= 1u) {
+        [[unroll]]
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            uint partnerKey = subgroupShuffleXor(key, j);
+            uint partnerIdx = subgroupShuffleXor(idx, j);
+            bool dir_asc = ((lane & k) == 0u);
+            bool shouldTakeMin = ((lane & j) == 0u) == dir_asc;
+            bool swap = shouldTakeMin ? (key > partnerKey) : (key < partnerKey);
+            if (swap) {
+                key = partnerKey;
+                idx = partnerIdx;
+            }
+        }
+    }
+
+    if (gIdx < count) {
+        secondaryIndices[gIdx] = idx;
+    }
+}
