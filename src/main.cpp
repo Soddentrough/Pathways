@@ -61,7 +61,31 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to Living Room and rendered 3 frames cleanly.");
 
-            // Switch to scene 4: Pontiac GTO Extended (user-reported crash scenario)
+            // Switch to scene 4: Breakfast Room
+            if (!engine.loadScene("scenes/breakfast-room/breakfast_room_extended.glb")) {
+                pathways::Logger::error("Test failed: loadScene Breakfast Room failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Breakfast Room and rendered 3 frames cleanly.");
+
+            // Switch to scene 5: Dragon Dispersion
+            if (!engine.loadScene("scenes/DragonDispersion.glb")) {
+                pathways::Logger::error("Test failed: loadScene Dragon Dispersion failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Dragon Dispersion and rendered 3 frames cleanly.");
+
+            // Switch to scene 6: Car Concept
+            if (!engine.loadScene("scenes/CarConcept.glb")) {
+                pathways::Logger::error("Test failed: loadScene Car Concept failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Car Concept and rendered 3 frames cleanly.");
+
+            // Switch to scene 7: Pontiac GTO Extended (user-reported crash scenario)
             if (!engine.loadScene("scenes/pontiac-gto/pontiac_gto_extended.glb")) {
                 pathways::Logger::error("Test failed: loadScene Pontiac GTO failed.");
                 return 1;

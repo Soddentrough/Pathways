@@ -257,10 +257,8 @@ void main() {
                     if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
                         vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
                     }
-                    if (enableTaa && !enableShadowDenoiser) {
-                        ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
-                        imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, 10000.0));
-                    }
+                    ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+                    imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 1.0, 10000.0));
                 }
                 vSpecular = vSurface;
                 if (s == 0u) {

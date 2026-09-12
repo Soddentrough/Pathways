@@ -15,6 +15,9 @@ layout(binding = 2) readonly uniform image2D uHistoryRadiance;
 // Binding 3: Output accumulated radiance (RGBA16F or RGBA32F, RGB: accumulated radiance, A: sample count N)
 layout(binding = 3) writeonly uniform image2D uOutputRadiance;
 
+// Binding 4: Primary hit Normal & Linear Depth (RGBA16F, RGB: normal, A: depth)
+layout(binding = 4) readonly uniform image2D uNormalDepth;
+
 layout(push_constant) uniform PushConstants {
     ivec2 imageSize;
     vec2 invImageSize;
@@ -36,23 +39,31 @@ void main() {
         return;
     }
 
+    float invTotal = (pc.totalSamples > 1u) ? (1.0 / float(pc.totalSamples)) : 1.0;
+
     // 1. Fetch current frame radiance
     vec4 currData = imageLoad(uCurrentRadiance, pixelCoord);
-    vec3 C_curr = currData.rgb;
-    if (pc.totalSamples > 1u) {
-        C_curr /= float(pc.totalSamples);
-    }
+    vec3 C_curr = currData.rgb * invTotal;
     if (isInvalid(C_curr)) {
         C_curr = vec3(0.0);
     }
 
-    // 2. Compute 3x3 local color statistics for neighborhood clamping (Salvi 2016 / Karis 2014)
+    // When the camera is stationary, the path tracer is performing progressive Monte Carlo accumulation.
+    // C_curr already represents the exact, unbiased physical radiance without temporal lag or ghosting.
+    // We pass through C_curr directly to output and store it in history so that history is primed for future motion.
+    if (pc.cameraMoved == 0u) {
+        float N_curr = min(float(max(pc.totalSamples, 1u)), pc.maxHistorySamples);
+        imageStore(uOutputRadiance, pixelCoord, vec4(C_curr, N_curr));
+        return;
+    }
+
+    // 2. Compute 3x3 local color statistics for neighborhood clamping
     vec3 m1 = vec3(0.0);
     vec3 m2 = vec3(0.0);
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             ivec2 tapCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), pc.imageSize - 1);
-            vec3 tap = imageLoad(uCurrentRadiance, tapCoord).rgb;
+            vec3 tap = imageLoad(uCurrentRadiance, tapCoord).rgb * invTotal;
             if (isInvalid(tap)) tap = C_curr;
             m1 += tap;
             m2 += tap * tap;
@@ -61,8 +72,9 @@ void main() {
     vec3 mean = m1 / 9.0;
     vec3 variance = max(vec3(0.0), (m2 / 9.0) - (mean * mean));
     vec3 stdDev = sqrt(variance);
-    vec3 boxMin = max(vec3(0.0), mean - pc.clampingGamma * stdDev);
-    vec3 boxMax = mean + pc.clampingGamma * stdDev;
+    float gamma = max(pc.clampingGamma, 2.5); // Wide box for stochastic 1-SPP noise
+    vec3 boxMin = max(vec3(0.0), mean - gamma * stdDev);
+    vec3 boxMax = mean + gamma * stdDev;
 
     // 3. Motion Vector Reprojection
     vec2 mv = imageLoad(uMotionVectors, pixelCoord).xy;
@@ -96,34 +108,31 @@ void main() {
             historyVal = vec4(C_curr, 1.0);
             validHistory = false;
         }
+
+        // Geometric Disocclusion Test: check depth and normal consistency with reprojected pixel
+        vec4 currND = imageLoad(uNormalDepth, pixelCoord);
+        ivec2 prevCoord = clamp(ivec2(prevUV * vec2(pc.imageSize)), ivec2(0), pc.imageSize - 1);
+        vec4 prevND = imageLoad(uNormalDepth, prevCoord);
+        if (currND.w < 5000.0 && prevND.w < 5000.0) {
+            float depthDiff = abs(currND.w - prevND.w) / max(currND.w, 0.1);
+            float normalDot = dot(currND.xyz, prevND.xyz);
+            if (depthDiff > 0.15 || normalDot < 0.70) {
+                validHistory = false;
+                historyVal = vec4(C_curr, 1.0);
+            }
+        }
     }
 
-    // 4. Neighborhood Clamping (eliminates ghosting under camera motion)
-    vec3 C_clamped = clamp(historyVal.rgb, boxMin, boxMax);
-    float N_prev = historyVal.a;
-
-    // 5. Weighted RLS (wRLS) Outlier Rejection (Han et al., arXiv:2106.08034)
-    // Down-weights extreme fireflies / noise spikes to prevent polluting history during motion
-    vec3 diff = abs(C_curr - C_clamped);
-    vec3 denom = min(C_curr, C_clamped) + vec3(0.01);
-    vec3 relDiff = diff / denom;
-    float d2 = dot(relDiff, relDiff);
-    float outlierWeight = exp(-d2 / max(pc.outlierH * pc.outlierH, 1e-4));
-    vec3 C_curr_clean = mix(C_clamped, C_curr, clamp(outlierWeight, 0.05, 1.0));
-
-    // 6. Sample-Count Adaptive Blending (Tong et al., BMFR)
-    // Disoccluded / newly exposed pixels converge rapidly via arithmetic average (1/N);
-    // Converged pixels use an exponential moving average (alpha ~ 0.12 - 0.15) for high stability.
-    float N_curr = validHistory ? min(N_prev + 1.0, pc.maxHistorySamples) : 1.0;
-    float alpha;
-    if (N_curr < 5.0) {
-        alpha = 1.0 / N_curr;
-    } else {
-        alpha = max(1.0 / N_curr, 0.12);
+    // 4. Blending with reprojected history
+    vec3 C_final = C_curr;
+    float N_curr = 1.0;
+    if (validHistory) {
+        N_curr = min(historyVal.a + 1.0, pc.maxHistorySamples);
+        float alpha = 1.0 / max(N_curr, 1.0);
+        alpha = clamp(alpha, 0.08, 0.20); // 80-92% history, 8-20% current sample (Tong et al.)
+        C_final = mix(historyVal.rgb, C_curr, alpha);
     }
 
-    vec3 C_final = validHistory ? mix(C_clamped, C_curr_clean, alpha) : C_curr;
-
-    // 7. Store accumulated radiance (RGB) and tracked sample count (A)
+    // 5. Store accumulated radiance (RGB) and tracked sample count (A)
     imageStore(uOutputRadiance, pixelCoord, vec4(C_final, N_curr));
 }

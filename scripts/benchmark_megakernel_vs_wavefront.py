@@ -36,6 +36,24 @@ DEFAULT_SCENES = {
         "desc": "High geometry, coherent dielectric transmission",
         "camera": None
     },
+    "dragon_dispersion": {
+        "name": "Dragon Dispersion",
+        "path": "scenes/DragonDispersion.glb",
+        "desc": "High geometry, dielectric dispersion and volumetric absorption",
+        "camera": None
+    },
+    "car_concept": {
+        "name": "Car Concept",
+        "path": "scenes/CarConcept.glb",
+        "desc": "Automotive PBR, clearcoat, iridescence, and complex materials",
+        "camera": None
+    },
+    "breakfast_room": {
+        "name": "Breakfast Room",
+        "path": "scenes/breakfast-room/breakfast_room_extended.glb",
+        "desc": "Complex interior architectural GI with high occlusion",
+        "camera": None
+    },
     "living_room": {
         "name": "Living Room Extended",
         "path": "scenes/living-room/living_room_extended.glb",

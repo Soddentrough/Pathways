@@ -30,13 +30,15 @@ def analyze_image(png_path, label=""):
     lum = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
     mean_lum = float(np.mean(lum))
     shadow_pct = float(np.mean(lum < 0.05) * 100.0)
+    blown_pct = float(np.mean(lum > 0.95) * 100.0)
     min_val = float(arr.min())
     max_val = float(arr.max())
     mean_rgb = [float(np.mean(arr[:, :, c])) for c in range(3)]
-    print(f"[{label}] Mean Lum: {mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | RGB: [{mean_rgb[0]:.3f}, {mean_rgb[1]:.3f}, {mean_rgb[2]:.3f}] | Range: [{min_val:.3f}, {max_val:.3f}]")
+    print(f"[{label}] Mean Lum: {mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Blown Out (>0.95): {blown_pct:.2f}% | RGB: [{mean_rgb[0]:.3f}, {mean_rgb[1]:.3f}, {mean_rgb[2]:.3f}] | Range: [{min_val:.3f}, {max_val:.3f}]")
     return {
         "mean_lum": mean_lum,
         "shadow_pct": shadow_pct,
+        "blown_pct": blown_pct,
         "mean_rgb": mean_rgb,
         "min_val": min_val,
         "max_val": max_val,
@@ -53,7 +55,7 @@ def main():
     all_passed = True
 
     # -------------------------------------------------------------------------
-    # Test 1: Classroom 4K Native Wavefront Reference Mode (Default)
+    # Test 1: Classroom 4K Native Wavefront Mode (Camera Motion, 60 Frames)
     # -------------------------------------------------------------------------
     print("\n====================================================================")
     print("  [TEST 1] Classroom 4K Native Reference Mode (Camera Motion, 60 Frames)")
@@ -71,7 +73,6 @@ def main():
         "--max-bounces", "4",
         "--frames", "60",
         "--warmup-frames", "10",
-        "--no-accumulation",
         "--camera-motion",
         "--dump-frame", wf_png,
         "--dump-stats", wf_stats
@@ -81,7 +82,7 @@ def main():
         print("[FAIL] Classroom Wavefront run failed")
         all_passed = False
     else:
-        m_wf = analyze_image(wf_png, "Classroom Default Wavefront")
+        m_wf = analyze_image(wf_png, "Classroom Wavefront Motion")
         with open(wf_stats, "r") as f:
             st = json.load(f)
         avg_ms = st["performance"]["avg_frame_time_ms"]
@@ -91,19 +92,31 @@ def main():
         if m_wf["shadow_pct"] < 10.0:
             print(f"[FAIL] Deep shadow retention {m_wf['shadow_pct']:.2f}% is below 10% floor")
             all_passed = False
-        else:
-            print(f"\033[32m[PASS]\033[0m Contact shadows intact: {m_wf['shadow_pct']:.2f}% >= 10%")
-
-        if m_wf["mean_lum"] > 0.62:
-            print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} exceeds ceiling 0.62")
+        elif m_wf["shadow_pct"] > 40.0:
+            print(f"[FAIL] Deep shadow retention {m_wf['shadow_pct']:.2f}% exceeds 40% ceiling (dark collapse)")
             all_passed = False
         else:
-            print(f"\033[32m[PASS]\033[0m Proper exposure: {m_wf['mean_lum']:.4f} <= 0.62")
+            print(f"\033[32m[PASS]\033[0m Contact shadows intact: {m_wf['shadow_pct']:.2f}% in [10%, 40%]")
 
-        if avg_ms > 8.0:
-            print(f"\033[33m[WARN]\033[0m Latency {avg_ms:.3f} ms slightly above 8.0 ms target")
+        if m_wf["mean_lum"] < 0.20:
+            print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} below floor 0.20 (dark collapse under motion)")
+            all_passed = False
+        elif m_wf["mean_lum"] > 0.50:
+            print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} exceeds ceiling 0.50 (overexposed)")
+            all_passed = False
         else:
-            print(f"\033[32m[PASS]\033[0m Sub-8ms budget achieved: {avg_ms:.3f} ms <= 8.0 ms")
+            print(f"\033[32m[PASS]\033[0m Proper exposure: {m_wf['mean_lum']:.4f} in [0.20, 0.50]")
+
+        if m_wf["blown_pct"] > 2.0:
+            print(f"[FAIL] Blown-out percentage {m_wf['blown_pct']:.2f}% exceeds 2.0% ceiling")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Blown-out pixels controlled: {m_wf['blown_pct']:.2f}% <= 2.0%")
+
+        if avg_ms > 16.0:
+            print(f"\033[33m[WARN]\033[0m Latency {avg_ms:.3f} ms slightly above 16.0 ms target")
+        else:
+            print(f"\033[32m[PASS]\033[0m Target latency achieved: {avg_ms:.3f} ms <= 16.0 ms")
 
     # -------------------------------------------------------------------------
     # Test 2: Classroom 4K Pure Monte Carlo Convergence (30 Frames Static)
@@ -139,21 +152,27 @@ def main():
         fps_mc = st_mc["performance"]["avg_fps"]
         print(f"       Latency: {avg_ms_mc:.3f} ms ({fps_mc:.1f} FPS)")
 
-        # Verify shadow retention: must be >= 10%
         if m_mc["shadow_pct"] < 10.0:
             print(f"[FAIL] Deep shadow retention {m_mc['shadow_pct']:.2f}% is below 10% floor (shadows destroyed)")
             all_passed = False
         else:
             print(f"\033[32m[PASS]\033[0m Contact shadows preserved: {m_mc['shadow_pct']:.2f}% >= 10%")
 
-        # Verify exposure: must be <= 0.62
-        if m_mc["mean_lum"] > 0.62:
+        if m_mc["mean_lum"] < 0.35:
+            print(f"[FAIL] Mean luminance {m_mc['mean_lum']:.4f} is too dark (below 0.35)")
+            all_passed = False
+        elif m_mc["mean_lum"] > 0.62:
             print(f"[FAIL] Mean luminance {m_mc['mean_lum']:.4f} is bleached / overexposed (exceeds 0.62)")
             all_passed = False
         else:
-            print(f"\033[32m[PASS]\033[0m Exposure normalized: {m_mc['mean_lum']:.4f} <= 0.62")
+            print(f"\033[32m[PASS]\033[0m Exposure normalized: {m_mc['mean_lum']:.4f} in [0.35, 0.62]")
 
-        # Verify color tint balance: R, G, B should be balanced (not green tint G >> R, B)
+        if m_mc["blown_pct"] > 30.0:
+            print(f"[FAIL] Blown-out percentage {m_mc['blown_pct']:.2f}% exceeds 30.0% ceiling")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Highlight bounds preserved: {m_mc['blown_pct']:.2f}% <= 30.0%")
+
         rg_diff = abs(m_mc["mean_rgb"][1] - m_mc["mean_rgb"][0])
         if rg_diff > 0.10:
             print(f"[FAIL] Color cast detected: G-R diff={rg_diff:.4f}")
@@ -161,9 +180,148 @@ def main():
         else:
             print(f"\033[32m[PASS]\033[0m Color tint balanced: |G - R| = {rg_diff:.4f} <= 0.10")
 
+    # -------------------------------------------------------------------------
+    # Test 3: Living Room Static Convergence vs Dynamic Motion (1080p)
+    # -------------------------------------------------------------------------
+    print("\n====================================================================")
+    print("  [TEST 3] Living Room Static Convergence & Dynamic Motion Stability")
+    print("====================================================================")
+    lr_stat_png = "output/test_lr_static_test.png"
+    lr_stat_json = "output/stats_lr_static_test.json"
+    cmd_lr_stat = [
+        bin_path,
+        "--headless",
+        "--scene", "scenes/living-room/living_room_extended.glb",
+        "--width", "1920",
+        "--height", "1080",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "60",
+        "--warmup-frames", "10",
+        "--dump-frame", lr_stat_png,
+        "--dump-stats", lr_stat_json
+    ]
+    ok_stat, _ = run_cmd(cmd_lr_stat)
+
+    lr_mot_png = "output/test_lr_motion_test.png"
+    lr_mot_json = "output/stats_lr_motion_test.json"
+    cmd_lr_mot = [
+        bin_path,
+        "--headless",
+        "--scene", "scenes/living-room/living_room_extended.glb",
+        "--width", "1920",
+        "--height", "1080",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "60",
+        "--warmup-frames", "10",
+        "--camera-motion",
+        "--dump-frame", lr_mot_png,
+        "--dump-stats", lr_mot_json
+    ]
+    ok_mot, _ = run_cmd(cmd_lr_mot)
+
+    if not ok_stat or not ok_mot:
+        print("[FAIL] Living room test executions failed")
+        all_passed = False
+    else:
+        m_stat = analyze_image(lr_stat_png, "Living Room Static (60 Frames)")
+        m_mot = analyze_image(lr_mot_png, "Living Room Motion (60 Frames)")
+
+        # Static checks: strictly verify NO overexposure blowout
+        if m_stat["mean_lum"] < 0.10 or m_stat["mean_lum"] > 0.16:
+            print(f"[FAIL] Living Room static mean luminance {m_stat['mean_lum']:.4f} out of bounds [0.10, 0.16]")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Living Room static convergence: Mean={m_stat['mean_lum']:.4f} in [0.10, 0.16]")
+
+        if m_stat["blown_pct"] > 1.0:
+            print(f"[FAIL] Living Room static blown-out pixels {m_stat['blown_pct']:.2f}% exceeds 1.0% (overexposure regression!)")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Living Room static blown-out pixels: {m_stat['blown_pct']:.2f}% <= 1.0%")
+
+        # Dynamic motion checks: strictly verify NO dark grainy collapse
+        if m_mot["mean_lum"] < 0.08 or m_mot["mean_lum"] > 0.15:
+            print(f"[FAIL] Living Room motion mean luminance {m_mot['mean_lum']:.4f} out of bounds [0.08, 0.15] (energy collapse!)")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Living Room motion exposure: Mean={m_mot['mean_lum']:.4f} in [0.08, 0.15]")
+
+        if m_mot["shadow_pct"] > 68.0:
+            print(f"[FAIL] Living Room motion shadow percentage {m_mot['shadow_pct']:.2f}% exceeds 68% (collapsed to dark noise!)")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Living Room motion shadow retention: {m_mot['shadow_pct']:.2f}% <= 68.0%")
+
+        retention = m_mot["mean_lum"] / m_stat["mean_lum"] * 100.0
+        if retention < 70.0:
+            print(f"[FAIL] Dynamic motion energy retention {retention:.1f}% below 70.0% threshold")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m Dynamic motion energy retention: {retention:.1f}% >= 70.0%")
+
+    # -------------------------------------------------------------------------
+    # Test 4: Living Room BMFR Denoiser Camera Motion Stability (1080p)
+    # -------------------------------------------------------------------------
+    print("\n====================================================================")
+    print("  [TEST 4] Living Room BMFR Denoiser Camera Motion Stability (1080p)")
+    print("====================================================================")
+    bmfr_png = "output/test_lr_bmfr_motion_test.png"
+    bmfr_stats = "output/stats_lr_bmfr_motion_test.json"
+    cmd_bmfr = [
+        bin_path,
+        "--headless",
+        "--scene", "scenes/living-room/living_room_extended.glb",
+        "--width", "1920",
+        "--height", "1080",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "60",
+        "--warmup-frames", "10",
+        "--bmfr",
+        "--camera-motion",
+        "--dump-frame", bmfr_png,
+        "--dump-stats", bmfr_stats
+    ]
+    ok_bmfr, _ = run_cmd(cmd_bmfr)
+    if not ok_bmfr:
+        print("[FAIL] Living Room BMFR motion run failed")
+        all_passed = False
+    else:
+        m_bmfr = analyze_image(bmfr_png, "Living Room BMFR Motion")
+        with open(bmfr_stats, "r") as f:
+            st_b = json.load(f)
+        avg_ms_b = st_b["performance"]["avg_frame_time_ms"]
+        fps_b = st_b["performance"]["avg_fps"]
+        print(f"       Latency: {avg_ms_b:.3f} ms ({fps_b:.1f} FPS)")
+
+        if m_bmfr["mean_lum"] < 0.08 or m_bmfr["mean_lum"] > 0.15:
+            print(f"[FAIL] BMFR motion mean luminance {m_bmfr['mean_lum']:.4f} out of bounds [0.08, 0.15]")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m BMFR motion luminance: {m_bmfr['mean_lum']:.4f} in [0.08, 0.15]")
+
+        if m_bmfr["shadow_pct"] > 65.0:
+            print(f"[FAIL] BMFR motion shadow percentage {m_bmfr['shadow_pct']:.2f}% exceeds 65% ceiling")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m BMFR motion shadow retention: {m_bmfr['shadow_pct']:.2f}% <= 65.0%")
+
+        if m_bmfr["blown_pct"] > 1.0:
+            print(f"[FAIL] BMFR motion blown-out pixels {m_bmfr['blown_pct']:.2f}% exceeds 1.0%")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m BMFR motion blown-out pixels: {m_bmfr['blown_pct']:.2f}% <= 1.0%")
+
+        if avg_ms_b > 5.0:
+            print(f"\033[33m[WARN]\033[0m BMFR latency {avg_ms_b:.3f} ms slightly above 5.0 ms target")
+        else:
+            print(f"\033[32m[PASS]\033[0m BMFR sub-5ms budget achieved: {avg_ms_b:.3f} ms <= 5.0 ms")
+
     print("\n--------------------------------------------------------------------")
     if all_passed:
-        print("\033[32m[SUCCESS]\033[0m All image quality and camera motion tests passed!")
+        print("\033[32m[SUCCESS]\033[0m All image quality and camera motion tests passed cleanly!")
         sys.exit(0)
     else:
         print("\033[31m[FAILURE]\033[0m Image quality regression detected.")

@@ -111,7 +111,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCQueryQueue
         { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCTrainQueue
         { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCCounters
-        { 23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // uMotionVectorImage
+        { 23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMotionVectorImage
+        { 24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // uNormalDepthImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -126,7 +127,7 @@ void WavefrontPipeline::createDescriptorLayout() {
 
 void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
@@ -280,12 +281,15 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                VkBuffer nrcQueryBuffer,
                                                VkBuffer nrcTrainBuffer,
                                                VkBuffer nrcCountersBuffer,
-                                               VkImageView motionVectorImageView) {
+                                               VkImageView motionVectorImageView,
+                                               VkImageView normalDepthImageView) {
     if (frameSlot >= 2) frameSlot = 0;
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView mvView = (motionVectorImageView != VK_NULL_HANDLE) ? motionVectorImageView : accumImageView;
     VkDescriptorImageInfo mvImageInfo{ VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ndView = (normalDepthImageView != VK_NULL_HANDLE) ? normalDepthImageView : accumImageView;
+    VkDescriptorImageInfo ndImageInfo{ VK_NULL_HANDLE, ndView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo camInfo{ cameraUBO, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo triInfo{ triangleBuffer, 0, triSize };
     VkDescriptorBufferInfo sphereInfo{ sphereBuffer, 0, sphereSize };
@@ -339,6 +343,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         }
 
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }

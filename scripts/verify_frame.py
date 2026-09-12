@@ -11,7 +11,8 @@ import numpy as np
 from PIL import Image
 
 def verify_frame(png_path, expected_width=None, expected_height=None, reference_path=None,
-                 min_shadow_pct=None, max_mean_lum=None, max_mae=None, min_psnr=None):
+                 min_shadow_pct=None, max_shadow_pct=None, min_mean_lum=None, max_mean_lum=None,
+                 max_blown_pct=None, max_mae=None, min_psnr=None):
     if not os.path.exists(png_path):
         print(f"\033[31m[FAIL]\033[0m Image file not found: {png_path}")
         return False
@@ -44,8 +45,14 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
         mean_lum = float(np.mean(lum))
         shadow_mask = lum < 0.05
         shadow_pct = float(np.mean(shadow_mask) * 100.0)
+        blown_mask = lum > 0.95
+        blown_pct = float(np.mean(blown_mask) * 100.0)
 
-        print(f"\033[32m[PASS]\033[0m Luminance stats: Mean={mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Range: [{min_val:.3f}, {max_val:.3f}]")
+        print(f"\033[32m[PASS]\033[0m Luminance stats: Mean={mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Blown Out (>0.95): {blown_pct:.2f}% | Range: [{min_val:.3f}, {max_val:.3f}]")
+
+        if min_mean_lum is not None and mean_lum < min_mean_lum:
+            print(f"\033[31m[FAIL]\033[0m Mean luminance {mean_lum:.4f} below floor {min_mean_lum:.4f} (underexposed / dark collapse)")
+            return False
 
         if max_mean_lum is not None and mean_lum > max_mean_lum:
             print(f"\033[31m[FAIL]\033[0m Mean luminance {mean_lum:.4f} exceeds ceiling {max_mean_lum:.4f} (overexposed / bleached)")
@@ -53,6 +60,14 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
 
         if min_shadow_pct is not None and shadow_pct < min_shadow_pct:
             print(f"\033[31m[FAIL]\033[0m Deep shadow percentage {shadow_pct:.2f}% below floor {min_shadow_pct:.2f}% (shadows destroyed)")
+            return False
+
+        if max_shadow_pct is not None and shadow_pct > max_shadow_pct:
+            print(f"\033[31m[FAIL]\033[0m Deep shadow percentage {shadow_pct:.2f}% exceeds ceiling {max_shadow_pct:.2f}% (image collapsed to black / severe energy loss)")
+            return False
+
+        if max_blown_pct is not None and blown_pct > max_blown_pct:
+            print(f"\033[31m[FAIL]\033[0m Blown-out percentage {blown_pct:.2f}% exceeds ceiling {max_blown_pct:.2f}% (overexposed / bleached)")
             return False
 
         if reference_path:
@@ -132,7 +147,10 @@ def main():
     parser.add_argument("max_ms", nargs="?", type=float, default=8.0, help="Maximum allowed average frame time (ms)")
     parser.add_argument("--reference", type=str, default=None, help="Ground-truth reference image path")
     parser.add_argument("--min-shadow-pct", type=float, default=None, help="Minimum percentage of pixels with lum < 0.05")
+    parser.add_argument("--max-shadow-pct", type=float, default=None, help="Maximum allowed percentage of pixels with lum < 0.05")
+    parser.add_argument("--min-mean-lum", type=float, default=None, help="Minimum allowed mean luminance")
     parser.add_argument("--max-mean-lum", type=float, default=None, help="Maximum allowed mean luminance")
+    parser.add_argument("--max-blown-pct", type=float, default=None, help="Maximum allowed percentage of blown-out pixels (lum > 0.95)")
     parser.add_argument("--max-mae", type=float, default=None, help="Maximum allowed MAE against reference")
     parser.add_argument("--min-psnr", type=float, default=None, help="Minimum allowed PSNR against reference")
 
@@ -148,7 +166,10 @@ def main():
         args.expected_height,
         reference_path=args.reference,
         min_shadow_pct=args.min_shadow_pct,
+        max_shadow_pct=args.max_shadow_pct,
+        min_mean_lum=args.min_mean_lum,
         max_mean_lum=args.max_mean_lum,
+        max_blown_pct=args.max_blown_pct,
         max_mae=args.max_mae,
         min_psnr=args.min_psnr
     )

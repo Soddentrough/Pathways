@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.19.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.19.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -391,11 +391,14 @@ add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 include(GNUInstallDirs)
 
 set(CURATED_SCENE_FILES
+    scenes/CarConcept.glb
     scenes/DamagedHelmet.glb
     scenes/DragonAttenuation.glb
+    scenes/DragonDispersion.glb
 )
 
 set(CURATED_SCENE_DIRS
+    breakfast-room
     classroom
     coffee-maker
     living-room
