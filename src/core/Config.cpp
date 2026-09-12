@@ -117,62 +117,62 @@ bool parseVec3(std::string_view str, glm::vec3& outVec) {
 } // namespace
 
 void Config::printUsage(const char* progName) {
-    std::cout << "Usage: " << progName << " [options]\n"
-              << "Options:\n"
+    std::cout << "Usage: " << progName << " [options]\n\n"
+              << "General & Display:\n"
               << "  --headless              Run in headless offscreen mode (no window)\n"
-              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Work Lists & DGC [default]) or 'rtp' (KHR Ray Tracing Pipeline)\n"
               << "  --fullscreen            Run in fullscreen mode [default]\n"
               << "  --windowed              Run in windowed / non-fullscreen mode\n"
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
+              << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n\n"
+              << "Rendering & Path Tracing:\n"
+              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Work Lists & DGC [default]) or 'rtp' (KHR RTP)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
-              << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
-              << "  --warmup-frames <int>   Initial frames to exclude from benchmark stats (default: 0)\n"
-              << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n"
+              << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
+              << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
+              << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
+              << "  --accum-cutoff <int>    Maximum static accumulation frames (default: 2048, 0 = unlimited)\n"
+              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n\n"
+              << "Frame Pacing & Dynamic Governor:\n"
+              << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
+              << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor to track target FPS\n"
+              << "  --min-spp <int>         Minimum dynamic SPP floor (default: 1)\n"
+              << "  --max-spp <int>         Maximum dynamic SPP ceiling (default: 16)\n"
+              << "  --min-bounces <int>     Minimum dynamic bounce floor (default: 2)\n"
+              << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n\n"
+              << "Multi-GPU Subsystem:\n"
+              << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
+              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
+              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR), 'staging'\n"
+              << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
+              << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
+              << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
+              << "Wavefront Architecture:\n"
+              << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
+              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
+              << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n\n"
+              << "Camera & Navigation:\n"
+              << "  --camera-motion         Simulate continuous camera motion\n"
+              << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
+              << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
+              << "  --camera-target <x,y,z> Set camera target look-at point (or --cam-target)\n"
+              << "  --camera-up <x,y,z>     Set camera world up vector (default: 0,1,0)\n"
+              << "  --camera-fov <degrees>  Set camera vertical field of view in degrees (or --fov)\n\n"
+              << "Benchmarking & Diagnostics:\n"
+              << "  --benchmark             Enable per-frame latency logging and verification\n"
+              << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
+              << "  --warmup-frames <int>   Initial frames to exclude from benchmark stats (default: 0)\n"
+              << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --dump-frame <path.png> Save tonemapped LDR frame to PNG\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --capture-training-data <dir> Output directory for high-speed raw binary training tensors\n"
               << "  --capture-frames <int>        Number of training sequence frames to capture (default: 60)\n"
               << "  --capture-reference-spp <int> Sample count for stationary ground truth reference (default: 512)\n"
-              << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
-              << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
-              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR), 'staging'\n"
-              << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
-              << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
-              << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
-              << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n"
-              << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
-              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
-              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
-              << "  --benchmark             Enable per-frame latency logging and verification\n"
-              << "  --atrous                Enable A-Trous Wavelet Diffuse Denoiser\n"
-              << "  --no-atrous             Disable A-Trous Wavelet Diffuse Denoiser [default: disabled]\n"
-              << "  --restir                Enable all ReSTIR (both DI and GI reservoir resampling) [default: disabled]\n"
-              << "  --no-restir             Disable all ReSTIR (both DI and GI reservoir resampling)\n"
-              << "  --restir-di             Enable ReSTIR DI spatio-temporal direct illumination resampling\n"
-              << "  --no-restir-di          Disable ReSTIR DI spatio-temporal direct illumination resampling\n"
-              << "  --restir-gi             Enable ReSTIR GI secondary path reservoir resampling\n"
-              << "  --no-restir-gi          Disable ReSTIR GI secondary path reservoir resampling\n"
-              << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
-              << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor\n"
-              << "  --no-adaptive-spp       Disable dynamic sample rate governor\n"
-              << "  --min-spp <int>         Minimum dynamic SPP floor (default: 1)\n"
-              << "  --max-spp <int>         Maximum dynamic SPP ceiling (default: 16)\n"
-              << "  --min-bounces <int>     Minimum dynamic bounce floor (default: 2)\n"
-              << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n"
-              << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
-              << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --accum-cutoff <int>    Maximum static accumulation frames (default: 2048, 0 = unlimited)\n"
-              << "  --camera-motion         Simulate continuous camera motion\n"
-              << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
-              << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
-              << "  --camera-target <x,y,z> Set camera target look-at point (or --cam-target)\n"
-              << "  --camera-up <x,y,z>     Set camera world up vector (default: 0,1,0)\n"
-              << "  --camera-fov <degrees>  Set camera vertical field of view in degrees (or --fov)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -231,14 +231,22 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.custom_resolution = true;
         } else if (arg == "--spp" && i + 1 < argc) {
             cfg.spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--max-bounces" && i + 1 < argc) {
+        } else if (arg.starts_with("--spp=")) {
+            cfg.spp = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if ((arg == "--max-bounces" || arg == "--bounces") && i + 1 < argc) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--max-bounces=")) {
+            cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg.starts_with("--bounces=")) {
+            cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
             cfg.frame_limit = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--warmup-frames" && i + 1 < argc) {
             cfg.warmup_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--render-scale" && i + 1 < argc) {
             cfg.render_scale = std::stof(argv[++i]);
+        } else if (arg.starts_with("--render-scale=")) {
+            cfg.render_scale = std::stof(arg.substr(arg.find('=') + 1));
         } else if (arg == "--exposure" && i + 1 < argc) {
             cfg.exposure = std::stof(argv[++i]);
         } else if (arg == "--scene" && i + 1 < argc) {
@@ -253,20 +261,6 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_hdr_path = argv[++i];
         } else if (arg == "--dump-stats" && i + 1 < argc) {
             cfg.dump_stats_path = argv[++i];
-        } else if (arg == "--capture-training-data" && i + 1 < argc) {
-            cfg.capture_training_data = true;
-            cfg.training_data_dir = argv[++i];
-        } else if (arg.starts_with("--capture-training-data=")) {
-            cfg.capture_training_data = true;
-            cfg.training_data_dir = arg.substr(arg.find('=') + 1);
-        } else if (arg == "--capture-frames" && i + 1 < argc) {
-            cfg.training_capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--capture-frames=")) {
-            cfg.training_capture_frames = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--capture-reference-spp" && i + 1 < argc) {
-            cfg.training_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--capture-reference-spp=")) {
-            cfg.training_reference_spp = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {
@@ -299,10 +293,27 @@ Config Config::parse(int argc, char* argv[]) {
             ++i;
         } else if (arg == "--taa-gamma" && i + 1 < argc) {
             ++i;
+        } else if (arg == "--denoiser" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "atrous") {
+                cfg.enable_atrous = true;
+                cfg.denoiser_mode = DenoiserMode::Atrous;
+            } else if (mode == "none" || mode == "off") {
+                cfg.enable_atrous = false;
+                cfg.denoiser_mode = DenoiserMode::None;
+            }
+        } else if (arg.starts_with("--denoiser=")) {
+            std::string mode = arg.substr(arg.find('=') + 1);
+            if (mode == "atrous") {
+                cfg.enable_atrous = true;
+                cfg.denoiser_mode = DenoiserMode::Atrous;
+            } else if (mode == "none" || mode == "off") {
+                cfg.enable_atrous = false;
+                cfg.denoiser_mode = DenoiserMode::None;
+            }
         } else if (arg == "--atrous") {
             cfg.enable_atrous = true;
-        } else if (arg == "--no-atrous") {
-            cfg.enable_atrous = false;
+            cfg.denoiser_mode = DenoiserMode::Atrous;
         } else if (arg == "--atrous-passes" && i + 1 < argc) {
             cfg.atrous_passes = static_cast<uint32_t>(std::clamp(std::stoi(argv[++i]), 1, 5));
         } else if (arg.starts_with("--atrous-passes=")) {
@@ -348,6 +359,8 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
+        } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
+            setenv("PATHWAYS_DISABLE_DGC_PREPROCESS", "1", 1);
         } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
         } else if (arg == "--double-buffer-shared" || arg == "--double-buffer") {
@@ -523,28 +536,6 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--benchmark") {
             cfg.benchmark = true;
-        } else if (arg == "--restir") {
-            cfg.enable_restir_di = true;
-            cfg.enable_restir_gi = true;
-        } else if (arg == "--no-restir") {
-            cfg.enable_restir_di = false;
-            cfg.enable_restir_gi = false;
-        } else if (arg == "--restir-di") {
-            cfg.enable_restir_di = true;
-        } else if (arg == "--no-restir-di") {
-            cfg.enable_restir_di = false;
-        } else if (arg == "--restir-gi") {
-            cfg.enable_restir_gi = true;
-        } else if (arg == "--no-restir-gi") {
-            cfg.enable_restir_gi = false;
-        } else if (arg == "--restir-spatial-samples" && i + 1 < argc) {
-            cfg.restir_spatial_samples = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--restir-spatial-samples=")) {
-            cfg.restir_spatial_samples = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--restir-spatial-radius" && i + 1 < argc) {
-            cfg.restir_spatial_radius = std::stof(argv[++i]);
-        } else if (arg.starts_with("--restir-spatial-radius=")) {
-            cfg.restir_spatial_radius = std::stof(arg.substr(arg.find('=') + 1));
         } else if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;
@@ -598,13 +589,6 @@ Config Config::parse(int argc, char* argv[]) {
     if (cfg.headless && cfg.frame_limit == 0) {
         // In headless mode, default to 1 frame unless explicitly told to run more
         cfg.frame_limit = 1;
-    }
-
-    // Scale default spatial search radius for 4K (3840x2160) to maintain wide angular neighbor coverage
-    if (cfg.width >= 3840 || cfg.height >= 2160) {
-        if (cfg.restir_spatial_radius == 8.0f) {
-            cfg.restir_spatial_radius = 16.0f;
-        }
     }
 
     return cfg;

@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Soddentrough\0"
             VALUE "FileDescription",  "Pathways: Real-Time Vulkan 1.4 Path Tracer\0"
-            VALUE "FileVersion",      "1.14.0.0\0"
+            VALUE "FileVersion",      "1.15.0.0\0"
             VALUE "InternalName",     "pathways\0"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Soddentrough. MIT License.\0"
             VALUE "OriginalFilename", "pathways.exe\0"
             VALUE "ProductName",      "Pathways\0"
-            VALUE "ProductVersion",   "1.13.0.0\0"
+            VALUE "ProductVersion",   "1.15.0.0\0"
         END
     END
     BLOCK "VarFileInfo"

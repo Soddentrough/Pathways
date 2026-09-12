@@ -3,6 +3,9 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <vector>
+#include "stb_image.h"
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -55,6 +58,8 @@ Window::Window(const Config& config)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         throw std::runtime_error(std::string("Failed to initialize SDL3: ") + SDL_GetError());
     }
+
+    SDL_SetAppMetadata("Pathways", "1.15.0", "pathways");
 
     // 1. Detect Physical Display & Resolution Characteristics
     SDL_DisplayID displayID = SDL_GetPrimaryDisplay();
@@ -152,6 +157,29 @@ Window::Window(const Config& config)
 
     if (!m_window) {
         throw std::runtime_error(std::string("Failed to create SDL3 window: ") + SDL_GetError());
+    }
+
+    // Set application window icon
+    const std::vector<std::string> iconSearchPaths = {
+        "data/pathways.png",
+        "../data/pathways.png",
+        "/usr/share/pixmaps/pathways.png",
+        "/usr/share/icons/hicolor/1024x1024/apps/pathways.png"
+    };
+    for (const auto& path : iconSearchPaths) {
+        if (std::filesystem::exists(path)) {
+            int iconW = 0, iconH = 0, channels = 0;
+            unsigned char* iconData = stbi_load(path.c_str(), &iconW, &iconH, &channels, 4);
+            if (iconData) {
+                SDL_Surface* iconSurface = SDL_CreateSurfaceFrom(iconW, iconH, SDL_PIXELFORMAT_RGBA32, iconData, iconW * 4);
+                if (iconSurface) {
+                    SDL_SetWindowIcon(m_window, iconSurface);
+                    SDL_DestroySurface(iconSurface);
+                }
+                stbi_image_free(iconData);
+                break;
+            }
+        }
     }
 
     if (config.fullscreen) {
