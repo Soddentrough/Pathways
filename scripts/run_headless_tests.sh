@@ -244,8 +244,13 @@ python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_brea
 
 # 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
 echo ""
-echo "[7/7] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."
+echo "[7/8] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."
 python3 tests/test_image_quality.py
+
+# 11. Test Suite 8: Automated Before/After Visual Regression Verification
+echo ""
+echo "[8/8] Running Test Suite 8: Visual Regression Verification against Golden References..."
+python3 scripts/visual_regression_test.py --strict
 
 echo ""
 echo "=========================================================="

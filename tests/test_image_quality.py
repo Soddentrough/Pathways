@@ -319,6 +319,34 @@ def main():
         else:
             print(f"\033[32m[PASS]\033[0m BMFR sub-5ms budget achieved: {avg_ms_b:.3f} ms <= 5.0 ms")
 
+    # -------------------------------------------------------------------------
+    # Test 5: Automated Before/After Golden Reference Verification
+    # -------------------------------------------------------------------------
+    print("\n====================================================================")
+    print("  [TEST 5] Before/After Golden Reference Verification & Anomaly Detection")
+    print("====================================================================")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    try:
+        from visual_regression_test import compute_metrics, generate_html_report, TEST_CONFIGS
+        vis_results = []
+        for cfg in TEST_CONFIGS:
+            if os.path.exists(cfg["render_path"]) and os.path.exists(cfg["ref_path"]):
+                m = compute_metrics(cfg["render_path"], cfg["ref_path"], cfg["diff_path"])
+                vis_results.append({"config": cfg, "metrics": m})
+                sev = m.get("severity")
+                if sev == "pass":
+                    print(f"  \033[32m[{m['status']}]\033[0m {cfg['name']}: SSIM={m['ssim']:.4f}, PSNR={m['psnr']:.1f} dB")
+                elif sev == "notice":
+                    print(f"  \033[35m[{m['status']}]\033[0m {cfg['name']}: SSIM={m['ssim']:.4f}, PSNR={m['psnr']:.1f} dB | {m['detail']}")
+                elif sev == "warn":
+                    print(f"  \033[33m[{m['status']}]\033[0m {cfg['name']}: SSIM={m['ssim']:.4f}, PSNR={m['psnr']:.1f} dB | {m['detail']}")
+                else:
+                    print(f"  \033[31m[{m['status']}]\033[0m {cfg['name']}: SSIM={m['ssim']:.4f}, PSNR={m['psnr']:.1f} dB | {m['detail']}")
+                    all_passed = False
+        generate_html_report(vis_results, "output/visual_regression_report.html")
+    except Exception as e:
+        print(f"[WARN] Visual regression engine check error: {e}")
+
     print("\n--------------------------------------------------------------------")
     if all_passed:
         print("\033[32m[SUCCESS]\033[0m All image quality and camera motion tests passed cleanly!")
