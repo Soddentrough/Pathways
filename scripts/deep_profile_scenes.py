@@ -44,6 +44,24 @@ SCENES = [
         "desc": "High geometry density with physical Beer-Lambert volumetric absorption."
     },
     {
+        "name": "Dragon Dispersion",
+        "category": "High Poly & Dispersion",
+        "path": "scenes/DragonDispersion.glb",
+        "desc": "Dense dragon model testing KHR_materials_dispersion and dielectric transmission."
+    },
+    {
+        "name": "Car Concept",
+        "category": "Automotive PBR & Clearcoat",
+        "path": "scenes/CarConcept.glb",
+        "desc": "Complex automotive concept showcasing clearcoat, anisotropy, iridescence, and detailed materials."
+    },
+    {
+        "name": "Breakfast Room",
+        "category": "Interior Architectural GI",
+        "path": "scenes/breakfast-room/breakfast_room_extended.glb",
+        "desc": "Complex interior architectural GI with high multi-bounce occlusion and subtle daylighting."
+    },
+    {
         "name": "Damaged Helmet",
         "category": "Complex PBR",
         "path": "scenes/DamagedHelmet.glb",
@@ -83,7 +101,7 @@ SCENES = [
         "name": "Bistro Interior",
         "category": "Massive Scale (>1.3M Triangles)",
         "path": "scenes/bistro/bistro_interior.glb",
-        "camera_args": ["--camera-pos", "-0.5,2.1,-1.5", "--camera-target", "6.0,1.8,-3.5", "--fov", "70"],
+        "camera_args": ["--camera-pos", "3.5,1.75,-6.2", "--camera-target", "9.5,1.65,0.5", "--fov", "70"],
         "desc": "Massive geometry (1.32M tris), 74 materials, 64 lights, and 207 textures."
     }
 ]

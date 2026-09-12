@@ -38,6 +38,12 @@ enum class SecondarySortMode {
     SpatialIndex    // Option 2: 4-Byte Index-Only Spatial-Morton Reordering
 };
 
+enum class DenoiserMode {
+    None,     // Raw stochastic path traced output (unfiltered progressive)
+    Temporal, // Motion-vector guided Temporal Radiance Accumulation [Default]
+    BMFR      // Blockwise Multi-Order Feature Regression [Experimental]
+};
+
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
@@ -68,22 +74,26 @@ struct Config {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool enable_direct_light = true;
-    bool enable_restir_di = false;
-    bool enable_restir_spatial = true;
-    uint32_t restir_spatial_samples = 3;
-    float restir_spatial_radius = 8.0f;
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;
     bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
-    bool enable_atrous = false;           // Hierarchical Edge-Avoiding A-Trous Wavelet Diffuse Denoiser [Default: disabled]
-    uint32_t atrous_passes = 3;           // Number of A-Trous filter iterations (1-5, default: 3 passes: s=1,2,4)
-    float atrous_normal_power = 32.0f;    // Normal edge-stopping sensitivity
-    float atrous_depth_sigma = 0.03f;     // Depth edge-stopping sensitivity
+    DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
+    bool enable_temporal_accum = false;   // Motion-vector guided temporal accumulation [Default: disabled, opt-in via --temporal-accum / --denoiser temporal]
+    bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled, opt-in via --bmfr]
+    float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
+    float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth
+    float temporal_max_history = 32.0f;   // Maximum temporal history sample accumulation limit
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
+    uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)
+
+    // Neural Radiance Caching (NRC) with Wave32 WMMA (gfx1201 / Vulkan 1.4)
+    bool enable_nrc = false;              // Neural Radiance Cache indirect query termination [Default: disabled]
+    uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
+    float nrc_train_ratio = 0.03f;        // Ratio of paths (2%-5%, default 0.03 = 3%) continuing tracing to ground truth depth for training
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
@@ -101,12 +111,6 @@ struct Config {
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
-
-    // Neural Denoiser & Continuous Upscaler (NDCU) Training Capture
-    bool capture_training_data = false;
-    std::string training_data_dir = "";
-    uint32_t training_capture_frames = 60;
-    uint32_t training_reference_spp = 512;
 
     // Camera view overrides (useful for headless testing & reproducible framing)
     std::optional<glm::vec3> camera_pos;

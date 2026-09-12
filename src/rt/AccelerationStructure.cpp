@@ -2,6 +2,7 @@
 #include "core/Logger.hpp"
 #include <stdexcept>
 #include <cstring>
+#include <chrono>
 
 namespace pathways {
 
@@ -216,7 +217,15 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     vkCmdPipelineBarrier2(cmd, &depInfo);
 
     vkEndCommandBuffer(cmd);
+    auto tStart = std::chrono::steady_clock::now();
     submitCommandBuffer(cmd);
+    auto tEnd = std::chrono::steady_clock::now();
+    m_lastBlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    m_blasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_blasTriangles = 0;
+    for (const auto& g : geometries) {
+        m_blasTriangles += g.triangleCount;
+    }
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 
     // Query device address
@@ -228,8 +237,8 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
     result->setHandle(blasHandle, blasAddr, std::move(blasBuffer));
 
-    Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x})",
-                 sizeInfo.accelerationStructureSize / 1024.0, blasAddr);
+    Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
+                 m_blasSizeKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
     return result;
 }
 
@@ -276,7 +285,7 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildTLAS(c
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &tlasGeom;
 
@@ -357,7 +366,12 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildTLAS(c
     vkCmdPipelineBarrier2(cmd, &depInfo);
 
     vkEndCommandBuffer(cmd);
+    auto tStart = std::chrono::steady_clock::now();
     submitCommandBuffer(cmd);
+    auto tEnd = std::chrono::steady_clock::now();
+    m_lastTlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    m_tlasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_tlasInstances = primitiveCount;
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
@@ -368,9 +382,138 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildTLAS(c
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
     result->setHandle(tlasHandle, tlasAddr, std::move(tlasBuffer));
 
-    Logger::info("Built TLAS successfully (size: {:.2f} KB, address: 0x{:x}, instances: {})",
-                 sizeInfo.accelerationStructureSize / 1024.0, tlasAddr, primitiveCount);
+    Logger::info("Built TLAS successfully (size: {:.2f} KB, address: 0x{:x}, instances: {}, time: {:.3f} ms)",
+                 m_tlasSizeKb, tlasAddr, primitiveCount, m_lastTlasBuildTimeMs);
     return result;
+}
+
+VkAccelerationStructureBuildSizesInfoKHR AccelerationStructureManager::getTLASBuildSizes(uint32_t instanceCount) {
+    VkAccelerationStructureGeometryKHR tlasGeom{};
+    tlasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tlasGeom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasGeom.geometry.instances.arrayOfPointers = VK_FALSE;
+    tlasGeom.geometry.instances.data.deviceAddress = 0;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &tlasGeom;
+
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
+    sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    pfn_vkGetAccelerationStructureBuildSizesKHR(
+        m_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &buildInfo, &instanceCount, &sizeInfo
+    );
+    return sizeInfo;
+}
+
+std::unique_ptr<AccelerationStructure> AccelerationStructureManager::createTLAS(uint32_t instanceCount) {
+    auto sizeInfo = getTLASBuildSizes(instanceCount);
+
+    auto tlasBuffer = std::make_unique<Buffer>(
+        m_allocator, sizeInfo.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, 256
+    );
+
+    VkAccelerationStructureCreateInfoKHR createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    createInfo.buffer = tlasBuffer->getBuffer();
+    createInfo.size = sizeInfo.accelerationStructureSize;
+    createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+
+    VkAccelerationStructureKHR tlasHandle;
+    VkResult res = pfn_vkCreateAccelerationStructureKHR(m_device, &createInfo, nullptr, &tlasHandle);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create GPU TLAS handle!");
+    }
+
+    VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
+    addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    addressInfo.accelerationStructure = tlasHandle;
+    VkDeviceAddress tlasAddr = pfn_vkGetAccelerationStructureDeviceAddressKHR(m_device, &addressInfo);
+
+    auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
+    result->setHandle(tlasHandle, tlasAddr, std::move(tlasBuffer));
+    return result;
+}
+
+void AccelerationStructureManager::recordBuildTLAS(VkCommandBuffer cmd,
+                                                   Buffer* instanceBuffer,
+                                                   uint32_t instanceCount,
+                                                   Buffer* scratchBuffer,
+                                                   AccelerationStructure* dstTlas,
+                                                   bool updateMode) {
+    if (!instanceBuffer || !scratchBuffer || !dstTlas || instanceCount == 0) return;
+
+    // 1. Pipeline barrier: Wait for GPU instance updates (compute shader) to write out instances
+    VkBufferMemoryBarrier2 instBarrier{};
+    instBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    instBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    instBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    instBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    instBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    instBarrier.buffer = instanceBuffer->getBuffer();
+    instBarrier.offset = 0;
+    instBarrier.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo preDep{};
+    preDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    preDep.bufferMemoryBarrierCount = 1;
+    preDep.pBufferMemoryBarriers = &instBarrier;
+    vkCmdPipelineBarrier2(cmd, &preDep);
+
+    // 2. Geometry specification
+    VkAccelerationStructureGeometryKHR tlasGeom{};
+    tlasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    tlasGeom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasGeom.geometry.instances.arrayOfPointers = VK_FALSE;
+    tlasGeom.geometry.instances.data.deviceAddress = instanceBuffer->getDeviceAddress(m_device);
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    buildInfo.mode = updateMode ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.srcAccelerationStructure = updateMode ? dstTlas->getHandle() : VK_NULL_HANDLE;
+    buildInfo.dstAccelerationStructure = dstTlas->getHandle();
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &tlasGeom;
+
+    constexpr VkDeviceSize scratchAlignment = 256;
+    VkDeviceAddress rawScratch = scratchBuffer->getDeviceAddress(m_device);
+    VkDeviceAddress alignedScratch = (rawScratch + (scratchAlignment - 1)) & ~(scratchAlignment - 1);
+    buildInfo.scratchData.deviceAddress = alignedScratch;
+
+    VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+    rangeInfo.primitiveCount = instanceCount;
+    rangeInfo.primitiveOffset = 0;
+    rangeInfo.firstVertex = 0;
+    rangeInfo.transformOffset = 0;
+    const VkAccelerationStructureBuildRangeInfoKHR* pRange = &rangeInfo;
+
+    pfn_vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRange);
+
+    // 3. Post-barrier: Ensure TLAS build finishes before subsequent ray queries / compute
+    VkMemoryBarrier2 postBarrier{};
+    postBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    postBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+
+    VkDependencyInfo postDep{};
+    postDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    postDep.memoryBarrierCount = 1;
+    postDep.pMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &postDep);
 }
 
 } // namespace pathways

@@ -47,9 +47,9 @@ By integrating OpenUSD support, Pathways will achieve two primary capabilities:
                                      │
                                      ▼
     ┌───────────────────────────────────────────────────────────────────┐
-    │           Vulkan 1.4 Hardware Ray Tracing & ReSTIR DI             │
+    │     Vulkan 1.4 Hardware Ray Tracing & Native Wavefront Path Tracer│
     │  - VK_KHR_acceleration_structure (BLAS / TLAS Multi-Instance)     │
-    │  - ReSTIR DI (4-Candidate WRS + Spatio-Temporal Resampling)       │
+    │  - High-Throughput Wavefront Path Tracing (Stochastic MIS NEE)    │
     │  - Dual GPU Pipelined Execution (RADV GFX1201 / RDNA 4 Wave32)    │
     └───────────────────────────────────────────────────────────────────┘
 ```
@@ -64,7 +64,7 @@ By integrating OpenUSD support, Pathways will achieve two primary capabilities:
 | **Composition Arcs** | None (monolithic file) | SubLayers, References, Payloads, Variants | Non-destructive edits, multi-LOD variant toggles |
 | **Storage Formats** | JSON (`.gltf`), Binary pack (`.glb`) | Text (`.usda`), Zero-Copy Binary (`.usdc`), ZIP (`.usdz`) | Memory-mapped zero-copy parsing of massive datasets |
 | **Instancing Model** | Flat node transform hierarchy | Native Point Instancing (`UsdGeomPointInstancer`) | Direct 1:1 mapping to Vulkan TLAS instances |
-| **Lighting Standard** | KHR_lights_punctual (basic) | `UsdLux` (Rect, Disk, Sphere, Cylinder, Dome, Distant) | Full physical area lights for ReSTIR DI |
+| **Lighting Standard** | KHR_lights_punctual (basic) | `UsdLux` (Rect, Disk, Sphere, Cylinder, Dome, Distant) | Full physical area lights for stochastic MIS NEE |
 | **Material Standard** | Metallic-Roughness PBR | `UsdPreviewSurface` + MaterialX (`usdMtlx`) | Native clearcoat, IOR, transmission, and sheen |
 | **DCC Ecosystem** | Export-only interchange | Live two-way interchange via Hydra | Interactive live viewport in Houdini/Maya |
 
@@ -118,15 +118,15 @@ The `UsdPreviewSurface` standard maps 1:1 to Pathways' physical GGX shader model
 | `emissiveColor` | `color3f` / texture | `emission` (`vec4`) | Unshadowed analytical emission |
 | `normal` | `normal3f` / texture | Normal map sampler | Tangent-space perturbed shading normal |
 
-### 3.4 Lights (`UsdLux` $\to$ `LightGPU` & ReSTIR DI)
+### 3.4 Lights (`UsdLux` $\to$ `LightGPU` & MIS NEE)
 USD features first-class physical lighting primitives in the `UsdLux` schema:
 - **`UsdLuxRectLight`:** Mapped to rectangular Area Light (`LightGPU` with `u` and `v` edge vectors).
 - **`UsdLuxDiskLight`:** Mapped to elliptical/disk Area Light.
 - **`UsdLuxSphereLight`:** Mapped to spherical Area Light.
 - **`UsdLuxDistantLight`:** Mapped to directional sun light.
 - **`UsdLuxDomeLight`:** Mapped to Pathways' 32-bit floating-point environment map sky dome.
-- **Synergy with ReSTIR DI:**
-  Production USD scenes contain dozens or hundreds of `UsdLux` lights. Pathways' Phase 1 and Phase 2 ReSTIR DI engines immediately ingest these lights into `LightsBuffer`, executing 4-candidate Chao's WRS sampling and cross-bilateral spatio-temporal resampling with strictly **one shadow ray per pixel**.
+- **Synergy with Next-Event Estimation:**
+  Production USD scenes contain dozens or hundreds of `UsdLux` lights. Pathways' Wavefront path tracer ingests these lights into `LightsBuffer`, executing stochastic Next-Event Estimation with Multiple Importance Sampling (MIS).
 
 ---
 
@@ -179,7 +179,7 @@ To integrate Pathways directly into DCC applications (Houdini Solaris, Maya, Ble
 ┌───────────────────────────────────────────────────────────────────┐
 │                     HdPathwaysRenderPass                          │
 │   - Triggers Vulkan 1.4 hardware ray tracing (vkCmdTraceRaysKHR)  │
-│   - Executes ReSTIR DI spatio-temporal reservoir resampling       │
+│   - Executes Wavefront path tracing with stochastic MIS NEE       │
 │   - Blits result into OpenGL/Vulkan external memory viewport      │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -214,7 +214,7 @@ To integrate Pathways directly into DCC applications (Houdini Solaris, Maya, Ble
 - **Deliverables:**
   1. Interactive timeline scrubber in Dear ImGui (`UsdTimeCode`).
   2. Point instancer translation to Vulkan 1.4 TLAS instances (`VkAccelerationStructureInstanceKHR`).
-  3. Motion vectors for dynamic geometry in ReSTIR DI temporal reprojection.
+  3. Motion vectors for dynamic geometry in temporal reprojection and denoising.
 
 ### Phase 3: Hydra Render Delegate (`hdPathways`)
 - **Target:** Standalone shared library `libhdPathways.so` discoverable via `PXR_PLUGINPATH_NAME`.
@@ -227,4 +227,4 @@ To integrate Pathways directly into DCC applications (Houdini Solaris, Maya, Ble
 
 ## 7. Conclusion
 
-Adding OpenUSD support aligns Pathways with contemporary professional graphics pipelines. By leveraging the existing `usd-libs` infrastructure on Fedora Linux 44 and mapping USD prims directly into Pathways' pure Vulkan 1.4 `SceneData` model, Pathways will provide real-time hardware ray tracing, ReSTIR DI, and dual-GPU acceleration for cinematic production assets.
+Adding OpenUSD support aligns Pathways with contemporary professional graphics pipelines. By leveraging the existing `usd-libs` infrastructure on Fedora Linux 44 and mapping USD prims directly into Pathways' pure Vulkan 1.4 `SceneData` model, Pathways will provide real-time hardware ray tracing, stochastic MIS NEE, and dual-GPU acceleration for cinematic production assets.

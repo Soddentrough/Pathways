@@ -3,7 +3,6 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
-#include "utils/TrainingDataWriter.hpp"
 
 #include <fstream>
 #include <filesystem>
@@ -11,6 +10,7 @@
 #include <algorithm>
 #include <thread>
 #include <bit>
+#include <cstring>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -233,10 +233,11 @@ Engine::~Engine() {
     m_rtpKhrPipeline.reset();
     destroyShadowDenoiserResources();
     destroyShadowDenoiserPipelines();
-    destroyTaaResources();
-    destroyTaaPipelines();
-    destroyAtrousResources();
-    destroyAtrousPipelines();
+    destroyTemporalAccumResources();
+    destroyTemporalAccumPipelines();
+    destroyBmfrResources();
+    destroyBmfrPipelines();
+    m_motionVectorImage.reset();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
 
@@ -247,6 +248,14 @@ Engine::~Engine() {
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
+
+    if (m_updateTlasPipeline) vkDestroyPipeline(device, m_updateTlasPipeline, nullptr);
+    if (m_updateTlasPipelineLayout) vkDestroyPipelineLayout(device, m_updateTlasPipelineLayout, nullptr);
+    if (m_updateTlasDescLayout) vkDestroyDescriptorSetLayout(device, m_updateTlasDescLayout, nullptr);
+    if (m_updateTlasDescPool) vkDestroyDescriptorPool(device, m_updateTlasDescPool, nullptr);
+    m_tlasInstanceBuffer.reset();
+    m_tlasInputInstancesBuffer.reset();
+    m_tlasScratchBuffer.reset();
 
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     m_secTransferBuffer.reset();
@@ -370,6 +379,12 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    m_motionVectorImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
     // Transition layouts to GENERAL
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -386,6 +401,13 @@ void Engine::initVulkan() {
         m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
+    m_motionVectorImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
     vkEndCommandBuffer(m_commandBuffers[0]);
@@ -405,7 +427,12 @@ void Engine::initScene() {
     std::filesystem::path scenesDir = "scenes";
     if (!std::filesystem::exists(scenesDir) || !std::filesystem::is_directory(scenesDir)) {
         std::filesystem::path exeDir;
-#if defined(__linux__) || defined(__unix__)
+#ifdef _WIN32
+        char exePathBuf[MAX_PATH] = {0};
+        if (GetModuleFileNameA(NULL, exePathBuf, MAX_PATH)) {
+            exeDir = std::filesystem::path(exePathBuf).parent_path();
+        }
+#elif defined(__linux__) || defined(__unix__)
         std::error_code ec;
         auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
         if (!ec && !p.empty()) {
@@ -416,9 +443,15 @@ void Engine::initScene() {
         }
 #endif
         if (!exeDir.empty()) {
+            auto adjacentScenes = exeDir / "scenes";
+            auto parentScenes = exeDir / ".." / "scenes";
             auto relShare = exeDir / ".." / "share" / "pathways" / "scenes";
             auto devScenes = exeDir / ".." / ".." / "scenes";
-            if (std::filesystem::exists(relShare) && std::filesystem::is_directory(relShare)) {
+            if (std::filesystem::exists(adjacentScenes) && std::filesystem::is_directory(adjacentScenes)) {
+                scenesDir = adjacentScenes;
+            } else if (std::filesystem::exists(parentScenes) && std::filesystem::is_directory(parentScenes)) {
+                scenesDir = parentScenes;
+            } else if (std::filesystem::exists(relShare) && std::filesystem::is_directory(relShare)) {
                 scenesDir = relShare;
             } else if (std::filesystem::exists(devScenes) && std::filesystem::is_directory(devScenes)) {
                 scenesDir = devScenes;
@@ -593,23 +626,6 @@ void Engine::initScene() {
         );
     }
 
-    // Training Tensor Buffers (Binding 15)
-    VkDeviceSize tensorBufferSize = m_config.capture_training_data ?
-        (static_cast<VkDeviceSize>(m_config.width) * m_config.height * 16 * sizeof(uint16_t)) : 256;
-    m_trainingTensorBuffer = std::make_unique<Buffer>(
-        allocator, tensorBufferSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-    if (m_config.capture_training_data) {
-        m_trainingStagingBuffer = std::make_unique<Buffer>(
-            allocator, tensorBufferSize,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-    }
-
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     if (m_context->hasRayTracing()) {
         std::vector<Vertex> asVertices;
@@ -693,6 +709,7 @@ void Engine::initScene() {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
         }
+        initTlasBuffers(1);
         Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (BLAS & TLAS).");
         Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
     }
@@ -901,6 +918,7 @@ bool Engine::loadScene(const std::string& filepath) {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS rebuild failed.");
         }
+        initTlasBuffers(1);
     }
 
     // Reload scene textures
@@ -1094,9 +1112,6 @@ VkShaderModule Engine::createShaderModule(const std::vector<char>& code) {
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
-    // 0. Initialize ReSTIR DI Buffers
-    initReSTIRBuffers();
-
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 },
@@ -1126,13 +1141,10 @@ void Engine::initPipelines() {
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1184,18 +1196,10 @@ void Engine::initPipelines() {
         uboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
     }
 
-    VkDescriptorBufferInfo trainInfo{};
-    if (m_trainingTensorBuffer) {
-        trainInfo = { m_trainingTensorBuffer->getBuffer(), 0, m_trainingTensorBuffer->getSize() };
-    }
-
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfos[i], nullptr });
-        if (m_trainingTensorBuffer) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainInfo, nullptr });
-        }
     }
     // Tonemap set
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
@@ -1256,6 +1260,20 @@ void Engine::initPipelines() {
         m_context->hasDgcExecutionSet()
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
+
+    // 6c. Neural Radiance Caching (NRC) Manager (Wave32 WMMA)
+    try {
+        auto nrcInferCode = loadShaderSPIRV("nrc_encode_infer.comp.spv");
+        auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
+        m_nrcManager = std::make_unique<NRCManager>(
+            device, allocator,
+            m_config.width, m_config.height,
+            nrcInferCode, nrcTrainCode
+        );
+        Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA) initialized successfully.");
+    } catch (const std::exception& e) {
+        Logger::warn("NRCManager initialization failed: {}", e.what());
+    }
 
     // 7. ACES Tonemapping Compute Pipeline (Wave32 execution mode on RDNA4)
     VkPushConstantRange tonemapPushConstant{};
@@ -1350,13 +1368,16 @@ void Engine::initPipelines() {
     createShadowDenoiserPipelines();
     createShadowDenoiserResources();
 
-    // 9. Temporal Anti-Aliasing (TAA) Resources & Pipelines
-    createTaaPipelines();
-    createTaaResources();
+    // 9. Temporal Radiance Accumulation & wRLS Outlier Rejection
+    createTemporalAccumPipelines();
+    createTemporalAccumResources();
 
-    // 10. A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
-    createAtrousPipelines();
-    createAtrousResources();
+    // 10. Blockwise Multi-Order Feature Regression (BMFR)
+    createBmfrPipelines();
+    createBmfrResources();
+
+    // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
+    initTlasUpdatePipeline();
 
     updateAllImageDescriptors();
 }
@@ -1385,10 +1406,6 @@ void Engine::updateAllImageDescriptors() {
     if (m_motionVectorImage) {
         mvImageInfo.imageView = m_motionVectorImage->getImageView();
         mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    }
-    VkDescriptorBufferInfo trainInfo{};
-    if (m_trainingTensorBuffer) {
-        trainInfo = { m_trainingTensorBuffer->getBuffer(), 0, m_trainingTensorBuffer->getSize() };
     }
 
     std::vector<VkWriteDescriptorSet> writes;
@@ -1429,16 +1446,6 @@ void Engine::updateAllImageDescriptors() {
                 w14.pImageInfo = &mvImageInfo;
                 writes.push_back(w14);
             }
-
-            if (m_trainingTensorBuffer) {
-                VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                w15.dstSet = m_rtDescSets[i];
-                w15.dstBinding = 15;
-                w15.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                w15.descriptorCount = 1;
-                w15.pBufferInfo = &trainInfo;
-                writes.push_back(w15);
-            }
         }
     }
 
@@ -1464,8 +1471,9 @@ void Engine::updateAllImageDescriptors() {
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
-    updateAtrousDescriptors();
     updateWavefrontSceneDescriptors();
+    updateTemporalAccumDescriptors();
+    updateBmfrDescriptors();
 }
 
 void Engine::createShadowDenoiserPipelines() {
@@ -1586,7 +1594,11 @@ void Engine::createShadowDenoiserResources() {
 
     m_normalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
+    m_prevNormalDepthImage = std::make_unique<Image>(device, allocator, w, h,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     m_shadowFilterPingImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16_SFLOAT,
@@ -1616,6 +1628,7 @@ void Engine::createShadowDenoiserResources() {
     vkBeginCommandBuffer(cmd, &beginInfo);
     m_directLightImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_shadowFilterPingImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     for (int i = 0; i < 2; ++i) {
         m_momentsImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -1636,6 +1649,7 @@ void Engine::createShadowDenoiserResources() {
 void Engine::destroyShadowDenoiserResources() {
     m_directLightImage.reset();
     m_normalDepthImage.reset();
+    m_prevNormalDepthImage.reset();
     m_shadowFilterPingImage.reset();
     m_momentsImages[0].reset();
     m_momentsImages[1].reset();
@@ -1692,399 +1706,578 @@ void Engine::updateShadowDenoiserDescriptors() {
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void Engine::createTaaPipelines() {
+void Engine::createTemporalAccumPipelines() {
     VkDevice device = m_context->getDevice();
 
-    // 1. Create Sampler for history reprojection (bilinear clamp-to-edge)
-    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipLodBias = 0.0f;
-    samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 1.0f;
-    samplerInfo.compareEnable = VK_FALSE;
-    samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 0.0f;
-    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    vkCreateSampler(device, &samplerInfo, nullptr, &m_taaHistorySampler);
-
-    // 2. Create Descriptor Set Layout
-    std::vector<VkDescriptorSetLayoutBinding> taaBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = static_cast<uint32_t>(taaBindings.size());
-    layoutInfo.pBindings = taaBindings.data();
-    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_taaDescLayout);
-
-    // 3. Allocate Ping-Pong Descriptor Sets
-    std::array<VkDescriptorSetLayout, 2> layouts = { m_taaDescLayout, m_taaDescLayout };
-    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 2;
-    allocInfo.pSetLayouts = layouts.data();
-    vkAllocateDescriptorSets(device, &allocInfo, m_taaDescSets);
-
-    // 4. Create Pipeline Layout
-    VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 3 + sizeof(float) * 2 + sizeof(uint32_t) * 3;
-
-    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plInfo.setLayoutCount = 1;
-    plInfo.pSetLayouts = &m_taaDescLayout;
-    plInfo.pushConstantRangeCount = 1;
-    plInfo.pPushConstantRanges = &pcRange;
-    vkCreatePipelineLayout(device, &plInfo, nullptr, &m_taaPipelineLayout);
-
-    // 5. Create Compute Pipeline
-    auto taaCode = loadShaderSPIRV("taa_resolve.comp.spv");
-    VkShaderModule taaShaderModule = createShaderModule(taaCode);
-    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, taaShaderModule, "main", nullptr };
-    pipeInfo.layout = m_taaPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_taaPipeline);
-    vkDestroyShaderModule(device, taaShaderModule, nullptr);
-
-    Logger::info("Temporal Anti-Aliasing (TAA) pipelines created successfully.");
-}
-
-void Engine::destroyTaaPipelines() {
-    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
-    if (!device) return;
-
-    if (m_taaPipeline) { vkDestroyPipeline(device, m_taaPipeline, nullptr); m_taaPipeline = VK_NULL_HANDLE; }
-    if (m_taaPipelineLayout) { vkDestroyPipelineLayout(device, m_taaPipelineLayout, nullptr); m_taaPipelineLayout = VK_NULL_HANDLE; }
-    if (m_taaDescLayout) { vkDestroyDescriptorSetLayout(device, m_taaDescLayout, nullptr); m_taaDescLayout = VK_NULL_HANDLE; }
-    if (m_taaHistorySampler) { vkDestroySampler(device, m_taaHistorySampler, nullptr); m_taaHistorySampler = VK_NULL_HANDLE; }
-    m_taaDescSets[0] = VK_NULL_HANDLE;
-    m_taaDescSets[1] = VK_NULL_HANDLE;
-}
-
-void Engine::createTaaResources() {
-    VkDevice device = m_context->getDevice();
-    VmaAllocator allocator = m_context->getAllocator();
-    uint32_t w = m_config.width;
-    uint32_t h = m_config.height;
-
-    // Allocate Motion Vector Image (RG16F)
-    m_motionVectorImage = std::make_unique<Image>(device, allocator, w, h,
-        VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-
-    // Allocate History Images (RGBA16F to match radiance)
-    for (int i = 0; i < 2; ++i) {
-        m_taaHistoryImages[i] = std::make_unique<Image>(device, allocator, w, h,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    }
-
-    // Transition layouts to GENERAL and clear memory
-    VkCommandBuffer cmd = m_commandBuffers[0];
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(cmd, &beginInfo);
-    m_motionVectorImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    for (int i = 0; i < 2; ++i) {
-        m_taaHistoryImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    }
-
-    VkClearColorValue zeroColor{};
-    VkImageSubresourceRange range{};
-    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    range.baseMipLevel = 0;
-    range.levelCount = 1;
-    range.baseArrayLayer = 0;
-    range.layerCount = 1;
-
-    vkCmdClearColorImage(cmd, m_motionVectorImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
-    for (int i = 0; i < 2; ++i) {
-        vkCmdClearColorImage(cmd, m_taaHistoryImages[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1, &range);
-    }
-
-    VkMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-
-    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    clearDep.memoryBarrierCount = 1;
-    clearDep.pMemoryBarriers = &clearBarrier;
-    vkCmdPipelineBarrier2(cmd, &clearDep);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-
-    m_taaPingPongIndex = 0;
-    updateTaaDescriptors();
-    Logger::info("Temporal Anti-Aliasing (TAA) resources allocated successfully.");
-}
-
-void Engine::destroyTaaResources() {
-    m_motionVectorImage.reset();
-    m_taaHistoryImages[0].reset();
-    m_taaHistoryImages[1].reset();
-}
-
-void Engine::updateTaaDescriptors() {
-    if (m_taaDescSets[0] == VK_NULL_HANDLE || m_taaDescSets[1] == VK_NULL_HANDLE ||
-        !m_motionVectorImage || !m_taaHistoryImages[0] || !m_taaHistoryImages[1] ||
-        !m_accumImage || !m_normalDepthImage || m_taaHistorySampler == VK_NULL_HANDLE) return;
-
-    VkDevice device = m_context->getDevice();
-
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    VkDescriptorImageInfo histInfo0{ m_taaHistorySampler, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo histInfo1{ m_taaHistorySampler, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    VkDescriptorImageInfo outInfo0{ VK_NULL_HANDLE, m_taaHistoryImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outInfo1{ VK_NULL_HANDLE, m_taaHistoryImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes = {
-        // Set 0: Read history from [0], resolve output into [1]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo1, nullptr, nullptr },
-
-        // Set 1: Read history from [1], resolve output into [0]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &histInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_taaDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo0, nullptr, nullptr }
-    };
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
-
-void Engine::createAtrousPipelines() {
-    VkDevice device = m_context->getDevice();
-
-    // 1. Create Descriptor Set Layout
+    // 1. Descriptor Set Layout
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentRadiance
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uMotionVectors
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uHistoryRadiance
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uOutputRadiance
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentNormalDepth
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uPrevNormalDepth
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
-    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_atrousDescLayout);
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_temporalAccumDescSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation descriptor set layout");
+    }
 
-    // 2. Allocate Ping-Pong and Tonemap Descriptor Sets
-    std::array<VkDescriptorSetLayout, 3> atrousLayouts = { m_atrousDescLayout, m_atrousDescLayout, m_atrousDescLayout };
+    // 2. Descriptor Pool (2 temporal sets + 2 tonemap temporal sets)
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = 4;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_temporalAccumDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation descriptor pool");
+    }
+
+    // Allocate temporal sets
+    std::array<VkDescriptorSetLayout, 2> tempLayouts = { m_temporalAccumDescSetLayout, m_temporalAccumDescSetLayout };
     VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 3;
-    allocInfo.pSetLayouts = atrousLayouts.data();
-    vkAllocateDescriptorSets(device, &allocInfo, m_atrousDescSets.data());
+    allocInfo.descriptorPool = m_temporalAccumDescPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = tempLayouts.data();
+    if (vkAllocateDescriptorSets(device, &allocInfo, m_temporalAccumDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Temporal Accumulation descriptor sets");
+    }
 
-    std::array<VkDescriptorSetLayout, 2> tonemapLayouts = { m_tonemapDescLayout, m_tonemapDescLayout };
-    VkDescriptorSetAllocateInfo tonemapAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    tonemapAllocInfo.descriptorPool = m_descriptorPool;
-    tonemapAllocInfo.descriptorSetCount = 2;
-    tonemapAllocInfo.pSetLayouts = tonemapLayouts.data();
-    vkAllocateDescriptorSets(device, &tonemapAllocInfo, m_tonemapAtrousDescSets.data());
+    // Allocate tonemap descriptor sets
+    std::array<VkDescriptorSetLayout, 2> tmLayouts = { m_tonemapDescLayout, m_tonemapDescLayout };
+    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    tmAllocInfo.descriptorPool = m_temporalAccumDescPool;
+    tmAllocInfo.descriptorSetCount = 2;
+    tmAllocInfo.pSetLayouts = tmLayouts.data();
+    if (vkAllocateDescriptorSets(device, &tmAllocInfo, m_tonemapTemporalDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Tonemap Temporal descriptor sets");
+    }
 
-    // 3. Create Pipeline Layout
+    // 3. Pipeline Layout
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 3 + sizeof(float) * 3 + sizeof(uint32_t) * 2;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 3 + sizeof(uint32_t) * 3;
 
-    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plInfo.setLayoutCount = 1;
-    plInfo.pSetLayouts = &m_atrousDescLayout;
-    plInfo.pushConstantRangeCount = 1;
-    plInfo.pPushConstantRanges = &pcRange;
-    vkCreatePipelineLayout(device, &plInfo, nullptr, &m_atrousPipelineLayout);
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_temporalAccumDescSetLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_temporalAccumPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Temporal Accumulation pipeline layout");
+    }
 
-    // 4. Create Compute Pipeline
-    auto shaderCode = loadShaderSPIRV("atrous_denoise.comp.spv");
-    VkShaderModule shaderModule = createShaderModule(shaderCode);
+    // 4. Compute Pipeline
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+    };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto code = loadShaderSPIRV("temporal_accum.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(code);
+
     VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-    pipeInfo.layout = m_atrousPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_atrousPipeline);
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_temporalAccumPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_temporalAccumPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, shaderModule, nullptr);
+        throw std::runtime_error("Failed to create Temporal Accumulation pipeline");
+    }
     vkDestroyShaderModule(device, shaderModule, nullptr);
 
-    Logger::info("A-Trous Wavelet diffuse denoiser pipeline created successfully.");
+    Logger::info("Temporal Radiance Accumulation pipeline (Wave32) created successfully.");
 }
 
-void Engine::destroyAtrousPipelines() {
+void Engine::destroyTemporalAccumPipelines() {
     VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
     if (!device) return;
 
-    if (m_atrousPipeline) { vkDestroyPipeline(device, m_atrousPipeline, nullptr); m_atrousPipeline = VK_NULL_HANDLE; }
-    if (m_atrousPipelineLayout) { vkDestroyPipelineLayout(device, m_atrousPipelineLayout, nullptr); m_atrousPipelineLayout = VK_NULL_HANDLE; }
-    if (m_atrousDescLayout) { vkDestroyDescriptorSetLayout(device, m_atrousDescLayout, nullptr); m_atrousDescLayout = VK_NULL_HANDLE; }
-    m_atrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
-    m_tonemapAtrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    if (m_temporalAccumPipeline) {
+        vkDestroyPipeline(device, m_temporalAccumPipeline, nullptr);
+        m_temporalAccumPipeline = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_temporalAccumPipelineLayout, nullptr);
+        m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumDescPool) {
+        vkDestroyDescriptorPool(device, m_temporalAccumDescPool, nullptr);
+        m_temporalAccumDescPool = VK_NULL_HANDLE;
+    }
+    if (m_temporalAccumDescSetLayout) {
+        vkDestroyDescriptorSetLayout(device, m_temporalAccumDescSetLayout, nullptr);
+        m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
+    }
+    m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 }
 
-void Engine::createAtrousResources() {
+void Engine::createTemporalAccumResources() {
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
     uint32_t w = m_config.width;
     uint32_t h = m_config.height;
 
-    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
 
     for (int i = 0; i < 2; ++i) {
-        m_atrousPingPong[i] = std::make_unique<Image>(device, allocator, w, h,
-            accumFmt,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        m_temporalHistory[i] = std::make_unique<Image>(
+            device, allocator, w, h,
+            format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
     }
 
-    VkCommandBuffer cmd = m_commandBuffers[0];
-    vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
     for (int i = 0; i < 2; ++i) {
-        m_atrousPingPong[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        m_temporalHistory[i]->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
     }
-    vkEndCommandBuffer(cmd);
+
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
-    updateAtrousDescriptors();
-    Logger::info("A-Trous Wavelet diffuse denoiser resources allocated successfully.");
+    m_temporalPingPong = 0;
+    m_temporalResetRequested = true;
+
+    updateTemporalAccumDescriptors();
 }
 
-void Engine::destroyAtrousResources() {
-    m_atrousPingPong[0].reset();
-    m_atrousPingPong[1].reset();
+void Engine::destroyTemporalAccumResources() {
+    m_temporalHistory[0].reset();
+    m_temporalHistory[1].reset();
 }
 
-void Engine::updateAtrousDescriptors() {
-    if (m_atrousDescSets[0] == VK_NULL_HANDLE || !m_atrousPingPong[0] || !m_atrousPingPong[1] ||
-        !m_accumImage || !m_normalDepthImage || !m_outputImage) {
+void Engine::updateTemporalAccumDescriptors() {
+    if (!m_temporalAccumDescPool || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_motionVectorImage || !m_outputImage) {
         return;
     }
 
     VkDevice device = m_context->getDevice();
 
     VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pingInfo{ VK_NULL_HANDLE, m_atrousPingPong[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pongInfo{ VK_NULL_HANDLE, m_atrousPingPong[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo currNdInfo{ VK_NULL_HANDLE, m_normalDepthImage ? m_normalDepthImage->getImageView() : m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevNdInfo{ VK_NULL_HANDLE, m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : currNdInfo.imageView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
     std::vector<VkWriteDescriptorSet> writes;
 
-    // Set 0: accum -> ping
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
+    // Set 0: accum + mv + hist0 (in) -> hist1 (out) + currNd + prevNd
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
 
-    // Set 1: ping -> pong
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
+    // Set 1: accum + mv + hist1 (in) -> hist0 (out) + currNd + prevNd
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
 
-    // Set 2: pong -> ping
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_atrousDescSets[2], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
+    // Tonemap Set 0: hist0 -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
 
-    // Tonemap descriptor sets:
-    // [0]: ping -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
-
-    // [1]: pong -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pongInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapAtrousDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
+    // Tonemap Set 1: hist1 -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-uint32_t Engine::dispatchAtrous(VkCommandBuffer cmd) {
-    if (!m_config.enable_atrous || !m_atrousPipeline || m_config.atrous_passes == 0) {
-        return 0; // indicates A-Trous not run
+uint32_t Engine::dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory) {
+    if (!m_config.enable_temporal_accum || m_config.denoiser_mode == DenoiserMode::None || !m_temporalAccumPipeline) {
+        return 0; // indicates temporal accum not run
     }
 
-    uint32_t passes = std::clamp(m_config.atrous_passes, 1u, 5u);
-    uint32_t groupsX = (m_config.width + 15) / 16;
-    uint32_t groupsY = (m_config.height + 15) / 16;
+    uint32_t inSlot = m_temporalPingPong;
+    uint32_t outSlot = 1 - m_temporalPingPong;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipelineLayout, 0, 1, &m_temporalAccumDescSets[inSlot], 0, nullptr);
 
-    struct AtrousPushConstants {
-        int32_t imageWidth;
-        int32_t imageHeight;
-        int32_t stepSize;
-        float normalPower;
-        float depthSigma;
-        float colorPhi;
+    struct TemporalAccumPushConstants {
+        int32_t imageSize[2];
+        float invImageSize[2];
+        float clampingGamma;
+        float outlierH;
+        float maxHistorySamples;
+        uint32_t resetHistory;
+        uint32_t cameraMoved;
         uint32_t totalSamples;
-        uint32_t isFirstPass;
     } pc;
 
-    pc.imageWidth = static_cast<int32_t>(m_config.width);
-    pc.imageHeight = static_cast<int32_t>(m_config.height);
-    pc.normalPower = m_config.atrous_normal_power;
-    pc.depthSigma = m_config.atrous_depth_sigma;
-    pc.colorPhi = 4.0f;
+    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
+    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
+    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
+    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
+    pc.clampingGamma = m_config.temporal_clamping_gamma;
+    pc.outlierH = m_config.temporal_outlier_h;
+    pc.maxHistorySamples = static_cast<float>(m_config.temporal_max_history);
+    pc.resetHistory = resetHistory ? 1u : 0u;
+    pc.cameraMoved = m_cameraMovedLastFrame ? 1u : 0u;
+    pc.totalSamples = m_accumulatedSamples;
 
-    VkMemoryBarrier2 passBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    passBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    passBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    passBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    passBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    vkCmdPushConstants(cmd, m_temporalAccumPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    VkDependencyInfo passDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    passDep.memoryBarrierCount = 1;
-    passDep.pMemoryBarriers = &passBarrier;
+    uint32_t groupsX = (m_config.width + 15) / 16;
+    uint32_t groupsY = (m_config.height + 15) / 16;
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-    for (uint32_t k = 0; k < passes; ++k) {
-        pc.stepSize = 1 << k;
-        pc.isFirstPass = (k == 0) ? 1u : 0u;
-        pc.totalSamples = (k == 0) ? m_accumulatedSamples : 1u;
+    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.image = m_temporalHistory[outSlot]->getImage();
+    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        uint32_t descSetIdx;
-        if (k == 0) {
-            descSetIdx = 0; // m_accumImage -> pingPong[0]
-        } else if (k % 2 == 1) {
-            descSetIdx = 1; // pingPong[0] -> pingPong[1]
-        } else {
-            descSetIdx = 2; // pingPong[1] -> pingPong[0]
-        }
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
 
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipelineLayout, 0, 1, &m_atrousDescSets[descSetIdx], 0, nullptr);
-        vkCmdPushConstants(cmd, m_atrousPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    // Copy current frame normal and depth to previous buffer for next frame's disocclusion testing
+    if (m_normalDepthImage && m_prevNormalDepthImage) {
+        VkImageCopy copyRegion{};
+        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.extent = { m_config.width, m_config.height, 1 };
 
-        vkCmdPipelineBarrier2(cmd, &passDep);
+        VkImageMemoryBarrier2 preCopyBarriers[2] = {};
+        preCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].image = m_normalDepthImage->getImage();
+        preCopyBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        preCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        preCopyBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        preCopyBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].image = m_prevNormalDepthImage->getImage();
+        preCopyBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preDep.imageMemoryBarrierCount = 2;
+        preDep.pImageMemoryBarriers = preCopyBarriers;
+        vkCmdPipelineBarrier2(cmd, &preDep);
+
+        vkCmdCopyImage(cmd,
+            m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            m_prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            1, &copyRegion);
+
+        VkImageMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.image = m_prevNormalDepthImage->getImage();
+        postCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postDep.imageMemoryBarrierCount = 1;
+        postDep.pImageMemoryBarriers = &postCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &postDep);
     }
 
-    uint32_t finalIdx = (passes - 1) % 2;
-    return finalIdx + 1; // 1 => pingPong[0], 2 => pingPong[1]
+    m_temporalPingPong = outSlot;
+    return outSlot + 1; // 1 => history[0], 2 => history[1]
+}
+
+void Engine::createBmfrPipelines() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Descriptor Set Layout
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uInputRadiance
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uNormalDepth
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uOutputRadiance
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_bmfrDescSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR descriptor set layout");
+    }
+
+    // 2. Descriptor Pool (2 temporal sets + 1 raw set + 1 tonemap set)
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = 4;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_bmfrDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR descriptor pool");
+    }
+
+    // Allocate BMFR sets (2 for history ping-pong)
+    std::array<VkDescriptorSetLayout, 2> bmfrLayouts = { m_bmfrDescSetLayout, m_bmfrDescSetLayout };
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_bmfrDescPool;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = bmfrLayouts.data();
+    if (vkAllocateDescriptorSets(device, &allocInfo, m_bmfrDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate BMFR descriptor sets");
+    }
+
+    VkDescriptorSetAllocateInfo rawAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    rawAllocInfo.descriptorPool = m_bmfrDescPool;
+    rawAllocInfo.descriptorSetCount = 1;
+    rawAllocInfo.pSetLayouts = &m_bmfrDescSetLayout;
+    if (vkAllocateDescriptorSets(device, &rawAllocInfo, &m_bmfrRawDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate BMFR raw descriptor set");
+    }
+
+    // Allocate Tonemap BMFR set
+    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    tmAllocInfo.descriptorPool = m_bmfrDescPool;
+    tmAllocInfo.descriptorSetCount = 1;
+    tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
+    if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapBmfrDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Tonemap BMFR descriptor set");
+    }
+
+    // 3. Pipeline Layout
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 2;
+
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_bmfrDescSetLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_bmfrPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create BMFR pipeline layout");
+    }
+
+    // 4. Compute Pipeline
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+    };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto code = loadShaderSPIRV("bmfr_regression.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(code);
+
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_bmfrPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_bmfrPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, shaderModule, nullptr);
+        throw std::runtime_error("Failed to create BMFR pipeline");
+    }
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    Logger::info("Blockwise Multi-Order Feature Regression (BMFR) pipeline (Wave32) created successfully.");
+}
+
+void Engine::destroyBmfrPipelines() {
+    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
+    if (!device) return;
+
+    if (m_bmfrPipeline) {
+        vkDestroyPipeline(device, m_bmfrPipeline, nullptr);
+        m_bmfrPipeline = VK_NULL_HANDLE;
+    }
+    if (m_bmfrPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_bmfrPipelineLayout, nullptr);
+        m_bmfrPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_bmfrDescPool) {
+        vkDestroyDescriptorPool(device, m_bmfrDescPool, nullptr);
+        m_bmfrDescPool = VK_NULL_HANDLE;
+    }
+    if (m_bmfrDescSetLayout) {
+        vkDestroyDescriptorSetLayout(device, m_bmfrDescSetLayout, nullptr);
+        m_bmfrDescSetLayout = VK_NULL_HANDLE;
+    }
+    m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_bmfrRawDescSet = VK_NULL_HANDLE;
+    m_tonemapBmfrDescSet = VK_NULL_HANDLE;
+}
+
+void Engine::createBmfrResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    uint32_t w = m_config.width;
+    uint32_t h = m_config.height;
+
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+
+    m_bmfrOutputImage = std::make_unique<Image>(
+        device, allocator, w, h,
+        format,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+    m_bmfrOutputImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &m_commandBuffers[0];
+    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+
+    updateBmfrDescriptors();
+}
+
+void Engine::destroyBmfrResources() {
+    m_bmfrOutputImage.reset();
+}
+
+void Engine::updateBmfrDescriptors() {
+    if (!m_bmfrDescPool || !m_bmfrOutputImage || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_normalDepthImage || !m_outputImage) {
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+
+    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo rawInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo ndInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo bmfrOutInfo{ VK_NULL_HANDLE, m_bmfrOutputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::vector<VkWriteDescriptorSet> writes;
+
+    // BMFR Set 0: hist0 -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // BMFR Set 1: hist1 -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // BMFR Raw Set: accumImage -> bmfrOut
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+
+    // Tonemap BMFR Set: bmfrOut -> output
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
+    if ((!m_config.enable_bmfr && m_config.denoiser_mode != DenoiserMode::BMFR) || !m_bmfrPipeline || !m_bmfrOutputImage || !m_normalDepthImage) {
+        return false;
+    }
+
+    VkDescriptorSet targetDescSet = VK_NULL_HANDLE;
+    if (temporalSlot == 1) {
+        targetDescSet = m_bmfrDescSets[0];
+    } else if (temporalSlot == 2) {
+        targetDescSet = m_bmfrDescSets[1];
+    } else {
+        targetDescSet = m_bmfrRawDescSet;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipelineLayout, 0, 1, &targetDescSet, 0, nullptr);
+
+    struct BmfrPushConstants {
+        int32_t imageSize[2];
+        float invImageSize[2];
+        float lambda;
+        float maxDepth;
+        uint32_t tileSize;
+        uint32_t pad;
+    } pc;
+
+    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
+    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
+    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
+    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
+    pc.lambda = 0.05f;
+    pc.maxDepth = 50.0f;
+    pc.tileSize = 8;
+    pc.pad = 0;
+
+    vkCmdPushConstants(cmd, m_bmfrPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groupsX = (m_config.width + 7) / 8;
+    uint32_t groupsY = (m_config.height + 7) / 8;
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarrier.image = m_bmfrOutputImage->getImage();
+    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    return true;
 }
 
 void Engine::updateSceneDescriptors() {
@@ -2112,13 +2305,6 @@ void Engine::updateSceneDescriptors() {
         }
     }
 
-    VkDescriptorBufferInfo res0Info{};
-    VkDescriptorBufferInfo res1Info{};
-    if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
-        res0Info = { m_restirReservoirs[0]->getBuffer(), 0, m_restirReservoirs[0]->getSize() };
-        res1Info = { m_restirReservoirs[1]->getBuffer(), 0, m_restirReservoirs[1]->getSize() };
-    }
-
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_rtDescSets[i] == VK_NULL_HANDLE) continue;
@@ -2129,10 +2315,6 @@ void Engine::updateSceneDescriptors() {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
-        }
         VkDescriptorImageInfo bnInfo = m_blueNoiseTexture ? m_blueNoiseTexture->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &bnInfo, nullptr, nullptr });
     }
@@ -2158,6 +2340,10 @@ void Engine::updateWavefrontSceneDescriptors() {
         }
     }
 
+    VkBuffer nrcQueryBuf = m_nrcManager ? m_nrcManager->getQueryQueue()->getBuffer() : VK_NULL_HANDLE;
+    VkBuffer nrcTrainBuf = m_nrcManager ? m_nrcManager->getTrainQueue()->getBuffer() : VK_NULL_HANDLE;
+    VkBuffer nrcCountBuf = m_nrcManager ? m_nrcManager->getCounters()->getBuffer() : VK_NULL_HANDLE;
+
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         if (!m_cameraUBOs[slot]) continue;
         m_wavefrontPipeline->updateSceneDescriptors(
@@ -2170,56 +2356,18 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_lightBuffer->getBuffer(), m_lightBuffer->getSize(),
             tlasHandle,
             envInfo,
-            texInfos
+            texInfos,
+            nrcQueryBuf,
+            nrcTrainBuf,
+            nrcCountBuf,
+            m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE,
+            m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE
         );
     }
-}
 
-void Engine::initReSTIRBuffers() {
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
-    VmaAllocator allocator = m_context->getAllocator();
-
-    for (uint32_t i = 0; i < 2; ++i) {
-        m_restirReservoirs[i] = std::make_unique<Buffer>(
-            allocator, resSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
+    if (m_nrcManager && m_accumImage) {
+        m_nrcManager->updateDescriptors(m_accumImage->getImageView());
     }
-    m_restirPingPongIndex = 0;
-
-    // Clear reservoir buffers to 0 using a one-time command
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[0]->getBuffer(), 0, resSize, 0);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[1]->getBuffer(), 0, resSize, 0);
-    vkEndCommandBuffer(m_commandBuffers[0]);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-}
-
-void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
-    if (m_rtDescSets[frameSlot] == VK_NULL_HANDLE || !m_restirReservoirs[0] || !m_restirReservoirs[1]) {
-        return;
-    }
-    VkDevice device = m_context->getDevice();
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
-
-    VkDescriptorBufferInfo curInfo{ m_restirReservoirs[m_restirPingPongIndex]->getBuffer(), 0, resSize };
-    VkDescriptorBufferInfo histInfo{ m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(), 0, resSize };
-
-    std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
-    };
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void Engine::updateMergeDescriptors() {
@@ -2263,6 +2411,213 @@ void Engine::updateMergeDescriptors() {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr }
         };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
+    }
+}
+
+void Engine::initTlasBuffers(uint32_t instanceCount) {
+    if (!m_asManager || instanceCount == 0) return;
+    m_tlasInstanceCount = instanceCount;
+    VmaAllocator allocator = m_context->getAllocator();
+    VkDevice device = m_context->getDevice();
+
+    // 1. Device-local TLAS Instance Buffer (64 bytes per VkAccelerationStructureInstanceKHR)
+    VkDeviceSize instanceBufferSize = sizeof(VkAccelerationStructureInstanceKHR) * instanceCount;
+    m_tlasInstanceBuffer = std::make_unique<Buffer>(
+        allocator, instanceBufferSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // 2. Host-visible GPU Instance Data Buffer (96 bytes per ASInstanceGPUData)
+    VkDeviceSize inputBufferSize = sizeof(ASInstanceGPUData) * instanceCount;
+    m_tlasInputInstancesBuffer = std::make_unique<Buffer>(
+        allocator, inputBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    // 3. Device-local Scratch Buffer (aligned to 256 bytes)
+    auto sizeInfo = m_asManager->getTLASBuildSizes(instanceCount);
+    VkDeviceSize scratchSize = std::max(sizeInfo.buildScratchSize, sizeInfo.updateScratchSize);
+    if (scratchSize > 0) {
+        scratchSize = (scratchSize + 255) & ~VkDeviceSize(255);
+        m_tlasScratchBuffer = std::make_unique<Buffer>(
+            allocator, scratchSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+            0,
+            256
+        );
+    }
+
+    // 4. Initialize instance 0 with default transform and BLAS address
+    if (m_blas && m_tlasInputInstancesBuffer) {
+        ASInstanceGPUData initData{};
+        initData.transform = glm::mat4(1.0f);
+        initData.customIndex = 0;
+        initData.mask = 0xFF;
+        initData.hitGroupId = 0;
+        initData.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        initData.blasAddress = m_blas->getDeviceAddress();
+        initData.pad0 = 0;
+        initData.pad1 = 0;
+        m_tlasInputInstancesBuffer->copyFrom(&initData, sizeof(ASInstanceGPUData));
+    }
+
+    // 5. Update descriptor set if already created
+    if (m_updateTlasDescSet != VK_NULL_HANDLE && m_tlasInputInstancesBuffer && m_tlasInstanceBuffer) {
+        VkDescriptorBufferInfo inInfo{ m_tlasInputInstancesBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo outInfo{ m_tlasInstanceBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_updateTlasDescSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &inInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_updateTlasDescSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &outInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::initTlasUpdatePipeline() {
+    VkDevice device = m_context->getDevice();
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_updateTlasDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update descriptor set layout!");
+    }
+
+    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 1;
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_updateTlasDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update descriptor pool!");
+    }
+
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_updateTlasDescPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_updateTlasDescLayout;
+    if (vkAllocateDescriptorSets(device, &allocInfo, &m_updateTlasDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate TLAS update descriptor set!");
+    }
+
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(uint32_t) * 2;
+
+    VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &m_updateTlasDescLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &plInfo, nullptr, &m_updateTlasPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create TLAS update pipeline layout!");
+    }
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto compCode = loadShaderSPIRV("update_tlas_instances.comp.spv");
+    VkShaderModule compModule = createShaderModule(compCode);
+
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeInfo.stage.module = compModule;
+    pipeInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        pipeInfo.stage.pNext = &subgroupSize32;
+    }
+    pipeInfo.layout = m_updateTlasPipelineLayout;
+
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_updateTlasPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, compModule, nullptr);
+        throw std::runtime_error("Failed to create TLAS update compute pipeline!");
+    }
+    vkDestroyShaderModule(device, compModule, nullptr);
+
+    if (m_tlasInputInstancesBuffer && m_tlasInstanceBuffer) {
+        VkDescriptorBufferInfo inInfo{ m_tlasInputInstancesBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo outInfo{ m_tlasInstanceBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_updateTlasDescSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &inInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_updateTlasDescSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &outInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+
+    Logger::info("GPU TLAS Instance Writer & Refit Pipeline initialized successfully.");
+}
+
+void Engine::recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode) {
+    if (!m_updateTlasPipeline || !m_tlasInstanceBuffer || !m_tlasScratchBuffer || !m_tlas || m_tlasInstanceCount == 0) {
+        return;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateTlasPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_updateTlasPipelineLayout, 0, 1, &m_updateTlasDescSet, 0, nullptr);
+
+    struct {
+        uint32_t instanceCount;
+        uint32_t updateMode;
+    } pc = { m_tlasInstanceCount, updateMode ? 1u : 0u };
+    vkCmdPushConstants(cmd, m_updateTlasPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groupCountX = (m_tlasInstanceCount + 63) / 64;
+    vkCmdDispatch(cmd, groupCountX, 1, 1);
+
+    m_asManager->recordBuildTLAS(cmd, m_tlasInstanceBuffer.get(), m_tlasInstanceCount, m_tlasScratchBuffer.get(), m_tlas.get(), updateMode);
+    m_tlasGpuUpdateCount++;
+}
+
+void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform) {
+    if (!m_tlasInputInstancesBuffer || index >= m_tlasInstanceCount) {
+        return;
+    }
+    VkDeviceSize offset = index * sizeof(ASInstanceGPUData) + offsetof(ASInstanceGPUData, transform);
+    void* mapped = m_tlasInputInstancesBuffer->map();
+    if (mapped) {
+        std::memcpy(static_cast<char*>(mapped) + offset, &transform, sizeof(glm::mat4));
+        vmaFlushAllocation(m_context->getAllocator(), m_tlasInputInstancesBuffer->getAllocation(), offset, sizeof(glm::mat4));
+        m_tlasNeedsGpuUpdate = true;
     }
 }
 
@@ -2485,7 +2840,19 @@ void Engine::updateInput() {
 }
 
 void Engine::renderFrame() {
-    m_currentFrameStartTime = std::chrono::high_resolution_clock::now();
+    auto frameNow = std::chrono::high_resolution_clock::now();
+    if (m_totalFramesRendered > 0) {
+        double wallIntervalMs = std::chrono::duration<double, std::milli>(frameNow - m_lastWallFrameStartTime).count();
+        if (wallIntervalMs > 0.01 && wallIntervalMs < 1000.0) {
+            m_lastPresentationTimeMs = wallIntervalMs;
+            m_presentationTimesMs.push_back(wallIntervalMs);
+            if (!m_config.headless && m_presentationTimesMs.size() > 60) {
+                m_presentationTimesMs.erase(m_presentationTimesMs.begin());
+            }
+        }
+    }
+    m_lastWallFrameStartTime = frameNow;
+    m_currentFrameStartTime = frameNow;
     VkDevice device = m_context->getDevice();
     VkQueue queue = m_context->getGraphicsQueue();
 
@@ -2512,22 +2879,13 @@ void Engine::renderFrame() {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
+            : (gpuRtMs + gpuTonemapMs);
 
         m_lastGpuRtMs = gpuRtMs;
         m_lastSecGpuMs = secGpuMs;
         m_lastTonemapMs = gpuTonemapMs;
-        if (totalGpuMs > 0.01) {
-            m_lastFrameTimeMs = totalGpuMs;
-            if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
-                m_frameTimesMs.push_back(m_lastFrameTimeMs);
-                if (!m_config.headless && m_frameTimesMs.size() > 60) {
-                    m_frameTimesMs.erase(m_frameTimesMs.begin());
-                }
-                recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
-            }
-        }
-
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
         if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
             if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -2537,6 +2895,25 @@ void Engine::renderFrame() {
                 if (isBenchmarkMilestone || getenv("PATHWAYS_PROFILE_WF")) {
                     m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                 }
+            }
+        }
+
+        if (totalGpuMs > 0.01) {
+            m_lastFrameTimeMs = totalGpuMs;
+            if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
+                m_frameTimesMs.push_back(m_lastFrameTimeMs);
+                if (!m_config.headless && m_frameTimesMs.size() > 60) {
+                    m_frameTimesMs.erase(m_frameTimesMs.begin());
+                }
+                WavefrontStageSample wfSample;
+                if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
+                    wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                    wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
+                    for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                        wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                    }
+                }
+                recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
             }
         }
 
@@ -2662,7 +3039,8 @@ void Engine::renderFrame() {
 
     // Reset accumulation if camera moved or UI settings changed
     m_cameraMovedLastFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
-    bool accumReset = m_cameraMovedLastFrame || m_resetAccumulation || (m_totalFramesRendered == 0);
+    bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
+    bool accumReset = m_cameraMovedLastFrame || hardReset;
     if (accumReset) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
@@ -2688,8 +3066,14 @@ void Engine::renderFrame() {
         activeFractionalSpp = m_governor->getState().fractionalSpp;
         activeBounces = m_governor->getState().currentBounces;
     }
+    bool accumReachedCutoff = (m_config.progressive_accumulation &&
+                               m_config.max_accum_frames > 0 &&
+                               m_accumulatedSamples >= m_config.max_accum_frames);
+    m_accumulationComplete = accumReachedCutoff;
     if (m_config.progressive_accumulation) {
-        m_accumulatedSamples++;
+        if (!accumReachedCutoff) {
+            m_accumulatedSamples++;
+        }
     } else {
         m_accumulatedSamples = 1;
     }
@@ -2702,21 +3086,14 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-    if (m_config.enable_restir_di) {
-        flags |= (1 << 6);
-        if (m_config.enable_restir_spatial) {
-            flags |= (1 << 7);
-            uint32_t samples = std::clamp(m_config.restir_spatial_samples, 1u, 8u);
-            uint32_t radius = std::clamp(static_cast<uint32_t>(std::round(m_config.restir_spatial_radius)), 1u, 64u);
-            flags |= (samples & 0xFu) << 8;
-            flags |= (radius & 0xFFu) << 12;
-        }
-    }
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
     if (m_config.enable_taa) {
         flags |= (1 << 21);
+    }
+    if (accumReset || m_cameraMovedLastFrame) {
+        flags |= (1 << 23); // Camera motion / history reset flag
     }
 
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
@@ -2737,12 +3114,6 @@ void Engine::renderFrame() {
             return;
         }
     }
-
-    // Ping-pong ReSTIR DI reservoir buffers if enabled
-    if (m_config.enable_restir_di) {
-        m_restirPingPongIndex = 1 - m_restirPingPongIndex;
-    }
-    updateReSTIRDescriptors(m_currentFrame);
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -2802,55 +3173,82 @@ void Engine::renderFrame() {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
-        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
-            bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-            if (needAccumReset && m_accumImage) {
-                VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-                VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+        // GPU-Timeline TLAS Update / Refit (Tier 3)
+        if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
+            recordGpuTlasUpdate(cmd, true);
+            m_tlasNeedsGpuUpdate = false;
+        }
 
-                VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                clearBarrier.image = m_accumImage->getImage();
-                clearBarrier.subresourceRange = clearRange;
+        if (!accumReachedCutoff) {
+            bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
+            if (useWavefront) {
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->resetCounters(cmd);
+                }
 
-                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                clearDep.imageMemoryBarrierCount = 1;
-                clearDep.pImageMemoryBarriers = &clearBarrier;
-                vkCmdPipelineBarrier2(cmd, &clearDep);
-            }
+                bool needAccumReset = accumReset || !m_config.progressive_accumulation;
+                if (needAccumReset && m_accumImage) {
+                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
 
-            WavefrontSceneData wfSceneData{};
-            wfSceneData.numTriangles = m_numTriangles;
-            wfSceneData.numSpheres = m_numSpheres;
-            wfSceneData.numMaterials = m_numMaterials;
-            wfSceneData.numLights = m_numLights;
-            wfSceneData.hasEnvMap = hasEnvMap;
-            wfSceneData.envMapIntensity = envIntensity;
-            wfSceneData.useHardwareRT = useHwRT;
-            wfSceneData.frameIndex = m_frameIndex;
-            wfSceneData.useMorton = 1u;
-            wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
-            wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
-            wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
-            wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.image = m_accumImage->getImage();
+                    clearBarrier.subresourceRange = clearRange;
 
-            m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
-                                             activeSpp, activeBounces, wfSceneData);
-        } else {
+                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    clearDep.imageMemoryBarrierCount = 1;
+                    clearDep.pImageMemoryBarriers = &clearBarrier;
+                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                }
+
+                WavefrontSceneData wfSceneData{};
+                wfSceneData.numTriangles = m_numTriangles;
+                wfSceneData.numSpheres = m_numSpheres;
+                wfSceneData.numMaterials = m_numMaterials;
+                wfSceneData.numLights = m_numLights;
+                wfSceneData.hasEnvMap = hasEnvMap;
+                wfSceneData.envMapIntensity = envIntensity;
+                wfSceneData.useHardwareRT = useHwRT;
+                wfSceneData.frameIndex = m_frameIndex;
+                wfSceneData.useMorton = 1u;
+                wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+                wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+                wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+                wfSceneData.cameraFlags = flags;
+                wfSceneData.enableNrc = m_config.enable_nrc;
+                wfSceneData.nrcBounce = m_config.nrc_bounce;
+                wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
+                                                 activeSpp, activeBounces, wfSceneData);
+
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
+                                                  m_sceneData.boundsMin, m_sceneData.boundsMax);
+                    m_nrcManager->recordTraining(cmd, m_frameIndex,
+                                                 m_sceneData.boundsMin, m_sceneData.boundsMax,
+                                                 1e-3f, 1024);
+                }
+            } else {
             // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
+            uint32_t traceW = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+            uint32_t traceH = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+
             uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
             uint32_t rtPushConstants[16] = {
                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, m_config.width, m_config.height,
+                0, 0, traceW, traceH,
                 useHwRT,
                 hasEnvMap,
                 envIntensityBits,
@@ -2861,7 +3259,7 @@ void Engine::renderFrame() {
             VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
             vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
 
-            m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
+            m_rtpKhrPipeline->traceRays(cmd, traceW, traceH, 1);
         }
         if (m_governor) {
             m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
@@ -2952,83 +3350,7 @@ void Engine::renderFrame() {
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
-        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
-            VkMemoryBarrier2 rtToTaaBarrier{};
-            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo taaDep{};
-            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaDep.memoryBarrierCount = 1;
-            taaDep.pMemoryBarriers = &rtToTaaBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaDep);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
-
-            struct TaaPushConstants {
-                int32_t imageWidth;
-                int32_t imageHeight;
-                float invImageWidth;
-                float invImageHeight;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-                float blendAlpha;
-                float clippingGamma;
-                uint32_t resetHistory;
-                uint32_t isSampleParallel;
-                uint32_t screenWidth;
-            } taaPC;
-            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
-            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
-            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
-            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
-            taaPC.tileOffsetX = 0;
-            taaPC.tileOffsetY = 0;
-            taaPC.tileSize = m_config.tile_size;
-            if (m_config.progressive_accumulation && m_accumulatedSamples > 1) {
-                taaPC.blendAlpha = 1.0f / static_cast<float>(m_accumulatedSamples);
-            } else {
-                taaPC.blendAlpha = m_config.taa_blend_alpha;
-            }
-            taaPC.clippingGamma = m_config.taa_clipping_gamma;
-            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
-            taaPC.isSampleParallel = 0u;
-            taaPC.screenWidth = m_config.width;
-
-            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { m_config.width, m_config.height, 1 };
-
-            VkMemoryBarrier2 taaToCopyBarrier{};
-            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-
-            VkDependencyInfo taaToCopyDep{};
-            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaToCopyDep.memoryBarrierCount = 1;
-            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
-
-            vkCmdCopyImage(cmd,
-                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                1, &copyRegion);
-
-            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
-        }
+        } // end if (!accumReachedCutoff)
 
         VkMemoryBarrier2 memBarrier{};
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -3045,13 +3367,24 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
-        // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = dispatchAtrous(cmd);
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        bool resetTemporal = hardReset || m_temporalResetRequested;
+        m_temporalResetRequested = false;
+        uint32_t temporalOutputSlot = 0;
+        if (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
+            temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+        }
+
+        // Blockwise Multi-Order Feature Regression (BMFR)
+        bool bmfrRun = !accumReachedCutoff ? dispatchBmfr(cmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (atrousOutputSlot > 0) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapAtrousDescSets[atrousOutputSlot - 1], 0, nullptr);
+        if (bmfrRun) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (temporalOutputSlot > 0) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
@@ -3158,10 +3491,12 @@ void Engine::renderFrame() {
         uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (ubo.spp + uboSec.spp) : 0u;
 
         // 1. Launch secondary GPU concurrently for current frame
-        m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
-                                   m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
-                                   hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
-                                   totalCompositeSpp, m_numOpaqueTriangles);
+        if (!accumReachedCutoff) {
+            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+                                       m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
+                                       hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
+                                       totalCompositeSpp, m_numOpaqueTriangles);
+        }
 
         // 2. Concurrently record and execute primary GPU ray tracing asynchronously
         vkResetCommandBuffer(cmd, 0);
@@ -3172,6 +3507,12 @@ void Engine::renderFrame() {
         uint32_t qBase = m_currentFrame * 4;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
+
+        // GPU-Timeline TLAS Update / Refit (Tier 3)
+        if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
+            recordGpuTlasUpdate(cmd, true);
+            m_tlasNeedsGpuUpdate = false;
+        }
 
         uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
         uint32_t rtPushConstants[16] = {
@@ -3189,7 +3530,8 @@ void Engine::renderFrame() {
         };
 
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+        if (!accumReachedCutoff) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
         VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
         vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
@@ -3283,96 +3625,7 @@ void Engine::renderFrame() {
             m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
-        if (m_config.enable_taa && m_taaPipeline && m_motionVectorImage && m_taaHistoryImages[0] && m_taaHistoryImages[1]) {
-            VkMemoryBarrier2 rtToTaaBarrier{};
-            rtToTaaBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToTaaBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-            rtToTaaBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-            rtToTaaBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToTaaBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-
-            VkDependencyInfo taaDep{};
-            taaDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaDep.memoryBarrierCount = 1;
-            taaDep.pMemoryBarriers = &rtToTaaBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaDep);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_taaPipelineLayout, 0, 1, &m_taaDescSets[m_taaPingPongIndex], 0, nullptr);
-
-            struct TaaPushConstants {
-                int32_t imageWidth;
-                int32_t imageHeight;
-                float invImageWidth;
-                float invImageHeight;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-                float blendAlpha;
-                float clippingGamma;
-                uint32_t resetHistory;
-                uint32_t isSampleParallel;
-                uint32_t screenWidth;
-            } taaPC;
-            taaPC.imageWidth = static_cast<int32_t>(m_config.width);
-            taaPC.imageHeight = static_cast<int32_t>(m_config.height);
-            taaPC.invImageWidth = 1.0f / static_cast<float>(m_config.width);
-            taaPC.invImageHeight = 1.0f / static_cast<float>(m_config.height);
-            taaPC.tileOffsetX = tileOffsetX_prim;
-            taaPC.tileOffsetY = tileOffsetY_prim;
-            taaPC.tileSize = m_config.tile_size;
-            if (m_config.progressive_accumulation && m_accumulatedSamples > 1) {
-                taaPC.blendAlpha = 1.0f / static_cast<float>(m_accumulatedSamples);
-            } else {
-                taaPC.blendAlpha = m_config.taa_blend_alpha;
-            }
-            taaPC.clippingGamma = m_config.taa_clipping_gamma;
-            taaPC.resetHistory = (accumReset || m_frameIndex == 0) ? 1u : 0u;
-            taaPC.isSampleParallel = (activeMode == MultiGpuMode::SampleParallel) ? 1u : 0u;
-            taaPC.screenWidth = m_config.width;
-
-            vkCmdPushConstants(cmd, m_taaPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(taaPC), &taaPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Copy resolved output from history image [1 - m_taaPingPongIndex] back to m_accumImage
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { m_config.width, m_config.height, 1 };
-
-            VkMemoryBarrier2 taaToCopyBarrier{};
-            taaToCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            taaToCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            taaToCopyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            taaToCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            taaToCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-
-            VkDependencyInfo taaToCopyDep{};
-            taaToCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            taaToCopyDep.memoryBarrierCount = 1;
-            taaToCopyDep.pMemoryBarriers = &taaToCopyBarrier;
-            vkCmdPipelineBarrier2(cmd, &taaToCopyDep);
-
-            vkCmdCopyImage(cmd,
-                m_taaHistoryImages[1 - m_taaPingPongIndex]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                1, &copyRegion);
-
-            VkMemoryBarrier2 copyToMergeBarrier{};
-            copyToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            copyToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            copyToMergeBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            copyToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            copyToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo copyToMergeDep{};
-            copyToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            copyToMergeDep.memoryBarrierCount = 1;
-            copyToMergeDep.pMemoryBarriers = &copyToMergeBarrier;
-            vkCmdPipelineBarrier2(cmd, &copyToMergeDep);
-
-            m_taaPingPongIndex = 1 - m_taaPingPongIndex;
-        }
+        } // end if (!accumReachedCutoff)
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
@@ -3407,15 +3660,17 @@ void Engine::renderFrame() {
         vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
         // Merge Pass
-        vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-        vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
+        if (!accumReachedCutoff) {
+            vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-        uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
-        vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
+            uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
+            vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
-        uint32_t mergeGroupsX = (m_config.width + 15) / 16;
-        uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
-        vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+            uint32_t mergeGroupsX = (m_config.width + 15) / 16;
+            uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
+            vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+        }
 
         VkMemoryBarrier2 mergeBarrier{};
         mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -3430,13 +3685,21 @@ void Engine::renderFrame() {
         mergeDep.pMemoryBarriers = &mergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-        // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = dispatchAtrous(activeCmd);
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        bool resetTemporal = hardReset || m_temporalResetRequested;
+        m_temporalResetRequested = false;
+        uint32_t temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
+
+        // Blockwise Multi-Order Feature Regression (BMFR)
+        bool bmfrRun = dispatchBmfr(activeCmd, temporalOutputSlot);
 
         // Tonemapping
         vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (atrousOutputSlot > 0) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapAtrousDescSets[atrousOutputSlot - 1], 0, nullptr);
+        if (bmfrRun) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (temporalOutputSlot > 0) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
@@ -3657,7 +3920,7 @@ void Engine::renderFrame() {
     vkEndCommandBuffer(activeCmd);
 
     // Wait for secondary GPU completion of slot and PCIe transfer (if MGPU)
-    if (isMgpu) {
+    if (isMgpu && !accumReachedCutoff) {
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         m_mgpu->syncAndTransfer(slot, dstHost, frameBytes);
     }
@@ -3675,7 +3938,7 @@ void Engine::renderFrame() {
         waitSemaphores.push_back(m_rtCompleteSemaphores[m_currentFrame]);
         waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-        if (m_mgpu->isCrossGpuSyncActive()) {
+        if (m_mgpu->isCrossGpuSyncActive() && !accumReachedCutoff) {
             uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
             VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
             if (secSem != VK_NULL_HANDLE) {
@@ -3801,7 +4064,14 @@ void Engine::dumpOutputFiles() {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
+            : (gpuRtMs + gpuTonemapMs);
+
+        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
+            uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
+            m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
+        }
 
         if (totalGpuMs > 0.01) {
             m_lastGpuRtMs = gpuRtMs;
@@ -3809,13 +4079,17 @@ void Engine::dumpOutputFiles() {
             m_lastTonemapMs = gpuTonemapMs;
             m_lastFrameTimeMs = totalGpuMs;
             m_frameTimesMs.push_back(m_lastFrameTimeMs);
-            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs);
-        }
-    }
 
-    if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
-        uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
-        m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
+            WavefrontStageSample wfSample;
+            if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
+                wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
+                for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                }
+            }
+            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
+        }
     }
 
     // 1. Dump LDR PNG
@@ -3950,10 +4224,23 @@ FrameStats Engine::getStats() const {
     stats.spp = m_config.spp;
     stats.total_frames = m_totalFramesRendered;
     stats.total_samples = m_accumulatedSamples;
+    stats.max_accum_frames = m_config.max_accum_frames;
+    stats.accumulation_complete = m_accumulationComplete;
     stats.validation_errors = m_context->getValidationErrors();
 
     stats.current_frame_time_ms = m_lastFrameTimeMs;
     stats.current_fps = m_lastFrameTimeMs > 0.0001 ? (1000.0 / m_lastFrameTimeMs) : 0.0;
+
+    stats.presentation_time_ms = m_lastPresentationTimeMs;
+    stats.presentation_fps = m_lastPresentationTimeMs > 0.0001 ? (1000.0 / m_lastPresentationTimeMs) : stats.current_fps;
+
+    if (!m_presentationTimesMs.empty()) {
+        double pSum = std::accumulate(m_presentationTimesMs.begin(), m_presentationTimesMs.end(), 0.0);
+        double avgPresTime = pSum / m_presentationTimesMs.size();
+        stats.avg_presentation_fps = avgPresTime > 0.0001 ? (1000.0 / avgPresTime) : stats.presentation_fps;
+    } else {
+        stats.avg_presentation_fps = stats.presentation_fps;
+    }
 
     stats.target_fps = m_config.target_fps;
     stats.adaptive_spp = m_config.adaptive_spp;
@@ -4189,8 +4476,62 @@ FrameStats Engine::getStats() const {
         s.tonemap_time_ms = tally.getAvgTonemapMs();
         s.gigarays_per_second = tally.getRayThroughput() * 1e-9;
         s.target_achieved = tally.isTargetAchieved();
+
+        if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
+            s.pipeline_stages.is_wavefront = true;
+            s.pipeline_stages.classify_ms = tally.getAvgClassifyMs();
+            s.pipeline_stages.primary_rays = tally.getAvgPrimaryRays();
+            s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
+            auto bounces = tally.getAvgBounces();
+            for (const auto& b : bounces) {
+                FrameStats::StageBounceSummary sb;
+                sb.bounce = b.bounce;
+                sb.shade_ms = b.shadeMs;
+                sb.shadow_ms = b.shadowMs;
+                sb.intersect_ms = b.intersectMs;
+                sb.total_bounce_ms = b.totalMs;
+                sb.active_rays = b.activeCount;
+                sb.rays_left = b.nextCount;
+                sb.shadow_rays = b.shadowCount;
+                s.pipeline_stages.bounces.push_back(sb);
+            }
+        } else {
+            s.pipeline_stages.is_wavefront = false;
+            s.pipeline_stages.ray_tracing_pass_ms = tally.getAvgPrimaryRtMs();
+            s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
+        }
+
+        s.blas_build_time_ms = tally.blasBuildTimeMs;
+        s.blas_size_kb = tally.blasSizeKb;
+        s.blas_triangles = tally.blasTriangles;
+        s.tlas_build_time_ms = tally.tlasBuildTimeMs;
+        s.tlas_size_kb = tally.tlasSizeKb;
+        s.tlas_instances = tally.tlasInstances;
+        s.sec_blas_build_time_ms = tally.secBlasBuildTimeMs;
+        s.sec_blas_size_kb = tally.secBlasSizeKb;
+        s.sec_tlas_build_time_ms = tally.secTlasBuildTimeMs;
+        s.sec_tlas_size_kb = tally.secTlasSizeKb;
+        s.tlas_gpu_updates = tally.tlasGpuUpdateCount;
+
         stats.configurations_breakdown.push_back(std::move(s));
     }
+
+    if (m_asManager) {
+        stats.blas_build_time_ms = m_asManager->getLastBlasBuildTimeMs();
+        stats.blas_size_kb = m_asManager->getBlasSizeKb();
+        stats.blas_triangles = m_asManager->getBlasTriangles();
+        stats.tlas_build_time_ms = m_asManager->getLastTlasBuildTimeMs();
+        stats.tlas_size_kb = m_asManager->getTlasSizeKb();
+        stats.tlas_instances = m_asManager->getTlasInstances();
+    }
+    if (m_mgpu && m_mgpu->getSecondaryAsManager()) {
+        auto* secAs = m_mgpu->getSecondaryAsManager();
+        stats.sec_blas_build_time_ms = secAs->getLastBlasBuildTimeMs();
+        stats.sec_blas_size_kb = secAs->getBlasSizeKb();
+        stats.sec_tlas_build_time_ms = secAs->getLastTlasBuildTimeMs();
+        stats.sec_tlas_size_kb = secAs->getTlasSizeKb();
+    }
+    stats.tlas_gpu_updates = m_tlasGpuUpdateCount;
 
     return stats;
 }
@@ -4274,6 +4615,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    m_motionVectorImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
     // Transition images to GENERAL layout
     vkResetCommandBuffer(m_commandBuffers[0], 0);
     VkCommandBufferBeginInfo beginInfo{};
@@ -4293,6 +4640,13 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    m_motionVectorImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+
     vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkSubmitInfo submitInfo{};
@@ -4302,44 +4656,23 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
-    // 4. Recreate ReSTIR DI Buffers
-    initReSTIRBuffers();
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        updateReSTIRDescriptors(i);
-    }
-
     // 5. Resize secondary GPU if active before updating merge descriptor set
     if (m_mgpu && m_mgpu->isMultiGpuActive()) {
         m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    // 6. Recreate Shadow Denoiser & TAA Resources, update all image descriptors and multi-GPU merge descriptors
-    if (m_trainingTensorBuffer) {
-        VkDeviceSize tensorBufferSize = m_config.capture_training_data ?
-            (static_cast<VkDeviceSize>(m_config.width) * m_config.height * 16 * sizeof(uint16_t)) : 256;
-        m_trainingTensorBuffer = std::make_unique<Buffer>(
-            allocator, tensorBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-        if (m_config.capture_training_data) {
-            m_trainingStagingBuffer = std::make_unique<Buffer>(
-                allocator, tensorBufferSize,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-            );
-        }
-    }
-
     destroyShadowDenoiserResources();
     createShadowDenoiserResources();
-    destroyTaaResources();
-    createTaaResources();
-    destroyAtrousResources();
-    createAtrousResources();
+    destroyTemporalAccumResources();
+    createTemporalAccumResources();
+    destroyBmfrResources();
+    createBmfrResources();
     updateAllImageDescriptors();
     updateMergeDescriptors();
+
+    if (m_nrcManager) {
+        m_nrcManager->resize(m_config.width, m_config.height);
+    }
 
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->resize(m_config.width, m_config.height, m_config.wavefront_tile_size);
@@ -4375,11 +4708,15 @@ std::string Engine::getActiveSceneName() const {
     return SceneRegistry::formatSceneName(p.stem().string());
 }
 
-void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs) {
+void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
+                              const WavefrontStageSample* wfSample) {
     ConfigKey key;
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
+    key.denoiser = (m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR :
+                   (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None ? DenoiserMode::Temporal : DenoiserMode::None);
+    key.enable_nrc = m_config.enable_nrc;
     key.width = m_config.width;
     key.height = m_config.height;
     key.spp = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentSpp : m_config.spp;
@@ -4387,14 +4724,35 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.accum_format = m_config.accum_format;
     key.tile_size = m_config.tile_size;
 
+    auto updateAsMetrics = [this](ConfigStatsTally& t) {
+        if (m_asManager) {
+            t.blasBuildTimeMs = m_asManager->getLastBlasBuildTimeMs();
+            t.blasSizeKb = m_asManager->getBlasSizeKb();
+            t.blasTriangles = m_asManager->getBlasTriangles();
+            t.tlasBuildTimeMs = m_asManager->getLastTlasBuildTimeMs();
+            t.tlasSizeKb = m_asManager->getTlasSizeKb();
+            t.tlasInstances = m_asManager->getTlasInstances();
+        }
+        if (m_mgpu && m_mgpu->getSecondaryAsManager()) {
+            auto* secAs = m_mgpu->getSecondaryAsManager();
+            t.secBlasBuildTimeMs = secAs->getLastBlasBuildTimeMs();
+            t.secBlasSizeKb = secAs->getBlasSizeKb();
+            t.secTlasBuildTimeMs = secAs->getLastTlasBuildTimeMs();
+            t.secTlasSizeKb = secAs->getTlasSizeKb();
+        }
+        t.tlasGpuUpdateCount = m_tlasGpuUpdateCount;
+    };
+
     for (auto& tally : m_configTallies) {
         if (tally.key == key) {
-            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+            updateAsMetrics(tally);
             return;
         }
     }
     ConfigStatsTally newTally(key);
-    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs);
+    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+    updateAsMetrics(newTally);
     m_configTallies.push_back(std::move(newTally));
 }
 
@@ -4406,49 +4764,90 @@ void Engine::printExecutionSummary() const {
         return;
     }
 
-    Logger::info("  Execution Summary (Tallied Across {} Unique Configuration{}):",
+    Logger::info("  Pathways Hybrid Path Tracing Engine - Execution Summary ({} Configuration{})",
                  m_configTallies.size(), m_configTallies.size() == 1 ? "" : "s");
-    Logger::info("----------------------------------------------------------------------------------------");
+    Logger::info("========================================================================================");
 
     for (size_t i = 0; i < m_configTallies.size(); ++i) {
         const auto& tally = m_configTallies[i];
         Logger::info("  [Config {}/{}] {}", i + 1, m_configTallies.size(), tally.label);
-        if (m_config.warmup_frames > 0) {
-            Logger::info("    Rendered Frames:     {} (excluding {} warmup frames)", tally.frameCount, m_config.warmup_frames);
-        } else {
-            Logger::info("    Rendered Frames:     {}", tally.frameCount);
+        Logger::info("    Frames Sampled:      {}", tally.frameCount);
+        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
+        Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
+        Logger::info("    Acceleration Structures:");
+        Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
+                     tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        Logger::info("      - TLAS Build:        {:.3f} ms ({:.2f} KB, {} Instance{})",
+                     tally.tlasBuildTimeMs, tally.tlasSizeKb, tally.tlasInstances, tally.tlasInstances == 1 ? "" : "s");
+        if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.secBlasBuildTimeMs > 0.0) {
+            Logger::info("      - Secondary BLAS:    {:.3f} ms ({:.2f} KB)",
+                         tally.secBlasBuildTimeMs, tally.secBlasSizeKb);
+            Logger::info("      - Secondary TLAS:    {:.3f} ms ({:.2f} KB)",
+                         tally.secTlasBuildTimeMs, tally.secTlasSizeKb);
         }
-        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS) [Min: {:.3f} ms, Max: {:.3f} ms]",
-                     tally.getAvgFrameTimeMs(), tally.getAvgFps(), tally.minFrameTimeMs, tally.maxFrameTimeMs);
+        Logger::info("      - GPU TLAS Updates:  {} update{}",
+                     tally.tlasGpuUpdateCount, tally.tlasGpuUpdateCount == 1 ? "" : "s");
 
-        if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.getAvgSecondaryRtMs() > 0.001) {
-            Logger::info("    GPU Breakdown:       GPU 0: {:.3f} ms | GPU 1: {:.3f} ms | Tonemap & Merge: {:.3f} ms",
+        if (tally.key.mgpu_mode != MultiGpuMode::Off) {
+            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms | Tonemap: {:.3f} ms",
                          tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
-
-            // Look up single-GPU baseline for the same scene, resolution, spp, bounces, and format
+            // Find single GPU baseline for speedup calculation
             double baselineMs = 0.0;
             for (const auto& other : m_configTallies) {
                 if (other.key.scene_name == tally.key.scene_name &&
+                    other.key.pipeline_type == tally.key.pipeline_type &&
+                    other.key.mgpu_mode == MultiGpuMode::Off &&
                     other.key.width == tally.key.width &&
                     other.key.height == tally.key.height &&
                     other.key.spp == tally.key.spp &&
                     other.key.max_bounces == tally.key.max_bounces &&
                     other.key.accum_format == tally.key.accum_format &&
-                    other.key.mgpu_mode == MultiGpuMode::Off &&
-                    other.frameCount > 0) {
+                    other.key.denoiser == tally.key.denoiser &&
+                    other.key.enable_nrc == tally.key.enable_nrc) {
                     baselineMs = other.getAvgFrameTimeMs();
                     break;
                 }
             }
-
             if (baselineMs > 0.001) {
                 double speedup = baselineMs / tally.getAvgFrameTimeMs();
                 double efficiency = (speedup / 2.0) * 100.0;
                 Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
             }
         } else {
-            Logger::info("    GPU Breakdown:       GPU 0 (Primary RT): {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
+            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
                          tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+        }
+
+        if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
+            Logger::info("    Pipeline Stages:");
+            uint64_t primaryRays = tally.getAvgPrimaryRays();
+            auto bounces = tally.getAvgBounces();
+            if (primaryRays == 0 && !bounces.empty() && bounces[0].activeCount > 0) {
+                primaryRays = bounces[0].activeCount;
+            }
+            if (primaryRays > 0) {
+                Logger::info("      - Classify (Primary RayGen): {:.3f} ms | {} rays left (100.0%)",
+                             tally.getAvgClassifyMs(), formatRayCount(primaryRays));
+            } else {
+                Logger::info("      - Classify (Primary RayGen): {:.3f} ms", tally.getAvgClassifyMs());
+            }
+            for (const auto& b : bounces) {
+                double pct = (primaryRays > 0) ? (100.0 * static_cast<double>(b.nextCount) / primaryRays) : 0.0;
+                if (b.intersectMs > 0.0001) {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.intersectMs, b.totalMs,
+                                 formatRayCount(b.nextCount), pct);
+                } else {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.totalMs,
+                                 formatRayCount(b.nextCount), pct);
+                }
+            }
+            Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
+        } else if (tally.key.pipeline_type == PipelineType::RTP) {
+            Logger::info("    Pipeline Stages:");
+            Logger::info("      - Ray Tracing Pass:          {:.3f} ms", tally.getAvgPrimaryRtMs());
+            Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
         }
 
         Logger::info("    Ray Throughput:      {:.2f} GigaRays/sec", tally.getRayThroughput() * 1e-9);
@@ -4463,268 +4862,7 @@ void Engine::printExecutionSummary() const {
     Logger::info("========================================================================================");
 }
 
-void Engine::runTrainingCapture() {
-    std::string outDir = m_config.training_data_dir.empty() ? "output/training_data" : m_config.training_data_dir;
-    std::filesystem::create_directories(outDir);
-
-    Logger::info("========================================================================================");
-    Logger::info("  Pathways Neural Reconstruction Training Data Capture");
-    Logger::info("  Target Directory:    {}", outDir);
-    Logger::info("  Frame Count:         {}", m_config.training_capture_frames);
-    Logger::info("  Reference SPP:       {}", m_config.training_reference_spp);
-    Logger::info("  Resolution:          {}x{}", m_config.width, m_config.height);
-    Logger::info("========================================================================================");
-
-    VkDevice device = m_context->getDevice();
-    VkQueue queue = m_context->getGraphicsQueue();
-    VmaAllocator allocator = m_context->getAllocator();
-
-    uint32_t width = m_config.width;
-    uint32_t height = m_config.height;
-
-    VkDeviceSize tensorByteSize = static_cast<VkDeviceSize>(width) * height * 16 * sizeof(uint16_t);
-    bool isFp16 = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT);
-    VkDeviceSize refByteSize = static_cast<VkDeviceSize>(width) * height * 4 * (isFp16 ? sizeof(uint16_t) : sizeof(float));
-
-    if (!m_trainingStagingBuffer || m_trainingStagingBuffer->getSize() < tensorByteSize) {
-        m_trainingStagingBuffer = std::make_unique<Buffer>(
-            allocator, tensorByteSize,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-    }
-
-    if (!m_trainingTensorBuffer || m_trainingTensorBuffer->getSize() < tensorByteSize) {
-        m_trainingTensorBuffer = std::make_unique<Buffer>(
-            allocator, tensorByteSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-        updateAllImageDescriptors();
-    }
-
-    Buffer refStaging(allocator, refByteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-
-    uint32_t useHwRT = 1;
-    uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-    float envIntensity = 1.0f;
-    uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
-    VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-
-    auto totalStartTime = std::chrono::high_resolution_clock::now();
-
-    for (uint32_t frameIdx = 0; frameIdx < m_config.training_capture_frames; ++frameIdx) {
-        auto frameStartTime = std::chrono::high_resolution_clock::now();
-
-        if (frameIdx > 0 && m_camera) {
-            m_camera->processMouseMovement(1.5f, 0.2f);
-            m_camera->update(0.016f);
-        }
-
-        // --- PHASE 1: Render 1-SPP Input Tensor with Auxiliary Guides ---
-        {
-            uint32_t flags = 0;
-            if (m_config.enable_direct_light)   flags |= (1 << 0);
-            if (m_config.enable_indirect_light) flags |= (1 << 1);
-            flags |= (1 << 2); // Specular
-            if (m_config.enable_refraction)     flags |= (1 << 3);
-            if (m_config.enable_shadows)        flags |= (1 << 4);
-            if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-            flags |= (1 << 22); // Bit 22: capture_training_data
-
-            CameraUniform ubo = m_camera->getUniformData(0, 1, m_config.max_bounces, flags,
-                                                         false, width, height, 0);
-            m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
-
-            VkCommandBuffer cmd = m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[0], 0, nullptr);
-
-            uint32_t rtPushConstants[16] = {
-                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, width, height,
-                useHwRT,
-                hasEnvMap,
-                envIntensityBits,
-                0u, // accumulateHistory = 0 (clean single SPP)
-                0u, 0u, m_numOpaqueTriangles, 0u
-            };
-            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            m_rtpKhrPipeline->traceRays(cmd, width, height, 1);
-
-            VkBufferMemoryBarrier2 tensorBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
-            tensorBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            tensorBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            tensorBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-            tensorBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-            tensorBarrier.buffer = m_trainingTensorBuffer->getBuffer();
-            tensorBarrier.offset = 0;
-            tensorBarrier.size = tensorByteSize;
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.bufferMemoryBarrierCount = 1;
-            depInfo.pBufferMemoryBarriers = &tensorBarrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            VkBufferCopy copyRegion{};
-            copyRegion.srcOffset = 0;
-            copyRegion.dstOffset = 0;
-            copyRegion.size = tensorByteSize;
-            vkCmdCopyBuffer(cmd, m_trainingTensorBuffer->getBuffer(), m_trainingStagingBuffer->getBuffer(), 1, &copyRegion);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-
-            char inputFilename[256];
-            std::snprintf(inputFilename, sizeof(inputFilename), "frame_%05u_input.bin", frameIdx);
-            std::string inputPath = (std::filesystem::path(outDir) / inputFilename).string();
-
-            void* mappedData = m_trainingStagingBuffer->map();
-            if (mappedData) {
-                TrainingDataWriter::writeTensor(inputPath, width, height, 16, 0 /* Float16 */,
-                                                frameIdx, 1, mappedData, static_cast<size_t>(tensorByteSize));
-                m_trainingStagingBuffer->unmap();
-            }
-        }
-
-        // --- PHASE 2: Accumulate Ground Truth Reference Radiance ---
-        {
-            uint32_t targetRefSpp = m_config.training_reference_spp;
-            uint32_t sppPerDispatch = std::clamp(targetRefSpp, 1u, 32u);
-            uint32_t accumulated = 0;
-            uint32_t seedFrame = 0;
-
-            while (accumulated < targetRefSpp) {
-                uint32_t currentSpp = std::min(sppPerDispatch, targetRefSpp - accumulated);
-                bool accumHistory = (accumulated > 0);
-
-                uint32_t flags = 0;
-                if (m_config.enable_direct_light)   flags |= (1 << 0);
-                if (m_config.enable_indirect_light) flags |= (1 << 1);
-                flags |= (1 << 2); // Specular
-                if (m_config.enable_refraction)     flags |= (1 << 3);
-                if (m_config.enable_shadows)        flags |= (1 << 4);
-                if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-
-                CameraUniform ubo = m_camera->getUniformData(seedFrame, currentSpp, m_config.max_bounces, flags,
-                                                             false, width, height, 0);
-                m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
-
-                VkCommandBuffer cmd = m_commandBuffers[0];
-                vkResetCommandBuffer(cmd, 0);
-                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(cmd, &beginInfo);
-
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[0], 0, nullptr);
-
-                uint32_t rtPushConstants[16] = {
-                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                    0, 0, width, height,
-                    useHwRT,
-                    hasEnvMap,
-                    envIntensityBits,
-                    accumHistory ? 1u : 0u,
-                    0u, 0u, m_numOpaqueTriangles, 0u
-                };
-                vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-                m_rtpKhrPipeline->traceRays(cmd, width, height, 1);
-                vkEndCommandBuffer(cmd);
-
-                VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                submitInfo.commandBufferCount = 1;
-                submitInfo.pCommandBuffers = &cmd;
-                vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-                vkQueueWaitIdle(queue);
-
-                accumulated += currentSpp;
-                seedFrame++;
-            }
-
-            // Copy m_accumImage to refStaging
-            VkCommandBuffer cmd = m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            m_accumImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-            );
-
-            VkBufferImageCopy copyRegion{};
-            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.imageSubresource.layerCount = 1;
-            copyRegion.imageExtent = { width, height, 1 };
-
-            vkCmdCopyImageToBuffer(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, refStaging.getBuffer(), 1, &copyRegion);
-
-            m_accumImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-            );
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-
-            char refFilename[256];
-            std::snprintf(refFilename, sizeof(refFilename), "frame_%05u_reference.bin", frameIdx);
-            std::string refPath = (std::filesystem::path(outDir) / refFilename).string();
-
-            void* mappedRef = refStaging.map();
-            if (mappedRef) {
-                TrainingDataWriter::writeTensor(refPath, width, height, 4, isFp16 ? 0 : 1,
-                                                frameIdx, targetRefSpp, mappedRef, static_cast<size_t>(refByteSize));
-                refStaging.unmap();
-            }
-        }
-
-        auto frameEndTime = std::chrono::high_resolution_clock::now();
-        double frameMs = std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count();
-
-        Logger::info("Captured Training Frame [{:4d}/{:4d}] | 1-SPP Input + {}-SPP Ref | {:.2f} ms",
-                     frameIdx + 1, m_config.training_capture_frames, m_config.training_reference_spp, frameMs);
-    }
-
-    auto totalEndTime = std::chrono::high_resolution_clock::now();
-    double totalSec = std::chrono::duration<double>(totalEndTime - totalStartTime).count();
-
-    Logger::info("========================================================================================");
-    Logger::info("  Training data capture complete: {} frames written to {}", m_config.training_capture_frames, outDir);
-    Logger::info("  Total capture time: {:.2f} seconds ({:.2f} fps)", totalSec, m_config.training_capture_frames / std::max(totalSec, 0.001));
-    Logger::info("========================================================================================");
-}
-
 void Engine::run() {
-    if (m_config.capture_training_data) {
-        runTrainingCapture();
-        return;
-    }
-
     Logger::info("Starting Pathways render loop...");
 
     while (!m_window->shouldClose()) {

@@ -39,6 +39,8 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -110,6 +112,18 @@ layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
     uint secondaryIndices[];
 };
 
+layout(std430, binding = 20) writeonly buffer OutNRCQueryQueue {
+    NRCQuery nrcQueries[];
+};
+
+layout(std430, binding = 21) buffer InOutNRCTrainQueue {
+    NRCTrainingRecord nrcTrainRecords[];
+};
+
+layout(std430, binding = 22) buffer InOutNRCCounters {
+    NRCCountersBuffer nrcCounters;
+};
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -125,6 +139,10 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint useHardwareRT;
     uint secondarySortMode;
+    uint enableNrc;
+    uint nrcBounce;
+    float nrcTrainRatio;
+    uint frameIndex;
 } pc;
 
 void main() {
@@ -262,8 +280,9 @@ void main() {
             }
 
             vec3 V = -rayDir;
+            vec3 secDirectL = vec3(0.0);
 
-            // Direct Lighting (1-candidate stochastic NEE for Dual-Lobe PBR)
+            // Direct Lighting (Stochastic NEE with MIS)
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
@@ -308,6 +327,11 @@ void main() {
                         lightPdf = 1.0;
                         validLightSample = true;
                     }
+                } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                    lightDir = normalize(light.normal.xyz);
+                    lightDist = 10000.0;
+                    lightPdf = 1.0;
+                    validLightSample = true;
                 }
 
                 float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
@@ -336,7 +360,8 @@ void main() {
                         misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                     }
 
-                    vec3 unshadowed = throughput * combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    secDirectL = combinedBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    vec3 unshadowed = throughput * secDirectL;
 
                     if (length(unshadowed) > 1e-5) {
                         hasShadowRay = true;
@@ -350,7 +375,32 @@ void main() {
             if (!pathTerminated) {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                     pathTerminated = true;
-                } else {
+                } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce) {
+                    bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
+                    if (isTrain) {
+                        uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
+                        if (trainIdx < pc.maxQueueCapacity) {
+                            nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
+                            nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
+                            nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                            nrcTrainRecords[trainIdx].albedo_pad = vec4(diffuseColor, 0.0);
+                            nrcTrainRecords[trainIdx].throughput = vec4(throughput, 0.0);
+                            nrcTrainRecords[trainIdx].targetRadiance = vec4(secDirectL, 0.0);
+                        }
+                    } else {
+                        uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
+                        if (qIdx < pc.maxQueueCapacity) {
+                            nrcQueries[qIdx].pos_roughness = vec4(hitPoint, roughness);
+                            nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
+                            nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                            nrcQueries[qIdx].albedo_pad = vec4(diffuseColor, 0.0);
+                            nrcQueries[qIdx].throughput = vec4(throughput, 0.0);
+                        }
+                        pathTerminated = true;
+                    }
+                }
+
+                if (!pathTerminated) {
                     float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
                     vec3 Fview = fresnelSchlickVec(NdotV, F0);
                     float specProb = clamp(dot(Fview, vec3(0.3333)), 0.05, 0.95);
@@ -384,12 +434,12 @@ void main() {
                     if (!validBounce) {
                         pathTerminated = true;
                     } else {
-                        float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                        if (lum < 0.001) {
+                        float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                        if (pathLum < 0.001) {
                             pathTerminated = true;
                         } else if (bounce >= 1u) {
                             float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                            float p = clamp(lum, minP, 0.95);
+                            float p = clamp(pathLum, minP, 0.95);
                             if (randFloat(seed) > p) {
                                 pathTerminated = true;
                             } else {

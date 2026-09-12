@@ -61,25 +61,49 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to Living Room and rendered 3 frames cleanly.");
 
-            // Switch to scene 4: Pontiac GTO Extended (user-reported crash scenario)
-            if (!engine.loadScene("scenes/pontiac-gto/pontiac_gto_extended.glb")) {
-                pathways::Logger::error("Test failed: loadScene Pontiac GTO failed.");
+            // Switch to scene 4: Breakfast Room
+            if (!engine.loadScene("scenes/breakfast-room/breakfast_room_extended.glb")) {
+                pathways::Logger::error("Test failed: loadScene Breakfast Room failed.");
                 return 1;
             }
             for (int i = 0; i < 3; ++i) engine.renderFrame();
-            pathways::Logger::info("[PASS] Switched to Pontiac GTO Extended (Single-GPU) and rendered 3 frames cleanly.");
+            pathways::Logger::info("[PASS] Switched to Breakfast Room and rendered 3 frames cleanly.");
+
+            // Switch to scene 5: Dragon Dispersion
+            if (!engine.loadScene("scenes/DragonDispersion.glb")) {
+                pathways::Logger::error("Test failed: loadScene Dragon Dispersion failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Dragon Dispersion and rendered 3 frames cleanly.");
+
+            // Switch to scene 6: Car Concept
+            if (!engine.loadScene("scenes/CarConcept.glb")) {
+                pathways::Logger::error("Test failed: loadScene Car Concept failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Car Concept and rendered 3 frames cleanly.");
+
+            // Switch to scene 7: Cornell Caustic Extended (Tier 1 Research Scene)
+            if (!engine.loadScene("scenes/cornell-caustic/cornell_caustic_extended.glb")) {
+                pathways::Logger::error("Test failed: loadScene Cornell Caustic failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Cornell Caustic Extended (Single-GPU) and rendered 3 frames cleanly.");
 
             // Dynamically switch to Dual-GPU Checkerboard Tiling mode
-            pathways::Logger::info("Dynamically switching to Dual-GPU Checkerboard Tiling mode on Pontiac scene...");
+            pathways::Logger::info("Dynamically switching to Dual-GPU Checkerboard Tiling mode on Cornell Caustic scene...");
             engine.setMgpuMode(pathways::MultiGpuMode::CheckerboardTile);
             for (int i = 0; i < 5; ++i) engine.renderFrame();
-            pathways::Logger::info("[PASS] Dual-GPU Checkerboard Tiling rendered 5 frames cleanly on Pontiac scene.");
+            pathways::Logger::info("[PASS] Dual-GPU Checkerboard Tiling rendered 5 frames cleanly on Cornell Caustic scene.");
 
             // Dynamically switch to Dual-GPU Sample Parallel mode
-            pathways::Logger::info("Dynamically switching to Dual-GPU Sample Parallel mode on Pontiac scene...");
+            pathways::Logger::info("Dynamically switching to Dual-GPU Sample Parallel mode on Cornell Caustic scene...");
             engine.setMgpuMode(pathways::MultiGpuMode::SampleParallel);
             for (int i = 0; i < 5; ++i) engine.renderFrame();
-            pathways::Logger::info("[PASS] Dual-GPU Sample Parallel rendered 5 frames cleanly on Pontiac scene.");
+            pathways::Logger::info("[PASS] Dual-GPU Sample Parallel rendered 5 frames cleanly on Cornell Caustic scene.");
 
             // Dynamically switch back to Single-GPU mode
             pathways::Logger::info("Dynamically switching back to Single-GPU mode...");

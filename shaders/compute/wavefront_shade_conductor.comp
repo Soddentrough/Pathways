@@ -39,6 +39,8 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -252,15 +254,41 @@ void main() {
             metallic = clamp(metallic, 0.0, 1.0);
             float alphaRoughness = roughness * roughness;
 
+            // KHR_materials_anisotropy & KHR_materials_iridescence
+            float ax = alphaRoughness;
+            float ay = alphaRoughness;
+            vec3 T = abs(hitNormal.z) < 0.999 ? normalize(cross(vec3(0.0, 0.0, 1.0), hitNormal)) : normalize(cross(vec3(1.0, 0.0, 0.0), hitNormal));
+            vec3 B = cross(hitNormal, T);
+            bool isAniso = (mat.anisotropyStrength > 0.001);
+            if (isAniso) {
+                float anisoFactor = clamp(mat.anisotropyStrength, 0.0, 0.99);
+                float rX = max(roughness * (1.0 + anisoFactor), 0.001);
+                float rY = max(roughness * (1.0 - anisoFactor), 0.001);
+                ax = rX * rX;
+                ay = rY * rY;
+                if (abs(mat.anisotropyRotation) > 0.001) {
+                    float sRot = sin(mat.anisotropyRotation);
+                    float cRot = cos(mat.anisotropyRotation);
+                    vec3 rotT = cRot * T + sRot * B;
+                    B = -sRot * T + cRot * B;
+                    T = rotT;
+                }
+            }
+
             vec3 F0 = mix(vec3(0.04), baseColor.rgb, metallic);
             vec3 V = -rayDir;
             float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
+
+            if (mat.iridescence > 0.001) {
+                vec3 iridColor = evalThinFilmIridescence(NdotV, mat.iridescenceIor, mat.iridescenceThickness > 0.0 ? mat.iridescenceThickness : 350.0);
+                F0 = mix(F0, iridColor, mat.iridescence);
+            }
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
             bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
 
-            // Direct Lighting (1-candidate stochastic NEE for microfacet GGX)
+            // Direct Lighting (Stochastic NEE with MIS)
             if (!pathTerminated && enableDirect && enableSpecular && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
@@ -305,6 +333,11 @@ void main() {
                         lightPdf = 1.0;
                         validLightSample = true;
                     }
+                } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                    lightDir = normalize(light.normal.xyz);
+                    lightDist = 10000.0;
+                    lightPdf = 1.0;
+                    validLightSample = true;
                 }
 
                 float NdotL = dot(hitNormal, lightDir);
@@ -313,7 +346,8 @@ void main() {
                     float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                     float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
-                    float D = distributionGGX(NdotH, alphaRoughness);
+                    float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, sqrt(ax), sqrt(ay))
+                                      : distributionGGX(NdotH, alphaRoughness);
                     float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
                     vec3 F = fresnelSchlickVec(VdotH, F0);
 
@@ -326,7 +360,8 @@ void main() {
                         misWeight = lightPdfEff / (lightPdfEff + specPdf);
                     }
 
-                    vec3 unshadowed = throughput * specBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    vec3 secDirectL = specBrdf * lightEmission * (NdotL * misWeight / max(lightPdf * lightSelectPdf, 1e-6));
+                    vec3 unshadowed = throughput * secDirectL;
 
                     if (length(unshadowed) > 1e-5) {
                         hasShadowRay = true;
@@ -341,7 +376,8 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
                     pathTerminated = true;
                 } else {
-                vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
+                vec3 H = isAniso ? sampleAnisotropicGGX(hitNormal, T, B, sqrt(ax), sqrt(ay), seed)
+                                 : sampleGGX(hitNormal, alphaRoughness, seed);
                 vec3 nextDirection = reflect(-V, H);
                 vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
 
@@ -357,12 +393,12 @@ void main() {
                     // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
                     throughput *= F_sample * (4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4));
 
-                    float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                    if (lum < 0.001) {
+                    float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                    if (pathLum < 0.001) {
                         pathTerminated = true;
                     } else if (bounce >= 1u) {
                         float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float p = clamp(lum, minP, 0.95);
+                        float p = clamp(pathLum, minP, 0.95);
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {

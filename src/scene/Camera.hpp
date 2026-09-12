@@ -5,17 +5,6 @@
 
 namespace pathways {
 
-struct ReservoirGPU {
-    uint32_t lightIdx = 0;
-    float    uvX = 0.0f;
-    float    uvY = 0.0f;
-    float    wSum = 0.0f;
-    float    M = 0.0f;
-    float    W = 0.0f;
-    float    targetPdf = 0.0f;
-    uint32_t pad = 0; // Packed geometry: lower 16 bits = oct normal, upper 16 bits = half depth
-};
-
 struct CameraUniform {
     glm::mat4 viewInverse;
     glm::mat4 projInverse;
@@ -25,7 +14,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI, 7: restirSpatial, bits 8..11: spatialSamples, bits 12..19: spatialRadius, bit 20: shadowDenoiser, bit 21: taa
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 20: shadowDenoiser, 21: taa, 23: cameraMoved / history reset
     glm::mat4 unjitteredViewProj;
     glm::vec4 jitterOffset; // xy = pixel jitter [-0.5, 0.5], zw = NDC jitter
 };

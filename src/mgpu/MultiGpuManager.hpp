@@ -53,10 +53,6 @@ struct GpuDeviceNode {
     std::unique_ptr<Buffer> lightBuffer;
     std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> cameraUBOs;
 
-    // Secondary ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
-    std::array<std::unique_ptr<Buffer>, 2> restirReservoirs;
-    uint32_t restirPingPongIndex = 0;
-
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> asManager;
@@ -97,18 +93,8 @@ struct GpuDeviceNode {
     VkPipeline shadowClassifyPipeline = VK_NULL_HANDLE;
     VkPipeline shadowFilterPipeline = VK_NULL_HANDLE;
 
-    // Secondary TAA Resources & Pipelines (Solution 2 & 1)
+    // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
     std::unique_ptr<Image> motionVectorImage;
-    std::unique_ptr<Image> taaHistoryImages[2];
-    VkSampler taaHistorySampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout taaDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet taaDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    uint32_t taaPingPongIndex = 0;
-    VkPipelineLayout taaPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline taaPipeline = VK_NULL_HANDLE;
-
-    // Secondary Training Tensor Buffer (Binding 15)
-    std::unique_ptr<Buffer> trainingTensorBuffer;
 
     ~GpuDeviceNode();
 };
@@ -130,6 +116,7 @@ public:
     double getSecondaryTransferTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
     VulkanContext* getSecondaryContext() const { return m_devices.empty() ? nullptr : m_devices[0]->context.get(); }
+    AccelerationStructureManager* getSecondaryAsManager() const { return m_devices.empty() ? nullptr : m_devices[0]->asManager.get(); }
     void resize(uint32_t width, uint32_t height);
     bool loadScene(const SceneData& scene);
 
@@ -226,11 +213,7 @@ private:
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
     void updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode);
-    void createSecondaryTaaPipelines(GpuDeviceNode* secNode);
-    void createSecondaryTaaResources(GpuDeviceNode* secNode, uint32_t width, uint32_t height);
-    void destroySecondaryTaaResources(GpuDeviceNode* secNode);
-    void destroySecondaryTaaPipelines(GpuDeviceNode* secNode);
-    void updateSecondaryTaaDescriptors(GpuDeviceNode* secNode);
+
     bool initSharedP2PBuffer(VkDeviceSize bufferSize);
     void destroySharedP2PBuffer();
     void initSharedHostBuffer(VkDeviceSize bufferSize);

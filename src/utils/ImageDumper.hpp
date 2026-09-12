@@ -119,9 +119,14 @@ struct FrameStats {
     double min_frame_time_ms = 0.0;
     double max_frame_time_ms = 0.0;
     double avg_fps = 0.0;
+    double presentation_time_ms = 0.0;
+    double presentation_fps = 0.0;
+    double avg_presentation_fps = 0.0;
     double rays_per_second = 0.0;
     uint32_t validation_errors = 0;
     bool target_achieved = false; // true if avg_frame_time_ms < 8.0
+    bool accumulation_complete = false;
+    uint32_t max_accum_frames = 2048;
 
     // GPU Timestamp Profiler Breakdown
     double primary_gpu_time_ms = 0.0;
@@ -160,6 +165,26 @@ struct FrameStats {
     WavefrontProfilingStats wavefront_stats;
 
     // Tallied unique configurations breakdown
+    struct StageBounceSummary {
+        uint32_t bounce = 0;
+        double shade_ms = 0.0;
+        double shadow_ms = 0.0;
+        double intersect_ms = 0.0;
+        double total_bounce_ms = 0.0;
+        uint64_t active_rays = 0;
+        uint64_t rays_left = 0;
+        uint64_t shadow_rays = 0;
+    };
+
+    struct PipelineStagesSummary {
+        bool is_wavefront = false;
+        double ray_tracing_pass_ms = 0.0;
+        double classify_ms = 0.0;
+        uint64_t primary_rays = 0;
+        std::vector<StageBounceSummary> bounces;
+        double tonemap_ms = 0.0;
+    };
+
     struct ConfigTallySummary {
         std::string label;
         uint32_t frame_count = 0;
@@ -172,8 +197,33 @@ struct FrameStats {
         double tonemap_time_ms = 0.0;
         double gigarays_per_second = 0.0;
         bool target_achieved = false;
+        double blas_build_time_ms = 0.0;
+        double blas_size_kb = 0.0;
+        uint32_t blas_triangles = 0;
+        double tlas_build_time_ms = 0.0;
+        double tlas_size_kb = 0.0;
+        uint32_t tlas_instances = 0;
+        double sec_blas_build_time_ms = 0.0;
+        double sec_blas_size_kb = 0.0;
+        double sec_tlas_build_time_ms = 0.0;
+        double sec_tlas_size_kb = 0.0;
+        uint32_t tlas_gpu_updates = 0;
+        PipelineStagesSummary pipeline_stages;
     };
     std::vector<ConfigTallySummary> configurations_breakdown;
+
+    // Acceleration Structure Telemetry
+    double blas_build_time_ms = 0.0;
+    double blas_size_kb = 0.0;
+    uint32_t blas_triangles = 0;
+    double tlas_build_time_ms = 0.0;
+    double tlas_size_kb = 0.0;
+    uint32_t tlas_instances = 0;
+    double sec_blas_build_time_ms = 0.0;
+    double sec_blas_size_kb = 0.0;
+    double sec_tlas_build_time_ms = 0.0;
+    double sec_tlas_size_kb = 0.0;
+    uint32_t tlas_gpu_updates = 0;
 };
 
 class ImageDumper {

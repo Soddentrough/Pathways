@@ -129,6 +129,17 @@ int main() {
         bp0.comp_rays = 39976;
         stats.wavefront_stats.bounces.push_back(bp0);
 
+        FrameStats::ConfigTallySummary cfgSummary{};
+        cfgSummary.label = "Test Configuration";
+        cfgSummary.frame_count = 100;
+        cfgSummary.avg_frame_time_ms = 12.5;
+        cfgSummary.pipeline_stages.is_wavefront = true;
+        cfgSummary.pipeline_stages.classify_ms = 0.175;
+        cfgSummary.pipeline_stages.primary_rays = 1920 * 1080;
+        cfgSummary.pipeline_stages.bounces.push_back({0, 0.575, 0.151, 0.535, 1.261, 1656446, 1400000, 1500000});
+        cfgSummary.pipeline_stages.tonemap_ms = 0.120;
+        stats.configurations_breakdown.push_back(cfgSummary);
+
         std::string testJsonPath = "output/test_telemetry_dump.json";
         std::error_code ec;
         std::filesystem::create_directories("output", ec);
@@ -142,6 +153,9 @@ int main() {
         check_true(content.find("wavefront_profiler_breakdown") != std::string::npos, "JSON contains wavefront_profiler_breakdown");
         check_true(content.find("estimated_vram_traffic_mb") != std::string::npos, "JSON contains estimated_vram_traffic_mb");
         check_true(content.find("dielectric_rays") != std::string::npos, "JSON contains dielectric_rays");
+        check_true(content.find("pipeline_stages_ms") != std::string::npos, "JSON contains pipeline_stages_ms");
+        check_true(content.find("primary_rays") != std::string::npos, "JSON contains primary_rays");
+        check_true(content.find("rays_left") != std::string::npos, "JSON contains rays_left");
 
         // Clean up test file
         std::filesystem::remove(testJsonPath, ec);

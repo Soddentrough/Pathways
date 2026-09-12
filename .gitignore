@@ -31,8 +31,12 @@ scenes/Bedroom_1.gltf
 scenes/*/
 
 # Re-include Tier 1 shipped research scenes
+!scenes/breakfast-room/
+!scenes/breakfast-room/**
 !scenes/coffee-maker/
 !scenes/coffee-maker/**
+!scenes/cornell-caustic/
+!scenes/cornell-caustic/**
 !scenes/classroom/
 !scenes/classroom/**
 !scenes/living-room/

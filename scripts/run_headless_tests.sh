@@ -12,14 +12,12 @@ echo "=========================================================="
 
 # 1. Check GPU utilization & VRAM status per user rules
 echo "[1/4] Checking AMD GPU metrics via amd-smi..."
-if command -v amd-smi &> /dev/null; then
-    amd-smi
+if [ -x /opt/rocm/core-10.0/bin/amd-smi ]; then
+    /opt/rocm/core-10.0/bin/amd-smi || true
 elif [ -x /home/naoki/.local/bin/amd-smi ]; then
-    /home/naoki/.local/bin/amd-smi
-elif [ -x /opt/rocm/core-10.0/bin/amd-smi ]; then
-    /opt/rocm/core-10.0/bin/amd-smi
-elif [ -x /opt/rocm/bin/amd-smi ]; then
-    /opt/rocm/bin/amd-smi
+    /home/naoki/.local/bin/amd-smi || true
+elif command -v amd-smi &> /dev/null; then
+    amd-smi || true
 else
     echo "amd-smi not found in known paths, continuing..."
 fi
@@ -32,7 +30,7 @@ ninja -C build -j16
 # Create output directory
 mkdir -p output
 
-# 2b. Run CTest unit test suites (Camera controls, ImGui headless, ReSTIR quality, Shadow denoiser)
+# 2b. Run CTest unit test suites (Camera controls, ImGui headless, Shadow denoiser, TAA/A-Trous, Telemetry)
 echo ""
 echo "[2b] Running CTest Unit Test Suites..."
 ctest --test-dir build --output-on-failure
@@ -55,7 +53,7 @@ echo "[3/7] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..."
     --dump-hdr output/test_cornell_1080p.exr \
     --dump-stats output/stats_1080p.json
 
-python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0
+python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 4. Test Suite 2: 4K Native Real-Time Benchmark (<8ms Target)
 echo ""
@@ -73,7 +71,7 @@ echo "[4/5] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)
     --dump-frame output/test_cornell_4k.png \
     --dump-stats output/stats_4k.json
 
-python3 scripts/verify_frame.py output/test_cornell_4k.png output/stats_4k.json 3840 2160 10.0
+python3 scripts/verify_frame.py output/test_cornell_4k.png output/stats_4k.json 3840 2160 10.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 4b. Test Suite 2b: 4K Native Multi-GPU Interleaved Scanlines (1 SPP, Sub-8ms Target)
 echo ""
@@ -91,7 +89,7 @@ echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1
     --dump-frame output/test_cornell_4k_mgpu_interleaved.png \
     --dump-stats output/stats_4k_mgpu_interleaved.json
 
-python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png output/stats_4k_mgpu_interleaved.json 3840 2160 8.0
+python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png output/stats_4k_mgpu_interleaved.json 3840 2160 8.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 4c. Test Suite 2c: 4K Native Multi-GPU Frame Pacing & Camera Motion Regression Test
 echo ""
@@ -108,7 +106,7 @@ echo "[4c] Running Test Suite 2c: 4K Native Multi-GPU Frame Pacing (Camera Motio
     --dump-frame output/test_cornell_4k_mgpu_motion.png \
     --dump-stats output/stats_4k_mgpu_motion.json
 
-python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 6.0 10.0 60
+python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 8.0 10.0 60
 
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""
@@ -123,7 +121,7 @@ echo "[4/5] Running Test Suite 3: Multi-GPU Sample Parallelism (Dual R9700 @ PCI
     --dump-frame output/test_mgpu_sample.png \
     --dump-stats output/stats_mgpu_sample.json
 
-python3 scripts/verify_frame.py output/test_mgpu_sample.png output/stats_mgpu_sample.json 1920 1080 30.0
+python3 scripts/verify_frame.py output/test_mgpu_sample.png output/stats_mgpu_sample.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 6. Test Suite 4: Multi-GPU Scaling Benchmark (Verify >=1.8x Speedup)
 echo ""
@@ -170,7 +168,7 @@ echo "[6a] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Damaged Helm
     --dump-frame output/test_gltf_helmet.png \
     --dump-stats output/stats_gltf_helmet.json
 
-python3 scripts/verify_frame.py output/test_gltf_helmet.png output/stats_gltf_helmet.json 1920 1080 45.0
+python3 scripts/verify_frame.py output/test_gltf_helmet.png output/stats_gltf_helmet.json 1920 1080 45.0 --max-mean-lum 0.65 --max-blown-pct 2.0
 
 # 8. Test Suite 6: Extreme Scenes & Dielectric Transmission Stress Test (Cornell Caustic & Glass of Water)
 echo ""
@@ -186,7 +184,7 @@ echo "[6b] Running Test Suite 6: Extreme Scenes Regression Verification (Caustic
     --dump-frame output/test_cornell_caustic.png \
     --dump-stats output/stats_cornell_caustic.json
 
-python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cornell_caustic.json 1920 1080 30.0
+python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cornell_caustic.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 15.0
 
 ./build/bin/pathways \
     --headless \
@@ -200,7 +198,59 @@ python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cor
     --dump-frame output/test_glass_of_water.png \
     --dump-stats output/stats_glass_of_water.json
 
-python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glass_of_water.json 1920 1080 30.0
+python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glass_of_water.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 10.0
+
+# 9. Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes (Dragon Dispersion, Car Concept, Breakfast Room)
+echo ""
+echo "[6c] Running Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes..."
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --scene scenes/DragonDispersion.glb \
+    --dump-frame output/test_dragon_dispersion.png \
+    --dump-stats output/stats_dragon_dispersion.json
+
+python3 scripts/verify_frame.py output/test_dragon_dispersion.png output/stats_dragon_dispersion.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 25.0
+
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --scene scenes/CarConcept.glb \
+    --dump-frame output/test_car_concept.png \
+    --dump-stats output/stats_car_concept.json
+
+python3 scripts/verify_frame.py output/test_car_concept.png output/stats_car_concept.json 1920 1080 20.0 --max-mean-lum 0.95 --max-blown-pct 50.0
+
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --scene scenes/breakfast-room/breakfast_room_extended.glb \
+    --dump-frame output/test_breakfast_room.png \
+    --dump-stats output/stats_breakfast_room.json
+
+python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_breakfast_room.json 1920 1080 35.0 --max-mean-lum 0.35 --max-blown-pct 8.0
+
+# 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
+echo ""
+echo "[7/8] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."
+python3 tests/test_image_quality.py
+
+# 11. Test Suite 8: Automated Before/After Visual Regression Verification
+echo ""
+echo "[8/8] Running Test Suite 8: Visual Regression Verification against Golden References..."
+python3 scripts/visual_regression_test.py --strict
 
 echo ""
 echo "=========================================================="

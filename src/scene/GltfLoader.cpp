@@ -264,10 +264,41 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             }
         }
 
+        if (mat.has_anisotropy) {
+            gpuMat.anisotropyStrength = mat.anisotropy.anisotropy_strength;
+            gpuMat.anisotropyRotation = mat.anisotropy.anisotropy_rotation;
+            if (mat.anisotropy.anisotropy_texture.texture) {
+                gpuMat.anisotropyTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.anisotropy.anisotropy_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_dispersion) {
+            gpuMat.dispersion = mat.dispersion.dispersion;
+        }
+
+        if (mat.has_sheen) {
+            gpuMat.sheenColor = glm::vec3(
+                mat.sheen.sheen_color_factor[0],
+                mat.sheen.sheen_color_factor[1],
+                mat.sheen.sheen_color_factor[2]
+            );
+            gpuMat.sheenRoughness = mat.sheen.sheen_roughness_factor;
+            if (mat.sheen.sheen_color_texture.texture) {
+                gpuMat.sheenTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.sheen.sheen_color_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_iridescence) {
+            gpuMat.iridescence = mat.iridescence.iridescence_factor;
+            gpuMat.iridescenceIor = mat.iridescence.iridescence_ior;
+            gpuMat.iridescenceThickness = mat.iridescence.iridescence_thickness_max;
+        }
+
         bool hasTextures = (gpuMat.albedoTex > 0 || gpuMat.mrTex > 0 || gpuMat.normalTex > 0 ||
                             gpuMat.occlusionTex > 0 || gpuMat.emissiveTex > 0 || gpuMat.transmissionTex > 0 ||
                             gpuMat.clearcoatTex > 0 || gpuMat.clearcoatRoughnessTex > 0 || gpuMat.clearcoatNormalTex > 0 ||
-                            gpuMat.thicknessTex > 0 || gpuMat.specularTex > 0);
+                            gpuMat.thicknessTex > 0 || gpuMat.specularTex > 0 ||
+                            gpuMat.anisotropyTex > 0 || gpuMat.sheenTex > 0);
         if (!hasTextures && (gpuMat.emissive.r > 0.1f || gpuMat.emissive.g > 0.1f || gpuMat.emissive.b > 0.1f)) {
             gpuMat.type = MATERIAL_EMISSIVE;
         }
@@ -388,27 +419,67 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
     }
 
     // 4. Parse Punctual Lights (KHR_lights_punctual)
-    for (size_t l = 0; l < data->lights_count; ++l) {
-        const auto& light = data->lights[l];
-        LightGPU gpuLight{};
-        gpuLight.emission = glm::vec4(
-            light.color[0] * light.intensity,
-            light.color[1] * light.intensity,
-            light.color[2] * light.intensity,
-            1.0f
-        );
+    for (size_t n = 0; n < data->nodes_count; ++n) {
+        const auto& node = data->nodes[n];
+        if (node.light) {
+            const auto& light = *node.light;
+            float worldMat[16];
+            cgltf_node_transform_world(&node, worldMat);
+            glm::mat4 M = glm::make_mat4(worldMat);
+            glm::vec3 pos = glm::vec3(M[3]);
 
-        if (light.type == cgltf_light_type_spot) {
-            gpuLight.position.w = LIGHT_SPOT;
-            gpuLight.u.w = std::cos(light.spot_inner_cone_angle);
-            gpuLight.v.w = std::cos(light.spot_outer_cone_angle);
-        } else if (light.type == cgltf_light_type_directional) {
-            gpuLight.position.w = LIGHT_DIRECTIONAL;
-        } else {
-            gpuLight.position.w = LIGHT_AREA_QUAD;
+            LightGPU gpuLight{};
+            gpuLight.emission = glm::vec4(
+                light.color[0] * light.intensity,
+                light.color[1] * light.intensity,
+                light.color[2] * light.intensity,
+                1.0f
+            );
+
+            if (light.type == cgltf_light_type_spot) {
+                gpuLight.position = glm::vec4(pos, LIGHT_SPOT);
+                glm::vec3 dir = -glm::normalize(glm::vec3(M[2]));
+                gpuLight.normal = glm::vec4(dir, 0.0f);
+                gpuLight.u.w = std::cos(light.spot_inner_cone_angle);
+                gpuLight.v.w = std::cos(light.spot_outer_cone_angle);
+            } else if (light.type == cgltf_light_type_directional) {
+                // glTF directional light illuminates along -Z.
+                // NEE shadow rays sample toward the light (+Z).
+                glm::vec3 dirToLight = glm::normalize(glm::vec3(M[2]));
+                gpuLight.position = glm::vec4(pos, LIGHT_DIRECTIONAL);
+                gpuLight.normal = glm::vec4(dirToLight, 0.0f);
+            } else {
+                gpuLight.position = glm::vec4(pos, LIGHT_AREA_QUAD);
+            }
+
+            outScene.lights.push_back(gpuLight);
         }
+    }
 
-        outScene.lights.push_back(gpuLight);
+    // Fallback: If lights were defined at the document root without node instantiation
+    if (outScene.lights.empty() && data->lights_count > 0) {
+        for (size_t l = 0; l < data->lights_count; ++l) {
+            const auto& light = data->lights[l];
+            LightGPU gpuLight{};
+            gpuLight.emission = glm::vec4(
+                light.color[0] * light.intensity,
+                light.color[1] * light.intensity,
+                light.color[2] * light.intensity,
+                1.0f
+            );
+            if (light.type == cgltf_light_type_directional) {
+                gpuLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
+                gpuLight.normal = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
+            } else if (light.type == cgltf_light_type_spot) {
+                gpuLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_SPOT);
+                gpuLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+                gpuLight.u.w = std::cos(light.spot_inner_cone_angle);
+                gpuLight.v.w = std::cos(light.spot_outer_cone_angle);
+            } else {
+                gpuLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_AREA_QUAD);
+            }
+            outScene.lights.push_back(gpuLight);
+        }
     }
 
     // 5. Parse Cameras
@@ -734,8 +805,9 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
             float emPower = glm::length(em);
             // Only extract as a physical area light if explicitly MATERIAL_EMISSIVE
             // or an untextured emissive source with high radiant flux
-            bool isExplicitLight = (mat.type == MATERIAL_EMISSIVE) ||
-                                   (emPower > 1.0f && mat.albedoTex == 0 && mat.mrTex == 0);
+            bool isExplicitLight = gltfScene.lights.empty() ? 
+                                   ((mat.type == MATERIAL_EMISSIVE) || (emPower >= 2.0f && mat.albedoTex == 0 && mat.mrTex == 0)) :
+                                   (emPower >= 20.0f && mat.albedoTex == 0 && mat.mrTex == 0);
             if (isExplicitLight) {
                 glm::vec3 p0 = glm::vec3(tri.v0.position);
                 glm::vec3 p1 = glm::vec3(tri.v1.position);

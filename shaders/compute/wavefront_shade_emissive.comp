@@ -160,14 +160,24 @@ void main() {
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
             accumRadiance += throughput * skyColor;
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
         } else {
             vec2 hitUv = vec2(0.0);
             uint matId = 0u;
+            vec3 hitNormal = -rayDir;
 
             if (hitType == 0u) {
                 float u = hitBary.x;
                 float v = hitBary.y;
                 float w = 1.0 - u - v;
+
+                vec3 n0 = triangles[primId].v0.normal.xyz;
+                vec3 n1 = triangles[primId].v1.normal.xyz;
+                vec3 n2 = triangles[primId].v2.normal.xyz;
+                hitNormal = normalize(w * n0 + u * n1 + v * n2);
+                if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
 
                 vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
                 vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
@@ -176,6 +186,8 @@ void main() {
                 matId = triangles[primId].materialId;
             } else if (hitType == 1u) {
                 Sphere sp = spheres[primId];
+                hitNormal = normalize((origin + hitT * rayDir) - sp.centerRadius.xyz);
+                if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
                 matId = sp.materialId;
             }
 
@@ -184,12 +196,12 @@ void main() {
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
-            accumRadiance += throughput * emissive;
-        }
 
-        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-        imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            accumRadiance += throughput * emissive;
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+        }
     }
 
     // Atomic workgroup retirement to prepare downstream dispatches directly

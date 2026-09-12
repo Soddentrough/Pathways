@@ -1,5 +1,6 @@
 #include "ui/GuiManager.hpp"
 #include "core/Logger.hpp"
+#include "core/ConfigTally.hpp"
 #include "core/Window.hpp"
 #include "scene/Camera.hpp"
 
@@ -202,6 +203,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         m_smoothedFrameTime = m_smoothedFrameTime * 0.75f + currentFrameTime * 0.25f;
     }
 
+    float currentPresTime = static_cast<float>(stats.presentation_time_ms > 0.001 ? stats.presentation_time_ms : currentFrameTime);
+    if (m_smoothedPresTime <= 0.001f) {
+        m_smoothedPresTime = currentPresTime;
+    } else {
+        m_smoothedPresTime = m_smoothedPresTime * 0.75f + currentPresTime * 0.25f;
+    }
+
     m_frameTimeHistory[m_historyOffset] = currentFrameTime;
     m_historyOffset = (m_historyOffset + 1) % HISTORY_SIZE;
 
@@ -283,10 +291,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     // WINDOW 1: Pathways Live Profiler & Telemetry HUD
     // =========================================================================
     float fps = (m_smoothedFrameTime > 0.0001f) ? (1000.0f / m_smoothedFrameTime) : 0.0f;
+    float presFps = (m_smoothedPresTime > 0.0001f) ? (1000.0f / m_smoothedPresTime) : fps;
     float avgFps = (historyAvg > 0.0001f) ? (1000.0f / historyAvg) : 0.0f;
 
-    char hudTitle[128];
-    std::snprintf(hudTitle, sizeof(hudTitle), "Pathways Telemetry HUD  -  %.0f FPS (%.2f ms)###TelemetryHUD", fps, currentFrameTime);
+    char hudTitle[160];
+    if (config.target_fps > 0) {
+        std::snprintf(hudTitle, sizeof(hudTitle), "Pathways Telemetry HUD  -  Display: %.0f FPS (%.2f ms) | GPU: %.2f ms (%.0f FPS)###TelemetryHUD",
+                      presFps, currentPresTime, currentFrameTime, fps);
+    } else {
+        std::snprintf(hudTitle, sizeof(hudTitle), "Pathways Telemetry HUD  -  %.0f FPS (%.2f ms)###TelemetryHUD", fps, currentFrameTime);
+    }
 
     ImGui::SetNextWindowPos(ImVec2(hudX, hudY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
@@ -316,22 +330,57 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.90f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
-        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 58.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
 
-            ImGui::SetWindowFontScale(2.2f);
-            if (fps >= 60.0f) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.45f, 1.0f), "%.0f FPS", fps);
-            } else if (fps >= 30.0f) {
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%.0f FPS", fps);
+            ImGui::BeginGroup();
+            ImGui::SetWindowFontScale(2.0f);
+            if (config.target_fps > 0) {
+                // When frame pacing is active, hero metric is the display presentation framerate
+                if (presFps >= static_cast<float>(config.target_fps) - 1.5f) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.45f, 1.0f), "%.0f FPS", presFps);
+                } else if (presFps >= 30.0f) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%.0f FPS", presFps);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%.0f FPS", presFps);
+                }
+                ImGui::SetWindowFontScale(0.82f);
+                ImGui::TextDisabled("Paced Display Rate");
             } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%.0f FPS", fps);
+                // Uncapped mode: hero metric is execution throughput
+                if (fps >= 60.0f) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.45f, 1.0f), "%.0f FPS", fps);
+                } else if (fps >= 30.0f) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%.0f FPS", fps);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%.0f FPS", fps);
+                }
+                ImGui::SetWindowFontScale(0.82f);
+                ImGui::TextDisabled("GPU Exec Time");
             }
             ImGui::SetWindowFontScale(1.0f);
+            ImGui::EndGroup();
 
-            ImGui::SameLine(hudW * 0.46f);
+            ImGui::SameLine(hudW * 0.42f);
             ImGui::BeginGroup();
-            ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Latency: %.2f ms", currentFrameTime);
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Rolling Avg: %.1f FPS", avgFps);
+            if (config.target_fps > 0) {
+                float targetBudgetMs = 1000.0f / static_cast<float>(config.target_fps);
+                float idleMs = std::max(0.0f, targetBudgetMs - currentFrameTime);
+                if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.90f, 1.0f, 1.0f), "GPU Latency:  %.2f ms (Idle/Paused)", currentFrameTime);
+                } else {
+                    ImGui::TextColored(ImVec4(0.35f, 0.90f, 1.0f, 1.0f), "GPU Latency:  %.2f ms (%.0f FPS)", currentFrameTime, fps);
+                }
+                if (config.adaptive_spp) {
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "Dynamic:      %u SPP, %u Bounces", stats.dynamic_spp, stats.dynamic_bounces);
+                } else {
+                    ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Static:       %u SPP, %u Bounces", config.spp, config.max_bounces);
+                }
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Headroom:     %.2f ms idle", idleMs);
+            } else {
+                ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Presentation: %.1f FPS", presFps);
+                ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "GPU Latency:  %.2f ms", currentFrameTime);
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Rolling Avg:  %.1f FPS", avgFps);
+            }
             ImGui::EndGroup();
         }
         ImGui::EndChild();
@@ -339,18 +388,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
-        // 1. Target Status Banner (<8.0 ms for 4K 120+ FPS)
-        bool targetPass = currentFrameTime < 8.0f;
-        if (targetPass) {
-            ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f), "[BUDGET ACHIEVED] Sub-8ms Target (<8.0 ms): %.2f ms | %.1f FPS",
-                               currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
+        // 1. Target Status Banner
+        if (config.target_fps > 0) {
+            float targetBudgetMs = 1000.0f / static_cast<float>(config.target_fps);
+            float idleHeadroom = std::max(0.0f, targetBudgetMs - currentFrameTime);
+            if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                    "[PACED %u FPS | CONVERGED %u/%u] Display: %.1f FPS (%.2f ms) | GPU: Idle (Paused) | %u SPP, %u Bounces",
+                    config.target_fps, stats.total_samples, config.max_accum_frames, presFps, m_smoothedPresTime, stats.dynamic_spp, stats.dynamic_bounces);
+            } else if (config.adaptive_spp) {
+                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f),
+                    "[PACED %u FPS | ADAPTIVE] Display: %.1f FPS (%.2f ms) | GPU: %.2f ms (%.2f ms idle) | Dynamic: %u SPP, %u Bounces",
+                    config.target_fps, presFps, m_smoothedPresTime, currentFrameTime, idleHeadroom, stats.dynamic_spp, stats.dynamic_bounces);
+            } else {
+                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f),
+                    "[PACED %u FPS] Display: %.1f FPS (%.2f ms) | GPU Work: %.2f ms (%.2f ms idle)",
+                    config.target_fps, presFps, m_smoothedPresTime, currentFrameTime, idleHeadroom);
+            }
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[CONVERGING] Frame Latency: %.2f ms | %.1f FPS (Target: <8.0 ms)",
-                               currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
+            if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "[CONVERGED %u/%u] Display: %.1f FPS | GPU: Idle (Paused)",
+                                   stats.total_samples, config.max_accum_frames, presFps);
+            } else {
+                bool targetPass = currentFrameTime < 8.0f;
+                if (targetPass) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f), "[BUDGET ACHIEVED] Sub-8ms Target (<8.0 ms): %.2f ms | %.1f FPS",
+                                       currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[CONVERGING] Frame Latency: %.2f ms | %.1f FPS (Target: <8.0 ms)",
+                                       currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
+                }
+            }
         }
 
         float displayFps = m_smoothedFrameTime > 0.0001f ? (1000.0f / m_smoothedFrameTime) : 0.0f;
-        ImGui::Text("Frame Time: %6.2f ms  |  FPS: %6.1f", m_smoothedFrameTime, displayFps);
+        ImGui::Text("GPU Exec Time: %5.2f ms | FPS: %5.1f", m_smoothedFrameTime, displayFps);
         ImGui::Text("Min: %5.2f ms | Max: %5.2f ms | Avg: %5.2f ms (%4.0f FPS)",
                     historyMin, historyMax, historyAvg, historyAvg > 0.0f ? 1000.0f / historyAvg : 0.0f);
 
@@ -397,10 +469,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.7f, 1.0f), "  Link:    %s", stats.mgpu_transfer_mode_str.c_str());
                 }
             }
-
-            if (ImGui::SmallButton("Re-check PCIe Status")) {
-                if (actions) actions->refreshPciStatus = true;
-            }
             ImGui::Separator();
 
             if (config.visualize_mgpu_split && config.mgpu_mode != MultiGpuMode::Off) {
@@ -408,8 +476,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             if (stats.secondary_gpu_time_ms > 0.001) {
-                ImGui::Text("  GPU 0 (Primary RT):    %.3f ms", stats.primary_gpu_time_ms);
-                ImGui::Text("  GPU 1 (Secondary RT):  %.3f ms", stats.secondary_gpu_time_ms);
+                ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms);
+                ImGui::Text("  GPU 1 Ray Tracing:     %.3f ms", stats.secondary_gpu_time_ms);
                 ImGui::Text("  Tonemap & Merge Pass:  %.3f ms", stats.tonemap_time_ms);
 
                 float totalWork = static_cast<float>(stats.primary_gpu_time_ms + stats.secondary_gpu_time_ms);
@@ -451,13 +519,25 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
-            if (config.enable_atrous) {
-                ImGui::Text("Denoising:    A-Trous Wavelet (%u Passes)", config.atrous_passes);
+            if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
+                ImGui::Text("Denoising:    BMFR (Feature Regression) [Experimental]");
+            } else if (config.enable_temporal_accum && config.denoiser_mode != DenoiserMode::None) {
+                ImGui::Text("Denoising:    Temporal Accumulation (wRLS)");
             } else {
-                ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
+                ImGui::Text("Denoising:    Off (Pure Monte Carlo) [Default]");
             }
             if (config.progressive_accumulation) {
-                ImGui::Text("Accumulation: Frame %u (%u samples accumulated)", stats.total_frames, stats.total_frames * config.spp);
+                uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
+                if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                        "Accumulation: Complete (%u / %u Frames | Paused)", stats.total_samples, config.max_accum_frames);
+                } else if (config.max_accum_frames > 0) {
+                    ImGui::Text("Accumulation: Frame %u / %u (%u samples accumulated)",
+                        stats.total_samples, config.max_accum_frames, stats.total_samples * activeSpp);
+                } else {
+                    ImGui::Text("Accumulation: Frame %u (%u samples accumulated | Unlimited)",
+                        stats.total_samples, stats.total_samples * activeSpp);
+                }
             } else {
                 ImGui::Text("Accumulation: Disabled (Real-Time 1 SPP)");
             }
@@ -492,6 +572,31 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::BulletText("GPU 0: %.2f ms | GPU 1: %.2f ms | Merge: %.2f ms", c.primary_gpu_time_ms, c.secondary_gpu_time_ms, c.tonemap_time_ms);
                 } else {
                     ImGui::BulletText("GPU 0: %.2f ms | Tonemap: %.2f ms | GPU 1: Standby", c.primary_gpu_time_ms, c.tonemap_time_ms);
+                }
+                if (c.pipeline_stages.is_wavefront && !c.pipeline_stages.bounces.empty()) {
+                    ImGui::Indent(15.0f);
+                    if (c.pipeline_stages.primary_rays > 0) {
+                        ImGui::TextDisabled("Stages: Classify: %.2f ms | %s rays left (100.0%%)",
+                                            c.pipeline_stages.classify_ms,
+                                            formatRayCount(c.pipeline_stages.primary_rays).c_str());
+                    } else {
+                        ImGui::TextDisabled("Stages: Classify: %.2f ms", c.pipeline_stages.classify_ms);
+                    }
+                    for (const auto& b : c.pipeline_stages.bounces) {
+                        double pct = (c.pipeline_stages.primary_rays > 0)
+                            ? (100.0 * static_cast<double>(b.rays_left) / c.pipeline_stages.primary_rays)
+                            : 0.0;
+                        if (b.intersect_ms > 0.0001) {
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | Intersect: %.2f ms | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, b.shadow_ms, b.intersect_ms,
+                                                formatRayCount(b.rays_left).c_str(), pct);
+                        } else {
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, b.shadow_ms,
+                                                formatRayCount(b.rays_left).c_str(), pct);
+                        }
+                    }
+                    ImGui::Unindent(15.0f);
                 }
                 ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED (<8ms)" : "EXCEEDED");
             }
@@ -917,6 +1022,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 config.pipeline_type = PipelineType::RTP;
             }
             ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Acceleration Structure Telemetry:");
+            ImGui::BulletText("Primary BLAS: %.3f ms (%.2f KB, %u Triangles)", stats.blas_build_time_ms, stats.blas_size_kb, stats.blas_triangles);
+            ImGui::BulletText("Primary TLAS: %.3f ms (%.2f KB, %u Instance%s)", stats.tlas_build_time_ms, stats.tlas_size_kb, stats.tlas_instances, stats.tlas_instances == 1 ? "" : "s");
+            if (stats.is_mgpu_active && stats.sec_blas_build_time_ms > 0.0) {
+                ImGui::BulletText("Secondary BLAS: %.3f ms (%.2f KB)", stats.sec_blas_build_time_ms, stats.sec_blas_size_kb);
+                ImGui::BulletText("Secondary TLAS: %.3f ms (%.2f KB)", stats.sec_tlas_build_time_ms, stats.sec_tlas_size_kb);
+            }
+            ImGui::BulletText("GPU TLAS Updates: %u", stats.tlas_gpu_updates);
             ImGui::Separator();
         }
 
@@ -1057,7 +1172,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Unindent();
 
                 ImGui::Spacing();
-                ImGui::TextDisabled("Governor Dynamic Search Bounds:");
+                ImGui::SeparatorText("Samples Per Pixel (SPP)");
+
+                // Current dynamically applied SPP display
+                uint32_t activeSppVal = stats.dynamic_spp > 0 ? stats.dynamic_spp : config.spp;
+                int curSpp = static_cast<int>(activeSppVal);
+                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.45f, 1.0f), "Current Applied SPP: %u SPP", activeSppVal);
+                ImGui::BeginDisabled();
+                ImGui::SliderInt("##CurrentAppliedSPP", &curSpp, static_cast<int>(config.min_spp), static_cast<int>(config.max_spp), "%d SPP (Active Dynamic)");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Current sample count per pixel dynamically applied by the Quality Governor.");
+                }
+
                 int minSpp = static_cast<int>(config.min_spp);
                 if (ImGui::SliderInt("Min SPP Floor", &minSpp, 1, static_cast<int>(config.max_spp))) {
                     config.min_spp = static_cast<uint32_t>(minSpp);
@@ -1068,6 +1195,21 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     config.max_spp = static_cast<uint32_t>(maxSpp);
                     settingsChanged = true;
                 }
+
+                ImGui::Spacing();
+                ImGui::SeparatorText("Ray Bounces");
+
+                // Current dynamically applied Bounces display
+                uint32_t activeBouncesVal = stats.dynamic_bounces > 0 ? stats.dynamic_bounces : config.max_bounces;
+                int curBounces = static_cast<int>(activeBouncesVal);
+                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.45f, 1.0f), "Current Applied Bounces: %u Bounces", activeBouncesVal);
+                ImGui::BeginDisabled();
+                ImGui::SliderInt("##CurrentAppliedBounces", &curBounces, static_cast<int>(config.min_bounces), static_cast<int>(config.max_dynamic_bounces), "%d Bounces (Active Dynamic)");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("Current ray bounce depth dynamically applied by the Quality Governor (locked at 4 until SPP reaches 16).");
+                }
+
                 int minB = static_cast<int>(config.min_bounces);
                 if (ImGui::SliderInt("Min Bounces Floor", &minB, 1, static_cast<int>(config.max_dynamic_bounces))) {
                     config.min_bounces = static_cast<uint32_t>(minB);
@@ -1107,34 +1249,97 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("Soft Area Shadows", &config.enable_shadows)) {
                 settingsChanged = true;
             }
-        }
 
-        // 5. Post-Processing & Tonemapping
-        if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::Checkbox("A-Trous Diffuse Denoiser", &config.enable_atrous)) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Neural Radiance Caching (Wave32 WMMA):");
+            if (ImGui::Checkbox("Enable Neural Radiance Cache", &config.enable_nrc)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Hierarchical edge-avoiding A-Trous wavelet filter with normal and depth edge-stopping functions.");
+                ImGui::SetTooltip("Accelerates multi-bounce indirect GI using on-chip cooperative matrix MLP.");
             }
-            if (config.enable_atrous) {
+            if (config.enable_nrc) {
                 ImGui::Indent();
-                int passes = static_cast<int>(config.atrous_passes);
-                if (ImGui::SliderInt("Filter Passes", &passes, 1, 5)) {
-                    config.atrous_passes = static_cast<uint32_t>(passes);
+                int nrcBounce = static_cast<int>(config.nrc_bounce);
+                if (ImGui::SliderInt("NRC Cutoff Bounce", &nrcBounce, 1, 4)) {
+                    config.nrc_bounce = static_cast<uint32_t>(nrcBounce);
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Bounce index at which indirect rays query the neural radiance cache.");
+                }
+
+                float trainRatioPct = config.nrc_train_ratio * 100.0f;
+                if (ImGui::SliderFloat("Training Ray Ratio (%)", &trainRatioPct, 1.0f, 10.0f, "%.1f%%")) {
+                    config.nrc_train_ratio = trainRatioPct / 100.0f;
                     settingsChanged = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Number of dyadic wavelet iterations (step sizes 2^k). 3 passes covers 17x17 px, 4 passes covers 33x33 px.");
-                }
-                if (ImGui::SliderFloat("Normal Sensitivity", &config.atrous_normal_power, 4.0f, 64.0f, "%.1f")) {
-                    settingsChanged = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Exponent for normal similarity weighting (higher = sharper normal edge preservation).");
+                    ImGui::SetTooltip("Percentage of rays that continue tracing to provide real-time training samples.");
                 }
                 ImGui::Unindent();
+            }
+        }
+
+        // 5. Post-Processing & Denoising
+        if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const char* denoiserModes[] = {
+                "None (Pure Monte Carlo) [Default]",
+                "Temporal Radiance Accumulation (Motion-Vector Guided)",
+                "BMFR (Blockwise Feature Regression) [Experimental]"
+            };
+            int currentDenoiser = 0;
+            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
+                currentDenoiser = 2;
+            } else if (config.denoiser_mode == DenoiserMode::Temporal && config.enable_temporal_accum) {
+                currentDenoiser = 1;
+            } else {
+                currentDenoiser = 0;
+            }
+
+            if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
+                if (currentDenoiser == 0) {
+                    config.denoiser_mode = DenoiserMode::None;
+                    config.enable_temporal_accum = false;
+                    config.enable_bmfr = false;
+                } else if (currentDenoiser == 1) {
+                    config.denoiser_mode = DenoiserMode::Temporal;
+                    config.enable_temporal_accum = true;
+                    config.enable_bmfr = false;
+                } else if (currentDenoiser == 2) {
+                    config.denoiser_mode = DenoiserMode::BMFR;
+                    config.enable_temporal_accum = true;
+                    config.enable_bmfr = true;
+                }
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Select active denoising architecture. None (Pure Monte Carlo) is default for unbiased reference rendering.");
+            }
+
+            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                    "Warning: BMFR uses discrete 8x8 blocks which may exhibit tile seams and edge artifacts during camera motion.");
+            }
+
+            if (ImGui::Checkbox("Temporal Accumulation (Motion-Vector Guided)", &config.enable_temporal_accum)) {
+                if (config.enable_temporal_accum) {
+                    if (config.denoiser_mode == DenoiserMode::None) {
+                        config.denoiser_mode = DenoiserMode::Temporal;
+                    }
+                } else {
+                    if (config.denoiser_mode == DenoiserMode::Temporal) {
+                        config.denoiser_mode = DenoiserMode::None;
+                    }
+                }
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Motion-vector guided temporal accumulation with neighborhood clamping and wRLS outlier rejection.");
             }
 
             if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
@@ -1143,6 +1348,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time 1-SPP noise.");
+            }
+
+            if (config.progressive_accumulation) {
+                ImGui::Indent();
+                int cutoff = static_cast<int>(config.max_accum_frames);
+                const char* cutoffFmt = (cutoff == 0) ? "Cutoff: Unlimited" : "Cutoff: %d Frames";
+                if (ImGui::SliderInt("Accumulation Cutoff", &cutoff, 0, 4096, cutoffFmt)) {
+                    config.max_accum_frames = static_cast<uint32_t>(std::max(0, cutoff));
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Maximum frames to accumulate while camera is stationary (0 = Unlimited, default: 2048). Once reached, rendering freezes to conserve GPU power and avoid FP16 mantissa absorption.");
+                }
+                ImGui::Unindent();
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {

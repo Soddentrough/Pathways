@@ -121,7 +121,7 @@ In `MultiGpuMode::SampleParallel`, the governor can distribute samples asymmetri
 
 - **Status:** Proposed / Architectural Blueprint
 - **Target Hardware:** Dual AMD Radeon AI PRO R9700 (gfx1201 / RDNA 4), Vulkan 1.4
-- **Priority:** High (Directly amplifies ReSTIR DI effectiveness in production scenes)
+- **Priority:** High (Directly amplifies stochastic Next-Event Estimation effectiveness in production scenes)
 
 ### 2.1 Motivation & Problem Statement
 
@@ -129,10 +129,10 @@ Currently, Pathways represents analytical lights (point, spot, area lights) in a
 
 1. **Static Light Bindings:** Light transformations and intensities are loaded statically upon scene initialization. Real-time scenes require animated lights (flickering flames, moving vehicle headlights, swinging pendants, oscillating spotlights, orbiting celestial sources).
 2. **The Many-Light Sampling Problem ($N > 100$ to $10,000+$):**
-   - In ReSTIR DI initial candidate generation, uniform random light picking selects each light with probability $p = 1/N$.
-   - In a scene with 5,000 lights, drawing $M_{\text{init}} = 4$ candidates has a negligible probability of proposing lights that are unoccluded and physically close to the surface point.
-   - Consequently, reservoirs are populated with zero-weight candidates, leading to high initial variance, slow temporal convergence, and disocclusion noise.
-3. **Emissive Geometry as First-Class Lights:** Emissive mesh triangles (e.g. neon signs, digital screens, architectural light panels) are currently evaluated solely upon accidental ray intersection rather than through explicit Next-Event Estimation or ReSTIR candidate generation.
+   - In standard Next-Event Estimation, uniform random light picking selects each light with probability $p = 1/N$.
+   - In a scene with 5,000 lights, drawing 1 candidate light uniformly has a negligible probability of proposing lights that are unoccluded and physically close to the surface point.
+   - Consequently, uniform light picking suffers high variance and slow Monte Carlo convergence in many-light scenes.
+3. **Emissive Geometry as First-Class Lights:** Emissive mesh triangles (e.g. neon signs, digital screens, architectural light panels) are currently evaluated solely upon accidental ray intersection rather than through explicit Next-Event Estimation.
 
 ---
 
@@ -163,11 +163,10 @@ Currently, Pathways represents analytical lights (point, spot, area lights) in a
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│               Enhanced ReSTIR DI Candidate Generation                  │
-│   - Stage 1: Traverse Light Tree to draw candidate lights ~ E(x)       │
-│   - Stage 2: Evaluate unshadowed target p_hat via BSDF and geometry    │
-│   - Stage 3: Chao's WRS streaming accumulation + spatio-temporal merge │
-│   - Stage 4: Single deferred shadow ray query (100% throughput)        │
+│               Importance Sampled Next-Event Estimation (NEE)           │
+│   - Stage 1: Traverse Light Tree in O(log N) to sample light ~ E(x)   │
+│   - Stage 2: Evaluate BSDF and calculate MIS sampling weights          │
+│   - Stage 3: Single shadow ray query (100% throughput)                 │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -176,7 +175,6 @@ Each light in `LightsBuffer` is augmented with kinematic tracking:
 - `vec4 prevPosition`: Position in frame $t-1$ (for moving point/spot/area sources).
 - `vec4 prevNormal`: Orientation in frame $t-1$.
 - `vec4 velocity`: Real-time motion vector $(\text{m/s})$.
-- **Temporal Reprojection with Dynamic Lights:** During ReSTIR temporal reuse, candidate lights that underwent rapid translation/rotation have their historical radiance re-evaluated at the current surface point using their historical and current spatial relationship, preventing catastrophic disocclusion streaks.
 
 #### B. GPU Light Tree / Hierarchical Light BVH
 For scenes with large light counts ($N \in [10^2, 10^5]$), Pathways will construct a GPU-resident **Light Tree** (hierarchical cluster BVH):
@@ -208,8 +206,8 @@ For scenes with large light counts ($N \in [10^2, 10^5]$), Pathways will constru
 - [ ] **3. GPU Light Tree Builder (`shaders/compute/light_tree_build.comp`):**
   - Compute 30-bit Morton codes for light bounds; parallel radix sort in compute.
   - Build Linear BVH (LBVH) nodes with bounding box, normal cone, and radiant flux hierarchy.
-- [ ] **4. Light Tree Traversal in ReSTIR DI (`shaders/rt/raytrace.rchit`):**
-  - Implement stackless or short-stack stochastic traversal of Light Tree for candidate generation.
+- [ ] **4. Light Tree Traversal in Stochastic NEE (`shaders/rt/raytrace.rchit` & Wavefront Shade):**
+  - Implement stackless or short-stack stochastic traversal of Light Tree for importance-sampled NEE.
   - Integrate target PDF evaluation with tree selection probability $q(\text{light} \mid x)$.
 - [ ] **5. Dual-GPU Synchronization (`mgpu/MultiGpuManager.cpp`):**
   - Broadcast dynamic light updates and Light Tree buffer to secondary GPU node via zero-copy host memory.
@@ -268,7 +266,7 @@ By adopting a **Pure Path-Traced Cluster DAG Architecture** with **Dynamic Micro
 │   fine-LOD clusters (linear scratch)  │   for incoherent secondary GI  │
 │ - Hardware ray queries / RTP traversal│ - Drastically cuts traversal   │
 │ - 100% physically correct primary hits│   divergence on secondary rays │
-│ - Direct input to ReSTIR DI reservoirs│ - Evaluates MIS NEE & shadows  │
+│ - Direct input to Wavefront queues    │ - Evaluates MIS NEE & shadows  │
 └───────────────────────────────────────┴────────────────────────────────┘
 ```
 
@@ -291,7 +289,7 @@ Preserving Pathways' pure path tracer principles:
 1. **No Rasterization or Screen-Space Buffers:** All primary camera visibility, secondary bounces, and shadows are resolved exclusively via pure ray tracing (`VK_KHR_ray_query` and hardware ray tracing pipelines).
 2. **Dynamic Cluster BLAS:** Active cluster subsets are packed into localized micro-BLAS instances built per frame with `VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR` using linear GPU scratch memory.
 3. **Coarse Proxy BLAS:** Incoherent diffuse and distant GI rays traverse a compact, simplified cluster proxy BLAS, reducing BVH memory footprint by over $80\%$ without visual divergence.
-4. **ReSTIR DI Integration:** Direct lighting candidates and temporal/spatial resampling operate directly on ray-hit surfaces and surface interactions.
+4. **Wavefront Integration:** Direct lighting and multi-bounce indirect scattering operate directly on compacted wavefront ray queues with zero scratch spilling.
 
 ---
 
@@ -622,3 +620,16 @@ Pathways currently employs a pre-transformed world-space BLAS design: during sce
    - Primitive indexing is resolved via `customIndex` (asset descriptor index) + `gl_PrimitiveID`.
 4. **Hardware Ray Masking:**
    - Utilize 8-bit TLAS instance masks (`mask = 0x01` for opaque, `0x02` for non-opaque) to cull non-opaque objects completely from primary or shadow ray traversal when appropriate.
+
+# ANIMATIONS
+
+1. We should support animated geometry:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AnimatedColorsCube
+
+2. Animated UVs:
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AnimationPointerUVs
+
+# COMPRESSION
+
+1. KHR_mesh_quantization
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/MeshoptCubeTest

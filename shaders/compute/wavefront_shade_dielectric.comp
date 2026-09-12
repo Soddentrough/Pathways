@@ -223,6 +223,17 @@ void main() {
 
             if (!pathTerminated) {
                 float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+
+                // KHR_materials_dispersion: Spectral wavelength sampling
+                if (mat.dispersion > 0.001) {
+                    uint channel = uint(randFloat(seed) * 3.0);
+                    channel = min(channel, 2u);
+                    float dispDelta = (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+                    iorVal += dispDelta;
+                    vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                    throughput *= mask;
+                }
+
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
                 vec3 V = -rayDir;
                 float cosTheta = min(dot(V, hitNormal), 1.0);
@@ -230,6 +241,12 @@ void main() {
 
                 bool cannotRefract = eta * sinTheta > 1.0;
                 float reflectProb = fresnelSchlick(cosTheta, eta);
+
+                // KHR_materials_iridescence
+                if (mat.iridescence > 0.001) {
+                    vec3 iridColor = evalThinFilmIridescence(cosTheta, mat.iridescenceIor, mat.iridescenceThickness > 0.0 ? mat.iridescenceThickness : 350.0);
+                    fresnel = mix(fresnel, clamp(dot(iridColor, vec3(0.333)), 0.0, 1.0), mat.iridescence);
+                }
 
                 vec3 nextDirection;
                 vec3 nextOrigin;
@@ -255,12 +272,12 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces) {
                     pathTerminated = true;
                 } else {
-                    float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                    if (lum < 0.001) {
+                    float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                    if (pathLum < 0.001) {
                         pathTerminated = true;
                     } else if (bounce >= 1u) {
                         float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float p = clamp(lum, minP, 0.95);
+                        float p = clamp(pathLum, minP, 0.95);
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {

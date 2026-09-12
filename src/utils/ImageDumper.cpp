@@ -109,7 +109,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"timestamp_iso8601\": \"{}\",\n", timeBuf)
         << std::format("    \"timestamp_unix\": {},\n", static_cast<uint64_t>(now_c))
         << "    \"application\": \"Pathways Pure Vulkan 1.4 Path Tracer\",\n"
-        << "    \"engine_version\": \"1.11.0\"\n"
+        << "    \"engine_version\": \"1.18.0\"\n"
         << "  },\n"
         << "  \"platform\": {\n"
         << std::format("    \"os\": \"{}\",\n", stats.os_name)
@@ -243,6 +243,9 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << "  \"performance\": {\n"
         << std::format("    \"current_frame_time_ms\": {:.3f},\n", stats.current_frame_time_ms)
         << std::format("    \"current_fps\": {:.1f},\n", stats.current_fps)
+        << std::format("    \"presentation_time_ms\": {:.3f},\n", stats.presentation_time_ms)
+        << std::format("    \"presentation_fps\": {:.1f},\n", stats.presentation_fps)
+        << std::format("    \"avg_presentation_fps\": {:.1f},\n", stats.avg_presentation_fps)
         << std::format("    \"avg_frame_time_ms\": {:.3f},\n", stats.avg_frame_time_ms)
         << std::format("    \"min_frame_time_ms\": {:.3f},\n", stats.min_frame_time_ms)
         << std::format("    \"max_frame_time_ms\": {:.3f},\n", stats.max_frame_time_ms)
@@ -291,8 +294,23 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
             << "    },\n";
     }
 
-    out << std::format("    \"total_frames\": {},\n", stats.total_frames)
+    out << "    \"acceleration_structures\": {\n"
+        << std::format("      \"blas_build_time_ms\": {:.3f},\n", stats.blas_build_time_ms)
+        << std::format("      \"blas_size_kb\": {:.2f},\n", stats.blas_size_kb)
+        << std::format("      \"blas_triangles\": {},\n", stats.blas_triangles)
+        << std::format("      \"tlas_build_time_ms\": {:.3f},\n", stats.tlas_build_time_ms)
+        << std::format("      \"tlas_size_kb\": {:.2f},\n", stats.tlas_size_kb)
+        << std::format("      \"tlas_instances\": {},\n", stats.tlas_instances)
+        << std::format("      \"secondary_blas_build_time_ms\": {:.3f},\n", stats.sec_blas_build_time_ms)
+        << std::format("      \"secondary_blas_size_kb\": {:.2f},\n", stats.sec_blas_size_kb)
+        << std::format("      \"secondary_tlas_build_time_ms\": {:.3f},\n", stats.sec_tlas_build_time_ms)
+        << std::format("      \"secondary_tlas_size_kb\": {:.2f},\n", stats.sec_tlas_size_kb)
+        << std::format("      \"tlas_gpu_updates\": {}\n", stats.tlas_gpu_updates)
+        << "    },\n"
+        << std::format("    \"total_frames\": {},\n", stats.total_frames)
         << std::format("    \"total_accumulated_samples\": {},\n", stats.total_samples)
+        << std::format("    \"max_accum_frames\": {},\n", stats.max_accum_frames)
+        << std::format("    \"accumulation_complete\": {},\n", stats.accumulation_complete ? "true" : "false")
         << std::format("    \"validation_errors\": {},\n", stats.validation_errors)
         << "    \"configurations_breakdown\": [\n";
 
@@ -309,7 +327,47 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
              << std::format("        \"secondary_gpu_time_ms\": {:.3f},\n", c.secondary_gpu_time_ms)
              << std::format("        \"tonemap_time_ms\": {:.3f},\n", c.tonemap_time_ms)
              << std::format("        \"gigarays_per_second\": {:.3f},\n", c.gigarays_per_second)
-             << std::format("        \"target_achieved_sub_8ms\": {}\n", c.target_achieved ? "true" : "false")
+             << std::format("        \"target_achieved_sub_8ms\": {},\n", c.target_achieved ? "true" : "false")
+             << "        \"acceleration_structures\": {\n"
+             << std::format("          \"blas_build_time_ms\": {:.3f},\n", c.blas_build_time_ms)
+             << std::format("          \"blas_size_kb\": {:.2f},\n", c.blas_size_kb)
+             << std::format("          \"blas_triangles\": {},\n", c.blas_triangles)
+             << std::format("          \"tlas_build_time_ms\": {:.3f},\n", c.tlas_build_time_ms)
+             << std::format("          \"tlas_size_kb\": {:.2f},\n", c.tlas_size_kb)
+             << std::format("          \"tlas_instances\": {},\n", c.tlas_instances)
+             << std::format("          \"secondary_blas_build_time_ms\": {:.3f},\n", c.sec_blas_build_time_ms)
+             << std::format("          \"secondary_blas_size_kb\": {:.2f},\n", c.sec_blas_size_kb)
+             << std::format("          \"secondary_tlas_build_time_ms\": {:.3f},\n", c.sec_tlas_build_time_ms)
+             << std::format("          \"secondary_tlas_size_kb\": {:.2f},\n", c.sec_tlas_size_kb)
+             << std::format("          \"tlas_gpu_updates\": {}\n", c.tlas_gpu_updates)
+             << "        },\n"
+             << "        \"pipeline_stages_ms\": {\n";
+        if (c.pipeline_stages.is_wavefront) {
+            out << std::format("          \"classify_ms\": {:.3f},\n", c.pipeline_stages.classify_ms);
+            if (c.pipeline_stages.primary_rays > 0) {
+                out << std::format("          \"primary_rays\": {},\n", c.pipeline_stages.primary_rays);
+            }
+            out << "          \"bounces\": [\n";
+            for (size_t b = 0; b < c.pipeline_stages.bounces.size(); ++b) {
+                const auto& bp = c.pipeline_stages.bounces[b];
+                out << "            {\n"
+                    << std::format("              \"bounce\": {},\n", bp.bounce)
+                    << std::format("              \"shade_ms\": {:.3f},\n", bp.shade_ms)
+                    << std::format("              \"shadow_ms\": {:.3f},\n", bp.shadow_ms)
+                    << std::format("              \"intersect_ms\": {:.3f},\n", bp.intersect_ms)
+                    << std::format("              \"total_bounce_ms\": {:.3f},\n", bp.total_bounce_ms)
+                    << std::format("              \"active_rays\": {},\n", bp.active_rays)
+                    << std::format("              \"rays_left\": {},\n", bp.rays_left)
+                    << std::format("              \"shadow_rays\": {}\n", bp.shadow_rays)
+                    << (b + 1 < c.pipeline_stages.bounces.size() ? "            },\n" : "            }\n");
+            }
+            out << "          ],\n";
+            out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
+        } else {
+            out << std::format("          \"ray_tracing_pass_ms\": {:.3f},\n", c.pipeline_stages.ray_tracing_pass_ms)
+                << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
+        }
+        out << "        }\n"
              << (i + 1 < stats.configurations_breakdown.size() ? "      },\n" : "      }\n");
     }
 

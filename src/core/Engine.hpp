@@ -14,6 +14,7 @@
 #include "rt/DGCManager.hpp"
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
+#include "rt/NRCManager.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
 #include "core/QualityGovernor.hpp"
@@ -53,6 +54,7 @@ public:
     Window* getWindow() const { return m_window.get(); }
     Swapchain* getSwapchain() const { return m_swapchain.get(); }
     QualityGovernor* getGovernor() const { return m_governor.get(); }
+    NRCManager* getNrcManager() const { return m_nrcManager.get(); }
 
 private:
     void initVulkan();
@@ -92,20 +94,20 @@ private:
     std::unique_ptr<Buffer> m_lightBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
-    std::unique_ptr<Buffer> m_trainingTensorBuffer;
-    std::unique_ptr<Buffer> m_trainingStagingBuffer;
-
-    // ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
-    std::array<std::unique_ptr<Buffer>, 2> m_restirReservoirs;
-    uint32_t m_restirPingPongIndex = 0;
-    void initReSTIRBuffers();
-    void updateReSTIRDescriptors(uint32_t frameSlot);
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> m_asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;
     std::unique_ptr<AccelerationStructure> m_blas;
     std::unique_ptr<AccelerationStructure> m_tlas;
+
+    // GPU-Timeline TLAS Instance & Scratch Buffers (Tier 3)
+    std::unique_ptr<Buffer> m_tlasInstanceBuffer;
+    std::unique_ptr<Buffer> m_tlasInputInstancesBuffer;
+    std::unique_ptr<Buffer> m_tlasScratchBuffer;
+    uint32_t m_tlasInstanceCount = 0;
+    bool m_tlasNeedsGpuUpdate = false;
+    uint32_t m_tlasGpuUpdateCount = 0;
 
 
 
@@ -133,7 +135,20 @@ private:
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
+    std::unique_ptr<NRCManager> m_nrcManager;
     WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
+
+    // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
+    VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_updateTlasDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet m_updateTlasDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_updateTlasPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_updateTlasPipeline = VK_NULL_HANDLE;
+    void initTlasBuffers(uint32_t instanceCount);
+    void initTlasUpdatePipeline();
+    void recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode = true);
+    void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
+    void markTlasDirty() { m_tlasNeedsGpuUpdate = true; }
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
@@ -161,9 +176,9 @@ private:
     void updateSceneDescriptors();
     void updateWavefrontSceneDescriptors();
 
-    // FidelityFX Shadow Denoiser Resources & Pipelines
     std::unique_ptr<Image> m_directLightImage;
     std::unique_ptr<Image> m_normalDepthImage;
+    std::unique_ptr<Image> m_prevNormalDepthImage;
     std::unique_ptr<Image> m_shadowFilterPingImage;
     std::unique_ptr<Image> m_momentsImages[2];
     std::unique_ptr<Image> m_depthImages[2];
@@ -186,38 +201,43 @@ private:
     void updateShadowDenoiserDescriptors();
     double m_lastShadowDenoiserTimeMs = 0.0;
 
-    // Temporal Anti-Aliasing (TAA) Resources & Pipelines
+    // Screen-Space Motion Vectors (used by ray tracer and temporal reconstruction passes)
     std::unique_ptr<Image> m_motionVectorImage;
-    std::unique_ptr<Image> m_taaHistoryImages[2];
-    VkSampler m_taaHistorySampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_taaDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_taaDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    uint32_t m_taaPingPongIndex = 0;
-    VkPipelineLayout m_taaPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_taaPipeline = VK_NULL_HANDLE;
 
-    void createTaaPipelines();
-    void createTaaResources();
-    void destroyTaaResources();
-    void destroyTaaPipelines();
-    void updateTaaDescriptors();
-    double m_lastTaaTimeMs = 0.0;
+    // Temporal Radiance Accumulation & wRLS Outlier Rejection
+    std::array<std::unique_ptr<Image>, 2> m_temporalHistory;
+    uint32_t m_temporalPingPong = 0;
+    bool m_temporalResetRequested = true;
+    VkDescriptorSetLayout m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_temporalAccumDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_temporalAccumPipeline = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    // A-Trous Wavelet Diffuse Denoiser Resources & Pipelines
-    std::unique_ptr<Image> m_atrousPingPong[2];
-    VkDescriptorSetLayout m_atrousDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 3> m_atrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, 2> m_tonemapAtrousDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_atrousPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_atrousPipeline = VK_NULL_HANDLE;
+    void createTemporalAccumPipelines();
+    void createTemporalAccumResources();
+    void destroyTemporalAccumResources();
+    void destroyTemporalAccumPipelines();
+    void updateTemporalAccumDescriptors();
+    uint32_t dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory);
 
-    void createAtrousPipelines();
-    void createAtrousResources();
-    void destroyAtrousResources();
-    void destroyAtrousPipelines();
-    void updateAtrousDescriptors();
-    uint32_t dispatchAtrous(VkCommandBuffer cmd);
-    double m_lastAtrousTimeMs = 0.0;
+    // Blockwise Multi-Order Feature Regression (BMFR)
+    std::unique_ptr<Image> m_bmfrOutputImage;
+    VkDescriptorSetLayout m_bmfrDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_bmfrDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_bmfrRawDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_tonemapBmfrDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_bmfrPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_bmfrPipeline = VK_NULL_HANDLE;
+
+    void createBmfrPipelines();
+    void createBmfrResources();
+    void destroyBmfrResources();
+    void destroyBmfrPipelines();
+    void updateBmfrDescriptors();
+    bool dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot);
 
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
@@ -249,7 +269,11 @@ private:
     // Frame tracking & Quality Governor
     std::unique_ptr<QualityGovernor> m_governor;
     uint32_t m_accumulatedSamples = 0;
+    bool m_accumulationComplete = false;
     std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;
+    std::chrono::high_resolution_clock::time_point m_lastWallFrameStartTime;
+    double m_lastPresentationTimeMs = 0.0;
+    std::vector<double> m_presentationTimesMs;
     uint32_t m_frameIndex = 0;
     uint32_t m_totalFramesRendered = 0;
     MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;
@@ -264,10 +288,8 @@ private:
 
     // Per-configuration tallied statistics
     std::vector<ConfigStatsTally> m_configTallies;
-    void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs);
-
-    // Training Data Capture (Neural Denoiser / Continuous Upscaler)
-    void runTrainingCapture();
+    void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
+                          const WavefrontStageSample* wfSample = nullptr);
 
     // Hardware Sensors & Telemetry (Infrequent background sampler)
     void startHwMonThread();

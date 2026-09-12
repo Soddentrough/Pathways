@@ -21,6 +21,14 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         return;
     }
 
+    m_explicitPreprocess = (getenv("PATHWAYS_DISABLE_DGC_TIER1") == nullptr &&
+                            getenv("PATHWAYS_DISABLE_DGC_PREPROCESS") == nullptr);
+    if (!m_explicitPreprocess) {
+        Logger::info("DGC Tier 1 explicit preprocessing disabled. Running DGC baseline (implicit preprocessing, flags = 0).");
+    } else {
+        Logger::info("DGC Tier 1 optimizations enabled (explicit preprocessing + unordered sequences).");
+    }
+
     // Modern DGC Token Layout:
     // Single Dispatch Token Limitation: Exactly one work-dispatching token strictly last
     VkIndirectCommandsLayoutTokenEXT token{};
@@ -30,7 +38,9 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
 
     VkIndirectCommandsLayoutCreateInfoEXT createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT;
-    createInfo.flags = 0;
+    createInfo.flags = m_explicitPreprocess ?
+        (VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT |
+         VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT) : 0;
     createInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
     createInfo.indirectStride = sizeof(VkDispatchIndirectCommand); // 12 bytes
     createInfo.pipelineLayout = m_pipelineLayout;
@@ -39,8 +49,8 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
 
     VkResult res = pfn_vkCreateIndirectCommandsLayoutEXT(m_device, &createInfo, nullptr, &m_indirectLayout);
     if (res == VK_SUCCESS) {
-        Logger::info("Created DGC indirect commands layout (Single Dispatch Token, stride: {} bytes).",
-                     createInfo.indirectStride);
+        Logger::info("Created DGC indirect commands layout (Single Dispatch Token, stride: {} bytes, flags: 0x{:x}).",
+                     createInfo.indirectStride, createInfo.flags);
     } else {
         Logger::warn("Failed to create DGC indirect commands layout (code: {}). Falling back to standard indirect dispatch.", (int)res);
         m_supported = false;
@@ -63,7 +73,9 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
 
         VkIndirectCommandsLayoutCreateInfoEXT matCreateInfo{};
         matCreateInfo.sType = VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT;
-        matCreateInfo.flags = 0;
+        matCreateInfo.flags = m_explicitPreprocess ?
+            (VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT |
+             VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT) : 0;
         matCreateInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
         matCreateInfo.indirectStride = sizeof(DGCCommand); // 16 bytes
         matCreateInfo.pipelineLayout = m_pipelineLayout;
@@ -155,7 +167,7 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
         VkDeviceSize align = std::max<VkDeviceSize>(memReqs.memoryRequirements.alignment, 256);
         m_sliceSize = ((reqSize + align - 1) / align) * align;
         if (m_sliceSize < 4096) m_sliceSize = 4096;
-        VkDeviceSize totalSize = m_sliceSize * 4;
+        VkDeviceSize totalSize = m_sliceSize * 16;
 
         m_preprocessBuffer = std::make_unique<Buffer>(
             m_allocator, totalSize,
@@ -169,8 +181,12 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
 }
 
 void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                                  VkDeviceSize argumentOffset, uint32_t sliceIndex, uint32_t maxSequenceCount) {
-    if (!m_supported || !argumentBuffer || !m_preprocessBuffer) return;
+                                  VkDeviceSize argumentOffset, uint32_t sliceIndex,
+                                  uint32_t maxSequenceCount, VkDeviceAddress sequenceCountAddress) {
+    if (!m_supported || !m_explicitPreprocess || !argumentBuffer) return;
+
+    ensurePreprocessBuffer(pipeline, maxSequenceCount);
+    if (!m_preprocessBuffer) return;
 
     VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
 
@@ -187,13 +203,34 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
+void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
+    if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
+
+    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
+    barrier.srcAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT |
+                           VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
+                            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
+    VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &barrier;
+
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
 void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                               VkDeviceSize argumentOffset, uint32_t sliceIndex,
-                              uint32_t maxSequenceCount, bool isPreprocessed) {
+                              uint32_t maxSequenceCount, bool isPreprocessed,
+                              VkDeviceAddress sequenceCountAddress) {
     if (!argumentBuffer) return;
 
     if (!m_supported || !m_indirectLayout) {
@@ -221,8 +258,10 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
         genInfo.preprocessSize = m_sliceSize;
     }
     genInfo.maxSequenceCount = maxSequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
-    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, isPreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
+    bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
+    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
 }
 
 void DGCManager::recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuffer, VkDeviceSize argumentOffset) {
@@ -269,9 +308,39 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
     Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", materialPipelines.size());
 }
 
+void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
+                                        Buffer* argumentBuffer, VkDeviceSize argumentOffset,
+                                        uint32_t sliceIndex, uint32_t sequenceCount,
+                                        VkDeviceAddress sequenceCountAddress) {
+    if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipelines.empty()) return;
+    if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) return;
+
+    ensurePreprocessBuffer(pipelines[0], sequenceCount);
+    if (!m_preprocessBuffer) return;
+
+    // Bind initial pipeline before preprocessing
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
+
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+
+    VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
+    genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
+    genInfo.indirectExecutionSet = m_materialExecutionSet;
+    genInfo.indirectCommandsLayout = m_materialIndirectLayout;
+    genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
+    genInfo.indirectAddressSize = sizeof(DGCCommand) * sequenceCount;
+    genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
+    genInfo.preprocessSize = m_sliceSize;
+    genInfo.maxSequenceCount = sequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
+
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
+}
+
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                       Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                      uint32_t sliceIndex, uint32_t sequenceCount) {
+                                      uint32_t sliceIndex, uint32_t sequenceCount,
+                                      bool isPreprocessed, VkDeviceAddress sequenceCountAddress) {
     if (!argumentBuffer || pipelines.empty()) return;
 
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) {
@@ -282,6 +351,8 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
         }
         return;
     }
+
+    ensurePreprocessBuffer(pipelines[0], sequenceCount);
 
     // Bind initial pipeline before executing generated commands as required by VUID-vkCmdExecuteGeneratedCommandsEXT-indirectCommandsLayout-11053
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
@@ -299,8 +370,10 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
         genInfo.preprocessSize = m_sliceSize;
     }
     genInfo.maxSequenceCount = sequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
 
-    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, VK_FALSE, &genInfo);
+    bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
+    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
 }
 
 } // namespace pathways

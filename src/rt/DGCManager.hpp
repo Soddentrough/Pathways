@@ -21,6 +21,7 @@ public:
     ~DGCManager();
 
     bool isSupported() const { return m_supported; }
+    bool isExplicitPreprocessEnabled() const { return m_explicitPreprocess; }
     VkIndirectCommandsLayoutEXT getLayout() const { return m_indirectLayout; }
     VkIndirectExecutionSetEXT getExecutionSet() const { return m_executionSet; }
 
@@ -30,12 +31,17 @@ public:
 
     // Asynchronous preprocessing of indirect commands
     void recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                          VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0, uint32_t maxSequenceCount = 1);
+                          VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0,
+                          uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
+
+    // Synchronization barrier between preprocessing and execution
+    void recordPreprocessBarrier(VkCommandBuffer cmd);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                        VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0,
-                       uint32_t maxSequenceCount = 1, bool isPreprocessed = true);
+                       uint32_t maxSequenceCount = 1, bool isPreprocessed = true,
+                       VkDeviceAddress sequenceCountAddress = 0);
 
     // Standard indirect dispatch fallback (for when DGC execution is disabled or bypassed)
     void recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0);
@@ -44,9 +50,14 @@ public:
     bool isMaterialDGCSupported() const { return m_materialDGCSupported; }
     VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSet; }
     void initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines);
+    void recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
+                                  Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
+                                  uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
+                                  VkDeviceAddress sequenceCountAddress = 0);
     void recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
-                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 6);
+                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
+                               bool isPreprocessed = true, VkDeviceAddress sequenceCountAddress = 0);
 
 private:
     void loadFunctionPointers();
@@ -63,6 +74,7 @@ private:
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
     bool m_supported = false;
+    bool m_explicitPreprocess = true;
     bool m_materialDGCSupported = false;
 
     PFN_vkCreateIndirectCommandsLayoutEXT pfn_vkCreateIndirectCommandsLayoutEXT = nullptr;

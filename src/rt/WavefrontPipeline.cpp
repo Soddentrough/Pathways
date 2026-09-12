@@ -42,7 +42,7 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     VkQueryPoolCreateInfo qpInfo{};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpInfo.queryCount = 64;
+    qpInfo.queryCount = MAX_WAVEFRONT_TIMESTAMP_QUERIES;
     for (int i = 0; i < 2; ++i) {
         vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPools[i]);
     }
@@ -111,7 +111,12 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // OutRayGeomQueue
         { 17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // RayHitQueue
         { 18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // MaterialIndexQueue
-        { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // SecondaryIndexQueue
+        { 19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // SecondaryIndexQueue
+        { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCQueryQueue
+        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCTrainQueue
+        { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCCounters
+        { 23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMotionVectorImage
+        { 24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // uNormalDepthImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -126,9 +131,9 @@ void WavefrontPipeline::createDescriptorLayout() {
 
 void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 }
     };
@@ -204,18 +209,18 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
         m_queueCounters->unmap();
     }
 
-    // IndirectArgs = 16384 bytes (supports up to 64 bounces * 16 dispatches * 16 bytes) - double-buffered per frame slot
+    // IndirectArgs = 65536 bytes (supports up to 256 bounces * 16 dispatches * 16 bytes) - double-buffered per frame slot
     for (uint32_t slot = 0; slot < 2; ++slot) {
-        m_indirectArgs[slot] = std::make_unique<Buffer>(m_allocator, 16384, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+        m_indirectArgs[slot] = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
         void* pIndirect = m_indirectArgs[slot]->map();
         if (pIndirect) {
-            std::memset(pIndirect, 0, 16384);
+            std::memset(pIndirect, 0, 65536);
             m_indirectArgs[slot]->unmap();
         }
     }
 
-    // DGCStream = 16384 bytes
-    m_dgcStream = std::make_unique<Buffer>(m_allocator, 16384, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    // DGCStream = 65536 bytes
+    m_dgcStream = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 }
 
 void WavefrontPipeline::updateQueueDescriptors() {
@@ -275,16 +280,29 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                              VkBuffer matBuffer, VkDeviceSize matSize,
                                              VkBuffer lightBuffer, VkDeviceSize lightSize,
                                              VkAccelerationStructureKHR tlas,
-                                             VkDescriptorImageInfo envMapInfo,
-                                             const std::vector<VkDescriptorImageInfo>& sceneTexInfos) {
+                                              VkDescriptorImageInfo envMapInfo,
+                                              const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
+                                               VkBuffer nrcQueryBuffer,
+                                               VkBuffer nrcTrainBuffer,
+                                               VkBuffer nrcCountersBuffer,
+                                               VkImageView motionVectorImageView,
+                                               VkImageView normalDepthImageView) {
     if (frameSlot >= 2) frameSlot = 0;
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mvView = (motionVectorImageView != VK_NULL_HANDLE) ? motionVectorImageView : accumImageView;
+    VkDescriptorImageInfo mvImageInfo{ VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ndView = (normalDepthImageView != VK_NULL_HANDLE) ? normalDepthImageView : accumImageView;
+    VkDescriptorImageInfo ndImageInfo{ VK_NULL_HANDLE, ndView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo camInfo{ cameraUBO, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo triInfo{ triangleBuffer, 0, triSize };
     VkDescriptorBufferInfo sphereInfo{ sphereBuffer, 0, sphereSize };
     VkDescriptorBufferInfo matInfo{ matBuffer, 0, matSize };
     VkDescriptorBufferInfo lightInfo{ lightBuffer, 0, lightSize };
+
+    VkDescriptorBufferInfo nrcQueryInfo{ nrcQueryBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo nrcTrainInfo{ nrcTrainBuffer, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo nrcCountersInfo{ nrcCountersBuffer, 0, VK_WHOLE_SIZE };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -318,9 +336,23 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
             writes.push_back(texWrite);
         }
 
+        if (nrcQueryBuffer != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcQueryInfo, nullptr });
+        }
+        if (nrcTrainBuffer != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcTrainInfo, nullptr });
+        }
+        if (nrcCountersBuffer != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcCountersInfo, nullptr });
+        }
+
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
+
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 }
+
 
 void WavefrontPipeline::resize(uint32_t width, uint32_t height, uint32_t tileSize) {
     if (m_width == width && m_height == height && m_tileSize == tileSize) return;
@@ -435,7 +467,7 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     // Initialize DGCManager with Execution Set support flag:
     // [0] classify, [1] intersect, [2] shade, [3] shadow
     // Note: Mesa RADV currently requires multi-dispatch fallback for compute execution sets;
-    // can be explicitly enabled via PATHWAYS_ENABLE_DGC_EXECSET=1.
+    // can be explicitly enabled via PATHWAYS_ENABLE_DGC_EXECSET=1 or --dgc-execset.
     if (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr) {
         m_supportsExecutionSet = true;
     }
@@ -484,9 +516,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                     const WavefrontSceneData& sceneData) {
     if (frameSlot >= 2) frameSlot = 0;
     m_hasRecordedSlot[frameSlot] = true;
+    m_slotBounces[frameSlot] = maxBounces;
 
-    uint32_t endQuery = 3 + maxBounces * 6;
-    vkCmdResetQueryPool(cmd, m_queryPools[frameSlot], 0, 64);
+    uint32_t endQuery = std::min(3u + maxBounces * 6u, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
+    vkCmdResetQueryPool(cmd, m_queryPools[frameSlot], 0, MAX_WAVEFRONT_TIMESTAMP_QUERIES);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 0);
 
     uint32_t ts = m_tileSize;
@@ -554,7 +587,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 std::array<VkBufferMemoryBarrier2, 8> c2sBarriers = {
                     makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT),
+                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                        VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
                     makeBufferBarrier2(m_dgcStream->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
@@ -607,7 +641,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
                     // 4a. Shading microkernel(s)
-                    uint32_t shadePC[14] = {
+                    uint32_t shadePC[18] = {
                         sceneData.numTriangles,
                         sceneData.numSpheres,
                         sceneData.numMaterials,
@@ -621,66 +655,100 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.hasEnvMap,
                         std::bit_cast<uint32_t>(sceneData.envMapIntensity),
                         sceneData.useHardwareRT,
-                        sceneData.secondarySortMode
+                        sceneData.secondarySortMode,
+                        sceneData.enableNrc ? 1u : 0u,
+                        sceneData.nrcBounce,
+                        std::bit_cast<uint32_t>(sceneData.nrcTrainRatio),
+                        sceneData.frameIndex
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
                     uint32_t qBase = 3 + b * 6;
-                    if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 0);
+                    bool canProfileBounce = shouldProfile && (qBase + 5 < MAX_WAVEFRONT_TIMESTAMP_QUERIES);
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 0);
 
                     if (useMaterialSort) {
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordPreprocessBarrier(cmd);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes, true /* isPreprocessed */);
                         } else {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes, false /* isPreprocessed */);
                         }
                     } else {
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 3 + 0) * 16;
                         if (m_dgcManager->isSupported()) {
-                            m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, 0 /* slice 0 */, 1, false);
+                            m_dgcManager->recordPreprocess(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, 0 /* slice 0 */, 1);
+                            m_dgcManager->recordPreprocessBarrier(cmd);
+                            m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, 0 /* slice 0 */, 1, true /* isPreprocessed */);
                         } else {
                             m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadeOffset);
                         }
                     }
-                    if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
 
                     // Barrier: Shade -> Downstream (Shadow & Intersect indirect dispatches, scoped buffer barriers)
                     Buffer* currentOutGeom = (b % 2 == 0) ? m_rayGeomQueueB.get() : m_rayGeomQueueA.get();
                     Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB.get() : m_rayStateQueueA.get();
 
-                    std::array<VkBufferMemoryBarrier2, 7> s2dBarriers = {
-                        makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT),
-                        makeBufferBarrier2(m_dgcStream->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                        makeBufferBarrier2(m_queueCounters->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(m_shadowQueue->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(currentOutGeom->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(currentOutState->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                        makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
-                    };
+                    std::vector<VkBufferMemoryBarrier2> s2dBarriers;
+                    s2dBarriers.reserve(8);
+                    s2dBarriers.push_back(makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                        VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_dgcStream->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_shadowQueue->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(currentOutGeom->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(currentOutState->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                    s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
 
                     VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     s2dDep.bufferMemoryBarrierCount = static_cast<uint32_t>(s2dBarriers.size());
                     s2dDep.pBufferMemoryBarriers = s2dBarriers.data();
                     vkCmdPipelineBarrier2(cmd, &s2dDep);
+
+                    // Tier 2 Optimization: Batched Preprocessing
+                    // Shade has written arguments for both Shadow and Intersect.
+                    // Preprocess both passes concurrently before executing Shadow (unless disabled via --no-dgc-batch-preprocess).
+                    bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
+                    VkDeviceSize shadowOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 6) * 16
+                                                                : static_cast<VkDeviceSize>(b * 3 + 1) * 16;
+                    VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
+                                                                   : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
+
+                    if (m_dgcManager->isSupported()) {
+                        m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1);
+                        if (batchPreprocess && (b + 1 < maxBounces)) {
+                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
+                                for (uint32_t oct = 0; oct < 8; ++oct) {
+                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
+                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
+                                }
+                            } else {
+                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
+                            }
+                        }
+                        m_dgcManager->recordPreprocessBarrier(cmd);
+                    }
 
                     // 4b. Shadow microkernel (100% coherent hardware ray queries)
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
@@ -697,17 +765,16 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.numOpaqueTriangles
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
-                    if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 2);
-                    VkDeviceSize shadowOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 6) * 16
-                                                                : static_cast<VkDeviceSize>(b * 3 + 1) * 16;
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 2);
                     if (m_dgcManager->isSupported()) {
-                        m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1, false);
+                        m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1, true /* isPreprocessed */);
                     } else {
                         m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadowOffset);
                     }
-                    if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
 
                     // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
+                    // Note: Preprocessing was already executed in the batch above; dispatches launch immediately
                     if (b + 1 < maxBounces) {
                         uint32_t intersectPC[17] = {
                             sceneData.numTriangles,
@@ -728,55 +795,63 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             sceneData.secondarySortMode,
                             0 // octantBin
                         };
+                        if (!batchPreprocess && m_dgcManager->isSupported()) {
+                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
+                                for (uint32_t oct = 0; oct < 8; ++oct) {
+                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
+                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
+                                }
+                            } else {
+                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
+                            }
+                            m_dgcManager->recordPreprocessBarrier(cmd);
+                        }
 
                         if (sceneData.secondarySortMode == 1 && useMaterialSort) {
                             // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
 
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
 
                             for (uint32_t oct = 0; oct < 8; ++oct) {
                                 intersectPC[16] = oct;
                                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                                 VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
                                 if (m_dgcManager->isSupported()) {
-                                    m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 /* slice 2 */, 1, false);
+                                    m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1, true /* isPreprocessed */);
                                 } else {
                                     m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), octOffset);
                                 }
                             }
 
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         } else if (sceneData.secondarySortMode == 2 && useMaterialSort) {
                             // Option 2: Fused In-Register Spatial-Morton Wave32 Reordering (0ms pass overhead, zero barrier)
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            VkDeviceSize intersectOffset = static_cast<VkDeviceSize>(b * 16 + 7) * 16;
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
                             if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, false);
+                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
                             } else {
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
                             }
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         } else {
                             // Secondary sort disabled / fallback
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
-                                                                           : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
                             if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, false);
+                                m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
                             } else {
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
                             }
-                            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         }
 
                         // Barrier: Shadow & Intersect -> Next Bounce Shade (scoped buffer barriers)
@@ -785,7 +860,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         std::array<VkBufferMemoryBarrier2, 8> d2sBarriers = {
                             makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT),
+                                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                                VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
                             makeBufferBarrier2(m_dgcStream->getBuffer(),
                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                 VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
@@ -814,7 +890,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         d2sDep.pBufferMemoryBarriers = d2sBarriers.data();
                         vkCmdPipelineBarrier2(cmd, &d2sDep);
                     } else {
-                        if (shouldProfile) {
+                        if (canProfileBounce) {
                             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 4);
                             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         }
@@ -849,12 +925,14 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     WavefrontProfilingData data{};
     if (frameSlot >= 2 || !m_queryPools[frameSlot] || !m_hasRecordedSlot[frameSlot]) return data;
 
-    uint64_t ts[64] = {0};
-    uint32_t endQuery = 3 + maxBounces * 6;
+    uint32_t effectiveBounces = (m_slotBounces[frameSlot] > 0) ? m_slotBounces[frameSlot] : maxBounces;
+    std::vector<uint64_t> ts(MAX_WAVEFRONT_TIMESTAMP_QUERIES, 0);
+    uint32_t endQuery = std::min(3u + effectiveBounces * 6u, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
     uint32_t numQueries = endQuery + 1;
-    if (numQueries > 64) numQueries = 64;
 
-    VkResult res = vkGetQueryPoolResults(m_device, m_queryPools[frameSlot], 0, numQueries, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    VkResult res = vkGetQueryPoolResults(m_device, m_queryPools[frameSlot], 0, numQueries,
+                                         numQueries * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
+                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (res != VK_SUCCESS) {
         return data;
     }
@@ -898,13 +976,14 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
 
     double totalTrafficBytes = 0.0;
 
-    for (uint32_t b = 0; b < maxBounces && b < 4; ++b) {
+    for (uint32_t b = 0; b < effectiveBounces; ++b) {
         uint32_t base = 3 + b * 6;
+        if (base + 5 >= numQueries) break;
         BounceProfilingData bp{};
         bp.bounce = b;
         bp.shadeMs = toMs(ts[base + 1], ts[base + 0]);
         bp.shadowMs = toMs(ts[base + 3], ts[base + 2]);
-        bp.intersectMs = (b + 1 < maxBounces) ? toMs(ts[base + 5], ts[base + 4]) : 0.0;
+        bp.intersectMs = (b + 1 < effectiveBounces) ? toMs(ts[base + 5], ts[base + 4]) : 0.0;
 
         if (isMaterialMode && matDispatches) {
             bp.diffCount = matDispatches[b].diffCount;

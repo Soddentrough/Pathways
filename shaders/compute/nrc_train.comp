@@ -1,0 +1,171 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "nrc_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InTrainQueue {
+    NRCTrainingRecord records[];
+};
+
+layout(std430, set = 0, binding = 1) buffer InOutHashTable {
+    uint packedFeatures[];
+};
+
+layout(std430, set = 0, binding = 2) buffer InOutWeights {
+    float16_t weights[];
+};
+
+layout(std430, set = 0, binding = 3) buffer InOutWeightMomentum {
+    float weightM[NRC_TOTAL_WEIGHTS];
+    float weightV[NRC_TOTAL_WEIGHTS];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer InCounters {
+    NRCCountersBuffer counters;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint trainCount;
+    uint batchSize;
+    float learningRate;
+    uint frameIndex;
+    vec4 worldMin;
+    vec4 invWorldExtent;
+} pc;
+
+const float BETA1 = 0.9;
+const float BETA2 = 0.999;
+const float EPSILON_ADAM = 1e-8;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint maxTrain = min(min(pc.trainCount, pc.batchSize), counters.trainCount);
+    if (tid >= maxTrain) return;
+
+    NRCTrainingRecord rec = records[tid];
+    vec3 L_target = rec.targetRadiance.xyz;
+    if (any(isnan(L_target)) || any(isinf(L_target))) return;
+
+    vec3 normPos = clamp((rec.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+
+    // 1. Feature Extraction (64 features)
+    float x[64];
+    for (int i = 0; i < 64; ++i) x[i] = 0.0;
+
+    // Multi-frequency spatial encoding (24 features, matching nrc_encode_infer.comp)
+    for (uint l = 0u; l < NRC_LEVELS; ++l) {
+        float freq = float(1 << l);
+        vec3 p = normPos * freq;
+        vec2 f = vec2(sin(p.x + p.y), cos(p.y + p.z));
+        x[l * 2u + 0u] = f.x;
+        x[l * 2u + 1u] = f.y;
+    }
+
+    // Normal, ViewDir, Roughness, Albedo
+    x[24] = rec.normal_flags.x;
+    x[25] = rec.normal_flags.y;
+    x[26] = rec.normal_flags.z;
+    x[27] = rec.dir_pixelIndex.x;
+    x[28] = rec.dir_pixelIndex.y;
+    x[29] = rec.dir_pixelIndex.z;
+    x[30] = rec.pos_roughness.w;
+    x[31] = rec.albedo_pad.x;
+    x[32] = rec.albedo_pad.y;
+    x[33] = rec.albedo_pad.z;
+
+    // 2. Forward Pass
+    // Layer 0: 64 -> 64
+    float h0[64];
+    for (uint j = 0u; j < 64u; ++j) {
+        float sum = float(weights[NRC_B0_OFFSET + j]);
+        for (uint i = 0u; i < 64u; ++i) {
+            sum += x[i] * float(weights[NRC_W0_OFFSET + i * 64u + j]);
+        }
+        h0[j] = (sum > 0.0) ? sum : (0.01 * sum);
+    }
+
+    // Layer 1: 64 -> 64
+    float h1[64];
+    for (uint j = 0u; j < 64u; ++j) {
+        float sum = float(weights[NRC_B1_OFFSET + j]);
+        for (uint i = 0u; i < 64u; ++i) {
+            sum += h0[i] * float(weights[NRC_W1_OFFSET + i * 64u + j]);
+        }
+        h1[j] = (sum > 0.0) ? sum : (0.01 * sum);
+    }
+
+    // Layer 2: 64 -> 16
+    float y_out[16];
+    for (uint j = 0u; j < 16u; ++j) {
+        float sum = float(weights[NRC_B2_OFFSET + j]);
+        for (uint i = 0u; i < 64u; ++i) {
+            sum += h1[i] * float(weights[NRC_W2_OFFSET + i * 16u + j]);
+        }
+        y_out[j] = sum;
+    }
+
+    // 3. Loss & Output Gradient: Relative L1 Loss
+    // dL/dy = sign(y - y_target) / (y + 0.01)
+    vec3 pred = max(vec3(0.0), vec3(y_out[0], y_out[1], y_out[2]));
+    vec3 diff = pred - L_target;
+    vec3 denom = pred + vec3(0.01);
+    vec3 dL_dy = sign(diff) / denom;
+
+    float delta2[16];
+    delta2[0] = dL_dy.x;
+    delta2[1] = dL_dy.y;
+    delta2[2] = dL_dy.z;
+    for (int j = 3; j < 16; ++j) delta2[j] = 0.0;
+
+    // 4. Backpropagation
+    // Backprop to Layer 1: delta1 = (W2 * delta2) * LeakyReLU'(h1)
+    float delta1[64];
+    for (uint i = 0u; i < 64u; ++i) {
+        float sum = 0.0;
+        for (uint j = 0u; j < 16u; ++j) {
+            sum += delta2[j] * float(weights[NRC_W2_OFFSET + i * 16u + j]);
+        }
+        delta1[i] = (h1[i] > 0.0) ? sum : (0.01 * sum);
+    }
+
+    // Backprop to Layer 0: delta0 = (W1 * delta1) * LeakyReLU'(h0)
+    float delta0[64];
+    for (uint i = 0u; i < 64u; ++i) {
+        float sum = 0.0;
+        for (uint j = 0u; j < 64u; ++j) {
+            sum += delta1[j] * float(weights[NRC_W1_OFFSET + i * 64u + j]);
+        }
+        delta0[i] = (h0[i] > 0.0) ? sum : (0.01 * sum);
+    }
+
+    float lr = pc.learningRate;
+
+    // 6. Adam update for MLP weights (first thread coordinates weight step)
+    if (tid == 0u) {
+        float invBatch = 1.0 / float(maxTrain);
+
+        // Update Layer 2 weights & bias
+        for (uint j = 0u; j < 16u; ++j) {
+            float g_b = delta2[j] * invBatch;
+            uint bIdx = NRC_B2_OFFSET + j;
+            float m = BETA1 * weightM[bIdx] + (1.0 - BETA1) * g_b;
+            float v = BETA2 * weightV[bIdx] + (1.0 - BETA2) * g_b * g_b;
+            weightM[bIdx] = m;
+            weightV[bIdx] = v;
+            weights[bIdx] = float16_t(float(weights[bIdx]) - (lr / (sqrt(v) + EPSILON_ADAM)) * m);
+
+            for (uint i = 0u; i < 64u; ++i) {
+                float g_w = delta2[j] * h1[i] * invBatch;
+                uint wIdx = NRC_W2_OFFSET + i * 16u + j;
+                float wm = BETA1 * weightM[wIdx] + (1.0 - BETA1) * g_w;
+                float wv = BETA2 * weightV[wIdx] + (1.0 - BETA2) * g_w * g_w;
+                weightM[wIdx] = wm;
+                weightV[wIdx] = wv;
+                weights[wIdx] = float16_t(float(weights[wIdx]) - (lr / (sqrt(wv) + EPSILON_ADAM)) * wm);
+            }
+        }
+    }
+}

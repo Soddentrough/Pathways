@@ -27,6 +27,19 @@ struct ASInstanceInput {
     VkGeometryInstanceFlagsKHR flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 };
 
+// 96-byte GPU input struct matching compute shader update_tlas_instances.comp
+struct ASInstanceGPUData {
+    glm::mat4 transform = glm::mat4(1.0f); // 64 bytes (column-major transform)
+    uint32_t customIndex = 0;              // 4 bytes
+    uint32_t mask = 0xFF;                  // 4 bytes
+    uint32_t hitGroupId = 0;               // 4 bytes
+    uint32_t flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR; // 4 bytes
+    uint64_t blasAddress = 0;              // 8 bytes
+    uint32_t pad0 = 0;                     // 4 bytes
+    uint32_t pad1 = 0;                     // 4 bytes
+};
+static_assert(sizeof(ASInstanceGPUData) == 96, "ASInstanceGPUData must be exactly 96 bytes (std430 aligned)");
+
 class AccelerationStructure {
 public:
     AccelerationStructure(VkDevice device, VmaAllocator allocator);
@@ -62,9 +75,34 @@ public:
     std::unique_ptr<AccelerationStructure> buildBLAS(const std::vector<ASGeometryInput>& geometries);
     std::unique_ptr<AccelerationStructure> buildTLAS(const std::vector<ASInstanceInput>& instances);
 
+    // GPU-timeline TLAS sizing, allocation, and build / update (refit)
+    VkAccelerationStructureBuildSizesInfoKHR getTLASBuildSizes(uint32_t instanceCount);
+    std::unique_ptr<AccelerationStructure> createTLAS(uint32_t instanceCount);
+    void recordBuildTLAS(VkCommandBuffer cmd,
+                         Buffer* instanceBuffer,
+                         uint32_t instanceCount,
+                         Buffer* scratchBuffer,
+                         AccelerationStructure* dstTlas,
+                         bool updateMode = false);
+
+    // Telemetry stats
+    double getLastBlasBuildTimeMs() const { return m_lastBlasBuildTimeMs; }
+    double getBlasSizeKb() const { return m_blasSizeKb; }
+    uint32_t getBlasTriangles() const { return m_blasTriangles; }
+    double getLastTlasBuildTimeMs() const { return m_lastTlasBuildTimeMs; }
+    double getTlasSizeKb() const { return m_tlasSizeKb; }
+    uint32_t getTlasInstances() const { return m_tlasInstances; }
+
 private:
     void loadFunctionPointers();
     void submitCommandBuffer(VkCommandBuffer cmd);
+
+    double m_lastBlasBuildTimeMs = 0.0;
+    double m_blasSizeKb = 0.0;
+    uint32_t m_blasTriangles = 0;
+    double m_lastTlasBuildTimeMs = 0.0;
+    double m_tlasSizeKb = 0.0;
+    uint32_t m_tlasInstances = 0;
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
