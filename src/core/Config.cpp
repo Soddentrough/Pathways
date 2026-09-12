@@ -5,10 +5,19 @@
 #include <cstring>
 #include <cctype>
 #include <string_view>
+#include <cstdlib>
 
 namespace pathways {
 
 namespace {
+
+static inline void setEnvVar(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 bool parseResolutionString(std::string_view str, uint32_t& outW, uint32_t& outH) {
     while (!str.empty() && (str.front() == ' ' || str.front() == '\t')) str.remove_prefix(1);
     while (!str.empty() && (str.back() == ' ' || str.back() == '\t')) str.remove_suffix(1);
@@ -397,11 +406,11 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
         } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
-            setenv("PATHWAYS_DISABLE_DGC_PREPROCESS", "1", 1);
+            setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
         } else if (arg == "--no-dgc-batch-preprocess" || arg == "--no-dgc-tier2-batch") {
-            setenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1", 1);
+            setEnvVar("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1");
         } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
-            setenv("PATHWAYS_ENABLE_DGC_EXECSET", "1", 1);
+            setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
         } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
         } else if (arg == "--double-buffer-shared" || arg == "--double-buffer") {

@@ -245,7 +245,7 @@ void main() {
                 // KHR_materials_iridescence
                 if (mat.iridescence > 0.001) {
                     vec3 iridColor = evalThinFilmIridescence(cosTheta, mat.iridescenceIor, mat.iridescenceThickness > 0.0 ? mat.iridescenceThickness : 350.0);
-                    fresnel = mix(fresnel, clamp(dot(iridColor, vec3(0.333)), 0.0, 1.0), mat.iridescence);
+                    reflectProb = mix(reflectProb, clamp(dot(iridColor, vec3(0.333)), 0.0, 1.0), mat.iridescence);
                 }
 
                 vec3 nextDirection;
