@@ -617,6 +617,10 @@ void main() {
                 lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
                 lightPdf = 1.0 / float(pc.numLights);
             }
+        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+            lightDir = normalize(light.normal.xyz);
+            lightDist = 10000.0;
+            lightPdf = 1.0 / float(pc.numLights);
         } else {
             lightPdf = 0.0;
         }

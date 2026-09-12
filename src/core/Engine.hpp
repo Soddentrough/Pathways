@@ -176,9 +176,9 @@ private:
     void updateSceneDescriptors();
     void updateWavefrontSceneDescriptors();
 
-    // FidelityFX Shadow Denoiser Resources & Pipelines
     std::unique_ptr<Image> m_directLightImage;
     std::unique_ptr<Image> m_normalDepthImage;
+    std::unique_ptr<Image> m_prevNormalDepthImage;
     std::unique_ptr<Image> m_shadowFilterPingImage;
     std::unique_ptr<Image> m_momentsImages[2];
     std::unique_ptr<Image> m_depthImages[2];

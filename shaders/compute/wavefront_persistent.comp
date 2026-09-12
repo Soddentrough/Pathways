@@ -656,6 +656,10 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                     float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
                     lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
                     lightPdf = 1.0;
+                } else if (uint(light.position.w) == 2 /* DIRECTIONAL */) {
+                    lightDir = normalize(light.normal.xyz);
+                    lightDist = 10000.0;
+                    lightPdf = 1.0;
                 } else {
                     continue;
                 }

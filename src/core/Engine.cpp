@@ -1592,7 +1592,11 @@ void Engine::createShadowDenoiserResources() {
 
     m_normalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
+    m_prevNormalDepthImage = std::make_unique<Image>(device, allocator, w, h,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     m_shadowFilterPingImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16_SFLOAT,
@@ -1622,6 +1626,7 @@ void Engine::createShadowDenoiserResources() {
     vkBeginCommandBuffer(cmd, &beginInfo);
     m_directLightImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_shadowFilterPingImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     for (int i = 0; i < 2; ++i) {
         m_momentsImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -1642,6 +1647,7 @@ void Engine::createShadowDenoiserResources() {
 void Engine::destroyShadowDenoiserResources() {
     m_directLightImage.reset();
     m_normalDepthImage.reset();
+    m_prevNormalDepthImage.reset();
     m_shadowFilterPingImage.reset();
     m_momentsImages[0].reset();
     m_momentsImages[1].reset();
@@ -1707,7 +1713,8 @@ void Engine::createTemporalAccumPipelines() {
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uMotionVectors
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uHistoryRadiance
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uOutputRadiance
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uNormalDepth
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentNormalDepth
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uPrevNormalDepth
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
@@ -1719,7 +1726,7 @@ void Engine::createTemporalAccumPipelines() {
 
     // 2. Descriptor Pool (2 temporal sets + 2 tonemap temporal sets)
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.maxSets = 4;
@@ -1868,26 +1875,29 @@ void Engine::updateTemporalAccumDescriptors() {
 
     VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo ndInfo{ VK_NULL_HANDLE, m_normalDepthImage ? m_normalDepthImage->getImageView() : m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo currNdInfo{ VK_NULL_HANDLE, m_normalDepthImage ? m_normalDepthImage->getImageView() : m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevNdInfo{ VK_NULL_HANDLE, m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : currNdInfo.imageView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
     std::vector<VkWriteDescriptorSet> writes;
 
-    // Set 0: accum + mv + hist0 (in) -> hist1 (out) + nd
+    // Set 0: accum + mv + hist0 (in) -> hist1 (out) + currNd + prevNd
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
 
-    // Set 1: accum + mv + hist1 (in) -> hist0 (out) + nd
+    // Set 1: accum + mv + hist1 (in) -> hist0 (out) + currNd + prevNd
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
+    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
 
     // Tonemap Set 0: hist0 -> output
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
@@ -1953,6 +1963,60 @@ uint32_t Engine::dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory) {
     dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &postBarrier;
     vkCmdPipelineBarrier2(cmd, &dep);
+
+    // Copy current frame normal and depth to previous buffer for next frame's disocclusion testing
+    if (m_normalDepthImage && m_prevNormalDepthImage) {
+        VkImageCopy copyRegion{};
+        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.extent = { m_config.width, m_config.height, 1 };
+
+        VkImageMemoryBarrier2 preCopyBarriers[2] = {};
+        preCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].image = m_normalDepthImage->getImage();
+        preCopyBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        preCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        preCopyBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        preCopyBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].image = m_prevNormalDepthImage->getImage();
+        preCopyBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preDep.imageMemoryBarrierCount = 2;
+        preDep.pImageMemoryBarriers = preCopyBarriers;
+        vkCmdPipelineBarrier2(cmd, &preDep);
+
+        vkCmdCopyImage(cmd,
+            m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            m_prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+            1, &copyRegion);
+
+        VkImageMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.image = m_prevNormalDepthImage->getImage();
+        postCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postDep.imageMemoryBarrierCount = 1;
+        postDep.pImageMemoryBarriers = &postCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &postDep);
+    }
 
     m_temporalPingPong = outSlot;
     return outSlot + 1; // 1 => history[0], 2 => history[1]
@@ -3304,7 +3368,10 @@ void Engine::renderFrame() {
         // Temporal Radiance Accumulation & wRLS Outlier Rejection
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
-        uint32_t temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+        uint32_t temporalOutputSlot = 0;
+        if (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
+            temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+        }
 
         // Blockwise Multi-Order Feature Regression (BMFR)
         bool bmfrRun = !accumReachedCutoff ? dispatchBmfr(cmd, temporalOutputSlot) : false;

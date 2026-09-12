@@ -72,11 +72,27 @@ DEFAULT_SCENES = {
         "desc": "Complex specular/transmission reflection and refraction",
         "camera": None
     },
+    "cornell_caustic": {
+        "name": "Cornell Caustic Extended",
+        "path": "scenes/cornell-caustic/cornell_caustic_extended.glb",
+        "desc": "Dielectric glass sphere transmission, total internal reflection, and caustics",
+        "camera": None
+    },
     "helmet": {
         "name": "Damaged Helmet",
         "path": "scenes/DamagedHelmet.glb",
         "desc": "Canonical metallic-roughness PBR model with normal, AO & emissive maps",
         "camera": None
+    },
+    "bistro": {
+        "name": "Bistro Interior",
+        "path": "scenes/bistro/bistro_interior.glb",
+        "desc": "Massive geometry (1.32M tris), 74 materials, interior restaurant dining & bar",
+        "camera": {
+            "pos": [3.5, 1.75, -6.2],
+            "target": [9.5, 1.65, 0.5],
+            "fov": 70.0
+        }
     }
 }
 
@@ -141,7 +157,8 @@ def compute_image_metrics(img_path_a, img_path_b, diff_save_path=None):
 
 def run_single_benchmark(bin_path, scene_path, width, height, spp, bounces,
                          pipeline, sort_mode, gpu_id, frames, warmup,
-                         output_dir, tag, dump_frame=True, no_accum=False, env_overrides=None):
+                         output_dir, tag, dump_frame=True, no_accum=False, env_overrides=None,
+                         camera=None):
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"{tag}_stats.json")
     png_path = os.path.join(output_dir, f"{tag}_frame.png") if dump_frame else None
@@ -164,6 +181,14 @@ def run_single_benchmark(bin_path, scene_path, width, height, spp, bounces,
 
     if scene_path:
         cmd += ["--scene", scene_path]
+
+    if camera:
+        if "pos" in camera and camera["pos"]:
+            cmd += ["--camera-pos", f"{camera['pos'][0]},{camera['pos'][1]},{camera['pos'][2]}"]
+        if "target" in camera and camera["target"]:
+            cmd += ["--camera-target", f"{camera['target'][0]},{camera['target'][1]},{camera['target'][2]}"]
+        if "fov" in camera and camera["fov"]:
+            cmd += ["--fov", str(camera["fov"])]
 
     if pipeline == "rtp":
         cmd += ["--pipeline", "rtp"]
@@ -240,6 +265,7 @@ def run_aspect_comparison(bin_path, scene_key, scene_info, width, height, spp, b
                           gpu_id, frames, warmup, output_dir, capture_parity=True, no_accum=False):
     spath = scene_info["path"]
     sname = scene_info["name"]
+    cam_cfg = scene_info.get("camera")
     res_label = f"{width}x{height}"
     base_tag = f"{scene_key}_{res_label}_{bounces}b"
 
@@ -251,19 +277,22 @@ def run_aspect_comparison(bin_path, scene_key, scene_info, width, height, spp, b
     print(f"  [1/3] Running Megakernel (RTP)...")
     res_rtp = run_single_benchmark(bin_path, spath, width, height, spp, bounces,
                                    "rtp", None, gpu_id, frames, warmup,
-                                   output_dir, f"{base_tag}_rtp", dump_frame=capture_parity, no_accum=no_accum)
+                                   output_dir, f"{base_tag}_rtp", dump_frame=capture_parity, no_accum=no_accum,
+                                   camera=cam_cfg)
 
     # 2. Wavefront Monolithic (None sort)
     print(f"  [2/3] Running Wavefront Monolithic (No Material Sorting)...")
     res_wf_none = run_single_benchmark(bin_path, spath, width, height, spp, bounces,
                                        "wavefront", "none", gpu_id, frames, warmup,
-                                       output_dir, f"{base_tag}_wf_none", dump_frame=capture_parity, no_accum=no_accum)
+                                       output_dir, f"{base_tag}_wf_none", dump_frame=capture_parity, no_accum=no_accum,
+                                       camera=cam_cfg)
 
     # 3. Wavefront Autonomous DGC (Archetype sort)
     print(f"  [3/3] Running Wavefront Autonomous DGC (Archetype Sorting)...")
     res_wf_arch = run_single_benchmark(bin_path, spath, width, height, spp, bounces,
                                        "wavefront", "archetype", gpu_id, frames, warmup,
-                                       output_dir, f"{base_tag}_wf_archetype", dump_frame=capture_parity, no_accum=no_accum)
+                                       output_dir, f"{base_tag}_wf_archetype", dump_frame=capture_parity, no_accum=no_accum,
+                                       camera=cam_cfg)
 
     m_rtp = extract_pipeline_metrics(res_rtp)
     m_wf_none = extract_pipeline_metrics(res_wf_none)

@@ -15,8 +15,11 @@ layout(binding = 2) readonly uniform image2D uHistoryRadiance;
 // Binding 3: Output accumulated radiance (RGBA16F or RGBA32F, RGB: accumulated radiance, A: sample count N)
 layout(binding = 3) writeonly uniform image2D uOutputRadiance;
 
-// Binding 4: Primary hit Normal & Linear Depth (RGBA16F, RGB: normal, A: depth)
-layout(binding = 4) readonly uniform image2D uNormalDepth;
+// Binding 4: Current frame Primary hit Normal & Linear Depth (RGBA16F, RGB: normal, A: depth)
+layout(binding = 4) readonly uniform image2D uCurrentNormalDepth;
+
+// Binding 5: Previous frame Primary hit Normal & Linear Depth (RGBA16F, RGB: normal, A: depth)
+layout(binding = 5) readonly uniform image2D uPrevNormalDepth;
 
 layout(push_constant) uniform PushConstants {
     ivec2 imageSize;
@@ -31,6 +34,24 @@ layout(push_constant) uniform PushConstants {
 
 bool isInvalid(vec3 v) {
     return isnan(v.r) || isnan(v.g) || isnan(v.b) || isinf(v.r) || isinf(v.g) || isinf(v.b);
+}
+
+// Convert linear RGB to YCoCg space for perceptually decoupled variance clipping
+vec3 RGBToYCoCg(vec3 rgb) {
+    float Y  = dot(rgb, vec3( 0.25, 0.50,  0.25));
+    float Co = dot(rgb, vec3( 0.50, 0.00, -0.50));
+    float Cg = dot(rgb, vec3(-0.25, 0.50, -0.25));
+    return vec3(Y, Co, Cg);
+}
+
+vec3 YCoCgToRGB(vec3 ycocg) {
+    float Y  = ycocg.x;
+    float Co = ycocg.y;
+    float Cg = ycocg.z;
+    float R = Y + Co - Cg;
+    float G = Y + Cg;
+    float B = Y - Co - Cg;
+    return max(vec3(0.0), vec3(R, G, B));
 }
 
 void main() {
@@ -48,35 +69,16 @@ void main() {
         C_curr = vec3(0.0);
     }
 
-    // When the camera is stationary, the path tracer is performing progressive Monte Carlo accumulation.
+    // When the camera is stationary, the path tracer performs progressive Monte Carlo accumulation.
     // C_curr already represents the exact, unbiased physical radiance without temporal lag or ghosting.
-    // We pass through C_curr directly to output and store it in history so that history is primed for future motion.
+    // Pass through C_curr directly to output and store sample count in history.
     if (pc.cameraMoved == 0u) {
         float N_curr = min(float(max(pc.totalSamples, 1u)), pc.maxHistorySamples);
         imageStore(uOutputRadiance, pixelCoord, vec4(C_curr, N_curr));
         return;
     }
 
-    // 2. Compute 3x3 local color statistics for neighborhood clamping
-    vec3 m1 = vec3(0.0);
-    vec3 m2 = vec3(0.0);
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 tapCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), pc.imageSize - 1);
-            vec3 tap = imageLoad(uCurrentRadiance, tapCoord).rgb * invTotal;
-            if (isInvalid(tap)) tap = C_curr;
-            m1 += tap;
-            m2 += tap * tap;
-        }
-    }
-    vec3 mean = m1 / 9.0;
-    vec3 variance = max(vec3(0.0), (m2 / 9.0) - (mean * mean));
-    vec3 stdDev = sqrt(variance);
-    float gamma = max(pc.clampingGamma, 2.5); // Wide box for stochastic 1-SPP noise
-    vec3 boxMin = max(vec3(0.0), mean - gamma * stdDev);
-    vec3 boxMax = mean + gamma * stdDev;
-
-    // 3. Motion Vector Reprojection
+    // 2. Motion Vector Reprojection
     vec2 mv = imageLoad(uMotionVectors, pixelCoord).xy;
     vec2 currUV = (vec2(pixelCoord) + 0.5) * pc.invImageSize;
     vec2 prevUV = currUV - mv;
@@ -109,10 +111,11 @@ void main() {
             validHistory = false;
         }
 
-        // Geometric Disocclusion Test: check depth and normal consistency with reprojected pixel
-        vec4 currND = imageLoad(uNormalDepth, pixelCoord);
+        // Geometric Disocclusion Test: compare current primary hit against previous frame geometry
+        vec4 currND = imageLoad(uCurrentNormalDepth, pixelCoord);
         ivec2 prevCoord = clamp(ivec2(prevUV * vec2(pc.imageSize)), ivec2(0), pc.imageSize - 1);
-        vec4 prevND = imageLoad(uNormalDepth, prevCoord);
+        vec4 prevND = imageLoad(uPrevNormalDepth, prevCoord);
+
         if (currND.w < 5000.0 && prevND.w < 5000.0) {
             float depthDiff = abs(currND.w - prevND.w) / max(currND.w, 0.1);
             float normalDot = dot(currND.xyz, prevND.xyz);
@@ -120,19 +123,25 @@ void main() {
                 validHistory = false;
                 historyVal = vec4(C_curr, 1.0);
             }
+        } else if ((currND.w < 5000.0) != (prevND.w < 5000.0)) {
+            validHistory = false;
+            historyVal = vec4(C_curr, 1.0);
         }
     }
 
-    // 4. Blending with reprojected history
+    // 3. Adaptive History Blending (Energy-Conserving Monte Carlo EMA)
     vec3 C_final = C_curr;
     float N_curr = 1.0;
     if (validHistory) {
-        N_curr = min(historyVal.a + 1.0, pc.maxHistorySamples);
+        // In camera motion, cap effective sample count to 4.0 so ghost trails fade within 3-4 frames
+        // and prevent bright highlights from bleeding into deep contact shadows.
+        float maxMotionSamples = min(pc.maxHistorySamples, 4.0);
+        N_curr = min(historyVal.a + 1.0, maxMotionSamples);
         float alpha = 1.0 / max(N_curr, 1.0);
-        alpha = clamp(alpha, 0.08, 0.20); // 80-92% history, 8-20% current sample (Tong et al.)
+        alpha = clamp(alpha, 0.25, 1.0);
         C_final = mix(historyVal.rgb, C_curr, alpha);
     }
 
-    // 5. Store accumulated radiance (RGB) and tracked sample count (A)
+    // 4. Store accumulated radiance (RGB) and tracked sample count (A)
     imageStore(uOutputRadiance, pixelCoord, vec4(C_final, N_curr));
 }

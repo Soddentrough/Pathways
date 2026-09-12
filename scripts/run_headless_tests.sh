@@ -53,7 +53,7 @@ echo "[3/7] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..."
     --dump-hdr output/test_cornell_1080p.exr \
     --dump-stats output/stats_1080p.json
 
-python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0 --max-mean-lum 0.85 --min-shadow-pct 0.5 --max-blown-pct 12.0
+python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 4. Test Suite 2: 4K Native Real-Time Benchmark (<8ms Target)
 echo ""

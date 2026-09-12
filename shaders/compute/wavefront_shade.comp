@@ -380,6 +380,11 @@ void main() {
                                 lightPdf = 1.0;
                                 validLightSample = true;
                             }
+                        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                            lightDir = normalize(light.normal.xyz);
+                            lightDist = 10000.0;
+                            lightPdf = 1.0;
+                            validLightSample = true;
                         }
 
                         float NdotL = dot(hitNormal, lightDir);
@@ -562,12 +567,12 @@ void main() {
                         }
 
                         // 4. Luminance check & Russian Roulette path termination (aligned with raytrace.rgen)
-                        float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-                        if (lum < 0.001) {
+                        float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                        if (pathLum < 0.001) {
                             pathTerminated = true;
                         } else if (bounce >= 1u) {
                             float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                            float p = clamp(lum, minP, 0.95);
+                            float p = clamp(pathLum, minP, 0.95);
                             if (randFloat(seed) > p) {
                                 pathTerminated = true;
                             } else {

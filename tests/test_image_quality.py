@@ -74,6 +74,7 @@ def main():
         "--frames", "60",
         "--warmup-frames", "10",
         "--camera-motion",
+        "--temporal-accum",
         "--dump-frame", wf_png,
         "--dump-stats", wf_stats
     ]
@@ -216,6 +217,7 @@ def main():
         "--frames", "60",
         "--warmup-frames", "10",
         "--camera-motion",
+        "--temporal-accum",
         "--dump-frame", lr_mot_png,
         "--dump-stats", lr_mot_json
     ]

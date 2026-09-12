@@ -401,6 +401,7 @@ set(CURATED_SCENE_DIRS
     breakfast-room
     classroom
     coffee-maker
+    cornell-caustic
     living-room
 )
 

@@ -35,6 +35,8 @@ scenes/*/
 !scenes/breakfast-room/**
 !scenes/coffee-maker/
 !scenes/coffee-maker/**
+!scenes/cornell-caustic/
+!scenes/cornell-caustic/**
 !scenes/classroom/
 !scenes/classroom/**
 !scenes/living-room/

@@ -522,9 +522,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
                 ImGui::Text("Denoising:    BMFR (Feature Regression) [Experimental]");
             } else if (config.enable_temporal_accum && config.denoiser_mode != DenoiserMode::None) {
-                ImGui::Text("Denoising:    Temporal Accumulation (wRLS) [Default]");
+                ImGui::Text("Denoising:    Temporal Accumulation (wRLS)");
             } else {
-                ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
+                ImGui::Text("Denoising:    Off (Pure Monte Carlo) [Default]");
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -1286,14 +1286,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 5. Post-Processing & Denoising
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char* denoiserModes[] = {
-                "Temporal Radiance Accumulation (Motion-Vector Guided) [Default]",
-                "None (Pure Monte Carlo)",
+                "None (Pure Monte Carlo) [Default]",
+                "Temporal Radiance Accumulation (Motion-Vector Guided)",
                 "BMFR (Blockwise Feature Regression) [Experimental]"
             };
             int currentDenoiser = 0;
             if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
                 currentDenoiser = 2;
-            } else if (config.denoiser_mode == DenoiserMode::None || !config.enable_temporal_accum) {
+            } else if (config.denoiser_mode == DenoiserMode::Temporal && config.enable_temporal_accum) {
                 currentDenoiser = 1;
             } else {
                 currentDenoiser = 0;
@@ -1301,12 +1301,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
                 if (currentDenoiser == 0) {
-                    config.denoiser_mode = DenoiserMode::Temporal;
-                    config.enable_temporal_accum = true;
-                    config.enable_bmfr = false;
-                } else if (currentDenoiser == 1) {
                     config.denoiser_mode = DenoiserMode::None;
                     config.enable_temporal_accum = false;
+                    config.enable_bmfr = false;
+                } else if (currentDenoiser == 1) {
+                    config.denoiser_mode = DenoiserMode::Temporal;
+                    config.enable_temporal_accum = true;
                     config.enable_bmfr = false;
                 } else if (currentDenoiser == 2) {
                     config.denoiser_mode = DenoiserMode::BMFR;
@@ -1317,7 +1317,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select active denoising architecture. Temporal Accumulation is default for artifact-free motion.");
+                ImGui::SetTooltip("Select active denoising architecture. None (Pure Monte Carlo) is default for unbiased reference rendering.");
             }
 
             if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {

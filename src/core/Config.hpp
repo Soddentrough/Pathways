@@ -80,8 +80,8 @@ struct Config {
     bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
-    DenoiserMode denoiser_mode = DenoiserMode::Temporal; // Default: Temporal Radiance Accumulation
-    bool enable_temporal_accum = true;    // Motion-vector guided temporal accumulation [Default: enabled]
+    DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
+    bool enable_temporal_accum = false;   // Motion-vector guided temporal accumulation [Default: disabled, opt-in via --temporal-accum / --denoiser temporal]
     bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled, opt-in via --bmfr]
     float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
     float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth

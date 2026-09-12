@@ -101,7 +101,7 @@ SCENES = [
         "name": "Bistro Interior",
         "category": "Massive Scale (>1.3M Triangles)",
         "path": "scenes/bistro/bistro_interior.glb",
-        "camera_args": ["--camera-pos", "-0.5,2.1,-1.5", "--camera-target", "6.0,1.8,-3.5", "--fov", "70"],
+        "camera_args": ["--camera-pos", "3.5,1.75,-6.2", "--camera-target", "9.5,1.65,0.5", "--fov", "70"],
         "desc": "Massive geometry (1.32M tris), 74 materials, 64 lights, and 207 textures."
     }
 ]
