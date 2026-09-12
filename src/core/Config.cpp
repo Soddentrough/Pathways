@@ -142,6 +142,7 @@ void Config::printUsage(const char* progName) {
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
+              << "  --output-format <fmt>   Output backbuffer format: '10bit' (10-bit A2B10G10R10 [default]) or '8bit' (8-bit RGBA8)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
               << "  --temporal-accum, --tra Enable motion-vector guided temporal accumulation [default: disabled]\n"
               << "  --bmfr                  Enable experimental Blockwise Multi-Order Feature Regression [default: disabled]\n"
@@ -404,6 +405,13 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
+            }
+        } else if ((arg == "--output-format" || arg == "--out-format") && i + 1 < argc) {
+            std::string fmt = argv[++i];
+            if (fmt == "8bit" || fmt == "rgba8" || fmt == "8" || fmt == "rgba8_unorm") {
+                cfg.output_format = OutputFormat::RGBA8_UNORM;
+            } else {
+                cfg.output_format = OutputFormat::A2B10G10R10_UNORM;
             }
         } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");

@@ -6,8 +6,9 @@
 namespace pathways {
 
 Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
-                     uint32_t width, uint32_t height, uint32_t graphicsQueueFamily)
-    : m_device(device) {
+                     uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
+                     VkFormat preferredFormat)
+    : m_device(device), m_preferredFormat(preferredFormat) {
 
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &capabilities);
@@ -17,16 +18,41 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
 
-    // Prefer R8G8B8A8_UNORM to match engine storage output image, fallback to B8G8R8A8_UNORM
+    // Surface format selection: prioritize preferredFormat (e.g. A2B10G10R10_UNORM_PACK32 for 10-bit Deep Color/HDR),
+    // then R8G8B8A8_UNORM / B8G8R8A8_UNORM as SDR fallbacks.
     m_imageFormat = formats[0].format;
     m_colorSpace = formats[0].colorSpace;
     bool foundFormat = false;
+
+    // 1. Try to match preferredFormat directly
     for (const auto& f : formats) {
-        if (f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+        if (f.format == m_preferredFormat) {
             m_imageFormat = f.format;
             m_colorSpace = f.colorSpace;
             foundFormat = true;
             break;
+        }
+    }
+
+    // 2. Fallbacks if preferredFormat was not supported by surface
+    if (!foundFormat) {
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+                m_imageFormat = f.format;
+                m_colorSpace = f.colorSpace;
+                foundFormat = true;
+                break;
+            }
+        }
+    }
+    if (!foundFormat) {
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+                m_imageFormat = f.format;
+                m_colorSpace = f.colorSpace;
+                foundFormat = true;
+                break;
+            }
         }
     }
     if (!foundFormat) {
@@ -34,6 +60,7 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
             if (f.format == VK_FORMAT_B8G8R8A8_UNORM) {
                 m_imageFormat = f.format;
                 m_colorSpace = f.colorSpace;
+                foundFormat = true;
                 break;
             }
         }

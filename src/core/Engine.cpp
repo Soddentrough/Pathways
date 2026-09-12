@@ -131,13 +131,17 @@ Engine::Engine(const Config& config) : m_config(config) {
     if (!m_config.headless && m_window) {
         m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
         m_surface = m_window->createSurface(m_context->getInstance());
+        VkFormat preferredSwapFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
+            ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+            : VK_FORMAT_R8G8B8A8_UNORM;
         m_swapchain = std::make_unique<Swapchain>(
             m_context->getDevice(),
             m_context->getPhysicalDevice(),
             m_surface,
             m_window->getWidth(),
             m_window->getHeight(),
-            m_context->getGraphicsQueueFamily()
+            m_context->getGraphicsQueueFamily(),
+            preferredSwapFmt
         );
         m_config.width = m_swapchain->getExtent().width;
         m_config.height = m_swapchain->getExtent().height;
@@ -373,9 +377,12 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    VkFormat outputFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
+        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+        : VK_FORMAT_R8G8B8A8_UNORM;
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R8G8B8A8_UNORM,
+        outputFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -4131,9 +4138,27 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
-        const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
-        ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, pixels);
-        staging.unmap();
+        if (m_outputImage->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+            const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
+            std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
+                uint32_t px = src32[pIdx];
+                uint32_t r10 = (px >> 0) & 0x3FF;
+                uint32_t g10 = (px >> 10) & 0x3FF;
+                uint32_t b10 = (px >> 20) & 0x3FF;
+                uint32_t a2  = (px >> 30) & 0x03;
+                rgba8[pIdx * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                rgba8[pIdx * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                rgba8[pIdx * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                rgba8[pIdx * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+            }
+            ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
+            staging.unmap();
+        } else {
+            const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
+            ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, pixels);
+            staging.unmap();
+        }
     }
 
     // 2. Dump HDR OpenEXR
@@ -4184,23 +4209,39 @@ void Engine::dumpOutputFiles() {
     if (!m_config.dump_ui_path.empty() && m_uiDumpBuffer && m_swapchain) {
         uint32_t w = m_swapchain->getExtent().width;
         uint32_t h = m_swapchain->getExtent().height;
-        const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
         std::vector<uint8_t> rgba(w * h * 4);
-        bool isBgra = (m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_UNORM || m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_SRGB);
-        for (size_t i = 0; i < w * h; ++i) {
-            if (isBgra) {
-                rgba[i * 4 + 0] = raw[i * 4 + 2];
-                rgba[i * 4 + 1] = raw[i * 4 + 1];
-                rgba[i * 4 + 2] = raw[i * 4 + 0];
-                rgba[i * 4 + 3] = raw[i * 4 + 3];
-            } else {
-                rgba[i * 4 + 0] = raw[i * 4 + 0];
-                rgba[i * 4 + 1] = raw[i * 4 + 1];
-                rgba[i * 4 + 2] = raw[i * 4 + 2];
-                rgba[i * 4 + 3] = raw[i * 4 + 3];
+        if (m_swapchain->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+            const uint32_t* src32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                uint32_t px = src32[i];
+                uint32_t r10 = (px >> 0) & 0x3FF;
+                uint32_t g10 = (px >> 10) & 0x3FF;
+                uint32_t b10 = (px >> 20) & 0x3FF;
+                uint32_t a2  = (px >> 30) & 0x03;
+                rgba[i * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                rgba[i * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                rgba[i * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                rgba[i * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
             }
+            m_uiDumpBuffer->unmap();
+        } else {
+            const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
+            bool isBgra = (m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_UNORM || m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_SRGB);
+            for (size_t i = 0; i < w * h; ++i) {
+                if (isBgra) {
+                    rgba[i * 4 + 0] = raw[i * 4 + 2];
+                    rgba[i * 4 + 1] = raw[i * 4 + 1];
+                    rgba[i * 4 + 2] = raw[i * 4 + 0];
+                    rgba[i * 4 + 3] = raw[i * 4 + 3];
+                } else {
+                    rgba[i * 4 + 0] = raw[i * 4 + 0];
+                    rgba[i * 4 + 1] = raw[i * 4 + 1];
+                    rgba[i * 4 + 2] = raw[i * 4 + 2];
+                    rgba[i * 4 + 3] = raw[i * 4 + 3];
+                }
+            }
+            m_uiDumpBuffer->unmap();
         }
-        m_uiDumpBuffer->unmap();
         ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
     }
 
@@ -4575,13 +4616,17 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     // 1. Recreate Swapchain (destroy old swapchain first so surface is released)
     m_swapchain.reset();
+    VkFormat preferredSwapFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
+        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+        : VK_FORMAT_R8G8B8A8_UNORM;
     m_swapchain = std::make_unique<Swapchain>(
         device,
         m_context->getPhysicalDevice(),
         m_surface,
         m_config.width,
         m_config.height,
-        m_context->getGraphicsQueueFamily()
+        m_context->getGraphicsQueueFamily(),
+        preferredSwapFmt
     );
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
@@ -4609,9 +4654,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
+    VkFormat outputFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
+        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+        : VK_FORMAT_R8G8B8A8_UNORM;
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R8G8B8A8_UNORM,
+        outputFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
