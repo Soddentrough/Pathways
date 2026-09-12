@@ -21,12 +21,14 @@ struct ConfigKey {
     DenoiserMode denoiser = DenoiserMode::None;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
     uint32_t tile_size = 64;
+    bool enable_nrc = false;
 
     bool operator==(const ConfigKey& o) const {
         if (scene_name != o.scene_name) return false;
         if (pipeline_type != o.pipeline_type) return false;
         if (mgpu_mode != o.mgpu_mode) return false;
         if (denoiser != o.denoiser) return false;
+        if (enable_nrc != o.enable_nrc) return false;
         if (width != o.width || height != o.height) return false;
         if (spp != o.spp || max_bounces != o.max_bounces) return false;
         if (accum_format != o.accum_format) return false;
@@ -56,7 +58,8 @@ struct ConfigKey {
         if (denoiser == DenoiserMode::BMFR) {
             denoiserStr = " [BMFR]";
         }
-        return std::format("[{}]{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
+        std::string nrcStr = enable_nrc ? " [NRC]" : "";
+        return std::format("[{}]{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
     }
 };
 

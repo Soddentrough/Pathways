@@ -4645,7 +4645,8 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
-    key.denoiser = m_config.denoiser_mode;
+    key.denoiser = (m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR : DenoiserMode::None;
+    key.enable_nrc = m_config.enable_nrc;
     key.width = m_config.width;
     key.height = m_config.height;
     key.spp = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentSpp : m_config.spp;
@@ -4730,7 +4731,9 @@ void Engine::printExecutionSummary() const {
                     other.key.height == tally.key.height &&
                     other.key.spp == tally.key.spp &&
                     other.key.max_bounces == tally.key.max_bounces &&
-                    other.key.accum_format == tally.key.accum_format) {
+                    other.key.accum_format == tally.key.accum_format &&
+                    other.key.denoiser == tally.key.denoiser &&
+                    other.key.enable_nrc == tally.key.enable_nrc) {
                     baselineMs = other.getAvgFrameTimeMs();
                     break;
                 }

@@ -26,7 +26,7 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 // Shared memory for wave reduction and regression weights
-shared float s_wave1[39];
+shared float s_subgroupSums[2][39];
 shared float s_weights[18]; // 6 weights for R, 6 for G, 6 for B
 
 bool isInvalid(vec3 v) {
@@ -88,8 +88,8 @@ void main() {
 
     for (int i = 0; i < 39; ++i) {
         float waveSum = subgroupAdd(localVals[i]);
-        if (subgroupId == 1u && waveID == uint(i)) {
-            s_wave1[i] = waveSum;
+        if (waveID == 0u) {
+            s_subgroupSums[subgroupId][i] = waveSum;
         }
     }
 
@@ -101,7 +101,7 @@ void main() {
         int sIdx = 0;
         for (int j = 0; j < 6; ++j) {
             for (int k = j; k < 6; ++k) {
-                float total = subgroupAdd(localVals[sIdx]) + s_wave1[sIdx];
+                float total = s_subgroupSums[0][sIdx] + s_subgroupSums[1][sIdx];
                 S[j][k] = total;
                 S[k][j] = total;
                 sIdx++;
@@ -110,9 +110,9 @@ void main() {
 
         float bR[6], bG[6], bB[6];
         for (int j = 0; j < 6; ++j) {
-            bR[j] = subgroupAdd(localVals[21 + j])      + s_wave1[21 + j];
-            bG[j] = subgroupAdd(localVals[21 + 6 + j])  + s_wave1[21 + 6 + j];
-            bB[j] = subgroupAdd(localVals[21 + 12 + j]) + s_wave1[21 + 12 + j];
+            bR[j] = s_subgroupSums[0][21 + j]      + s_subgroupSums[1][21 + j];
+            bG[j] = s_subgroupSums[0][21 + 6 + j]  + s_subgroupSums[1][21 + 6 + j];
+            bB[j] = s_subgroupSums[0][21 + 12 + j] + s_subgroupSums[1][21 + 12 + j];
         }
 
         // Add Tikhonov regularization lambda * trace(S)/6 * I

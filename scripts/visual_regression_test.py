@@ -253,6 +253,18 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
         sharp_ref = 0.0
         sharp_pct_change = 0.0
 
+    # 4b. Chromatic Balance & Color Tint Drift
+    mean_rgb_curr = [float(np.mean(arr_curr[:, :, c])) for c in range(3)]
+    mean_rgb_ref = [float(np.mean(arr_ref[:, :, c])) for c in range(3)]
+    delta_r = mean_rgb_curr[0] - mean_rgb_ref[0]
+    delta_g = mean_rgb_curr[1] - mean_rgb_ref[1]
+    delta_b = mean_rgb_curr[2] - mean_rgb_ref[2]
+    chroma_drift = max(abs(delta_r - delta_g), abs(delta_g - delta_b), abs(delta_r - delta_b))
+
+    blue_ratio_curr = mean_rgb_curr[2] / max(max(mean_rgb_curr[0], mean_rgb_curr[1]), 1e-4)
+    blue_ratio_ref = mean_rgb_ref[2] / max(max(mean_rgb_ref[0], mean_rgb_ref[1]), 1e-4)
+    blue_ratio_drop = blue_ratio_ref - blue_ratio_curr
+
     # 5. Difference Heatmap Generation
     if diff_output_path:
         os.makedirs(os.path.dirname(diff_output_path) or ".", exist_ok=True)
@@ -268,13 +280,17 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
     detail = "Within stochastic Monte Carlo variance tolerance"
     severity = "pass"
 
-    if ssim_val >= 0.985 and mae <= 0.015:
+    if ssim_val >= 0.985 and mae <= 0.015 and chroma_drift <= 0.020:
         status = "MATCH (STABLE)"
         detail = "Reference match within stochastic tolerance"
         severity = "pass"
     else:
         # Significant difference detected. Classify root cause:
-        if delta_blown > 1.5 or (delta_mean_lum > 0.12 and blown_curr > 2.0):
+        if chroma_drift > 0.035 or (blue_ratio_drop > 0.20 and blue_ratio_curr < 0.70):
+            status = "FLAGGED REGRESSION: COLOR CAST / CHROMATIC DRIFT"
+            detail = f"Color tint shift: chroma_drift={chroma_drift:.4f}, delta_RGB=[{delta_r:+.3f}, {delta_g:+.3f}, {delta_b:+.3f}], Blue ratio={blue_ratio_curr:.2f} (ref={blue_ratio_ref:.2f})"
+            severity = "fail"
+        elif delta_blown > 1.5 or (delta_mean_lum > 0.12 and blown_curr > 2.0):
             status = "FLAGGED REGRESSION: OVEREXPOSURE"
             detail = f"Highlight blowout increased by {delta_blown:+.2f}%, mean lum increased by {delta_mean_lum:+.4f}"
             severity = "fail"
@@ -314,6 +330,11 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
         "mean_lum_curr": mean_lum_curr,
         "mean_lum_ref": mean_lum_ref,
         "delta_mean_lum": delta_mean_lum,
+        "mean_rgb_curr": mean_rgb_curr,
+        "mean_rgb_ref": mean_rgb_ref,
+        "chroma_drift": chroma_drift,
+        "blue_ratio_curr": blue_ratio_curr,
+        "blue_ratio_ref": blue_ratio_ref,
         "shadow_curr": shadow_curr,
         "shadow_ref": shadow_ref,
         "delta_shadow": delta_shadow,
@@ -540,6 +561,10 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
     <div class="metric-box">
       <div class="metric-label">Sharpness</div>
       <div class="metric-val">{m['sharp_pct_change']:+.1f}%</div>
+    </div>
+    <div class="metric-box">
+      <div class="metric-label">Color Drift</div>
+      <div class="metric-val">{m.get('chroma_drift', 0.0):.4f}</div>
     </div>
   </div>
 

@@ -319,6 +319,15 @@ def main():
         else:
             print(f"\033[32m[PASS]\033[0m BMFR sub-5ms budget achieved: {avg_ms_b:.3f} ms <= 5.0 ms")
 
+        # Strict chromatic balance assertions: enforce no green/yellow tint regression
+        gb_diff = abs(m_bmfr["mean_rgb"][1] - m_bmfr["mean_rgb"][2])
+        blue_ratio = m_bmfr["mean_rgb"][2] / max(max(m_bmfr["mean_rgb"][0], m_bmfr["mean_rgb"][1]), 1e-4)
+        if gb_diff > 0.035 or blue_ratio < 0.80:
+            print(f"[FAIL] BMFR color cast / green tint detected: |G - B| = {gb_diff:.4f} > 0.035 or Blue ratio = {blue_ratio:.2f} < 0.80")
+            all_passed = False
+        else:
+            print(f"\033[32m[PASS]\033[0m BMFR chromatic balance preserved: |G - B| = {gb_diff:.4f} <= 0.035, Blue ratio = {blue_ratio:.2f} >= 0.80")
+
     # -------------------------------------------------------------------------
     # Test 5: Automated Before/After Golden Reference Verification
     # -------------------------------------------------------------------------
