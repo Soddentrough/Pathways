@@ -15,3 +15,16 @@ https://gpuopen.com/learn/ray-tracing-massive-amounts-animated-geometry/
 https://gpuopen.com/learn/dense-geometry-format-amd-vulkan-extension/
 https://gpuopen.com/learn/amd-dgf-an-open-geometry-compression-standard/
 https://gpuopen.com/learn/introducing-amd-dgf-supercompression/
+
+# Ray Sorting / coherency
+https://arxiv.org/html/2506.11273v1
+https://arxiv.org/html/2310.07182v1
+https://graphics.stanford.edu/~boulos/papers/reorder_rt08.pdf
+
+# Dynamic BVH rebuiding
+https://dl.acm.org/doi/10.1145/3799818.3812105
+https://gpuopen.com/learn/why-multi-resolution-geometric-representation-bvh-ray-tracing/
+
+# Other
+https://gpuopen.com/learn/publications/
+https://dl.acm.org/doi/10.1145/1618452.1618512

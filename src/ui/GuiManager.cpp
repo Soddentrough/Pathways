@@ -1,5 +1,6 @@
 #include "ui/GuiManager.hpp"
 #include "core/Logger.hpp"
+#include "core/ConfigTally.hpp"
 #include "core/Window.hpp"
 #include "scene/Camera.hpp"
 
@@ -468,10 +469,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.7f, 1.0f), "  Link:    %s", stats.mgpu_transfer_mode_str.c_str());
                 }
             }
-
-            if (ImGui::SmallButton("Re-check PCIe Status")) {
-                if (actions) actions->refreshPciStatus = true;
-            }
             ImGui::Separator();
 
             if (config.visualize_mgpu_split && config.mgpu_mode != MultiGpuMode::Off) {
@@ -479,8 +476,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             if (stats.secondary_gpu_time_ms > 0.001) {
-                ImGui::Text("  GPU 0 (Primary RT):    %.3f ms", stats.primary_gpu_time_ms);
-                ImGui::Text("  GPU 1 (Secondary RT):  %.3f ms", stats.secondary_gpu_time_ms);
+                ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms);
+                ImGui::Text("  GPU 1 Ray Tracing:     %.3f ms", stats.secondary_gpu_time_ms);
                 ImGui::Text("  Tonemap & Merge Pass:  %.3f ms", stats.tonemap_time_ms);
 
                 float totalWork = static_cast<float>(stats.primary_gpu_time_ms + stats.secondary_gpu_time_ms);
@@ -526,19 +523,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Denoising:    A-Trous Wavelet (%u Passes)", config.atrous_passes);
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
-            }
-            if (config.enable_restir_di) {
-                ImGui::Text("ReSTIR DI:    Enabled (%s, %u Samples, R=%.0f)",
-                    config.enable_restir_spatial ? "Spatio-Temporal" : "Temporal Only",
-                    config.enable_restir_spatial ? config.restir_spatial_samples : 0u,
-                    config.restir_spatial_radius);
-            } else {
-                ImGui::Text("ReSTIR DI:    Disabled");
-            }
-            if (config.enable_restir_gi) {
-                ImGui::Text("ReSTIR GI:    Enabled (Spatio-Temporal Secondary Resampling)");
-            } else {
-                ImGui::Text("ReSTIR GI:    Disabled");
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -589,11 +573,26 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 if (c.pipeline_stages.is_wavefront && !c.pipeline_stages.bounces.empty()) {
                     ImGui::Indent(15.0f);
-                    ImGui::TextDisabled("Stages: Classify: %.2f ms | GI: %.2f ms",
-                                        c.pipeline_stages.classify_ms, c.pipeline_stages.restir_gi_ms);
+                    if (c.pipeline_stages.primary_rays > 0) {
+                        ImGui::TextDisabled("Stages: Classify: %.2f ms | %s rays left (100.0%%)",
+                                            c.pipeline_stages.classify_ms,
+                                            formatRayCount(c.pipeline_stages.primary_rays).c_str());
+                    } else {
+                        ImGui::TextDisabled("Stages: Classify: %.2f ms", c.pipeline_stages.classify_ms);
+                    }
                     for (const auto& b : c.pipeline_stages.bounces) {
-                        ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | Intersect: %.2f ms",
-                                            b.bounce, b.shade_ms, b.shadow_ms, b.intersect_ms);
+                        double pct = (c.pipeline_stages.primary_rays > 0)
+                            ? (100.0 * static_cast<double>(b.rays_left) / c.pipeline_stages.primary_rays)
+                            : 0.0;
+                        if (b.intersect_ms > 0.0001) {
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | Intersect: %.2f ms | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, b.shadow_ms, b.intersect_ms,
+                                                formatRayCount(b.rays_left).c_str(), pct);
+                        } else {
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, b.shadow_ms,
+                                                formatRayCount(b.rays_left).c_str(), pct);
+                        }
                     }
                     ImGui::Unindent(15.0f);
                 }
@@ -1238,53 +1237,32 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("Soft Area Shadows", &config.enable_shadows)) {
                 settingsChanged = true;
             }
-            if (ImGui::Checkbox("ReSTIR DI (Direct Illumination)", &config.enable_restir_di)) {
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatio-Temporal Direct Illumination Reservoir Resampling. Resolves complex many-light direct lighting with 1 shadow ray.");
-            }
-            if (config.enable_restir_di) {
-                ImGui::Indent();
-                if (ImGui::Checkbox("Spatial Resampling", &config.enable_restir_spatial)) {
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Gather candidate reservoirs from cross-bilateral neighbors in screen-space.");
-                }
-                if (config.enable_restir_spatial) {
-                    int samples = static_cast<int>(config.restir_spatial_samples);
-                    if (ImGui::SliderInt("Spatial Samples", &samples, 1, 8)) {
-                        config.restir_spatial_samples = static_cast<uint32_t>(samples);
-                        settingsChanged = true;
-                    }
-                    if (ImGui::SliderFloat("Spatial Radius", &config.restir_spatial_radius, 1.0f, 32.0f, "%.1f px")) {
-                        settingsChanged = true;
-                    }
-                }
-                ImGui::Unindent();
-            }
-            if (ImGui::Checkbox("ReSTIR GI (Global Illumination)", &config.enable_restir_gi)) {
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatio-Temporal Secondary Path Resampling. Resamples bounce 1 indirect samples across space and time with Jacobian corrections for clean multi-bounce diffuse GI.");
-            }
         }
 
         // 5. Post-Processing & Tonemapping
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ImGui::Checkbox("A-Trous Diffuse Denoiser", &config.enable_atrous)) {
+            const char* denoiserModes[] = { "None (Raw 1-SPP)", "A-Trous Wavelet" };
+            int currentDenoiser = 0;
+            if (config.denoiser_mode == DenoiserMode::Atrous || config.enable_atrous) {
+                currentDenoiser = 1;
+            }
+
+            if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
+                if (currentDenoiser == 0) {
+                    config.denoiser_mode = DenoiserMode::None;
+                    config.enable_atrous = false;
+                } else if (currentDenoiser == 1) {
+                    config.denoiser_mode = DenoiserMode::Atrous;
+                    config.enable_atrous = true;
+                }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Hierarchical edge-avoiding A-Trous wavelet filter with normal and depth edge-stopping functions.");
+                ImGui::SetTooltip("Pluggable real-time denoiser architecture.");
             }
-            if (config.enable_atrous) {
+
+            if (config.enable_atrous || config.denoiser_mode == DenoiserMode::Atrous) {
                 ImGui::Indent();
                 int passes = static_cast<int>(config.atrous_passes);
                 if (ImGui::SliderInt("Filter Passes", &passes, 1, 5)) {

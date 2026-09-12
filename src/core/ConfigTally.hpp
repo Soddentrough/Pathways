@@ -18,6 +18,7 @@ struct ConfigKey {
     uint32_t height = 2160;
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
+    DenoiserMode denoiser = DenoiserMode::None;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
     uint32_t tile_size = 64;
 
@@ -25,6 +26,7 @@ struct ConfigKey {
         if (scene_name != o.scene_name) return false;
         if (pipeline_type != o.pipeline_type) return false;
         if (mgpu_mode != o.mgpu_mode) return false;
+        if (denoiser != o.denoiser) return false;
         if (width != o.width || height != o.height) return false;
         if (spp != o.spp || max_bounces != o.max_bounces) return false;
         if (accum_format != o.accum_format) return false;
@@ -50,17 +52,24 @@ struct ConfigKey {
                 break;
         }
         std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";
-        return std::format("[{}] [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
+        std::string denoiserStr = "";
+        if (denoiser == DenoiserMode::Atrous) {
+            denoiserStr = " [A-Trous]";
+        }
+        return std::format("[{}]{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
     }
 };
 
 struct WavefrontStageSample {
     double classifyMs = 0.0;
-    double restirGiMs = 0.0;
+    uint64_t primaryRays = 0;
     struct Bounce {
         double shadeMs = 0.0;
         double shadowMs = 0.0;
         double intersectMs = 0.0;
+        uint64_t activeCount = 0;
+        uint64_t nextCount = 0;
+        uint64_t shadowCount = 0;
     };
     std::vector<Bounce> bounces;
 };
@@ -71,7 +80,20 @@ struct BounceStageAvg {
     double shadowMs = 0.0;
     double intersectMs = 0.0;
     double totalMs = 0.0;
+    uint64_t activeCount = 0;
+    uint64_t nextCount = 0;
+    uint64_t shadowCount = 0;
 };
+
+inline std::string formatRayCount(uint64_t count) {
+    std::string s = std::to_string(count);
+    int n = static_cast<int>(s.length()) - 3;
+    while (n > 0) {
+        s.insert(n, ",");
+        n -= 3;
+    }
+    return s;
+}
 
 struct ConfigStatsTally {
     ConfigKey key;
@@ -88,12 +110,15 @@ struct ConfigStatsTally {
     bool hasWavefrontStages = false;
     uint32_t wavefrontSampleCount = 0;
     double sumClassifyMs = 0.0;
-    double sumRestirGiMs = 0.0;
+    uint64_t sumPrimaryRays = 0;
 
     struct BounceTally {
         double sumShadeMs = 0.0;
         double sumShadowMs = 0.0;
         double sumIntersectMs = 0.0;
+        uint64_t sumActiveCount = 0;
+        uint64_t sumNextCount = 0;
+        uint64_t sumShadowCount = 0;
         uint32_t count = 0;
     };
     std::vector<BounceTally> bounceTallies;
@@ -116,7 +141,7 @@ struct ConfigStatsTally {
             hasWavefrontStages = true;
             wavefrontSampleCount++;
             sumClassifyMs += wfSample->classifyMs;
-            sumRestirGiMs += wfSample->restirGiMs;
+            sumPrimaryRays += wfSample->primaryRays;
 
             if (bounceTallies.size() < wfSample->bounces.size()) {
                 bounceTallies.resize(wfSample->bounces.size());
@@ -125,6 +150,9 @@ struct ConfigStatsTally {
                 bounceTallies[b].sumShadeMs += wfSample->bounces[b].shadeMs;
                 bounceTallies[b].sumShadowMs += wfSample->bounces[b].shadowMs;
                 bounceTallies[b].sumIntersectMs += wfSample->bounces[b].intersectMs;
+                bounceTallies[b].sumActiveCount += wfSample->bounces[b].activeCount;
+                bounceTallies[b].sumNextCount += wfSample->bounces[b].nextCount;
+                bounceTallies[b].sumShadowCount += wfSample->bounces[b].shadowCount;
                 bounceTallies[b].count++;
             }
         }
@@ -155,8 +183,11 @@ struct ConfigStatsTally {
         return wavefrontSampleCount > 0 ? (sumClassifyMs / wavefrontSampleCount) : 0.0;
     }
 
-    double getAvgRestirGiMs() const {
-        return wavefrontSampleCount > 0 ? (sumRestirGiMs / wavefrontSampleCount) : 0.0;
+    uint64_t getAvgPrimaryRays() const {
+        if (wavefrontSampleCount > 0 && sumPrimaryRays > 0) {
+            return sumPrimaryRays / wavefrontSampleCount;
+        }
+        return static_cast<uint64_t>(key.width) * key.height * key.spp;
     }
 
     std::vector<BounceStageAvg> getAvgBounces() const {
@@ -170,6 +201,9 @@ struct ConfigStatsTally {
             bAvg.shadowMs = bt.sumShadowMs / bt.count;
             bAvg.intersectMs = bt.sumIntersectMs / bt.count;
             bAvg.totalMs = bAvg.shadeMs + bAvg.shadowMs + bAvg.intersectMs;
+            bAvg.activeCount = bt.sumActiveCount / bt.count;
+            bAvg.nextCount = bt.sumNextCount / bt.count;
+            bAvg.shadowCount = bt.sumShadowCount / bt.count;
             result.push_back(bAvg);
         }
         return result;

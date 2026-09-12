@@ -3,7 +3,6 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
-#include "utils/TrainingDataWriter.hpp"
 
 #include <fstream>
 #include <filesystem>
@@ -603,23 +602,6 @@ void Engine::initScene() {
         );
     }
 
-    // Training Tensor Buffers (Binding 15)
-    VkDeviceSize tensorBufferSize = m_config.capture_training_data ?
-        (static_cast<VkDeviceSize>(m_config.width) * m_config.height * 16 * sizeof(uint16_t)) : 256;
-    m_trainingTensorBuffer = std::make_unique<Buffer>(
-        allocator, tensorBufferSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-    );
-    if (m_config.capture_training_data) {
-        m_trainingStagingBuffer = std::make_unique<Buffer>(
-            allocator, tensorBufferSize,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-    }
-
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     if (m_context->hasRayTracing()) {
         std::vector<Vertex> asVertices;
@@ -1104,10 +1086,6 @@ VkShaderModule Engine::createShaderModule(const std::vector<char>& code) {
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
-    // 0. Initialize ReSTIR DI & GI Buffers
-    initReSTIRBuffers();
-    initReSTIRGIBuffers();
-
     // 1. Descriptor Pool
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 },
@@ -1137,13 +1115,10 @@ void Engine::initPipelines() {
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1195,18 +1170,10 @@ void Engine::initPipelines() {
         uboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
     }
 
-    VkDescriptorBufferInfo trainInfo{};
-    if (m_trainingTensorBuffer) {
-        trainInfo = { m_trainingTensorBuffer->getBuffer(), 0, m_trainingTensorBuffer->getSize() };
-    }
-
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfos[i], nullptr });
-        if (m_trainingTensorBuffer) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainInfo, nullptr });
-        }
     }
     // Tonemap set
     writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
@@ -1256,7 +1223,6 @@ void Engine::initPipelines() {
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
     auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
-    auto wfRestirGICode = loadShaderSPIRV("wavefront_restir_gi.comp.spv");
 
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
@@ -1264,7 +1230,7 @@ void Engine::initPipelines() {
         m_config.wavefront_tile_size,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
-        wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode, wfRestirGICode
+        wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -1397,10 +1363,6 @@ void Engine::updateAllImageDescriptors() {
         mvImageInfo.imageView = m_motionVectorImage->getImageView();
         mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
-    VkDescriptorBufferInfo trainInfo{};
-    if (m_trainingTensorBuffer) {
-        trainInfo = { m_trainingTensorBuffer->getBuffer(), 0, m_trainingTensorBuffer->getSize() };
-    }
 
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -1439,16 +1401,6 @@ void Engine::updateAllImageDescriptors() {
                 w14.descriptorCount = 1;
                 w14.pImageInfo = &mvImageInfo;
                 writes.push_back(w14);
-            }
-
-            if (m_trainingTensorBuffer) {
-                VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                w15.dstSet = m_rtDescSets[i];
-                w15.dstBinding = 15;
-                w15.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                w15.descriptorCount = 1;
-                w15.pBufferInfo = &trainInfo;
-                writes.push_back(w15);
             }
         }
     }
@@ -2123,13 +2075,6 @@ void Engine::updateSceneDescriptors() {
         }
     }
 
-    VkDescriptorBufferInfo res0Info{};
-    VkDescriptorBufferInfo res1Info{};
-    if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
-        res0Info = { m_restirReservoirs[0]->getBuffer(), 0, m_restirReservoirs[0]->getSize() };
-        res1Info = { m_restirReservoirs[1]->getBuffer(), 0, m_restirReservoirs[1]->getSize() };
-    }
-
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_rtDescSets[i] == VK_NULL_HANDLE) continue;
@@ -2140,10 +2085,6 @@ void Engine::updateSceneDescriptors() {
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res0Info, nullptr });
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &res1Info, nullptr });
-        }
         VkDescriptorImageInfo bnInfo = m_blueNoiseTexture ? m_blueNoiseTexture->getDescriptorInfo() : m_dummyWhite->getDescriptorInfo();
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &bnInfo, nullptr, nullptr });
     }
@@ -2182,127 +2123,6 @@ void Engine::updateWavefrontSceneDescriptors() {
             tlasHandle,
             envInfo,
             texInfos
-        );
-        if (m_restirReservoirs[0] && m_restirReservoirs[1]) {
-            VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
-            m_wavefrontPipeline->updateReservoirDescriptors(
-                slot,
-                m_restirReservoirs[m_restirPingPongIndex]->getBuffer(),
-                m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(),
-                resSize
-            );
-        }
-        if (m_restirGIReservoirs[0] && m_restirGIReservoirs[1]) {
-            VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
-            m_wavefrontPipeline->updateGIReservoirDescriptors(
-                slot,
-                m_restirGIReservoirs[m_restirGIPingPongIndex]->getBuffer(),
-                m_restirGIReservoirs[1 - m_restirGIPingPongIndex]->getBuffer(),
-                resSize
-            );
-        }
-    }
-}
-
-void Engine::initReSTIRBuffers() {
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
-    VmaAllocator allocator = m_context->getAllocator();
-
-    for (uint32_t i = 0; i < 2; ++i) {
-        m_restirReservoirs[i] = std::make_unique<Buffer>(
-            allocator, resSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-    }
-    m_restirPingPongIndex = 0;
-
-    // Clear reservoir buffers to 0 using a one-time command
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[0]->getBuffer(), 0, resSize, 0);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirReservoirs[1]->getBuffer(), 0, resSize, 0);
-    vkEndCommandBuffer(m_commandBuffers[0]);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-}
-
-void Engine::initReSTIRGIBuffers() {
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
-    VmaAllocator allocator = m_context->getAllocator();
-
-    for (uint32_t i = 0; i < 2; ++i) {
-        m_restirGIReservoirs[i] = std::make_unique<Buffer>(
-            allocator, resSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-    }
-    m_restirGIPingPongIndex = 0;
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirGIReservoirs[0]->getBuffer(), 0, resSize, 0);
-    vkCmdFillBuffer(m_commandBuffers[0], m_restirGIReservoirs[1]->getBuffer(), 0, resSize, 0);
-    vkEndCommandBuffer(m_commandBuffers[0]);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-}
-
-void Engine::updateReSTIRDescriptors(uint32_t frameSlot) {
-    if (!m_restirReservoirs[0] || !m_restirReservoirs[1]) {
-        return;
-    }
-    VkDevice device = m_context->getDevice();
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGPU);
-
-    VkDescriptorBufferInfo curInfo{ m_restirReservoirs[m_restirPingPongIndex]->getBuffer(), 0, resSize };
-    VkDescriptorBufferInfo histInfo{ m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(), 0, resSize };
-
-    if (m_rtDescSets[frameSlot] != VK_NULL_HANDLE) {
-        std::vector<VkWriteDescriptorSet> writes = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &curInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[frameSlot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &histInfo, nullptr }
-        };
-        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    }
-
-    if (m_wavefrontPipeline) {
-        m_wavefrontPipeline->updateReservoirDescriptors(
-            frameSlot,
-            m_restirReservoirs[m_restirPingPongIndex]->getBuffer(),
-            m_restirReservoirs[1 - m_restirPingPongIndex]->getBuffer(),
-            resSize
-        );
-    }
-}
-
-void Engine::updateReSTIRGIDescriptors(uint32_t frameSlot) {
-    if (!m_restirGIReservoirs[0] || !m_restirGIReservoirs[1]) {
-        return;
-    }
-    VkDeviceSize resSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * sizeof(ReservoirGIGPU);
-
-    if (m_wavefrontPipeline) {
-        m_wavefrontPipeline->updateGIReservoirDescriptors(
-            frameSlot,
-            m_restirGIReservoirs[m_restirGIPingPongIndex]->getBuffer(),
-            m_restirGIReservoirs[1 - m_restirGIPingPongIndex]->getBuffer(),
-            resSize
         );
     }
 }
@@ -2609,7 +2429,9 @@ void Engine::renderFrame() {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
+            : (gpuRtMs + gpuTonemapMs);
 
         m_lastGpuRtMs = gpuRtMs;
         m_lastSecGpuMs = secGpuMs;
@@ -2636,9 +2458,9 @@ void Engine::renderFrame() {
                 WavefrontStageSample wfSample;
                 if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                     wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
-                    wfSample.restirGiMs = m_lastWavefrontProfile.restirGiMs;
+                    wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
                     for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                        wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs});
+                        wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                     }
                 }
                 recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
@@ -2813,24 +2635,11 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-    if (m_config.enable_restir_di) {
-        flags |= (1 << 6);
-        if (m_config.enable_restir_spatial) {
-            flags |= (1 << 7);
-            uint32_t samples = std::clamp(m_config.restir_spatial_samples, 1u, 8u);
-            uint32_t radius = std::clamp(static_cast<uint32_t>(std::round(m_config.restir_spatial_radius)), 1u, 64u);
-            flags |= (samples & 0xFu) << 8;
-            flags |= (radius & 0xFFu) << 12;
-        }
-    }
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
     if (m_config.enable_taa) {
         flags |= (1 << 21);
-    }
-    if (m_config.enable_restir_gi) {
-        flags |= (1 << 22);
     }
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
@@ -2854,16 +2663,6 @@ void Engine::renderFrame() {
             return;
         }
     }
-
-    // Ping-pong ReSTIR DI & GI reservoir buffers if enabled
-    if (m_config.enable_restir_di) {
-        m_restirPingPongIndex = 1 - m_restirPingPongIndex;
-    }
-    updateReSTIRDescriptors(m_currentFrame);
-    if (m_config.enable_restir_gi) {
-        m_restirGIPingPongIndex = 1 - m_restirGIPingPongIndex;
-    }
-    updateReSTIRGIDescriptors(m_currentFrame);
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -2924,7 +2723,8 @@ void Engine::renderFrame() {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         if (!accumReachedCutoff) {
-            if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+            bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
+            if (useWavefront) {
             bool needAccumReset = accumReset || !m_config.progressive_accumulation;
             if (needAccumReset && m_accumImage) {
                 VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -2970,10 +2770,13 @@ void Engine::renderFrame() {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
+            uint32_t traceW = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+            uint32_t traceH = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+
             uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
             uint32_t rtPushConstants[16] = {
                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, m_config.width, m_config.height,
+                0, 0, traceW, traceH,
                 useHwRT,
                 hasEnvMap,
                 envIntensityBits,
@@ -2984,7 +2787,7 @@ void Engine::renderFrame() {
             VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
             vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
 
-            m_rtpKhrPipeline->traceRays(cmd, m_config.width, m_config.height, 1);
+            m_rtpKhrPipeline->traceRays(cmd, traceW, traceH, 1);
         }
         if (m_governor) {
             m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
@@ -3170,7 +2973,7 @@ void Engine::renderFrame() {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
         // A-Trous Wavelet Diffuse Denoiser
-        uint32_t atrousOutputSlot = (!accumReachedCutoff) ? dispatchAtrous(cmd) : 0u;
+        uint32_t atrousOutputSlot = !accumReachedCutoff ? dispatchAtrous(cmd) : 0u;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
@@ -3931,7 +3734,9 @@ void Engine::dumpOutputFiles() {
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
+            : (gpuRtMs + gpuTonemapMs);
 
         if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
             uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
@@ -3948,9 +3753,9 @@ void Engine::dumpOutputFiles() {
             WavefrontStageSample wfSample;
             if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                 wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
-                wfSample.restirGiMs = m_lastWavefrontProfile.restirGiMs;
+                wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
                 for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs});
+                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                 }
             }
             recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
@@ -4160,7 +3965,6 @@ FrameStats Engine::getStats() const {
             stats.wavefront_stats.valid = true;
             stats.wavefront_stats.total_ms = m_lastWavefrontProfile.totalMs;
             stats.wavefront_stats.classify_ms = m_lastWavefrontProfile.classifyMs;
-            stats.wavefront_stats.restir_gi_ms = m_lastWavefrontProfile.restirGiMs;
             stats.wavefront_stats.resolve_ms = m_lastWavefrontProfile.resolveMs;
             stats.wavefront_stats.queue_memory_footprint_mb = m_lastWavefrontProfile.queueMemoryFootprintMb;
             stats.wavefront_stats.estimated_vram_traffic_mb = m_lastWavefrontProfile.estimatedVramTrafficMb;
@@ -4315,11 +4119,6 @@ FrameStats Engine::getStats() const {
     stats.enable_refraction = m_config.enable_refraction;
     stats.enable_shadows = m_config.enable_shadows;
     stats.aces_tonemap = m_config.aces_tonemap;
-    stats.restir_di_enabled = m_config.enable_restir_di;
-    stats.restir_spatial_enabled = m_config.enable_restir_spatial;
-    stats.restir_spatial_samples = m_config.restir_spatial_samples;
-    stats.restir_spatial_radius = m_config.restir_spatial_radius;
-    stats.restir_gi_enabled = m_config.enable_restir_gi;
     stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
     stats.hdri_path = m_config.hdri_path;
 
@@ -4351,7 +4150,7 @@ FrameStats Engine::getStats() const {
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
             s.pipeline_stages.is_wavefront = true;
             s.pipeline_stages.classify_ms = tally.getAvgClassifyMs();
-            s.pipeline_stages.restir_gi_ms = tally.getAvgRestirGiMs();
+            s.pipeline_stages.primary_rays = tally.getAvgPrimaryRays();
             s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
             auto bounces = tally.getAvgBounces();
             for (const auto& b : bounces) {
@@ -4361,6 +4160,9 @@ FrameStats Engine::getStats() const {
                 sb.shadow_ms = b.shadowMs;
                 sb.intersect_ms = b.intersectMs;
                 sb.total_bounce_ms = b.totalMs;
+                sb.active_rays = b.activeCount;
+                sb.rays_left = b.nextCount;
+                sb.shadow_rays = b.shadowCount;
                 s.pipeline_stages.bounces.push_back(sb);
             }
         } else {
@@ -4482,36 +4284,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
-    // 4. Recreate ReSTIR DI & GI Buffers
-    initReSTIRBuffers();
-    initReSTIRGIBuffers();
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        updateReSTIRDescriptors(i);
-        updateReSTIRGIDescriptors(i);
-    }
-
     // 5. Resize secondary GPU if active before updating merge descriptor set
     if (m_mgpu && m_mgpu->isMultiGpuActive()) {
         m_mgpu->resize(m_config.width, m_config.height);
-    }
-
-    // 6. Recreate Shadow Denoiser & TAA Resources, update all image descriptors and multi-GPU merge descriptors
-    if (m_trainingTensorBuffer) {
-        VkDeviceSize tensorBufferSize = m_config.capture_training_data ?
-            (static_cast<VkDeviceSize>(m_config.width) * m_config.height * 16 * sizeof(uint16_t)) : 256;
-        m_trainingTensorBuffer = std::make_unique<Buffer>(
-            allocator, tensorBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-        if (m_config.capture_training_data) {
-            m_trainingStagingBuffer = std::make_unique<Buffer>(
-                allocator, tensorBufferSize,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-            );
-        }
     }
 
     destroyShadowDenoiserResources();
@@ -4563,6 +4338,7 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
+    key.denoiser = m_config.denoiser_mode;
     key.width = m_config.width;
     key.height = m_config.height;
     key.spp = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentSpp : m_config.spp;
@@ -4589,66 +4365,69 @@ void Engine::printExecutionSummary() const {
         return;
     }
 
-    Logger::info("  Execution Summary (Tallied Across {} Unique Configuration{}):",
+    Logger::info("  Pathways Hybrid Path Tracing Engine - Execution Summary ({} Configuration{})",
                  m_configTallies.size(), m_configTallies.size() == 1 ? "" : "s");
-    Logger::info("----------------------------------------------------------------------------------------");
+    Logger::info("========================================================================================");
 
     for (size_t i = 0; i < m_configTallies.size(); ++i) {
         const auto& tally = m_configTallies[i];
         Logger::info("  [Config {}/{}] {}", i + 1, m_configTallies.size(), tally.label);
-        if (m_config.warmup_frames > 0) {
-            Logger::info("    Rendered Frames:     {} (excluding {} warmup frames)", tally.frameCount, m_config.warmup_frames);
-        } else {
-            Logger::info("    Rendered Frames:     {}", tally.frameCount);
-        }
-        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS) [Min: {:.3f} ms, Max: {:.3f} ms]",
-                     tally.getAvgFrameTimeMs(), tally.getAvgFps(), tally.minFrameTimeMs, tally.maxFrameTimeMs);
+        Logger::info("    Frames Sampled:      {}", tally.frameCount);
+        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
+        Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
 
-        if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.getAvgSecondaryRtMs() > 0.001) {
-            Logger::info("    GPU Breakdown:       GPU 0: {:.3f} ms | GPU 1: {:.3f} ms | Tonemap & Merge: {:.3f} ms",
+        if (tally.key.mgpu_mode != MultiGpuMode::Off) {
+            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms | Tonemap: {:.3f} ms",
                          tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
-
-            // Look up single-GPU baseline for the same scene, resolution, spp, bounces, and format
+            // Find single GPU baseline for speedup calculation
             double baselineMs = 0.0;
             for (const auto& other : m_configTallies) {
                 if (other.key.scene_name == tally.key.scene_name &&
+                    other.key.pipeline_type == tally.key.pipeline_type &&
+                    other.key.mgpu_mode == MultiGpuMode::Off &&
                     other.key.width == tally.key.width &&
                     other.key.height == tally.key.height &&
                     other.key.spp == tally.key.spp &&
                     other.key.max_bounces == tally.key.max_bounces &&
-                    other.key.accum_format == tally.key.accum_format &&
-                    other.key.mgpu_mode == MultiGpuMode::Off &&
-                    other.frameCount > 0) {
+                    other.key.accum_format == tally.key.accum_format) {
                     baselineMs = other.getAvgFrameTimeMs();
                     break;
                 }
             }
-
             if (baselineMs > 0.001) {
                 double speedup = baselineMs / tally.getAvgFrameTimeMs();
                 double efficiency = (speedup / 2.0) * 100.0;
                 Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
             }
         } else {
-            Logger::info("    GPU Breakdown:       GPU 0 (Primary RT): {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
+            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
                          tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
         }
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
             Logger::info("    Pipeline Stages:");
-            Logger::info("      - Classify (Primary RayGen): {:.3f} ms", tally.getAvgClassifyMs());
+            uint64_t primaryRays = tally.getAvgPrimaryRays();
             auto bounces = tally.getAvgBounces();
-            for (const auto& b : bounces) {
-                if (b.intersectMs > 0.0001) {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms | Intersect: {:.3f} ms (Total: {:.3f} ms)",
-                                 b.bounce, b.shadeMs, b.shadowMs, b.intersectMs, b.totalMs);
-                } else {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms (Total: {:.3f} ms)",
-                                 b.bounce, b.shadeMs, b.shadowMs, b.totalMs);
-                }
+            if (primaryRays == 0 && !bounces.empty() && bounces[0].activeCount > 0) {
+                primaryRays = bounces[0].activeCount;
             }
-            if (tally.getAvgRestirGiMs() > 0.005) {
-                Logger::info("      - ReSTIR GI Resampling:      {:.3f} ms", tally.getAvgRestirGiMs());
+            if (primaryRays > 0) {
+                Logger::info("      - Classify (Primary RayGen): {:.3f} ms | {} rays left (100.0%)",
+                             tally.getAvgClassifyMs(), formatRayCount(primaryRays));
+            } else {
+                Logger::info("      - Classify (Primary RayGen): {:.3f} ms", tally.getAvgClassifyMs());
+            }
+            for (const auto& b : bounces) {
+                double pct = (primaryRays > 0) ? (100.0 * static_cast<double>(b.nextCount) / primaryRays) : 0.0;
+                if (b.intersectMs > 0.0001) {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.intersectMs, b.totalMs,
+                                 formatRayCount(b.nextCount), pct);
+                } else {
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.shadowMs, b.totalMs,
+                                 formatRayCount(b.nextCount), pct);
+                }
             }
             Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
         } else if (tally.key.pipeline_type == PipelineType::RTP) {
@@ -4669,269 +4448,7 @@ void Engine::printExecutionSummary() const {
     Logger::info("========================================================================================");
 }
 
-void Engine::runTrainingCapture() {
-    std::string outDir = m_config.training_data_dir.empty() ? "output/training_data" : m_config.training_data_dir;
-    std::filesystem::create_directories(outDir);
-
-    Logger::info("========================================================================================");
-    Logger::info("  Pathways Neural Reconstruction Training Data Capture");
-    Logger::info("  Target Directory:    {}", outDir);
-    Logger::info("  Frame Count:         {}", m_config.training_capture_frames);
-    Logger::info("  Reference SPP:       {}", m_config.training_reference_spp);
-    Logger::info("  Resolution:          {}x{}", m_config.width, m_config.height);
-    Logger::info("========================================================================================");
-
-    VkDevice device = m_context->getDevice();
-    VkQueue queue = m_context->getGraphicsQueue();
-    VmaAllocator allocator = m_context->getAllocator();
-
-    uint32_t width = m_config.width;
-    uint32_t height = m_config.height;
-
-    VkDeviceSize tensorByteSize = static_cast<VkDeviceSize>(width) * height * 16 * sizeof(uint16_t);
-    bool isFp16 = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT);
-    VkDeviceSize refByteSize = static_cast<VkDeviceSize>(width) * height * 4 * (isFp16 ? sizeof(uint16_t) : sizeof(float));
-
-    if (!m_trainingStagingBuffer || m_trainingStagingBuffer->getSize() < tensorByteSize) {
-        m_trainingStagingBuffer = std::make_unique<Buffer>(
-            allocator, tensorByteSize,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-    }
-
-    if (!m_trainingTensorBuffer || m_trainingTensorBuffer->getSize() < tensorByteSize) {
-        m_trainingTensorBuffer = std::make_unique<Buffer>(
-            allocator, tensorByteSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
-        );
-        updateAllImageDescriptors();
-    }
-
-    Buffer refStaging(allocator, refByteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-
-    uint32_t useHwRT = 1;
-    uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-    float envIntensity = 1.0f;
-    uint32_t envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
-    VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-
-    auto totalStartTime = std::chrono::high_resolution_clock::now();
-
-    for (uint32_t frameIdx = 0; frameIdx < m_config.training_capture_frames; ++frameIdx) {
-        auto frameStartTime = std::chrono::high_resolution_clock::now();
-
-        if (frameIdx > 0 && m_camera) {
-            m_camera->processMouseMovement(1.5f, 0.2f);
-            m_camera->update(0.016f);
-        }
-
-        // --- PHASE 1: Render 1-SPP Input Tensor with Auxiliary Guides ---
-        {
-            uint32_t flags = 0;
-            if (m_config.enable_direct_light)   flags |= (1 << 0);
-            if (m_config.enable_indirect_light) flags |= (1 << 1);
-            flags |= (1 << 2); // Specular
-            if (m_config.enable_refraction)     flags |= (1 << 3);
-            if (m_config.enable_shadows)        flags |= (1 << 4);
-            if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-            flags |= (1 << 22); // Bit 22: capture_training_data
-
-            CameraUniform ubo = m_camera->getUniformData(0, 1, m_config.max_bounces, flags,
-                                                         false, width, height, 0);
-            m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
-
-            VkCommandBuffer cmd = m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[0], 0, nullptr);
-
-            uint32_t rtPushConstants[16] = {
-                m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                0, 0, width, height,
-                useHwRT,
-                hasEnvMap,
-                envIntensityBits,
-                0u, // accumulateHistory = 0 (clean single SPP)
-                0u, 0u, m_numOpaqueTriangles, 0u
-            };
-            vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-            m_rtpKhrPipeline->traceRays(cmd, width, height, 1);
-
-            VkBufferMemoryBarrier2 tensorBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
-            tensorBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            tensorBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            tensorBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-            tensorBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-            tensorBarrier.buffer = m_trainingTensorBuffer->getBuffer();
-            tensorBarrier.offset = 0;
-            tensorBarrier.size = tensorByteSize;
-
-            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            depInfo.bufferMemoryBarrierCount = 1;
-            depInfo.pBufferMemoryBarriers = &tensorBarrier;
-            vkCmdPipelineBarrier2(cmd, &depInfo);
-
-            VkBufferCopy copyRegion{};
-            copyRegion.srcOffset = 0;
-            copyRegion.dstOffset = 0;
-            copyRegion.size = tensorByteSize;
-            vkCmdCopyBuffer(cmd, m_trainingTensorBuffer->getBuffer(), m_trainingStagingBuffer->getBuffer(), 1, &copyRegion);
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-
-            char inputFilename[256];
-            std::snprintf(inputFilename, sizeof(inputFilename), "frame_%05u_input.bin", frameIdx);
-            std::string inputPath = (std::filesystem::path(outDir) / inputFilename).string();
-
-            void* mappedData = m_trainingStagingBuffer->map();
-            if (mappedData) {
-                TrainingDataWriter::writeTensor(inputPath, width, height, 16, 0 /* Float16 */,
-                                                frameIdx, 1, mappedData, static_cast<size_t>(tensorByteSize));
-                m_trainingStagingBuffer->unmap();
-            }
-        }
-
-        // --- PHASE 2: Accumulate Ground Truth Reference Radiance ---
-        {
-            uint32_t targetRefSpp = m_config.training_reference_spp;
-            uint32_t sppPerDispatch = std::clamp(targetRefSpp, 1u, 32u);
-            uint32_t accumulated = 0;
-            uint32_t seedFrame = 0;
-
-            while (accumulated < targetRefSpp) {
-                uint32_t currentSpp = std::min(sppPerDispatch, targetRefSpp - accumulated);
-                bool accumHistory = (accumulated > 0);
-
-                uint32_t flags = 0;
-                if (m_config.enable_direct_light)   flags |= (1 << 0);
-                if (m_config.enable_indirect_light) flags |= (1 << 1);
-                flags |= (1 << 2); // Specular
-                if (m_config.enable_refraction)     flags |= (1 << 3);
-                if (m_config.enable_shadows)        flags |= (1 << 4);
-                if (m_sceneHasNonOpaque)            flags |= (1 << 5);
-
-                CameraUniform ubo = m_camera->getUniformData(seedFrame, currentSpp, m_config.max_bounces, flags,
-                                                             false, width, height, 0);
-                m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
-
-                VkCommandBuffer cmd = m_commandBuffers[0];
-                vkResetCommandBuffer(cmd, 0);
-                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(cmd, &beginInfo);
-
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[0], 0, nullptr);
-
-                uint32_t rtPushConstants[16] = {
-                    m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
-                    0, 0, width, height,
-                    useHwRT,
-                    hasEnvMap,
-                    envIntensityBits,
-                    accumHistory ? 1u : 0u,
-                    0u, 0u, m_numOpaqueTriangles, 0u
-                };
-                vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-                m_rtpKhrPipeline->traceRays(cmd, width, height, 1);
-                vkEndCommandBuffer(cmd);
-
-                VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                submitInfo.commandBufferCount = 1;
-                submitInfo.pCommandBuffers = &cmd;
-                vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-                vkQueueWaitIdle(queue);
-
-                accumulated += currentSpp;
-                seedFrame += currentSpp;
-            }
-
-            // Copy m_accumImage to refStaging
-            VkCommandBuffer cmd = m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            m_accumImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-            );
-
-            VkBufferImageCopy copyRegion{};
-            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.imageSubresource.layerCount = 1;
-            copyRegion.imageExtent = { width, height, 1 };
-
-            vkCmdCopyImageToBuffer(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, refStaging.getBuffer(), 1, &copyRegion);
-
-            m_accumImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-            );
-
-            vkEndCommandBuffer(cmd);
-
-            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &cmd;
-            vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-
-            char refFilename[256];
-            std::snprintf(refFilename, sizeof(refFilename), "frame_%05u_reference.bin", frameIdx);
-            std::string refPath = (std::filesystem::path(outDir) / refFilename).string();
-
-            void* mappedRef = refStaging.map();
-            if (mappedRef) {
-                TrainingDataWriter::normalizeReferenceBuffer(mappedRef, width, height, isFp16 ? 0 : 1);
-                TrainingDataWriter::writeTensor(refPath, width, height, 4, isFp16 ? 0 : 1,
-                                                frameIdx, targetRefSpp, mappedRef, static_cast<size_t>(refByteSize));
-                refStaging.unmap();
-            }
-        }
-
-        auto frameEndTime = std::chrono::high_resolution_clock::now();
-        double frameMs = std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count();
-
-        Logger::info("Captured Training Frame [{:4d}/{:4d}] | 1-SPP Input + {}-SPP Ref | {:.2f} ms",
-                     frameIdx + 1, m_config.training_capture_frames, m_config.training_reference_spp, frameMs);
-    }
-
-    auto totalEndTime = std::chrono::high_resolution_clock::now();
-    double totalSec = std::chrono::duration<double>(totalEndTime - totalStartTime).count();
-
-    Logger::info("========================================================================================");
-    Logger::info("  Training data capture complete: {} frames written to {}", m_config.training_capture_frames, outDir);
-    Logger::info("  Total capture time: {:.2f} seconds ({:.2f} fps)", totalSec, m_config.training_capture_frames / std::max(totalSec, 0.001));
-    Logger::info("========================================================================================");
-}
-
 void Engine::run() {
-    if (m_config.capture_training_data) {
-        runTrainingCapture();
-        return;
-    }
-
     Logger::info("Starting Pathways render loop...");
 
     while (!m_window->shouldClose()) {

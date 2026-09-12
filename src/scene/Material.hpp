@@ -48,7 +48,19 @@ struct MaterialGPU {
     float thickness = 0.0f;                    // 4 bytes (offset 132) - volume thicknessFactor
     float specularFactor = 1.0f;               // 4 bytes (offset 136) - KHR_materials_specular factor
     uint32_t specularTex = 0;                  // 4 bytes (offset 140) - KHR_materials_specular texture
+
+    // Tier 2 glTF Extensions (offsets 144-192)
+    float anisotropyStrength = 0.0f;           // 4 bytes (offset 144) - KHR_materials_anisotropy strength [0, 1]
+    float anisotropyRotation = 0.0f;           // 4 bytes (offset 148) - KHR_materials_anisotropy rotation angle
+    uint32_t anisotropyTex = 0;                // 4 bytes (offset 152) - anisotropy texture (RG = dir, B = strength)
+    float dispersion = 0.0f;                   // 4 bytes (offset 156) - KHR_materials_dispersion (20/V_d)
+    glm::vec3 sheenColor = glm::vec3(0.0f);    // 12 bytes (offset 160) - KHR_materials_sheen colorFactor
+    float sheenRoughness = 0.0f;               // 4 bytes (offset 172) - KHR_materials_sheen roughnessFactor
+    float iridescence = 0.0f;                  // 4 bytes (offset 176) - KHR_materials_iridescence factor
+    float iridescenceIor = 1.3f;               // 4 bytes (offset 180) - KHR_materials_iridescence IOR
+    float iridescenceThickness = 0.0f;         // 4 bytes (offset 184) - KHR_materials_iridescence thickness
+    uint32_t sheenTex = 0;                     // 4 bytes (offset 188) - KHR_materials_sheen texture
 };
-static_assert(sizeof(MaterialGPU) == 144, "MaterialGPU must be exactly 144 bytes (std430 aligned)");
+static_assert(sizeof(MaterialGPU) == 192, "MaterialGPU must be exactly 192 bytes (std430 aligned)");
 
 } // namespace pathways

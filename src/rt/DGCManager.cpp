@@ -330,9 +330,36 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
     Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", materialPipelines.size());
 }
 
+void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
+                                        Buffer* argumentBuffer, VkDeviceSize argumentOffset,
+                                        uint32_t sliceIndex, uint32_t sequenceCount) {
+    if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipelines.empty()) return;
+    if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) return;
+
+    ensurePreprocessBuffer(pipelines[0], sequenceCount);
+    if (!m_preprocessBuffer) return;
+
+    // Bind initial pipeline before preprocessing
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
+
+    VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+
+    VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
+    genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
+    genInfo.indirectExecutionSet = m_materialExecutionSet;
+    genInfo.indirectCommandsLayout = m_materialIndirectLayout;
+    genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
+    genInfo.indirectAddressSize = sizeof(DGCCommand) * sequenceCount;
+    genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
+    genInfo.preprocessSize = m_sliceSize;
+    genInfo.maxSequenceCount = sequenceCount;
+
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
+}
+
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                       Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                      uint32_t sliceIndex, uint32_t sequenceCount) {
+                                      uint32_t sliceIndex, uint32_t sequenceCount, bool isPreprocessed) {
     if (!argumentBuffer || pipelines.empty()) return;
 
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) {
@@ -343,6 +370,8 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
         }
         return;
     }
+
+    ensurePreprocessBuffer(pipelines[0], sequenceCount);
 
     // Bind initial pipeline before executing generated commands as required by VUID-vkCmdExecuteGeneratedCommandsEXT-indirectCommandsLayout-11053
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
@@ -361,7 +390,8 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
     }
     genInfo.maxSequenceCount = sequenceCount;
 
-    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, VK_FALSE, &genInfo);
+    bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
+    pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
 }
 
 } // namespace pathways

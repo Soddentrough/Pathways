@@ -48,9 +48,12 @@ public:
     bool isMaterialDGCSupported() const { return m_materialDGCSupported; }
     VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSet; }
     void initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines);
+    void recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
+                                  Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
+                                  uint32_t sliceIndex = 0, uint32_t sequenceCount = 6);
     void recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
-                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 6);
+                               uint32_t sliceIndex = 0, uint32_t sequenceCount = 6, bool isPreprocessed = true);
 
 private:
     void loadFunctionPointers();

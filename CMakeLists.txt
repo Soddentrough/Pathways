@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.15.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.16.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -156,7 +156,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER}
+            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})

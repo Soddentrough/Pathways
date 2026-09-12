@@ -62,6 +62,18 @@ struct Material {
     float thickness;
     float specularFactor;
     uint specularTex;
+
+    // Tier 2 glTF Extensions (offsets 144-192)
+    float anisotropyStrength;
+    float anisotropyRotation;
+    uint anisotropyTex;
+    float dispersion;
+    vec3 sheenColor;
+    float sheenRoughness;
+    float iridescence;
+    float iridescenceIor;
+    float iridescenceThickness;
+    uint sheenTex;
 };
 
 struct Light {
@@ -141,16 +153,16 @@ uint getMaterialArchetype(Material mat) {
         (length(mat.emissive.rgb) > 0.1 && mat.albedoTex == 0u && length(mat.albedo.rgb) < 0.05 && mat.metallic < 0.01 && mat.transmission < 0.01)) {
         return MATERIAL_ARCHETYPE_EMISSIVE;
     }
-    // 3. Multi-layer complex PBR (Clearcoat on top of substrate)
-    if (mat.clearcoat > 0.001 || mat.clearcoatTex > 0u) {
+    // 3. Multi-layer complex PBR (Clearcoat on top of substrate, or Sheen)
+    if (mat.clearcoat > 0.001 || mat.clearcoatTex > 0u || length(mat.sheenColor) > 0.001 || mat.sheenTex > 0u) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
-    // 4. Pure dielectric transmission / refraction / glass
-    if (mat.transmission > 0.001 || mat.type == 2u /* MATERIAL_DIELECTRIC */) {
+    // 4. Pure dielectric transmission / refraction / glass / dispersion
+    if (mat.transmission > 0.001 || mat.type == 2u /* MATERIAL_DIELECTRIC */ || mat.dispersion > 0.001) {
         return MATERIAL_ARCHETYPE_DIELECTRIC;
     }
-    // 5. Metallic conductors (GGX microfacet specular reflection)
-    if (mat.type == 1u /* MATERIAL_METALLIC */ || mat.metallic > 0.5) {
+    // 5. Metallic conductors (GGX microfacet specular reflection, anisotropy, iridescence)
+    if (mat.type == 1u /* MATERIAL_METALLIC */ || mat.metallic > 0.5 || mat.anisotropyStrength > 0.001 || mat.iridescence > 0.001) {
         return MATERIAL_ARCHETYPE_CONDUCTOR;
     }
     // 6. Dielectric diffuse base + GGX specular dual-lobe PBR (plastics, wood, stone, cloth)
@@ -338,6 +350,42 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
     vec3 bitangent = cross(N, tangent);
 
     return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
+}
+
+// Anisotropic GGX Normal Distribution Function D
+float distributionAnisotropicGGX(float TdotH, float BdotH, float NdotH, float ax, float ay) {
+    float d = (TdotH * TdotH) / max(ax * ax, 1e-6) + (BdotH * BdotH) / max(ay * ay, 1e-6) + NdotH * NdotH;
+    return 1.0 / max(PI * ax * ay * d * d, 1e-6);
+}
+
+// Sample Anisotropic GGX microfacet normal
+vec3 sampleAnisotropicGGX(vec3 N, vec3 T, vec3 B, float ax, float ay, inout uint seed) {
+    vec2 xi = randVec2(seed);
+    float phi = atan(ay * sin(TWO_PI * xi.x), ax * cos(TWO_PI * xi.x));
+    if (phi < 0.0) phi += TWO_PI;
+    float cosTheta = sqrt(clamp((1.0 - xi.y) / max(xi.y * (ax * cos(phi) * ax * cos(phi) + ay * sin(phi) * ay * sin(phi) - 1.0) + 1.0, 1e-7), 0.0, 1.0));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    return normalize(T * H_local.x + B * H_local.y + N * H_local.z);
+}
+
+// Charlie Micro-Fiber Sheen Distribution (glTF KHR_materials_sheen)
+float evalSheenCharlie(float NdotH, float sheenRoughness) {
+    float invR = 1.0 / max(sheenRoughness, 0.01);
+    float cos2 = NdotH * NdotH;
+    float sin2 = max(1.0 - cos2, 1e-6);
+    return (2.0 + invR) * pow(sin2, invR * 0.5) / TWO_PI;
+}
+
+// Airy Thin-Film Iridescence Phase Interference (glTF KHR_materials_iridescence)
+vec3 evalThinFilmIridescence(float cosTheta, float iridIor, float thicknessNm) {
+    float sinTheta2 = 1.0 - cosTheta * cosTheta;
+    float cosThetaT2 = 1.0 - sinTheta2 / max(iridIor * iridIor, 1e-4);
+    float cosThetaT = sqrt(max(0.0, cosThetaT2));
+    float opd = 2.0 * iridIor * thicknessNm * cosThetaT; // Optical Path Difference in nm
+    // Constructive/destructive interference for RGB center wavelengths (650nm, 530nm, 460nm)
+    vec3 phase = (TWO_PI * opd) / vec3(650.0, 530.0, 460.0);
+    return clamp(0.5 + 0.5 * cos(phase), 0.0, 1.0);
 }
 
 // Evaluate combined BSDF PDF for Multiple Importance Sampling (MIS)

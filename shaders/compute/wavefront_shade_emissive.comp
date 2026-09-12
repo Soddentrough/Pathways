@@ -127,8 +127,6 @@ layout(push_constant) uniform PushConstants {
     uint secondarySortMode;
 } pc;
 
-#include "wavefront_restir_gi.glsl"
-
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint activeCount = queueCounters.currentMaterialCounts[4]; // Emissive queue
@@ -149,11 +147,7 @@ void main() {
 
         vec3 throughput = state.throughputSeed.rgb;
         vec3 accumRadiance = state.radiancePixel.rgb;
-        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
-        uint pixelIndex = rawPixel & 0x7FFFFFFFu;
-        bool isPrimaryGIDiffuse = (rawPixel & (1u << 31)) != 0u;
-
-        bool enableReSTIR_GI = (ubo.flags & (1u << 22)) != 0u && (pc.currentBounce == 0u || isPrimaryGIDiffuse);
+        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
 
         if (hitType == 2u) {
             // Sky miss fallback
@@ -165,14 +159,10 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            if (enableReSTIR_GI && pc.currentBounce == 1u) {
-                storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), 1e4, skyColor, -rayDir);
-            } else {
-                accumRadiance += throughput * skyColor;
-                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
-            }
+            accumRadiance += throughput * skyColor;
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
         } else {
             vec2 hitUv = vec2(0.0);
             uint matId = 0u;
@@ -207,14 +197,10 @@ void main() {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
 
-            if (enableReSTIR_GI && pc.currentBounce == 1u) {
-                storeSecondaryGISamplePackedDir(pixelIndex, pc.width * pc.height, floatBitsToUint(geom.originPackedDir.w), max(hitT, 1e-4), emissive, hitNormal);
-            } else {
-                accumRadiance += throughput * emissive;
-                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
-            }
+            accumRadiance += throughput * emissive;
+            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
         }
     }
 

@@ -98,11 +98,6 @@ struct FrameStats {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool aces_tonemap = true;
-    bool restir_di_enabled = false;
-    bool restir_spatial_enabled = true;
-    uint32_t restir_spatial_samples = 3;
-    float restir_spatial_radius = 8.0f;
-    bool restir_gi_enabled = false;
     std::string scene_path = "";
     uint32_t num_triangles = 0;
     uint32_t num_spheres = 0;
@@ -160,7 +155,6 @@ struct FrameStats {
         bool valid = false;
         double total_ms = 0.0;
         double classify_ms = 0.0;
-        double restir_gi_ms = 0.0;
         double resolve_ms = 0.0;
         std::vector<BounceProfile> bounces;
         double queue_memory_footprint_mb = 0.0;
@@ -177,14 +171,17 @@ struct FrameStats {
         double shadow_ms = 0.0;
         double intersect_ms = 0.0;
         double total_bounce_ms = 0.0;
+        uint64_t active_rays = 0;
+        uint64_t rays_left = 0;
+        uint64_t shadow_rays = 0;
     };
 
     struct PipelineStagesSummary {
         bool is_wavefront = false;
         double ray_tracing_pass_ms = 0.0;
         double classify_ms = 0.0;
+        uint64_t primary_rays = 0;
         std::vector<StageBounceSummary> bounces;
-        double restir_gi_ms = 0.0;
         double tonemap_ms = 0.0;
     };
 

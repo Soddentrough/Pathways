@@ -92,20 +92,6 @@ private:
     std::unique_ptr<Buffer> m_lightBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
-    std::unique_ptr<Buffer> m_trainingTensorBuffer;
-    std::unique_ptr<Buffer> m_trainingStagingBuffer;
-
-    // ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
-    std::array<std::unique_ptr<Buffer>, 2> m_restirReservoirs;
-    uint32_t m_restirPingPongIndex = 0;
-    void initReSTIRBuffers();
-    void updateReSTIRDescriptors(uint32_t frameSlot);
-
-    // ReSTIR GI Secondary Path Reservoir Buffers (Bindings 22 & 23)
-    std::array<std::unique_ptr<Buffer>, 2> m_restirGIReservoirs;
-    uint32_t m_restirGIPingPongIndex = 0;
-    void initReSTIRGIBuffers();
-    void updateReSTIRGIDescriptors(uint32_t frameSlot);
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> m_asVertexBuffer;
@@ -276,9 +262,6 @@ private:
     std::vector<ConfigStatsTally> m_configTallies;
     void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
                           const WavefrontStageSample* wfSample = nullptr);
-
-    // Training Data Capture (Neural Denoiser / Continuous Upscaler)
-    void runTrainingCapture();
 
     // Hardware Sensors & Telemetry (Infrequent background sampler)
     void startHwMonThread();

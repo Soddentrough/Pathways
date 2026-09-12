@@ -38,6 +38,11 @@ enum class SecondarySortMode {
     SpatialIndex    // Option 2: 4-Byte Index-Only Spatial-Morton Reordering
 };
 
+enum class DenoiserMode {
+    None,    // Raw noisy path traced output
+    Atrous   // Edge-avoiding A-Trous Wavelet diffuse denoiser
+};
+
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
@@ -68,17 +73,13 @@ struct Config {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool enable_direct_light = true;
-    bool enable_restir_di = false; // Default: false (pure reference Wavefront path tracing by default)
-    bool enable_restir_spatial = false;
-    uint32_t restir_spatial_samples = 3;
-    float restir_spatial_radius = 8.0f;
-    bool enable_restir_gi = false; // Default: false (pure reference Wavefront path tracing by default)
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;
     bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
+    DenoiserMode denoiser_mode = DenoiserMode::None;
     bool enable_atrous = false;           // Hierarchical Edge-Avoiding A-Trous Wavelet Diffuse Denoiser [Default: disabled]
     uint32_t atrous_passes = 3;           // Number of A-Trous filter iterations (1-5, default: 3 passes: s=1,2,4)
     float atrous_normal_power = 32.0f;    // Normal edge-stopping sensitivity
@@ -103,12 +104,6 @@ struct Config {
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
-
-    // Neural Denoiser & Continuous Upscaler (NDCU) Training Capture
-    bool capture_training_data = false;
-    std::string training_data_dir = "";
-    uint32_t training_capture_frames = 60;
-    uint32_t training_reference_spp = 512;
 
     // Camera view overrides (useful for headless testing & reproducible framing)
     std::optional<glm::vec3> camera_pos;

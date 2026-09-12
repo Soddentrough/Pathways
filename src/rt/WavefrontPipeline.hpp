@@ -45,8 +45,7 @@ public:
                       const std::vector<char>& shadeComplexCode = {},
                       const std::vector<char>& shadeEmissiveCode = {},
                       const std::vector<char>& shadePassthroughCode = {},
-                      const std::vector<char>& raySortCode = {},
-                      const std::vector<char>& restirGICode = {});
+                      const std::vector<char>& raySortCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -62,16 +61,6 @@ public:
                                 VkAccelerationStructureKHR tlas,
                                 VkDescriptorImageInfo envMapInfo,
                                 const std::vector<VkDescriptorImageInfo>& sceneTexInfos);
-
-    void updateReservoirDescriptors(uint32_t frameSlot,
-                                    VkBuffer curReservoir,
-                                    VkBuffer histReservoir,
-                                    VkDeviceSize resSize);
-
-    void updateGIReservoirDescriptors(uint32_t frameSlot,
-                                      VkBuffer curGIReservoir,
-                                      VkBuffer histGIReservoir,
-                                      VkDeviceSize giResSize);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);
@@ -101,7 +90,6 @@ public:
         bool valid = false;
         double totalMs = 0.0;
         double classifyMs = 0.0;
-        double restirGiMs = 0.0;
         double resolveMs = 0.0;
         std::vector<BounceProfilingData> bounces;
         double queueMemoryFootprintMb = 0.0;
@@ -133,8 +121,7 @@ private:
                          const std::vector<char>& shadeComplexCode,
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadePassthroughCode,
-                         const std::vector<char>& raySortCode,
-                         const std::vector<char>& restirGICode);
+                         const std::vector<char>& raySortCode);
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -158,7 +145,6 @@ private:
     std::unique_ptr<Buffer> m_materialIndexQueue; // 4B index * 4 archetypes (Index-Based Material Queues)
     std::unique_ptr<Buffer> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
     std::unique_ptr<Buffer> m_shadowQueue;    // 32B PackedShadowRay
-    std::unique_ptr<Buffer> m_rawGISampleBuffer; // 32B RawGISample
     std::unique_ptr<Buffer> m_queueCounters;
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs; // Double-buffered per in-flight frame slot
     std::unique_ptr<Buffer> m_dgcStream;
@@ -182,7 +168,6 @@ private:
     VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
     VkPipeline m_raySortPipeline = VK_NULL_HANDLE;
-    VkPipeline m_restirGIPipeline = VK_NULL_HANDLE;
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };

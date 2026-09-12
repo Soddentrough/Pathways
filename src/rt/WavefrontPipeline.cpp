@@ -432,7 +432,7 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     // Initialize DGCManager with Execution Set support flag:
     // [0] classify, [1] intersect, [2] shade, [3] shadow
     // Note: Mesa RADV currently requires multi-dispatch fallback for compute execution sets;
-    // can be explicitly enabled via PATHWAYS_ENABLE_DGC_EXECSET=1.
+    // can be explicitly enabled via PATHWAYS_ENABLE_DGC_EXECSET=1 or --dgc-execset.
     m_supportsExecutionSet = (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr);
     m_dgcManager = std::make_unique<DGCManager>(m_device, m_allocator, m_pipelineLayout, m_supportsExecutionSet);
     m_dgcManager->initExecutionSet({
@@ -629,9 +629,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordPreprocessBarrier(cmd);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes, true /* isPreprocessed */);
                         } else {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes, false /* isPreprocessed */);
                         }
                     } else {
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
@@ -676,11 +678,34 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
 
-
                     VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                     s2dDep.bufferMemoryBarrierCount = static_cast<uint32_t>(s2dBarriers.size());
                     s2dDep.pBufferMemoryBarriers = s2dBarriers.data();
                     vkCmdPipelineBarrier2(cmd, &s2dDep);
+
+                    // Tier 2 Optimization: Batched Preprocessing
+                    // Shade has written arguments for both Shadow and Intersect.
+                    // Preprocess both passes concurrently before executing Shadow (unless disabled via --no-dgc-batch-preprocess).
+                    bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
+                    VkDeviceSize shadowOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 6) * 16
+                                                                : static_cast<VkDeviceSize>(b * 3 + 1) * 16;
+                    VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
+                                                                   : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
+
+                    if (m_dgcManager->isSupported()) {
+                        m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1);
+                        if (batchPreprocess && (b + 1 < maxBounces)) {
+                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
+                                for (uint32_t oct = 0; oct < 8; ++oct) {
+                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
+                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
+                                }
+                            } else {
+                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
+                            }
+                        }
+                        m_dgcManager->recordPreprocessBarrier(cmd);
+                    }
 
                     // 4b. Shadow microkernel (100% coherent hardware ray queries)
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
@@ -698,11 +723,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     };
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
                     if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 2);
-                    VkDeviceSize shadowOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 6) * 16
-                                                                : static_cast<VkDeviceSize>(b * 3 + 1) * 16;
                     if (m_dgcManager->isSupported()) {
-                        m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1);
-                        m_dgcManager->recordPreprocessBarrier(cmd);
                         m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, 1 /* slice 1 */, 1, true /* isPreprocessed */);
                     } else {
                         m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), shadowOffset);
@@ -710,6 +731,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
 
                     // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
+                    // Note: Preprocessing was already executed in the batch above; dispatches launch immediately
                     if (b + 1 < maxBounces) {
                         uint32_t intersectPC[17] = {
                             sceneData.numTriangles,
@@ -730,6 +752,17 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             sceneData.secondarySortMode,
                             0 // octantBin
                         };
+                        if (!batchPreprocess && m_dgcManager->isSupported()) {
+                            if (sceneData.secondarySortMode == 1 && useMaterialSort) {
+                                for (uint32_t oct = 0; oct < 8; ++oct) {
+                                    VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
+                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
+                                }
+                            } else {
+                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
+                            }
+                            m_dgcManager->recordPreprocessBarrier(cmd);
+                        }
 
                         if (sceneData.secondarySortMode == 1 && useMaterialSort) {
                             // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
@@ -743,8 +776,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                                 VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
                                 if (m_dgcManager->isSupported()) {
-                                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1);
-                                    m_dgcManager->recordPreprocessBarrier(cmd);
                                     m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), octOffset, 2 + oct, 1, true /* isPreprocessed */);
                                 } else {
                                     m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), octOffset);
@@ -759,10 +790,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
                             if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            VkDeviceSize intersectOffset = static_cast<VkDeviceSize>(b * 16 + 7) * 16;
                             if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
-                                m_dgcManager->recordPreprocessBarrier(cmd);
                                 m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
                             } else {
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
@@ -775,11 +803,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
                             if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-                            VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
-                                                                           : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
                             if (m_dgcManager->isSupported()) {
-                                m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1);
-                                m_dgcManager->recordPreprocessBarrier(cmd);
                                 m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, 2 /* slice 2 */, 1, true /* isPreprocessed */);
                             } else {
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);

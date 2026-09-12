@@ -88,6 +88,7 @@ public:
     bool hasExternalMemoryFd() const { return m_hasExternalMemoryFd; }
     bool hasExternalMemoryDmaBuf() const { return m_hasExternalMemoryDmaBuf; }
     bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
+    bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
     PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFdKHR = nullptr;
     PFN_vkImportSemaphoreFdKHR pfnImportSemaphoreFdKHR = nullptr;
     PFN_vkGetMemoryFdKHR pfnGetMemoryFdKHR = nullptr;
@@ -131,6 +132,7 @@ private:
     bool m_hasExternalMemoryFd = false;
     bool m_hasExternalMemoryDmaBuf = false;
     bool m_hasExternalSemaphoreFd = false;
+    bool m_hasCooperativeMatrix = false;
     PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;

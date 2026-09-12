@@ -32,7 +32,7 @@ ninja -C build -j16
 # Create output directory
 mkdir -p output
 
-# 2b. Run CTest unit test suites (Camera controls, ImGui headless, ReSTIR quality, Shadow denoiser)
+# 2b. Run CTest unit test suites (Camera controls, ImGui headless, Shadow denoiser, TAA/A-Trous, Telemetry)
 echo ""
 echo "[2b] Running CTest Unit Test Suites..."
 ctest --test-dir build --output-on-failure

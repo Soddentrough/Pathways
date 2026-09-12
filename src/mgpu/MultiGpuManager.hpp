@@ -53,10 +53,6 @@ struct GpuDeviceNode {
     std::unique_ptr<Buffer> lightBuffer;
     std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> cameraUBOs;
 
-    // Secondary ReSTIR DI Reservoir Buffers (Bindings 9 & 10)
-    std::array<std::unique_ptr<Buffer>, 2> restirReservoirs;
-    uint32_t restirPingPongIndex = 0;
-
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> asVertexBuffer;
     std::unique_ptr<AccelerationStructureManager> asManager;
@@ -106,9 +102,6 @@ struct GpuDeviceNode {
     uint32_t taaPingPongIndex = 0;
     VkPipelineLayout taaPipelineLayout = VK_NULL_HANDLE;
     VkPipeline taaPipeline = VK_NULL_HANDLE;
-
-    // Secondary Training Tensor Buffer (Binding 15)
-    std::unique_ptr<Buffer> trainingTensorBuffer;
 
     ~GpuDeviceNode();
 };

@@ -300,6 +300,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, "VK_KHR_external_semaphore_fd") == 0) {
             m_hasExternalSemaphoreFd = true;
         }
+        if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
+            m_hasCooperativeMatrix = true;
+        }
     }
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
@@ -597,6 +600,10 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasExternalSemaphoreFd) {
         deviceExtensions.push_back("VK_KHR_external_semaphore_fd");
     }
+    if (m_hasCooperativeMatrix) {
+        deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        deviceExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    }
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
     VkPhysicalDeviceVulkan14Features features14{};
@@ -629,7 +636,16 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     features12.timelineSemaphore = VK_TRUE;
+    features12.vulkanMemoryModel = VK_TRUE;
+    features12.vulkanMemoryModelDeviceScope = VK_TRUE;
+    features12.shaderFloat16 = VK_TRUE;
     features12.pNext = &features13;
+
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.storageBuffer16BitAccess = VK_TRUE;
+    features11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+    features11.pNext = &features12;
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
     rtPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
@@ -652,10 +668,28 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     dgcFeatures.dynamicGeneratedPipelineLayout = VK_TRUE;
     dgcFeatures.pNext = &rayQueryFeatures;
 
+    void* tailFeature = nullptr;
     if (m_hasRayTracing && m_hasDGC) {
         features14.pNext = &dgcFeatures;
+        tailFeature = &rtPipelineFeatures;
     } else if (m_hasRayTracing) {
         features14.pNext = &rayQueryFeatures;
+        tailFeature = &rtPipelineFeatures;
+    } else {
+        tailFeature = &features14;
+    }
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatFeatures{};
+    coopMatFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    coopMatFeatures.cooperativeMatrix = VK_TRUE;
+    coopMatFeatures.pNext = nullptr;
+
+    if (m_hasCooperativeMatrix) {
+        if (tailFeature == &rtPipelineFeatures) {
+            rtPipelineFeatures.pNext = &coopMatFeatures;
+        } else if (tailFeature == &features14) {
+            features14.pNext = &coopMatFeatures;
+        }
     }
 
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
@@ -664,7 +698,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
-    deviceFeatures2.pNext = &features12;
+    deviceFeatures2.pNext = &features11;
 
     VkDeviceCreateInfo deviceCreateInfo{};
     deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

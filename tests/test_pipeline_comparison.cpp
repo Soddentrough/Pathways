@@ -114,7 +114,6 @@ int main() {
 
         stats.wavefront_stats.valid = true;
         stats.wavefront_stats.classify_ms = 0.175;
-        stats.wavefront_stats.restir_gi_ms = 0.250;
         stats.wavefront_stats.queue_memory_footprint_mb = 1233.99;
         stats.wavefront_stats.estimated_vram_traffic_mb = 861.29;
 
@@ -136,8 +135,8 @@ int main() {
         cfgSummary.avg_frame_time_ms = 12.5;
         cfgSummary.pipeline_stages.is_wavefront = true;
         cfgSummary.pipeline_stages.classify_ms = 0.175;
-        cfgSummary.pipeline_stages.restir_gi_ms = 0.250;
-        cfgSummary.pipeline_stages.bounces.push_back({0, 0.575, 0.151, 0.535, 1.261});
+        cfgSummary.pipeline_stages.primary_rays = 1920 * 1080;
+        cfgSummary.pipeline_stages.bounces.push_back({0, 0.575, 0.151, 0.535, 1.261, 1656446, 1400000, 1500000});
         cfgSummary.pipeline_stages.tonemap_ms = 0.120;
         stats.configurations_breakdown.push_back(cfgSummary);
 
@@ -152,10 +151,11 @@ int main() {
         std::ifstream inFile(testJsonPath);
         std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
         check_true(content.find("wavefront_profiler_breakdown") != std::string::npos, "JSON contains wavefront_profiler_breakdown");
-        check_true(content.find("restir_gi_time_ms") != std::string::npos, "JSON contains restir_gi_time_ms");
         check_true(content.find("estimated_vram_traffic_mb") != std::string::npos, "JSON contains estimated_vram_traffic_mb");
         check_true(content.find("dielectric_rays") != std::string::npos, "JSON contains dielectric_rays");
         check_true(content.find("pipeline_stages_ms") != std::string::npos, "JSON contains pipeline_stages_ms");
+        check_true(content.find("primary_rays") != std::string::npos, "JSON contains primary_rays");
+        check_true(content.find("rays_left") != std::string::npos, "JSON contains rays_left");
 
         // Clean up test file
         std::filesystem::remove(testJsonPath, ec);

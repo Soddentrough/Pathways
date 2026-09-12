@@ -210,3 +210,81 @@ In complex scenes with mixed light types (directional sun, point/spot lights, em
   - Hybrid Reconnection shift mapping for rough/diffuse hits.
   - Specular manifold exploration for caustic light paths.
   - Pairwise MIS (P-MIS) to prevent boiling and temporal correlation clumping.
+
+---
+
+## 6. Empirical Findings, Telemetry, and Post-Mortem Rationale for Removal
+
+Following rigorous implementation and profiling across Cornell Box, Classroom, and Many-Lights scenes on dual AMD Radeon AI PRO R9700 GPUs (RDNA 4, `gfx1201`), **ReSTIR was found to be a severe net-negative architectural trade-off in real-time rendering**. 
+
+As of September 2026, ReSTIR DI and ReSTIR GI have been **completely excised from the Pathways codebase**. This section documents the empirical telemetry, performance degradation, image degradation modes, and architectural analysis for archival reference.
+
+### 6.1 Empirical Telemetry: Pure Wavefront vs. ReSTIR
+
+All tests executed at **Native 4K (3840 × 2160), 1 SPP, 4 Bounces, FP16 HDR** on AMD RDNA 4 hardware:
+
+#### A. Procedural Many-Lights Stress Test (64 Analytical Quad Lights)
+```
+Pure Native Wavefront Path Tracer:
+  Rendered Frames:     1222
+  Average Frame Time:  7.438 ms (134.4 FPS) [Min: 6.812 ms, Max: 9.140 ms]
+  Primary RT GPU:      7.294 ms
+  Ray Throughput:      4.46 GigaRays/sec
+  Sub-8ms Budget:      ACHIEVED (120 Hz Target Met)
+  Pipeline Stages:
+    - Classify (Primary RayGen): 0.792 ms
+    - Bounce 0: Shade: 1.906 ms | Shadow: 0.812 ms | Intersect: 0.941 ms
+    - Bounce 1: Shade: 0.842 ms | Shadow: 0.315 ms | Intersect: 0.720 ms
+    - ReSTIR GI Pass: 0.000 ms
+
+ReSTIR Enabled (DI + GI):
+  Rendered Frames:     1222
+  Average Frame Time:  9.857 ms (101.5 FPS) [Min: 7.838 ms, Max: 14.128 ms]
+  Primary RT GPU:      9.713 ms
+  Ray Throughput:      3.37 GigaRays/sec
+  Sub-8ms Budget:      EXCEEDED (Failed 120 Hz Target)
+  Pipeline Stages:
+    - Classify (Primary RayGen): 0.804 ms
+    - Bounce 0: Shade: 3.263 ms (+71.2% slower) | Shadow: 0.825 ms | Intersect: 0.952 ms
+    - Bounce 1: Shade: 0.910 ms | Shadow: 0.320 ms | Intersect: 0.731 ms
+    - ReSTIR GI Pass: 1.445 ms
+```
+- **Net Cost of ReSTIR:** **+2.419 ms per frame (+32.5% slower)**.
+- **Visual Variance Benefit:** **0% perceptible noise reduction**. Single-pixel 1 SPP Monte Carlo noise remained visibly unresolved.
+- **Motion Quality:** Heavy smearing, ghost trails, and historical dragging under camera movement.
+
+#### B. Architectural Interior Benchmark (Classroom Scene, Dynamic Camera Motion)
+- **Pure Wavefront Path Tracer:** **7.64 ms (130.8 FPS) — sub-8ms budget achieved**. Crisp contact shadows under desks/chairs (deep shadow retention: 13.5%), sharp geometric silhouettes, zero ghosting.
+- **ReSTIR Enabled:** **10.3 – 12.6 ms (79.3 FPS) — sub-8ms budget failed**. Frame rate collapsed by 39%. Camera movement caused trailing halos behind chairs, delayed shadow response, and severe temporal lag.
+
+---
+
+### 6.2 The Three Fundamental Failure Modes of ReSTIR
+
+#### 1. Sampling vs. Filtering Confusion
+ReSTIR is purely an *importance resampling* algorithm — it selects which light source or indirect ray candidate to evaluate. **It is NOT an image filter, and it cannot replace a denoiser**.
+At 1 SPP, evaluating an optimal light candidate still yields stochastic Monte Carlo variance per pixel. To turn 1 SPP noisy radiance into clean real-time imagery requires a spatial/wavelet reconstructor (such as an edge-stopping À-Trous filter). ReSTIR's temporal reservoir accumulation attempted to smooth this variance over time, but at the cost of catastrophic temporal lag and ghosting during dynamic camera or object motion.
+
+#### 2. Excessive VRAM Memory Bandwidth and Cache Thrashing
+Maintaining ping-pong reservoir state at 4K ($3840 \times 2160 = 8,294,400$ pixels):
+- ReSTIR DI Reservoirs (32 bytes $\times 2$ ping-pong): **530.8 MiB**
+- ReSTIR GI Reservoirs (32 bytes $\times 2$ ping-pong): **530.8 MiB**
+- Raw GI Sample Queue (32 bytes): **265.4 MiB**
+- **Total VRAM Allocated to Reservoirs: ~1.32 GiB**.
+Every single frame, the compute kernels streamed hundreds of megabytes through the L2/Infinity Cache to read and write reservoir metadata, competing directly with BVH traversal, triangle vertex fetching, and ray queues.
+
+#### 3. Register Pressure & Compute Shader Spills
+Evaluating 4-candidate Chao's WRS, spatial bilateral edge-stopping neighbor gathers, and unshadowed target functions inside the material shade shaders expanded register usage dramatically:
+- In `wavefront_shade_diffuse.comp`, VGPR pressure increased from 38 to 64+ registers, cutting wave occupancy on RDNA 4 Compute Units in half.
+- As observed in the telemetry, **Bounce 0 Shade execution jumped from 1.906 ms to 3.263 ms (+71.2% slower)** simply from running the ReSTIR DI candidate loop.
+
+---
+
+### 6.3 Conclusion and Architectural Commitment
+
+Pathways is designed for maximum deterministic rendering speed, predictable frame pacing, and absolute physical correctness. The empirical evidence decisively demonstrated that:
+1. ReSTIR introduces substantial memory and compute overhead (+32.5% frame time penalty).
+2. It causes unacceptable motion artifacts (ghosting, smear, temporal disocclusion lag).
+3. It does not eliminate the need for spatial reconstruction filters.
+
+Consequently, ReSTIR has been permanently removed. Pathways relies exclusively on its high-throughput native Wavefront pipeline, dynamic SPP regulation, and lean spatial reconstruction (À-Trous / AMD FidelityFX denoiser) to deliver high-framerate 4K hardware path tracing.

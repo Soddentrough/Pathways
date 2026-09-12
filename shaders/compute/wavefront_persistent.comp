@@ -70,6 +70,18 @@ struct Material {
     float thickness;
     float specularFactor;
     uint specularTex;
+
+    // Tier 2 glTF Extensions (offsets 144-192)
+    float anisotropyStrength;
+    float anisotropyRotation;
+    uint anisotropyTex;
+    float dispersion;
+    vec3 sheenColor;
+    float sheenRoughness;
+    float iridescence;
+    float iridescenceIor;
+    float iridescenceThickness;
+    uint sheenTex;
 };
 
 struct Light {

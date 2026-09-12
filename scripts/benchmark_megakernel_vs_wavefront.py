@@ -406,7 +406,7 @@ def generate_markdown_report(comparisons, output_filepath):
     lines.append("### 5. Architectural Analysis & Core Takeaways")
     lines.append("")
     lines.append("1. **Register Pressure & GPU Occupancy:**")
-    lines.append("   - **Megakernel (RTP):** The monolithic Closest-Hit shader consolidates diffuse, conductor, dielectric refraction, Beer-Lambert attenuation, and ReSTIR candidate evaluation into a single compilation unit. This incurs significant register pressure (~120 VGPRs on RDNA 4), limiting active wavefront occupancy to ~37.5%. However, all ray state remains in high-speed VGPRs, generating **0 MB VRAM round-trip traffic**.")
+    lines.append("   - **Megakernel (RTP):** The monolithic Closest-Hit shader consolidates diffuse, conductor, dielectric refraction, Beer-Lambert attenuation, and stochastic direct lighting evaluation into a single compilation unit. This incurs significant register pressure (~120 VGPRs on RDNA 4), limiting active wavefront occupancy to ~37.5%. However, all ray state remains in high-speed VGPRs, generating **0 MB VRAM round-trip traffic**.")
     lines.append("   - **Wavefront DGC:** Decomposing the pipeline into specialized microkernels (`wavefront_shade_diffuse`, `_dielectric`, `_conductor`, `_complex`) drastically reduces register usage to 24–48 VGPRs per kernel, achieving **100% compute unit occupancy**.")
     lines.append("")
     lines.append("2. **Material Divergence & Autonomous DGC Dispatch:**")

@@ -264,10 +264,41 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             }
         }
 
+        if (mat.has_anisotropy) {
+            gpuMat.anisotropyStrength = mat.anisotropy.anisotropy_strength;
+            gpuMat.anisotropyRotation = mat.anisotropy.anisotropy_rotation;
+            if (mat.anisotropy.anisotropy_texture.texture) {
+                gpuMat.anisotropyTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.anisotropy.anisotropy_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_dispersion) {
+            gpuMat.dispersion = mat.dispersion.dispersion;
+        }
+
+        if (mat.has_sheen) {
+            gpuMat.sheenColor = glm::vec3(
+                mat.sheen.sheen_color_factor[0],
+                mat.sheen.sheen_color_factor[1],
+                mat.sheen.sheen_color_factor[2]
+            );
+            gpuMat.sheenRoughness = mat.sheen.sheen_roughness_factor;
+            if (mat.sheen.sheen_color_texture.texture) {
+                gpuMat.sheenTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.sheen.sheen_color_texture.texture)) + 1;
+            }
+        }
+
+        if (mat.has_iridescence) {
+            gpuMat.iridescence = mat.iridescence.iridescence_factor;
+            gpuMat.iridescenceIor = mat.iridescence.iridescence_ior;
+            gpuMat.iridescenceThickness = mat.iridescence.iridescence_thickness_max;
+        }
+
         bool hasTextures = (gpuMat.albedoTex > 0 || gpuMat.mrTex > 0 || gpuMat.normalTex > 0 ||
                             gpuMat.occlusionTex > 0 || gpuMat.emissiveTex > 0 || gpuMat.transmissionTex > 0 ||
                             gpuMat.clearcoatTex > 0 || gpuMat.clearcoatRoughnessTex > 0 || gpuMat.clearcoatNormalTex > 0 ||
-                            gpuMat.thicknessTex > 0 || gpuMat.specularTex > 0);
+                            gpuMat.thicknessTex > 0 || gpuMat.specularTex > 0 ||
+                            gpuMat.anisotropyTex > 0 || gpuMat.sheenTex > 0);
         if (!hasTextures && (gpuMat.emissive.r > 0.1f || gpuMat.emissive.g > 0.1f || gpuMat.emissive.b > 0.1f)) {
             gpuMat.type = MATERIAL_EMISSIVE;
         }

@@ -5,41 +5,6 @@
 
 namespace pathways {
 
-struct ReservoirGPU {
-    uint32_t lightIdx = 0;
-    float    uvX = 0.0f;
-    float    uvY = 0.0f;
-    float    wSum = 0.0f;
-    float    M = 0.0f;
-    float    W = 0.0f;
-    float    targetPdf = 0.0f;
-    uint32_t pad = 0; // Packed geometry: lower 16 bits = oct normal, upper 16 bits = half depth
-};
-
-struct ReservoirGIGPU {
-    uint32_t packedDir = 0;        // Oct-encoded secondary ray direction
-    float    hitDist = 0.0f;       // Distance to secondary hit point
-    uint32_t packedRadRG = 0;      // FP16 RG incoming radiance
-    uint32_t packedRadB_normS = 0; // FP16 B radiance + oct-encoded secondary normal
-    float    wSum = 0.0f;          // Sum of candidate weights
-    float    M = 0.0f;             // Effective sample count
-    float    W = 0.0f;             // Unbiased contribution weight
-    uint32_t primaryGeom = 0;      // Oct-encoded primary normal + half depth
-};
-static_assert(sizeof(ReservoirGIGPU) == 32, "ReservoirGIGPU must be exactly 32 bytes");
-
-struct RawGISampleGPU {
-    uint32_t packedDir = 0;          // Secondary ray direction
-    float    hitDist = 0.0f;         // Distance to secondary hit
-    uint32_t packedRadRG = 0;        // FP16 RG incoming radiance
-    uint32_t packedRadB_normS = 0;   // FP16 B radiance + oct secondary normal
-    uint32_t primaryGeom = 0;        // Oct-encoded primary normal + half depth
-    uint32_t primaryAlbedo = 0;      // FP16 RG primary diffuse albedo
-    uint32_t primaryAlbedoB_pad = 0; // FP16 B primary albedo
-    uint32_t pad = 0;
-};
-static_assert(sizeof(RawGISampleGPU) == 32, "RawGISampleGPU must be exactly 32 bytes");
-
 struct CameraUniform {
     glm::mat4 viewInverse;
     glm::mat4 projInverse;
@@ -49,7 +14,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: restirDI, 7: restirSpatial, bits 8..11: spatialSamples, bits 12..19: spatialRadius, bit 20: shadowDenoiser, bit 21: taa, bit 22: restirGI, bit 23: cameraMoved / history reset
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 20: shadowDenoiser, 21: taa, 23: cameraMoved / history reset
     glm::mat4 unjitteredViewProj;
     glm::vec4 jitterOffset; // xy = pixel jitter [-0.5, 0.5], zw = NDC jitter
 };
