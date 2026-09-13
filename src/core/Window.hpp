@@ -70,6 +70,9 @@ public:
     void setRelativeMouseMode(bool enabled);
 
 private:
+#ifdef _WIN32
+    void queryDxgiHdrInfo();
+#endif
     bool m_headless = false;
     bool m_shouldClose = false;
     bool m_isFullscreen = false;

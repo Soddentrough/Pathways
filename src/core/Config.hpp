@@ -78,6 +78,7 @@ struct Config {
     bool enable_hdr = true;              // Auto-negotiate HDR display formats (scRGB Linear / HDR10 PQ) [Default: true]
     float hdr_peak_nits = 1000.0f;       // Display peak luminance in cd/m^2 (nits) [Default: 1000.0]
     float hdr_paper_white_nits = 200.0f; // Reference paper white luminance in cd/m^2 (nits) [Default: 200.0]
+    bool custom_hdr_peak = false;        // Set to true when --hdr-peak is passed explicitly on CLI
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)

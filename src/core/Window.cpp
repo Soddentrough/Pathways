@@ -18,6 +18,54 @@
 
 namespace pathways {
 
+#ifdef _WIN32
+void Window::queryDxgiHdrInfo() {
+    // Query DXGI for native HDR display capabilities and exact luminance limits
+    Microsoft::WRL::ComPtr<IDXGIFactory1> dxgiFactory;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory)))) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        for (UINT a = 0; dxgiFactory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+                Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+                if (SUCCEEDED(output.As(&output6))) {
+                    DXGI_OUTPUT_DESC1 desc1{};
+                    if (SUCCEEDED(output6->GetDesc1(&desc1)) && desc1.AttachedToDesktop) {
+                        if (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                            m_displayInfo.isDesktopHdr = true;
+                        }
+                        if (desc1.BitsPerColor >= 10 || desc1.MaxLuminance > 300.0f) {
+                            m_displayInfo.isDisplayHdrCapable = true;
+                        }
+                        if (desc1.MaxLuminance > 0.0f) {
+                            m_displayInfo.maxLuminanceNits = desc1.MaxLuminance;
+                            m_displayInfo.minLuminanceNits = desc1.MinLuminance;
+                            m_displayInfo.maxFullFrameLuminanceNits = desc1.MaxFullFrameLuminance;
+                            m_displayInfo.redPrimary[0] = desc1.RedPrimary[0];
+                            m_displayInfo.redPrimary[1] = desc1.RedPrimary[1];
+                            m_displayInfo.greenPrimary[0] = desc1.GreenPrimary[0];
+                            m_displayInfo.greenPrimary[1] = desc1.GreenPrimary[1];
+                            m_displayInfo.bluePrimary[0] = desc1.BluePrimary[0];
+                            m_displayInfo.bluePrimary[1] = desc1.BluePrimary[1];
+                            m_displayInfo.whitePoint[0] = desc1.WhitePoint[0];
+                            m_displayInfo.whitePoint[1] = desc1.WhitePoint[1];
+                        }
+                        m_displayInfo.hmonitor = static_cast<void*>(desc1.Monitor);
+                        Logger::info("DXGI Display Output: Desktop HDR: {}, HDR Capable: {}, Peak: {:.1f} nits, Min: {:.4f} nits (ColorSpace: {})",
+                                     m_displayInfo.isDesktopHdr ? "ACTIVE" : "INACTIVE",
+                                     m_displayInfo.isDisplayHdrCapable ? "YES" : "NO",
+                                     m_displayInfo.maxLuminanceNits, m_displayInfo.minLuminanceNits,
+                                     static_cast<int>(desc1.ColorSpace));
+                        break;
+                    }
+                }
+            }
+            if (m_displayInfo.isDisplayHdrCapable) break;
+        }
+    }
+}
+#endif
+
 Window::Window(const Config& config)
     : m_headless(config.headless), m_width(config.width), m_height(config.height) {
 
@@ -113,49 +161,7 @@ Window::Window(const Config& config)
         }
 
 #ifdef _WIN32
-        // Query DXGI for native HDR display capabilities and exact luminance limits
-        Microsoft::WRL::ComPtr<IDXGIFactory1> dxgiFactory;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory)))) {
-            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-            for (UINT a = 0; dxgiFactory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
-                Microsoft::WRL::ComPtr<IDXGIOutput> output;
-                for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
-                    Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
-                    if (SUCCEEDED(output.As(&output6))) {
-                        DXGI_OUTPUT_DESC1 desc1{};
-                        if (SUCCEEDED(output6->GetDesc1(&desc1)) && desc1.AttachedToDesktop) {
-                            if (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-                                m_displayInfo.isDesktopHdr = true;
-                            }
-                            if (desc1.BitsPerColor >= 10 || desc1.MaxLuminance > 300.0f) {
-                                m_displayInfo.isDisplayHdrCapable = true;
-                            }
-                            if (desc1.MaxLuminance > 0.0f) {
-                                m_displayInfo.maxLuminanceNits = desc1.MaxLuminance;
-                                m_displayInfo.minLuminanceNits = desc1.MinLuminance;
-                                m_displayInfo.maxFullFrameLuminanceNits = desc1.MaxFullFrameLuminance;
-                                m_displayInfo.redPrimary[0] = desc1.RedPrimary[0];
-                                m_displayInfo.redPrimary[1] = desc1.RedPrimary[1];
-                                m_displayInfo.greenPrimary[0] = desc1.GreenPrimary[0];
-                                m_displayInfo.greenPrimary[1] = desc1.GreenPrimary[1];
-                                m_displayInfo.bluePrimary[0] = desc1.BluePrimary[0];
-                                m_displayInfo.bluePrimary[1] = desc1.BluePrimary[1];
-                                m_displayInfo.whitePoint[0] = desc1.WhitePoint[0];
-                                m_displayInfo.whitePoint[1] = desc1.WhitePoint[1];
-                            }
-                            m_displayInfo.hmonitor = static_cast<void*>(desc1.Monitor);
-                            Logger::info("DXGI Display Output: Desktop HDR: {}, HDR Capable: {}, Peak: {:.1f} nits, Min: {:.4f} nits (ColorSpace: {})",
-                                         m_displayInfo.isDesktopHdr ? "ACTIVE" : "INACTIVE",
-                                         m_displayInfo.isDisplayHdrCapable ? "YES" : "NO",
-                                         m_displayInfo.maxLuminanceNits, m_displayInfo.minLuminanceNits,
-                                         static_cast<int>(desc1.ColorSpace));
-                            break;
-                        }
-                    }
-                }
-                if (m_displayInfo.isDisplayHdrCapable) break;
-            }
-        }
+        queryDxgiHdrInfo();
 #endif
     }
 
@@ -233,8 +239,8 @@ Window::Window(const Config& config)
         }
         float headroom = SDL_GetFloatProperty(winProps, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
         float sdrWhite = SDL_GetFloatProperty(winProps, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0f);
-        if (headroom > 1.0f) {
-            float baseWhite = (config.hdr_paper_white_nits > 0.0f) ? config.hdr_paper_white_nits : 80.0f;
+        if (headroom > 1.0f && m_displayInfo.maxLuminanceNits <= 0.0f) {
+            float baseWhite = (config.hdr_paper_white_nits > 0.0f) ? config.hdr_paper_white_nits : 200.0f;
             float calculatedPeak = baseWhite * headroom;
             m_displayInfo.maxLuminanceNits = std::clamp(calculatedPeak, 400.0f, 10000.0f);
         }
@@ -243,7 +249,7 @@ Window::Window(const Config& config)
                      m_displayInfo.isDesktopHdr ? "ACTIVE" : "INACTIVE",
                      headroom, sdrWhite, m_displayInfo.maxLuminanceNits);
     }
-    if (config.hdr_peak_nits > 0.0f) {
+    if (config.custom_hdr_peak && config.hdr_peak_nits > 0.0f) {
         m_displayInfo.maxLuminanceNits = config.hdr_peak_nits;
     }
 
@@ -475,11 +481,17 @@ void Window::pollEvents() {
                     float headroom = SDL_GetFloatProperty(wp, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
                     m_displayInfo.isDisplayHdrCapable = hdr;
                     m_displayInfo.isDesktopHdr = hdr;
-                    if (headroom > 1.0f) {
-                        m_displayInfo.maxLuminanceNits = std::clamp(80.0f * headroom, 400.0f, 10000.0f);
+#ifdef _WIN32
+                    queryDxgiHdrInfo();
+#endif
+                    if (headroom > 1.0f && m_displayInfo.maxLuminanceNits <= 0.0f) {
+                        m_displayInfo.maxLuminanceNits = std::clamp(200.0f * headroom, 400.0f, 10000.0f);
                     }
                     Logger::info("SDL_EVENT_WINDOW_HDR_STATE_CHANGED: HDR active={}, headroom={:.2f}x (Peak: {:.1f} nits)",
                                  hdr, headroom, m_displayInfo.maxLuminanceNits);
+                    if (m_resizeCallback) {
+                        m_resizeCallback(m_width, m_height);
+                    }
                 }
                 break;
             }

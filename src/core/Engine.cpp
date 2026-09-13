@@ -132,7 +132,7 @@ Engine::Engine(const Config& config) : m_config(config) {
     if (!m_config.headless && m_window) {
         m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
         // Auto-adapt peak luminance to native display capabilities if not customized by user
-        if (m_config.hdr_peak_nits == 1000.0f && m_window->getDisplayInfo().isDisplayHdrCapable &&
+        if (!m_config.custom_hdr_peak && m_window->getDisplayInfo().isDisplayHdrCapable &&
             m_window->getDisplayInfo().maxLuminanceNits > 0.0f) {
             m_config.hdr_peak_nits = m_window->getDisplayInfo().maxLuminanceNits;
         }
@@ -4915,6 +4915,11 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     m_config.width = newWidth;
     m_config.height = newHeight;
+
+    if (m_window && !m_config.custom_hdr_peak && m_window->getDisplayInfo().isDisplayHdrCapable &&
+        m_window->getDisplayInfo().maxLuminanceNits > 0.0f) {
+        m_config.hdr_peak_nits = m_window->getDisplayInfo().maxLuminanceNits;
+    }
 
     // 1. Recreate Swapchain (destroy old swapchain first so surface is released)
     m_swapchain.reset();

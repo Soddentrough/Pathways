@@ -643,8 +643,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_hdr = false;
         } else if (arg == "--hdr-peak" && i + 1 < argc) {
             cfg.hdr_peak_nits = std::stof(argv[++i]);
+            cfg.custom_hdr_peak = true;
         } else if (arg.starts_with("--hdr-peak=")) {
             cfg.hdr_peak_nits = std::stof(arg.substr(arg.find('=') + 1));
+            cfg.custom_hdr_peak = true;
         } else if ((arg == "--hdr-white" || arg == "--hdr-paper-white") && i + 1 < argc) {
             cfg.hdr_paper_white_nits = std::stof(argv[++i]);
         } else if (arg.starts_with("--hdr-white=") || arg.starts_with("--hdr-paper-white=")) {
