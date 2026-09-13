@@ -208,12 +208,12 @@ void main() {
                 baseColor *= f16vec3(texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb);
             }
 
-            f16vec3 emissive = f16vec3(mat.emissive.rgb);
+            vec3 emissive = mat.emissive.rgb;
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                emissive *= f16vec3(texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb);
+                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
-            if (length(emissive) > float16_t(1e-3)) {
-                accumRadiance += vec3(throughput * emissive);
+            if (length(emissive) > 1e-3) {
+                accumRadiance += vec3(throughput) * emissive;
             }
 
             bool pathTerminated = false;
@@ -343,7 +343,7 @@ void main() {
                         float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
                         f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
 
-                        f16vec3 specBrdf = float16_t(D * G) * F;
+                        f16vec3 specBrdf = float16_t(clamp(D * G, 0.0, 65500.0)) * F;
                         float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
 
                         float misWeight = 1.0;
@@ -352,8 +352,9 @@ void main() {
                             misWeight = lightPdfEff / (lightPdfEff + specPdf);
                         }
 
-                        f16vec3 candidateContrib = specBrdf * (f16vec3(lightEmission) * float16_t(NdotL * misWeight));
-                        float target = float(dot(candidateContrib, f16vec3(0.2126, 0.7152, 0.0722)));
+                        vec3 directLightRadiance = clamp(lightEmission * (NdotL * misWeight), vec3(0.0), vec3(65500.0));
+                        f16vec3 candidateContrib = specBrdf * f16vec3(directLightRadiance);
+                        float target = max(float(dot(candidateContrib, f16vec3(0.2126, 0.7152, 0.0722))), 1e-6);
                         float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                         float weight = target / sourcePdf;
 
@@ -375,8 +376,8 @@ void main() {
 
                 if (hasCandidate && selectedTarget > 1e-6) {
                     float risWeight = totalWeightSum / (float(M) * selectedTarget);
-                    f16vec3 contrib = selectedBrdf * (f16vec3(selectedLightEmission) * float16_t(selectedNdotL * selectedMisWeight));
-                    secDirectL = contrib * float16_t(risWeight);
+                    vec3 directLightRadiance = clamp(selectedLightEmission * (selectedNdotL * selectedMisWeight * risWeight), vec3(0.0), vec3(65500.0));
+                    secDirectL = selectedBrdf * f16vec3(directLightRadiance);
                     f16vec3 unshadowed = throughput * secDirectL;
 
                     if (length(unshadowed) > float16_t(1e-5)) {

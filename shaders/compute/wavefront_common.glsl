@@ -293,6 +293,7 @@ vec3 randVec3(inout uint seed) {
 // Unbiased stochastic rounding for FP16 HDR accumulation buffer.
 // Prevents floating-point precision exhaustion and colored contour banding under multi-frame progressive accumulation.
 vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (isnan(val.r) || isnan(val.g) || isnan(val.b) || isinf(val.r) || isinf(val.g) || isinf(val.b)) return accum;
     if (dot(val, val) < 1e-12) return accum;
     uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
     vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));

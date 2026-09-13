@@ -317,7 +317,8 @@ void main() {
                     float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + diffPdf)) : 1.0;
 
                     float factor = (NdotL / lightPdfEff) * misWeight;
-                    secDirectL = diffBrdf * (f16vec3(lightEmission) * float16_t(factor));
+                    vec3 directLightRadiance = clamp(lightEmission * factor, vec3(0.0), vec3(65500.0));
+                    secDirectL = diffBrdf * f16vec3(directLightRadiance);
                     f16vec3 unshadowed = throughput * secDirectL;
 
                     if (length(unshadowed) > float16_t(1e-5)) {
@@ -400,7 +401,7 @@ void main() {
 
                     float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
                     if (validLightSample && NdotL > 0.0) {
-                        float target = max(float(dot(f16vec3(lightEmission), proxyLumWeight)) * NdotL, 1e-6);
+                        float target = max(dot(lightEmission, vec3(proxyLumWeight)) * NdotL, 1e-6);
                         float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                         float weight = target / sourcePdf;
 
@@ -429,7 +430,7 @@ void main() {
                         f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
                         float D = distributionGGX(NdotH, alphaRoughness);
                         float Vis = visibilitySmithGGXCorrelated(selectedNdotL, NdotV, alphaRoughness);
-                        f16vec3 specBrdf = float16_t(D * Vis) * F;
+                        f16vec3 specBrdf = float16_t(clamp(D * Vis, 0.0, 65500.0)) * F;
 
                         f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI));
                         f16vec3 combinedBrdf = diffBrdf + specBrdf;
@@ -448,7 +449,8 @@ void main() {
 
                         float risWeight = totalWeightSum / (float(M) * selectedTarget);
                         float factor = selectedNdotL * misWeight * risWeight;
-                        secDirectL = combinedBrdf * (f16vec3(selectedLightEmission) * float16_t(factor));
+                        vec3 directLightRadiance = clamp(selectedLightEmission * factor, vec3(0.0), vec3(65500.0));
+                        secDirectL = combinedBrdf * f16vec3(directLightRadiance);
                         f16vec3 unshadowed = throughput * secDirectL;
 
                         if (length(unshadowed) > float16_t(1e-5)) {

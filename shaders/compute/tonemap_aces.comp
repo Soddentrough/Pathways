@@ -97,6 +97,13 @@ void main() {
     // Apply exposure compensation
     linearColor *= pc.exposure;
 
+    // Sanitize against NaN, Inf, and negative radiance
+    if (isnan(linearColor.r) || isnan(linearColor.g) || isnan(linearColor.b) ||
+        isinf(linearColor.r) || isinf(linearColor.g) || isinf(linearColor.b)) {
+        linearColor = vec3(0.0);
+    }
+    linearColor = max(linearColor, vec3(0.0));
+
     vec3 finalColor;
 
     if (pc.displayMode == 1u) {
@@ -178,6 +185,11 @@ void main() {
                 finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1) * tintScale, 0.25);
             }
         }
+    }
+
+    if (isnan(finalColor.r) || isnan(finalColor.g) || isnan(finalColor.b) ||
+        isinf(finalColor.r) || isinf(finalColor.g) || isinf(finalColor.b)) {
+        finalColor = vec3(0.0);
     }
 
     imageStore(uOutputImage, pixelCoord, vec4(finalColor, 1.0));
