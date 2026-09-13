@@ -175,18 +175,21 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
                                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
+    // Producer-Side Binning (Directional DGC) reserves 8 dedicated octant sub-queues
+    constexpr uint32_t QUEUE_OCTANT_MULTIPLIER = 8;
+
     // RayGeometry = 16 bytes (packed originPackedDir)
-    VkDeviceSize geomQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
+    VkDeviceSize geomQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 16;
     m_rayGeomQueueA = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     m_rayGeomQueueB = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // RayState = 32 bytes
-    VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
+    VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 32;
     m_rayStateQueueA = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     m_rayStateQueueB = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // RayHit = 32 bytes (pre-interpolated normal, UV, tangent, material)
-    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
+    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 32;
     m_rayHitQueue = std::make_unique<Buffer>(m_allocator, hitQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
@@ -925,8 +928,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 }
 
 double WavefrontPipeline::getQueueMemoryFootprintMb() const {
-    // geomA(16B) + geomB(16B) + stateA(32B) + stateB(32B) + hit(16B) + shadow(32B) + matIndices(24B) + secIndices(32B) = 200B
-    double bytes = static_cast<double>(m_maxCapacity) * 200.0 + 256.0 + 16384.0 + 16384.0;
+    // geomA(16B*8) + geomB(16B*8) + stateA(32B*8) + stateB(32B*8) + hit(32B*8) + shadow(32B) + matIndices(24B) + secIndices(32B) = 1112B
+    double bytes = static_cast<double>(m_maxCapacity) * 1112.0 + 256.0 + 65536.0 * 2.0;
     return bytes / (1024.0 * 1024.0);
 }
 
@@ -1003,7 +1006,13 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
             bp.passCount = matDispatches[b].passCount;
             bp.activeCount = bp.diffCount + bp.dielCount + bp.condCount + bp.compCount + bp.emisCount + bp.passCount;
             bp.shadowCount = matDispatches[b].shadowCount;
-            bp.nextCount = matDispatches[b].nextCount;
+            if (m_secondarySortMode == 1) {
+                uint32_t totalOct = 0;
+                for (int k = 0; k < 8; ++k) totalOct += matDispatches[b].octants[k].count;
+                bp.nextCount = totalOct;
+            } else {
+                bp.nextCount = matDispatches[b].nextCount;
+            }
         } else if (dispatches) {
             bp.activeCount = dispatches[b].activeCount;
             bp.shadowCount = dispatches[b].shadowCount;

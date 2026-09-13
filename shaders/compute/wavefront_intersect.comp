@@ -115,9 +115,7 @@ void main() {
 
     uint rayIdx = idx;
     if (pc.secondarySortMode == 1u) {
-        if (inRange) {
-            rayIdx = secondaryIndices[pc.octantBin * pc.maxQueueCapacity + idx];
-        }
+        rayIdx = pc.octantBin * pc.maxQueueCapacity + idx;
     } else if (pc.secondarySortMode == 2u) {
         if (inRange) {
             rayIdx = secondaryIndices[idx];

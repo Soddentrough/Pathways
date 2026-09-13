@@ -216,14 +216,16 @@ void main() {
             dgcStream.commands[b * 16u + 7u].y = 1u;
             dgcStream.commands[b * 16u + 7u].z = 1u;
 
-            // Slots 8..15: Option 1 Directional DGC intersect dispatches
+            // Slots 8..15: Producer-Side Binning Directional DGC intersect dispatches
             uint totalIntersectWgs = 0u;
+            uint totalOctantRays = 0u;
             if (pc.secondarySortMode == 1u) {
                 for (uint k = 0u; k < 8u; ++k) {
                     uint octCnt = queueCounters.octantCounts[k];
                     queueCounters.currentOctantCounts[k] = octCnt;
                     uint octGroups = (octCnt + 31u) / 32u;
                     totalIntersectWgs += octGroups;
+                    totalOctantRays += octCnt;
 
                     indirect.commands[b * 16u + 8u + k].x = octGroups;
                     indirect.commands[b * 16u + 8u + k].y = 1u;
@@ -239,8 +241,10 @@ void main() {
                 }
             } else {
                 totalIntersectWgs = intersectGroups;
+                totalOctantRays = nextCount;
             }
             queueCounters.totalIntersectWorkgroups = totalIntersectWgs;
+            queueCounters.secondaryRayCount = totalOctantRays;
 
             if (pc.secondarySortMode == 2u) {
                 indirect.commands[b * 16u + 8u].x = intersectGroups;
@@ -250,7 +254,7 @@ void main() {
             }
 
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? totalOctantRays : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;
