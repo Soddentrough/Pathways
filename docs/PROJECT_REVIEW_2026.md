@@ -884,7 +884,7 @@ The repository contains 12 test targets. A deep inspection of each revealed majo
 | ID | Category | Description | Strategic Benefit | Roadmap Horizon |
 |---|---|---|---|---|
 | **FEAT-01** | Input / Hardware | **SDL3 Gamepad Support**: Initialize `SDL_INIT_GAMEPAD` in `Window.cpp` and implement dual-analog navigation (left stick fly, right stick look, triggers speed modulation). | Standard navigation for architectural visualization and CAD walk-throughs | Phase 3 (v1.19.0) |
-| **FEAT-02** | Lighting / SOTA | **ReSTIR DI for Many-Light Scenes**: Implement streaming reservoir sampling for analytical lights and emissive meshes (Section 2 in `TODO.md`), replacing uniform random light selection. | Orders-of-magnitude noise reduction in complex scenes with hundreds of lights | Phase 3 (v1.20.0) |
+| **FEAT-02** | Lighting / SOTA | **Hierarchical 3D Light Tree**: Implement SAOH binary BVH and $O(\log N)$ stochastic tree traversal for many-light importance sampling (replacing uniform $1/N$ sampling). | **Completed**: $O(\log N)$ tree traversal, 64-byte GPU nodes, directional emission cone bounds, zero cross-GPU PCIe traffic; unit tested & verified | **Completed** |
 | **FEAT-03** | Denoising | **BMFR Overlapping Block Smoothing**: Implement overlapping $12\times 12$ blocks with linear blending or post-regression cross-bilateral filter in `bmfr_regression.comp`. | Eliminates $8\times 8$ tile boundary seams during camera motion | Phase 3 (v1.20.0) |
 | **FEAT-04** | Ecosystem | **OpenUSD (`.usdc`) Ingestion & Hydra Delegate**: Implement native OpenUSD stage ingestion (`USD.md`, `TODO.md §4`) and Hydra `hdPathways` delegate for Houdini and Blender viewports. | Opens Pathways to VFX, cinematic CAD, and film production pipelines | Phase 4 (v2.0.0) |
 | **FEAT-05** | GPU Architecture | **Khronos GPU Work Graphs (`VK_KHR_work_graphs`)**: Migrate from `VK_EXT_device_generated_commands` to cross-vendor Work Graphs once finalized, executing the entire wavefront DAG on-chip. | Eliminates host DGC preprocessing and VRAM queue round-trips | Phase 4 (Post-Vulkan 1.4 update) |
@@ -927,10 +927,10 @@ PATHWAYS 4-PHASE REMEDIATION & EVOLUTION ROADMAP:
  ├── CRIT-04: Dynamically size NRC query queue by SPP & prevent silent ray drop on queue full [COMPLETED]
  ├── FEAT-03: Implement overlapping block smoothing in BMFR regression denoiser [COMPLETED]
  ├── FEAT-01: Add SDL3 Gamepad dual-analog navigation support [COMPLETED]
- ├── FEAT-02: Implement ReSTIR DI for many-light scenes (Streaming weighted reservoir sampling)
+ ├── FEAT-02: Hierarchical 3D Light Tree for many-light importance sampling (SAOH binary BVH, O(log N) stochastic descent) [COMPLETED]
  ├── CRIT-05: Replace non-atomic NRC imageStore with 32-bit fixed-point atomic buffer [COMPLETED]
  ├── OPT-03:  Split NRC feature encoding and MLP inference to eliminate 256 VGPR saturation [COMPLETED]
- └── OPT-12:  Restructure Dear ImGui HUD into collapsible docking panels with native scrollbars
+ └── OPT-12:  Restructure Dear ImGui HUD into collapsible docking panels (Accepted as-is / Deferred)
 
 [Phase 4: Long-Term Ecosystem & Next-Gen GPU Architecture] (Target: v2.0.0+)
  ├── FEAT-04: Native OpenUSD (.usdc) stage ingestion & Pixar Hydra (hdPathways) delegate
