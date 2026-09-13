@@ -44,7 +44,11 @@ int main() {
     qInfo0.queueCount = 1;
     qInfo0.pQueuePriorities = &priority;
 
+    VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    features13.synchronization2 = VK_TRUE;
+
     VkDeviceCreateInfo dInfo0{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dInfo0.pNext = &features13;
     dInfo0.queueCreateInfoCount = 1;
     dInfo0.pQueueCreateInfos = &qInfo0;
     dInfo0.enabledExtensionCount = 1;
@@ -127,13 +131,21 @@ int main() {
     std::cout << "Testing 100 consecutive cross-device semaphore signal -> export -> import -> wait cycles..." << std::endl;
     for (int iter = 0; iter < 100; ++iter) {
         // 1. Submit on Dev 1 signaling sem1
-        VkSubmitInfo submit1{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submit1.commandBufferCount = 1;
-        submit1.pCommandBuffers = &cmd1;
-        submit1.signalSemaphoreCount = 1;
-        submit1.pSignalSemaphores = &sem1;
-        if (vkQueueSubmit(q1, 1, &submit1, VK_NULL_HANDLE) != VK_SUCCESS) {
-            std::cerr << "vkQueueSubmit on Dev 1 failed at iter " << iter << std::endl;
+        VkCommandBufferSubmitInfo cmdInfo1{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdInfo1.commandBuffer = cmd1;
+
+        VkSemaphoreSubmitInfo sigInfo1{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        sigInfo1.semaphore = sem1;
+        sigInfo1.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+        VkSubmitInfo2 submit1{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submit1.commandBufferInfoCount = 1;
+        submit1.pCommandBufferInfos = &cmdInfo1;
+        submit1.signalSemaphoreInfoCount = 1;
+        submit1.pSignalSemaphoreInfos = &sigInfo1;
+
+        if (vkQueueSubmit2(q1, 1, &submit1, VK_NULL_HANDLE) != VK_SUCCESS) {
+            std::cerr << "vkQueueSubmit2 on Dev 1 failed at iter " << iter << std::endl;
             return 1;
         }
 
@@ -160,20 +172,25 @@ int main() {
         }
 
         // 4. Submit on Dev 0 waiting on sem0
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkSubmitInfo submit0{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submit0.commandBufferCount = 1;
-        submit0.pCommandBuffers = &cmd0;
-        submit0.waitSemaphoreCount = 1;
-        submit0.pWaitSemaphores = &sem0;
-        submit0.pWaitDstStageMask = &waitStage;
+        VkCommandBufferSubmitInfo cmdInfo0{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdInfo0.commandBuffer = cmd0;
+
+        VkSemaphoreSubmitInfo waitInfo0{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        waitInfo0.semaphore = sem0;
+        waitInfo0.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+        VkSubmitInfo2 submit0{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submit0.commandBufferInfoCount = 1;
+        submit0.pCommandBufferInfos = &cmdInfo0;
+        submit0.waitSemaphoreInfoCount = 1;
+        submit0.pWaitSemaphoreInfos = &waitInfo0;
 
         VkFence fence0 = VK_NULL_HANDLE;
         VkFenceCreateInfo fInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         vkCreateFence(dev0, &fInfo, nullptr, &fence0);
 
-        if (vkQueueSubmit(q0, 1, &submit0, fence0) != VK_SUCCESS) {
-            std::cerr << "vkQueueSubmit on Dev 0 failed at iter " << iter << std::endl;
+        if (vkQueueSubmit2(q0, 1, &submit0, fence0) != VK_SUCCESS) {
+            std::cerr << "vkQueueSubmit2 on Dev 0 failed at iter " << iter << std::endl;
             return 1;
         }
 

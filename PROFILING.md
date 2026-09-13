@@ -766,5 +766,35 @@ Benchmarked on **AMD Radeon AI PRO R9700 (`gfx1201`)** with Pure Monte Carlo:
 2. **BVH Early-Out**: Bounding distance truncates ray query traversal for all rays leaving the scene volume, reducing ray query iteration steps on AMD RDNA 4 Ray Accelerators without visual side-effects.
 3. **True Scale Invariance**: Adapts dynamically across unit variations (cm vs m vs km), eliminating scene-specific magic constants.
 
+---
+
+## 18. Vulkan 1.4 Core Modernization & Synchronization 2 Queue Submissions (v1.19.8)
+
+### 18.1 Motivation & Audit Findings
+A full Vulkan specification audit (`scripts/audit_vulkan_api.py`) identified several legacy Vulkan 1.0 holdouts in an otherwise clean Vulkan 1.4 core pipeline:
+1. **Queue Submissions**: While pipeline barriers and timestamps were 100% migrated to Synchronization 2 (`vkCmdPipelineBarrier2`, `vkCmdWriteTimestamp2`), queue submissions still relied on legacy Vulkan 1.0 `vkQueueSubmit` (`VkSubmitInfo` with 32-bit `VkPipelineStageFlags`).
+2. **Redundant Promoted Extension Requests**: `VulkanContext::createLogicalDevice` explicitly requested `VK_KHR_buffer_device_address`, `VK_KHR_dynamic_rendering`, `"VK_KHR_external_memory"`, and `VK_KHR_shader_float16_int8` despite targeting `VK_API_VERSION_1_4` and enabling these features via core feature structs (`VkPhysicalDeviceVulkan12Features`, `VkPhysicalDeviceVulkan13Features`).
+3. **Legacy Memory Requirements**: `MultiGpuManager.cpp` and P2P direct BAR tests used Vulkan 1.0 `vkGetBufferMemoryRequirements`.
+
+### 18.2 Architectural Changes
+1. **Synchronization 2 Queue Submission (`vkQueueSubmit2`)**:
+   - Upgraded all 18 queue submission sites across `Engine.cpp`, `MultiGpuManager.cpp`, `AccelerationStructure.cpp`, `Texture.cpp`, and `test_cross_gpu_sync.cpp` to `vkQueueSubmit2`.
+   - Structured submissions using `VkSubmitInfo2`, `VkCommandBufferSubmitInfo`, and `VkSemaphoreSubmitInfo`.
+   - Replaced 32-bit stage masks with 64-bit `VkPipelineStageFlags2` (`VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT`, `VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT`, `VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT`).
+2. **Device Extension Pruning**:
+   - Removed redundant core-promoted extension strings from logical device creation.
+   - Preserved only genuine platform-specific extensions (`VK_KHR_swapchain`, `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_host`, `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_semaphore_fd`, `VK_EXT_device_generated_commands`, `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline`, `VK_KHR_ray_query`, `VK_KHR_cooperative_matrix`).
+3. **Extensible Memory Requirements**:
+   - Upgraded buffer memory requirements queries to `vkGetBufferMemoryRequirements2` with `VkBufferMemoryRequirementsInfo2` and `VkMemoryRequirements2`.
+4. **Engine Version Synchronization**:
+   - Bumped CMake project version to `1.19.8`.
+   - Synchronized `appInfo.applicationVersion` and `appInfo.engineVersion` in `VulkanContext::createInstance` to `VK_MAKE_VERSION(1, 19, 8)`.
+
+### 18.3 Verification & Audit Status
+- `scripts/audit_vulkan_api.py` confirms `vkQueueSubmit` calls dropped from 18 to **0** in project code, with `vkQueueSubmit2` taking over 100% of engine submissions.
+- `test_cross_gpu_sync` successfully executed 100 consecutive cross-GPU semaphore export/import cycles using `vkQueueSubmit2` on dual AMD Radeon AI PRO R9700 GPUs.
+- `test_p2p_direct_bar` and `test_mgpu_frame_pacing` passed with zero errors.
+
+
 
 

@@ -80,9 +80,9 @@ void VulkanContext::createInstance(const Config& config) {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Pathways";
-    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.applicationVersion = VK_MAKE_VERSION(1, 19, 8);
     appInfo.pEngineName = "PathwaysEngine";
-    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.engineVersion = VK_MAKE_VERSION(1, 19, 8);
     appInfo.apiVersion = VK_API_VERSION_1_4;
 
     std::vector<const char*> instanceExtensions;
@@ -613,11 +613,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasDGC) {
         deviceExtensions.push_back(VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME);
     }
-    deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
-    deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
-    if (m_hasExternalMemoryHost || m_hasExternalMemoryFd) {
-        deviceExtensions.push_back("VK_KHR_external_memory");
-    }
     if (m_hasExternalMemoryHost) {
         deviceExtensions.push_back("VK_EXT_external_memory_host");
     }
@@ -632,7 +627,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     }
     if (m_hasCooperativeMatrix) {
         deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-        deviceExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
     }
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
