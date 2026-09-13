@@ -58,21 +58,13 @@ Pathways solves this by combining three orthogonal scaling axes into a continuou
                                                           (Continuous ~5-15% Vernier)
 ```
 
-### Axis 1: Spatiotemporal Checkerboard Sampling (0.5 SPP Steps)
+### Axis 1: Spatiotemporal Sampling (Integer SPP & Dynamic Bounce Regulation)
 
-- **Mechanism:** On any given frame, exactly 50% of the pixels launch ray paths based on a spatial checkerboard parity pattern:
-  $$\text{parity} = (x + y + \text{frameIndex}) \pmod 2$$
-- **Hardware Compaction (Wave32 Coherence):** A naive `if (((x+y)&1) != parity) return;` shader pattern idles 50% of SIMD lanes, forfeiting traversal throughput. Pathways dispatches a compacted grid:
-  $$\text{Dispatch Dimensions} = \left(\frac{W}{2}, H\right)$$
-  The ray generation shader mathematically unpacks coordinates:
-  ```glsl
-  ivec2 launchID = ivec2(gl_LaunchIDEXT.xy);
-  int x = launchID.x * 2 + ((launchID.y + frameParity) & 1);
-  int y = launchID.y;
-  ivec2 pixelCoord = ivec2(x, y);
-  ```
-  Every lane in every Wave32 wavefront executes active ray traversal, yielding a true $2.0\times$ speedup per checkerboard pass.
-- **Granularity:** Allows half-integer steps: **0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0 SPP**.
+> [!NOTE]
+> **Implementation Baseline**: While fractional checkerboard parity (0.5 SPP steps) was initially explored, the production engine standardizes on discrete integer SPP steps combined with dynamic bounce depth (Axis 3) and dual-GPU interleaving (Axis 2). This eliminates spatial checkerboard artifacts and avoids wave divergence on RDNA 4 (`fractionalSpp = 0.0f` in `QualityGovernor.hpp`).
+
+- **Mechanism:** Dispatches full-screen integer sample passes across the active wavefront microkernels, combining progressive accumulation with dynamic bounce depth scaling for sub-millisecond vernier regulation.
+- **Granularity:** Standardizes on discrete integer steps: **1, 2, 3, 4+ SPP**, fine-tuned through continuous dynamic bounce limits (**2 to 8 bounces**).
 
 ### Axis 2: Dual-GPU Sample Parallel Balancing (Device Partitioning)
 

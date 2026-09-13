@@ -155,18 +155,18 @@ private:
     uint32_t m_secondarySortMode = 0;
     bool m_supportsExecutionSet = false;
 
-    // Ray Work Queues & Counter SSBOs (SoA Layout)
-    std::unique_ptr<Buffer> m_rayGeomQueueA;  // 32B RayGeometry
-    std::unique_ptr<Buffer> m_rayGeomQueueB;  // 32B RayGeometry
-    std::unique_ptr<Buffer> m_rayStateQueueA; // 32B RayState
-    std::unique_ptr<Buffer> m_rayStateQueueB; // 32B RayState
-    std::unique_ptr<Buffer> m_rayHitQueue;    // 32B RayHit
-    std::unique_ptr<Buffer> m_materialIndexQueue; // 4B index * 4 archetypes (Index-Based Material Queues)
-    std::unique_ptr<Buffer> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
-    std::unique_ptr<Buffer> m_shadowQueue;    // 32B PackedShadowRay
-    std::unique_ptr<Buffer> m_queueCounters;
-    std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs; // Double-buffered per in-flight frame slot
-    std::unique_ptr<Buffer> m_dgcStream;
+    // Ray Work Queues & Counter SSBOs (SoA Layout) - Double-buffered per in-flight frame slot
+    std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueA;  // 16B RayGeometry
+    std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueB;  // 16B RayGeometry
+    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueA; // 32B RayState
+    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueB; // 32B RayState
+    std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 32B RayHit
+    std::array<std::unique_ptr<Buffer>, 2> m_materialIndexQueue; // 4B index * 6 archetypes (Index-Based Material Queues)
+    std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
+    std::array<std::unique_ptr<Buffer>, 2> m_shadowQueue;    // 32B PackedShadowRay
+    std::array<std::unique_ptr<Buffer>, 2> m_queueCounters;
+    std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;   // Double-buffered per in-flight frame slot
+    std::array<std::unique_ptr<Buffer>, 2> m_dgcStream;
 
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

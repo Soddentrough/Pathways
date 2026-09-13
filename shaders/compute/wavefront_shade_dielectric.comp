@@ -126,6 +126,11 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint useHardwareRT;
     uint secondarySortMode;
+    uint enableNrc;
+    uint nrcBounce;
+    float nrcTrainRatio;
+    uint frameIndex;
+    uint numOpaqueTriangles;
 } pc;
 
 void main() {
@@ -281,50 +286,50 @@ void main() {
         }
     }
 
+    // Standard single-queue linear compaction for ray geometry and state
+    uvec4 ballot = subgroupBallot(survivesToNext);
+    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+    uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+    uint waveGlobalOffset = 0u;
+    if (subgroupElect()) {
+        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+    }
+    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+    uint targetIdx = waveGlobalOffset + laneSlot;
+    if (survivesToNext) {
+        if (targetIdx < pc.maxQueueCapacity) {
+            outGeoms[targetIdx] = nextGeom;
+            outStates[targetIdx] = nextState;
+        }
+    }
+
     if (pc.secondarySortMode == 1u) {
-        // Producer-Side Binning: Partition rays directly into 8 directional octant sub-queues
-        // Zero indirection buffer, contiguous sequential memory layout for downstream traversal
+        // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
-        uint activeMask = activeBallot.x;
-        while (activeMask != 0u) {
-            uint leaderLane = findLSB(activeMask);
-            uint k = subgroupBroadcast(oct, leaderLane);
-            bool isOct = survivesToNext && (oct == k);
-            uvec4 octBallot = subgroupBallot(isOct);
-            uint octCount = subgroupBallotBitCount(octBallot);
-            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-            uint octBase = 0u;
-            if (gl_SubgroupInvocationID == leaderLane) {
-                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-            }
-            octBase = subgroupBroadcast(octBase, leaderLane);
-            if (isOct) {
-                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                if (octBase + octSlot < pc.maxQueueCapacity) {
-                    outGeoms[dest] = nextGeom;
-                    outStates[dest] = nextState;
+        for (uint w = 0u; w < 2u; ++w) {
+            uint activeMask = (w == 0u) ? activeBallot.x : activeBallot.y;
+            while (activeMask != 0u) {
+                uint leaderLane = w * 32u + findLSB(activeMask);
+                uint k = subgroupBroadcast(oct, leaderLane);
+                bool isOct = survivesToNext && (oct == k);
+                uvec4 octBallot = subgroupBallot(isOct);
+                uint octCount = subgroupBallotBitCount(octBallot);
+                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+                uint octBase = 0u;
+                if (gl_SubgroupInvocationID == leaderLane) {
+                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
                 }
-            }
-            activeMask &= ~octBallot.x;
-        }
-    } else {
-        // Standard single-queue linear compaction (for secondarySortMode == 0: None, or 2: Spatial Index)
-        uvec4 ballot = subgroupBallot(survivesToNext);
-        uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-        uint waveActiveCount = subgroupBallotBitCount(ballot);
-
-        uint waveGlobalOffset = 0u;
-        if (subgroupElect()) {
-            waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
-        }
-        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
-
-        if (survivesToNext) {
-            uint targetIdx = waveGlobalOffset + laneSlot;
-            if (targetIdx < pc.maxQueueCapacity) {
-                outGeoms[targetIdx] = nextGeom;
-                outStates[targetIdx] = nextState;
+                octBase = subgroupBroadcast(octBase, leaderLane);
+                if (isOct) {
+                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                    if (octBase + octSlot < pc.maxQueueCapacity) {
+                        secondaryIndices[dest] = targetIdx;
+                    }
+                }
+                activeMask &= ~((w == 0u) ? octBallot.x : octBallot.y);
             }
         }
     }

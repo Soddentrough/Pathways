@@ -89,6 +89,7 @@ void NRCManager::initWeightsAndHashTable() {
             float f1 = featDist(rng);
             pHash[i] = glm::packHalf2x16(glm::vec2(f0, f1));
         }
+        m_hashTable->flush();
         m_hashTable->unmap();
     }
 
@@ -119,6 +120,7 @@ void NRCManager::initWeightsAndHashTable() {
         for (size_t i = 0; i < 16; ++i) {
             pWeights[9344 + i] = glm::packHalf1x16(0.0f);
         }
+        m_weights->flush();
         m_weights->unmap();
     }
 
@@ -126,6 +128,7 @@ void NRCManager::initWeightsAndHashTable() {
     void* pMom = m_weightMomentum->map();
     if (pMom) {
         std::memset(pMom, 0, 2ull * 9360ull * sizeof(float));
+        m_weightMomentum->flush();
         m_weightMomentum->unmap();
     }
 
@@ -133,6 +136,7 @@ void NRCManager::initWeightsAndHashTable() {
     void* pCount = m_counters->map();
     if (pCount) {
         std::memset(pCount, 0, 256);
+        m_counters->flush();
         m_counters->unmap();
     }
 }

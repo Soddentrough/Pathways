@@ -6,6 +6,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 #include "nrc_common.glsl"
 
@@ -359,6 +360,13 @@ float fresnelSchlick(float cosTheta, float refIdx) {
 // Fresnel-Schlick approximation with vector F0 (Cook-Torrance PBR)
 vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
     return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+f16vec3 fresnelSchlickVec(float16_t cosTheta, f16vec3 F0) {
+    float16_t omc = clamp(float16_t(1.0) - cosTheta, float16_t(0.0), float16_t(1.0));
+    float16_t omc2 = omc * omc;
+    float16_t omc5 = omc2 * omc2 * omc;
+    return F0 + (f16vec3(1.0) - F0) * omc5;
 }
 
 // GGX / Trowbridge-Reitz Normal Distribution Function D

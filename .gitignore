@@ -56,3 +56,7 @@ imgui.ini
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Agent workspace artifacts
+.agents/
+ORIGINAL_REQUEST.md

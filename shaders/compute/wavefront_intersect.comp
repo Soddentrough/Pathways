@@ -116,7 +116,9 @@ void main() {
 
     uint rayIdx = idx;
     if (pc.secondarySortMode == 1u) {
-        rayIdx = pc.octantBin * pc.maxQueueCapacity + idx;
+        if (inRange) {
+            rayIdx = secondaryIndices[pc.octantBin * pc.maxQueueCapacity + idx];
+        }
     } else if (pc.secondarySortMode == 2u) {
         if (inRange) {
             rayIdx = secondaryIndices[idx];
@@ -394,6 +396,9 @@ void main() {
                     indirect.commands[nextB * 16u + 7u].x = 0u;
                     for (uint k = 0u; k < 8u; ++k) {
                         indirect.commands[nextB * 16u + 8u + k].x = 0u;
+                    }
+                    for (uint c = 0u; c < 6u; ++c) {
+                        dgcStream.commands[nextB * 16u + c].x = 0u;
                     }
                 }
 

@@ -69,30 +69,38 @@ void RTPipeline::createPipeline(const std::vector<char>& rgenCode,
     VkShaderModule shadowMissModule = createShaderModule(shadowMissCode);
     VkShaderModule rchitModule = createShaderModule(rchitCode);
 
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
+
     std::vector<VkPipelineShaderStageCreateInfo> stages(4);
     // Stage 0: Raygen
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     stages[0].module = rgenModule;
     stages[0].pName = "main";
+    stages[0].pNext = &subgroupSize32;
 
     // Stage 1: Primary Miss
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[1].module = rmissModule;
     stages[1].pName = "main";
+    stages[1].pNext = &subgroupSize32;
 
     // Stage 2: Shadow Miss
     stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[2].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[2].module = shadowMissModule;
     stages[2].pName = "main";
+    stages[2].pNext = &subgroupSize32;
 
     // Stage 3: Closest Hit
     stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[3].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     stages[3].module = rchitModule;
     stages[3].pName = "main";
+    stages[3].pNext = &subgroupSize32;
 
     std::vector<VkRayTracingShaderGroupCreateInfoKHR> groups(4);
     // Group 0: Raygen

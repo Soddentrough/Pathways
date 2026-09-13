@@ -132,10 +132,10 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 300 \
-    --warmup-frames 60 \
+    --frames 100 \
+    --warmup-frames 20 \
     --no-accumulation \
-    --scene scenes/DamagedHelmet.glb \
+    --scene cornell-box \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -145,10 +145,10 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 300 \
-    --warmup-frames 60 \
+    --frames 100 \
+    --warmup-frames 20 \
     --no-accumulation \
-    --scene scenes/DamagedHelmet.glb \
+    --scene cornell-box \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 

@@ -139,13 +139,20 @@ void Camera::resetToDefault() {
 }
 
 void Camera::update(float deltaTime) {
-    // Reserved for camera smoothing / animations
-    (void)deltaTime;
+    // Exponential smoothing / velocity inertia damping (OPT-05)
+    if (glm::length(m_velocity) > 0.0001f) {
+        float decay = 14.0f;
+        float alpha = 1.0f - std::exp(-decay * deltaTime);
+        m_velocity = glm::mix(m_velocity, glm::vec3(0.0f), alpha);
+        m_position += m_velocity * deltaTime;
+        m_moved = true;
+    }
 }
 
 void Camera::lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up) {
     m_position = position;
     m_worldUp = up;
+    m_velocity = glm::vec3(0.0f);
     glm::vec3 direction = glm::normalize(target - position);
     m_pitch = glm::degrees(std::asin(std::clamp(direction.y, -0.999f, 0.999f)));
     m_yaw = glm::degrees(std::atan2(direction.z, direction.x));
@@ -238,11 +245,12 @@ void Camera::processFpsInput(float forward, float strafe, float vertical, float 
         return;
     }
 
-    // Standard FPS movement
+    // Standard FPS movement (records velocity for inertia glide in update())
     glm::vec3 moveDir = m_front * forward + m_right * strafe + m_worldUp * vertical;
     if (glm::length(moveDir) > 0.0001f) {
         moveDir = glm::normalize(moveDir);
         float currentSpeed = getEffectiveSpeed(sprint, crawl);
+        m_velocity = moveDir * currentSpeed;
         m_position += moveDir * (currentSpeed * deltaTime);
         m_moved = true;
     }

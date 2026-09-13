@@ -464,13 +464,28 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         return;
     }
 
-    // Align buffer size to 64KB (satisfies minImportedHostPointerAlignment of 4096 or 65536)
-    VkDeviceSize hostAlignment = 65536;
-    m_sharedBufferSize = (bufferSize + hostAlignment - 1) & ~(hostAlignment - 1);
     VkDevice dev0 = m_primaryContext->getDevice();
     VkPhysicalDevice phys0 = m_primaryContext->getPhysicalDevice();
     VkDevice dev1 = m_devices[0]->context->getDevice();
     VkPhysicalDevice phys1 = m_devices[0]->context->getPhysicalDevice();
+
+    // Query minImportedHostPointerAlignment from both physical devices (CRIT-08)
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostExtProps0{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 props2_0{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2_0.pNext = &hostExtProps0;
+    vkGetPhysicalDeviceProperties2(phys0, &props2_0);
+
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostExtProps1{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 props2_1{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2_1.pNext = &hostExtProps1;
+    vkGetPhysicalDeviceProperties2(phys1, &props2_1);
+
+    VkDeviceSize hostAlignment = std::max({
+        static_cast<VkDeviceSize>(65536),
+        hostExtProps0.minImportedHostPointerAlignment,
+        hostExtProps1.minImportedHostPointerAlignment
+    });
+    m_sharedBufferSize = (bufferSize + hostAlignment - 1) & ~(hostAlignment - 1);
 
     auto pfnGet0 = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev0, "vkGetMemoryHostPointerPropertiesEXT");
     auto pfnGet1 = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev1, "vkGetMemoryHostPointerPropertiesEXT");
@@ -511,10 +526,29 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 
         uint32_t memIdx0 = UINT32_MAX, memIdx1 = UINT32_MAX;
         for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
-            if (hostProps0.memoryTypeBits & (1 << i)) { memIdx0 = i; break; }
+            if ((hostProps0.memoryTypeBits & (1 << i)) &&
+                (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                memIdx0 = i;
+                break;
+            }
         }
+        if (memIdx0 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+                if (hostProps0.memoryTypeBits & (1 << i)) { memIdx0 = i; break; }
+            }
+        }
+
         for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
-            if (hostProps1.memoryTypeBits & (1 << i)) { memIdx1 = i; break; }
+            if ((hostProps1.memoryTypeBits & (1 << i)) &&
+                (memProps1.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                memIdx1 = i;
+                break;
+            }
+        }
+        if (memIdx1 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+                if (hostProps1.memoryTypeBits & (1 << i)) { memIdx1 = i; break; }
+            }
         }
 
         if (memIdx0 == UINT32_MAX || memIdx1 == UINT32_MAX) {

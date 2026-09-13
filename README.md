@@ -55,13 +55,16 @@ Load any glTF 2.0 or procedural scene and fly through it in real time with high-
 
 | Control | Action |
 | :--- | :--- |
+| **TAB** | Toggle between UI Control Panel and FPS Camera Navigation |
+| **Mouse Move** | Look / rotate camera (in FPS mode) |
 | **W / A / S / D** | Fly forward / left / backward / right |
 | **E / Q** or **Space / C** | Fly up / fly down |
-| **Right Click + Drag** | Look / rotate camera |
-| **Shift** (hold) | Sprint / speed multiplier |
-| **F1** | Toggle Dear ImGui HUD & Controls overlay |
-| **F2** | Cycle multi-GPU load visualization overlay |
-| **Esc** | Exit Pathways |
+| **Shift** (hold) | Sprint speed multiplier (3.0x) |
+| **Alt** (hold) | Precision crawl speed multiplier (0.25x) |
+| **Mouse Wheel** | Adjust fly camera movement speed |
+| **F** | Focus and center camera on target object |
+| **F11** | Toggle Fullscreen |
+| **Alt+F4 / Close** | Exit Pathways |
 
 ---
 

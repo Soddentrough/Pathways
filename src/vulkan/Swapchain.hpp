@@ -22,7 +22,8 @@ public:
               bool enableHdr = true, bool isFullscreen = false,
               const VulkanContext* context = nullptr,
               const DisplayInfo* displayInfo = nullptr,
-              float peakNits = 1000.0f, float paperWhiteNits = 200.0f);
+              float peakNits = 1000.0f, float paperWhiteNits = 200.0f,
+              VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE);
     ~Swapchain();
 
     VkSwapchainKHR getSwapchain() const { return m_swapchain; }

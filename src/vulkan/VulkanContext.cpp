@@ -80,9 +80,9 @@ void VulkanContext::createInstance(const Config& config) {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Pathways";
-    appInfo.applicationVersion = VK_MAKE_VERSION(1, 19, 8);
+    appInfo.applicationVersion = VK_MAKE_VERSION(PATHWAYS_VERSION_MAJOR, PATHWAYS_VERSION_MINOR, PATHWAYS_VERSION_PATCH);
     appInfo.pEngineName = "PathwaysEngine";
-    appInfo.engineVersion = VK_MAKE_VERSION(1, 19, 8);
+    appInfo.engineVersion = VK_MAKE_VERSION(PATHWAYS_VERSION_MAJOR, PATHWAYS_VERSION_MINOR, PATHWAYS_VERSION_PATCH);
     appInfo.apiVersion = VK_API_VERSION_1_4;
 
     std::vector<const char*> instanceExtensions;
@@ -292,6 +292,29 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                  m_queueIndices.graphicsComputeFamily,
                  m_queueIndices.transferFamily,
                  m_queueIndices.asyncComputeFamily);
+
+    // Verify surface presentation support if a surface was supplied (CRIT-07)
+    if (surface != VK_NULL_HANDLE) {
+        VkBool32 presentSupport = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(m_physicalDevice, m_queueIndices.graphicsComputeFamily, surface, &presentSupport);
+        if (!presentSupport) {
+            bool found = false;
+            for (uint32_t i = 0; i < queueFamilyCount; ++i) {
+                vkGetPhysicalDeviceSurfaceSupportKHR(m_physicalDevice, i, surface, &presentSupport);
+                if (presentSupport) {
+                    Logger::info("Queue family {} supports surface presentation", i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                Logger::error("Selected physical device does not support presentation to the provided surface!");
+                throw std::runtime_error("No surface presentation support found on selected physical device");
+            }
+        } else {
+            Logger::info("Verified presentation support on graphics/compute queue family {}", m_queueIndices.graphicsComputeFamily);
+        }
+    }
 
     // Query Device Extensions
     uint32_t extCount = 0;
@@ -656,7 +679,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features14.dynamicRenderingLocalRead = VK_TRUE;
     features14.maintenance5 = VK_TRUE;
     features14.maintenance6 = VK_TRUE;
-    features14.pushDescriptor = VK_TRUE;
 
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -676,6 +698,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features12.descriptorBindingPartiallyBound = VK_TRUE;
     features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.scalarBlockLayout = VK_TRUE;
     features12.timelineSemaphore = VK_TRUE;
     features12.vulkanMemoryModel = VK_TRUE;
     features12.vulkanMemoryModelDeviceScope = VK_TRUE;

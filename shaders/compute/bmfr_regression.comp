@@ -25,9 +25,12 @@ layout(push_constant) uniform PushConstants {
     uint pad;
 } pc;
 
-// Shared memory for wave reduction and regression weights
+// Shared memory for wave reduction, regression system, and fitted weights
 shared float s_subgroupSums[2][39];
 shared float s_weights[18]; // 6 weights for R, 6 for G, 6 for B
+shared float s_S[6][6];
+shared float s_L[6][6];
+shared float s_y[6];
 
 bool isInvalid(vec3 v) {
     return isnan(v.r) || isnan(v.g) || isnan(v.b) || isinf(v.r) || isinf(v.g) || isinf(v.b);
@@ -57,39 +60,52 @@ void main() {
     bool isSky = (depth > 5000.0 || depth <= 0.0);
     float dNorm = isSky ? 1.0 : clamp(depth / max(pc.maxDepth, 1.0), 0.0, 10.0);
 
-    // 6 Features: [1, Nx, Ny, Nz, D, D^2]
-    float f[6];
-    f[0] = 1.0;
-    f[1] = N.x;
-    f[2] = N.y;
-    f[3] = N.z;
-    f[4] = dNorm;
-    f[5] = dNorm * dNorm;
+    // 2. Outer products and parallel reduction across 64 threads (2 Wave32 subgroups)
+    {
+        // 6 Features: [1, Nx, Ny, Nz, D, D^2]
+        float f[6];
+        f[0] = 1.0;
+        f[1] = N.x;
+        f[2] = N.y;
+        f[3] = N.z;
+        f[4] = dNorm;
+        f[5] = dNorm * dNorm;
 
-    // Outer products S = f * f^T (21 unique elements for symmetric 6x6)
-    float localVals[39];
-    int idx = 0;
-    for (int j = 0; j < 6; ++j) {
-        for (int k = j; k < 6; ++k) {
-            localVals[idx++] = inBounds ? (f[j] * f[k]) : 0.0;
+        uint waveID = gl_SubgroupInvocationID;
+        uint subgroupId = gl_SubgroupID;
+
+        // S = f * f^T (21 unique elements for symmetric 6x6)
+        int idx = 0;
+        for (int j = 0; j < 6; ++j) {
+            for (int k = j; k < 6; ++k) {
+                float val = inBounds ? (f[j] * f[k]) : 0.0;
+                float waveSum = subgroupAdd(val);
+                if (waveID == 0u) {
+                    s_subgroupSums[subgroupId][idx] = waveSum;
+                }
+                idx++;
+            }
         }
-    }
 
-    // Right-hand sides b = f * C^T (18 elements: 6 R, 6 G, 6 B)
-    for (int j = 0; j < 6; ++j) {
-        localVals[21 + j]     = inBounds ? (f[j] * C.r) : 0.0;
-        localVals[21 + 6 + j] = inBounds ? (f[j] * C.g) : 0.0;
-        localVals[21 + 12 + j]= inBounds ? (f[j] * C.b) : 0.0;
-    }
+        // Right-hand sides b = f * C^T (18 elements: 6 R, 6 G, 6 B)
+        for (int j = 0; j < 6; ++j) {
+            float valR = inBounds ? (f[j] * C.r) : 0.0;
+            float sumR = subgroupAdd(valR);
+            if (waveID == 0u) {
+                s_subgroupSums[subgroupId][21 + j] = sumR;
+            }
 
-    // 2. Parallel Reduction across 64 threads (2 Wave32 subgroups)
-    uint waveID = gl_SubgroupInvocationID;
-    uint subgroupId = gl_SubgroupID;
+            float valG = inBounds ? (f[j] * C.g) : 0.0;
+            float sumG = subgroupAdd(valG);
+            if (waveID == 0u) {
+                s_subgroupSums[subgroupId][21 + 6 + j] = sumG;
+            }
 
-    for (int i = 0; i < 39; ++i) {
-        float waveSum = subgroupAdd(localVals[i]);
-        if (waveID == 0u) {
-            s_subgroupSums[subgroupId][i] = waveSum;
+            float valB = inBounds ? (f[j] * C.b) : 0.0;
+            float sumB = subgroupAdd(valB);
+            if (waveID == 0u) {
+                s_subgroupSums[subgroupId][21 + 12 + j] = sumB;
+            }
         }
     }
 
@@ -97,95 +113,59 @@ void main() {
 
     // 3. Lane 0 solves 6x6 SPD system via Cholesky Decomposition
     if (gl_LocalInvocationIndex == 0u) {
-        float S[6][6];
         int sIdx = 0;
         for (int j = 0; j < 6; ++j) {
             for (int k = j; k < 6; ++k) {
                 float total = s_subgroupSums[0][sIdx] + s_subgroupSums[1][sIdx];
-                S[j][k] = total;
-                S[k][j] = total;
+                s_S[j][k] = total;
+                s_S[k][j] = total;
                 sIdx++;
             }
         }
 
-        float bR[6], bG[6], bB[6];
-        for (int j = 0; j < 6; ++j) {
-            bR[j] = s_subgroupSums[0][21 + j]      + s_subgroupSums[1][21 + j];
-            bG[j] = s_subgroupSums[0][21 + 6 + j]  + s_subgroupSums[1][21 + 6 + j];
-            bB[j] = s_subgroupSums[0][21 + 12 + j] + s_subgroupSums[1][21 + 12 + j];
-        }
-
         // Add Tikhonov regularization lambda * trace(S)/6 * I
-        float traceS = S[0][0] + S[1][1] + S[2][2] + S[3][3] + S[4][4] + S[5][5];
+        float traceS = s_S[0][0] + s_S[1][1] + s_S[2][2] + s_S[3][3] + s_S[4][4] + s_S[5][5];
         float reg = max(pc.lambda * (traceS / 6.0), 1e-4);
         for (int j = 0; j < 6; ++j) {
-            S[j][j] += reg;
+            s_S[j][j] += reg;
         }
 
-        // Cholesky Factorization: S = L * L^T
-        float L[6][6];
+        // Cholesky Factorization: S = L * L^T (written to s_L in LDS)
         for (int i = 0; i < 6; ++i) {
             for (int j = 0; j <= i; ++j) {
-                float sum = S[i][j];
+                float sum = s_S[i][j];
                 for (int k = 0; k < j; ++k) {
-                    sum -= L[i][k] * L[j][k];
+                    sum -= s_L[i][k] * s_L[j][k];
                 }
                 if (i == j) {
                     if (sum <= 1e-6) {
                         sum = 1e-6;
                     }
-                    L[i][j] = sqrt(sum);
+                    s_L[i][j] = sqrt(sum);
                 } else {
-                    L[i][j] = sum / max(L[j][j], 1e-6);
+                    s_L[i][j] = sum / max(s_L[j][j], 1e-6);
                 }
             }
         }
 
-        // Solve for each channel: L * y = b, then L^T * w = y
-        // Channel R:
-        float yR[6], wR[6];
-        for (int i = 0; i < 6; ++i) {
-            float sum = bR[i];
-            for (int k = 0; k < i; ++k) sum -= L[i][k] * yR[k];
-            yR[i] = sum / max(L[i][i], 1e-6);
-        }
-        for (int i = 5; i >= 0; --i) {
-            float sum = yR[i];
-            for (int k = i + 1; k < 6; ++k) sum -= L[k][i] * wR[k];
-            wR[i] = sum / max(L[i][i], 1e-6);
-        }
+        // Solve for each color channel: L * y = b, then L^T * w = y
+        for (int c = 0; c < 3; ++c) {
+            int bOffset = 21 + c * 6;
+            int wOffset = c * 6;
 
-        // Channel G:
-        float yG[6], wG[6];
-        for (int i = 0; i < 6; ++i) {
-            float sum = bG[i];
-            for (int k = 0; k < i; ++k) sum -= L[i][k] * yG[k];
-            yG[i] = sum / max(L[i][i], 1e-6);
-        }
-        for (int i = 5; i >= 0; --i) {
-            float sum = yG[i];
-            for (int k = i + 1; k < 6; ++k) sum -= L[k][i] * wG[k];
-            wG[i] = sum / max(L[i][i], 1e-6);
-        }
+            // Forward solve: L * y = b
+            for (int i = 0; i < 6; ++i) {
+                float sum = s_subgroupSums[0][bOffset + i] + s_subgroupSums[1][bOffset + i];
+                for (int k = 0; k < i; ++k) sum -= s_L[i][k] * s_y[k];
+                s_y[i] = sum / max(s_L[i][i], 1e-6);
+            }
 
-        // Channel B:
-        float yB[6], wB[6];
-        for (int i = 0; i < 6; ++i) {
-            float sum = bB[i];
-            for (int k = 0; k < i; ++k) sum -= L[i][k] * yB[k];
-            yB[i] = sum / max(L[i][i], 1e-6);
-        }
-        for (int i = 5; i >= 0; --i) {
-            float sum = yB[i];
-            for (int k = i + 1; k < 6; ++k) sum -= L[k][i] * wB[k];
-            wB[i] = sum / max(L[i][i], 1e-6);
-        }
-
-        // Store weights to LDS
-        for (int m = 0; m < 6; ++m) {
-            s_weights[m]          = wR[m];
-            s_weights[6 + m]      = wG[m];
-            s_weights[12 + m]     = wB[m];
+            // Backward solve: L^T * w = y (writes directly into s_weights in LDS)
+            for (int i = 5; i >= 0; --i) {
+                float sum = s_y[i];
+                for (int k = i + 1; k < 6; ++k) sum -= s_L[k][i] * s_weights[wOffset + k];
+                s_weights[wOffset + i] = sum / max(s_L[i][i], 1e-6);
+            }
         }
     }
 
@@ -196,17 +176,26 @@ void main() {
         if (isSky) {
             imageStore(uOutputRadiance, pixelCoord, vec4(C, 1.0));
         } else {
-            vec3 recon = vec3(0.0);
-            for (int m = 0; m < 6; ++m) {
-                recon.r += s_weights[m] * f[m];
-                recon.g += s_weights[6 + m] * f[m];
-                recon.b += s_weights[12 + m] * f[m];
-            }
+            float dNorm2 = dNorm * dNorm;
+            vec3 recon = vec3(
+                s_weights[0]  + s_weights[1]*N.x  + s_weights[2]*N.y  + s_weights[3]*N.z  + s_weights[4]*dNorm  + s_weights[5]*dNorm2,
+                s_weights[6]  + s_weights[7]*N.x  + s_weights[8]*N.y  + s_weights[9]*N.z  + s_weights[10]*dNorm + s_weights[11]*dNorm2,
+                s_weights[12] + s_weights[13]*N.x + s_weights[14]*N.y + s_weights[15]*N.z + s_weights[16]*dNorm + s_weights[17]*dNorm2
+            );
 
             recon = max(vec3(0.0), recon);
             if (isInvalid(recon)) recon = C;
 
-            vec3 finalColor = mix(C, recon, 0.65);
+            // Overlapping block boundary smoothing (FEAT-03)
+            // Taper reconstruction weight near block borders to eliminate discrete 8x8 grid seams
+            float distToEdge = min(
+                min(float(gl_LocalInvocationID.x), float(7u - gl_LocalInvocationID.x)),
+                min(float(gl_LocalInvocationID.y), float(7u - gl_LocalInvocationID.y))
+            );
+            float edgeSmooth = smoothstep(0.0, 2.0, distToEdge);
+            float blendWeight = mix(0.50, 0.70, edgeSmooth);
+
+            vec3 finalColor = mix(C, recon, blendWeight);
             imageStore(uOutputRadiance, pixelCoord, vec4(finalColor, 1.0));
         }
     }

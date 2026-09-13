@@ -21,12 +21,11 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         return;
     }
 
-    m_explicitPreprocess = (getenv("PATHWAYS_DISABLE_DGC_TIER1") == nullptr &&
-                            getenv("PATHWAYS_DISABLE_DGC_PREPROCESS") == nullptr);
+    m_explicitPreprocess = (getenv("PATHWAYS_ENABLE_DGC_PREPROCESS") != nullptr);
     if (!m_explicitPreprocess) {
-        Logger::info("DGC Tier 1 explicit preprocessing disabled. Running DGC baseline (implicit preprocessing, flags = 0).");
+        Logger::info("DGC baseline active (implicit preprocessing, flags = UNORDERED_SEQUENCES).");
     } else {
-        Logger::info("DGC Tier 1 optimizations enabled (explicit preprocessing + unordered sequences).");
+        Logger::info("DGC Tier 1 explicit preprocessing enabled.");
     }
 
     // Modern DGC Token Layout:
@@ -209,9 +208,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
-    genInfo.sequenceCountAddress = sequenceCountAddress;
-
-    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, VK_NULL_HANDLE);
 }
 
 void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex) {
@@ -289,8 +286,10 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
 
 void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
                                          const std::vector<VkPipeline>& secondaryPipelines) {
-    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || primaryPipelines.empty()) {
+    bool enableMaterialDGC = (getenv("PATHWAYS_ENABLE_MATERIAL_DGC") != nullptr);
+    if (!enableMaterialDGC || !m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
+        Logger::info("Material microkernels active via GPU multi-dispatch indirect work-lists (6 specialized pipelines).");
         return;
     }
 
@@ -377,7 +376,7 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
     genInfo.maxSequenceCount = sequenceCount;
     genInfo.sequenceCountAddress = sequenceCountAddress;
 
-    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, VK_NULL_HANDLE);
 }
 
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
@@ -389,7 +388,7 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
 
     VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
 
-    if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet) {
+    if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet || (m_explicitPreprocess && !isPreprocessed)) {
         // Direct multi-dispatch indirect fallback (16 bytes stride per DispatchCommand)
         for (uint32_t k = 0; k < sequenceCount && k < pipelines.size(); ++k) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[k]);

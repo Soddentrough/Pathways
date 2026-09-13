@@ -62,6 +62,7 @@ int main() {
 
     VkDeviceQueueCreateInfo qInfo1 = qInfo0;
     VkDeviceCreateInfo dInfo1 = dInfo0;
+    dInfo1.pQueueCreateInfos = &qInfo1;
     VkDevice dev1 = VK_NULL_HANDLE;
     if (vkCreateDevice(gpus[1], &dInfo1, nullptr, &dev1) != VK_SUCCESS) {
         std::cerr << "Failed to create Device 1 with external_semaphore_fd." << std::endl;

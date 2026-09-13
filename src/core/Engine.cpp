@@ -222,6 +222,13 @@ Engine::Engine(const Config& config) : m_config(config) {
 Engine::~Engine() {
     Logger::info("Shutting down Pathways Engine...");
     stopHwMonThread();
+    if (m_telemetryWorker.joinable()) {
+        m_telemetryWorker.join();
+    }
+    if (m_gamepad) {
+        SDL_CloseGamepad(m_gamepad);
+        m_gamepad = nullptr;
+    }
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
 
@@ -2771,6 +2778,11 @@ bool Engine::handleEvent(const SDL_Event& e) {
 
     // 2. Window-level events: allow ImGui to track focus/cursor, then forward to Window handler
     if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) {
+        if (e.type == SDL_EVENT_WINDOW_MINIMIZED || e.type == SDL_EVENT_WINDOW_OCCLUDED) {
+            m_isMinimized = true;
+        } else if (e.type == SDL_EVENT_WINDOW_RESTORED || e.type == SDL_EVENT_WINDOW_EXPOSED) {
+            m_isMinimized = false;
+        }
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             if (m_cameraMode) {
                 setCameraMode(false);
@@ -2796,7 +2808,7 @@ bool Engine::handleEvent(const SDL_Event& e) {
         return false;
     }
 
-    // 5. ESC key: if in camera mode, return to UI mode; if in UI mode, close window
+    // 5. ESC key: if in camera mode, return to UI mode; if in UI mode, close application
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
         if (m_cameraMode) {
             setCameraMode(false);
@@ -2832,6 +2844,52 @@ bool Engine::handleEvent(const SDL_Event& e) {
             return true;
         }
         return false;
+    }
+
+    // 6. Gamepad Hotplug & Dual-Analog Navigation Events (FEAT-01)
+    if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+        if (!m_gamepad) {
+            m_gamepad = SDL_OpenGamepad(e.gdevice.which);
+            if (m_gamepad) {
+                Logger::info("Gamepad connected: {}", SDL_GetGamepadName(m_gamepad));
+            }
+        }
+        return true;
+    }
+    if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        if (m_gamepad && e.gdevice.which == SDL_GetGamepadID(m_gamepad)) {
+            Logger::info("Gamepad disconnected.");
+            SDL_CloseGamepad(m_gamepad);
+            m_gamepad = nullptr;
+        }
+        return true;
+    }
+    if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+        constexpr float DEADZONE = 0.15f;
+        float val = static_cast<float>(e.gaxis.value) / 32767.0f;
+        if (std::abs(val) < DEADZONE) val = 0.0f;
+
+        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) m_gamepadLeftX = val;
+        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) m_gamepadLeftY = -val;
+        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX) m_gamepadRightX = val;
+        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) m_gamepadRightY = val;
+        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) m_gamepadLeftTrigger = std::max(0.0f, val);
+        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) m_gamepadRightTrigger = std::max(0.0f, val);
+        return true;
+    }
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
+            setCameraMode(!m_cameraMode);
+            return true;
+        }
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) m_gamepadBtnA = true;
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) m_gamepadBtnB = true;
+        return true;
+    }
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) m_gamepadBtnA = false;
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) m_gamepadBtnB = false;
+        return true;
     }
 
     // 5. In UI Mode: route events to ImGui
@@ -2912,7 +2970,21 @@ void Engine::updateInput() {
         }
     }
 
+    // Incorporate analog gamepad sticks & triggers (FEAT-01)
+    forward += m_gamepadLeftY;
+    strafe += m_gamepadLeftX;
+    if (m_gamepadBtnA) vertical += 1.0f;
+    if (m_gamepadBtnB) vertical -= 1.0f;
+    if (m_gamepadRightTrigger > 0.1f) sprint = true;
+    if (m_gamepadLeftTrigger > 0.1f) crawl = true;
+
+    if (std::abs(m_gamepadRightX) > 0.05f || std::abs(m_gamepadRightY) > 0.05f) {
+        constexpr float GAMEPAD_ROT_SPEED = 180.0f; // degrees per second
+        m_camera->processMouseMovement(m_gamepadRightX * GAMEPAD_ROT_SPEED * dt, -m_gamepadRightY * GAMEPAD_ROT_SPEED * dt, ctrl);
+    }
+
     m_camera->processFpsInput(forward, strafe, vertical, dt, sprint, crawl, ctrl);
+    m_camera->update(dt);
 }
 
 void Engine::renderFrame() {
@@ -3888,7 +3960,17 @@ void Engine::renderFrame() {
             tonemapConstants.totalSamples = m_accumulatedSamples;
         }
 
-        tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
+        bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
+        if (isCheckerboard) {
+            MultiGpuMode effectiveMode = m_config.mgpu_mode;
+            if (effectiveMode == MultiGpuMode::Auto) {
+                effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+            }
+            if (effectiveMode == MultiGpuMode::SampleParallel) {
+                isCheckerboard = false;
+            }
+        }
+        tonemapConstants.visualizeSplit = (m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u;
         tonemapConstants.tileSize = m_config.tile_size;
         tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
         tonemapConstants.peakNits = m_config.hdr_peak_nits;
@@ -4882,13 +4964,17 @@ FrameStats Engine::getStats() const {
 std::string Engine::exportTelemetry(const std::string& customPath) {
     std::string path = customPath.empty() ? ImageDumper::generateDefaultTelemetryPath() : customPath;
     FrameStats stats = getStats();
-    if (ImageDumper::saveStatsJSON(path, stats)) {
-        Logger::info("Exported comprehensive telemetry dataset to: {}", path);
-        return path;
-    } else {
-        Logger::error("Failed to export telemetry dataset to: {}", path);
-        return "";
+    if (m_telemetryWorker.joinable()) {
+        m_telemetryWorker.join();
     }
+    m_telemetryWorker = std::thread([path, stats]() {
+        if (ImageDumper::saveStatsJSON(path, stats)) {
+            Logger::info("Exported comprehensive telemetry dataset to: {}", path);
+        } else {
+            Logger::error("Failed to export telemetry dataset to: {}", path);
+        }
+    });
+    return path;
 }
 
 void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate) {
@@ -4921,9 +5007,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_config.hdr_peak_nits = m_window->getDisplayInfo().maxLuminanceNits;
     }
 
-    // 1. Recreate Swapchain (destroy old swapchain first so surface is released)
-    m_swapchain.reset();
-    m_swapchain = std::make_unique<Swapchain>(
+    // 1. Recreate Swapchain (reusing oldSwapchain for smooth compositor transition under Wayland)
+    VkSwapchainKHR oldSwapchainHandle = m_swapchain ? m_swapchain->getSwapchain() : VK_NULL_HANDLE;
+    auto newSwapchain = std::make_unique<Swapchain>(
         device,
         m_context->getPhysicalDevice(),
         m_surface,
@@ -4935,8 +5021,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_context.get(),
         m_window ? &m_window->getDisplayInfo() : nullptr,
         m_config.hdr_peak_nits,
-        m_config.hdr_paper_white_nits
+        m_config.hdr_paper_white_nits,
+        oldSwapchainHandle
     );
+    m_swapchain = std::move(newSwapchain);
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
 
@@ -5245,6 +5333,12 @@ void Engine::run() {
 
     while (!m_window->shouldClose()) {
         m_window->pollEvents();
+
+        // Check if minimized/occluded: throttle render loop to prevent runaway GPU power draw (OPT-04)
+        if (m_isMinimized || (m_window && m_window->isMinimized())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
 
         // Execute pending window resolution / fullscreen actions outside of command buffer recording
         if (m_pendingToggleFullscreen) {

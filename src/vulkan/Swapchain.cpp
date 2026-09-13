@@ -22,7 +22,8 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
                      bool enableHdr, bool isFullscreen,
                      const VulkanContext* context,
                      const DisplayInfo* displayInfo,
-                     float peakNits, float paperWhiteNits)
+                     float peakNits, float paperWhiteNits,
+                     VkSwapchainKHR oldSwapchain)
     : m_device(device), m_context(context) {
 
     VkSurfaceCapabilitiesKHR capabilities;
@@ -190,7 +191,7 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     createInfo.compositeAlpha = compositeAlpha;
     createInfo.presentMode = chosenPresentMode;
     createInfo.clipped = VK_TRUE;
-    createInfo.oldSwapchain = VK_NULL_HANDLE;
+    createInfo.oldSwapchain = oldSwapchain;
 
 #ifdef _WIN32
     VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo{};

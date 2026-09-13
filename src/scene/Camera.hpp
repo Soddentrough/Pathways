@@ -140,6 +140,7 @@ private:
     bool m_adaptiveFov = true;
 
     bool m_moved = true;
+    glm::vec3 m_velocity{ 0.0f };
     mutable glm::mat4 m_prevViewProj{ 1.0f };
     mutable bool m_hasPrevViewProj = false;
 };

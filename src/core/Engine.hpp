@@ -314,6 +314,21 @@ private:
     std::atomic<uint32_t> m_gpu0TempC{0};
     std::atomic<uint32_t> m_gpu1ClockMhz{0};
     std::atomic<uint32_t> m_gpu1TempC{0};
+
+    // State & Asynchronous Workers
+    bool m_isMinimized = false;
+    std::thread m_telemetryWorker;
+
+    // Gamepad Navigation Support (FEAT-01)
+    SDL_Gamepad* m_gamepad = nullptr;
+    float m_gamepadLeftX = 0.0f;
+    float m_gamepadLeftY = 0.0f;
+    float m_gamepadRightX = 0.0f;
+    float m_gamepadRightY = 0.0f;
+    float m_gamepadLeftTrigger = 0.0f;
+    float m_gamepadRightTrigger = 0.0f;
+    bool m_gamepadBtnA = false;
+    bool m_gamepadBtnB = false;
 };
 
 } // namespace pathways

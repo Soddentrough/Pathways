@@ -7,6 +7,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 #include "wavefront_common.glsl"
 
@@ -128,7 +129,9 @@ layout(std430, binding = 22) buffer InOutNRCCounters {
     NRCCountersBuffer nrcCounters;
 };
 
+#if !IS_SECONDARY_BOUNCE
 #include "wavefront_shadow_inline.glsl"
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -162,11 +165,6 @@ void main() {
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
-    bool doInlineShadow = false;
-    vec3 inlineShadowOrigin = vec3(0.0);
-    vec3 inlineShadowDir = vec3(0.0);
-    float inlineShadowDist = 0.0;
-    vec3 inlineShadowUnshadowed = vec3(0.0);
 
     if (inRange) {
         uint rayIdx = materialIndices[0u * pc.maxQueueCapacity + idx];
@@ -185,7 +183,7 @@ void main() {
         uint primId = floatBitsToUint(hit.hitData1.z);
         uint hitType = floatBitsToUint(hit.hitData1.w);
 
-        vec3 throughput = state.throughputSeed.rgb;
+        f16vec3 throughput = f16vec3(state.throughputSeed.rgb);
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
         uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
@@ -201,7 +199,7 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            accumRadiance += throughput * skyColor;
+            accumRadiance += vec3(throughput) * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
@@ -234,10 +232,10 @@ void main() {
                 emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
             }
             if (length(emissive) > 1e-3) {
-                accumRadiance += throughput * emissive;
+                accumRadiance += vec3(throughput) * emissive;
             }
 
-            vec3 diffuseColor = baseColor.rgb;
+            f16vec3 diffuseColor = f16vec3(baseColor.rgb);
 
             float roughness = mat.roughness;
             if (mat.mrTex > 0u && mat.mrTex <= 512u) {
@@ -249,13 +247,13 @@ void main() {
             float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
             float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
 #if IS_SECONDARY_BOUNCE
-            vec3 F0 = vec3(clamp(f0Dielectric * mat.specularFactor, 0.0, 1.0));
+            f16vec3 F0 = f16vec3(clamp(f0Dielectric * mat.specularFactor, 0.0, 1.0));
 #else
             float specFactor = mat.specularFactor;
             if (mat.specularTex > 0u && mat.specularTex <= 512u) {
                 specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
             }
-            vec3 F0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
+            f16vec3 F0 = f16vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
 #endif
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
@@ -268,12 +266,11 @@ void main() {
             }
 
             vec3 V = -rayDir;
-            vec3 secDirectL = vec3(0.0);
+            f16vec3 secDirectL = f16vec3(0.0);
 
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Pure Lambertian Diffuse) ---
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
-                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
                 SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
@@ -314,29 +311,22 @@ void main() {
 
                 float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
                 if (validLight && NdotL > 0.0) {
-                    vec3 diffBrdf = diffuseColor * INV_PI;
+                    f16vec3 diffBrdf = diffuseColor * float16_t(INV_PI);
                     float lightPdfEff = max(lightPdf * lightSelectPdf, 1e-6);
                     float diffPdf = NdotL * INV_PI;
                     float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + diffPdf)) : 1.0;
 
-                    secDirectL = diffBrdf * lightEmission * (NdotL / lightPdfEff) * misWeight;
-                    vec3 unshadowed = throughput * secDirectL;
+                    float factor = (NdotL / lightPdfEff) * misWeight;
+                    secDirectL = diffBrdf * (f16vec3(lightEmission) * float16_t(factor));
+                    f16vec3 unshadowed = throughput * secDirectL;
 
-                    if (length(unshadowed) > 1e-5) {
+                    if (length(unshadowed) > float16_t(1e-5)) {
                         if (enableShadows) {
-                            if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                doInlineShadow = true;
-                                inlineShadowOrigin = hitPoint + hitNormal * EPSILON;
-                                inlineShadowDir = lightDir;
-                                inlineShadowDist = lightDist;
-                                inlineShadowUnshadowed = unshadowed;
-                            } else {
-                                hasShadowRay = true;
-                                shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
-                            }
+                            hasShadowRay = true;
+                            shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                            shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 0.0)));
                         } else {
-                            accumRadiance += unshadowed;
+                            accumRadiance += vec3(unshadowed);
                         }
                     }
                 }
@@ -358,8 +348,8 @@ void main() {
                 float totalWeightSum = 0.0;
                 bool hasCandidate = false;
 
-                // Fast proxy luminance weight for RIS candidate selection:
-                vec3 proxyLumWeight = max(diffuseColor + F0, vec3(0.04)) * vec3(0.2126, 0.7152, 0.0722);
+                // Fast proxy luminance weight for RIS candidate selection (Packed FP16):
+                f16vec3 proxyLumWeight = max(diffuseColor + F0, f16vec3(0.04)) * f16vec3(0.2126, 0.7152, 0.0722);
 
                 for (uint c = 0u; c < M; ++c) {
                     uint lightIdx = 0u;
@@ -410,7 +400,7 @@ void main() {
 
                     float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
                     if (validLightSample && NdotL > 0.0) {
-                        float target = max(dot(lightEmission, proxyLumWeight) * NdotL, 1e-6);
+                        float target = max(float(dot(f16vec3(lightEmission), proxyLumWeight)) * NdotL, 1e-6);
                         float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                         float weight = target / sourcePdf;
 
@@ -436,17 +426,17 @@ void main() {
                         float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                         float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
-                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
                         float D = distributionGGX(NdotH, alphaRoughness);
                         float Vis = visibilitySmithGGXCorrelated(selectedNdotL, NdotV, alphaRoughness);
-                        vec3 specBrdf = D * Vis * F;
+                        f16vec3 specBrdf = float16_t(D * Vis) * F;
 
-                        vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
-                        vec3 combinedBrdf = diffBrdf + specBrdf;
+                        f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI));
+                        f16vec3 combinedBrdf = diffBrdf + specBrdf;
 
                         float diffPdf = selectedNdotL * INV_PI;
                         float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                        float specProb = clamp(dot(F, vec3(0.3333)), 0.05, 0.95);
+                        float specProb = clamp(float(dot(F, f16vec3(0.3333))), 0.05, 0.95);
                         float bsdfPdf = (1.0 - specProb) * diffPdf + specProb * specPdf;
 
                         float misWeight = 1.0;
@@ -457,25 +447,27 @@ void main() {
                         }
 
                         float risWeight = totalWeightSum / (float(M) * selectedTarget);
-                        vec3 contrib = combinedBrdf * selectedLightEmission * selectedNdotL * misWeight;
-                        secDirectL = contrib * risWeight;
-                        vec3 unshadowed = throughput * secDirectL;
+                        float factor = selectedNdotL * misWeight * risWeight;
+                        secDirectL = combinedBrdf * (f16vec3(selectedLightEmission) * float16_t(factor));
+                        f16vec3 unshadowed = throughput * secDirectL;
 
-                        if (length(unshadowed) > 1e-5) {
+                        if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
                                 if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                    doInlineShadow = true;
-                                    inlineShadowOrigin = hitPoint + hitNormal * EPSILON;
-                                    inlineShadowDir = selectedLightDir;
-                                    inlineShadowDist = selectedLightDist;
-                                    inlineShadowUnshadowed = unshadowed;
+                                    bool occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
+                                                                         (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                    if (!occluded) {
+                                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                    }
                                 } else {
                                     hasShadowRay = true;
                                     shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 0.0)));
                                 }
                             } else {
-                                accumRadiance += unshadowed;
+                                accumRadiance += vec3(unshadowed);
                             }
                         }
                     }
@@ -495,9 +487,9 @@ void main() {
                             nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
                             nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
                             nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcTrainRecords[trainIdx].albedo_pad = vec4(diffuseColor, 0.0);
-                            nrcTrainRecords[trainIdx].throughput = vec4(throughput, 0.0);
-                            nrcTrainRecords[trainIdx].targetRadiance = vec4(secDirectL, 0.0);
+                            nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
+                            nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput), 0.0);
+                            nrcTrainRecords[trainIdx].targetRadiance = vec4(vec3(secDirectL), 0.0);
                         }
                     } else {
                         uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
@@ -505,17 +497,20 @@ void main() {
                             nrcQueries[qIdx].pos_roughness = vec4(hitPoint, roughness);
                             nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
                             nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcQueries[qIdx].albedo_pad = vec4(diffuseColor, 0.0);
-                            nrcQueries[qIdx].throughput = vec4(throughput, 0.0);
+                            nrcQueries[qIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
+                            nrcQueries[qIdx].throughput = vec4(vec3(throughput), 0.0);
+                            pathTerminated = true;
+                        } else {
+                            // Queue capacity exceeded: do NOT drop ray silently (CRIT-04). Continue standard bounce.
+                            pathTerminated = false;
                         }
-                        pathTerminated = true;
                     }
                 }
 
                 if (!pathTerminated) {
                     float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
-                    vec3 Fview = fresnelSchlickVec(NdotV, F0);
-                    float specProb = clamp(dot(Fview, vec3(0.3333)), 0.05, 0.95);
+                    f16vec3 Fview = fresnelSchlickVec(float16_t(NdotV), F0);
+                    float specProb = clamp(float(dot(Fview, f16vec3(0.3333))), 0.05, 0.95);
 
                     nextDirection = vec3(0.0);
                     vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
@@ -534,9 +529,10 @@ void main() {
                         float NdotL = dot(hitNormal, nextDirection);
                         if (NdotL > 0.0) {
                             float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                            vec3 F = fresnelSchlickVec(VdotH, F0);
+                            f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
                             float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                            throughput *= (F * (4.0 * VdotH * Vis * NdotL)) / specProb;
+                            float scale = (4.0 * VdotH * Vis * NdotL) / specProb;
+                            throughput *= F * float16_t(scale);
                             validBounce = true;
                         }
                     } else {
@@ -544,8 +540,9 @@ void main() {
                         nextDirection = sampleCosineHemisphere(hitNormal, seed);
                         vec3 H = normalize(V + nextDirection);
                         float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                        vec3 F = fresnelSchlickVec(VdotH, F0);
-                        throughput *= ((vec3(1.0) - F) * diffuseColor) / (1.0 - specProb);
+                        f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
+                        float invDiffProb = 1.0 / (1.0 - specProb);
+                        throughput *= (f16vec3(1.0) - F) * (diffuseColor * float16_t(invDiffProb));
                         validBounce = true;
                     }
 #endif
@@ -553,7 +550,7 @@ void main() {
                     if (!validBounce) {
                         pathTerminated = true;
                     } else {
-                        float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                        float pathLum = float(dot(throughput * float16_t(max(ubo.spp, 1u)), f16vec3(0.2126, 0.7152, 0.0722)));
                         if (pathLum < 0.001) {
                             pathTerminated = true;
                         } else if (bounce >= 1u) {
@@ -566,14 +563,14 @@ void main() {
                             if (randFloat(seed) > p) {
                                 pathTerminated = true;
                             } else {
-                                throughput /= p;
+                                throughput /= float16_t(p);
                             }
                         }
 
                         if (!pathTerminated) {
                             survivesToNext = true;
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                            nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
+                            nextState.throughputSeed = vec4(vec3(throughput), uintBitsToFloat(seed));
                             nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
                         }
                     }
@@ -585,63 +582,53 @@ void main() {
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
             }
+        }
+    }
 
-            if (doInlineShadow) {
-                bool occluded = traceShadowRayInline(inlineShadowOrigin, inlineShadowDir, inlineShadowDist,
-                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                if (!occluded) {
-                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, inlineShadowUnshadowed, seed), 0.0));
-                }
-            }
+    // Standard single-queue linear compaction for ray geometry and state
+    uvec4 ballot = subgroupBallot(survivesToNext);
+    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+    uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+    uint waveGlobalOffset = 0u;
+    if (subgroupElect()) {
+        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+    }
+    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+    uint targetIdx = waveGlobalOffset + laneSlot;
+    if (survivesToNext) {
+        if (targetIdx < pc.maxQueueCapacity) {
+            outGeoms[targetIdx] = nextGeom;
+            outStates[targetIdx] = nextState;
         }
     }
 
     if (pc.secondarySortMode == 1u) {
-        // Producer-Side Binning: Partition rays directly into 8 directional octant sub-queues
-        // Zero indirection buffer, contiguous sequential memory layout for downstream traversal
+        // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
-        uint activeMask = activeBallot.x;
-        while (activeMask != 0u) {
-            uint leaderLane = findLSB(activeMask);
-            uint k = subgroupBroadcast(oct, leaderLane);
-            bool isOct = survivesToNext && (oct == k);
-            uvec4 octBallot = subgroupBallot(isOct);
-            uint octCount = subgroupBallotBitCount(octBallot);
-            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-            uint octBase = 0u;
-            if (gl_SubgroupInvocationID == leaderLane) {
-                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-            }
-            octBase = subgroupBroadcast(octBase, leaderLane);
-            if (isOct) {
-                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                if (octBase + octSlot < pc.maxQueueCapacity) {
-                    outGeoms[dest] = nextGeom;
-                    outStates[dest] = nextState;
+        for (uint w = 0u; w < 2u; ++w) {
+            uint activeMask = (w == 0u) ? activeBallot.x : activeBallot.y;
+            while (activeMask != 0u) {
+                uint leaderLane = w * 32u + findLSB(activeMask);
+                uint k = subgroupBroadcast(oct, leaderLane);
+                bool isOct = survivesToNext && (oct == k);
+                uvec4 octBallot = subgroupBallot(isOct);
+                uint octCount = subgroupBallotBitCount(octBallot);
+                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+                uint octBase = 0u;
+                if (gl_SubgroupInvocationID == leaderLane) {
+                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
                 }
-            }
-            activeMask &= ~octBallot.x;
-        }
-    } else {
-        // Standard single-queue linear compaction (for secondarySortMode == 0: None, or 2: Spatial Index)
-        uvec4 ballot = subgroupBallot(survivesToNext);
-        uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-        uint waveActiveCount = subgroupBallotBitCount(ballot);
-
-        uint waveGlobalOffset = 0u;
-        if (subgroupElect()) {
-            waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
-        }
-        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
-
-        if (survivesToNext) {
-            uint targetIdx = waveGlobalOffset + laneSlot;
-            if (targetIdx < pc.maxQueueCapacity) {
-                outGeoms[targetIdx] = nextGeom;
-                outStates[targetIdx] = nextState;
+                octBase = subgroupBroadcast(octBase, leaderLane);
+                if (isOct) {
+                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                    if (octBase + octSlot < pc.maxQueueCapacity) {
+                        secondaryIndices[dest] = targetIdx;
+                    }
+                }
+                activeMask &= ~((w == 0u) ? octBallot.x : octBallot.y);
             }
         }
     }

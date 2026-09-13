@@ -25,7 +25,7 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadeDiffuseSecCode,
                                      const std::vector<char>& shadeComplexSecCode)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize),
-      m_supportsExecutionSet(supportsExecutionSet && (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr)) {
+      m_supportsExecutionSet(supportsExecutionSet) {
 
     if (m_tileSize > 0) {
         m_maxCapacity = std::min(m_tileSize * m_tileSize, m_width * m_height);
@@ -181,70 +181,69 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
                                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
-    // Producer-Side Binning (Directional DGC) reserves 8 dedicated octant sub-queues
-    constexpr uint32_t QUEUE_OCTANT_MULTIPLIER = 8;
-
+    // Sized to screen capacity without static 8x multiplier
     // RayGeometry = 16 bytes (packed originPackedDir)
-    VkDeviceSize geomQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 16;
-    m_rayGeomQueueA = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    m_rayGeomQueueB = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    VkDeviceSize geomQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
 
     // RayState = 32 bytes
-    VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 32;
-    m_rayStateQueueA = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    m_rayStateQueueB = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
 
     // RayHit = 32 bytes (pre-interpolated normal, UV, tangent, material)
-    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * QUEUE_OCTANT_MULTIPLIER * 32;
-    m_rayHitQueue = std::make_unique<Buffer>(m_allocator, hitQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
 
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
     VkDeviceSize shadowQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
-    m_shadowQueue = std::make_unique<Buffer>(m_allocator, shadowQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // MaterialIndexQueue = 6 archetypes * 4 bytes * maxCapacity (Index-Based Material Queues)
     VkDeviceSize matIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 6 * sizeof(uint32_t);
-    m_materialIndexQueue = std::make_unique<Buffer>(m_allocator, matIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // SecondaryIndexQueue = 8 octants * 4 bytes * maxCapacity (for Mode 1 directional binning & Mode 2 spatial sort)
     VkDeviceSize secIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 8 * sizeof(uint32_t);
-    m_secondaryIndexQueue = std::make_unique<Buffer>(m_allocator, secIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // QueueCounters = 256 bytes (supports unified QueueCountersBuffer struct)
-    m_queueCounters = std::make_unique<Buffer>(m_allocator, 256, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-    void* pCounters = m_queueCounters->map();
-    if (pCounters) {
-        std::memset(pCounters, 0, 256);
-        m_queueCounters->unmap();
-    }
-
-    // IndirectArgs = 65536 bytes (supports up to 256 bounces * 16 dispatches * 16 bytes) - double-buffered per frame slot
+    // Double-buffered queues per in-flight frame slot
     for (uint32_t slot = 0; slot < 2; ++slot) {
+        m_rayGeomQueueA[slot] = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_rayGeomQueueB[slot] = std::make_unique<Buffer>(m_allocator, geomQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_rayStateQueueA[slot] = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_rayStateQueueB[slot] = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_rayHitQueue[slot] = std::make_unique<Buffer>(m_allocator, hitQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_shadowQueue[slot] = std::make_unique<Buffer>(m_allocator, shadowQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_materialIndexQueue[slot] = std::make_unique<Buffer>(m_allocator, matIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_secondaryIndexQueue[slot] = std::make_unique<Buffer>(m_allocator, secIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        // QueueCounters = 256 bytes (supports unified QueueCountersBuffer struct)
+        m_queueCounters[slot] = std::make_unique<Buffer>(m_allocator, 256, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+        void* pCounters = m_queueCounters[slot]->map();
+        if (pCounters) {
+            std::memset(pCounters, 0, 256);
+            m_queueCounters[slot]->unmap();
+        }
+
+        // IndirectArgs = 65536 bytes (supports up to 256 bounces * 16 dispatches * 16 bytes)
         m_indirectArgs[slot] = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
         void* pIndirect = m_indirectArgs[slot]->map();
         if (pIndirect) {
             std::memset(pIndirect, 0, 65536);
             m_indirectArgs[slot]->unmap();
         }
-    }
 
-    // DGCStream = 65536 bytes
-    m_dgcStream = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        // DGCStream = 65536 bytes
+        m_dgcStream[slot] = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    }
 }
 
 void WavefrontPipeline::updateQueueDescriptors() {
-    VkDescriptorBufferInfo stateAInfo{ m_rayStateQueueA->getBuffer(), 0, m_rayStateQueueA->getSize() };
-    VkDescriptorBufferInfo stateBInfo{ m_rayStateQueueB->getBuffer(), 0, m_rayStateQueueB->getSize() };
-    VkDescriptorBufferInfo geomAInfo{ m_rayGeomQueueA->getBuffer(), 0, m_rayGeomQueueA->getSize() };
-    VkDescriptorBufferInfo geomBInfo{ m_rayGeomQueueB->getBuffer(), 0, m_rayGeomQueueB->getSize() };
-    VkDescriptorBufferInfo hitInfo{ m_rayHitQueue->getBuffer(), 0, m_rayHitQueue->getSize() };
-    VkDescriptorBufferInfo matIndexInfo{ m_materialIndexQueue->getBuffer(), 0, m_materialIndexQueue->getSize() };
-    VkDescriptorBufferInfo secIndexInfo{ m_secondaryIndexQueue->getBuffer(), 0, m_secondaryIndexQueue->getSize() };
-    VkDescriptorBufferInfo countersInfo{ m_queueCounters->getBuffer(), 0, m_queueCounters->getSize() };
-    VkDescriptorBufferInfo shadowQueueInfo{ m_shadowQueue->getBuffer(), 0, m_shadowQueue->getSize() };
-    VkDescriptorBufferInfo dgcStreamInfo{ m_dgcStream->getBuffer(), 0, m_dgcStream->getSize() };
-
     for (uint32_t slot = 0; slot < 2; ++slot) {
+        VkDescriptorBufferInfo stateAInfo{ m_rayStateQueueA[slot]->getBuffer(), 0, m_rayStateQueueA[slot]->getSize() };
+        VkDescriptorBufferInfo stateBInfo{ m_rayStateQueueB[slot]->getBuffer(), 0, m_rayStateQueueB[slot]->getSize() };
+        VkDescriptorBufferInfo geomAInfo{ m_rayGeomQueueA[slot]->getBuffer(), 0, m_rayGeomQueueA[slot]->getSize() };
+        VkDescriptorBufferInfo geomBInfo{ m_rayGeomQueueB[slot]->getBuffer(), 0, m_rayGeomQueueB[slot]->getSize() };
+        VkDescriptorBufferInfo hitInfo{ m_rayHitQueue[slot]->getBuffer(), 0, m_rayHitQueue[slot]->getSize() };
+        VkDescriptorBufferInfo matIndexInfo{ m_materialIndexQueue[slot]->getBuffer(), 0, m_materialIndexQueue[slot]->getSize() };
+        VkDescriptorBufferInfo secIndexInfo{ m_secondaryIndexQueue[slot]->getBuffer(), 0, m_secondaryIndexQueue[slot]->getSize() };
+        VkDescriptorBufferInfo countersInfo{ m_queueCounters[slot]->getBuffer(), 0, m_queueCounters[slot]->getSize() };
+        VkDescriptorBufferInfo shadowQueueInfo{ m_shadowQueue[slot]->getBuffer(), 0, m_shadowQueue[slot]->getSize() };
+        VkDescriptorBufferInfo dgcStreamInfo{ m_dgcStream[slot]->getBuffer(), 0, m_dgcStream[slot]->getSize() };
         VkDescriptorBufferInfo indirectInfo{ m_indirectArgs[slot]->getBuffer(), 0, m_indirectArgs[slot]->getSize() };
 
         // Even sets: InState = A, OutState = B, InGeom = A, OutGeom = B, Hit = Hit, MatIdx = MatIdx, SecIdx = SecIdx
@@ -309,9 +308,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorBufferInfo matInfo{ matBuffer, 0, matSize };
     VkDescriptorBufferInfo lightInfo{ lightBuffer, 0, lightSize };
 
-    VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_queueCounters->getBuffer();
-    VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_queueCounters->getBuffer();
-    VkBuffer actualNrcCounters = (nrcCountersBuffer != VK_NULL_HANDLE) ? nrcCountersBuffer : m_queueCounters->getBuffer();
+    VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualNrcCounters = (nrcCountersBuffer != VK_NULL_HANDLE) ? nrcCountersBuffer : m_queueCounters[frameSlot]->getBuffer();
 
     VkDescriptorBufferInfo nrcQueryInfo{ actualNrcQuery, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo nrcTrainInfo{ actualNrcTrain, 0, VK_WHOLE_SIZE };
@@ -481,11 +480,6 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
 
     // Initialize DGCManager with Execution Set support flag:
     // [0] classify, [1] intersect, [2] shade, [3] shadow
-    // Note: Mesa RADV currently requires multi-dispatch fallback for compute execution sets;
-    // can be explicitly enabled via PATHWAYS_ENABLE_DGC_EXECSET=1 or --dgc-execset.
-    if (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr) {
-        m_supportsExecutionSet = true;
-    }
     m_dgcManager = std::make_unique<DGCManager>(m_device, m_allocator, m_pipelineLayout, m_supportsExecutionSet);
     m_dgcManager->initExecutionSet({
         m_classifyPipeline,
@@ -557,23 +551,23 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     uint32_t numTilesY = (ts > 0) ? (height + ts - 1) / ts : 1;
 
     vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(cmd, m_dgcStream->getBuffer(), 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(cmd, m_queueCounters->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, m_dgcStream[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, m_queueCounters[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
     std::vector<VkBufferMemoryBarrier2> clearBarriers = {
         makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
-        makeBufferBarrier2(m_dgcStream->getBuffer(),
+        makeBufferBarrier2(m_dgcStream[frameSlot]->getBuffer(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
-        makeBufferBarrier2(m_queueCounters->getBuffer(),
+        makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
     };
-    if (sceneData.secondarySortMode != 0 && m_secondaryIndexQueue) {
-        vkCmdFillBuffer(cmd, m_secondaryIndexQueue->getBuffer(), static_cast<VkDeviceSize>(m_maxCapacity) * sizeof(uint32_t), 1024 * sizeof(uint32_t), 0);
-        clearBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+    if (sceneData.secondarySortMode != 0 && m_secondaryIndexQueue[frameSlot]) {
+        vkCmdFillBuffer(cmd, m_secondaryIndexQueue[frameSlot]->getBuffer(), static_cast<VkDeviceSize>(m_maxCapacity) * sizeof(uint32_t), 1024 * sizeof(uint32_t), 0);
+        clearBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
     }
@@ -630,25 +624,25 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                    makeBufferBarrier2(m_dgcStream->getBuffer(),
+                    makeBufferBarrier2(m_dgcStream[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT),
-                    makeBufferBarrier2(m_queueCounters->getBuffer(),
+                    makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
-                    makeBufferBarrier2(m_rayGeomQueueA->getBuffer(),
+                    makeBufferBarrier2(m_rayGeomQueueA[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                    makeBufferBarrier2(m_rayStateQueueA->getBuffer(),
+                    makeBufferBarrier2(m_rayStateQueueA[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                    makeBufferBarrier2(m_rayHitQueue->getBuffer(),
+                    makeBufferBarrier2(m_rayHitQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                    makeBufferBarrier2(m_materialIndexQueue->getBuffer(),
+                    makeBufferBarrier2(m_materialIndexQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT),
-                    makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                    makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
                 };
@@ -701,11 +695,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                         uint32_t sliceIdx = DGCManager::getSliceIndex(frameSlot, b);
-                        VkDeviceAddress seqCountAddr = m_queueCounters ? (m_queueCounters->getDeviceAddress(m_device) + 172) : 0;
+                        VkDeviceAddress seqCountAddr = 0;
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
                             m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr, isSecondary);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr, isSecondary);
                         } else {
                             m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr, isSecondary);
                         }
@@ -718,8 +712,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
 
                     // Barrier: Shade -> Downstream (Shadow & Intersect indirect dispatches, scoped buffer barriers)
-                    Buffer* currentOutGeom = (b % 2 == 0) ? m_rayGeomQueueB.get() : m_rayGeomQueueA.get();
-                    Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB.get() : m_rayStateQueueA.get();
+                    Buffer* currentOutGeom = (b % 2 == 0) ? m_rayGeomQueueB[frameSlot].get() : m_rayGeomQueueA[frameSlot].get();
+                    Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB[frameSlot].get() : m_rayStateQueueA[frameSlot].get();
 
                     std::vector<VkBufferMemoryBarrier2> s2dBarriers;
                     s2dBarriers.reserve(7);
@@ -727,10 +721,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
                         VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT));
-                    s2dBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
+                    s2dBarriers.push_back(makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
-                    s2dBarriers.push_back(makeBufferBarrier2(m_shadowQueue->getBuffer(),
+                    s2dBarriers.push_back(makeBufferBarrier2(m_shadowQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
                     s2dBarriers.push_back(makeBufferBarrier2(currentOutGeom->getBuffer(),
@@ -740,7 +734,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
                     if (sceneData.secondarySortMode != 0) {
-                        s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                        s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
                     }
@@ -852,7 +846,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
 
                                 // Barrier Pass 0 -> Pass 1
-                                VkBufferMemoryBarrier2 p0ToP1 = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                VkBufferMemoryBarrier2 p0ToP1 = makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
                                 VkDependencyInfo dep01{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -869,7 +863,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                 vkCmdDispatch(cmd, 1, 1, 1);
 
                                 // Barrier Pass 1 -> Pass 2
-                                VkBufferMemoryBarrier2 p1ToP2 = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                VkBufferMemoryBarrier2 p1ToP2 = makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
                                 VkDependencyInfo dep12{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -886,7 +880,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
 
                                 // Barrier Pass 2 -> Intersect
-                                VkBufferMemoryBarrier2 p2ToInt = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                VkBufferMemoryBarrier2 p2ToInt = makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
                                 VkDependencyInfo dep2Int{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -921,16 +915,16 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
                             VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
-                        d2sBarriers.push_back(makeBufferBarrier2(m_dgcStream->getBuffer(),
+                        d2sBarriers.push_back(makeBufferBarrier2(m_dgcStream[frameSlot]->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
-                        d2sBarriers.push_back(makeBufferBarrier2(m_queueCounters->getBuffer(),
+                        d2sBarriers.push_back(makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
-                        d2sBarriers.push_back(makeBufferBarrier2(m_rayHitQueue->getBuffer(),
+                        d2sBarriers.push_back(makeBufferBarrier2(m_rayHitQueue[frameSlot]->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
-                        d2sBarriers.push_back(makeBufferBarrier2(m_materialIndexQueue->getBuffer(),
+                        d2sBarriers.push_back(makeBufferBarrier2(m_materialIndexQueue[frameSlot]->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
 
@@ -1043,6 +1037,7 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
             bp.passCount = matDispatches[b].passCount;
             bp.activeCount = bp.diffCount + bp.dielCount + bp.condCount + bp.compCount + bp.emisCount + bp.passCount;
             bp.shadowCount = matDispatches[b].shadowCount;
+
             if (m_secondarySortMode == 1) {
                 uint32_t totalOct = 0;
                 for (int k = 0; k < 8; ++k) totalOct += matDispatches[b].octants[k].count;

@@ -2,9 +2,9 @@
 
 ## 1. Dynamic Quality Governor & Target Frame Rate Limiter (Adaptive SPP)
 
-- **Status:** Proposed / Backlog
+- **Status:** Complete (Implemented in `src/core/QualityGovernor.hpp/cpp`)
 - **Target Hardware:** Dual AMD Radeon AI PRO R9700 (gfx1201 / RDNA 4), single-GPU fallback
-- **Priority:** Medium-High (High visual impact during interactive navigation)
+- **Priority:** High (Fully operational in production)
 
 ---
 
@@ -28,12 +28,6 @@ At a target frame rate of $60\text{ FPS}$ ($\Delta t_{\text{frame}} = 16.667\tex
 - **Available Ray Tracing Budget:** $\Delta t_{\text{RT\_budget}} \approx 15.0\text{ ms} - 15.5\text{ ms}$.
 
 Empirical headroom on Dual RDNA 4 GPUs at 4K Native:
-- `DamagedHelmet` (baseline ~1.13 ms): **12–14 SPP** feasible within 15.5 ms (~3.6x noise reduction).
-- `DragonAttenuation` (baseline ~4.10 ms): **3–4 SPP** feasible within 15.5 ms (~2.0x noise reduction).
-- `living-room` (baseline ~6.01 ms): **2–3 SPP** feasible within 15.5 ms (~1.5x–1.7x noise reduction).
-
----
-
 ### 1.3 Architectural Design & Components
 
 ```
@@ -93,25 +87,25 @@ In `MultiGpuMode::SampleParallel`, the governor can distribute samples asymmetri
 
 ### 1.4 Implementation Checklist
 
-- [ ] **1. Configuration & CLI Parameters (`Config.hpp`, `Config.cpp`):**
+- [x] **1. Configuration & CLI Parameters (`Config.hpp`, `Config.cpp`):**
   - Add `uint32_t target_fps = 0` (0 = uncapped, default: 0 or 60).
   - Add `bool adaptive_spp = false`.
   - Add `uint32_t min_spp = 1`, `uint32_t max_spp = 16`.
   - CLI flags: `--target-fps <int>`, `--adaptive-spp`, `--min-spp <int>`, `--max-spp <int>`.
-- [ ] **2. Dynamic Quality Governor Class (`core/QualityGovernor.hpp` / `Engine.cpp`):**
+- [x] **2. Dynamic Quality Governor Class (`core/QualityGovernor.hpp` / `Engine.cpp`):**
   - Maintain timestamp history and EMA calculation.
   - Implement hysteresis, upgrade/downgrade guard bands, and cooldown timers.
   - Expose current target SPP, current bounce limit, and predicted headroom percentage.
-- [ ] **3. Frame Pacing Engine (`Engine.cpp`):**
+- [x] **3. Frame Pacing Engine (`Engine.cpp`):**
   - Implement high-resolution frame sleep / pacing timer before command submit or swapchain present to guarantee rock-solid frame times when the GPU finishes early.
-- [ ] **4. Multi-GPU Sample Parallel Balancing (`MultiGpuManager.cpp`):**
+- [x] **4. Multi-GPU Sample Parallel Balancing (`MultiGpuManager.cpp`):**
   - Handle asymmetric SPP splits (`(spp + 1) / 2` and `spp / 2`) dynamically.
-- [ ] **5. UI Controls & Telemetry (`GuiManager.cpp`):**
+- [x] **5. UI Controls & Telemetry (`GuiManager.cpp`):**
   - Add "Dynamic Quality Governor" section in Dear ImGui:
     - Target FPS slider (30, 60, 90, 120, 144, Uncapped).
     - Adaptive SPP toggle.
     - Live readout: `Target: 60 FPS | Dynamic SPP: 3 | Bounces: 6 | RT Time: 13.2 ms | Headroom: 15%`.
-- [ ] **6. Validation & Regression Testing:**
+- [x] **6. Validation & Regression Testing:**
   - Verify zero memory leaks or descriptor churn.
   - Verify stability across camera movements and scene switches (`scripts/run_headless_tests.sh`).
 

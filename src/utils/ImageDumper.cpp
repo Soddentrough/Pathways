@@ -202,7 +202,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"timestamp_iso8601\": \"{}\",\n", timeBuf)
         << std::format("    \"timestamp_unix\": {},\n", static_cast<uint64_t>(now_c))
         << "    \"application\": \"Pathways Pure Vulkan 1.4 Path Tracer\",\n"
-        << "    \"engine_version\": \"1.18.0\"\n"
+        << std::format("    \"engine_version\": \"{}\"\n", PATHWAYS_VERSION_STRING)
         << "  },\n"
         << "  \"platform\": {\n"
         << std::format("    \"os\": \"{}\",\n", stats.os_name)
@@ -332,7 +332,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"num_materials\": {},\n", stats.num_materials)
         << std::format("      \"num_lights\": {},\n", stats.num_lights)
         << std::format("      \"num_textures\": {},\n", stats.num_textures)
-        << std::format("      \"hdri_path\": \"{}\"\n", stats.hdri_path)
+        << std::format("      \"hdri_path\": \"{}\"\n", safeHdriPath)
         << "    },\n"
         << "    \"camera\": {\n"
         << std::format("      \"position\": [{:.3f}, {:.3f}, {:.3f}],\n", stats.cam_pos[0], stats.cam_pos[1], stats.cam_pos[2])

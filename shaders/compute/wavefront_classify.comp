@@ -440,6 +440,9 @@ void main() {
                 if (totalShadeWgs == 0u) {
                     indirect.commands[6].x = 0u;
                     indirect.commands[7].x = 0u;
+                    for (uint c = 0u; c < 6u; ++c) {
+                        dgcStream.commands[c].x = 0u;
+                    }
                 }
 
                 queueCounters.diffuseCount = 0u;

@@ -11,7 +11,7 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 // Dual shared memory buffers for ping-ponging 16 queries x 64 features (2 KB each)
 shared float16_t s_layer0[16 * 64];
 shared float16_t s_layer1[16 * 64];
-shared float s_output[16 * 16];
+shared float16_t s_output[16 * 16];
 
 shared vec3 s_throughput[16];
 shared uint s_pixelIndex[16];
@@ -128,8 +128,8 @@ void main() {
     // 3. LAYER 0: 64 -> 64 WMMA
     // ==========================================
     for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
-        c0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
+        c0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
         for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
@@ -144,9 +144,9 @@ void main() {
         // LeakyReLU activation + store directly to s_layer1
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
         for (int i = 0; i < c0.length(); ++i) {
-            float v = c0[i];
-            v = (v > 0.0) ? v : (0.01 * v);
-            outTile[i] = float16_t(v);
+            float16_t v = c0[i];
+            v = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+            outTile[i] = v;
         }
         coopMatStore(outTile, s_layer1, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
@@ -156,8 +156,8 @@ void main() {
     // 4. LAYER 1: 64 -> 64 WMMA
     // ==========================================
     for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
-        c1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
+        c1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
         for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
@@ -172,9 +172,9 @@ void main() {
         // LeakyReLU activation + store directly back to s_layer0
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
         for (int i = 0; i < c1.length(); ++i) {
-            float v = c1[i];
-            v = (v > 0.0) ? v : (0.01 * v);
-            outTile[i] = float16_t(v);
+            float16_t v = c1[i];
+            v = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+            outTile[i] = v;
         }
         coopMatStore(outTile, s_layer0, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
@@ -183,8 +183,8 @@ void main() {
     // ==========================================
     // 5. LAYER 2: 64 -> 16 WMMA (Output layer)
     // ==========================================
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2;
-    c2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2;
+    c2 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
     for (uint k = 0u; k < 4u; ++k) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
@@ -203,7 +203,7 @@ void main() {
 
     // 6. Write final predicted radiance directly to uAccumImage
     if (tid < 16u && s_valid[tid]) {
-        vec3 predRadiance = max(vec3(0.0), vec3(s_output[tid * 16u + 0u], s_output[tid * 16u + 1u], s_output[tid * 16u + 2u]));
+        vec3 predRadiance = max(vec3(0.0), vec3(float(s_output[tid * 16u + 0u]), float(s_output[tid * 16u + 1u]), float(s_output[tid * 16u + 2u])));
         vec3 radiance = s_throughput[tid] * predRadiance;
 
         uint pixelIdx = s_pixelIndex[tid];

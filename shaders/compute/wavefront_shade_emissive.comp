@@ -126,6 +126,11 @@ layout(push_constant) uniform PushConstants {
     float envMapIntensity;
     uint useHardwareRT;
     uint secondarySortMode;
+    uint enableNrc;
+    uint nrcBounce;
+    float nrcTrainRatio;
+    uint frameIndex;
+    uint numOpaqueTriangles;
 } pc;
 
 void main() {

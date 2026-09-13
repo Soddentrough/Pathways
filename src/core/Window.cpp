@@ -105,7 +105,7 @@ Window::Window(const Config& config)
     }
 #endif
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         throw std::runtime_error(std::string("Failed to initialize SDL3: ") + SDL_GetError());
     }
 
@@ -445,6 +445,14 @@ void Window::toggleFullscreen() {
     if (m_resizeCallback) {
         m_resizeCallback(m_width, m_height);
     }
+}
+
+bool Window::isMinimized() const {
+    if (m_window) {
+        Uint64 flags = SDL_GetWindowFlags(m_window);
+        return (flags & SDL_WINDOW_MINIMIZED) != 0 || (flags & SDL_WINDOW_OCCLUDED) != 0;
+    }
+    return false;
 }
 
 void Window::pollEvents() {

@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 #include "wavefront_common.glsl"
 
@@ -165,7 +166,7 @@ void main() {
         uint primId = floatBitsToUint(hit.hitData1.z);
         uint hitType = floatBitsToUint(hit.hitData1.w);
 
-        vec3 throughput = state.throughputSeed.rgb;
+        f16vec3 throughput = f16vec3(state.throughputSeed.rgb);
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
         uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
@@ -181,7 +182,7 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            accumRadiance += throughput * skyColor;
+            accumRadiance += vec3(throughput) * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
@@ -202,17 +203,17 @@ void main() {
                 hitNormal = normalize(tbn * normalMap);
             }
 
-            vec4 baseColor = mat.albedo;
+            f16vec3 baseColor = f16vec3(mat.albedo.rgb);
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
+                baseColor *= f16vec3(texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb);
             }
 
-            vec3 emissive = mat.emissive.rgb;
+            f16vec3 emissive = f16vec3(mat.emissive.rgb);
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
+                emissive *= f16vec3(texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb);
             }
-            if (length(emissive) > 1e-3) {
-                accumRadiance += throughput * emissive;
+            if (length(emissive) > float16_t(1e-3)) {
+                accumRadiance += vec3(throughput * emissive);
             }
 
             bool pathTerminated = false;
@@ -252,20 +253,20 @@ void main() {
                 }
             }
 
-            vec3 F0 = mix(vec3(0.04), baseColor.rgb, metallic);
+            f16vec3 F0 = mix(f16vec3(0.04), baseColor, float16_t(metallic));
             vec3 V = -rayDir;
             float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
 
             if (mat.iridescence > 0.001) {
                 vec3 iridColor = evalThinFilmIridescence(NdotV, mat.iridescenceIor, mat.iridescenceThickness > 0.0 ? mat.iridescenceThickness : 350.0);
-                F0 = mix(F0, iridColor, mat.iridescence);
+                F0 = mix(F0, f16vec3(iridColor), float16_t(mat.iridescence));
             }
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
             bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
             bool enableShadows = (ubo.flags & (1 << 4)) != 0;
-            vec3 secDirectL = vec3(0.0);
+            f16vec3 secDirectL = f16vec3(0.0);
 
             // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
             if (!pathTerminated && enableDirect && enableSpecular && pc.numLights > 0u) {
@@ -277,7 +278,7 @@ void main() {
                 float selectedLightDist = 0.0;
                 vec3 selectedLightEmission = vec3(0.0);
                 float selectedLightPdf = 1.0;
-                vec3 selectedBrdf = vec3(0.0);
+                f16vec3 selectedBrdf = f16vec3(0.0);
                 float selectedNdotL = 0.0;
                 float selectedMisWeight = 1.0;
                 float selectedTarget = 0.0;
@@ -340,9 +341,9 @@ void main() {
                         float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, sqrt(ax), sqrt(ay))
                                           : distributionGGX(NdotH, alphaRoughness);
                         float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                        vec3 F = fresnelSchlickVec(VdotH, F0);
+                        f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
 
-                        vec3 specBrdf = D * G * F;
+                        f16vec3 specBrdf = float16_t(D * G) * F;
                         float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
 
                         float misWeight = 1.0;
@@ -351,8 +352,8 @@ void main() {
                             misWeight = lightPdfEff / (lightPdfEff + specPdf);
                         }
 
-                        vec3 candidateContrib = specBrdf * lightEmission * NdotL * misWeight;
-                        float target = dot(candidateContrib, vec3(0.2126, 0.7152, 0.0722));
+                        f16vec3 candidateContrib = specBrdf * (f16vec3(lightEmission) * float16_t(NdotL * misWeight));
+                        float target = float(dot(candidateContrib, f16vec3(0.2126, 0.7152, 0.0722)));
                         float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                         float weight = target / sourcePdf;
 
@@ -374,11 +375,11 @@ void main() {
 
                 if (hasCandidate && selectedTarget > 1e-6) {
                     float risWeight = totalWeightSum / (float(M) * selectedTarget);
-                    vec3 contrib = selectedBrdf * selectedLightEmission * selectedNdotL * selectedMisWeight;
-                    secDirectL = contrib * risWeight;
-                    vec3 unshadowed = throughput * secDirectL;
+                    f16vec3 contrib = selectedBrdf * (f16vec3(selectedLightEmission) * float16_t(selectedNdotL * selectedMisWeight));
+                    secDirectL = contrib * float16_t(risWeight);
+                    f16vec3 unshadowed = throughput * secDirectL;
 
-                    if (length(unshadowed) > 1e-5) {
+                    if (length(unshadowed) > float16_t(1e-5)) {
                         if (enableShadows) {
                             bool occluded = false;
                             if (enableInlineShadows && pc.useHardwareRT == 1u) {
@@ -387,15 +388,15 @@ void main() {
                                 if (!occluded) {
                                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                     vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), 0.0));
+                                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
                                 }
                             } else {
                                 hasShadowRay = true;
                                 shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 0.0)));
                             }
                         } else {
-                            accumRadiance += unshadowed;
+                            accumRadiance += vec3(unshadowed);
                         }
                     }
                 }
@@ -417,13 +418,13 @@ void main() {
                 } else {
                     float VdotH = clamp(dot(V, H), 0.0, 1.0);
                     float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                    vec3 F_sample = fresnelSchlickVec(VdotH, F0);
+                    f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotH), F0);
                     float G_sample = visibilitySmithGGXCorrelated(NdotL_next, NdotV, alphaRoughness);
 
                     // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
-                    throughput *= F_sample * (4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4));
+                    throughput *= F_sample * float16_t(4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4));
 
-                    float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+                    float pathLum = float(dot(throughput * float16_t(max(ubo.spp, 1u)), f16vec3(0.2126, 0.7152, 0.0722)));
                     if (pathLum < 0.001) {
                         pathTerminated = true;
                     } else if (bounce >= 1u) {
@@ -436,14 +437,14 @@ void main() {
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {
-                            throughput /= p;
+                            throughput /= float16_t(p);
                         }
                     }
 
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
+                        nextState.throughputSeed = vec4(vec3(throughput), uintBitsToFloat(seed));
                         nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
                     }
                 }
@@ -458,50 +459,50 @@ void main() {
     }
 }
 
+    // Standard single-queue linear compaction for ray geometry and state
+    uvec4 ballot = subgroupBallot(survivesToNext);
+    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+    uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+    uint waveGlobalOffset = 0u;
+    if (subgroupElect()) {
+        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+    }
+    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+    uint targetIdx = waveGlobalOffset + laneSlot;
+    if (survivesToNext) {
+        if (targetIdx < pc.maxQueueCapacity) {
+            outGeoms[targetIdx] = nextGeom;
+            outStates[targetIdx] = nextState;
+        }
+    }
+
     if (pc.secondarySortMode == 1u) {
-        // Producer-Side Binning: Partition rays directly into 8 directional octant sub-queues
-        // Zero indirection buffer, contiguous sequential memory layout for downstream traversal
+        // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
-        uint activeMask = activeBallot.x;
-        while (activeMask != 0u) {
-            uint leaderLane = findLSB(activeMask);
-            uint k = subgroupBroadcast(oct, leaderLane);
-            bool isOct = survivesToNext && (oct == k);
-            uvec4 octBallot = subgroupBallot(isOct);
-            uint octCount = subgroupBallotBitCount(octBallot);
-            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-            uint octBase = 0u;
-            if (gl_SubgroupInvocationID == leaderLane) {
-                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-            }
-            octBase = subgroupBroadcast(octBase, leaderLane);
-            if (isOct) {
-                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                if (octBase + octSlot < pc.maxQueueCapacity) {
-                    outGeoms[dest] = nextGeom;
-                    outStates[dest] = nextState;
+        for (uint w = 0u; w < 2u; ++w) {
+            uint activeMask = (w == 0u) ? activeBallot.x : activeBallot.y;
+            while (activeMask != 0u) {
+                uint leaderLane = w * 32u + findLSB(activeMask);
+                uint k = subgroupBroadcast(oct, leaderLane);
+                bool isOct = survivesToNext && (oct == k);
+                uvec4 octBallot = subgroupBallot(isOct);
+                uint octCount = subgroupBallotBitCount(octBallot);
+                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+                uint octBase = 0u;
+                if (gl_SubgroupInvocationID == leaderLane) {
+                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
                 }
-            }
-            activeMask &= ~octBallot.x;
-        }
-    } else {
-        // Standard single-queue linear compaction (for secondarySortMode == 0: None, or 2: Spatial Index)
-        uvec4 ballot = subgroupBallot(survivesToNext);
-        uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-        uint waveActiveCount = subgroupBallotBitCount(ballot);
-
-        uint waveGlobalOffset = 0u;
-        if (subgroupElect()) {
-            waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
-        }
-        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
-
-        if (survivesToNext) {
-            uint targetIdx = waveGlobalOffset + laneSlot;
-            if (targetIdx < pc.maxQueueCapacity) {
-                outGeoms[targetIdx] = nextGeom;
-                outStates[targetIdx] = nextState;
+                octBase = subgroupBroadcast(octBase, leaderLane);
+                if (isOct) {
+                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                    if (octBase + octSlot < pc.maxQueueCapacity) {
+                        secondaryIndices[dest] = targetIdx;
+                    }
+                }
+                activeMask &= ~((w == 0u) ? octBallot.x : octBallot.y);
             }
         }
     }

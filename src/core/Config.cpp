@@ -194,9 +194,6 @@ void Config::printUsage(const char* progName) {
               << "  --no-inline-shadows     Disable hybrid inline primary shadows\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
-              << "  --capture-training-data <dir> Output directory for high-speed raw binary training tensors\n"
-              << "  --capture-frames <int>        Number of training sequence frames to capture (default: 60)\n"
-              << "  --capture-reference-spp <int> Sample count for stationary ground truth reference (default: 512)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -358,11 +355,6 @@ Config Config::parse(int argc, char* argv[]) {
             if (cfg.denoiser_mode == DenoiserMode::None) {
                 cfg.denoiser_mode = DenoiserMode::Temporal;
             }
-        } else if (arg == "--no-temporal-accum") {
-            cfg.enable_temporal_accum = false;
-            if (cfg.denoiser_mode == DenoiserMode::Temporal) {
-                cfg.denoiser_mode = DenoiserMode::None;
-            }
         } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
             Logger::warn("A-Trous Wavelet denoiser has been removed. Use --temporal-accum or --bmfr.");
         } else if (arg == "--nrc") {
@@ -432,8 +424,6 @@ Config Config::parse(int argc, char* argv[]) {
             setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
         } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
-        } else if (arg == "--double-buffer-shared" || arg == "--double-buffer") {
-            cfg.double_buffered_shared_mem = true;
         } else if (arg == "--camera-motion") {
             cfg.camera_motion = true;
         } else if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {
@@ -595,8 +585,6 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--visualize-split" || arg == "--show-split") {
             cfg.visualize_mgpu_split = true;
-        } else if (arg == "--no-visualize-split") {
-            cfg.visualize_mgpu_split = false;
         } else if (arg == "--log-interval") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cfg.log_interval_sec = std::stof(argv[++i]);

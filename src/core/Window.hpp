@@ -54,6 +54,7 @@ public:
     void setTitle(const std::string& title);
     void toggleFullscreen();
     bool isFullscreen() const { return m_isFullscreen; }
+    bool isMinimized() const;
     float getPixelDensity() const;
     void getWindowSizeInPoints(int* w, int* h) const;
 

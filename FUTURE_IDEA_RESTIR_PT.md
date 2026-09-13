@@ -105,5 +105,5 @@ If full ReSTIR PT were implemented in Pathways:
 
 ### Strategic Alternatives for Pathways:
 1. **Neural Radiance Caching (NRC)**: Eliminates secondary bounce rays altogether by querying a Wave32 WMMA-accelerated neural representation, providing noise-free indirect illumination with zero light leaks and bounded execution time.
-2. **A-Trous Wavelet & Spatiotemporal Filtering**: Pathways already includes clean A-Trous diffuse denoising and TAA with motion vectors that resolve residual Monte Carlo noise at 0.15 ms overhead without altering path integration measures.
+2. **BMFR & Temporal Radiance Accumulation**: Pathways incorporates high-throughput BMFR regression (`--bmfr`) and motion-vector guided temporal accumulation (`--temporal-accum`), resolving residual Monte Carlo noise at sub-millisecond overhead without altering path integration measures.
 3. **Pure Wavefront Scaling**: The dual AMD Radeon AI PRO R9700 setup delivers 18+ GigaRays/s. Direct Monte Carlo path tracing remains the most physically robust, artifact-free, and driver-reliable foundation.

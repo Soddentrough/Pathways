@@ -1,10 +1,17 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.19.8 LANGUAGES C CXX)
+project(Pathways VERSION 1.19.9 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+add_compile_definitions(
+    PATHWAYS_VERSION_STRING="${PROJECT_VERSION}"
+    PATHWAYS_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    PATHWAYS_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    PATHWAYS_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
 
 # Default to Release build if none specified
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -23,9 +30,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wpedantic
         -Wno-unused-parameter
-        -Wno-missing-field-initializers
         -Wno-unused-variable
-        -Wno-array-bounds
+        -Wno-missing-field-initializers # Required for Vulkan 1.4 C-struct aggregate zero-initialization
     )
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
@@ -143,6 +149,10 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
+    ${SHADER_DIR}/compute/dgc_compact.comp
+    ${SHADER_DIR}/compute/raytrace_comp.comp
+    ${SHADER_DIR}/compute/wavefront_persistent.comp
+    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -243,6 +253,9 @@ target_compile_definitions(pathways PRIVATE
     SHADER_DIR="${SPV_OUTPUT_DIR}"
     VK_ENABLE_BETA_EXTENSIONS=0
 )
+
+# Scoped warning suppression for third-party header tinyexr inlined into ImageDumper.cpp
+set_source_files_properties(src/utils/ImageDumper.cpp PROPERTIES COMPILE_OPTIONS "-Wno-array-bounds")
 
 # Windows runtime DLL deployment
 if(WIN32)
@@ -353,6 +366,13 @@ if(UNIX)
     )
     target_link_libraries(test_p2p_direct_bar PRIVATE Vulkan::Vulkan)
     add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
+
+    # Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd) Unit Test Target
+    add_executable(test_cross_gpu_sync
+        tests/test_cross_gpu_sync.cpp
+    )
+    target_link_libraries(test_cross_gpu_sync PRIVATE Vulkan::Vulkan)
+    add_test(NAME CrossGpuSync COMMAND test_cross_gpu_sync)
 endif()
 
 # Pipeline Comparison & Telemetry Unit Test Target

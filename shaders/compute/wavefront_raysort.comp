@@ -104,34 +104,37 @@ void main() {
         myBin = computeRayBin(origin, dir);
     }
 
-    // Subgroup ballot aggregation across the 32-lane wave
-    uint activeLanes = subgroupBallot(inRange).x;
-    while (activeLanes != 0u) {
-        uint leader = findLSB(activeLanes);
-        uint targetBin = subgroupShuffle(myBin, leader);
-        bool match = (inRange && myBin == targetBin);
-        uvec4 matchBallot = subgroupBallot(match);
-        uint waveCount = subgroupBallotBitCount(matchBallot);
-        uint laneSlot = subgroupBallotExclusiveBitCount(matchBallot);
+    // Subgroup ballot aggregation across the wave (Wave32 and Wave64 safe)
+    uvec4 inRangeBallot = subgroupBallot(inRange);
+    for (uint w = 0u; w < 2u; ++w) {
+        uint activeLanes = (w == 0u) ? inRangeBallot.x : inRangeBallot.y;
+        while (activeLanes != 0u) {
+            uint leader = w * 32u + findLSB(activeLanes);
+            uint targetBin = subgroupShuffle(myBin, leader);
+            bool match = (inRange && myBin == targetBin);
+            uvec4 matchBallot = subgroupBallot(match);
+            uint waveCount = subgroupBallotBitCount(matchBallot);
+            uint laneSlot = subgroupBallotExclusiveBitCount(matchBallot);
 
-        if (passId == 0u) {
-            // Pass 0: Add wave total to bin counter
-            if (gl_SubgroupInvocationID == leader) {
-                atomicAdd(secondaryIndices[countBase + targetBin], waveCount);
+            if (passId == 0u) {
+                // Pass 0: Add wave total to bin counter
+                if (gl_SubgroupInvocationID == leader) {
+                    atomicAdd(secondaryIndices[countBase + targetBin], waveCount);
+                }
+            } else {
+                // Pass 2: Scatter ray index into compacted bin segment
+                uint base = 0u;
+                if (gl_SubgroupInvocationID == leader) {
+                    base = atomicAdd(secondaryIndices[curOffsetBase + targetBin], waveCount);
+                }
+                base = subgroupShuffle(base, leader);
+                if (match) {
+                    uint dest = base + laneSlot;
+                    secondaryIndices[dest] = gIdx;
+                }
             }
-        } else {
-            // Pass 2: Scatter ray index into compacted bin segment
-            uint base = 0u;
-            if (gl_SubgroupInvocationID == leader) {
-                base = atomicAdd(secondaryIndices[curOffsetBase + targetBin], waveCount);
-            }
-            base = subgroupShuffle(base, leader);
-            if (match) {
-                uint dest = base + laneSlot;
-                secondaryIndices[dest] = gIdx;
-            }
+
+            activeLanes &= ~((w == 0u) ? matchBallot.x : matchBallot.y);
         }
-
-        activeLanes &= ~matchBallot.x;
     }
 }
