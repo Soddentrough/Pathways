@@ -36,9 +36,7 @@ public:
     }
 
     // Dynamic multi-slice ring buffer controls
-    uint32_t acquireSlice();
-    void resetSliceCounter();
-    uint32_t getSliceCount() const { return m_sliceCount; }
+    uint32_t getSliceCount() const { return NUM_SLICES; }
     VkDeviceSize getSliceSize() const { return m_sliceSize; }
     Buffer* getPreprocessBuffer() const { return m_preprocessBuffer.get(); }
 
@@ -48,7 +46,7 @@ public:
                           uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
 
     // Synchronization barrier between preprocessing and execution (sliceIndex == UINT32_MAX synchronizes entire buffer)
-    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX, uint32_t sliceCount = 1);
+    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
@@ -92,8 +90,6 @@ private:
     VkIndirectExecutionSetEXT m_materialExecutionSetSecondary = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
-    uint32_t m_sliceCount = 32;
-    uint32_t m_currentSlice = 0;
     bool m_supported = false;
     bool m_explicitPreprocess = true;
     bool m_materialDGCSupported = false;

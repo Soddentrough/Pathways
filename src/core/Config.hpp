@@ -20,11 +20,6 @@ enum class AccumFormat {
     RGBA32_SFLOAT  // 128-bit Full Float HDR
 };
 
-enum class OutputFormat {
-    A2B10G10R10_UNORM, // 10-bit Deep Color / HDR output backbuffer (1024 levels) [Default]
-    RGBA8_UNORM        // 8-bit SDR fallback (256 levels)
-};
-
 enum class PipelineType {
     RTP,       // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
     Wavefront  // Wavefront Path Tracing with Work Lists & DGC
@@ -117,12 +112,10 @@ struct Config {
     };
     MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::Host;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
-    OutputFormat output_format = OutputFormat::A2B10G10R10_UNORM; // Default: 10-bit Deep Color / HDR output backbuffer
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     uint32_t tile_size = 64;
     uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
-    bool async_dgc_preprocess = true; // Dedicated async compute queue DGC preprocessing [Default: true, disable via --no-async-preprocess]
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

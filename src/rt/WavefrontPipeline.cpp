@@ -556,10 +556,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     uint32_t numTilesX = (ts > 0) ? (width + ts - 1) / ts : 1;
     uint32_t numTilesY = (ts > 0) ? (height + ts - 1) / ts : 1;
 
-    if (m_dgcManager) {
-        m_dgcManager->resetSliceCounter();
-    }
-
     vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_dgcStream->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_queueCounters->getBuffer(), 0, VK_WHOLE_SIZE, 0);

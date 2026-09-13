@@ -149,11 +149,6 @@ void main() {
         finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
     }
 
-    // High-frequency triangular dither (scaled for 10-bit quantization: 1024 discrete code levels)
-    // Eliminates Mach banding across low-contrast gradients and smooth surfaces
-    float dither = (fract(sin(dot(vec2(pixelCoord), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 1023.0;
-    finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
-
     // Multi-GPU Load Split Visualization Overlay
     if (pc.visualizeSplit == 1u) {
         float tintScale = (pc.displayMode == 1u) ? (pc.paperWhiteNits / 80.0) : 1.0;

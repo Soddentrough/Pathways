@@ -64,16 +64,13 @@ public:
     VkQueue getGraphicsQueue() const { return m_graphicsQueue; }
     VkQueue getTransferQueue() const { return m_transferQueue; }
     VkQueue getAsyncComputeQueue() const { return m_asyncComputeQueue != VK_NULL_HANDLE ? m_asyncComputeQueue : m_graphicsQueue; }
-    VkQueue getComputeQueue() const { return getAsyncComputeQueue(); }
     uint32_t getGraphicsQueueFamily() const { return m_queueIndices.graphicsComputeFamily; }
     uint32_t getTransferQueueFamily() const { return m_queueIndices.transferFamily; }
     uint32_t getAsyncComputeQueueFamily() const { return m_queueIndices.asyncComputeFamily; }
-    uint32_t getComputeQueueFamily() const { return m_queueIndices.asyncComputeFamily; }
     bool hasDedicatedAsyncCompute() const {
         return m_asyncComputeQueue != VK_NULL_HANDLE &&
                m_queueIndices.asyncComputeFamily != m_queueIndices.graphicsComputeFamily;
     }
-    bool hasDedicatedComputeQueue() const { return hasDedicatedAsyncCompute(); }
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
