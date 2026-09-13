@@ -114,6 +114,8 @@ struct ConfigStatsTally {
     // Acceleration structures
     double blasBuildTimeMs = 0.0;
     double blasSizeKb = 0.0;
+    double uncompactedBlasSizeKb = 0.0;
+    bool blasCompacted = false;
     uint32_t blasTriangles = 0;
     double tlasBuildTimeMs = 0.0;
     double tlasSizeKb = 0.0;

@@ -88,6 +88,8 @@ public:
     // Telemetry stats
     double getLastBlasBuildTimeMs() const { return m_lastBlasBuildTimeMs; }
     double getBlasSizeKb() const { return m_blasSizeKb; }
+    double getUncompactedBlasSizeKb() const { return m_uncompactedBlasSizeKb; }
+    bool isBlasCompacted() const { return m_blasCompacted; }
     uint32_t getBlasTriangles() const { return m_blasTriangles; }
     double getLastTlasBuildTimeMs() const { return m_lastTlasBuildTimeMs; }
     double getTlasSizeKb() const { return m_tlasSizeKb; }
@@ -99,6 +101,8 @@ private:
 
     double m_lastBlasBuildTimeMs = 0.0;
     double m_blasSizeKb = 0.0;
+    double m_uncompactedBlasSizeKb = 0.0;
+    bool m_blasCompacted = false;
     uint32_t m_blasTriangles = 0;
     double m_lastTlasBuildTimeMs = 0.0;
     double m_tlasSizeKb = 0.0;
@@ -116,6 +120,8 @@ private:
     PFN_vkGetAccelerationStructureBuildSizesKHR pfn_vkGetAccelerationStructureBuildSizesKHR = nullptr;
     PFN_vkCmdBuildAccelerationStructuresKHR pfn_vkCmdBuildAccelerationStructuresKHR = nullptr;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfn_vkGetAccelerationStructureDeviceAddressKHR = nullptr;
+    PFN_vkCmdWriteAccelerationStructuresPropertiesKHR pfn_vkCmdWriteAccelerationStructuresPropertiesKHR = nullptr;
+    PFN_vkCmdCopyAccelerationStructureKHR pfn_vkCmdCopyAccelerationStructureKHR = nullptr;
 };
 
 } // namespace pathways

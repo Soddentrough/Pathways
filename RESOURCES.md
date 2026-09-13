@@ -24,6 +24,7 @@ https://graphics.stanford.edu/~boulos/papers/reorder_rt08.pdf
 # Dynamic BVH rebuiding
 https://dl.acm.org/doi/10.1145/3799818.3812105
 https://gpuopen.com/learn/why-multi-resolution-geometric-representation-bvh-ray-tracing/
+https://gpuopen.com/download/GPUOpen_BVHApproximation.pdf
 
 # Denoising - spatiotemporal filtering techniques that accumulate samples across frames using motion vectors
 https://gpuopen.com/fidelityfx-denoiser/

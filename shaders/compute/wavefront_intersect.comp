@@ -118,6 +118,10 @@ void main() {
         if (inRange) {
             rayIdx = secondaryIndices[pc.octantBin * pc.maxQueueCapacity + idx];
         }
+    } else if (pc.secondarySortMode == 2u) {
+        if (inRange) {
+            rayIdx = secondaryIndices[idx];
+        }
     }
 
     RayGeometry geom;
@@ -125,43 +129,6 @@ void main() {
         geom = inGeom[rayIdx];
     } else {
         geom.originPackedDir = vec4(0.0);
-    }
-
-    if (pc.secondarySortMode == 2u) {
-        uint lane = gl_SubgroupInvocationID;
-        uint key = 0xFFFFFFFFu;
-        if (inRange) {
-            vec3 orig = geom.originPackedDir.xyz;
-            vec3 d = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-            uint oct = getDirectionalOctant(d);
-            vec3 pNorm = fract((orig * 0.05) + 0.5);
-            uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
-            uint morton = morton3D_10bit(qPos) & 0x0FFFFFu;
-            key = (oct << 20u) | morton;
-        }
-
-        uint sortedLane = lane;
-        [[unroll]]
-        for (uint k = 2u; k <= 32u; k <<= 1u) {
-            [[unroll]]
-            for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-                uint partnerKey = subgroupShuffleXor(key, j);
-                uint partnerLaneId = subgroupShuffleXor(sortedLane, j);
-                bool dir_asc = ((lane & k) == 0u);
-                bool shouldTakeMin = ((lane & j) == 0u) == dir_asc;
-                bool swap = shouldTakeMin ? (key > partnerKey) : (key < partnerKey);
-                if (swap) {
-                    key = partnerKey;
-                    sortedLane = partnerLaneId;
-                }
-            }
-        }
-        inRange = (key != 0xFFFFFFFFu);
-        rayIdx = subgroupShuffle(rayIdx, sortedLane);
-        geom.originPackedDir.x = subgroupShuffle(geom.originPackedDir.x, sortedLane);
-        geom.originPackedDir.y = subgroupShuffle(geom.originPackedDir.y, sortedLane);
-        geom.originPackedDir.z = subgroupShuffle(geom.originPackedDir.z, sortedLane);
-        geom.originPackedDir.w = subgroupShuffle(geom.originPackedDir.w, sortedLane);
     }
 
     vec3 origin = geom.originPackedDir.xyz;

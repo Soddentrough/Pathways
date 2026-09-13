@@ -530,7 +530,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     vkCmdFillBuffer(cmd, m_dgcStream->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_queueCounters->getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
-    std::array<VkBufferMemoryBarrier2, 3> clearBarriers = {
+    std::vector<VkBufferMemoryBarrier2> clearBarriers = {
         makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
@@ -541,6 +541,12 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
     };
+    if (sceneData.secondarySortMode != 0 && m_secondaryIndexQueue) {
+        vkCmdFillBuffer(cmd, m_secondaryIndexQueue->getBuffer(), static_cast<VkDeviceSize>(m_maxCapacity) * sizeof(uint32_t), 1024 * sizeof(uint32_t), 0);
+        clearBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
+    }
     VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     clearDep.bufferMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size());
     clearDep.pBufferMemoryBarriers = clearBarriers.data();
@@ -711,7 +717,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (sceneData.secondarySortMode != 0) {
                         s2dBarriers.push_back(makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT));
                     }
 
                     VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -782,7 +788,74 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
                             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                         } else if (sceneData.secondarySortMode == 2 && useMaterialSort) {
-                            // Option 2: Fused In-Register Spatial-Morton Wave32 Reordering (0ms pass overhead, zero barrier)
+                            // Option 2: Global Spatial-Directional Ray Sorting (512 bins, 3 passes: Histogram, Prefix Sum, Scatter)
+                            if (m_raySortPipeline != VK_NULL_HANDLE) {
+                                glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
+                                extent.x = std::max(extent.x, 1e-3f);
+                                extent.y = std::max(extent.y, 1e-3f);
+                                extent.z = std::max(extent.z, 1e-3f);
+
+                                struct RaySortPC {
+                                    glm::vec4 boundsMin;    // xyz: scene min, w: passId
+                                    glm::vec4 boundsExtent; // xyz: scene extent, w: maxQueueCapacity
+                                };
+
+                                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_raySortPipeline);
+                                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
+
+                                // Pass 0: Histogram (Subgroup ballot binning into secondaryIndices[countBase..])
+                                RaySortPC pc0{
+                                    glm::vec4(sceneData.boundsMin, 0.0f),
+                                    glm::vec4(extent, static_cast<float>(m_maxCapacity))
+                                };
+                                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc0), &pc0);
+                                m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
+
+                                // Barrier Pass 0 -> Pass 1
+                                VkBufferMemoryBarrier2 p0ToP1 = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                                VkDependencyInfo dep01{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                                dep01.bufferMemoryBarrierCount = 1;
+                                dep01.pBufferMemoryBarriers = &p0ToP1;
+                                vkCmdPipelineBarrier2(cmd, &dep01);
+
+                                // Pass 1: Single Wave32 Prefix Sum over 512 bins (in registers)
+                                RaySortPC pc1{
+                                    glm::vec4(sceneData.boundsMin, 1.0f),
+                                    glm::vec4(extent, static_cast<float>(m_maxCapacity))
+                                };
+                                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
+                                vkCmdDispatch(cmd, 1, 1, 1);
+
+                                // Barrier Pass 1 -> Pass 2
+                                VkBufferMemoryBarrier2 p1ToP2 = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                                VkDependencyInfo dep12{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                                dep12.bufferMemoryBarrierCount = 1;
+                                dep12.pBufferMemoryBarriers = &p1ToP2;
+                                vkCmdPipelineBarrier2(cmd, &dep12);
+
+                                // Pass 2: Scatter ray indices into compacted contiguous bin segments
+                                RaySortPC pc2{
+                                    glm::vec4(sceneData.boundsMin, 2.0f),
+                                    glm::vec4(extent, static_cast<float>(m_maxCapacity))
+                                };
+                                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+                                m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), intersectOffset);
+
+                                // Barrier Pass 2 -> Intersect
+                                VkBufferMemoryBarrier2 p2ToInt = makeBufferBarrier2(m_secondaryIndexQueue->getBuffer(),
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                                VkDependencyInfo dep2Int{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                                dep2Int.bufferMemoryBarrierCount = 1;
+                                dep2Int.pBufferMemoryBarriers = &p2ToInt;
+                                vkCmdPipelineBarrier2(cmd, &dep2Int);
+                            }
+
+                            // Intersect microkernel with pre-sorted indices
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
                             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);

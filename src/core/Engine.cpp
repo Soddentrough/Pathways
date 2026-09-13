@@ -3295,6 +3295,8 @@ void Engine::renderFrame() {
                 wfSceneData.enableNrc = m_config.enable_nrc;
                 wfSceneData.nrcBounce = m_config.nrc_bounce;
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+                wfSceneData.boundsMin = m_sceneData.boundsMin;
+                wfSceneData.boundsMax = m_sceneData.boundsMax;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
@@ -3653,6 +3655,8 @@ void Engine::renderFrame() {
                 wfSceneData.enableNrc = m_config.enable_nrc;
                 wfSceneData.nrcBounce = m_config.nrc_bounce;
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+                wfSceneData.boundsMin = m_sceneData.boundsMin;
+                wfSceneData.boundsMax = m_sceneData.boundsMax;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);
@@ -5021,6 +5025,8 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
         if (m_asManager) {
             t.blasBuildTimeMs = m_asManager->getLastBlasBuildTimeMs();
             t.blasSizeKb = m_asManager->getBlasSizeKb();
+            t.uncompactedBlasSizeKb = m_asManager->getUncompactedBlasSizeKb();
+            t.blasCompacted = m_asManager->isBlasCompacted();
             t.blasTriangles = m_asManager->getBlasTriangles();
             t.tlasBuildTimeMs = m_asManager->getLastTlasBuildTimeMs();
             t.tlasSizeKb = m_asManager->getTlasSizeKb();
@@ -5068,8 +5074,14 @@ void Engine::printExecutionSummary() const {
         Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
         Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
         Logger::info("    Acceleration Structures:");
-        Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
-                     tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        if (tally.blasCompacted) {
+            double ratio = (1.0 - (tally.blasSizeKb / tally.uncompactedBlasSizeKb)) * 100.0;
+            Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB compacted from {:.2f} KB, -{:.1f}%, {} Triangles)",
+                         tally.blasBuildTimeMs, tally.blasSizeKb, tally.uncompactedBlasSizeKb, ratio, tally.blasTriangles);
+        } else {
+            Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
+                         tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        }
         Logger::info("      - TLAS Build:        {:.3f} ms ({:.2f} KB, {} Instance{})",
                      tally.tlasBuildTimeMs, tally.tlasSizeKb, tally.tlasInstances, tally.tlasInstances == 1 ? "" : "s");
         if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.secBlasBuildTimeMs > 0.0) {

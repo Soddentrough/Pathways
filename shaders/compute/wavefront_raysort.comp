@@ -41,58 +41,97 @@ layout(std430, binding = 15) readonly buffer InRayGeomQueue {
     RayGeometry inGeoms[];
 };
 
-layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
+layout(std430, binding = 19) buffer SecondaryIndexQueue {
     uint secondaryIndices[];
 };
 
 layout(push_constant) uniform PushConstants {
-    uint maxQueueCapacity;
-    uint activeCount;
-    uint currentBounce;
-    uint pad;
+    vec4 boundsMin;    // xyz: scene min, w: pass (0 = histogram, 1 = prefix, 2 = scatter)
+    vec4 boundsExtent; // xyz: scene extent (max - min), w: maxQueueCapacity
 } pc;
 
+uint computeRayBin(vec3 origin, vec3 dir) {
+    vec3 extent = max(pc.boundsExtent.xyz, vec3(1e-4));
+    vec3 p = clamp((origin - pc.boundsMin.xyz) / extent, vec3(0.0), vec3(0.9999));
+    uvec3 cell = uvec3(p * 4.0); // 4x4x4 spatial grid = 64 cells
+    uint spatialId = cell.x + (cell.y << 2u) + (cell.z << 4u); // 0..63
+    uint octant = getDirectionalOctant(dir); // 0..7
+    return (spatialId << 3u) | octant; // 0..511 (512 bins total)
+}
+
 void main() {
+    uint passId = uint(round(pc.boundsMin.w));
+    uint maxCap = uint(round(pc.boundsExtent.w));
+    uint countBase = maxCap;
+    uint curOffsetBase = maxCap + 512u;
+
+    if (passId == 1u) {
+        // Pass 1: Single Wave32 Prefix Sum over 512 bins (100% in registers, zero LDS, zero barriers)
+        if (gl_WorkGroupID.x > 0u || queueCounters.activeRayCount == 0u) return;
+        uint lane = gl_SubgroupInvocationID; // 0..31
+        
+        // Each lane handles 16 consecutive bins
+        uint laneSum = 0u;
+        [[unroll]]
+        for (uint i = 0u; i < 16u; ++i) {
+            laneSum += secondaryIndices[countBase + lane * 16u + i];
+        }
+
+        uint wavePrefix = subgroupExclusiveAdd(laneSum);
+
+        uint running = wavePrefix;
+        [[unroll]]
+        for (uint i = 0u; i < 16u; ++i) {
+            uint bIdx = lane * 16u + i;
+            uint cnt = secondaryIndices[countBase + bIdx];
+            secondaryIndices[curOffsetBase + bIdx] = running;
+            secondaryIndices[countBase + bIdx] = 0u; // Reset histogram for next bounce
+            running += cnt;
+        }
+        return;
+    }
+
+    // Pass 0 (Histogram) and Pass 2 (Scatter)
     uint count = queueCounters.activeRayCount;
-    if (gl_WorkGroupID.x * 32u >= count) return;
-
     uint gIdx = gl_GlobalInvocationID.x;
-    uint lane = gl_SubgroupInvocationID;
+    bool inRange = (gIdx < count);
 
-    uint key = 0xFFFFFFFFu;
-    uint idx = gIdx;
-
-    if (gIdx < count) {
+    uint myBin = 0u;
+    if (inRange) {
         RayGeometry geom = inGeoms[gIdx];
         vec3 origin = geom.originPackedDir.xyz;
         vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-
-        uint octant = getDirectionalOctant(dir);
-        vec3 pNorm = fract((origin * 0.05) + 0.5);
-        uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
-        uint morton = morton3D_10bit(qPos) & 0x0FFFFFu;
-
-        key = (octant << 20u) | morton;
+        myBin = computeRayBin(origin, dir);
     }
 
-    // 32-element register-only Bitonic Sort via Subgroup Shuffle XOR (Zero LDS, Zero Barriers)
-    [[unroll]]
-    for (uint k = 2u; k <= 32u; k <<= 1u) {
-        [[unroll]]
-        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-            uint partnerKey = subgroupShuffleXor(key, j);
-            uint partnerIdx = subgroupShuffleXor(idx, j);
-            bool dir_asc = ((lane & k) == 0u);
-            bool shouldTakeMin = ((lane & j) == 0u) == dir_asc;
-            bool swap = shouldTakeMin ? (key > partnerKey) : (key < partnerKey);
-            if (swap) {
-                key = partnerKey;
-                idx = partnerIdx;
+    // Subgroup ballot aggregation across the 32-lane wave
+    uint activeLanes = subgroupBallot(inRange).x;
+    while (activeLanes != 0u) {
+        uint leader = findLSB(activeLanes);
+        uint targetBin = subgroupShuffle(myBin, leader);
+        bool match = (inRange && myBin == targetBin);
+        uvec4 matchBallot = subgroupBallot(match);
+        uint waveCount = subgroupBallotBitCount(matchBallot);
+        uint laneSlot = subgroupBallotExclusiveBitCount(matchBallot);
+
+        if (passId == 0u) {
+            // Pass 0: Add wave total to bin counter
+            if (gl_SubgroupInvocationID == leader) {
+                atomicAdd(secondaryIndices[countBase + targetBin], waveCount);
+            }
+        } else {
+            // Pass 2: Scatter ray index into compacted bin segment
+            uint base = 0u;
+            if (gl_SubgroupInvocationID == leader) {
+                base = atomicAdd(secondaryIndices[curOffsetBase + targetBin], waveCount);
+            }
+            base = subgroupShuffle(base, leader);
+            if (match) {
+                uint dest = base + laneSlot;
+                secondaryIndices[dest] = gIdx;
             }
         }
-    }
 
-    if (gIdx < count) {
-        secondaryIndices[gIdx] = idx;
+        activeLanes &= ~matchBallot.x;
     }
 }

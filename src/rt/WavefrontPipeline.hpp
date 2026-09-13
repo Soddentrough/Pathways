@@ -29,6 +29,8 @@ struct WavefrontSceneData {
     bool enableNrc = false;
     uint32_t nrcBounce = 2;
     float nrcTrainRatio = 0.03f;
+    glm::vec3 boundsMin = glm::vec3(-1000.0f);
+    glm::vec3 boundsMax = glm::vec3(1000.0f);
 };
 
 class WavefrontPipeline {
