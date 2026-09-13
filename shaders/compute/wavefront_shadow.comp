@@ -64,7 +64,8 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint currentOctantCounts[8];
     uint totalIntersectWorkgroups;
     uint secondaryRayCount;
-    uint pad[21];
+    uint activeMaterialSequenceCount;
+    uint pad[20];
 } queueCounters;
 
 layout(push_constant) uniform PushConstants {

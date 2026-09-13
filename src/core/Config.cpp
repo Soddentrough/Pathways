@@ -172,6 +172,7 @@ void Config::printUsage(const char* progName) {
               << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
+              << "  --no-async-preprocess   Disable dedicated async compute queue DGC preprocessing\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
@@ -416,6 +417,9 @@ Config Config::parse(int argc, char* argv[]) {
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
         } else if (arg == "--no-dgc-batch-preprocess" || arg == "--no-dgc-tier2-batch") {
             setEnvVar("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1");
+        } else if (arg == "--no-async-preprocess") {
+            cfg.async_dgc_preprocess = false;
+            setEnvVar("PATHWAYS_DISABLE_ASYNC_PREPROCESS", "1");
         } else if (arg == "--no-inline-shadows") {
             cfg.inline_primary_shadows = false;
         } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {

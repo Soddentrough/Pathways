@@ -132,8 +132,8 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 100 \
-    --warmup-frames 20 \
+    --frames 300 \
+    --warmup-frames 60 \
     --no-accumulation \
     --scene scenes/DamagedHelmet.glb \
     --mgpu-mode off \
@@ -145,8 +145,8 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --height 1080 \
     --spp 16 \
     --max-bounces 4 \
-    --frames 100 \
-    --warmup-frames 20 \
+    --frames 300 \
+    --warmup-frames 60 \
     --no-accumulation \
     --scene scenes/DamagedHelmet.glb \
     --mgpu-mode sample \

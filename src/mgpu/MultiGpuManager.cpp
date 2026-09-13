@@ -61,6 +61,7 @@ GpuDeviceNode::~GpuDeviceNode() {
     vkDeviceWaitIdle(device);
 
     rtpKhrPipeline.reset();
+    wavefrontPipeline.reset();
     if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
     for (uint32_t i = 0; i < NUM_IN_FLIGHT; ++i) {
         if (queryPools[i]) vkDestroyQueryPool(device, queryPools[i], nullptr);
@@ -1075,7 +1076,37 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     );
     Logger::info("Secondary GPU: Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) initialized.");
 
+    // Wavefront Path Tracing Pipeline on secondary device
+    if (config.pipeline_type == PipelineType::Wavefront) {
+        try {
+            auto wfClassifyCode = loadShaderSPIRV("wavefront_classify.comp.spv");
+            auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
+            auto wfShadeCode = loadShaderSPIRV("wavefront_shade.comp.spv");
+            auto wfShadowCode = loadShaderSPIRV("wavefront_shadow.comp.spv");
+            auto wfShadeDiffuseCode = loadShaderSPIRV("wavefront_shade_diffuse.comp.spv");
+            auto wfShadeDielectricCode = loadShaderSPIRV("wavefront_shade_dielectric.comp.spv");
+            auto wfShadeConductorCode = loadShaderSPIRV("wavefront_shade_conductor.comp.spv");
+            auto wfShadeComplexCode = loadShaderSPIRV("wavefront_shade_complex.comp.spv");
+            auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
+            auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
+            auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
 
+            secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
+                secDevice, secAlloc,
+                config.width, config.height,
+                config.wavefront_tile_size,
+                wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
+                wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
+                wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
+                secNode->context->hasDgcExecutionSet()
+            );
+            updateSecondaryWavefrontDescriptors(secNode.get());
+            Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}. Falling back to RTP.", e.what());
+            secNode->wavefrontPipeline.reset();
+        }
+    }
 
     // 8. Transition secondary images to GENERAL layout
     VkCommandBufferBeginInfo beginInfo{};
@@ -1204,7 +1235,40 @@ void MultiGpuManager::updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* se
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
+void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->wavefrontPipeline || !secNode->accumTarget || !secNode->triangleBuffer) return;
 
+    VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
+    VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
+
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
+        if (i < secNode->sceneTextures.size() && secNode->sceneTextures[i]) {
+            texInfos[i] = secNode->sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = secNode->dummyWhite->getDescriptorInfo();
+        }
+    }
+
+    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        if (!secNode->cameraUBOs[slot]) continue;
+        secNode->wavefrontPipeline->updateSceneDescriptors(
+            slot,
+            secNode->accumTarget->getImageView(),
+            secNode->cameraUBOs[slot]->getBuffer(),
+            secNode->triangleBuffer->getBuffer(), secNode->triangleBuffer->getSize(),
+            secNode->sphereBuffer->getBuffer(), secNode->sphereBuffer->getSize(),
+            secNode->materialBuffer->getBuffer(), secNode->materialBuffer->getSize(),
+            secNode->lightBuffer->getBuffer(), secNode->lightBuffer->getSize(),
+            tlasHandle,
+            envInfo,
+            texInfos,
+            VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+            secNode->motionVectorImage ? secNode->motionVectorImage->getImageView() : VK_NULL_HANDLE,
+            secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE
+        );
+    }
+}
 
 void MultiGpuManager::workerLoop() {
     while (true) {
@@ -1262,7 +1326,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     vkResetFences(device, 1, &node->renderFences[slot]);
 
     // 2. Update Camera UBO for this slot
-    node->cameraUBOs[slot]->copyFrom(&packet.cameraUniform, sizeof(CameraUniform));
+    CameraUniform uboSecCopy = packet.cameraUniform;
+    uint32_t secSppLoop = packet.cameraUniform.spp;
+    if (packet.totalCompositeSpp > 0) {
+        uboSecCopy.spp = packet.totalCompositeSpp;
+    }
+    node->cameraUBOs[slot]->copyFrom(&uboSecCopy, sizeof(CameraUniform));
 
     // 3. Record secondary GPU commands
     VkCommandBuffer cmd = node->commandBuffers[slot];
@@ -1304,13 +1373,55 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
     }
 
-    // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSets[slot], 0, nullptr);
-    VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-    vkCmdPushConstants(cmd, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+    if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline) {
+        if (packet.accumulateHistory == 0u) {
+            VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+            VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(cmd, node->accumTarget->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
 
-    node->rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
+            VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearBarrier.image = node->accumTarget->getImage();
+            clearBarrier.subresourceRange = clearRange;
+
+            VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            clearDep.imageMemoryBarrierCount = 1;
+            clearDep.pImageMemoryBarriers = &clearBarrier;
+            vkCmdPipelineBarrier2(cmd, &clearDep);
+        }
+
+        WavefrontSceneData wfSceneData{};
+        wfSceneData.numTriangles = packet.numTriangles;
+        wfSceneData.numSpheres = packet.numSpheres;
+        wfSceneData.numMaterials = packet.numMaterials;
+        wfSceneData.numLights = packet.numLights;
+        wfSceneData.hasEnvMap = packet.hasEnvMap;
+        wfSceneData.envMapIntensity = packet.envMapIntensity;
+        wfSceneData.useHardwareRT = packet.useHardwareRT;
+        wfSceneData.frameIndex = packet.cameraUniform.frameIndex;
+        wfSceneData.useMorton = 1u;
+        wfSceneData.accumulateHistory = packet.accumulateHistory;
+        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.numOpaqueTriangles = packet.numOpaqueTriangles;
+        wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+        wfSceneData.cameraFlags = packet.cameraUniform.flags;
+        wfSceneData.enableNrc = false;
+
+        node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
+                                             secSppLoop, m_config.max_bounces, wfSceneData);
+    } else {
+        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSets[slot], 0, nullptr);
+        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+        vkCmdPushConstants(cmd, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+
+        node->rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
 
     if ((packet.cameraUniform.flags & (1 << 20)) && node->shadowClassifyPipeline && node->shadowFilterPipeline) {
         VkMemoryBarrier2 rtToClassifyBarrier{};
@@ -1394,6 +1505,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         vkCmdDispatch(cmd, (packet.tileWidth + 7) / 8, (packet.tileHeight + 7) / 8, 1);
 
         node->shadowPingPongIndex = 1 - node->shadowPingPongIndex;
+    }
     }
 
 
@@ -1766,6 +1878,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             }
         }
         updateSecondaryShadowDenoiserDescriptors(node.get());
+        if (node->wavefrontPipeline) {
+            node->wavefrontPipeline->resize(width, height, m_config.wavefront_tile_size);
+            updateSecondaryWavefrontDescriptors(node.get());
+        }
         m_slotSubmitted = { false, false };
         m_workSubmitted = false;
     }
@@ -1983,6 +2099,9 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
         }
         writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr });
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+    if (secNode->wavefrontPipeline) {
+        updateSecondaryWavefrontDescriptors(secNode.get());
     }
     Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());
     return true;

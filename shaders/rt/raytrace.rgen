@@ -316,10 +316,14 @@ void main() {
                 break;
             }
 
-            // Luminance-weighted Russian Roulette
+            // Adaptive depth-attenuated Russian Roulette
             if (bounce >= 1u) {
                 float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                float p = clamp(lum, minP, 0.95);
+                float maxP = 0.95;
+                float p = clamp(lum, minP, maxP);
+                if (bounce >= 2u && lum >= 0.35) {
+                    p = clamp(lum * 0.85, minP, 0.90);
+                }
                 if (randFloat(seed) > p) {
                     break;
                 }

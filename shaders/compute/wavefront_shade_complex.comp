@@ -77,7 +77,8 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint currentOctantCounts[8];
     uint totalIntersectWorkgroups;
     uint secondaryRayCount;
-    uint pad[21];
+    uint activeMaterialSequenceCount;
+    uint pad[20];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -158,6 +159,11 @@ void main() {
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
+    bool doInlineShadow = false;
+    vec3 inlineShadowOrigin = vec3(0.0);
+    vec3 inlineShadowDir = vec3(0.0);
+    float inlineShadowDist = 0.0;
+    vec3 inlineShadowUnshadowed = vec3(0.0);
 
     if (inRange) {
         uint rayIdx = materialIndices[3u * pc.maxQueueCapacity + idx];
@@ -167,10 +173,14 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData.x;
-        uint primId = floatBitsToUint(hit.hitData.y);
-        vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
-        uint hitType = floatBitsToUint(hit.hitData.w);
+        float hitT = hit.hitData0.x;
+        uint matId = floatBitsToUint(hit.hitData0.y);
+        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
+        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
+        vec3 geomTan = unpackOct32(floatBitsToUint(hit.hitData1.x));
+        float tanSign = hit.hitData1.y;
+        uint primId = floatBitsToUint(hit.hitData1.z);
+        uint hitType = floatBitsToUint(hit.hitData1.w);
 
         vec3 throughput = state.throughputSeed.rgb;
         uint seed = floatBitsToUint(state.throughputSeed.w);
@@ -193,56 +203,21 @@ void main() {
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
-            vec3 hitNormal = vec3(0.0, 1.0, 0.0);
-            vec2 hitUv = vec2(0.0);
-            uint matId = 0u;
-            bool frontFace = true;
-
-            if (hitType == 0u) {
-                float u = hitBary.x;
-                float v = hitBary.y;
-                float w = 1.0 - u - v;
-
-                vec3 n0 = triangles[primId].v0.normal.xyz;
-                vec3 n1 = triangles[primId].v1.normal.xyz;
-                vec3 n2 = triangles[primId].v2.normal.xyz;
-                hitNormal = normalize(w * n0 + u * n1 + v * n2);
-
-                vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
-                vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
-                vec2 uv2 = vec2(triangles[primId].v2.position.w, triangles[primId].v2.normal.w);
-                hitUv = w * uv0 + u * uv1 + v * uv2;
-                matId = triangles[primId].materialId;
-
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
-
-                Material mat = materials[matId];
-                if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-                    vec4 tan0 = triangles[primId].v0.tangent;
-                    vec4 tan1 = triangles[primId].v1.tangent;
-                    vec4 tan2 = triangles[primId].v2.tangent;
-                    vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
-                    float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
-
-                    vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
-                    normalMap.xy *= mat.normalScale;
-                    normalMap = normalize(normalMap);
-
-                    geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
-                    vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
-                    mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
-                    hitNormal = normalize(tbn * normalMap);
-                }
-            } else if (hitType == 1u) {
-                Sphere sp = spheres[primId];
-                hitNormal = (hitPoint - sp.centerRadius.xyz) / sp.centerRadius.w;
-                matId = sp.materialId;
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
-            }
+            bool frontFace = dot(rayDir, hitNormal) < 0.0;
+            hitNormal = frontFace ? hitNormal : -hitNormal;
 
             Material mat = materials[matId];
+            if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                normalMap.xy *= mat.normalScale;
+                normalMap = normalize(normalMap);
+
+                geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
+                vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
+                mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
+                hitNormal = normalize(tbn * normalMap);
+            }
+
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
@@ -296,12 +271,14 @@ void main() {
                     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
                     vec3 clearcoatNormal = hitNormal;
-                    if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
-                        vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-                        vec3 cTan = normalize(cross(up, hitNormal));
-                        vec3 cBitan = cross(hitNormal, cTan);
-                        vec3 cNormMap = texture(sceneTextures[mat.clearcoatNormalTex - 1u], hitUv).rgb * 2.0 - 1.0;
-                        clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
+                    if (clearcoat > 0.001) {
+                        if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
+                            vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+                            vec3 cTan = normalize(cross(up, hitNormal));
+                            vec3 cBitan = cross(hitNormal, cTan);
+                            vec3 cNormMap = texture(sceneTextures[mat.clearcoatNormalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                            clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
+                        }
                     }
 
                     // KHR_materials_sheen
@@ -339,12 +316,15 @@ void main() {
                         float selectedLightDist = 0.0;
                         vec3 selectedLightEmission = vec3(0.0);
                         float selectedLightPdf = 1.0;
-                        vec3 selectedBrdf = vec3(0.0);
+                        float selectedLightSelectPdf = 1.0;
                         float selectedNdotL = 0.0;
-                        float selectedMisWeight = 1.0;
                         float selectedTarget = 0.0;
                         float totalWeightSum = 0.0;
                         bool hasCandidate = false;
+
+                        // Fast proxy luminance weight for RIS candidate selection:
+                        // correlates with surface response without computing GGX/Clearcoat/Sheen lobes in the loop
+                        vec3 proxyLumWeight = max(diffuseColor + F0, vec3(0.04)) * vec3(0.2126, 0.7152, 0.0722);
 
                         for (uint c = 0u; c < M; ++c) {
                             uint lightIdx = 0u;
@@ -394,51 +374,8 @@ void main() {
                             }
 
                             float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
-                            float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
-                            if (validLightSample && NdotL > 0.0 && NdotV > 0.0) {
-                                vec3 H = normalize(V + lightDir);
-                                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                                float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                                vec3 F = fresnelSchlickVec(VdotH, F0);
-                                float D = distributionGGX(NdotH, alphaRoughness);
-                                float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                                vec3 specBrdf = enableSpecular ? (D * Vis * F) : vec3(0.0);
-
-                                vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
-                                vec3 baseBrdf = diffBrdf + specBrdf;
-
-                                float diffPdf = NdotL * INV_PI;
-                                float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                                float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + baseSpecProb * specPdf;
-
-                                float misWeight = 1.0;
-                                if (uint(light.position.w) == 0u) {
-                                    float lightPdfEff = lightPdf * lightSelectPdf;
-                                    misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
-                                }
-
-                                if (clearcoat > 0.001 && enableSpecular) {
-                                    float NcDotH = clamp(dot(clearcoatNormal, H), 0.0, 1.0);
-                                    float NcDotL = clamp(dot(clearcoatNormal, lightDir), 0.0, 1.0);
-                                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
-                                    float Dc = distributionGGX(NcDotH, clearcoatAlpha);
-                                    float Gc = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
-                                    float Fc = fresnelSchlick(clamp(dot(V, H), 0.0, 1.0), 1.5) * clearcoat;
-                                    vec3 clearcoatBrdf = vec3(Dc * Gc * Fc);
-                                    baseBrdf = baseBrdf * (1.0 - Fc) + clearcoatBrdf;
-                                }
-
-                                if (length(sheenColor) > 1e-4) {
-                                    float D_sheen = evalSheenCharlie(NdotH, sheenRoughness);
-                                    float V_sheen = 1.0 / (4.0 * max(NdotL + NdotV - NdotL * NdotV, 1e-4));
-                                    vec3 sheenBrdf = sheenColor * (D_sheen * V_sheen);
-                                    float maxSheen = clamp(max(sheenColor.r, max(sheenColor.g, sheenColor.b)), 0.0, 1.0);
-                                    baseBrdf = baseBrdf * (1.0 - maxSheen) + sheenBrdf;
-                                }
-
-                                vec3 candidateContrib = baseBrdf * lightEmission * NdotL * misWeight;
-                                float target = dot(candidateContrib, vec3(0.2126, 0.7152, 0.0722));
+                            if (validLightSample && NdotL > 0.0) {
+                                float target = max(dot(lightEmission, proxyLumWeight) * NdotL, 1e-6);
                                 float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                                 float weight = target / sourcePdf;
 
@@ -449,9 +386,8 @@ void main() {
                                     selectedLightDist = lightDist;
                                     selectedLightEmission = lightEmission;
                                     selectedLightPdf = lightPdf;
-                                    selectedBrdf = baseBrdf;
+                                    selectedLightSelectPdf = lightSelectPdf;
                                     selectedNdotL = NdotL;
-                                    selectedMisWeight = misWeight;
                                     selectedTarget = target;
                                     hasCandidate = true;
                                 }
@@ -459,29 +395,71 @@ void main() {
                         }
 
                         if (hasCandidate && selectedTarget > 1e-6) {
-                            float risWeight = totalWeightSum / (float(M) * selectedTarget);
-                            vec3 contrib = selectedBrdf * selectedLightEmission * selectedNdotL * selectedMisWeight;
-                            secDirectL = contrib * risWeight;
-                            vec3 unshadowed = throughput * secDirectL;
+                            float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                            if (NdotV > 0.0) {
+                                vec3 H = normalize(V + selectedLightDir);
+                                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                                float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
-                            if (length(unshadowed) > 1e-5) {
-                                if (enableShadows) {
-                                    bool occluded = false;
-                                    if (bounce == 0u && enableInlineShadows && pc.useHardwareRT == 1u) {
-                                        occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
-                                                                        (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                        if (!occluded) {
-                                            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), 0.0));
+                                vec3 F = fresnelSchlickVec(VdotH, F0);
+                                float D = distributionGGX(NdotH, alphaRoughness);
+                                float Vis = visibilitySmithGGXCorrelated(selectedNdotL, NdotV, alphaRoughness);
+                                vec3 specBrdf = enableSpecular ? (D * Vis * F) : vec3(0.0);
+
+                                vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                                vec3 baseBrdf = diffBrdf + specBrdf;
+
+                                float diffPdf = selectedNdotL * INV_PI;
+                                float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
+                                float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + baseSpecProb * specPdf;
+
+                                float misWeight = 1.0;
+                                Light selLight = lights[selectedLightIdx];
+                                if (uint(selLight.position.w) == 0u) {
+                                    float lightPdfEff = selectedLightPdf * selectedLightSelectPdf;
+                                    misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
+                                }
+
+                                if (clearcoat > 0.001 && enableSpecular) {
+                                    float NcDotH = clamp(dot(clearcoatNormal, H), 0.0, 1.0);
+                                    float NcDotL = clamp(dot(clearcoatNormal, selectedLightDir), 0.0, 1.0);
+                                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
+                                    float Dc = distributionGGX(NcDotH, clearcoatAlpha);
+                                    float Gc = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
+                                    float Fc = fresnelSchlick(clamp(dot(V, H), 0.0, 1.0), 1.5) * clearcoat;
+                                    vec3 clearcoatBrdf = vec3(Dc * Gc * Fc);
+                                    baseBrdf = baseBrdf * (1.0 - Fc) + clearcoatBrdf;
+                                }
+
+                                if (length(sheenColor) > 1e-4) {
+                                    float D_sheen = evalSheenCharlie(NdotH, sheenRoughness);
+                                    float V_sheen = 1.0 / (4.0 * max(selectedNdotL + NdotV - selectedNdotL * NdotV, 1e-4));
+                                    vec3 sheenBrdf = sheenColor * (D_sheen * V_sheen);
+                                    float maxSheen = clamp(max(sheenColor.r, max(sheenColor.g, sheenColor.b)), 0.0, 1.0);
+                                    baseBrdf = baseBrdf * (1.0 - maxSheen) + sheenBrdf;
+                                }
+
+                                float risWeight = totalWeightSum / (float(M) * selectedTarget);
+                                vec3 contrib = baseBrdf * selectedLightEmission * selectedNdotL * misWeight;
+                                secDirectL = contrib * risWeight;
+                                vec3 unshadowed = throughput * secDirectL;
+
+                                if (length(unshadowed) > 1e-5) {
+                                    if (enableShadows) {
+                                        if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                            doInlineShadow = true;
+                                            inlineShadowOrigin = hitPoint + hitNormal * EPSILON;
+                                            inlineShadowDir = selectedLightDir;
+                                            inlineShadowDist = selectedLightDist;
+                                            inlineShadowUnshadowed = unshadowed;
+                                        } else {
+                                            hasShadowRay = true;
+                                            shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
+                                            shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
                                         }
                                     } else {
-                                        hasShadowRay = true;
-                                        shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                        shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                        accumRadiance += unshadowed;
                                     }
-                                } else {
-                                    accumRadiance += unshadowed;
                                 }
                             }
                         }
@@ -566,13 +544,17 @@ void main() {
                         }
                     }
 
-                    // Russian roulette
+                    // Adaptive Russian roulette
                     float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
                     if (pathLum < 0.001) {
                         pathTerminated = true;
                     } else if (bounce >= 1u) {
                         float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float p = clamp(pathLum, minP, 0.95);
+                        float maxP = 0.95;
+                        float p = clamp(pathLum, minP, maxP);
+                        if (bounce >= 2u && pathLum >= 0.35) {
+                            p = clamp(pathLum * 0.85, minP, 0.90);
+                        }
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {
@@ -591,6 +573,16 @@ void main() {
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            }
+
+            if (doInlineShadow) {
+                bool occluded = traceShadowRayInline(inlineShadowOrigin, inlineShadowDir, inlineShadowDist,
+                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                if (!occluded) {
+                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, inlineShadowUnshadowed, seed), 0.0));
+                }
             }
         }
     }

@@ -12,6 +12,7 @@ namespace pathways {
 struct QueueFamilyIndices {
     uint32_t graphicsComputeFamily = UINT32_MAX;
     uint32_t transferFamily = UINT32_MAX;
+    uint32_t asyncComputeFamily = UINT32_MAX;
 
     bool isComplete() const {
         return graphicsComputeFamily != UINT32_MAX;
@@ -62,8 +63,14 @@ public:
     VmaAllocator getAllocator() const { return m_allocator; }
     VkQueue getGraphicsQueue() const { return m_graphicsQueue; }
     VkQueue getTransferQueue() const { return m_transferQueue; }
+    VkQueue getAsyncComputeQueue() const { return m_asyncComputeQueue; }
     uint32_t getGraphicsQueueFamily() const { return m_queueIndices.graphicsComputeFamily; }
     uint32_t getTransferQueueFamily() const { return m_queueIndices.transferFamily; }
+    uint32_t getAsyncComputeQueueFamily() const { return m_queueIndices.asyncComputeFamily; }
+    bool hasDedicatedAsyncCompute() const {
+        return m_asyncComputeQueue != VK_NULL_HANDLE &&
+               m_queueIndices.asyncComputeFamily != m_queueIndices.graphicsComputeFamily;
+    }
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
@@ -119,6 +126,7 @@ private:
 
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     VkQueue m_transferQueue = VK_NULL_HANDLE;
+    VkQueue m_asyncComputeQueue = VK_NULL_HANDLE;
     QueueFamilyIndices m_queueIndices;
 
     VkPhysicalDeviceProperties m_deviceProperties{};

@@ -113,6 +113,7 @@ struct Config {
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     uint32_t tile_size = 64;
     uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
+    bool async_dgc_preprocess = true; // Dedicated async compute queue DGC preprocessing [Default: true, disable via --no-async-preprocess]
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

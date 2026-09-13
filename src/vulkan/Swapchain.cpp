@@ -18,9 +18,9 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
 
-    Logger::info("Surface formats supported by display ({} available):", formatCount);
+    Logger::debug("Surface formats supported by display ({} available):", formatCount);
     for (const auto& f : formats) {
-        Logger::info("  Format: {}, ColorSpace: {}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
+        Logger::debug("  Format: {}, ColorSpace: {}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
     }
 
     bool chosen = false;

@@ -208,7 +208,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
-void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
+void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex) {
     if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
 
     VkBufferMemoryBarrier2 bufferBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
@@ -219,8 +219,13 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd) {
     bufferBarrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
                                   VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     bufferBarrier.buffer = m_preprocessBuffer->getBuffer();
-    bufferBarrier.offset = 0;
-    bufferBarrier.size = VK_WHOLE_SIZE;
+    if (sliceIndex != UINT32_MAX && (static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize < m_preprocessBuffer->getSize())) {
+        bufferBarrier.offset = static_cast<VkDeviceSize>(sliceIndex) * m_sliceSize;
+        bufferBarrier.size = m_sliceSize;
+    } else {
+        bufferBarrier.offset = 0;
+        bufferBarrier.size = VK_WHOLE_SIZE;
+    }
 
     VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.bufferMemoryBarrierCount = 1;

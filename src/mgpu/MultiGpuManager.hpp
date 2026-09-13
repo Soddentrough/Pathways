@@ -8,6 +8,7 @@
 #include "core/Config.hpp"
 #include "rt/AccelerationStructure.hpp"
 #include "rt/RTPipeline.hpp"
+#include "rt/WavefrontPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -73,6 +74,7 @@ struct GpuDeviceNode {
     std::array<VkDescriptorSet, NUM_IN_FLIGHT> rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout rtpPipelineLayout = VK_NULL_HANDLE;
     std::unique_ptr<RTPipeline> rtpKhrPipeline;
+    std::unique_ptr<WavefrontPipeline> wavefrontPipeline;
 
     // Secondary FidelityFX Shadow Denoiser Resources & Pipelines
     std::unique_ptr<Image> directLightImage;
@@ -213,6 +215,7 @@ private:
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
     void updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode);
+    void updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode);
 
     bool initSharedP2PBuffer(VkDeviceSize bufferSize);
     void destroySharedP2PBuffer();

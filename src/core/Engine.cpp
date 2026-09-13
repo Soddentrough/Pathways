@@ -766,27 +766,45 @@ void Engine::initScene() {
     Logger::info("Scene textures loaded: {} texture(s).", m_sceneTextures.size());
 }
 
-bool Engine::loadScene(const std::string& filepath) {
+void Engine::requestSceneChange(const std::string& filepath) {
+    if (m_isSceneLoading.load()) {
+        Logger::warn("Scene loading already in progress; ignoring request for '{}'", filepath);
+        return;
+    }
+    m_loadingScenePath = filepath;
+    m_loadingSceneName = std::filesystem::path(filepath).stem().string();
+    if (m_loadingSceneName.empty() || filepath == "__procedural_cornell_box__") {
+        m_loadingSceneName = "Cornell Box";
+    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+        m_loadingSceneName = "Many-Lights Cornell Box";
+    }
+    m_isSceneLoading.store(true);
+    Logger::info("Initiating asynchronous scene load for '{}'...", filepath);
+
+    m_sceneLoadingFuture = std::async(std::launch::async, [filepath]() -> SceneData {
+        if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+            Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
+            return ProceduralScene::createCornellBox();
+        } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+            Logger::info("Dynamic Scene Switch: Loading Procedural Many-Lights Cornell Box (64 Lights)...");
+            return ProceduralScene::createManyLightsScene();
+        } else {
+            Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
+            return GltfLoader::loadSceneData(filepath);
+        }
+    });
+}
+
+bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
+    if (newScene.triangles.empty() && newScene.spheres.empty()) {
+        Logger::warn("Loaded scene '{}' contains no renderable geometry! Keeping current scene.", filepath);
+        return false;
+    }
+
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
     if (m_mgpu && m_mgpu->getSecondaryContext()) {
         vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
-    }
-
-    SceneData newScene;
-    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
-        Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
-        newScene = ProceduralScene::createCornellBox();
-    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
-        Logger::info("Dynamic Scene Switch: Loading Procedural Many-Lights Cornell Box (64 Lights)...");
-        newScene = ProceduralScene::createManyLightsScene();
-    } else {
-        Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
-        newScene = GltfLoader::loadSceneData(filepath);
-    }
-    if (newScene.triangles.empty() && newScene.spheres.empty()) {
-        Logger::warn("Loaded scene '{}' contains no renderable geometry! Keeping current scene.", filepath);
-        return false;
     }
 
     m_sceneData = std::move(newScene);
@@ -1032,6 +1050,21 @@ bool Engine::loadScene(const std::string& filepath) {
 
     Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
     return true;
+}
+
+bool Engine::loadScene(const std::string& filepath) {
+    SceneData newScene;
+    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+        Logger::info("Loading Procedural Cornell Box...");
+        newScene = ProceduralScene::createCornellBox();
+    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+        Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
+        newScene = ProceduralScene::createManyLightsScene();
+    } else {
+        Logger::info("Loading glTF scene '{}'...", filepath);
+        newScene = GltfLoader::loadSceneData(filepath);
+    }
+    return applyLoadedScene(std::move(newScene), filepath);
 }
 
 void Engine::updateSceneTransparencyFlag() {
@@ -2905,7 +2938,7 @@ void Engine::renderFrame() {
         m_lastSecGpuMs = secGpuMs;
         m_lastTonemapMs = gpuTonemapMs;
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
-        if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
             if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
                 m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                 static int wfProfCount = 0;
@@ -2944,18 +2977,30 @@ void Engine::renderFrame() {
         }
     }
 
+    // Check if background asynchronous scene loading completed
+    if (m_isSceneLoading.load()) {
+        if (m_sceneLoadingFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            SceneData loadedData = m_sceneLoadingFuture.get();
+            applyLoadedScene(std::move(loadedData), m_loadingScenePath);
+            m_isSceneLoading.store(false);
+            m_loadingScenePath.clear();
+            m_loadingSceneName.clear();
+        }
+    }
+
+    if (m_pendingSceneChange) {
+        std::string targetPath = m_pendingScenePath;
+        m_pendingSceneChange = false;
+        requestSceneChange(targetPath);
+    }
+
     // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
-    if (m_pendingSceneChange || m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
+    if (m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
         VkDevice dev = m_context->getDevice();
         VmaAllocator alloc = m_context->getAllocator();
         vkDeviceWaitIdle(dev);
         if (m_mgpu && m_mgpu->getSecondaryContext()) {
             vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
-        }
-
-        if (m_pendingSceneChange) {
-            loadScene(m_pendingScenePath);
-            m_pendingSceneChange = false;
         }
 
         if (m_pendingAccumFormatChange) {
@@ -3455,6 +3500,8 @@ void Engine::renderFrame() {
         uint32_t dispatchHeight = (m_config.height + 1) / 2;
         secAccumHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
         uint32_t mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
+        uint32_t primSpp = activeSpp;
+        uint32_t secSpp = 0u;
 
         uboSec = ubo;
 
@@ -3477,10 +3524,10 @@ void Engine::renderFrame() {
             dispatchHeight = m_config.height;
             secAccumHistory = 0u; // Secondary only renders current frame's delta; Primary accumulates
 
-            // Split SPP: e.g. spp = 2 -> prim: 1, sec: 1; spp = 4 -> prim: 2, sec: 2
+            // Split SPP evenly: e.g. spp = 2 -> prim: 1, sec: 1; spp = 16 -> prim: 8, sec: 8
             uint32_t currentTotalSpp = activeSpp;
-            uint32_t primSpp = (currentTotalSpp + 1) / 2;
-            uint32_t secSpp = currentTotalSpp / 2;
+            primSpp = (currentTotalSpp + 1) / 2;
+            secSpp = currentTotalSpp / 2;
             if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
                 primSpp = m_governor->getState().primSpp;
                 secSpp = m_governor->getState().secSpp;
@@ -3497,8 +3544,12 @@ void Engine::renderFrame() {
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
-            // Re-upload primary camera UBO with primSpp
-            m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
+            uint32_t totalCompositeSpp = (primSpp + secSpp);
+            CameraUniform uboPrim = ubo;
+            if (totalCompositeSpp > 0) {
+                uboPrim.spp = totalCompositeSpp;
+            }
+            m_cameraUBOs[m_currentFrame]->copyFrom(&uboPrim, sizeof(CameraUniform));
         }
 
         if (m_mgpu) {
@@ -3512,7 +3563,7 @@ void Engine::renderFrame() {
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
-        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (ubo.spp + uboSec.spp) : 0u;
+        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : 0u;
 
         // 1. Launch secondary GPU concurrently for current frame
         if (!accumReachedCutoff) {
@@ -3553,18 +3604,78 @@ void Engine::renderFrame() {
             m_numOpaqueTriangles, 0u
         };
 
-        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) or Wavefront Pipeline
         if (!accumReachedCutoff) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-        vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-        m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
-        if (m_governor) {
-            m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
-        }
+            bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
+            uint32_t primDispatchSpp = (activeMode == MultiGpuMode::SampleParallel) ? primSpp : activeSpp;
+            if (useWavefront) {
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->resetCounters(cmd);
+                }
 
-        if (m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
+                bool needAccumReset = accumReset || !m_config.progressive_accumulation;
+                if (needAccumReset && m_accumImage) {
+                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+
+                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.image = m_accumImage->getImage();
+                    clearBarrier.subresourceRange = clearRange;
+
+                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    clearDep.imageMemoryBarrierCount = 1;
+                    clearDep.pImageMemoryBarriers = &clearBarrier;
+                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                }
+
+                WavefrontSceneData wfSceneData{};
+                wfSceneData.numTriangles = m_numTriangles;
+                wfSceneData.numSpheres = m_numSpheres;
+                wfSceneData.numMaterials = m_numMaterials;
+                wfSceneData.numLights = m_numLights;
+                wfSceneData.hasEnvMap = hasEnvMap;
+                wfSceneData.envMapIntensity = envIntensity;
+                wfSceneData.useHardwareRT = useHwRT;
+                wfSceneData.frameIndex = m_frameIndex;
+                wfSceneData.useMorton = 1u;
+                wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+                wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+                wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+                wfSceneData.cameraFlags = flags;
+                wfSceneData.enableNrc = m_config.enable_nrc;
+                wfSceneData.nrcBounce = m_config.nrc_bounce;
+                wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
+                                                 primDispatchSpp, activeBounces, wfSceneData);
+
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
+                                                  m_sceneData.boundsMin, m_sceneData.boundsMax);
+                    m_nrcManager->recordTraining(cmd, m_frameIndex,
+                                                 m_sceneData.boundsMin, m_sceneData.boundsMax,
+                                                 1e-3f, 1024);
+                }
+            } else {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+                VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+                vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+                m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
+            }
+            if (m_governor) {
+                m_governor->recordDispatch(m_currentFrame, primDispatchSpp, activeBounces);
+            }
+
+            if (!useWavefront && m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
             VkMemoryBarrier2 rtToClassifyBarrier{};
             rtToClassifyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
             rtToClassifyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;

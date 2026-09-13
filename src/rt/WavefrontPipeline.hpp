@@ -151,7 +151,7 @@ private:
     std::unique_ptr<Buffer> m_rayGeomQueueB;  // 32B RayGeometry
     std::unique_ptr<Buffer> m_rayStateQueueA; // 32B RayState
     std::unique_ptr<Buffer> m_rayStateQueueB; // 32B RayState
-    std::unique_ptr<Buffer> m_rayHitQueue;    // 16B RayHit
+    std::unique_ptr<Buffer> m_rayHitQueue;    // 32B RayHit
     std::unique_ptr<Buffer> m_materialIndexQueue; // 4B index * 4 archetypes (Index-Based Material Queues)
     std::unique_ptr<Buffer> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
     std::unique_ptr<Buffer> m_shadowQueue;    // 32B PackedShadowRay

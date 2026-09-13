@@ -9,6 +9,8 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <filesystem>
 #include <cstring>
+#include <thread>
+#include <atomic>
 
 namespace pathways {
 
@@ -59,9 +61,11 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
         }
     }
 
-    // 0. Parse Images and Textures
+    // 0. Parse Images and Textures in parallel across CPU worker threads
     std::filesystem::path sceneDir = std::filesystem::path(filepath).parent_path();
-    for (size_t t = 0; t < data->textures_count; ++t) {
+    outScene.textures.resize(data->textures_count);
+
+    auto loadTextureWorker = [&](size_t t) {
         const auto& tex = data->textures[t];
         TextureData texData{};
         texData.isSrgb = (t < textureIsSrgb.size()) ? textureIsSrgb[t] : false;
@@ -85,7 +89,31 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 stbi_image_free(rawPixels);
             }
         }
-        outScene.textures.push_back(std::move(texData));
+        outScene.textures[t] = std::move(texData);
+    };
+
+    uint32_t numWorkers = std::min(16u, std::max(1u, std::thread::hardware_concurrency()));
+    if (data->textures_count <= 1 || numWorkers <= 1) {
+        for (size_t t = 0; t < data->textures_count; ++t) {
+            loadTextureWorker(t);
+        }
+    } else {
+        uint32_t threadCount = std::min<uint32_t>(numWorkers, static_cast<uint32_t>(data->textures_count));
+        std::vector<std::thread> workers;
+        workers.reserve(threadCount);
+        std::atomic<size_t> nextIndex{0};
+        for (uint32_t id = 0; id < threadCount; ++id) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    size_t t = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                    if (t >= data->textures_count) break;
+                    loadTextureWorker(t);
+                }
+            });
+        }
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
     }
 
     // 1. Parse Materials

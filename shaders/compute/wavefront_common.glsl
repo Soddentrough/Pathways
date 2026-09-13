@@ -146,12 +146,17 @@ struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
-// 16-byte cache-line aligned ray hit (written by intersect/classify, read by shade)
+// 32-byte cache-line aligned pre-interpolated ray hit (written by intersect/classify, read by shade)
 struct RayHit {
-    vec4 hitData;
+    vec4 hitData0;
     // x: hitT (float)
-    // y: uintBitsToFloat(primitiveIndex)
-    // z: uintBitsToFloat(packHalf2x16(barycentrics))
+    // y: uintBitsToFloat(matId)
+    // z: uintBitsToFloat(packOct32(hitNormal))
+    // w: uintBitsToFloat(packHalf2x16(hitUv))
+    vec4 hitData1;
+    // x: uintBitsToFloat(packOct32(geomTangent.xyz))
+    // y: geomTangent.w (tangent sign)
+    // z: uintBitsToFloat(primitiveIndex)
     // w: uintBitsToFloat(hitType) (0: triangle, 1: sphere, 2: miss)
 };
 

@@ -185,8 +185,8 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
     m_rayStateQueueA = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     m_rayStateQueueB = std::make_unique<Buffer>(m_allocator, stateQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // RayHit = 16 bytes
-    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
+    // RayHit = 32 bytes (pre-interpolated normal, UV, tangent, material)
+    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
     m_rayHitQueue = std::make_unique<Buffer>(m_allocator, hitQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
@@ -300,9 +300,13 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorBufferInfo matInfo{ matBuffer, 0, matSize };
     VkDescriptorBufferInfo lightInfo{ lightBuffer, 0, lightSize };
 
-    VkDescriptorBufferInfo nrcQueryInfo{ nrcQueryBuffer, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo nrcTrainInfo{ nrcTrainBuffer, 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo nrcCountersInfo{ nrcCountersBuffer, 0, VK_WHOLE_SIZE };
+    VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_queueCounters->getBuffer();
+    VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_queueCounters->getBuffer();
+    VkBuffer actualNrcCounters = (nrcCountersBuffer != VK_NULL_HANDLE) ? nrcCountersBuffer : m_queueCounters->getBuffer();
+
+    VkDescriptorBufferInfo nrcQueryInfo{ actualNrcQuery, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo nrcTrainInfo{ actualNrcTrain, 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo nrcCountersInfo{ actualNrcCounters, 0, VK_WHOLE_SIZE };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -336,15 +340,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
             writes.push_back(texWrite);
         }
 
-        if (nrcQueryBuffer != VK_NULL_HANDLE) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcQueryInfo, nullptr });
-        }
-        if (nrcTrainBuffer != VK_NULL_HANDLE) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcTrainInfo, nullptr });
-        }
-        if (nrcCountersBuffer != VK_NULL_HANDLE) {
-            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcCountersInfo, nullptr });
-        }
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcQueryInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcTrainInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nrcCountersInfo, nullptr });
 
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
@@ -671,12 +669,14 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
+                        uint32_t sliceIdx = DGCManager::getSliceIndex(frameSlot, b);
+                        VkDeviceAddress seqCountAddr = m_queueCounters ? (m_queueCounters->getDeviceAddress(m_device) + 172) : 0;
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes);
-                            m_dgcManager->recordPreprocessBarrier(cmd);
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, 0, numMatPipes, true /* isPreprocessed */);
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr);
+                            m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr);
                         } else {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, 0, numMatPipes, false /* isPreprocessed */);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr);
                         }
                     } else {
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);

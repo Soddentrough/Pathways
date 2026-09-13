@@ -29,13 +29,19 @@ public:
     // [0] classify, [1] intersect, [2] shade, [3] shadow, [4] resolve
     void initExecutionSet(const std::vector<VkPipeline>& pipelines);
 
+    static constexpr uint32_t NUM_SLICES = 16;
+    static inline uint32_t getSliceIndex(uint32_t frameSlot, uint32_t bounce, uint32_t passIndex = 0) {
+        // Double-buffered frameSlot (0..1) with up to 8 bounces, partitioned per pass
+        return ((frameSlot * 8 + bounce) * 1 + passIndex) % NUM_SLICES;
+    }
+
     // Asynchronous preprocessing of indirect commands
     void recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                           VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0,
                           uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
 
-    // Synchronization barrier between preprocessing and execution
-    void recordPreprocessBarrier(VkCommandBuffer cmd);
+    // Synchronization barrier between preprocessing and execution (sliceIndex == UINT32_MAX synchronizes entire buffer)
+    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,

@@ -27,6 +27,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <future>
 
 namespace pathways {
 
@@ -48,6 +49,10 @@ public:
     void setMgpuMode(MultiGpuMode mode);
 
     bool loadScene(const std::string& filepath);
+    bool applyLoadedScene(SceneData newScene, const std::string& filepath);
+    void requestSceneChange(const std::string& filepath);
+    bool isSceneLoading() const { return m_isSceneLoading.load(); }
+    const std::string& getLoadingSceneName() const { return m_loadingSceneName; }
     const std::vector<SceneEntry>& getAvailableScenes() const { return m_availableScenes; }
     int getCurrentSceneIndex() const { return m_currentSceneIndex; }
     std::string getActiveSceneName() const;
@@ -242,6 +247,10 @@ private:
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";
+    std::future<SceneData> m_sceneLoadingFuture;
+    std::atomic<bool> m_isSceneLoading{false};
+    std::string m_loadingScenePath = "";
+    std::string m_loadingSceneName = "";
     bool m_pendingMgpuModeChange = false;
     MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
     bool m_pendingAccumFormatChange = false;
