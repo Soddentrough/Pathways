@@ -12,6 +12,8 @@
     #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
+    #include <dxgi1_6.h>
+    #include <wrl/client.h>
 #endif
 
 namespace pathways {
@@ -102,6 +104,52 @@ Window::Window(const Config& config)
         }
         m_displayInfo.isPortrait = (m_displayInfo.displayAspect < 1.0f);
         m_displayInfo.isUltraWide = (m_displayInfo.displayAspect > 2.0f);
+
+#ifdef _WIN32
+        // Query DXGI for native HDR display capabilities and exact luminance limits
+        Microsoft::WRL::ComPtr<IDXGIFactory1> dxgiFactory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory)))) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            for (UINT a = 0; dxgiFactory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+                Microsoft::WRL::ComPtr<IDXGIOutput> output;
+                for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+                    Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+                    if (SUCCEEDED(output.As(&output6))) {
+                        DXGI_OUTPUT_DESC1 desc1{};
+                        if (SUCCEEDED(output6->GetDesc1(&desc1)) && desc1.AttachedToDesktop) {
+                            if (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                                m_displayInfo.isDesktopHdr = true;
+                            }
+                            if (desc1.BitsPerColor >= 10 || desc1.MaxLuminance > 300.0f) {
+                                m_displayInfo.isDisplayHdrCapable = true;
+                            }
+                            if (desc1.MaxLuminance > 0.0f) {
+                                m_displayInfo.maxLuminanceNits = desc1.MaxLuminance;
+                                m_displayInfo.minLuminanceNits = desc1.MinLuminance;
+                                m_displayInfo.maxFullFrameLuminanceNits = desc1.MaxFullFrameLuminance;
+                                m_displayInfo.redPrimary[0] = desc1.RedPrimary[0];
+                                m_displayInfo.redPrimary[1] = desc1.RedPrimary[1];
+                                m_displayInfo.greenPrimary[0] = desc1.GreenPrimary[0];
+                                m_displayInfo.greenPrimary[1] = desc1.GreenPrimary[1];
+                                m_displayInfo.bluePrimary[0] = desc1.BluePrimary[0];
+                                m_displayInfo.bluePrimary[1] = desc1.BluePrimary[1];
+                                m_displayInfo.whitePoint[0] = desc1.WhitePoint[0];
+                                m_displayInfo.whitePoint[1] = desc1.WhitePoint[1];
+                            }
+                            m_displayInfo.hmonitor = static_cast<void*>(desc1.Monitor);
+                            Logger::info("DXGI Display Output: Desktop HDR: {}, HDR Capable: {}, Peak: {:.1f} nits, Min: {:.4f} nits (ColorSpace: {})",
+                                         m_displayInfo.isDesktopHdr ? "ACTIVE" : "INACTIVE",
+                                         m_displayInfo.isDisplayHdrCapable ? "YES" : "NO",
+                                         m_displayInfo.maxLuminanceNits, m_displayInfo.minLuminanceNits,
+                                         static_cast<int>(desc1.ColorSpace));
+                            break;
+                        }
+                    }
+                }
+                if (m_displayInfo.isDisplayHdrCapable) break;
+            }
+        }
+#endif
     }
 
     // 2. Select Sensible Window Bounds if user did not pass explicit --width or --height
@@ -158,6 +206,16 @@ Window::Window(const Config& config)
     if (!m_window) {
         throw std::runtime_error(std::string("Failed to create SDL3 window: ") + SDL_GetError());
     }
+
+#ifdef _WIN32
+    HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(m_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (hwnd) {
+        HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (hmon) {
+            m_displayInfo.hmonitor = static_cast<void*>(hmon);
+        }
+    }
+#endif
 
     // Set application window icon
     const std::vector<std::string> iconSearchPaths = {

@@ -12,11 +12,17 @@ enum class HdrDisplayMode : uint32_t {
     HDR10 = 2  // High Dynamic Range HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ)
 };
 
+class VulkanContext;
+struct DisplayInfo;
+
 class Swapchain {
 public:
     Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
               uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
-              bool enableHdr = true);
+              bool enableHdr = true, bool isFullscreen = false,
+              const VulkanContext* context = nullptr,
+              const DisplayInfo* displayInfo = nullptr,
+              float peakNits = 1000.0f, float paperWhiteNits = 200.0f);
     ~Swapchain();
 
     VkSwapchainKHR getSwapchain() const { return m_swapchain; }
@@ -34,10 +40,15 @@ public:
     VkColorSpaceKHR getColorSpace() const { return m_colorSpace; }
     const char* getColorSpaceName() const;
     const char* getFormatName() const;
+    bool isExclusiveModeAcquired() const { return m_exclusiveModeAcquired; }
+
+    void setHdrMetadata(float peakNits, float paperWhiteNits, float minNits, const DisplayInfo* displayInfo = nullptr);
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
+    const VulkanContext* m_context = nullptr;
+    bool m_exclusiveModeAcquired = false;
     std::vector<VkImage> m_images;
     std::vector<VkImageView> m_imageViews;
     VkFormat m_imageFormat = VK_FORMAT_B8G8R8A8_UNORM;

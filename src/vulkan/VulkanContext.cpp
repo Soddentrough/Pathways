@@ -90,6 +90,7 @@ void VulkanContext::createInstance(const Config& config) {
         instanceExtensions.push_back("VK_KHR_surface");
 #ifdef _WIN32
         instanceExtensions.push_back("VK_KHR_win32_surface");
+        instanceExtensions.push_back("VK_KHR_get_surface_capabilities2");
 #else
         instanceExtensions.push_back("VK_KHR_wayland_surface");
         instanceExtensions.push_back("VK_KHR_xcb_surface");
@@ -324,6 +325,14 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
             m_hasCooperativeMatrix = true;
         }
+        if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
+            m_hasHdrMetadata = true;
+        }
+#ifdef _WIN32
+        if (std::strcmp(ext.extensionName, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME) == 0) {
+            m_hasFullScreenExclusive = true;
+        }
+#endif
     }
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
@@ -603,6 +612,14 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     std::vector<const char*> deviceExtensions;
     if (!config.headless) {
         deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        if (m_hasHdrMetadata) {
+            deviceExtensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+        }
+#ifdef _WIN32
+        if (m_hasFullScreenExclusive) {
+            deviceExtensions.push_back(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+        }
+#endif
     }
     if (m_hasRayTracing) {
         deviceExtensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -753,6 +770,15 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         pfnGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryFdKHR");
         pfnGetMemoryFdPropertiesKHR = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryFdPropertiesKHR");
     }
+    if (!config.headless && m_hasHdrMetadata) {
+        pfnVkSetHdrMetadataEXT = (PFN_vkSetHdrMetadataEXT)vkGetDeviceProcAddr(m_device, "vkSetHdrMetadataEXT");
+    }
+#ifdef _WIN32
+    if (!config.headless && m_hasFullScreenExclusive) {
+        pfnVkAcquireFullScreenExclusiveModeEXT = (PFN_vkAcquireFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(m_device, "vkAcquireFullScreenExclusiveModeEXT");
+        pfnVkReleaseFullScreenExclusiveModeEXT = (PFN_vkReleaseFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(m_device, "vkReleaseFullScreenExclusiveModeEXT");
+    }
+#endif
 }
 
 void VulkanContext::initVMA() {

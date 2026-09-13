@@ -1,6 +1,18 @@
 #pragma once
 
-#include <vulkan/vulkan.h>
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
+    #include <windows.h>
+    #include <vulkan/vulkan.h>
+    #include <vulkan/vulkan_win32.h>
+#else
+    #include <vulkan/vulkan.h>
+#endif
 #include "vk_mem_alloc.h"
 #include "core/Config.hpp"
 #include <vector>
@@ -97,6 +109,13 @@ public:
     bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
     bool hasDgcExecutionSet() const { return m_hasDgcExecutionSet; }
     bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
+    bool hasHdrMetadata() const { return m_hasHdrMetadata; }
+    bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
+    PFN_vkSetHdrMetadataEXT getSetHdrMetadataEXT() const { return pfnVkSetHdrMetadataEXT; }
+#ifdef _WIN32
+    PFN_vkAcquireFullScreenExclusiveModeEXT getAcquireFullScreenExclusiveModeEXT() const { return pfnVkAcquireFullScreenExclusiveModeEXT; }
+    PFN_vkReleaseFullScreenExclusiveModeEXT getReleaseFullScreenExclusiveModeEXT() const { return pfnVkReleaseFullScreenExclusiveModeEXT; }
+#endif
     PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFdKHR = nullptr;
     PFN_vkImportSemaphoreFdKHR pfnImportSemaphoreFdKHR = nullptr;
     PFN_vkGetMemoryFdKHR pfnGetMemoryFdKHR = nullptr;
@@ -143,6 +162,13 @@ private:
     bool m_hasExternalSemaphoreFd = false;
     bool m_hasDgcExecutionSet = false;
     bool m_hasCooperativeMatrix = false;
+    bool m_hasHdrMetadata = false;
+    bool m_hasFullScreenExclusive = false;
+    PFN_vkSetHdrMetadataEXT pfnVkSetHdrMetadataEXT = nullptr;
+#ifdef _WIN32
+    PFN_vkAcquireFullScreenExclusiveModeEXT pfnVkAcquireFullScreenExclusiveModeEXT = nullptr;
+    PFN_vkReleaseFullScreenExclusiveModeEXT pfnVkReleaseFullScreenExclusiveModeEXT = nullptr;
+#endif
     PciLinkInfo m_pciLinkInfo;
 
     static uint32_t s_validationErrors;

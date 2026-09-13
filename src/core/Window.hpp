@@ -21,6 +21,16 @@ struct DisplayInfo {
     float windowAspect = 16.0f / 9.0f;
     bool isPortrait = false;
     bool isUltraWide = false;
+    bool isDesktopHdr = false;
+    bool isDisplayHdrCapable = false;
+    float maxLuminanceNits = 1000.0f;
+    float minLuminanceNits = 0.001f;
+    float maxFullFrameLuminanceNits = 800.0f;
+    float redPrimary[2] = { 0.680f, 0.320f };
+    float greenPrimary[2] = { 0.265f, 0.690f };
+    float bluePrimary[2] = { 0.150f, 0.060f };
+    float whitePoint[2] = { 0.3127f, 0.3290f };
+    void* hmonitor = nullptr; // HMONITOR on Windows
 };
 
 class Window {

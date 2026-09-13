@@ -131,7 +131,14 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     if (!m_config.headless && m_window) {
         m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
+        // Auto-adapt peak luminance to native display capabilities if not customized by user
+        if (m_config.hdr_peak_nits == 1000.0f && m_window->getDisplayInfo().isDisplayHdrCapable &&
+            m_window->getDisplayInfo().maxLuminanceNits > 0.0f) {
+            m_config.hdr_peak_nits = m_window->getDisplayInfo().maxLuminanceNits;
+        }
+
         m_surface = m_window->createSurface(m_context->getInstance());
+
         m_swapchain = std::make_unique<Swapchain>(
             m_context->getDevice(),
             m_context->getPhysicalDevice(),
@@ -139,7 +146,12 @@ Engine::Engine(const Config& config) : m_config(config) {
             m_window->getWidth(),
             m_window->getHeight(),
             m_context->getGraphicsQueueFamily(),
-            m_config.enable_hdr
+            m_config.enable_hdr,
+            m_window->isFullscreen(),
+            m_context.get(),
+            &m_window->getDisplayInfo(),
+            m_config.hdr_peak_nits,
+            m_config.hdr_paper_white_nits
         );
         m_config.width = m_swapchain->getExtent().width;
         m_config.height = m_swapchain->getExtent().height;
@@ -4913,7 +4925,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_config.width,
         m_config.height,
         m_context->getGraphicsQueueFamily(),
-        m_config.enable_hdr
+        m_config.enable_hdr,
+        m_window ? m_window->isFullscreen() : false,
+        m_context.get(),
+        m_window ? &m_window->getDisplayInfo() : nullptr,
+        m_config.hdr_peak_nits,
+        m_config.hdr_paper_white_nits
     );
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;

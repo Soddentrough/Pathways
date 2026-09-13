@@ -223,6 +223,10 @@ target_link_libraries(pathways
     ZLIB::ZLIB
 )
 
+if(WIN32)
+    target_link_libraries(pathways PRIVATE dxgi)
+endif()
+
 if(UNIX)
     target_link_libraries(pathways PRIVATE m)
 endif()

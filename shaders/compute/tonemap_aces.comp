@@ -51,34 +51,32 @@ vec3 LinearToST2084(vec3 L) {
     return pow(num / den, vec3(m2));
 }
 
-// HDR Filmic Shoulder Roll-Off
-// Smoothly maps scene linear radiance into extended display luminance range [0, peakNits / 80.0]
-// Preserves linear color and chromaticity below knee, gently compressing specular highlights to display peak.
-vec3 TonemapHDR(vec3 color, float paperWhite, float peakNits) {
-    float sWhite = paperWhite / 80.0;
-    float sPeak = max(peakNits / 80.0, sWhite * 1.05);
+// Filmic HDR S-Curve Tone Mapping
+// Maps scene linear radiance [0, inf) into target absolute display luminance [0, peakNits]
+// - Anchors true blacks (x -> 0 => L -> 0) with a natural filmic contrast toe (p = 1.25).
+// - Preserves contrast in dark regions rather than linearly boosting them.
+// - Anchors reference diffuse paper white (x = 1.0) cleanly to paperWhite nits.
+// - Asymptotically rolls off high-dynamic-range highlights to peakNits.
+// - Scales color vector by mapped luminance ratio to preserve chromaticity without color shifts.
+float FilmicHdrLuminance(float x, float paperWhite, float peakNits) {
+    if (x <= 1e-6) return 0.0;
+    const float p = 1.25;
+    float k = max((peakNits / max(paperWhite, 50.0)) - 1.0, 0.1);
+    float xp = pow(x, p);
+    return peakNits * (xp / (xp + k));
+}
 
-    // Scale scene radiance so that 1.0 scene linear = paperWhite in scRGB units
-    vec3 v = color * sWhite;
-    float lum = dot(v, vec3(0.2126, 0.7152, 0.0722));
-    if (lum <= 1e-5) {
+vec3 TonemapHDR(vec3 color, float paperWhite, float peakNits) {
+    float inLum = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    if (inLum <= 1e-6) {
         return vec3(0.0);
     }
-
-    // Knee starts at 60% of paper white
-    float knee = 0.6 * sWhite;
-    float mappedLum;
-    if (lum < knee) {
-        mappedLum = lum;
-    } else {
-        float x = lum - knee;
-        float maxHighlight = sPeak - knee;
-        // Smooth asymptotic shoulder: f(x) = maxHighlight * (x / (x + maxHighlight))
-        float mappedHighlight = maxHighlight * (x / (x + maxHighlight));
-        mappedLum = knee + mappedHighlight;
-    }
-
-    return v * (mappedLum / lum);
+    // Compute mapped absolute display luminance in cd/m^2 (nits)
+    float outLumNits = FilmicHdrLuminance(inLum, paperWhite, peakNits);
+    // Convert target luminance in nits to scRGB units (1.0 = 80 nits)
+    float outLumScRgb = outLumNits / 80.0;
+    // Scale color preserving chromaticity
+    return color * (outLumScRgb / inLum);
 }
 
 void main() {

@@ -1,14 +1,29 @@
 #include "vulkan/Swapchain.hpp"
+#include "vulkan/VulkanContext.hpp"
+#include "core/Window.hpp"
 #include "core/Logger.hpp"
 #include <algorithm>
 #include <stdexcept>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 
 namespace pathways {
 
 Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
                      uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
-                     bool enableHdr)
-    : m_device(device) {
+                     bool enableHdr, bool isFullscreen,
+                     const VulkanContext* context,
+                     const DisplayInfo* displayInfo,
+                     float peakNits, float paperWhiteNits)
+    : m_device(device), m_context(context) {
 
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &capabilities);
@@ -26,39 +41,60 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     bool chosen = false;
     m_hdrMode = HdrDisplayMode::SDR;
 
+    bool allowHdr = enableHdr;
     if (enableHdr) {
-        // Priority 1: scRGB Linear (16-bit Float, 1.0 = 80 nits reference paper white)
+        // Evaluate whether HDR output can be engaged:
+        // 1. If in windowed mode while desktop is in SDR, DWM cannot output HDR -> fallback to SDR to prevent washed-out clipping.
+        // 2. If in fullscreen mode, application can switch the display output color space to HDR10 via direct scanout.
+        // 3. If desktop is already in HDR mode, both windowed and fullscreen can use HDR.
+        bool isDesktopHdr = displayInfo ? displayInfo->isDesktopHdr : false;
+        bool isDisplayCapable = displayInfo ? displayInfo->isDisplayHdrCapable : true;
+
+        if (!isFullscreen && !isDesktopHdr && displayInfo) {
+            Logger::info("Windowed mode on SDR desktop detected: DWM HDR unavailable. Using SDR sRGB. (Run in Fullscreen to engage display HDR10 mode).");
+            allowHdr = false;
+        } else if (!isDisplayCapable && displayInfo) {
+            Logger::info("Connected display does not report HDR capabilities. Using SDR sRGB.");
+            allowHdr = false;
+        }
+    }
+
+    if (allowHdr) {
+        // Priority 1: True HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ)
+        // HDR10 is the physical HDMI/DisplayPort standard; it triggers the display's HDR logo,
+        // accepts CTA-861 Static HDR InfoFrames via VK_EXT_hdr_metadata, and avoids DWM clipping.
         for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
-                f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                 f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
                 m_imageFormat = f.format;
                 m_colorSpace = f.colorSpace;
-                m_hdrMode = HdrDisplayMode::scRGB;
+                m_hdrMode = HdrDisplayMode::HDR10;
                 chosen = true;
-                Logger::info("Selected HDR Display: R16G16B16A16_SFLOAT with EXTENDED_SRGB_LINEAR (scRGB Linear)");
+                Logger::info("Selected HDR Display: {} with HDR10_ST2084 (HDR10 PQ Rec.2020)",
+                             f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? "A2B10G10R10_UNORM" : "A2R10G10B10_UNORM");
                 break;
             }
         }
 
-        // Priority 2: HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ)
+        // Priority 2: scRGB Linear (16-bit Float, 1.0 = 80 nits reference paper white)
+        // Fallback for compositors that expose scRGB but not HDR10
         if (!chosen) {
             for (const auto& f : formats) {
-                if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                     f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
-                    f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                    f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
                     m_imageFormat = f.format;
                     m_colorSpace = f.colorSpace;
-                    m_hdrMode = HdrDisplayMode::HDR10;
+                    m_hdrMode = HdrDisplayMode::scRGB;
                     chosen = true;
-                    Logger::info("Selected HDR Display: {} with HDR10_ST2084 (HDR10 PQ Rec.2020)",
-                                 f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? "A2B10G10R10_UNORM" : "A2R10G10B10_UNORM");
+                    Logger::info("Selected HDR Display: R16G16B16A16_SFLOAT with EXTENDED_SRGB_LINEAR (scRGB Linear)");
                     break;
                 }
             }
         }
 
         if (!chosen) {
-            Logger::info("HDR display mode requested, but display compositor does not expose scRGB or HDR10 surface formats. Falling back to SDR.");
+            Logger::info("HDR display mode requested, but display compositor does not expose HDR10 or scRGB surface formats. Falling back to SDR.");
         }
     }
 
@@ -144,11 +180,57 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = VK_NULL_HANDLE;
 
+#ifdef _WIN32
+    VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo{};
+    exclusiveInfo.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT;
+
+    VkSurfaceFullScreenExclusiveWin32InfoEXT win32ExclusiveInfo{};
+    win32ExclusiveInfo.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+
+    if (m_context && m_context->hasFullScreenExclusive() && isFullscreen) {
+        exclusiveInfo.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
+
+        HMONITOR targetHmon = nullptr;
+        if (displayInfo && displayInfo->hmonitor) {
+            targetHmon = static_cast<HMONITOR>(displayInfo->hmonitor);
+        }
+        if (!targetHmon) {
+            targetHmon = MonitorFromWindow(GetActiveWindow(), MONITOR_DEFAULTTONEAREST);
+        }
+        win32ExclusiveInfo.hmonitor = targetHmon;
+
+        exclusiveInfo.pNext = &win32ExclusiveInfo;
+        win32ExclusiveInfo.pNext = const_cast<void*>(createInfo.pNext);
+        createInfo.pNext = &exclusiveInfo;
+    }
+#endif
+
     Logger::info("Swapchain Present Mode: {}", chosenPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX (Low-Latency Triple Buffering)" : "FIFO (VSync)");
 
     VkResult res = vkCreateSwapchainKHR(m_device, &createInfo, nullptr, &m_swapchain);
     if (res != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan swapchain! Error: " + std::to_string(res));
+    }
+
+#ifdef _WIN32
+    if (m_context && m_context->hasFullScreenExclusive() && isFullscreen &&
+        exclusiveInfo.fullScreenExclusive == VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT) {
+        auto pfnAcquire = m_context->getAcquireFullScreenExclusiveModeEXT();
+        if (pfnAcquire) {
+            VkResult acqRes = pfnAcquire(m_device, m_swapchain);
+            if (acqRes == VK_SUCCESS) {
+                m_exclusiveModeAcquired = true;
+                Logger::info("Acquired FullScreen Exclusive Mode (VK_EXT_full_screen_exclusive). Direct display scanout active.");
+            } else {
+                Logger::warn("vkAcquireFullScreenExclusiveModeEXT returned: {}", static_cast<int>(acqRes));
+            }
+        }
+    }
+#endif
+
+    if (m_hdrMode != HdrDisplayMode::SDR) {
+        float minNits = displayInfo ? displayInfo->minLuminanceNits : 0.001f;
+        setHdrMetadata(peakNits, paperWhiteNits, minNits, displayInfo);
     }
 
     vkGetSwapchainImagesKHR(m_device, m_swapchain, &imageCount, nullptr);
@@ -179,6 +261,15 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
 }
 
 Swapchain::~Swapchain() {
+#ifdef _WIN32
+    if (m_exclusiveModeAcquired && m_context) {
+        auto pfnRelease = m_context->getReleaseFullScreenExclusiveModeEXT();
+        if (pfnRelease && m_device && m_swapchain) {
+            pfnRelease(m_device, m_swapchain);
+            m_exclusiveModeAcquired = false;
+        }
+    }
+#endif
     for (auto imageView : m_imageViews) {
         if (imageView && m_device) {
             vkDestroyImageView(m_device, imageView, nullptr);
@@ -225,6 +316,35 @@ const char* Swapchain::getFormatName() const {
         case VK_FORMAT_B8G8R8A8_UNORM:            return "B8G8R8A8_UNORM (8-bit)";
         default:                                  return "Unknown Format";
     }
+}
+
+void Swapchain::setHdrMetadata(float peakNits, float paperWhiteNits, float minNits, const DisplayInfo* displayInfo) {
+    if (!m_context || !m_context->hasHdrMetadata()) return;
+    auto pfnSetMeta = m_context->getSetHdrMetadataEXT();
+    if (!pfnSetMeta || !m_swapchain) return;
+
+    VkHdrMetadataEXT meta{};
+    meta.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+    if (displayInfo && displayInfo->isDisplayHdrCapable && displayInfo->maxLuminanceNits > 0.0f) {
+        meta.displayPrimaryRed = { displayInfo->redPrimary[0], displayInfo->redPrimary[1] };
+        meta.displayPrimaryGreen = { displayInfo->greenPrimary[0], displayInfo->greenPrimary[1] };
+        meta.displayPrimaryBlue = { displayInfo->bluePrimary[0], displayInfo->bluePrimary[1] };
+        meta.whitePoint = { displayInfo->whitePoint[0], displayInfo->whitePoint[1] };
+    } else {
+        // ITU-R BT.2020 reference primaries & D65 white point
+        meta.displayPrimaryRed = { 0.708f, 0.292f };
+        meta.displayPrimaryGreen = { 0.170f, 0.797f };
+        meta.displayPrimaryBlue = { 0.131f, 0.046f };
+        meta.whitePoint = { 0.3127f, 0.3290f };
+    }
+    meta.maxLuminance = peakNits;
+    meta.minLuminance = minNits > 0.0f ? minNits : 0.001f;
+    meta.maxContentLightLevel = peakNits;
+    meta.maxFrameAverageLightLevel = paperWhiteNits;
+
+    pfnSetMeta(m_device, 1, &m_swapchain, &meta);
+    Logger::info("Applied HDR Metadata (CTA-861): Peak={:.1f} nits, PaperWhite={:.1f} nits, Min={:.4f} nits",
+                 meta.maxLuminance, meta.maxFrameAverageLightLevel, meta.minLuminance);
 }
 
 } // namespace pathways
