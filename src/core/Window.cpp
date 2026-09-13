@@ -105,6 +105,13 @@ Window::Window(const Config& config)
         m_displayInfo.isPortrait = (m_displayInfo.displayAspect < 1.0f);
         m_displayInfo.isUltraWide = (m_displayInfo.displayAspect > 2.0f);
 
+        // Cross-platform SDL3 display HDR query (Linux Wayland, KMS/DRM, Windows)
+        SDL_PropertiesID dispProps = SDL_GetDisplayProperties(displayID);
+        if (dispProps && SDL_GetBooleanProperty(dispProps, SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN, false)) {
+            m_displayInfo.isDisplayHdrCapable = true;
+            m_displayInfo.isDesktopHdr = true;
+        }
+
 #ifdef _WIN32
         // Query DXGI for native HDR display capabilities and exact luminance limits
         Microsoft::WRL::ComPtr<IDXGIFactory1> dxgiFactory;
@@ -216,6 +223,29 @@ Window::Window(const Config& config)
         }
     }
 #endif
+
+    // Query cross-platform SDL3 window HDR properties and dynamic headroom
+    SDL_PropertiesID winProps = SDL_GetWindowProperties(m_window);
+    if (winProps) {
+        if (SDL_GetBooleanProperty(winProps, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false)) {
+            m_displayInfo.isDisplayHdrCapable = true;
+            m_displayInfo.isDesktopHdr = true;
+        }
+        float headroom = SDL_GetFloatProperty(winProps, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+        float sdrWhite = SDL_GetFloatProperty(winProps, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0f);
+        if (headroom > 1.0f) {
+            float baseWhite = (config.hdr_paper_white_nits > 0.0f) ? config.hdr_paper_white_nits : 80.0f;
+            float calculatedPeak = baseWhite * headroom;
+            m_displayInfo.maxLuminanceNits = std::clamp(calculatedPeak, 400.0f, 10000.0f);
+        }
+        Logger::info("SDL3 HDR Status: Display HDR: {}, Window HDR: {}, Headroom: {:.2f}x, SDR White: {:.2f} (Target Peak: {:.1f} nits)",
+                     m_displayInfo.isDisplayHdrCapable ? "CAPABLE" : "SDR",
+                     m_displayInfo.isDesktopHdr ? "ACTIVE" : "INACTIVE",
+                     headroom, sdrWhite, m_displayInfo.maxLuminanceNits);
+    }
+    if (config.hdr_peak_nits > 0.0f) {
+        m_displayInfo.maxLuminanceNits = config.hdr_peak_nits;
+    }
 
     // Set application window icon
     const std::vector<std::string> iconSearchPaths = {
@@ -438,6 +468,21 @@ void Window::pollEvents() {
                 Logger::info("Window left fullscreen mode.");
                 m_isFullscreen = false;
                 break;
+            case SDL_EVENT_WINDOW_HDR_STATE_CHANGED: {
+                SDL_PropertiesID wp = SDL_GetWindowProperties(m_window);
+                if (wp) {
+                    bool hdr = SDL_GetBooleanProperty(wp, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+                    float headroom = SDL_GetFloatProperty(wp, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+                    m_displayInfo.isDisplayHdrCapable = hdr;
+                    m_displayInfo.isDesktopHdr = hdr;
+                    if (headroom > 1.0f) {
+                        m_displayInfo.maxLuminanceNits = std::clamp(80.0f * headroom, 400.0f, 10000.0f);
+                    }
+                    Logger::info("SDL_EVENT_WINDOW_HDR_STATE_CHANGED: HDR active={}, headroom={:.2f}x (Peak: {:.1f} nits)",
+                                 hdr, headroom, m_displayInfo.maxLuminanceNits);
+                }
+                break;
+            }
             case SDL_EVENT_KEY_DOWN:
                 if (event.key.key == SDLK_ESCAPE) {
                     Logger::info("Received SDLK_ESCAPE -> closing window.");

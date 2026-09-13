@@ -88,9 +88,9 @@ void VulkanContext::createInstance(const Config& config) {
     std::vector<const char*> instanceExtensions;
     if (!config.headless) {
         instanceExtensions.push_back("VK_KHR_surface");
+        instanceExtensions.push_back("VK_KHR_get_surface_capabilities2");
 #ifdef _WIN32
         instanceExtensions.push_back("VK_KHR_win32_surface");
-        instanceExtensions.push_back("VK_KHR_get_surface_capabilities2");
 #else
         instanceExtensions.push_back("VK_KHR_wayland_surface");
         instanceExtensions.push_back("VK_KHR_xcb_surface");

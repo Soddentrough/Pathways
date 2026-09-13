@@ -51,7 +51,7 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
         bool isDisplayCapable = displayInfo ? displayInfo->isDisplayHdrCapable : true;
 
         if (!isFullscreen && !isDesktopHdr && displayInfo) {
-            Logger::info("Windowed mode on SDR desktop detected: DWM HDR unavailable. Using SDR sRGB. (Run in Fullscreen to engage display HDR10 mode).");
+            Logger::info("Windowed mode on SDR desktop detected: Compositor / Desktop HDR unavailable. Using SDR sRGB. (Run in Fullscreen to engage display HDR10 mode).");
             allowHdr = false;
         } else if (!isDisplayCapable && displayInfo) {
             Logger::info("Connected display does not report HDR capabilities. Using SDR sRGB.");
@@ -60,20 +60,32 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     }
 
     if (allowHdr) {
-        // Priority 1: True HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ)
-        // HDR10 is the physical HDMI/DisplayPort standard; it triggers the display's HDR logo,
-        // accepts CTA-861 Static HDR InfoFrames via VK_EXT_hdr_metadata, and avoids DWM clipping.
+        // Priority 1: True HDR10 with native 10-bit A2B10G10R10_UNORM_PACK32 (Rec.2020 SMPTE ST 2084 PQ)
+        // Explicitly prioritize A2B10G10R10 over A2R10G10B10 to match engine backbuffer layout
         for (const auto& f : formats) {
-            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                 f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
                 f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
                 m_imageFormat = f.format;
                 m_colorSpace = f.colorSpace;
                 m_hdrMode = HdrDisplayMode::HDR10;
                 chosen = true;
-                Logger::info("Selected HDR Display: {} with HDR10_ST2084 (HDR10 PQ Rec.2020)",
-                             f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? "A2B10G10R10_UNORM" : "A2R10G10B10_UNORM");
+                Logger::info("Selected HDR Display: A2B10G10R10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
                 break;
+            }
+        }
+
+        // Fallback for drivers/compositors exposing A2R10G10B10 instead of A2B10G10R10
+        if (!chosen) {
+            for (const auto& f : formats) {
+                if (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
+                    f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                    m_imageFormat = f.format;
+                    m_colorSpace = f.colorSpace;
+                    m_hdrMode = HdrDisplayMode::HDR10;
+                    chosen = true;
+                    Logger::info("Selected HDR Display: A2R10G10B10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
+                    break;
+                }
             }
         }
 
