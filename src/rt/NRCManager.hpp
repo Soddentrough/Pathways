@@ -42,7 +42,8 @@ public:
     NRCManager(VkDevice device, VmaAllocator allocator,
                uint32_t width, uint32_t height,
                const std::vector<char>& inferSpv,
-               const std::vector<char>& trainSpv);
+               const std::vector<char>& trainSpv,
+               const std::vector<char>& resolveSpv = {});
     ~NRCManager();
 
     NRCManager(const NRCManager&) = delete;
@@ -63,6 +64,7 @@ public:
     Buffer* getCounters() const { return m_counters.get(); }
     Buffer* getHashTable() const { return m_hashTable.get(); }
     Buffer* getWeights() const { return m_weights.get(); }
+    Buffer* getAtomicAccumBuffer() const { return m_atomicAccumBuffer.get(); }
 
     uint32_t getMaxQueries() const { return m_maxQueries; }
     uint32_t getMaxTrainRecords() const { return m_maxTrainRecords; }
@@ -74,7 +76,7 @@ private:
     void initWeightsAndHashTable();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv);
+    void createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv, const std::vector<char>& resolveSpv);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -92,6 +94,7 @@ private:
     std::unique_ptr<Buffer> m_queryQueue;
     std::unique_ptr<Buffer> m_trainQueue;
     std::unique_ptr<Buffer> m_counters;
+    std::unique_ptr<Buffer> m_atomicAccumBuffer; // 32-bit fixed-point atomic accumulation buffer (CRIT-05)
 
     // Descriptors & Pipelines
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -105,6 +108,11 @@ private:
     VkDescriptorSet m_trainDescSet = VK_NULL_HANDLE;
     VkPipelineLayout m_trainPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_trainPipeline = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout m_resolveDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_resolveDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_resolvePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

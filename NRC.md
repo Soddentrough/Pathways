@@ -113,16 +113,12 @@ When testing multi-sample workloads (e.g., 8 SPP with 16 bounces), users may obs
 - By sample 4 or 5, `queryCount` exceeds `maxQueueCapacity`. For all remaining samples, the path is terminated from tracing further bounces, but **silently dropped from the query queue**.
 - The dropped samples contribute **$0.0$ indirect radiance**, causing massive sample-to-sample variance, dark holes, and severe blotchiness.
 
-#### 2. Non-Atomic Read-Modify-Write Data Race on `uAccumImage`
+#### 2. Non-Atomic Read-Modify-Write Data Race on `uAccumImage` [RESOLVED - CRIT-05]
 - At **1 SPP**, each pixel $(x, y)$ has at most one query at bounce 2.
 - At **8 SPP**, each pixel $(x, y)$ has up to 8 separate queries in the queue.
-- In `shaders/compute/nrc_encode_infer.comp`:
-  ```glsl
-  vec4 prev = imageLoad(uAccumImage, pixelCoord);
-  imageStore(uAccumImage, pixelCoord, prev + vec4(radiance, 0.0));
-  ```
-- Multiple GPU compute waves in parallel workgroups execute `imageLoad` and `imageStore` to the **exact same pixel coordinates** concurrently without atomic operations.
-- Because storage images lack atomic floating-point addition in standard GLSL, threads overwrite each other's radiance contributions. This data race injects severe random high-frequency salt-and-pepper noise and flickering every frame.
+- *Historical Issue*: In previous revisions of `shaders/compute/nrc_encode_infer.comp`, inference waves executed unsynchronized `imageLoad` and `imageStore` on `uAccumImage`. Multiple GPU compute waves targeting the same pixel coordinates collided concurrently without atomic operations, overwriting each other's radiance contributions and creating high-frequency salt-and-pepper noise and flickering.
+- *Resolution (CRIT-05)*: Replaced the storage image load/store with a 32-bit Q16.16 fixed-point atomic buffer (`AtomicAccumBuffer`) where inference threads execute hardware integer `atomicAdd(nrcAtomicBuffer[base + c], fixedRad[c])` scaled by $65,536.0$. A dedicated single-pass resolve microkernel (`shaders/compute/nrc_resolve.comp`) executes one thread per pixel to read the accumulated fixed-point values, scale back to float, apply stochastic FP16 dithering onto `uAccumImage`, and cleanly reset the atomic buffer back to zero in L2/MALL cache.
+
 
 #### 3. Monte Carlo Physical Convergence vs. Under-Trained Neural Approximation
 - **Pure Monte Carlo**: At 8 SPP and 16 bounces, each pixel fires 8 true physical rays traversing the full BVH hierarchy. Variance decreases monotonically following the central limit theorem:
@@ -161,6 +157,6 @@ Located under **Lighting & Shading Components**:
 
 To enable high-quality NRC at $\text{SPP} > 1$, the following architectural improvements are planned:
 1. **Dynamic Multi-SPP Buffer Allocation**: Size `m_queryQueue` dynamically as $\text{Width} \times \text{Height} \times \text{SPP}$, or dispatch NRC inference per sample index rather than once per frame.
-2. **Intermediate Atomic Accumulation**: Accumulate NRC inference contributions into a 32-bit fixed-point integer atomic buffer or per-pixel staging buffer to eliminate the non-atomic `imageLoad`/`imageStore` race condition.
+2. **Intermediate Atomic Accumulation**: Accumulate NRC inference contributions into a 32-bit fixed-point integer atomic buffer or per-pixel staging buffer to eliminate the non-atomic `imageLoad`/`imageStore` race condition. **[COMPLETED - CRIT-05 via Q16.16 AtomicAccumBuffer & nrc_resolve.comp]**
 3. **Multi-Bounce Training Ground Truth**: Route downstream continuation ray radiance back into `nrcTrainRecords.targetRadiance` across bounces $3 \dots 16$ to train the MLP on true multi-bounce equilibrium.
 4. **Indirect Dispatch Sizing**: Use `vkCmdDispatchIndirect` reading from `counters.queryCount` to eliminate launching idle wavegroups.

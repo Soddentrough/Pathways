@@ -149,6 +149,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
+    ${SHADER_DIR}/compute/nrc_resolve.comp
     ${SHADER_DIR}/compute/dgc_compact.comp
     ${SHADER_DIR}/compute/raytrace_comp.comp
     ${SHADER_DIR}/compute/wavefront_persistent.comp

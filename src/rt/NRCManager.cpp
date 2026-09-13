@@ -12,14 +12,15 @@ namespace pathways {
 NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
                        uint32_t width, uint32_t height,
                        const std::vector<char>& inferSpv,
-                       const std::vector<char>& trainSpv)
+                       const std::vector<char>& trainSpv,
+                       const std::vector<char>& resolveSpv)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height)
 {
     initBuffers();
     initWeightsAndHashTable();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
-    createPipelines(inferSpv, trainSpv);
+    createPipelines(inferSpv, trainSpv, resolveSpv);
     m_initialized = true;
     Logger::info("NRCManager initialized: {}x{} cache resolution, Wave32 WMMA enabled.", width, height);
 }
@@ -33,6 +34,10 @@ NRCManager::~NRCManager() {
         if (m_trainPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_trainPipeline, nullptr);
         if (m_trainPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_trainPipelineLayout, nullptr);
         if (m_trainDescLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_device, m_trainDescLayout, nullptr);
+
+        if (m_resolvePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_resolvePipeline, nullptr);
+        if (m_resolvePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_resolvePipelineLayout, nullptr);
+        if (m_resolveDescLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_device, m_resolveDescLayout, nullptr);
 
         if (m_descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
     }
@@ -73,6 +78,17 @@ void NRCManager::initBuffers() {
     VkDeviceSize momentumSize = 2ull * 9360ull * sizeof(float);
     m_weightMomentum = std::make_unique<Buffer>(m_allocator, momentumSize, queueUsage,
                                                 VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+    // 7. Atomic Accumulation Buffer: 3 channels * width * height * sizeof(uint32_t) bytes (CRIT-05)
+    VkDeviceSize atomicAccumSize = static_cast<VkDeviceSize>(m_width) * m_height * 3ull * sizeof(uint32_t);
+    m_atomicAccumBuffer = std::make_unique<Buffer>(m_allocator, atomicAccumSize, queueUsage,
+                                                  VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+    void* pAccum = m_atomicAccumBuffer->map();
+    if (pAccum) {
+        std::memset(pAccum, 0, atomicAccumSize);
+        m_atomicAccumBuffer->flush();
+        m_atomicAccumBuffer->unmap();
+    }
 }
 
 void NRCManager::initWeightsAndHashTable() {
@@ -142,9 +158,9 @@ void NRCManager::initWeightsAndHashTable() {
 }
 
 void NRCManager::createDescriptorSetLayouts() {
-    // Inference Layout: Image(0), QueryQueue(1), HashTable(2), Weights(3), Counters(4)
+    // Inference Layout: AtomicBuffer(0), QueryQueue(1), HashTable(2), Weights(3), Counters(4) (CRIT-05)
     std::vector<VkDescriptorSetLayoutBinding> inferBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -171,12 +187,24 @@ void NRCManager::createDescriptorSetLayouts() {
     if (vkCreateDescriptorSetLayout(m_device, &trainLayoutInfo, nullptr, &m_trainDescLayout) != VK_SUCCESS) {
         throw std::runtime_error("NRCManager: Failed to create training descriptor set layout!");
     }
+
+    // Resolve Layout: uAccumImage(0), AtomicBuffer(1) (CRIT-05)
+    std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
+    resolveLayoutInfo.pBindings = resolveBindings.data();
+    if (vkCreateDescriptorSetLayout(m_device, &resolveLayoutInfo, nullptr, &m_resolveDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("NRCManager: Failed to create resolve descriptor set layout!");
+    }
 }
 
 void NRCManager::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.maxSets = 4;
@@ -202,12 +230,33 @@ void NRCManager::allocateDescriptorSets() {
         throw std::runtime_error("NRCManager: Failed to allocate training descriptor set!");
     }
 
-    // Write persistent buffer bindings for training descriptor set
-    VkDescriptorBufferInfo trainQueueInfo{ m_trainQueue->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorSetAllocateInfo allocResolve{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocResolve.descriptorPool = m_descriptorPool;
+    allocResolve.descriptorSetCount = 1;
+    allocResolve.pSetLayouts = &m_resolveDescLayout;
+    if (vkAllocateDescriptorSets(m_device, &allocResolve, &m_resolveDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("NRCManager: Failed to allocate resolve descriptor set!");
+    }
+
+    // Write persistent buffer bindings for inference descriptor set (0: AtomicBuffer)
+    VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo hashInfo{ m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo momInfo{ m_weightMomentum->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
+
+    std::vector<VkWriteDescriptorSet> inferWrites = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+    };
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(inferWrites.size()), inferWrites.data(), 0, nullptr);
+
+    // Write persistent buffer bindings for training descriptor set
+    VkDescriptorBufferInfo trainQueueInfo{ m_trainQueue->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo momInfo{ m_weightMomentum->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> trainWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
@@ -217,21 +266,23 @@ void NRCManager::allocateDescriptorSets() {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(trainWrites.size()), trainWrites.data(), 0, nullptr);
+
+    // Write persistent buffer binding for resolve descriptor set (binding 1: AtomicBuffer)
+    VkWriteDescriptorSet resolveBufWrite{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr
+    };
+    vkUpdateDescriptorSets(m_device, 1, &resolveBufWrite, 0, nullptr);
 }
 
 void NRCManager::updateDescriptors(VkImageView accumImageView) {
+    // Update resolve descriptor set image binding (0) and buffer binding (1)
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo hashInfo{ m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -247,7 +298,7 @@ VkShaderModule NRCManager::createShaderModule(const std::vector<char>& code) {
     return mod;
 }
 
-void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv) {
+void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv, const std::vector<char>& resolveSpv) {
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcRange.offset = 0;
@@ -304,6 +355,37 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
         throw std::runtime_error("NRCManager: Failed to create training compute pipeline!");
     }
     vkDestroyShaderModule(m_device, trainMod, nullptr);
+
+    // Resolve Pipeline (CRIT-05)
+    if (!resolveSpv.empty()) {
+        VkPushConstantRange resPcRange{};
+        resPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        resPcRange.offset = 0;
+        resPcRange.size = sizeof(uint32_t) * 2; // width, height (8 bytes)
+
+        VkPipelineLayoutCreateInfo resLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        resLayoutInfo.setLayoutCount = 1;
+        resLayoutInfo.pSetLayouts = &m_resolveDescLayout;
+        resLayoutInfo.pushConstantRangeCount = 1;
+        resLayoutInfo.pPushConstantRanges = &resPcRange;
+        if (vkCreatePipelineLayout(m_device, &resLayoutInfo, nullptr, &m_resolvePipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("NRCManager: Failed to create resolve pipeline layout!");
+        }
+
+        VkShaderModule resMod = createShaderModule(resolveSpv);
+        VkComputePipelineCreateInfo resPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        resPipeInfo.layout = m_resolvePipelineLayout;
+        resPipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        resPipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        resPipeInfo.stage.module = resMod;
+        resPipeInfo.stage.pName = "main";
+        resPipeInfo.stage.pNext = &subgroupSize32;
+        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &resPipeInfo, nullptr, &m_resolvePipeline) != VK_SUCCESS) {
+            vkDestroyShaderModule(m_device, resMod, nullptr);
+            throw std::runtime_error("NRCManager: Failed to create resolve compute pipeline!");
+        }
+        vkDestroyShaderModule(m_device, resMod, nullptr);
+    }
 }
 
 void NRCManager::resize(uint32_t width, uint32_t height) {
@@ -312,6 +394,32 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
     m_height = height;
     initBuffers();
     initWeightsAndHashTable();
+
+    // Re-bind updated buffer handles to persistent descriptor sets
+    VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo hashInfo{ m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo trainQueueInfo{ m_trainQueue->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo momInfo{ m_weightMomentum->getBuffer(), 0, VK_WHOLE_SIZE };
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
+    };
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void NRCManager::resetCounters(VkCommandBuffer cmd) {
@@ -392,18 +500,44 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
     uint32_t dispatchCount = (queryCount + 15u) / 16u;
     if (dispatchCount > 0) {
         vkCmdDispatch(cmd, dispatchCount, 1, 1);
-    }
 
-    // Barrier: Inference writes uAccumImage -> downstream tonemapping / denoiser reads
-    VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    outDep.memoryBarrierCount = 1;
-    outDep.pMemoryBarriers = &outBarrier;
-    vkCmdPipelineBarrier2(cmd, &outDep);
+        // Barrier: Inference writes atomic buffer -> Resolve reads and resets atomic buffer (CRIT-05)
+        VkBufferMemoryBarrier2 inferToResolveBarrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
+        };
+        VkDependencyInfo inferToResolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        inferToResolveDep.bufferMemoryBarrierCount = 1;
+        inferToResolveDep.pBufferMemoryBarriers = &inferToResolveBarrier;
+        vkCmdPipelineBarrier2(cmd, &inferToResolveDep);
+
+        // Resolve: Single-thread-per-pixel atomic buffer -> uAccumImage (CRIT-05)
+        if (m_resolvePipeline != VK_NULL_HANDLE) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSet, 0, nullptr);
+
+            struct ResolvePushConstants {
+                uint32_t width;
+                uint32_t height;
+            } rpc{ width, height };
+            vkCmdPushConstants(cmd, m_resolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
+            vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1);
+        }
+
+        // Barrier: Resolve writes uAccumImage -> downstream tonemapping / denoiser reads
+        VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        outDep.memoryBarrierCount = 1;
+        outDep.pMemoryBarriers = &outBarrier;
+        vkCmdPipelineBarrier2(cmd, &outDep);
+    }
 }
 
 void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,

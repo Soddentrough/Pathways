@@ -1339,12 +1339,13 @@ void Engine::initPipelines() {
     try {
         auto nrcInferCode = loadShaderSPIRV("nrc_encode_infer.comp.spv");
         auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
+        auto nrcResolveCode = loadShaderSPIRV("nrc_resolve.comp.spv");
         m_nrcManager = std::make_unique<NRCManager>(
             device, allocator,
             m_config.width, m_config.height,
-            nrcInferCode, nrcTrainCode
+            nrcInferCode, nrcTrainCode, nrcResolveCode
         );
-        Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA) initialized successfully.");
+        Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized successfully.");
     } catch (const std::exception& e) {
         Logger::warn("NRCManager initialization failed: {}", e.what());
     }
