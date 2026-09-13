@@ -94,12 +94,14 @@ void AccelerationStructureManager::loadFunctionPointers() {
 }
 
 void AccelerationStructureManager::submitCommandBuffer(VkCommandBuffer cmd) {
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
 
-    vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+
+    vkQueueSubmit2(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_queue);
 }
 

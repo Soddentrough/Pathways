@@ -37,10 +37,8 @@ int main() {
     vkEnumeratePhysicalDevices(instance, &gpuCount, gpus.data());
 
     std::vector<const char*> devExts = {
-        "VK_KHR_external_memory",
         "VK_KHR_external_memory_fd",
         "VK_EXT_external_memory_dma_buf",
-        "VK_KHR_external_semaphore",
         "VK_KHR_external_semaphore_fd"
     };
 
@@ -104,8 +102,11 @@ int main() {
         return 1;
     }
 
-    VkMemoryRequirements memReq1;
-    vkGetBufferMemoryRequirements(dev1, buf1, &memReq1);
+    VkBufferMemoryRequirementsInfo2 reqInfo{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+    reqInfo.buffer = buf1;
+    VkMemoryRequirements2 memReq2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+    vkGetBufferMemoryRequirements2(dev1, &reqInfo, &memReq2);
+    VkMemoryRequirements memReq1 = memReq2.memoryRequirements;
 
     VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
     exportAllocInfo.handleTypes = handleType;

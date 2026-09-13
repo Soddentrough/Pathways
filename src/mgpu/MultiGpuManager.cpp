@@ -302,8 +302,11 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
         VkResult res = vkCreateBuffer(dev1, &bufInfo1, nullptr, &m_p2pBufferSecondary[slot]);
         if (res != VK_SUCCESS) { allSucceeded = false; break; }
 
-        VkMemoryRequirements memReq1;
-        vkGetBufferMemoryRequirements(dev1, m_p2pBufferSecondary[slot], &memReq1);
+        VkBufferMemoryRequirementsInfo2 reqInfo1{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+        reqInfo1.buffer = m_p2pBufferSecondary[slot];
+        VkMemoryRequirements2 memReq2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        vkGetBufferMemoryRequirements2(dev1, &reqInfo1, &memReq2);
+        VkMemoryRequirements memReq1 = memReq2.memoryRequirements;
 
         // 2. Allocate exportable Device-Local memory on Device 1
         VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
@@ -1165,11 +1168,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     vkEndCommandBuffer(secNode->commandBuffers[0]);
 
-    VkSubmitInfo initSubmit{};
-    initSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    initSubmit.commandBufferCount = 1;
-    initSubmit.pCommandBuffers = &secNode->commandBuffers[0];
-    vkQueueSubmit(secNode->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = secNode->commandBuffers[0];
+
+    VkSubmitInfo2 initSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    initSubmit.commandBufferInfoCount = 1;
+    initSubmit.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(secNode->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
 
     Logger::info("Secondary GPU Node fully initialized: {} ({})", secNode->deviceName, secNode->context->getPciLinkString());
@@ -1565,15 +1570,23 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     vkEndCommandBuffer(cmd);
 
     // 5. Submit secondary workload
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSemaphoreSubmitInfo sigInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     if (m_useCrossGpuSync) {
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &node->secSemaphores[slot];
+        sigInfo.semaphore = node->secSemaphores[slot];
+        sigInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     }
-    vkQueueSubmit(queue, 1, &submitInfo, node->renderFences[slot]);
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    if (m_useCrossGpuSync) {
+        submitInfo.signalSemaphoreInfoCount = 1;
+        submitInfo.pSignalSemaphoreInfos = &sigInfo;
+    }
+    vkQueueSubmit2(queue, 1, &submitInfo, node->renderFences[slot]);
 
     // Export semaphore FD from secondary device
     if (m_useCrossGpuSync) {
@@ -1843,11 +1856,13 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         vkEndCommandBuffer(node->commandBuffers[0]);
 
-        VkSubmitInfo initSubmit{};
-        initSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        initSubmit.commandBufferCount = 1;
-        initSubmit.pCommandBuffers = &node->commandBuffers[0];
-        vkQueueSubmit(node->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = node->commandBuffers[0];
+
+        VkSubmitInfo2 initSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        initSubmit.commandBufferInfoCount = 1;
+        initSubmit.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(node->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
         vkQueueWaitIdle(node->context->getGraphicsQueue());
 
         VkDeviceSize bufferSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;

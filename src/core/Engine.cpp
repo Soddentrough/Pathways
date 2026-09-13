@@ -428,11 +428,13 @@ void Engine::initVulkan() {
 
     vkEndCommandBuffer(m_commandBuffers[0]);
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 }
 
@@ -1689,10 +1691,13 @@ void Engine::createShadowDenoiserResources() {
         m_depthImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
     vkEndCommandBuffer(cmd);
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
     m_shadowPingPongIndex = 0;
@@ -1905,10 +1910,13 @@ void Engine::createTemporalAccumResources() {
 
     vkEndCommandBuffer(m_commandBuffers[0]);
 
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
     m_temporalPingPong = 0;
@@ -2224,10 +2232,13 @@ void Engine::createBmfrResources() {
 
     vkEndCommandBuffer(m_commandBuffers[0]);
 
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
     updateBmfrDescriptors();
@@ -3029,10 +3040,13 @@ void Engine::renderFrame() {
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
             );
             vkEndCommandBuffer(m_commandBuffers[0]);
-            VkSubmitInfo transSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            transSubmit.commandBufferCount = 1;
-            transSubmit.pCommandBuffers = &m_commandBuffers[0];
-            vkQueueSubmit(m_context->getGraphicsQueue(), 1, &transSubmit, VK_NULL_HANDLE);
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+            VkSubmitInfo2 transSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            transSubmit.commandBufferInfoCount = 1;
+            transSubmit.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &transSubmit, VK_NULL_HANDLE);
             vkQueueWaitIdle(m_context->getGraphicsQueue());
 
             updateAllImageDescriptors();
@@ -3074,10 +3088,13 @@ void Engine::renderFrame() {
             VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             vkCmdClearColorImage(m_commandBuffers[0], m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
             vkEndCommandBuffer(m_commandBuffers[0]);
-            VkSubmitInfo clearSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            clearSubmit.commandBufferCount = 1;
-            clearSubmit.pCommandBuffers = &m_commandBuffers[0];
-            vkQueueSubmit(m_context->getGraphicsQueue(), 1, &clearSubmit, VK_NULL_HANDLE);
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+            VkSubmitInfo2 clearSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            clearSubmit.commandBufferInfoCount = 1;
+            clearSubmit.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &clearSubmit, VK_NULL_HANDLE);
             vkQueueWaitIdle(m_context->getGraphicsQueue());
         }
 
@@ -3778,13 +3795,19 @@ void Engine::renderFrame() {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
         vkEndCommandBuffer(cmd);
 
-        VkSubmitInfo rtSubmit{};
-        rtSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        rtSubmit.commandBufferCount = 1;
-        rtSubmit.pCommandBuffers = &cmd;
-        rtSubmit.signalSemaphoreCount = 1;
-        rtSubmit.pSignalSemaphores = &m_rtCompleteSemaphores[m_currentFrame];
-        vkQueueSubmit(queue, 1, &rtSubmit, VK_NULL_HANDLE);
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+
+        VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        signalInfo.semaphore = m_rtCompleteSemaphores[m_currentFrame];
+        signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+        VkSubmitInfo2 rtSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        rtSubmit.commandBufferInfoCount = 1;
+        rtSubmit.pCommandBufferInfos = &cmdSubmitInfo;
+        rtSubmit.signalSemaphoreInfoCount = 1;
+        rtSubmit.pSignalSemaphoreInfos = &signalInfo;
+        vkQueueSubmit2(queue, 1, &rtSubmit, VK_NULL_HANDLE);
 
         // 3. Concurrently record Merge & Tonemapping commands on primary GPU into postCmd
         activeCmd = m_postCommandBuffers[m_currentFrame];
@@ -4079,40 +4102,51 @@ void Engine::renderFrame() {
     }
 
     // Submit Work
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &activeCmd;
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = activeCmd;
 
-    std::vector<VkSemaphore> waitSemaphores;
-    std::vector<VkPipelineStageFlags> waitStages;
+    std::vector<VkSemaphoreSubmitInfo> waitSemaphoreInfos;
+    std::vector<VkSemaphoreSubmitInfo> signalSemaphoreInfos;
 
     if (isMgpu) {
-        waitSemaphores.push_back(m_rtCompleteSemaphores[m_currentFrame]);
-        waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        waitRt.semaphore = m_rtCompleteSemaphores[m_currentFrame];
+        waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        waitSemaphoreInfos.push_back(waitRt);
 
         if (m_mgpu->isCrossGpuSyncActive() && !accumReachedCutoff) {
             uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
             VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
             if (secSem != VK_NULL_HANDLE) {
-                waitSemaphores.push_back(secSem);
-                waitStages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                waitSec.semaphore = secSem;
+                waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                waitSemaphoreInfos.push_back(waitSec);
             }
         }
     }
 
     if (!m_config.headless && m_swapchain) {
-        waitSemaphores.push_back(m_imageAvailableSemaphores[m_currentFrame]);
-        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
+        VkSemaphoreSubmitInfo waitImg{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        waitImg.semaphore = m_imageAvailableSemaphores[m_currentFrame];
+        waitImg.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        waitSemaphoreInfos.push_back(waitImg);
+
+        VkSemaphoreSubmitInfo sigRender{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        sigRender.semaphore = m_renderFinishedSemaphores[imageIndex];
+        sigRender.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        signalSemaphoreInfos.push_back(sigRender);
     }
 
-    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size());
-    submitInfo.pWaitSemaphores = waitSemaphores.data();
-    submitInfo.pWaitDstStageMask = waitStages.data();
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    submitInfo.waitSemaphoreInfoCount = static_cast<uint32_t>(waitSemaphoreInfos.size());
+    submitInfo.pWaitSemaphoreInfos = waitSemaphoreInfos.data();
+    submitInfo.signalSemaphoreInfoCount = static_cast<uint32_t>(signalSemaphoreInfos.size());
+    submitInfo.pSignalSemaphoreInfos = signalSemaphoreInfos.data();
 
-    vkQueueSubmit(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
+    vkQueueSubmit2(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
 
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
@@ -4279,11 +4313,13 @@ void Engine::dumpOutputFiles() {
 
         vkEndCommandBuffer(m_commandBuffers[0]);
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_commandBuffers[0];
-        vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
         staging.invalidate();
@@ -4395,11 +4431,13 @@ void Engine::dumpOutputFiles() {
 
         vkEndCommandBuffer(m_commandBuffers[0]);
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_commandBuffers[0];
-        vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
         staging.invalidate();
@@ -4958,11 +4996,13 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     vkEndCommandBuffer(m_commandBuffers[0]);
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffers[0];
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
 
     // 5. Resize secondary GPU if active before updating merge descriptor set
