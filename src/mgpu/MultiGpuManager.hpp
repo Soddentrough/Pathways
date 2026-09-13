@@ -259,6 +259,8 @@ private:
     std::array<VkBuffer, NUM_SHARED_BUFFERS> m_sharedBufferSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     bool m_useZeroCopyHost = false;
     bool m_useCrossGpuSync = false;
+    glm::vec3 m_boundsMin = glm::vec3(-1000.0f);
+    glm::vec3 m_boundsMax = glm::vec3(1000.0f);
 };
 
 } // namespace pathways

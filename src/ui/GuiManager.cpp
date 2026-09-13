@@ -521,6 +521,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Material Sort:      %s", wfSortStr);
                 ImGui::Text("Secondary Sort:     %s", secSortStr);
                 ImGui::Text("Secondary Shading:  %s", config.streamline_secondary_shading ? "Streamlined (1-Sample NEE + Lambertian)" : "Full Primary Math (4-Cand RIS + GGX)");
+                ImGui::Text("Distance Clamping:  %s", config.distance_clamping ? "Scene-Scale Invariant (D_scene * 1.25)" : "Disabled (10,000m)");
             }
             ImGui::Text("Ray Scheduling:     RDNA4 Hardware BVH Traversal (Wave32)");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
@@ -1110,6 +1111,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 1-Sample NEE + Lambertian (Bounces >= 1, -17%% ISA footprint)");
                 } else {
                     ImGui::TextDisabled("  -> Full 4-candidate RIS & microfacet GGX on all bounces");
+                }
+
+                if (ImGui::Checkbox("Scene-Scale Distance Clamping##DistClamp", &config.distance_clamping)) {
+                    settingsChanged = true;
+                }
+                if (config.distance_clamping) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Clamped to D_scene * 1.25 (Unit-invariant BVH early-out)");
+                } else {
+                    ImGui::TextDisabled("  -> Default static bound (10,000m)");
                 }
 
                 // Wavefront Tile Size

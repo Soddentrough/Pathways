@@ -777,7 +777,20 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
                     // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
                     if (b + 1 < maxBounces) {
-                        uint32_t intersectPC[17] = {
+                        float maxRayDist = 10000.0f;
+                        if (sceneData.enableDistanceClamping) {
+                            if (sceneData.maxSecondaryRayDistance > 0.0f) {
+                                maxRayDist = sceneData.maxSecondaryRayDistance;
+                            } else {
+                                glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
+                                float sceneDiameter = glm::length(extent);
+                                if (sceneDiameter > 0.01f) {
+                                    maxRayDist = sceneDiameter * 1.25f;
+                                }
+                            }
+                        }
+
+                        uint32_t intersectPC[18] = {
                             sceneData.numTriangles,
                             sceneData.numSpheres,
                             sceneData.numMaterials,
@@ -794,7 +807,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             sceneData.sortMode,
                             sceneData.numOpaqueTriangles,
                             sceneData.secondarySortMode,
-                            0 // octantBin
+                            0, // octantBin
+                            std::bit_cast<uint32_t>(maxRayDist)
                         };
 
                         if (sceneData.secondarySortMode == 1 && useMaterialSort) {
@@ -806,6 +820,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
                             for (uint32_t oct = 0; oct < 8; ++oct) {
                                 intersectPC[16] = oct;
+                                intersectPC[17] = std::bit_cast<uint32_t>(maxRayDist);
                                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                                 VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
                                 m_dgcManager->recordIndirectDispatch(cmd, m_indirectArgs[frameSlot].get(), octOffset);

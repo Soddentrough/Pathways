@@ -3301,6 +3301,8 @@ void Engine::renderFrame() {
                 wfSceneData.boundsMin = m_sceneData.boundsMin;
                 wfSceneData.boundsMax = m_sceneData.boundsMax;
                 wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+                wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+                wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
@@ -3662,6 +3664,8 @@ void Engine::renderFrame() {
                 wfSceneData.boundsMin = m_sceneData.boundsMin;
                 wfSceneData.boundsMax = m_sceneData.boundsMax;
                 wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+                wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+                wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);
@@ -4282,6 +4286,7 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
+        staging.invalidate();
         if (outFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
             const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
             bool isRgb = (outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
@@ -4397,6 +4402,7 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
+        staging.invalidate();
         const float* floatPixels = static_cast<const float*>(staging.map());
         ImageDumper::saveEXR(m_config.dump_hdr_path, m_config.width, m_config.height, floatPixels);
         staging.unmap();
@@ -4409,6 +4415,7 @@ void Engine::dumpOutputFiles() {
         VkFormat fmt = m_swapchain->getFormat();
         std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
 
+        m_uiDumpBuffer->invalidate();
         if (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
             const uint32_t* raw32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
             bool isRgb = (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);

@@ -171,6 +171,8 @@ void Config::printUsage(const char* progName) {
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
               << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
+              << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
+              << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --no-async-preprocess   Disable dedicated async compute queue DGC preprocessing\n"
@@ -409,6 +411,12 @@ Config Config::parse(int argc, char* argv[]) {
             else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
             cfg.streamline_secondary_shading = false;
+        } else if (arg == "--no-distance-clamping" || arg == "--no-ray-clamping") {
+            cfg.distance_clamping = false;
+        } else if ((arg == "--sec-max-dist" || arg == "--secondary-max-distance") && i + 1 < argc) {
+            cfg.max_secondary_distance = std::stof(argv[++i]);
+        } else if (arg.starts_with("--sec-max-dist=") || arg.starts_with("--secondary-max-distance=")) {
+            cfg.max_secondary_distance = std::stof(arg.substr(arg.find('=') + 1));
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {

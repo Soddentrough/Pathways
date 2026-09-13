@@ -592,7 +592,8 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
     Config secConfig = config;
     secConfig.gpu_index = 1; // Explicit secondary GPU
-    secConfig.headless = true; // Secondary GPU always runs headless compute
+    m_boundsMin = scene.boundsMin;
+    m_boundsMax = scene.boundsMax;
 
     auto secNode = std::make_unique<GpuDeviceNode>();
     secNode->deviceIndex = 1;
@@ -1414,7 +1415,11 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = packet.cameraUniform.flags;
         wfSceneData.enableNrc = false;
+        wfSceneData.boundsMin = m_boundsMin;
+        wfSceneData.boundsMax = m_boundsMax;
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+        wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+        wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, m_config.max_bounces, wfSceneData);
@@ -1894,6 +1899,8 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 }
 
 bool MultiGpuManager::loadScene(const SceneData& scene) {
+    m_boundsMin = scene.boundsMin;
+    m_boundsMax = scene.boundsMax;
     if (m_devices.empty()) return false;
     auto& secNode = m_devices[0];
     if (!secNode || !secNode->context) return false;

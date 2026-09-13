@@ -106,6 +106,7 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint secondarySortMode;
     uint octantBin;
+    float maxRayDistance;
 } pc;
 
 void main() {
@@ -132,7 +133,7 @@ void main() {
     vec3 origin = geom.originPackedDir.xyz;
     vec3 direction = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
 
-    float closestT = 10000.0;
+    float closestT = (pc.maxRayDistance > 0.0) ? pc.maxRayDistance : 10000.0;
     int closestTri = -1;
     vec2 closestBary = vec2(0.0);
     int closestSphere = -1;

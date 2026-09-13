@@ -32,6 +32,8 @@ struct WavefrontSceneData {
     glm::vec3 boundsMin = glm::vec3(-1000.0f);
     glm::vec3 boundsMax = glm::vec3(1000.0f);
     bool streamlineSecondaryShading = true;
+    bool enableDistanceClamping = true;
+    float maxSecondaryRayDistance = 0.0f; // 0 = automatic scene bounding diameter * 1.25
 };
 
 class WavefrontPipeline {
