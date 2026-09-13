@@ -1300,6 +1300,8 @@ void Engine::initPipelines() {
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
     auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
+    auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
+    auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
@@ -1308,7 +1310,8 @@ void Engine::initPipelines() {
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
-        m_context->hasDgcExecutionSet()
+        m_context->hasDgcExecutionSet(),
+        wfShadeDiffuseSecCode, wfShadeComplexSecCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -3297,6 +3300,7 @@ void Engine::renderFrame() {
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
                 wfSceneData.boundsMin = m_sceneData.boundsMin;
                 wfSceneData.boundsMax = m_sceneData.boundsMax;
+                wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
@@ -3657,6 +3661,7 @@ void Engine::renderFrame() {
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
                 wfSceneData.boundsMin = m_sceneData.boundsMin;
                 wfSceneData.boundsMax = m_sceneData.boundsMax;
+                wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);

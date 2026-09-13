@@ -48,6 +48,7 @@ struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
     SecondarySortMode secondary_sort_mode = SecondarySortMode::None; // Secondary ray BVH traversal coherency mode
+    bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI

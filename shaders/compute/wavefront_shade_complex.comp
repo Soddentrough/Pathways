@@ -1,4 +1,7 @@
 #version 460
+#ifndef IS_SECONDARY_BOUNCE
+#define IS_SECONDARY_BOUNCE 0
+#endif
 #extension GL_EXT_ray_query : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
@@ -207,6 +210,7 @@ void main() {
             hitNormal = frontFace ? hitNormal : -hitNormal;
 
             Material mat = materials[matId];
+#if !IS_SECONDARY_BOUNCE
             if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
@@ -217,6 +221,7 @@ void main() {
                 mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
                 hitNormal = normalize(tbn * normalMap);
             }
+#endif
 
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
@@ -271,6 +276,7 @@ void main() {
                     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
                     vec3 clearcoatNormal = hitNormal;
+#if !IS_SECONDARY_BOUNCE
                     if (clearcoat > 0.001) {
                         if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
                             vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
@@ -287,6 +293,10 @@ void main() {
                         sheenColor *= texture(sceneTextures[mat.sheenTex - 1u], hitUv).rgb;
                     }
                     float sheenRoughness = clamp(mat.sheenRoughness, 0.01, 1.0);
+#else
+                    vec3 sheenColor = vec3(0.0);
+                    float sheenRoughness = 0.01;
+#endif
 
                     // Volumetric Beer-Lambert absorption (physical ray traversal distance)
                     float mediumDist = !frontFace ? hitT : 0.0;
@@ -305,6 +315,94 @@ void main() {
                     float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
                     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
+#if IS_SECONDARY_BOUNCE
+                    // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Base Lobe BRDF) ---
+                    vec3 secDirectL = vec3(0.0);
+                    if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
+                        bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                        uint lightIdx = 0u;
+                        float lightSelectPdf = 1.0;
+                        SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+
+                        Light light = lights[lightIdx];
+                        vec3 lightDir;
+                        float lightDist = 0.0;
+                        float lightPdf = 1.0;
+                        vec3 lightEmission = light.emission.rgb;
+                        bool validLight = false;
+
+                        if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                            vec2 luv = randVec2(seed);
+                            vec3 lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                            vec3 toLight = lightPoint - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+                            float cosLight = dot(-lightDir, light.normal.xyz);
+                            if (cosLight > 0.0) {
+                                lightPdf = (lightDist * lightDist) / (light.emission.w * cosLight);
+                                validLight = true;
+                            }
+                        } else if (uint(light.position.w) == 1u /* SPOT */) {
+                            vec3 toLight = light.position.xyz - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+                            float cosSpot = dot(-lightDir, light.normal.xyz);
+                            if (cosSpot >= light.v.w) {
+                                float spotFactor = clamp((cosSpot - light.v.w) / max(light.u.w - light.v.w, 1e-4), 0.0, 1.0);
+                                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                                validLight = true;
+                            }
+                        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                            lightDir = normalize(light.normal.xyz);
+                            lightDist = 10000.0;
+                            validLight = true;
+                        }
+
+                        float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
+                        if (validLight && NdotL > 0.0) {
+                            float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+                            if (NdotV > 0.0) {
+                                vec3 H = normalize(V + lightDir);
+                                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                                float VdotH = clamp(dot(V, H), 0.0, 1.0);
+
+                                vec3 F = fresnelSchlickVec(VdotH, F0);
+                                float D = distributionGGX(NdotH, alphaRoughness);
+                                float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
+                                vec3 specBrdf = enableSpecular ? (D * Vis * F) : vec3(0.0);
+                                vec3 diffBrdf = (vec3(1.0) - F) * diffuseColor * INV_PI;
+                                vec3 baseBrdf = diffBrdf + specBrdf;
+
+                                float lightPdfEff = max(lightPdf * lightSelectPdf, 1e-6);
+                                float diffPdf = NdotL * INV_PI;
+                                float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
+                                float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + baseSpecProb * specPdf;
+                                float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + bsdfPdf)) : 1.0;
+
+                                secDirectL = baseBrdf * lightEmission * (NdotL / lightPdfEff) * misWeight;
+                                vec3 unshadowed = throughput * secDirectL;
+
+                                if (length(unshadowed) > 1e-5) {
+                                    if (enableShadows) {
+                                        if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                            doInlineShadow = true;
+                                            inlineShadowOrigin = hitPoint + hitNormal * EPSILON;
+                                            inlineShadowDir = lightDir;
+                                            inlineShadowDist = lightDist;
+                                            inlineShadowUnshadowed = unshadowed;
+                                        } else {
+                                            hasShadowRay = true;
+                                            shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                                            shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                        }
+                                    } else {
+                                        accumRadiance += unshadowed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+#else
                     // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
                     vec3 secDirectL = vec3(0.0);
                     if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
@@ -464,6 +562,7 @@ void main() {
                             }
                         }
                     }
+#endif
 
                     // Indirect Bounce
                     nextDirection = vec3(0.0);

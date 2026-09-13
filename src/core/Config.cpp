@@ -170,6 +170,7 @@ void Config::printUsage(const char* progName) {
               << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
               << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
+              << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --no-async-preprocess   Disable dedicated async compute queue DGC preprocessing\n"
@@ -406,6 +407,8 @@ Config Config::parse(int argc, char* argv[]) {
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
             else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
+        } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
+            cfg.streamline_secondary_shading = false;
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {

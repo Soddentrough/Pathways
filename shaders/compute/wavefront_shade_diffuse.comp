@@ -1,4 +1,7 @@
 #version 460
+#ifndef IS_SECONDARY_BOUNCE
+#define IS_SECONDARY_BOUNCE 0
+#endif
 #extension GL_EXT_ray_query : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
@@ -208,6 +211,7 @@ void main() {
             hitNormal = frontFace ? hitNormal : -hitNormal;
 
             Material mat = materials[matId];
+#if !IS_SECONDARY_BOUNCE
             if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
@@ -218,6 +222,7 @@ void main() {
                 mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
                 hitNormal = normalize(tbn * normalMap);
             }
+#endif
 
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
@@ -243,11 +248,15 @@ void main() {
 
             float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
             float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
+#if IS_SECONDARY_BOUNCE
+            vec3 F0 = vec3(clamp(f0Dielectric * mat.specularFactor, 0.0, 1.0));
+#else
             float specFactor = mat.specularFactor;
             if (mat.specularTex > 0u && mat.specularTex <= 512u) {
                 specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
             }
             vec3 F0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
+#endif
 
             bool enableDirect = (ubo.flags & (1 << 0)) != 0;
             bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
@@ -261,6 +270,78 @@ void main() {
             vec3 V = -rayDir;
             vec3 secDirectL = vec3(0.0);
 
+#if IS_SECONDARY_BOUNCE
+            // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Pure Lambertian Diffuse) ---
+            if (!pathTerminated && enableDirect && pc.numLights > 0u) {
+                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                uint lightIdx = 0u;
+                float lightSelectPdf = 1.0;
+                SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+
+                Light light = lights[lightIdx];
+                vec3 lightDir;
+                float lightDist = 0.0;
+                float lightPdf = 1.0;
+                vec3 lightEmission = light.emission.rgb;
+                bool validLight = false;
+
+                if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                    vec2 luv = randVec2(seed);
+                    vec3 lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                    vec3 toLight = lightPoint - hitPoint;
+                    lightDist = length(toLight);
+                    lightDir = toLight / max(lightDist, 1e-4);
+                    float cosLight = dot(-lightDir, light.normal.xyz);
+                    if (cosLight > 0.0) {
+                        lightPdf = (lightDist * lightDist) / (light.emission.w * cosLight);
+                        validLight = true;
+                    }
+                } else if (uint(light.position.w) == 1u /* SPOT */) {
+                    vec3 toLight = light.position.xyz - hitPoint;
+                    lightDist = length(toLight);
+                    lightDir = toLight / max(lightDist, 1e-4);
+                    float cosSpot = dot(-lightDir, light.normal.xyz);
+                    if (cosSpot >= light.v.w) {
+                        float spotFactor = clamp((cosSpot - light.v.w) / max(light.u.w - light.v.w, 1e-4), 0.0, 1.0);
+                        lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                        validLight = true;
+                    }
+                } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                    lightDir = normalize(light.normal.xyz);
+                    lightDist = 10000.0;
+                    validLight = true;
+                }
+
+                float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
+                if (validLight && NdotL > 0.0) {
+                    vec3 diffBrdf = diffuseColor * INV_PI;
+                    float lightPdfEff = max(lightPdf * lightSelectPdf, 1e-6);
+                    float diffPdf = NdotL * INV_PI;
+                    float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + diffPdf)) : 1.0;
+
+                    secDirectL = diffBrdf * lightEmission * (NdotL / lightPdfEff) * misWeight;
+                    vec3 unshadowed = throughput * secDirectL;
+
+                    if (length(unshadowed) > 1e-5) {
+                        if (enableShadows) {
+                            if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                doInlineShadow = true;
+                                inlineShadowOrigin = hitPoint + hitNormal * EPSILON;
+                                inlineShadowDir = lightDir;
+                                inlineShadowDist = lightDist;
+                                inlineShadowUnshadowed = unshadowed;
+                            } else {
+                                hasShadowRay = true;
+                                shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                            }
+                        } else {
+                            accumRadiance += unshadowed;
+                        }
+                    }
+                }
+            }
+#else
             // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
             if (!pathTerminated && enableDirect && pc.numLights > 0u) {
                 bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
@@ -400,6 +481,7 @@ void main() {
                     }
                 }
             }
+#endif
 
             // Indirect Bounce: Stochastic Lobe Selection (Dielectric Specular GGX vs Diffuse Cosine)
             if (!pathTerminated) {
@@ -439,6 +521,12 @@ void main() {
                     vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
                     bool validBounce = false;
 
+#if IS_SECONDARY_BOUNCE
+                    // Secondary diffuse bounce: Pure Lambertian Cosine Hemisphere sampling
+                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                    throughput *= diffuseColor;
+                    validBounce = true;
+#else
                     if (randFloat(seed) < specProb) {
                         // Specular GGX Lobe
                         vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
@@ -460,6 +548,7 @@ void main() {
                         throughput *= ((vec3(1.0) - F) * diffuseColor) / (1.0 - specProb);
                         validBounce = true;
                     }
+#endif
 
                     if (!validBounce) {
                         pathTerminated = true;

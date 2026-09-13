@@ -520,6 +520,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
                 ImGui::Text("Material Sort:      %s", wfSortStr);
                 ImGui::Text("Secondary Sort:     %s", secSortStr);
+                ImGui::Text("Secondary Shading:  %s", config.streamline_secondary_shading ? "Streamlined (1-Sample NEE + Lambertian)" : "Full Primary Math (4-Cand RIS + GGX)");
             }
             ImGui::Text("Ray Scheduling:     RDNA4 Hardware BVH Traversal (Wave32)");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
@@ -1100,6 +1101,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "  -> 512 Spatial-Directional Bins (3-Pass Wave32 Counting Sort)");
                 } else {
                     ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
+                }
+
+                if (ImGui::Checkbox("Streamline Secondary Shading##SecShade", &config.streamline_secondary_shading)) {
+                    settingsChanged = true;
+                }
+                if (config.streamline_secondary_shading) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 1-Sample NEE + Lambertian (Bounces >= 1, -17%% ISA footprint)");
+                } else {
+                    ImGui::TextDisabled("  -> Full 4-candidate RIS & microfacet GGX on all bounces");
                 }
 
                 // Wavefront Tile Size

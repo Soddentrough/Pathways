@@ -1090,6 +1090,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
             auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
             auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
+            auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
+            auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,
@@ -1098,7 +1100,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
                 wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
                 wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
-                secNode->context->hasDgcExecutionSet()
+                secNode->context->hasDgcExecutionSet(),
+                wfShadeDiffuseSecCode, wfShadeComplexSecCode
             );
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
@@ -1411,6 +1414,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = packet.cameraUniform.flags;
         wfSceneData.enableNrc = false;
+        wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, m_config.max_bounces, wfSceneData);

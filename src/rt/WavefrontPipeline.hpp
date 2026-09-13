@@ -31,6 +31,7 @@ struct WavefrontSceneData {
     float nrcTrainRatio = 0.03f;
     glm::vec3 boundsMin = glm::vec3(-1000.0f);
     glm::vec3 boundsMax = glm::vec3(1000.0f);
+    bool streamlineSecondaryShading = true;
 };
 
 class WavefrontPipeline {
@@ -52,7 +53,9 @@ public:
                       const std::vector<char>& shadeEmissiveCode = {},
                       const std::vector<char>& shadePassthroughCode = {},
                       const std::vector<char>& raySortCode = {},
-                      bool supportsExecutionSet = false);
+                      bool supportsExecutionSet = false,
+                      const std::vector<char>& shadeDiffuseSecCode = {},
+                      const std::vector<char>& shadeComplexSecCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -133,7 +136,9 @@ private:
                          const std::vector<char>& shadeComplexCode,
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadePassthroughCode,
-                         const std::vector<char>& raySortCode);
+                         const std::vector<char>& raySortCode,
+                         const std::vector<char>& shadeDiffuseSecCode = {},
+                         const std::vector<char>& shadeComplexSecCode = {});
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -179,7 +184,12 @@ private:
     VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_raySortPipeline = VK_NULL_HANDLE;
+
+    std::vector<VkPipeline> m_primaryMatPipelines;
+    std::vector<VkPipeline> m_secondaryMatPipelines;
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };

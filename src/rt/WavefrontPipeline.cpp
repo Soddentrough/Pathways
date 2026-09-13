@@ -21,7 +21,9 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadeEmissiveCode,
                                      const std::vector<char>& shadePassthroughCode,
                                      const std::vector<char>& raySortCode,
-                                     bool supportsExecutionSet)
+                                     bool supportsExecutionSet,
+                                     const std::vector<char>& shadeDiffuseSecCode,
+                                     const std::vector<char>& shadeComplexSecCode)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height), m_tileSize(tileSize),
       m_supportsExecutionSet(supportsExecutionSet && (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr)) {
 
@@ -37,7 +39,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     updateQueueDescriptors();
     createPipelines(classifyCode, intersectCode, shadeCode, shadowCode,
                     shadeDiffuseCode, shadeDielectricCode, shadeConductorCode, shadeComplexCode,
-                    shadeEmissiveCode, shadePassthroughCode, raySortCode);
+                    shadeEmissiveCode, shadePassthroughCode, raySortCode,
+                    shadeDiffuseSecCode, shadeComplexSecCode);
 
     VkQueryPoolCreateInfo qpInfo{};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -47,8 +50,9 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
         vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPools[i]);
     }
 
-    Logger::info("Pure WavefrontPipeline created successfully (tileSize: {}, capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, RaySort: {}).",
+    Logger::info("Pure WavefrontPipeline created successfully (tileSize: {}, capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, Streamlined Secondary: {}, RaySort: {}).",
                  m_tileSize, m_maxCapacity, (m_shadeDiffusePipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
+                 (m_shadeDiffuseSecPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
                  (m_raySortPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"));
 }
 
@@ -65,6 +69,8 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeComplexPipeline) vkDestroyPipeline(m_device, m_shadeComplexPipeline, nullptr);
     if (m_shadeEmissivePipeline) vkDestroyPipeline(m_device, m_shadeEmissivePipeline, nullptr);
     if (m_shadePassthroughPipeline) vkDestroyPipeline(m_device, m_shadePassthroughPipeline, nullptr);
+    if (m_shadeDiffuseSecPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecPipeline, nullptr);
+    if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
     if (m_raySortPipeline) vkDestroyPipeline(m_device, m_raySortPipeline, nullptr);
 
     if (m_classifyPipeline) vkDestroyPipeline(m_device, m_classifyPipeline, nullptr);
@@ -386,7 +392,9 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
                                         const std::vector<char>& shadeComplexCode,
                                         const std::vector<char>& shadeEmissiveCode,
                                         const std::vector<char>& shadePassthroughCode,
-                                        const std::vector<char>& raySortCode) {
+                                        const std::vector<char>& raySortCode,
+                                        const std::vector<char>& shadeDiffuseSecCode,
+                                        const std::vector<char>& shadeComplexSecCode) {
     // Pipeline Layout (128 bytes push constants for all stages)
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -461,6 +469,12 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     if (!shadePassthroughCode.empty()) {
         m_shadePassthroughPipeline = buildComputePipeline(shadePassthroughCode, "shade_passthrough");
     }
+    if (!shadeDiffuseSecCode.empty()) {
+        m_shadeDiffuseSecPipeline = buildComputePipeline(shadeDiffuseSecCode, "shade_diffuse_sec");
+    }
+    if (!shadeComplexSecCode.empty()) {
+        m_shadeComplexSecPipeline = buildComputePipeline(shadeComplexSecCode, "shade_complex_sec");
+    }
     if (!raySortCode.empty()) {
         m_raySortPipeline = buildComputePipeline(raySortCode, "wavefront_raysort");
     }
@@ -481,15 +495,28 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     });
 
     if (m_shadeDiffusePipeline && m_shadeDielectricPipeline && m_shadeConductorPipeline && m_shadeComplexPipeline) {
-        std::vector<VkPipeline> matPipes = {
+        m_primaryMatPipelines = {
             m_shadeDiffusePipeline,
             m_shadeDielectricPipeline,
             m_shadeConductorPipeline,
             m_shadeComplexPipeline
         };
-        if (m_shadeEmissivePipeline) matPipes.push_back(m_shadeEmissivePipeline);
-        if (m_shadePassthroughPipeline) matPipes.push_back(m_shadePassthroughPipeline);
-        m_dgcManager->initMaterialExecutionSet(matPipes);
+        if (m_shadeEmissivePipeline) m_primaryMatPipelines.push_back(m_shadeEmissivePipeline);
+        if (m_shadePassthroughPipeline) m_primaryMatPipelines.push_back(m_shadePassthroughPipeline);
+
+        VkPipeline secDiffuse = m_shadeDiffuseSecPipeline ? m_shadeDiffuseSecPipeline : m_shadeDiffusePipeline;
+        VkPipeline secComplex = m_shadeComplexSecPipeline ? m_shadeComplexSecPipeline : m_shadeComplexPipeline;
+
+        m_secondaryMatPipelines = {
+            secDiffuse,
+            m_shadeDielectricPipeline,
+            m_shadeConductorPipeline,
+            secComplex
+        };
+        if (m_shadeEmissivePipeline) m_secondaryMatPipelines.push_back(m_shadeEmissivePipeline);
+        if (m_shadePassthroughPipeline) m_secondaryMatPipelines.push_back(m_shadePassthroughPipeline);
+
+        m_dgcManager->initMaterialExecutionSets(m_primaryMatPipelines, m_secondaryMatPipelines);
     }
 }
 
@@ -631,15 +658,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 c2sDep.pBufferMemoryBarriers = c2sBarriers.data();
                 vkCmdPipelineBarrier2(cmd, &c2sDep);
 
-                bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE);
-                std::vector<VkPipeline> matPipelines = {
-                    m_shadeDiffusePipeline,
-                    m_shadeDielectricPipeline,
-                    m_shadeConductorPipeline,
-                    m_shadeComplexPipeline
-                };
-                if (m_shadeEmissivePipeline) matPipelines.push_back(m_shadeEmissivePipeline);
-                if (m_shadePassthroughPipeline) matPipelines.push_back(m_shadePassthroughPipeline);
+                bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
 
                 // 4. Multi-Bounce Loop for this Tile
                 for (uint32_t b = 0; b < maxBounces; ++b) {
@@ -675,17 +694,20 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 0);
 
                     if (useMaterialSort) {
+                        bool isSecondary = (b >= 1 && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty());
+                        const auto& matPipelines = isSecondary ? m_secondaryMatPipelines : m_primaryMatPipelines;
+
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                         VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                         uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                         uint32_t sliceIdx = DGCManager::getSliceIndex(frameSlot, b);
                         VkDeviceAddress seqCountAddr = m_queueCounters ? (m_queueCounters->getDeviceAddress(m_device) + 172) : 0;
                         if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr);
+                            m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
                             m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream.get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr, isSecondary);
                         } else {
-                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr);
+                            m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr, isSecondary);
                         }
                     } else {
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
