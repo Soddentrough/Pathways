@@ -911,6 +911,7 @@ PATHWAYS 4-PHASE REMEDIATION & EVOLUTION ROADMAP:
 [Phase 2: Performance Tuning & Micro-Architectural Polish] (Target: v1.19.9 - Complete)
  ├── OPT-02:  Move BMFR 10x10 covariance matrix to LDS (Eliminate 304B scratch spill -> 100% occupancy) [COMPLETED]
  ├── OPT-09:  Packed FP16 BSDF Arithmetic & Register Pressure Reduction (-36% VGPRs on diffuse) [COMPLETED]
+ │    └── Hardened against high-radiance light emission FP16 overflow (>65,504 nits in Cornell Caustic) via FP32 pre-multiplication & NaN sanitization [FIXED]
  ├── OPT-08:  Enable scalarBlockLayout & strip padding[3] from Triangle (160B -> 148B) [COMPLETED]
  ├── OPT-05:  Implement camera inertia and exponential velocity damping in Camera::update [COMPLETED]
  ├── OPT-07:  Dispatch telemetry JSON serialization to background worker thread [COMPLETED]
