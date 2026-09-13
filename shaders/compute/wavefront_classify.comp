@@ -115,30 +115,56 @@ layout(push_constant) uniform PushConstants {
     uint tileSizeY;
     uint sortMode;
     uint numOpaqueTriangles;
+    uint fullWidth;
+    uint fullHeight;
 } pc;
 
 void main() {
+    uint fw = (pc.fullWidth > 0u) ? pc.fullWidth : pc.width;
+    uint fh = (pc.fullHeight > 0u) ? pc.fullHeight : pc.height;
+    ivec2 globalID = ivec2(gl_GlobalInvocationID.xy);
     ivec2 pixelCoord;
+    ivec2 storeCoord;
+    uint storeWidth;
     bool inBounds = false;
-    uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
 
-    if (pc.tileSizeX > 0u && pc.tileSizeY > 0u) {
+    if (pc.tileOffsetX == 1u || pc.tileOffsetX == 2u) {
+        // Multi-GPU Checkerboard Tiling (tileOffsetX: 1 = primary even tiles, 2 = secondary odd tiles)
+        uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+        uint ty = uint(globalID.y) / tileSize;
+        uint tx_half = uint(globalID.x) / tileSize;
+        uint localX = uint(globalID.x) % tileSize;
+        uint tx = (pc.tileOffsetX == 1u)
+            ? (tx_half * 2u + (ty & 1u))
+            : (tx_half * 2u + (1u - (ty & 1u)));
+        pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
+        storeCoord = (pc.tileOffsetX == 2u) ? globalID : pixelCoord;
+        storeWidth = (pc.tileOffsetX == 2u) ? pc.width : fw;
+        inBounds = (globalID.x < int(pc.width) && globalID.y < int(pc.height) &&
+                    pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
+    } else if (pc.tileSizeX > 0u && pc.tileSizeY > 0u) {
+        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
         ivec2 localCoord;
         if (pc.useMorton != 0u) {
             localCoord = getPixelCoordsMorton8x4(linearIdx, pc.tileSizeX, pc.tileSizeY);
         } else {
-            localCoord = ivec2(gl_GlobalInvocationID.xy);
+            localCoord = globalID;
         }
         pixelCoord = localCoord + ivec2(pc.tileOffsetX, pc.tileOffsetY);
+        storeCoord = pixelCoord;
+        storeWidth = fw;
         inBounds = (localCoord.x < int(pc.tileSizeX) && localCoord.y < int(pc.tileSizeY) &&
-                    pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height));
+                    pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
     } else {
+        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
         if (pc.useMorton != 0u) {
             pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
         } else {
-            pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+            pixelCoord = globalID;
         }
-        inBounds = (pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height));
+        storeCoord = pixelCoord;
+        storeWidth = fw;
+        inBounds = (pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
     }
     bool isActive = false;
     uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
@@ -149,7 +175,7 @@ void main() {
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
         vec2 jitter = randVec2(seed) - vec2(0.5);
-        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(float(pc.width), float(pc.height));
+        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(float(fw), float(fh));
         vec2 d = uv * 2.0 - 1.0;
 
         vec4 target = ubo.projInverse * vec4(d.x, d.y, 1.0, 1.0);
@@ -192,7 +218,7 @@ void main() {
         }
 
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
-        uint pixelIndex = uint(pixelCoord.x + pixelCoord.y * int(pc.width));
+        uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
         vec3 hitNormal = vec3(0.0, 1.0, 0.0);
 
         if (closestTri < 0 && closestSphere < 0) {
@@ -207,8 +233,8 @@ void main() {
             }
             skyColor *= invSpp;
 
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
+            vec4 prev = imageLoad(uAccumImage, storeCoord);
+            imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
         } else {
             // Hit! Setup SoA state
             isActive = true;

@@ -34,6 +34,10 @@ struct WavefrontSceneData {
     bool streamlineSecondaryShading = true;
     bool enableDistanceClamping = true;
     float maxSecondaryRayDistance = 0.0f; // 0 = automatic scene bounding diameter * 1.25
+    uint32_t tileOffsetX = 0;             // Multi-GPU Checkerboard: 0 = full frame / sample parallel, 1 = primary even tiles, 2 = secondary odd tiles
+    uint32_t tileOffsetY = 0;             // Multi-GPU Checkerboard tile size (16, 32, 64, 128; defaults to 64 if 0)
+    uint32_t fullWidth = 0;               // Full unclipped frame resolution width
+    uint32_t fullHeight = 0;              // Full unclipped frame resolution height
 };
 
 class WavefrontPipeline {

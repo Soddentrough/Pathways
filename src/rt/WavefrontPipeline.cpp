@@ -557,6 +557,9 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     m_secondarySortMode = sceneData.secondarySortMode;
     uint32_t numTilesX = (ts > 0) ? (width + ts - 1) / ts : 1;
     uint32_t numTilesY = (ts > 0) ? (height + ts - 1) / ts : 1;
+    uint32_t fw = (sceneData.fullWidth > 0) ? sceneData.fullWidth : width;
+    uint32_t fh = (sceneData.fullHeight > 0) ? sceneData.fullHeight : height;
+    uint32_t storeWidth = (sceneData.tileOffsetX == 2u) ? width : fw;
 
     vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_dgcStream[frameSlot]->getBuffer(), 0, VK_WHOLE_SIZE, 0);
@@ -601,25 +604,27 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
 
-                uint32_t classifyPC[18] = {
+                uint32_t classifyPC[20] = {
                     sceneData.numTriangles,
                     sceneData.numSpheres,
                     sceneData.numMaterials,
                     sceneData.numLights,
-                    width,
-                    height,
+                    curTileW,
+                    curTileH,
                     sceneData.useMorton,
                     sceneData.hasEnvMap,
                     std::bit_cast<uint32_t>(sceneData.envMapIntensity),
                     m_maxCapacity,
                     sampleIdx,
                     sceneData.useHardwareRT,
-                    tileOffsetX,
-                    tileOffsetY,
+                    (sceneData.tileOffsetX != 0u) ? sceneData.tileOffsetX : tileOffsetX,
+                    (sceneData.tileOffsetX != 0u) ? sceneData.tileOffsetY : tileOffsetY,
                     ts,
                     ts,
                     sceneData.sortMode,
-                    sceneData.numOpaqueTriangles
+                    sceneData.numOpaqueTriangles,
+                    fw,
+                    fh
                 };
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
                 if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
@@ -673,8 +678,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.numSpheres,
                         sceneData.numMaterials,
                         sceneData.numLights,
-                        width,
-                        height,
+                        storeWidth,
+                        fh,
                         b,
                         maxBounces,
                         m_maxCapacity,
@@ -765,8 +770,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         sceneData.numSpheres,
                         sceneData.numMaterials,
                         sceneData.numLights,
-                        width,
-                        height,
+                        storeWidth,
+                        fh,
                         sceneData.frameIndex,
                         sampleIdx,
                         sceneData.numOpaqueTriangles
@@ -797,8 +802,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             sceneData.numSpheres,
                             sceneData.numMaterials,
                             sceneData.numLights,
-                            width,
-                            height,
+                            storeWidth,
+                            fh,
                             b,
                             maxBounces,
                             m_maxCapacity,

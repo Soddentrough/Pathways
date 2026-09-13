@@ -3797,6 +3797,10 @@ void Engine::renderFrame() {
                 wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
                 wfSceneData.enableDistanceClamping = m_config.distance_clamping;
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+                wfSceneData.tileOffsetX = tileOffsetX_prim;
+                wfSceneData.tileOffsetY = tileOffsetY_prim;
+                wfSceneData.fullWidth = m_config.width;
+                wfSceneData.fullHeight = m_config.height;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);

@@ -1473,6 +1473,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.tileOffsetX = packet.tileOffsetX;
+        wfSceneData.tileOffsetY = packet.tileOffsetY;
+        wfSceneData.fullWidth = packet.tileWidth;
+        wfSceneData.fullHeight = packet.tileHeight;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, m_config.max_bounces, wfSceneData);
