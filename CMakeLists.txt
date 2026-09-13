@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.19.3 LANGUAGES C CXX)
+project(Pathways VERSION 1.19.7 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -165,6 +165,29 @@ foreach(SHADER ${SHADER_FILES})
         list(APPEND SPV_FILES ${SPV_FILE})
     endif()
 endforeach()
+
+# Streamlined Secondary Shaders (Specialized compile-time dead-code elimination)
+set(SEC_DIFFUSE_SPV ${SPV_OUTPUT_DIR}/wavefront_shade_diffuse_sec.comp.spv)
+set(BIN_SEC_DIFFUSE_SPV ${BIN_SPV_DIR}/wavefront_shade_diffuse_sec.comp.spv)
+add_custom_command(
+    OUTPUT ${SEC_DIFFUSE_SPV}
+    COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DIS_SECONDARY_BOUNCE=1 -O ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp -o ${SEC_DIFFUSE_SPV}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SEC_DIFFUSE_SPV} ${BIN_SEC_DIFFUSE_SPV}
+    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl
+    COMMENT "Compiling streamlined secondary shader wavefront_shade_diffuse_sec.comp to SPIR-V"
+)
+list(APPEND SPV_FILES ${SEC_DIFFUSE_SPV})
+
+set(SEC_COMPLEX_SPV ${SPV_OUTPUT_DIR}/wavefront_shade_complex_sec.comp.spv)
+set(BIN_SEC_COMPLEX_SPV ${BIN_SPV_DIR}/wavefront_shade_complex_sec.comp.spv)
+add_custom_command(
+    OUTPUT ${SEC_COMPLEX_SPV}
+    COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DIS_SECONDARY_BOUNCE=1 -O ${SHADER_DIR}/compute/wavefront_shade_complex.comp -o ${SEC_COMPLEX_SPV}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SEC_COMPLEX_SPV} ${BIN_SEC_COMPLEX_SPV}
+    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_complex.comp ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl
+    COMMENT "Compiling streamlined secondary shader wavefront_shade_complex_sec.comp to SPIR-V"
+)
+list(APPEND SPV_FILES ${SEC_COMPLEX_SPV})
 
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 

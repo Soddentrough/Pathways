@@ -29,7 +29,13 @@ public:
     // [0] classify, [1] intersect, [2] shade, [3] shadow, [4] resolve
     void initExecutionSet(const std::vector<VkPipeline>& pipelines);
 
-    // Multi-slice ring buffer controls
+    static constexpr uint32_t NUM_SLICES = 32;
+    static inline uint32_t getSliceIndex(uint32_t frameSlot, uint32_t bounce, uint32_t passIndex = 0) {
+        // Double-buffered frameSlot (0..1) with up to 16 bounces, partitioned per pass
+        return ((frameSlot * 16 + bounce) * 1 + passIndex) % NUM_SLICES;
+    }
+
+    // Dynamic multi-slice ring buffer controls
     uint32_t acquireSlice();
     void resetSliceCounter();
     uint32_t getSliceCount() const { return m_sliceCount; }
@@ -41,8 +47,8 @@ public:
                           VkDeviceSize argumentOffset = 0, uint32_t sliceIndex = 0,
                           uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
 
-    // Synchronization barrier between preprocessing and execution (sliceCount = 0 synchronizes all active slices)
-    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t firstSlice = 0, uint32_t sliceCount = 0);
+    // Synchronization barrier between preprocessing and execution (sliceIndex == UINT32_MAX synchronizes entire buffer)
+    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX, uint32_t sliceCount = 1);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
@@ -56,15 +62,20 @@ public:
     // Material execution set support (Techniques A, B, C)
     bool isMaterialDGCSupported() const { return m_materialDGCSupported; }
     VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSet; }
+    VkIndirectExecutionSetEXT getMaterialExecutionSetSecondary() const { return m_materialExecutionSetSecondary; }
     void initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines);
+    void initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
+                                   const std::vector<VkPipeline>& secondaryPipelines);
     void recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                   Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
                                   uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
-                                  VkDeviceAddress sequenceCountAddress = 0);
+                                  VkDeviceAddress sequenceCountAddress = 0,
+                                  bool isSecondary = false);
     void recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
                                uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
-                               bool isPreprocessed = true, VkDeviceAddress sequenceCountAddress = 0);
+                               bool isPreprocessed = true, VkDeviceAddress sequenceCountAddress = 0,
+                               bool isSecondary = false);
 
 private:
     void loadFunctionPointers();
@@ -78,6 +89,7 @@ private:
     VkIndirectExecutionSetEXT m_executionSet = VK_NULL_HANDLE;
     VkIndirectCommandsLayoutEXT m_materialIndirectLayout = VK_NULL_HANDLE;
     VkIndirectExecutionSetEXT m_materialExecutionSet = VK_NULL_HANDLE;
+    VkIndirectExecutionSetEXT m_materialExecutionSetSecondary = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
     uint32_t m_sliceCount = 32;

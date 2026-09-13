@@ -114,4 +114,16 @@ void Buffer::copyFrom(const void* data, VkDeviceSize size) {
     vmaFlushAllocation(m_allocator, m_allocation, 0, size);
 }
 
+void Buffer::invalidate(VkDeviceSize offset, VkDeviceSize size) {
+    if (m_allocator && m_allocation) {
+        vmaInvalidateAllocation(m_allocator, m_allocation, offset, size);
+    }
+}
+
+void Buffer::flush(VkDeviceSize offset, VkDeviceSize size) {
+    if (m_allocator && m_allocation) {
+        vmaFlushAllocation(m_allocator, m_allocation, offset, size);
+    }
+}
+
 } // namespace pathways

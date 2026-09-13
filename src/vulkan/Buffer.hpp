@@ -27,6 +27,8 @@ public:
     void* map();
     void unmap();
     void copyFrom(const void* data, VkDeviceSize size);
+    void invalidate(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
+    void flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
 
 private:
     void release();

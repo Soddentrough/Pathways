@@ -7,63 +7,87 @@ namespace pathways {
 
 Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
                      uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
-                     VkFormat preferredFormat)
-    : m_device(device), m_preferredFormat(preferredFormat) {
+                     bool enableHdr)
+    : m_device(device) {
 
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &capabilities);
 
-    uint32_t formatCount;
+    uint32_t formatCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
 
-    // Surface format selection: prioritize preferredFormat (e.g. A2B10G10R10_UNORM_PACK32 for 10-bit Deep Color/HDR),
-    // then R8G8B8A8_UNORM / B8G8R8A8_UNORM as SDR fallbacks.
-    m_imageFormat = formats[0].format;
-    m_colorSpace = formats[0].colorSpace;
-    bool foundFormat = false;
-
-    // 1. Try to match preferredFormat directly
+    Logger::debug("Surface formats supported by display ({} available):", formatCount);
     for (const auto& f : formats) {
-        if (f.format == m_preferredFormat) {
-            m_imageFormat = f.format;
-            m_colorSpace = f.colorSpace;
-            foundFormat = true;
-            break;
+        Logger::debug("  Format: {}, ColorSpace: {}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
+    }
+
+    bool chosen = false;
+    m_hdrMode = HdrDisplayMode::SDR;
+
+    if (enableHdr) {
+        // Priority 1: scRGB Linear (16-bit Float, 1.0 = 80 nits reference paper white)
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+                m_imageFormat = f.format;
+                m_colorSpace = f.colorSpace;
+                m_hdrMode = HdrDisplayMode::scRGB;
+                chosen = true;
+                Logger::info("Selected HDR Display: R16G16B16A16_SFLOAT with EXTENDED_SRGB_LINEAR (scRGB Linear)");
+                break;
+            }
+        }
+
+        // Priority 2: HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ)
+        if (!chosen) {
+            for (const auto& f : formats) {
+                if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                     f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                    f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                    m_imageFormat = f.format;
+                    m_colorSpace = f.colorSpace;
+                    m_hdrMode = HdrDisplayMode::HDR10;
+                    chosen = true;
+                    Logger::info("Selected HDR Display: {} with HDR10_ST2084 (HDR10 PQ Rec.2020)",
+                                 f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? "A2B10G10R10_UNORM" : "A2R10G10B10_UNORM");
+                    break;
+                }
+            }
+        }
+
+        if (!chosen) {
+            Logger::info("HDR display mode requested, but display compositor does not expose scRGB or HDR10 surface formats. Falling back to SDR.");
         }
     }
 
-    // 2. Fallbacks if preferredFormat was not supported by surface
-    if (!foundFormat) {
+    // SDR Fallback: Prefer R8G8B8A8_UNORM, then B8G8R8A8_UNORM
+    if (!chosen) {
+        m_hdrMode = HdrDisplayMode::SDR;
         for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+            if (f.format == VK_FORMAT_R8G8B8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
                 m_imageFormat = f.format;
                 m_colorSpace = f.colorSpace;
-                foundFormat = true;
+                chosen = true;
                 break;
             }
         }
-    }
-    if (!foundFormat) {
-        for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_R8G8B8A8_UNORM) {
-                m_imageFormat = f.format;
-                m_colorSpace = f.colorSpace;
-                foundFormat = true;
-                break;
+        if (!chosen) {
+            for (const auto& f : formats) {
+                if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    m_imageFormat = f.format;
+                    m_colorSpace = f.colorSpace;
+                    chosen = true;
+                    break;
+                }
             }
         }
-    }
-    if (!foundFormat) {
-        for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM) {
-                m_imageFormat = f.format;
-                m_colorSpace = f.colorSpace;
-                foundFormat = true;
-                break;
-            }
+        if (!chosen && !formats.empty()) {
+            m_imageFormat = formats[0].format;
+            m_colorSpace = formats[0].colorSpace;
         }
+        Logger::info("Selected SDR Display: format {} with color space {}", static_cast<int>(m_imageFormat), static_cast<int>(m_colorSpace));
     }
 
     if (capabilities.currentExtent.width != UINT32_MAX) {
@@ -105,7 +129,17 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     }
     createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     createInfo.preTransform = capabilities.currentTransform;
-    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    VkCompositeAlphaFlagBitsKHR compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
+        if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+            compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+        } else if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+            compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+        } else if (capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) {
+            compositeAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+        }
+    }
+    createInfo.compositeAlpha = compositeAlpha;
     createInfo.presentMode = chosenPresentMode;
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = VK_NULL_HANDLE;
@@ -140,7 +174,8 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
         }
     }
 
-    Logger::info("Created swapchain: {}x{}, {} images, format: {}", m_extent.width, m_extent.height, imageCount, (int)m_imageFormat);
+    Logger::info("Created swapchain: {}x{}, {} images, format: {}, colorSpace: {}",
+                 m_extent.width, m_extent.height, imageCount, getFormatName(), getColorSpaceName());
 }
 
 Swapchain::~Swapchain() {
@@ -168,6 +203,28 @@ VkResult Swapchain::queuePresent(VkQueue queue, uint32_t imageIndex, VkSemaphore
     presentInfo.pImageIndices = &imageIndex;
 
     return vkQueuePresentKHR(queue, &presentInfo);
+}
+
+const char* Swapchain::getColorSpaceName() const {
+    switch (m_colorSpace) {
+        case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: return "EXTENDED_SRGB_LINEAR (scRGB Linear)";
+        case VK_COLOR_SPACE_HDR10_ST2084_EXT:         return "HDR10_ST2084 (BT.2020 PQ)";
+        case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:       return "SRGB_NONLINEAR (SDR standard)";
+        case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT: return "DISPLAY_P3_NONLINEAR";
+        case VK_COLOR_SPACE_BT2020_LINEAR_EXT:        return "BT2020_LINEAR";
+        default:                                      return "Custom / Unspecified";
+    }
+}
+
+const char* Swapchain::getFormatName() const {
+    switch (m_imageFormat) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT:       return "R16G16B16A16_SFLOAT (64-bit Half)";
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:  return "A2B10G10R10_UNORM (10-bit)";
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32:  return "A2R10G10B10_UNORM (10-bit)";
+        case VK_FORMAT_R8G8B8A8_UNORM:            return "R8G8B8A8_UNORM (8-bit)";
+        case VK_FORMAT_B8G8R8A8_UNORM:            return "B8G8R8A8_UNORM (8-bit)";
+        default:                                  return "Unknown Format";
+    }
 }
 
 } // namespace pathways

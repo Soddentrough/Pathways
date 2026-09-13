@@ -146,12 +146,17 @@ struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
-// 16-byte cache-line aligned ray hit (written by intersect/classify, read by shade)
+// 32-byte cache-line aligned pre-interpolated ray hit (written by intersect/classify, read by shade)
 struct RayHit {
-    vec4 hitData;
+    vec4 hitData0;
     // x: hitT (float)
-    // y: uintBitsToFloat(primitiveIndex)
-    // z: uintBitsToFloat(packHalf2x16(barycentrics))
+    // y: uintBitsToFloat(matId)
+    // z: uintBitsToFloat(packOct32(hitNormal))
+    // w: uintBitsToFloat(packHalf2x16(hitUv))
+    vec4 hitData1;
+    // x: uintBitsToFloat(packOct32(geomTangent.xyz))
+    // y: geomTangent.w (tangent sign)
+    // z: uintBitsToFloat(primitiveIndex)
     // w: uintBitsToFloat(hitType) (0: triangle, 1: sphere, 2: miss)
 };
 
@@ -282,6 +287,16 @@ vec2 randVec2(inout uint seed) {
 
 vec3 randVec3(inout uint seed) {
     return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+// Unbiased stochastic rounding for FP16 HDR accumulation buffer.
+// Prevents floating-point precision exhaustion and colored contour banding under multi-frame progressive accumulation.
+vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (dot(val, val) < 1e-12) return accum;
+    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
+    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
+    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
+    return max(vec3(0.0), accum + val + dither);
 }
 
 vec2 directionToEquirectangular(vec3 dir) {

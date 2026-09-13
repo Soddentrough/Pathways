@@ -159,6 +159,14 @@ vec3 randVec3(inout uint seed) {
     return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
 }
 
+vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (dot(val, val) < 1e-12) return accum;
+    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
+    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
+    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
+    return max(vec3(0.0), accum + val + dither);
+}
+
 // Ray structure
 struct Ray {
     vec3 origin;
@@ -906,7 +914,7 @@ void main() {
         newAccum = vec4(pixelRadiance, float(ubo.spp));
     } else {
         vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
-        newAccum = prevAccum + vec4(pixelRadiance, float(ubo.spp));
+        newAccum = vec4(addFp16Stochastic(prevAccum.rgb, pixelRadiance, seed), prevAccum.a + float(ubo.spp));
     }
 
     imageStore(uAccumImage, storeCoord, newAccum);

@@ -75,7 +75,8 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint currentOctantCounts[8];
     uint totalIntersectWorkgroups;
     uint secondaryRayCount;
-    uint pad[21];
+    uint activeMaterialSequenceCount;
+    uint pad[20];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -140,12 +141,15 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData.x;
-        uint primId = floatBitsToUint(hit.hitData.y);
-        vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
-        uint hitType = floatBitsToUint(hit.hitData.w);
+        float hitT = hit.hitData0.x;
+        uint matId = floatBitsToUint(hit.hitData0.y);
+        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
+        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
+        uint primId = floatBitsToUint(hit.hitData1.z);
+        uint hitType = floatBitsToUint(hit.hitData1.w);
 
         vec3 throughput = state.throughputSeed.rgb;
+        uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
         uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
 
@@ -162,34 +166,9 @@ void main() {
             accumRadiance += throughput * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
         } else {
-            vec2 hitUv = vec2(0.0);
-            uint matId = 0u;
-            vec3 hitNormal = -rayDir;
-
-            if (hitType == 0u) {
-                float u = hitBary.x;
-                float v = hitBary.y;
-                float w = 1.0 - u - v;
-
-                vec3 n0 = triangles[primId].v0.normal.xyz;
-                vec3 n1 = triangles[primId].v1.normal.xyz;
-                vec3 n2 = triangles[primId].v2.normal.xyz;
-                hitNormal = normalize(w * n0 + u * n1 + v * n2);
-                if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
-
-                vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
-                vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
-                vec2 uv2 = vec2(triangles[primId].v2.position.w, triangles[primId].v2.normal.w);
-                hitUv = w * uv0 + u * uv1 + v * uv2;
-                matId = triangles[primId].materialId;
-            } else if (hitType == 1u) {
-                Sphere sp = spheres[primId];
-                hitNormal = normalize((origin + hitT * rayDir) - sp.centerRadius.xyz);
-                if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
-                matId = sp.materialId;
-            }
+            if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
 
             Material mat = materials[matId];
             vec3 emissive = mat.emissive.rgb;
@@ -200,7 +179,7 @@ void main() {
             accumRadiance += throughput * emissive;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
         }
     }
 
@@ -237,14 +216,16 @@ void main() {
             dgcStream.commands[b * 16u + 7u].y = 1u;
             dgcStream.commands[b * 16u + 7u].z = 1u;
 
-            // Slots 8..15: Option 1 Directional DGC intersect dispatches
+            // Slots 8..15: Producer-Side Binning Directional DGC intersect dispatches
             uint totalIntersectWgs = 0u;
+            uint totalOctantRays = 0u;
             if (pc.secondarySortMode == 1u) {
                 for (uint k = 0u; k < 8u; ++k) {
                     uint octCnt = queueCounters.octantCounts[k];
                     queueCounters.currentOctantCounts[k] = octCnt;
                     uint octGroups = (octCnt + 31u) / 32u;
                     totalIntersectWgs += octGroups;
+                    totalOctantRays += octCnt;
 
                     indirect.commands[b * 16u + 8u + k].x = octGroups;
                     indirect.commands[b * 16u + 8u + k].y = 1u;
@@ -260,8 +241,10 @@ void main() {
                 }
             } else {
                 totalIntersectWgs = intersectGroups;
+                totalOctantRays = nextCount;
             }
             queueCounters.totalIntersectWorkgroups = totalIntersectWgs;
+            queueCounters.secondaryRayCount = totalOctantRays;
 
             if (pc.secondarySortMode == 2u) {
                 indirect.commands[b * 16u + 8u].x = intersectGroups;
@@ -271,7 +254,7 @@ void main() {
             }
 
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? totalOctantRays : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;

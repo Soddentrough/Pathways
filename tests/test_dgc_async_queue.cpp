@@ -41,18 +41,18 @@ int main() {
     std::cout << "[TEST 3] QueueFamilyIndices Invariants & Dedicated Compute Discovery..." << std::endl;
     QueueFamilyIndices indices{};
     check_true(!indices.isComplete(), "Default QueueFamilyIndices must not be complete");
-    check_true(indices.dedicatedComputeFamily == UINT32_MAX, "Default dedicatedComputeFamily must be UINT32_MAX");
+    check_true(indices.asyncComputeFamily == UINT32_MAX, "Default asyncComputeFamily must be UINT32_MAX");
 
     indices.graphicsComputeFamily = 0;
     check_true(indices.isComplete(), "QueueFamilyIndices with graphicsComputeFamily set must be complete");
 
     indices.transferFamily = 2;
-    indices.dedicatedComputeFamily = 1;
-    check_true(indices.dedicatedComputeFamily != indices.graphicsComputeFamily,
-               "Dedicated compute family must be distinct from graphics family when available");
-    check_true(indices.dedicatedComputeFamily != indices.transferFamily,
-               "Dedicated compute family must be distinct from transfer family");
-    std::cout << "  -> QueueFamilyIndices invariants verified (Graphics: 0, Dedicated Compute: 1, Transfer: 2)." << std::endl;
+    indices.asyncComputeFamily = 1;
+    check_true(indices.asyncComputeFamily != indices.graphicsComputeFamily,
+               "Async compute family must be distinct from graphics family when available");
+    check_true(indices.asyncComputeFamily != indices.transferFamily,
+               "Async compute family must be distinct from transfer family");
+    std::cout << "  -> QueueFamilyIndices invariants verified (Graphics: 0, Async Compute: 1, Transfer: 2)." << std::endl;
 
     // 4. Verify Multi-Slice Ring Buffer Offset & Rollover Logic
     std::cout << "[TEST 4] Multi-Slice Ring Buffer Offset & Rollover Calculations..." << std::endl;

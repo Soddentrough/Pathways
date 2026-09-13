@@ -116,6 +116,10 @@ DGCManager::~DGCManager() {
         pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);
         m_materialExecutionSet = VK_NULL_HANDLE;
     }
+    if (m_materialExecutionSetSecondary && pfn_vkDestroyIndirectExecutionSetEXT) {
+        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSetSecondary, nullptr);
+        m_materialExecutionSetSecondary = VK_NULL_HANDLE;
+    }
 }
 
 void DGCManager::loadFunctionPointers() {
@@ -220,15 +224,8 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
-void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t firstSlice, uint32_t sliceCount) {
+void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex, uint32_t sliceCount) {
     if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
-
-    VkDeviceSize offset = (sliceCount == 0) ? 0 : static_cast<VkDeviceSize>(firstSlice % m_sliceCount) * m_sliceSize;
-    VkDeviceSize size = (sliceCount == 0) ? VK_WHOLE_SIZE : static_cast<VkDeviceSize>(sliceCount) * m_sliceSize;
-    if (size != VK_WHOLE_SIZE && (offset + size > m_preprocessBuffer->getSize())) {
-        offset = 0;
-        size = VK_WHOLE_SIZE;
-    }
 
     VkBufferMemoryBarrier2 bufferBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
     bufferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT;
@@ -238,8 +235,18 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t firstSlic
     bufferBarrier.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT |
                                   VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     bufferBarrier.buffer = m_preprocessBuffer->getBuffer();
-    bufferBarrier.offset = offset;
-    bufferBarrier.size = size;
+
+    if (sliceIndex != UINT32_MAX && (static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize < m_preprocessBuffer->getSize())) {
+        bufferBarrier.offset = static_cast<VkDeviceSize>(sliceIndex % m_sliceCount) * m_sliceSize;
+        bufferBarrier.size = static_cast<VkDeviceSize>(sliceCount) * m_sliceSize;
+        if (bufferBarrier.offset + bufferBarrier.size > m_preprocessBuffer->getSize()) {
+            bufferBarrier.offset = 0;
+            bufferBarrier.size = VK_WHOLE_SIZE;
+        }
+    } else {
+        bufferBarrier.offset = 0;
+        bufferBarrier.size = VK_WHOLE_SIZE;
+    }
 
     VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     depInfo.bufferMemoryBarrierCount = 1;
@@ -291,50 +298,79 @@ void DGCManager::recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuf
 }
 
 void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines) {
-    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || materialPipelines.empty()) {
+    initMaterialExecutionSets(materialPipelines, {});
+}
+
+void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
+                                         const std::vector<VkPipeline>& secondaryPipelines) {
+    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
         return;
     }
+
+    auto createExecSet = [&](const std::vector<VkPipeline>& pipes, const char* name) -> VkIndirectExecutionSetEXT {
+        if (pipes.empty()) return VK_NULL_HANDLE;
+
+        VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
+        pipelineInfo.initialPipeline = pipes[0];
+        pipelineInfo.maxPipelineCount = static_cast<uint32_t>(pipes.size());
+
+        VkIndirectExecutionSetCreateInfoEXT execSetCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
+        execSetCreateInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
+        execSetCreateInfo.info.pPipelineInfo = &pipelineInfo;
+
+        VkIndirectExecutionSetEXT execSet = VK_NULL_HANDLE;
+        VkResult res = pfn_vkCreateIndirectExecutionSetEXT(m_device, &execSetCreateInfo, nullptr, &execSet);
+        if (res != VK_SUCCESS || execSet == VK_NULL_HANDLE) {
+            Logger::warn("Failed to create {} VkIndirectExecutionSetEXT (code: {}).", name, (int)res);
+            return VK_NULL_HANDLE;
+        }
+
+        std::vector<VkWriteIndirectExecutionSetPipelineEXT> writes(pipes.size());
+        for (size_t i = 0; i < pipes.size(); ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT;
+            writes[i].pNext = nullptr;
+            writes[i].index = static_cast<uint32_t>(i);
+            writes[i].pipeline = pipes[i];
+        }
+
+        pfn_vkUpdateIndirectExecutionSetPipelineEXT(m_device, execSet, static_cast<uint32_t>(writes.size()), writes.data());
+        return execSet;
+    };
 
     if (m_materialExecutionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
         pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);
         m_materialExecutionSet = VK_NULL_HANDLE;
     }
+    if (m_materialExecutionSetSecondary && pfn_vkDestroyIndirectExecutionSetEXT) {
+        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSetSecondary, nullptr);
+        m_materialExecutionSetSecondary = VK_NULL_HANDLE;
+    }
 
-    VkIndirectExecutionSetPipelineInfoEXT pipelineInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT };
-    pipelineInfo.initialPipeline = materialPipelines[0];
-    pipelineInfo.maxPipelineCount = static_cast<uint32_t>(materialPipelines.size());
-
-    VkIndirectExecutionSetCreateInfoEXT execSetCreateInfo{ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT };
-    execSetCreateInfo.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
-    execSetCreateInfo.info.pPipelineInfo = &pipelineInfo;
-
-    VkResult res = pfn_vkCreateIndirectExecutionSetEXT(m_device, &execSetCreateInfo, nullptr, &m_materialExecutionSet);
-    if (res != VK_SUCCESS || m_materialExecutionSet == VK_NULL_HANDLE) {
-        Logger::warn("Failed to create material VkIndirectExecutionSetEXT (code: {}). Falling back to multi-dispatch indirect.", (int)res);
+    m_materialExecutionSet = createExecSet(primaryPipelines, "primary material");
+    if (m_materialExecutionSet == VK_NULL_HANDLE) {
         m_materialDGCSupported = false;
-        m_materialExecutionSet = VK_NULL_HANDLE;
+        Logger::warn("Falling back to multi-dispatch indirect for materials.");
         return;
     }
 
-    std::vector<VkWriteIndirectExecutionSetPipelineEXT> writes(materialPipelines.size());
-    for (size_t i = 0; i < materialPipelines.size(); ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT;
-        writes[i].pNext = nullptr;
-        writes[i].index = static_cast<uint32_t>(i);
-        writes[i].pipeline = materialPipelines[i];
+    if (!secondaryPipelines.empty()) {
+        m_materialExecutionSetSecondary = createExecSet(secondaryPipelines, "secondary material");
+        Logger::info("Initialized primary and secondary VkIndirectExecutionSetEXT ({} primary, {} secondary pipelines).",
+                     primaryPipelines.size(), secondaryPipelines.size());
+    } else {
+        Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", primaryPipelines.size());
     }
-
-    pfn_vkUpdateIndirectExecutionSetPipelineEXT(m_device, m_materialExecutionSet, static_cast<uint32_t>(writes.size()), writes.data());
-    Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", materialPipelines.size());
 }
 
 void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                         Buffer* argumentBuffer, VkDeviceSize argumentOffset,
                                         uint32_t sliceIndex, uint32_t sequenceCount,
-                                        VkDeviceAddress sequenceCountAddress) {
+                                        VkDeviceAddress sequenceCountAddress,
+                                        bool isSecondary) {
     if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipelines.empty()) return;
-    if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) return;
+    VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
+    if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet) return;
 
     ensurePreprocessBuffer(pipelines[0], sequenceCount);
     if (!m_preprocessBuffer) return;
@@ -346,7 +382,7 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
 
     VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
     genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    genInfo.indirectExecutionSet = m_materialExecutionSet;
+    genInfo.indirectExecutionSet = targetSet;
     genInfo.indirectCommandsLayout = m_materialIndirectLayout;
     genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
     genInfo.indirectAddressSize = sizeof(DGCCommand) * sequenceCount;
@@ -361,10 +397,13 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                       Buffer* argumentBuffer, VkDeviceSize argumentOffset,
                                       uint32_t sliceIndex, uint32_t sequenceCount,
-                                      bool isPreprocessed, VkDeviceAddress sequenceCountAddress) {
+                                      bool isPreprocessed, VkDeviceAddress sequenceCountAddress,
+                                      bool isSecondary) {
     if (!argumentBuffer || pipelines.empty()) return;
 
-    if (!m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) {
+    VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
+
+    if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet) {
         // Direct multi-dispatch indirect fallback (16 bytes stride per DispatchCommand)
         for (uint32_t k = 0; k < sequenceCount && k < pipelines.size(); ++k) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[k]);
@@ -382,7 +421,7 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
 
     VkGeneratedCommandsInfoEXT genInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT };
     genInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    genInfo.indirectExecutionSet = m_materialExecutionSet;
+    genInfo.indirectExecutionSet = targetSet;
     genInfo.indirectCommandsLayout = m_materialIndirectLayout;
     genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
     genInfo.indirectAddressSize = sizeof(DGCCommand) * sequenceCount;

@@ -61,7 +61,11 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
             print(f"\033[32m[PASS]\033[0m Resolution matches expected: {w}x{h}")
 
         rgb_img = img.convert("RGB")
-        arr = np.array(rgb_img, dtype=np.float32) / 255.0
+        raw_arr = np.array(rgb_img)
+        if raw_arr.dtype == np.uint16:
+            arr = raw_arr.astype(np.float32) / 65535.0
+        else:
+            arr = raw_arr.astype(np.float32) / 255.0
         max_val = float(arr.max())
         min_val = float(arr.min())
 

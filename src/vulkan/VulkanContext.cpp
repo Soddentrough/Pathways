@@ -95,6 +95,7 @@ void VulkanContext::createInstance(const Config& config) {
         instanceExtensions.push_back("VK_KHR_xcb_surface");
         instanceExtensions.push_back("VK_KHR_xlib_surface");
 #endif
+        instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     }
     if (config.validation_layers) {
         instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -257,27 +258,39 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
 
     for (uint32_t i = 0; i < queueFamilyCount; ++i) {
-        if ((queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-            (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+        const auto flags = queueFamilies[i].queueFlags;
+        if ((flags & VK_QUEUE_GRAPHICS_BIT) && (flags & VK_QUEUE_COMPUTE_BIT)) {
             m_queueIndices.graphicsComputeFamily = i;
-        } else if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
-                   !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
-            m_queueIndices.dedicatedComputeFamily = i;
-        } else if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
-                   !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+        }
+        if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT)) {
+            m_queueIndices.asyncComputeFamily = i;
+        }
+        if ((flags & VK_QUEUE_TRANSFER_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT) && !(flags & VK_QUEUE_COMPUTE_BIT)) {
             m_queueIndices.transferFamily = i;
         }
     }
 
     if (m_queueIndices.transferFamily == UINT32_MAX) {
-        // Fallback to graphics family for transfer if no dedicated transfer queue
+        // Fallback to any queue with transfer and no graphics
+        for (uint32_t i = 0; i < queueFamilyCount; ++i) {
+            if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+                !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                m_queueIndices.transferFamily = i;
+                break;
+            }
+        }
+    }
+    if (m_queueIndices.transferFamily == UINT32_MAX) {
         m_queueIndices.transferFamily = m_queueIndices.graphicsComputeFamily;
     }
+    if (m_queueIndices.asyncComputeFamily == UINT32_MAX) {
+        m_queueIndices.asyncComputeFamily = m_queueIndices.graphicsComputeFamily;
+    }
 
-    Logger::info("Queue Families -> Graphics/Compute: {}, Transfer: {}, Dedicated Compute: {}",
+    Logger::info("Queue Families -> Graphics/Compute: {}, Transfer: {}, Async Compute: {}",
                  m_queueIndices.graphicsComputeFamily,
                  m_queueIndices.transferFamily,
-                 m_queueIndices.dedicatedComputeFamily != UINT32_MAX ? std::to_string(m_queueIndices.dedicatedComputeFamily) : "None (shared)");
+                 m_queueIndices.asyncComputeFamily);
 
     // Query Device Extensions
     uint32_t extCount = 0;
@@ -566,32 +579,25 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
     float queuePriority = 1.0f;
 
-    VkDeviceQueueCreateInfo graphicsQueueCreateInfo{};
-    graphicsQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    graphicsQueueCreateInfo.queueFamilyIndex = m_queueIndices.graphicsComputeFamily;
-    graphicsQueueCreateInfo.queueCount = 1;
-    graphicsQueueCreateInfo.pQueuePriorities = &queuePriority;
-    queueCreateInfos.push_back(graphicsQueueCreateInfo);
+    std::vector<uint32_t> uniqueFamilies;
+    auto addUnique = [&](uint32_t fam) {
+        if (fam != UINT32_MAX && std::find(uniqueFamilies.begin(), uniqueFamilies.end(), fam) == uniqueFamilies.end()) {
+            uniqueFamilies.push_back(fam);
+        }
+    };
+    addUnique(m_queueIndices.graphicsComputeFamily);
+    addUnique(m_queueIndices.transferFamily);
+    addUnique(m_queueIndices.asyncComputeFamily);
 
-    if (m_queueIndices.transferFamily != m_queueIndices.graphicsComputeFamily) {
-        VkDeviceQueueCreateInfo transferQueueCreateInfo{};
-        transferQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        transferQueueCreateInfo.queueFamilyIndex = m_queueIndices.transferFamily;
-        transferQueueCreateInfo.queueCount = 1;
-        transferQueueCreateInfo.pQueuePriorities = &queuePriority;
-        queueCreateInfos.push_back(transferQueueCreateInfo);
+    for (uint32_t family : uniqueFamilies) {
+        VkDeviceQueueCreateInfo qci{};
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = family;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &queuePriority;
+        queueCreateInfos.push_back(qci);
     }
 
-    if (m_queueIndices.dedicatedComputeFamily != UINT32_MAX &&
-        m_queueIndices.dedicatedComputeFamily != m_queueIndices.graphicsComputeFamily &&
-        m_queueIndices.dedicatedComputeFamily != m_queueIndices.transferFamily) {
-        VkDeviceQueueCreateInfo computeQueueCreateInfo{};
-        computeQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        computeQueueCreateInfo.queueFamilyIndex = m_queueIndices.dedicatedComputeFamily;
-        computeQueueCreateInfo.queueCount = 1;
-        computeQueueCreateInfo.pQueuePriorities = &queuePriority;
-        queueCreateInfos.push_back(computeQueueCreateInfo);
-    }
 
     // Device extensions
     std::vector<const char*> deviceExtensions;
@@ -739,10 +745,10 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 
     vkGetDeviceQueue(m_device, m_queueIndices.graphicsComputeFamily, 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueIndices.transferFamily, 0, &m_transferQueue);
-    if (m_queueIndices.dedicatedComputeFamily != UINT32_MAX) {
-        vkGetDeviceQueue(m_device, m_queueIndices.dedicatedComputeFamily, 0, &m_computeQueue);
+    if (m_queueIndices.asyncComputeFamily != UINT32_MAX) {
+        vkGetDeviceQueue(m_device, m_queueIndices.asyncComputeFamily, 0, &m_asyncComputeQueue);
     } else {
-        m_computeQueue = m_graphicsQueue;
+        m_asyncComputeQueue = m_graphicsQueue;
     }
 
     if (m_hasExternalSemaphoreFd) {

@@ -12,7 +12,9 @@ layout(push_constant) uniform PushConstants {
     uint applyACES;
     uint visualizeSplit; // 0 = off, 1 = Checkerboard Tile Overlay
     uint tileSize;       // Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
-    uint padding[3];
+    uint displayMode;    // 0 = SDR (sRGB 2.2), 1 = HDR scRGB Linear, 2 = HDR10 (Rec.2020 ST 2084 PQ)
+    float peakNits;      // Display peak luminance in cd/m^2 (e.g. 1000.0)
+    float paperWhiteNits;// Reference paper white luminance in cd/m^2 (e.g. 200.0)
 } pc;
 
 // ACES Filmic Tone Mapping Curve (Narkowicz / Stephen Hill fit)
@@ -23,6 +25,60 @@ vec3 ACESFilm(vec3 x) {
     float d = 0.59f;
     float e = 0.14f;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Rec.709 to Rec.2020 Color Gamut Conversion Matrix
+const mat3 REC709_TO_REC2020 = mat3(
+    0.6274040, 0.0690970, 0.0163916,
+    0.3292820, 0.9195400, 0.0880132,
+    0.0433136, 0.0113612, 0.8955952
+);
+
+// SMPTE ST 2084 (Perceptual Quantizer / PQ) Transfer Function
+// Input: absolute luminance normalized to 10,000 nits ([0.0, 1.0])
+// Output: non-linear PQ encoded value ([0.0, 1.0])
+vec3 LinearToST2084(vec3 L) {
+    L = max(L, vec3(0.0));
+    const float m1 = 0.1593017578125;      // 2610 / 16384
+    const float m2 = 78.84375;             // (2523 / 4096) * 128
+    const float c1 = 0.8359375;            // 3424 / 4096
+    const float c2 = 18.8515625;           // (2413 / 4096) * 32
+    const float c3 = 18.6875;              // (2392 / 4096) * 32
+
+    vec3 Lm1 = pow(L, vec3(m1));
+    vec3 num = c1 + c2 * Lm1;
+    vec3 den = vec3(1.0) + c3 * Lm1;
+    return pow(num / den, vec3(m2));
+}
+
+// HDR Filmic Shoulder Roll-Off
+// Smoothly maps scene linear radiance into extended display luminance range [0, peakNits / 80.0]
+// Preserves linear color and chromaticity below knee, gently compressing specular highlights to display peak.
+vec3 TonemapHDR(vec3 color, float paperWhite, float peakNits) {
+    float sWhite = paperWhite / 80.0;
+    float sPeak = max(peakNits / 80.0, sWhite * 1.05);
+
+    // Scale scene radiance so that 1.0 scene linear = paperWhite in scRGB units
+    vec3 v = color * sWhite;
+    float lum = dot(v, vec3(0.2126, 0.7152, 0.0722));
+    if (lum <= 1e-5) {
+        return vec3(0.0);
+    }
+
+    // Knee starts at 60% of paper white
+    float knee = 0.6 * sWhite;
+    float mappedLum;
+    if (lum < knee) {
+        mappedLum = lum;
+    } else {
+        float x = lum - knee;
+        float maxHighlight = sPeak - knee;
+        // Smooth asymptotic shoulder: f(x) = maxHighlight * (x / (x + maxHighlight))
+        float mappedHighlight = maxHighlight * (x / (x + maxHighlight));
+        mappedLum = knee + mappedHighlight;
+    }
+
+    return v * (mappedLum / lum);
 }
 
 void main() {
@@ -43,17 +99,55 @@ void main() {
     // Apply exposure compensation
     linearColor *= pc.exposure;
 
-    // Apply ACES Tonemapping
-    vec3 mappedColor = linearColor;
-    if (pc.applyACES != 0) {
-        mappedColor = ACESFilm(linearColor);
-    } else {
-        // Fallback Reinhard
-        mappedColor = linearColor / (linearColor + vec3(1.0));
-    }
+    vec3 finalColor;
 
-    // Gamma correction (sRGB ~2.2)
-    vec3 finalColor = pow(mappedColor, vec3(1.0 / 2.2));
+    if (pc.displayMode == 1u) {
+        // --- HDR scRGB Linear (16-bit Float, 1.0 = 80 nits) ---
+        if (pc.applyACES != 0u) {
+            finalColor = TonemapHDR(linearColor, pc.paperWhiteNits, pc.peakNits);
+        } else {
+            // Uncompressed Linear Radiance scaled to scRGB units
+            float sWhite = pc.paperWhiteNits / 80.0;
+            float sPeak = pc.peakNits / 80.0;
+            finalColor = clamp(linearColor * sWhite, vec3(0.0), vec3(sPeak));
+        }
+        // scRGB is strictly linear — NO gamma power curve!
+    } else if (pc.displayMode == 2u) {
+        // --- HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ) ---
+        vec3 scRgbColor;
+        if (pc.applyACES != 0u) {
+            scRgbColor = TonemapHDR(linearColor, pc.paperWhiteNits, pc.peakNits);
+        } else {
+            float sWhite = pc.paperWhiteNits / 80.0;
+            float sPeak = pc.peakNits / 80.0;
+            scRgbColor = clamp(linearColor * sWhite, vec3(0.0), vec3(sPeak));
+        }
+        // Convert Rec.709 linear primaries to Rec.2020 linear primaries
+        vec3 rec2020Linear = REC709_TO_REC2020 * scRgbColor;
+        // Convert scRGB units (1.0 = 80 nits) to absolute PQ units (1.0 = 10,000 nits)
+        // normalizedL = (scRGB * 80.0) / 10000.0 = scRGB / 125.0
+        vec3 normalizedL = rec2020Linear / 125.0;
+        finalColor = LinearToST2084(normalizedL);
+
+        // High-frequency triangular dither (scaled for 10-bit quantization: 1024 discrete code levels)
+        float dither = (fract(sin(dot(vec2(pixelCoord), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 1023.0;
+        finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
+    } else {
+        // --- SDR Fallback (sRGB ~2.2 Gamma, [0.0, 1.0]) ---
+        vec3 mappedColor = linearColor;
+        if (pc.applyACES != 0u) {
+            mappedColor = ACESFilm(linearColor);
+        } else {
+            // Reinhard fallback
+            mappedColor = linearColor / (linearColor + vec3(1.0));
+        }
+        // Gamma correction (sRGB ~2.2)
+        finalColor = pow(clamp(mappedColor, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+
+        // High-frequency triangular dither (scaled for 10-bit / 8-bit backbuffer quantization)
+        float dither = (fract(sin(dot(vec2(pixelCoord), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 1023.0;
+        finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
+    }
 
     // High-frequency triangular dither (scaled for 10-bit quantization: 1024 discrete code levels)
     // Eliminates Mach banding across low-contrast gradients and smooth surfaces
@@ -62,39 +156,33 @@ void main() {
 
     // Multi-GPU Load Split Visualization Overlay
     if (pc.visualizeSplit == 1u) {
+        float tintScale = (pc.displayMode == 1u) ? (pc.paperWhiteNits / 80.0) : 1.0;
         uint check;
         if (pc.tileSize == 0u) {
-            // Interleaved Scanline mode: alternating scanline tint with CRT-style luminance modulation
             check = uint(pixelCoord.y) & 1u;
-            // Apply scanline contrast to prevent optical blending at 4K
             finalColor *= (check == 0u) ? 1.15 : 0.85;
             if (pixelCoord.y % 16u == 0u) {
-                finalColor *= 0.65; // Horizontal grid demarcation line every 16 scanlines
+                finalColor *= 0.65;
             }
             if (check == 0u) {
-                // GPU 0 (Primary) - Electric Cyan
-                finalColor = mix(finalColor, vec3(0.0, 0.85, 1.0), 0.35);
+                finalColor = mix(finalColor, vec3(0.0, 0.85, 1.0) * tintScale, 0.35);
             } else {
-                // GPU 1 (Secondary) - Warm Radiant Amber
-                finalColor = mix(finalColor, vec3(1.0, 0.50, 0.0), 0.35);
+                finalColor = mix(finalColor, vec3(1.0, 0.50, 0.0) * tintScale, 0.35);
             }
-            // Left edge indicator bar
             if (pixelCoord.x < 14u) {
-                finalColor = (check == 0u) ? vec3(0.0, 0.9, 1.0) : vec3(1.0, 0.5, 0.0);
+                finalColor = (check == 0u) ? (vec3(0.0, 0.9, 1.0) * tintScale) : (vec3(1.0, 0.5, 0.0) * tintScale);
             }
         } else {
             uint sz = pc.tileSize;
             check = ((pixelCoord.x / sz) + (pixelCoord.y / sz)) & 1u;
             bool isBorder = (pixelCoord.x % sz == 0u) || (pixelCoord.y % sz == 0u);
             if (isBorder) {
-                finalColor = mix(finalColor, vec3(0.0, 0.0, 0.0), 0.6);
+                finalColor = mix(finalColor, vec3(0.0), 0.6);
             }
             if (check == 0u) {
-                // GPU 0 (Primary) - cool cyan tint
-                finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0), 0.25);
+                finalColor = mix(finalColor, vec3(0.1, 0.55, 1.0) * tintScale, 0.25);
             } else {
-                // GPU 1 (Secondary) - warm amber tint
-                finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1), 0.25);
+                finalColor = mix(finalColor, vec3(1.0, 0.45, 0.1) * tintScale, 0.25);
             }
         }
     }

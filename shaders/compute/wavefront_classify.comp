@@ -72,7 +72,8 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint currentOctantCounts[8];
     uint totalIntersectWorkgroups;
     uint secondaryRayCount;
-    uint pad[21];
+    uint activeMaterialSequenceCount;
+    uint pad[20];
 } queueCounters;
 
 layout(std430, binding = 13) buffer IndirectCommand {
@@ -192,6 +193,7 @@ void main() {
 
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
         uint pixelIndex = uint(pixelCoord.x + pixelCoord.y * int(pc.width));
+        vec3 hitNormal = vec3(0.0, 1.0, 0.0);
 
         if (closestTri < 0 && closestSphere < 0) {
             // Miss: Sky / ambient radiance
@@ -206,7 +208,7 @@ void main() {
             skyColor *= invSpp;
 
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(skyColor, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
         } else {
             // Hit! Setup SoA state
             isActive = true;
@@ -214,24 +216,47 @@ void main() {
             geom.originPackedDir = vec4(origin, uintBitsToFloat(packOct32(direction)));
 
             archetype = MATERIAL_ARCHETYPE_DIFFUSE;
-            vec3 hitNormal = vec3(0.0, 1.0, 0.0);
-            vec3 albedo = vec3(0.8);
+            vec2 hitUv = vec2(0.0);
+            uint matId = 0u;
+
             if (closestTri >= 0) {
-                hit.hitData = vec4(closestT,
+                float u = closestBary.x;
+                float v = closestBary.y;
+                float w = 1.0 - u - v;
+                Triangle tri = triangles[closestTri];
+                hitNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+                hitUv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
+                        u * vec2(tri.v1.position.w, tri.v1.normal.w) +
+                        v * vec2(tri.v2.position.w, tri.v2.normal.w);
+                vec4 geomTan = w * tri.v0.tangent + u * tri.v1.tangent + v * tri.v2.tangent;
+                float tanLen = length(geomTan.xyz);
+                vec3 tanDir = tanLen > 1e-4 ? (geomTan.xyz / tanLen) : vec3(1.0, 0.0, 0.0);
+                float tanSign = tri.v0.tangent.w != 0.0 ? tri.v0.tangent.w : 1.0;
+
+                matId = tri.materialId;
+                hit.hitData0 = vec4(closestT,
+                                   uintBitsToFloat(matId),
+                                   uintBitsToFloat(packOct32(hitNormal)),
+                                   uintBitsToFloat(packHalf2x16(hitUv)));
+                hit.hitData1 = vec4(uintBitsToFloat(packOct32(tanDir)),
+                                   tanSign,
                                    uintBitsToFloat(uint(closestTri)),
-                                   uintBitsToFloat(packHalf2x16(closestBary)),
                                    uintBitsToFloat(0u)); // 0: triangle
-                uint matId = triangles[closestTri].materialId;
                 if (matId < pc.numMaterials) {
                     Material mat = materials[matId];
                     archetype = getMaterialArchetype(mat);
                 }
             } else {
-                hit.hitData = vec4(closestT,
+                hitNormal = closestSphereNorm;
+                matId = spheres[closestSphere].materialId;
+                hit.hitData0 = vec4(closestT,
+                                   uintBitsToFloat(matId),
+                                   uintBitsToFloat(packOct32(hitNormal)),
+                                   uintBitsToFloat(packHalf2x16(vec2(0.0))));
+                hit.hitData1 = vec4(uintBitsToFloat(packOct32(vec3(1.0, 0.0, 0.0))),
+                                   1.0,
                                    uintBitsToFloat(uint(closestSphere)),
-                                   uintBitsToFloat(0u),
                                    uintBitsToFloat(1u)); // 1: sphere
-                uint matId = spheres[closestSphere].materialId;
                 if (matId < pc.numMaterials) {
                     Material mat = materials[matId];
                     archetype = getMaterialArchetype(mat);
@@ -254,13 +279,7 @@ void main() {
                     vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
                 }
                 primaryDepth = closestT;
-                if (closestTri >= 0) {
-                    primaryNormal = normalize((1.0 - closestBary.x - closestBary.y) * triangles[closestTri].v0.normal.xyz +
-                                              closestBary.x * triangles[closestTri].v1.normal.xyz +
-                                              closestBary.y * triangles[closestTri].v2.normal.xyz);
-                } else {
-                    primaryNormal = closestSphereNorm;
-                }
+                primaryNormal = hitNormal;
             } else {
                 vec3 skyDirPt = origin + direction * 1000.0;
                 vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
@@ -416,6 +435,7 @@ void main() {
 
                 uint totalShadeWgs = diffGroups + dielGroups + condGroups + compGroups + emisGroups + passGroups;
                 queueCounters.totalShadeWorkgroups = totalShadeWgs;
+                queueCounters.activeMaterialSequenceCount = (totalShadeWgs > 0u) ? 6u : 0u;
 
                 if (totalShadeWgs == 0u) {
                     indirect.commands[6].x = 0u;

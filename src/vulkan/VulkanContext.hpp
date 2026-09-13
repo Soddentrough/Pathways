@@ -12,7 +12,7 @@ namespace pathways {
 struct QueueFamilyIndices {
     uint32_t graphicsComputeFamily = UINT32_MAX;
     uint32_t transferFamily = UINT32_MAX;
-    uint32_t dedicatedComputeFamily = UINT32_MAX;
+    uint32_t asyncComputeFamily = UINT32_MAX;
 
     bool isComplete() const {
         return graphicsComputeFamily != UINT32_MAX;
@@ -63,11 +63,17 @@ public:
     VmaAllocator getAllocator() const { return m_allocator; }
     VkQueue getGraphicsQueue() const { return m_graphicsQueue; }
     VkQueue getTransferQueue() const { return m_transferQueue; }
-    VkQueue getComputeQueue() const { return m_computeQueue != VK_NULL_HANDLE ? m_computeQueue : m_graphicsQueue; }
+    VkQueue getAsyncComputeQueue() const { return m_asyncComputeQueue != VK_NULL_HANDLE ? m_asyncComputeQueue : m_graphicsQueue; }
+    VkQueue getComputeQueue() const { return getAsyncComputeQueue(); }
     uint32_t getGraphicsQueueFamily() const { return m_queueIndices.graphicsComputeFamily; }
     uint32_t getTransferQueueFamily() const { return m_queueIndices.transferFamily; }
-    uint32_t getComputeQueueFamily() const { return m_queueIndices.dedicatedComputeFamily != UINT32_MAX ? m_queueIndices.dedicatedComputeFamily : m_queueIndices.graphicsComputeFamily; }
-    bool hasDedicatedComputeQueue() const { return m_computeQueue != VK_NULL_HANDLE && m_queueIndices.dedicatedComputeFamily != m_queueIndices.graphicsComputeFamily; }
+    uint32_t getAsyncComputeQueueFamily() const { return m_queueIndices.asyncComputeFamily; }
+    uint32_t getComputeQueueFamily() const { return m_queueIndices.asyncComputeFamily; }
+    bool hasDedicatedAsyncCompute() const {
+        return m_asyncComputeQueue != VK_NULL_HANDLE &&
+               m_queueIndices.asyncComputeFamily != m_queueIndices.graphicsComputeFamily;
+    }
+    bool hasDedicatedComputeQueue() const { return hasDedicatedAsyncCompute(); }
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
@@ -123,7 +129,7 @@ private:
 
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     VkQueue m_transferQueue = VK_NULL_HANDLE;
-    VkQueue m_computeQueue = VK_NULL_HANDLE;
+    VkQueue m_asyncComputeQueue = VK_NULL_HANDLE;
     QueueFamilyIndices m_queueIndices;
 
     VkPhysicalDeviceProperties m_deviceProperties{};

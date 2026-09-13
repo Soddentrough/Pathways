@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 namespace pathways {
 
@@ -69,39 +70,70 @@ std::string SceneRegistry::formatSceneName(const std::string& rawName) {
     return out;
 }
 
-static void populateSceneMetadata(SceneEntry& entry) {
-    if (entry.filepath.empty()) return;
+static bool populateSceneMetadata(SceneEntry& entry) {
+    if (entry.filepath.empty()) return false;
 
     std::error_code ec;
-    if (std::filesystem::exists(entry.filepath, ec)) {
-        entry.fileSizeBytes = std::filesystem::file_size(entry.filepath, ec);
+    if (!std::filesystem::exists(entry.filepath, ec)) {
+        return false;
     }
+    entry.fileSizeBytes = std::filesystem::file_size(entry.filepath, ec);
 
     cgltf_options options{};
     cgltf_data* data = nullptr;
     cgltf_result res = cgltf_parse_file(&options, entry.filepath.c_str(), &data);
-    if (res == cgltf_result_success && data) {
-        uint64_t tris = 0;
-        for (cgltf_size m = 0; m < data->meshes_count; ++m) {
-            const auto& mesh = data->meshes[m];
-            for (cgltf_size p = 0; p < mesh.primitives_count; ++p) {
-                const auto& prim = mesh.primitives[p];
-                if (prim.indices) {
-                    tris += prim.indices->count / 3;
+    if (res != cgltf_result_success || !data) {
+        Logger::warn("SceneRegistry: Failed to parse glTF manifest '{}'.", entry.filepath);
+        return false;
+    }
+
+    // Validate that all declared external buffers actually exist on disk
+    std::filesystem::path parentDir = std::filesystem::path(entry.filepath).parent_path();
+    for (cgltf_size b = 0; b < data->buffers_count; ++b) {
+        const char* uri = data->buffers[b].uri;
+        if (uri && std::strncmp(uri, "data:", 5) != 0) {
+            std::string rawUri(uri);
+            std::string decodedUri;
+            for (size_t i = 0; i < rawUri.length(); ++i) {
+                if (rawUri[i] == '%' && i + 2 < rawUri.length()) {
+                    std::string hex = rawUri.substr(i + 1, 2);
+                    char ch = static_cast<char>(std::strtol(hex.c_str(), nullptr, 16));
+                    decodedUri += ch;
+                    i += 2;
                 } else {
-                    for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
-                        if (prim.attributes[a].type == cgltf_attribute_type_position && prim.attributes[a].data) {
-                            tris += prim.attributes[a].data->count / 3;
-                            break;
-                        }
+                    decodedUri += rawUri[i];
+                }
+            }
+            if (!std::filesystem::exists(parentDir / rawUri) && !std::filesystem::exists(parentDir / decodedUri)) {
+                Logger::warn("SceneRegistry: Skipping scene '{}' because external buffer '{}' does not exist.",
+                             entry.filepath, uri);
+                cgltf_free(data);
+                return false;
+            }
+        }
+    }
+
+    uint64_t tris = 0;
+    for (cgltf_size m = 0; m < data->meshes_count; ++m) {
+        const auto& mesh = data->meshes[m];
+        for (cgltf_size p = 0; p < mesh.primitives_count; ++p) {
+            const auto& prim = mesh.primitives[p];
+            if (prim.indices) {
+                tris += prim.indices->count / 3;
+            } else {
+                for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
+                    if (prim.attributes[a].type == cgltf_attribute_type_position && prim.attributes[a].data) {
+                        tris += prim.attributes[a].data->count / 3;
+                        break;
                     }
                 }
             }
         }
-        entry.triangleCount = tris;
-        entry.materialCount = static_cast<uint32_t>(data->materials_count);
-        cgltf_free(data);
     }
+    entry.triangleCount = tris;
+    entry.materialCount = static_cast<uint32_t>(data->materials_count);
+    cgltf_free(data);
+    return (tris > 0);
 }
 
 std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
@@ -148,8 +180,9 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                 std::string stem = item.path().stem().string();
                 std::string label = formatSceneName(stem);
                 SceneEntry e{ label, item.path().string(), "Showcase" };
-                populateSceneMetadata(e);
-                fileEntries.push_back(e);
+                if (populateSceneMetadata(e)) {
+                    fileEntries.push_back(e);
+                }
             }
         }
     }
@@ -175,20 +208,24 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
 
             if (hasExt && hasCore) {
                 SceneEntry e{ dirTitle + " (Extended)", extGlb.string(), "Research" };
-                populateSceneMetadata(e);
-                fileEntries.push_back(e);
+                if (populateSceneMetadata(e)) {
+                    fileEntries.push_back(e);
+                }
 
                 SceneEntry c{ dirTitle + " (Core)", coreGlb.string(), "Research" };
-                populateSceneMetadata(c);
-                fileEntries.push_back(c);
+                if (populateSceneMetadata(c)) {
+                    fileEntries.push_back(c);
+                }
             } else if (hasExt) {
                 SceneEntry e{ dirTitle, extGlb.string(), "Research" };
-                populateSceneMetadata(e);
-                fileEntries.push_back(e);
+                if (populateSceneMetadata(e)) {
+                    fileEntries.push_back(e);
+                }
             } else if (hasCore) {
                 SceneEntry e{ dirTitle, coreGlb.string(), "Research" };
-                populateSceneMetadata(e);
-                fileEntries.push_back(e);
+                if (populateSceneMetadata(e)) {
+                    fileEntries.push_back(e);
+                }
             }
 
             // Also check for any other glb/gltf files in this directory
@@ -200,8 +237,9 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                         if (subItem.path() != extGlb && subItem.path() != coreGlb) {
                             std::string subStem = subItem.path().stem().string();
                             SceneEntry e{ dirTitle + " - " + formatSceneName(subStem), subItem.path().string(), "Custom" };
-                            populateSceneMetadata(e);
-                            fileEntries.push_back(e);
+                            if (populateSceneMetadata(e)) {
+                                fileEntries.push_back(e);
+                            }
                         }
                     }
                 }

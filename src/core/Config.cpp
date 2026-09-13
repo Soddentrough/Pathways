@@ -134,7 +134,10 @@ void Config::printUsage(const char* progName) {
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
-              << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n\n"
+              << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n"
+              << "  --no-hdr                Disable HDR display auto-negotiation (force SDR sRGB)\n"
+              << "  --hdr-peak <float>      Display peak luminance in nits (default: 1000.0)\n"
+              << "  --hdr-white <float>     Reference paper white luminance in nits (default: 200.0)\n\n"
               << "Rendering & Path Tracing:\n"
               << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Work Lists & DGC [default]) or 'rtp' (KHR RTP)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
@@ -168,8 +171,12 @@ void Config::printUsage(const char* progName) {
               << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
               << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
+              << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
+              << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
+              << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
+              << "  --no-async-preprocess   Disable dedicated async compute queue DGC preprocessing\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
@@ -185,6 +192,7 @@ void Config::printUsage(const char* progName) {
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
               << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
+              << "  --no-inline-shadows     Disable hybrid inline primary shadows\n"
               << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --capture-training-data <dir> Output directory for high-speed raw binary training tensors\n"
@@ -402,6 +410,14 @@ Config Config::parse(int argc, char* argv[]) {
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
             else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
+        } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
+            cfg.streamline_secondary_shading = false;
+        } else if (arg == "--no-distance-clamping" || arg == "--no-ray-clamping") {
+            cfg.distance_clamping = false;
+        } else if ((arg == "--sec-max-dist" || arg == "--secondary-max-distance") && i + 1 < argc) {
+            cfg.max_secondary_distance = std::stof(argv[++i]);
+        } else if (arg.starts_with("--sec-max-dist=") || arg.starts_with("--secondary-max-distance=")) {
+            cfg.max_secondary_distance = std::stof(arg.substr(arg.find('=') + 1));
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
@@ -418,8 +434,9 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
-        } else if (arg == "--no-dgc-batch-preprocess" || arg == "--no-dgc-tier2-batch") {
-            setEnvVar("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1");
+        } else if (arg == "--no-async-preprocess") {
+            cfg.async_dgc_preprocess = false;
+            setEnvVar("PATHWAYS_DISABLE_ASYNC_PREPROCESS", "1");
         } else if (arg == "--no-inline-shadows") {
             cfg.inline_primary_shadows = false;
         } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
@@ -633,6 +650,16 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_indirect_light = false;
         } else if (arg == "--indirect") {
             cfg.enable_indirect_light = true;
+        } else if (arg == "--no-hdr") {
+            cfg.enable_hdr = false;
+        } else if (arg == "--hdr-peak" && i + 1 < argc) {
+            cfg.hdr_peak_nits = std::stof(argv[++i]);
+        } else if (arg.starts_with("--hdr-peak=")) {
+            cfg.hdr_peak_nits = std::stof(arg.substr(arg.find('=') + 1));
+        } else if ((arg == "--hdr-white" || arg == "--hdr-paper-white") && i + 1 < argc) {
+            cfg.hdr_paper_white_nits = std::stof(argv[++i]);
+        } else if (arg.starts_with("--hdr-white=") || arg.starts_with("--hdr-paper-white=")) {
+            cfg.hdr_paper_white_nits = std::stof(arg.substr(arg.find('=') + 1));
         } else if (arg == "--no-validation") {
             cfg.validation_layers = false;
         } else if (arg == "--debug") {

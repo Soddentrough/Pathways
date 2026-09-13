@@ -73,6 +73,18 @@ vec2 randVec2(inout uint seed) {
     return vec2(randFloat(seed), randFloat(seed));
 }
 
+vec3 randVec3(inout uint seed) {
+    return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
+    if (dot(val, val) < 1e-12) return accum;
+    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
+    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
+    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
+    return max(vec3(0.0), accum + val + dither);
+}
+
 // 32-bit Octahedral Decoding (Cigolle et al.)
 vec2 octSign(vec2 v) {
     return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);
@@ -304,10 +316,14 @@ void main() {
                 break;
             }
 
-            // Luminance-weighted Russian Roulette
+            // Adaptive depth-attenuated Russian Roulette
             if (bounce >= 1u) {
                 float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                float p = clamp(lum, minP, 0.95);
+                float maxP = 0.95;
+                float p = clamp(lum, minP, maxP);
+                if (bounce >= 2u && lum >= 0.35) {
+                    p = clamp(lum * 0.85, minP, 0.90);
+                }
                 if (randFloat(seed) > p) {
                     break;
                 }
@@ -339,7 +355,7 @@ void main() {
         newAccum = vec4(pixelRadiance, 1.0);
     } else {
         vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
-        newAccum = prevAccum + vec4(pixelRadiance, 1.0);
+        newAccum = vec4(addFp16Stochastic(prevAccum.rgb, pixelRadiance, seed), prevAccum.a + 1.0);
     }
 
     imageStore(uAccumImage, storeCoord, newAccum);

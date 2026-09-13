@@ -45,3 +45,6 @@ Suite root: `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`
   - If a feature is **enabled by default**, provide only the flag to disable/negate it (e.g., `--no-double-buffer`, `--no-temporal-accum`). Do NOT add a redundant positive flag.
   - Never introduce redundant pairs of opposing flags (e.g., having both `--bmfr` and `--no-bmfr` when BMFR is disabled by default).
 
+# GENERAL 
+
+Do not make assumptions. Do not guess. Check code, check recent commits, use performance profiling tools. Verify everything and be sure of things before you say them. 

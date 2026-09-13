@@ -98,6 +98,13 @@ struct FrameStats {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool aces_tonemap = true;
+    // HDR Display Pipeline Telemetry
+    std::string swapchain_format_str = "B8G8R8A8_UNORM";
+    std::string swapchain_color_space_str = "SRGB_NONLINEAR";
+    std::string hdr_mode_str = "SDR";
+    bool is_hdr_display = false;
+    float hdr_peak_nits = 1000.0f;
+    float hdr_paper_white_nits = 200.0f;
     std::string scene_path = "";
     uint32_t num_triangles = 0;
     uint32_t num_spheres = 0;

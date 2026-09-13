@@ -85,6 +85,8 @@ void AccelerationStructureManager::loadFunctionPointers() {
     pfn_vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureBuildSizesKHR");
     pfn_vkCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(m_device, "vkCmdBuildAccelerationStructuresKHR");
     pfn_vkGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureDeviceAddressKHR");
+    pfn_vkCmdWriteAccelerationStructuresPropertiesKHR = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)vkGetDeviceProcAddr(m_device, "vkCmdWriteAccelerationStructuresPropertiesKHR");
+    pfn_vkCmdCopyAccelerationStructureKHR = (PFN_vkCmdCopyAccelerationStructureKHR)vkGetDeviceProcAddr(m_device, "vkCmdCopyAccelerationStructureKHR");
 
     if (!pfn_vkCreateAccelerationStructureKHR || !pfn_vkCmdBuildAccelerationStructuresKHR) {
         throw std::runtime_error("Failed to load Vulkan Ray Tracing KHR function pointers!");
@@ -140,7 +142,7 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
     buildInfo.geometryCount = static_cast<uint32_t>(asGeometries.size());
     buildInfo.pGeometries = asGeometries.data();
 
@@ -151,14 +153,14 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
         &buildInfo, maxPrimitiveCounts.data(), &sizeInfo
     );
 
-    // Allocate BLAS buffer with 256-byte alignment
+    // Allocate initial BLAS buffer with 256-byte alignment
     auto blasBuffer = std::make_unique<Buffer>(
         m_allocator, sizeInfo.accelerationStructureSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, 256
     );
 
-    // Create BLAS handle
+    // Create initial BLAS handle
     VkAccelerationStructureCreateInfoKHR createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
     createInfo.buffer = blasBuffer->getBuffer();
@@ -184,6 +186,18 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     buildInfo.dstAccelerationStructure = blasHandle;
     buildInfo.scratchData.deviceAddress = alignedScratch;
 
+    // Create query pool for compaction sizing query
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    if (pfn_vkCmdWriteAccelerationStructuresPropertiesKHR && pfn_vkCmdCopyAccelerationStructureKHR) {
+        VkQueryPoolCreateInfo qpInfo{};
+        qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+        qpInfo.queryCount = 1;
+        if (vkCreateQueryPool(m_device, &qpInfo, nullptr, &queryPool) != VK_SUCCESS) {
+            queryPool = VK_NULL_HANDLE;
+        }
+    }
+
     // Build BLAS on GPU
     VkCommandBufferAllocateInfo cmdAlloc{};
     cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -199,10 +213,14 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    if (queryPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, queryPool, 0, 1);
+    }
+
     const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfos = asBuildRanges.data();
     pfn_vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfos);
 
-    // Memory barrier
+    // Memory barrier: wait for BLAS build write to complete
     VkMemoryBarrier2 barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -216,12 +234,96 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     depInfo.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
 
+    if (queryPool != VK_NULL_HANDLE) {
+        pfn_vkCmdWriteAccelerationStructuresPropertiesKHR(
+            cmd, 1, &blasHandle,
+            VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+            queryPool, 0
+        );
+    }
+
     vkEndCommandBuffer(cmd);
     auto tStart = std::chrono::steady_clock::now();
     submitCommandBuffer(cmd);
+
+    // Query compacted size
+    VkDeviceSize compactedSize = 0;
+    if (queryPool != VK_NULL_HANDLE) {
+        VkResult qRes = vkGetQueryPoolResults(
+            m_device, queryPool, 0, 1,
+            sizeof(VkDeviceSize), &compactedSize, sizeof(VkDeviceSize),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+        );
+        if (qRes != VK_SUCCESS) {
+            compactedSize = 0;
+        }
+    }
+
+    bool compacted = false;
+    VkAccelerationStructureKHR finalBlasHandle = blasHandle;
+    std::unique_ptr<Buffer> finalBlasBuffer = std::move(blasBuffer);
+
+    if (compactedSize > 0 && compactedSize < sizeInfo.accelerationStructureSize) {
+        // Allocate tightly-fitted compact buffer with 256-byte alignment
+        auto compactBuffer = std::make_unique<Buffer>(
+            m_allocator, compactedSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, 256
+        );
+
+        VkAccelerationStructureCreateInfoKHR compactCreateInfo{};
+        compactCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+        compactCreateInfo.buffer = compactBuffer->getBuffer();
+        compactCreateInfo.size = compactedSize;
+        compactCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+
+        VkAccelerationStructureKHR compactHandle = VK_NULL_HANDLE;
+        VkResult resCompact = pfn_vkCreateAccelerationStructureKHR(m_device, &compactCreateInfo, nullptr, &compactHandle);
+        if (resCompact == VK_SUCCESS) {
+            vkResetCommandBuffer(cmd, 0);
+            vkBeginCommandBuffer(cmd, &beginInfo);
+
+            VkCopyAccelerationStructureInfoKHR copyInfo{};
+            copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+            copyInfo.src = blasHandle;
+            copyInfo.dst = compactHandle;
+            copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+
+            pfn_vkCmdCopyAccelerationStructureKHR(cmd, &copyInfo);
+
+            VkMemoryBarrier2 copyBarrier{};
+            copyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            copyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+            copyBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            copyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            copyBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+
+            VkDependencyInfo copyDep{};
+            copyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            copyDep.memoryBarrierCount = 1;
+            copyDep.pMemoryBarriers = &copyBarrier;
+            vkCmdPipelineBarrier2(cmd, &copyDep);
+
+            vkEndCommandBuffer(cmd);
+            submitCommandBuffer(cmd);
+
+            // Destroy original uncompacted BLAS
+            pfn_vkDestroyAccelerationStructureKHR(m_device, blasHandle, nullptr);
+            finalBlasHandle = compactHandle;
+            finalBlasBuffer = std::move(compactBuffer);
+            compacted = true;
+        }
+    }
+
+    if (queryPool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(m_device, queryPool, nullptr);
+    }
+
     auto tEnd = std::chrono::steady_clock::now();
     m_lastBlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
-    m_blasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_uncompactedBlasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
+    m_blasSizeKb = (compacted ? compactedSize : sizeInfo.accelerationStructureSize) / 1024.0;
+    m_blasCompacted = compacted;
     m_blasTriangles = 0;
     for (const auto& g : geometries) {
         m_blasTriangles += g.triangleCount;
@@ -231,14 +333,20 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     // Query device address
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
     addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    addressInfo.accelerationStructure = blasHandle;
+    addressInfo.accelerationStructure = finalBlasHandle;
     VkDeviceAddress blasAddr = pfn_vkGetAccelerationStructureDeviceAddressKHR(m_device, &addressInfo);
 
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
-    result->setHandle(blasHandle, blasAddr, std::move(blasBuffer));
+    result->setHandle(finalBlasHandle, blasAddr, std::move(finalBlasBuffer));
 
-    Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
-                 m_blasSizeKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
+    if (compacted) {
+        double ratio = (1.0 - (static_cast<double>(compactedSize) / static_cast<double>(sizeInfo.accelerationStructureSize))) * 100.0;
+        Logger::info("Built & Compacted BLAS successfully (uncompacted: {:.2f} KB -> compacted: {:.2f} KB, -{:.1f}%, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
+                     m_uncompactedBlasSizeKb, m_blasSizeKb, ratio, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
+    } else {
+        Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
+                     m_blasSizeKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
+    }
     return result;
 }
 

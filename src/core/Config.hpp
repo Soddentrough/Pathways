@@ -53,6 +53,9 @@ struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
     SecondarySortMode secondary_sort_mode = SecondarySortMode::None; // Secondary ray BVH traversal coherency mode
+    bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
+    bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
+    float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -76,9 +79,13 @@ struct Config {
     bool benchmark = false;
     bool validation_layers = true;
     bool aces_tonemap = true;
+    // High Dynamic Range (HDR) Display
+    bool enable_hdr = true;              // Auto-negotiate HDR display formats (scRGB Linear / HDR10 PQ) [Default: true]
+    float hdr_peak_nits = 1000.0f;       // Display peak luminance in cd/m^2 (nits) [Default: 1000.0]
+    float hdr_paper_white_nits = 200.0f; // Reference paper white luminance in cd/m^2 (nits) [Default: 200.0]
     bool enable_refraction = true;
     bool enable_shadows = true;
-    bool inline_primary_shadows = true;   // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
+    bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
     bool enable_direct_light = true;
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
@@ -115,6 +122,7 @@ struct Config {
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     uint32_t tile_size = 64;
     uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
+    bool async_dgc_preprocess = true; // Dedicated async compute queue DGC preprocessing [Default: true, disable via --no-async-preprocess]
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

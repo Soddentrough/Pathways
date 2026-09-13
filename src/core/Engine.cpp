@@ -3,6 +3,7 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
+#include <glm/detail/type_half.hpp>
 
 #include <fstream>
 #include <filesystem>
@@ -131,9 +132,6 @@ Engine::Engine(const Config& config) : m_config(config) {
     if (!m_config.headless && m_window) {
         m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
         m_surface = m_window->createSurface(m_context->getInstance());
-        VkFormat preferredSwapFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
-            ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-            : VK_FORMAT_R8G8B8A8_UNORM;
         m_swapchain = std::make_unique<Swapchain>(
             m_context->getDevice(),
             m_context->getPhysicalDevice(),
@@ -141,7 +139,7 @@ Engine::Engine(const Config& config) : m_config(config) {
             m_window->getWidth(),
             m_window->getHeight(),
             m_context->getGraphicsQueueFamily(),
-            preferredSwapFmt
+            m_config.enable_hdr
         );
         m_config.width = m_swapchain->getExtent().width;
         m_config.height = m_swapchain->getExtent().height;
@@ -377,9 +375,19 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    VkFormat outputFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
-        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-        : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless) {
+        VkFormat swapFmt = m_swapchain->getFormat();
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            outputFmt = swapFmt;
+        } else if (m_swapchain->isHdr()) {
+            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+        } else {
+            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        }
+    }
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         outputFmt,
@@ -757,27 +765,45 @@ void Engine::initScene() {
     Logger::info("Scene textures loaded: {} texture(s).", m_sceneTextures.size());
 }
 
-bool Engine::loadScene(const std::string& filepath) {
+void Engine::requestSceneChange(const std::string& filepath) {
+    if (m_isSceneLoading.load()) {
+        Logger::warn("Scene loading already in progress; ignoring request for '{}'", filepath);
+        return;
+    }
+    m_loadingScenePath = filepath;
+    m_loadingSceneName = std::filesystem::path(filepath).stem().string();
+    if (m_loadingSceneName.empty() || filepath == "__procedural_cornell_box__") {
+        m_loadingSceneName = "Cornell Box";
+    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+        m_loadingSceneName = "Many-Lights Cornell Box";
+    }
+    m_isSceneLoading.store(true);
+    Logger::info("Initiating asynchronous scene load for '{}'...", filepath);
+
+    m_sceneLoadingFuture = std::async(std::launch::async, [filepath]() -> SceneData {
+        if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+            Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
+            return ProceduralScene::createCornellBox();
+        } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+            Logger::info("Dynamic Scene Switch: Loading Procedural Many-Lights Cornell Box (64 Lights)...");
+            return ProceduralScene::createManyLightsScene();
+        } else {
+            Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
+            return GltfLoader::loadSceneData(filepath);
+        }
+    });
+}
+
+bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
+    if (newScene.triangles.empty() && newScene.spheres.empty()) {
+        Logger::warn("Loaded scene '{}' contains no renderable geometry! Keeping current scene.", filepath);
+        return false;
+    }
+
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
     if (m_mgpu && m_mgpu->getSecondaryContext()) {
         vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
-    }
-
-    SceneData newScene;
-    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
-        Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
-        newScene = ProceduralScene::createCornellBox();
-    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
-        Logger::info("Dynamic Scene Switch: Loading Procedural Many-Lights Cornell Box (64 Lights)...");
-        newScene = ProceduralScene::createManyLightsScene();
-    } else {
-        Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
-        newScene = GltfLoader::loadSceneData(filepath);
-    }
-    if (newScene.triangles.empty() && newScene.spheres.empty()) {
-        Logger::warn("Loaded scene '{}' contains no renderable geometry! Keeping current scene.", filepath);
-        return false;
     }
 
     m_sceneData = std::move(newScene);
@@ -1025,6 +1051,21 @@ bool Engine::loadScene(const std::string& filepath) {
     return true;
 }
 
+bool Engine::loadScene(const std::string& filepath) {
+    SceneData newScene;
+    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+        Logger::info("Loading Procedural Cornell Box...");
+        newScene = ProceduralScene::createCornellBox();
+    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+        Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
+        newScene = ProceduralScene::createManyLightsScene();
+    } else {
+        Logger::info("Loading glTF scene '{}'...", filepath);
+        newScene = GltfLoader::loadSceneData(filepath);
+    }
+    return applyLoadedScene(std::move(newScene), filepath);
+}
+
 void Engine::updateSceneTransparencyFlag() {
     m_sceneHasNonOpaque = false;
     for (const auto& mat : m_sceneData.materials) {
@@ -1258,6 +1299,8 @@ void Engine::initPipelines() {
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
     auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
+    auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
+    auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
@@ -1266,7 +1309,8 @@ void Engine::initPipelines() {
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
-        m_context->hasDgcExecutionSet()
+        m_context->hasDgcExecutionSet(),
+        wfShadeDiffuseSecCode, wfShadeComplexSecCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -2896,7 +2940,7 @@ void Engine::renderFrame() {
         m_lastSecGpuMs = secGpuMs;
         m_lastTonemapMs = gpuTonemapMs;
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
-        if (!isMgpuActive && m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
             if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
                 m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                 static int wfProfCount = 0;
@@ -2935,18 +2979,30 @@ void Engine::renderFrame() {
         }
     }
 
+    // Check if background asynchronous scene loading completed
+    if (m_isSceneLoading.load()) {
+        if (m_sceneLoadingFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            SceneData loadedData = m_sceneLoadingFuture.get();
+            applyLoadedScene(std::move(loadedData), m_loadingScenePath);
+            m_isSceneLoading.store(false);
+            m_loadingScenePath.clear();
+            m_loadingSceneName.clear();
+        }
+    }
+
+    if (m_pendingSceneChange) {
+        std::string targetPath = m_pendingScenePath;
+        m_pendingSceneChange = false;
+        requestSceneChange(targetPath);
+    }
+
     // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
-    if (m_pendingSceneChange || m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
+    if (m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
         VkDevice dev = m_context->getDevice();
         VmaAllocator alloc = m_context->getAllocator();
         vkDeviceWaitIdle(dev);
         if (m_mgpu && m_mgpu->getSecondaryContext()) {
             vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
-        }
-
-        if (m_pendingSceneChange) {
-            loadScene(m_pendingScenePath);
-            m_pendingSceneChange = false;
         }
 
         if (m_pendingAccumFormatChange) {
@@ -3136,12 +3192,17 @@ void Engine::renderFrame() {
         uint32_t applyACES = 1;
         uint32_t visualizeSplit = 0;
         uint32_t tileSize = 64;
-        uint32_t padding[3] = {0, 0, 0};
+        uint32_t displayMode = 0;
+        float peakNits = 1000.0f;
+        float paperWhiteNits = 200.0f;
     } tonemapConstants;
     tonemapConstants.exposure = m_config.exposure;
     tonemapConstants.applyACES = m_config.aces_tonemap ? 1 : 0;
     tonemapConstants.visualizeSplit = 0;
     tonemapConstants.tileSize = m_config.tile_size;
+    tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+    tonemapConstants.peakNits = m_config.hdr_peak_nits;
+    tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
 
@@ -3236,6 +3297,11 @@ void Engine::renderFrame() {
                 wfSceneData.enableNrc = m_config.enable_nrc;
                 wfSceneData.nrcBounce = m_config.nrc_bounce;
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+                wfSceneData.boundsMin = m_sceneData.boundsMin;
+                wfSceneData.boundsMax = m_sceneData.boundsMax;
+                wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+                wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+                wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
@@ -3441,6 +3507,8 @@ void Engine::renderFrame() {
         uint32_t dispatchHeight = (m_config.height + 1) / 2;
         secAccumHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
         uint32_t mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
+        uint32_t primSpp = activeSpp;
+        uint32_t secSpp = 0u;
 
         uboSec = ubo;
 
@@ -3463,10 +3531,10 @@ void Engine::renderFrame() {
             dispatchHeight = m_config.height;
             secAccumHistory = 0u; // Secondary only renders current frame's delta; Primary accumulates
 
-            // Split SPP: e.g. spp = 2 -> prim: 1, sec: 1; spp = 4 -> prim: 2, sec: 2
+            // Split SPP evenly: e.g. spp = 2 -> prim: 1, sec: 1; spp = 16 -> prim: 8, sec: 8
             uint32_t currentTotalSpp = activeSpp;
-            uint32_t primSpp = (currentTotalSpp + 1) / 2;
-            uint32_t secSpp = currentTotalSpp / 2;
+            primSpp = (currentTotalSpp + 1) / 2;
+            secSpp = currentTotalSpp / 2;
             if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
                 primSpp = m_governor->getState().primSpp;
                 secSpp = m_governor->getState().secSpp;
@@ -3483,8 +3551,12 @@ void Engine::renderFrame() {
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
-            // Re-upload primary camera UBO with primSpp
-            m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
+            uint32_t totalCompositeSpp = (primSpp + secSpp);
+            CameraUniform uboPrim = ubo;
+            if (totalCompositeSpp > 0) {
+                uboPrim.spp = totalCompositeSpp;
+            }
+            m_cameraUBOs[m_currentFrame]->copyFrom(&uboPrim, sizeof(CameraUniform));
         }
 
         if (m_mgpu) {
@@ -3498,7 +3570,7 @@ void Engine::renderFrame() {
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
-        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (ubo.spp + uboSec.spp) : 0u;
+        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : 0u;
 
         // 1. Launch secondary GPU concurrently for current frame
         if (!accumReachedCutoff) {
@@ -3539,18 +3611,83 @@ void Engine::renderFrame() {
             m_numOpaqueTriangles, 0u
         };
 
-        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
+        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) or Wavefront Pipeline
         if (!accumReachedCutoff) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
-        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-        vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-        m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
-        if (m_governor) {
-            m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
-        }
+            bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
+            uint32_t primDispatchSpp = (activeMode == MultiGpuMode::SampleParallel) ? primSpp : activeSpp;
+            if (useWavefront) {
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->resetCounters(cmd);
+                }
 
-        if (m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
+                bool needAccumReset = accumReset || !m_config.progressive_accumulation;
+                if (needAccumReset && m_accumImage) {
+                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+
+                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    clearBarrier.image = m_accumImage->getImage();
+                    clearBarrier.subresourceRange = clearRange;
+
+                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    clearDep.imageMemoryBarrierCount = 1;
+                    clearDep.pImageMemoryBarriers = &clearBarrier;
+                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                }
+
+                WavefrontSceneData wfSceneData{};
+                wfSceneData.numTriangles = m_numTriangles;
+                wfSceneData.numSpheres = m_numSpheres;
+                wfSceneData.numMaterials = m_numMaterials;
+                wfSceneData.numLights = m_numLights;
+                wfSceneData.hasEnvMap = hasEnvMap;
+                wfSceneData.envMapIntensity = envIntensity;
+                wfSceneData.useHardwareRT = useHwRT;
+                wfSceneData.frameIndex = m_frameIndex;
+                wfSceneData.useMorton = 1u;
+                wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+                wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+                wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+                wfSceneData.cameraFlags = flags;
+                wfSceneData.enableNrc = m_config.enable_nrc;
+                wfSceneData.nrcBounce = m_config.nrc_bounce;
+                wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+                wfSceneData.boundsMin = m_sceneData.boundsMin;
+                wfSceneData.boundsMax = m_sceneData.boundsMax;
+                wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+                wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+                wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
+                                                 primDispatchSpp, activeBounces, wfSceneData);
+
+                if (m_config.enable_nrc && m_nrcManager) {
+                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
+                                                  m_sceneData.boundsMin, m_sceneData.boundsMax);
+                    m_nrcManager->recordTraining(cmd, m_frameIndex,
+                                                 m_sceneData.boundsMin, m_sceneData.boundsMax,
+                                                 1e-3f, 1024);
+                }
+            } else {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
+                VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+                vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
+                m_rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
+            }
+            if (m_governor) {
+                m_governor->recordDispatch(m_currentFrame, primDispatchSpp, activeBounces);
+            }
+
+            if (!useWavefront && m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
             VkMemoryBarrier2 rtToClassifyBarrier{};
             rtToClassifyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
             rtToClassifyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
@@ -3718,6 +3855,9 @@ void Engine::renderFrame() {
 
         tonemapConstants.visualizeSplit = m_config.visualize_mgpu_split ? 1u : 0u;
         tonemapConstants.tileSize = m_config.tile_size;
+        tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+        tonemapConstants.peakNits = m_config.hdr_peak_nits;
+        tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
         vkCmdDispatch(activeCmd, groupsX, groupsY, 1);
@@ -3879,8 +4019,10 @@ void Engine::renderFrame() {
             depToSrc.pImageMemoryBarriers = &toSrc;
             vkCmdPipelineBarrier2(activeCmd, &depToSrc);
 
+            VkFormat swapFmt = m_swapchain->getFormat();
+            size_t bpp = (swapFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
             if (!m_uiDumpBuffer) {
-                VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * 4;
+                VkDeviceSize size = static_cast<VkDeviceSize>(m_swapchain->getExtent().width) * m_swapchain->getExtent().height * bpp;
                 m_uiDumpBuffer = std::make_unique<Buffer>(m_context->getAllocator(), size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
             }
@@ -4104,7 +4246,9 @@ void Engine::dumpOutputFiles() {
 
     // 1. Dump LDR PNG
     if (!m_config.dump_frame_path.empty()) {
-        VkDeviceSize bufferSize = m_config.width * m_config.height * 4;
+        VkFormat outFmt = m_outputImage->getFormat();
+        size_t bpp = (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
+        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bpp;
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
@@ -4141,35 +4285,72 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
-        if (m_outputImage->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+        staging.invalidate();
+        if (outFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
             const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
-            bool force8bit = m_config.dump_8bit_png || (m_config.output_format == OutputFormat::RGBA8_UNORM);
+            bool isRgb = (outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+            bool force8bit = m_config.dump_8bit_png;
             if (force8bit) {
                 std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
-                for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
-                    uint32_t px = src32[pIdx];
-                    uint32_t r10 = (px >> 0) & 0x3FF;
-                    uint32_t g10 = (px >> 10) & 0x3FF;
-                    uint32_t b10 = (px >> 20) & 0x3FF;
-                    uint32_t a2  = (px >> 30) & 0x03;
-                    rgba8[pIdx * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
-                    rgba8[pIdx * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
-                    rgba8[pIdx * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
-                    rgba8[pIdx * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    uint32_t px = src32[p];
+                    uint32_t c0 = (px >> 20) & 0x3FF;
+                    uint32_t c1 = (px >> 10) & 0x3FF;
+                    uint32_t c2 = px & 0x3FF;
+                    uint32_t a2 = (px >> 30) & 0x03;
+                    uint32_t r10 = isRgb ? c0 : c2;
+                    uint32_t g10 = c1;
+                    uint32_t b10 = isRgb ? c2 : c0;
+                    rgba8[p * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                    rgba8[p * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
                 }
                 ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
             } else {
                 std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
-                for (size_t pIdx = 0; pIdx < static_cast<size_t>(m_config.width) * m_config.height; ++pIdx) {
-                    uint32_t px = src32[pIdx];
-                    uint32_t r10 = (px >> 0) & 0x3FF;
-                    uint32_t g10 = (px >> 10) & 0x3FF;
-                    uint32_t b10 = (px >> 20) & 0x3FF;
-                    uint32_t a2  = (px >> 30) & 0x03;
-                    rgba16[pIdx * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
-                    rgba16[pIdx * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
-                    rgba16[pIdx * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
-                    rgba16[pIdx * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    uint32_t px = src32[p];
+                    uint32_t c0 = (px >> 20) & 0x3FF;
+                    uint32_t c1 = (px >> 10) & 0x3FF;
+                    uint32_t c2 = px & 0x3FF;
+                    uint32_t a2 = (px >> 30) & 0x03;
+                    uint32_t r10 = isRgb ? c0 : c2;
+                    uint32_t g10 = c1;
+                    uint32_t b10 = isRgb ? c2 : c0;
+                    rgba16[p * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
+                    rgba16[p * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+                }
+                ImageDumper::savePNG16(m_config.dump_frame_path, m_config.width, m_config.height, rgba16.data());
+            }
+            staging.unmap();
+        } else if (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
+            const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
+            bool force8bit = m_config.dump_8bit_png;
+            if (force8bit) {
+                std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    for (int c = 0; c < 3; ++c) {
+                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                        rgba8[p * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+                    }
+                    rgba8[p * 4 + 3] = 255;
+                }
+                ImageDumper::savePNG(m_config.dump_frame_path, m_config.width, m_config.height, rgba8.data());
+            } else {
+                std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+                float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+                for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                    for (int c = 0; c < 3; ++c) {
+                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                        rgba16[p * 4 + c] = static_cast<uint16_t>(std::clamp(srgb * 65535.0f + 0.5f, 0.0f, 65535.0f));
+                    }
+                    rgba16[p * 4 + 3] = 65535;
                 }
                 ImageDumper::savePNG16(m_config.dump_frame_path, m_config.width, m_config.height, rgba16.data());
             }
@@ -4220,6 +4401,7 @@ void Engine::dumpOutputFiles() {
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
 
+        staging.invalidate();
         const float* floatPixels = static_cast<const float*>(staging.map());
         ImageDumper::saveEXR(m_config.dump_hdr_path, m_config.width, m_config.height, floatPixels);
         staging.unmap();
@@ -4229,46 +4411,61 @@ void Engine::dumpOutputFiles() {
     if (!m_config.dump_ui_path.empty() && m_uiDumpBuffer && m_swapchain) {
         uint32_t w = m_swapchain->getExtent().width;
         uint32_t h = m_swapchain->getExtent().height;
-        std::vector<uint8_t> rgba(w * h * 4);
-        bool force8bit = m_config.dump_8bit_png || (m_config.output_format == OutputFormat::RGBA8_UNORM);
-        if (m_swapchain->getFormat() == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
-            const uint32_t* src32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
-            if (force8bit) {
-                std::vector<uint8_t> rgba(w * h * 4);
-                for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-                    uint32_t px = src32[i];
-                    uint32_t r10 = (px >> 0) & 0x3FF;
-                    uint32_t g10 = (px >> 10) & 0x3FF;
-                    uint32_t b10 = (px >> 20) & 0x3FF;
-                    uint32_t a2  = (px >> 30) & 0x03;
-                    rgba[i * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
-                    rgba[i * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
-                    rgba[i * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
-                    rgba[i * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
-                }
-                m_uiDumpBuffer->unmap();
-                ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
-            } else {
-                std::vector<uint16_t> rgba16(w * h * 4);
-                for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-                    uint32_t px = src32[i];
-                    uint32_t r10 = (px >> 0) & 0x3FF;
-                    uint32_t g10 = (px >> 10) & 0x3FF;
-                    uint32_t b10 = (px >> 20) & 0x3FF;
-                    uint32_t a2  = (px >> 30) & 0x03;
-                    rgba16[i * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
-                    rgba16[i * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
-                    rgba16[i * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
-                    rgba16[i * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
-                }
-                m_uiDumpBuffer->unmap();
-                ImageDumper::savePNG16(m_config.dump_ui_path, w, h, rgba16.data());
+        VkFormat fmt = m_swapchain->getFormat();
+        std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+
+        m_uiDumpBuffer->invalidate();
+        if (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+            const uint32_t* raw32 = static_cast<const uint32_t*>(m_uiDumpBuffer->map());
+            bool isRgb = (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+            float invPaperWhite = 1.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+            const float m1 = 0.1593017578125f;
+            const float m2 = 78.84375f;
+            const float c1 = 0.8359375f;
+            const float c2 = 18.8515625f;
+            const float c3 = 18.6875f;
+
+            auto pqToSrgb = [&](float v) -> uint8_t {
+                float v_pow = std::pow(std::max(v, 0.0f), 1.0f / m2);
+                float num = std::max(v_pow - c1, 0.0f);
+                float den = std::max(c2 - c3 * v_pow, 1e-6f);
+                float linearNits = std::pow(num / den, 1.0f / m1) * 10000.0f;
+                float srgb = std::pow(std::clamp(linearNits * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                return static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+            };
+
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                uint32_t val = raw32[i];
+                float c0 = static_cast<float>((val >> 20) & 0x3FF) / 1023.0f;
+                float c1_val = static_cast<float>((val >> 10) & 0x3FF) / 1023.0f;
+                float c2_val = static_cast<float>(val & 0x3FF) / 1023.0f;
+
+                float r_norm = isRgb ? c0 : c2_val;
+                float g_norm = c1_val;
+                float b_norm = isRgb ? c2_val : c0;
+
+                rgba[i * 4 + 0] = pqToSrgb(r_norm);
+                rgba[i * 4 + 1] = pqToSrgb(g_norm);
+                rgba[i * 4 + 2] = pqToSrgb(b_norm);
+                rgba[i * 4 + 3] = 255;
             }
+            m_uiDumpBuffer->unmap();
+        } else if (fmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
+            const uint16_t* raw16 = static_cast<const uint16_t*>(m_uiDumpBuffer->map());
+            float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    float val = glm::detail::toFloat32(raw16[i * 4 + c]);
+                    float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                    rgba[i * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+                }
+                rgba[i * 4 + 3] = 255;
+            }
+            m_uiDumpBuffer->unmap();
         } else {
             const uint8_t* raw = static_cast<const uint8_t*>(m_uiDumpBuffer->map());
-            std::vector<uint8_t> rgba(w * h * 4);
-            bool isBgra = (m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_UNORM || m_swapchain->getFormat() == VK_FORMAT_B8G8R8A8_SRGB);
-            for (size_t i = 0; i < w * h; ++i) {
+            bool isBgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
                 if (isBgra) {
                     rgba[i * 4 + 0] = raw[i * 4 + 2];
                     rgba[i * 4 + 1] = raw[i * 4 + 1];
@@ -4282,8 +4479,8 @@ void Engine::dumpOutputFiles() {
                 }
             }
             m_uiDumpBuffer->unmap();
-            ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
         }
+        ImageDumper::savePNG(m_config.dump_ui_path, w, h, rgba.data());
     }
 
     // 4. Dump Stats JSON
@@ -4531,6 +4728,20 @@ FrameStats Engine::getStats() const {
     stats.enable_refraction = m_config.enable_refraction;
     stats.enable_shadows = m_config.enable_shadows;
     stats.aces_tonemap = m_config.aces_tonemap;
+    if (m_swapchain && !m_config.headless) {
+        stats.swapchain_format_str = m_swapchain->getFormatName();
+        stats.swapchain_color_space_str = m_swapchain->getColorSpaceName();
+        stats.is_hdr_display = m_swapchain->isHdr();
+        stats.hdr_mode_str = (m_swapchain->getHdrMode() == HdrDisplayMode::scRGB) ? "scRGB Linear (16-bit Float)" :
+                             ((m_swapchain->getHdrMode() == HdrDisplayMode::HDR10) ? "HDR10 PQ (10-bit Rec.2020)" : "SDR sRGB (8-bit)");
+    } else {
+        stats.swapchain_format_str = "R8G8B8A8_UNORM (Headless Offscreen)";
+        stats.swapchain_color_space_str = "SRGB_NONLINEAR";
+        stats.is_hdr_display = false;
+        stats.hdr_mode_str = "Headless SDR";
+    }
+    stats.hdr_peak_nits = m_config.hdr_peak_nits;
+    stats.hdr_paper_white_nits = m_config.hdr_paper_white_nits;
     stats.scene_path = m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_config.scene_path;
     stats.hdri_path = m_config.hdri_path;
 
@@ -4657,9 +4868,6 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     // 1. Recreate Swapchain (destroy old swapchain first so surface is released)
     m_swapchain.reset();
-    VkFormat preferredSwapFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
-        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-        : VK_FORMAT_R8G8B8A8_UNORM;
     m_swapchain = std::make_unique<Swapchain>(
         device,
         m_context->getPhysicalDevice(),
@@ -4667,7 +4875,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_config.width,
         m_config.height,
         m_context->getGraphicsQueueFamily(),
-        preferredSwapFmt
+        m_config.enable_hdr
     );
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
@@ -4695,9 +4903,20 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    VkFormat outputFmt = (m_config.output_format == OutputFormat::A2B10G10R10_UNORM)
-        ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-        : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless) {
+        VkFormat swapFmt = m_swapchain->getFormat();
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
+        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            outputFmt = swapFmt;
+        } else if (m_swapchain->isHdr()) {
+            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+        } else {
+            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        }
+    }
+
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         outputFmt,
@@ -4817,6 +5036,8 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
         if (m_asManager) {
             t.blasBuildTimeMs = m_asManager->getLastBlasBuildTimeMs();
             t.blasSizeKb = m_asManager->getBlasSizeKb();
+            t.uncompactedBlasSizeKb = m_asManager->getUncompactedBlasSizeKb();
+            t.blasCompacted = m_asManager->isBlasCompacted();
             t.blasTriangles = m_asManager->getBlasTriangles();
             t.tlasBuildTimeMs = m_asManager->getLastTlasBuildTimeMs();
             t.tlasSizeKb = m_asManager->getTlasSizeKb();
@@ -4864,8 +5085,14 @@ void Engine::printExecutionSummary() const {
         Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
         Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
         Logger::info("    Acceleration Structures:");
-        Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
-                     tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        if (tally.blasCompacted) {
+            double ratio = (1.0 - (tally.blasSizeKb / tally.uncompactedBlasSizeKb)) * 100.0;
+            Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB compacted from {:.2f} KB, -{:.1f}%, {} Triangles)",
+                         tally.blasBuildTimeMs, tally.blasSizeKb, tally.uncompactedBlasSizeKb, ratio, tally.blasTriangles);
+        } else {
+            Logger::info("      - BLAS Build:        {:.3f} ms ({:.2f} KB, {} Triangles)",
+                         tally.blasBuildTimeMs, tally.blasSizeKb, tally.blasTriangles);
+        }
         Logger::info("      - TLAS Build:        {:.3f} ms ({:.2f} KB, {} Instance{})",
                      tally.tlasBuildTimeMs, tally.tlasSizeKb, tally.tlasInstances, tally.tlasInstances == 1 ? "" : "s");
         if (tally.key.mgpu_mode != MultiGpuMode::Off && tally.secBlasBuildTimeMs > 0.0) {

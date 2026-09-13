@@ -77,7 +77,8 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint currentOctantCounts[8];
     uint totalIntersectWorkgroups;
     uint secondaryRayCount;
-    uint pad[21];
+    uint activeMaterialSequenceCount;
+    uint pad[20];
 } queueCounters;
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
@@ -155,10 +156,14 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData.x;
-        uint primId = floatBitsToUint(hit.hitData.y);
-        vec2 hitBary = unpackHalf2x16(floatBitsToUint(hit.hitData.z));
-        uint hitType = floatBitsToUint(hit.hitData.w);
+        float hitT = hit.hitData0.x;
+        uint matId = floatBitsToUint(hit.hitData0.y);
+        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
+        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
+        vec3 geomTan = unpackOct32(floatBitsToUint(hit.hitData1.x));
+        float tanSign = hit.hitData1.y;
+        uint primId = floatBitsToUint(hit.hitData1.z);
+        uint hitType = floatBitsToUint(hit.hitData1.w);
 
         vec3 throughput = state.throughputSeed.rgb;
         uint seed = floatBitsToUint(state.throughputSeed.w);
@@ -179,59 +184,24 @@ void main() {
             accumRadiance += throughput * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
-            vec3 hitNormal = vec3(0.0, 1.0, 0.0);
-            vec2 hitUv = vec2(0.0);
-            uint matId = 0u;
-            bool frontFace = true;
-
-            if (hitType == 0u) {
-                float u = hitBary.x;
-                float v = hitBary.y;
-                float w = 1.0 - u - v;
-
-                vec3 n0 = triangles[primId].v0.normal.xyz;
-                vec3 n1 = triangles[primId].v1.normal.xyz;
-                vec3 n2 = triangles[primId].v2.normal.xyz;
-                hitNormal = normalize(w * n0 + u * n1 + v * n2);
-
-                vec2 uv0 = vec2(triangles[primId].v0.position.w, triangles[primId].v0.normal.w);
-                vec2 uv1 = vec2(triangles[primId].v1.position.w, triangles[primId].v1.normal.w);
-                vec2 uv2 = vec2(triangles[primId].v2.position.w, triangles[primId].v2.normal.w);
-                hitUv = w * uv0 + u * uv1 + v * uv2;
-                matId = triangles[primId].materialId;
-
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
-
-                Material mat = materials[matId];
-                if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-                    vec4 tan0 = triangles[primId].v0.tangent;
-                    vec4 tan1 = triangles[primId].v1.tangent;
-                    vec4 tan2 = triangles[primId].v2.tangent;
-                    vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
-                    float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
-
-                    vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
-                    normalMap.xy *= mat.normalScale;
-                    normalMap = normalize(normalMap);
-
-                    geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
-                    vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
-                    mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
-                    hitNormal = normalize(tbn * normalMap);
-                }
-            } else if (hitType == 1u) {
-                Sphere sp = spheres[primId];
-                hitNormal = (hitPoint - sp.centerRadius.xyz) / sp.centerRadius.w;
-                matId = sp.materialId;
-                frontFace = dot(rayDir, hitNormal) < 0.0;
-                hitNormal = frontFace ? hitNormal : -hitNormal;
-            }
+            bool frontFace = dot(rayDir, hitNormal) < 0.0;
+            hitNormal = frontFace ? hitNormal : -hitNormal;
 
             Material mat = materials[matId];
+            if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                normalMap.xy *= mat.normalScale;
+                normalMap = normalize(normalMap);
+
+                geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
+                vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
+                mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
+                hitNormal = normalize(tbn * normalMap);
+            }
+
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
@@ -355,13 +325,13 @@ void main() {
                         if (length(unshadowed) > 1e-5) {
                             if (enableShadows) {
                                 bool occluded = false;
-                                if (bounce == 0u && enableInlineShadows && pc.useHardwareRT == 1u) {
+                                if (enableInlineShadows && pc.useHardwareRT == 1u) {
                                     occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
                                     if (!occluded) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                         vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, prev + vec4(unshadowed, 0.0));
+                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), 0.0));
                                     }
                                 } else {
                                     hasShadowRay = true;
@@ -379,7 +349,7 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                     pathTerminated = true;
                 } else {
-                    vec3 nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
                     vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
                     throughput *= diffuseColor;
 
@@ -388,7 +358,11 @@ void main() {
                         pathTerminated = true;
                     } else if (bounce >= 1u) {
                         float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float p = clamp(pathLum, minP, 0.95);
+                        float maxP = 0.95;
+                        float p = clamp(pathLum, minP, maxP);
+                        if (bounce >= 2u && pathLum >= 0.35) {
+                            p = clamp(pathLum * 0.85, minP, 0.90);
+                        }
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {
@@ -407,52 +381,56 @@ void main() {
                 if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                     vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                    imageStore(uAccumImage, pixelCoord, prev + vec4(accumRadiance, 0.0));
+                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
                 }
             }
         }
     }
 
-    // Subgroup Wave Ballot Compaction into downstream surviving secondary ray queue
-    uvec4 ballot = subgroupBallot(survivesToNext);
-    uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
-    uint waveActiveCount = subgroupBallotBitCount(ballot);
-
-    uint waveGlobalOffset = 0u;
-    if (subgroupElect()) {
-        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
-    }
-    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
-
-    uint targetIdx = 0u;
-    if (survivesToNext) {
-        targetIdx = waveGlobalOffset + laneSlot;
-        if (targetIdx < pc.maxQueueCapacity) {
-            outGeoms[targetIdx] = nextGeom;
-            outStates[targetIdx] = nextState;
-        }
-    }
-
-    // Option 1: On-Chip Directional Multi-Queue Binning via Subgroup Ballots
     if (pc.secondarySortMode == 1u) {
+        // Producer-Side Binning: Partition rays directly into 8 directional octant sub-queues
+        // Zero indirection buffer, contiguous sequential memory layout for downstream traversal
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
-        for (uint k = 0u; k < 8u; ++k) {
+        uvec4 activeBallot = subgroupBallot(survivesToNext);
+        uint activeMask = activeBallot.x;
+        while (activeMask != 0u) {
+            uint leaderLane = findLSB(activeMask);
+            uint k = subgroupBroadcast(oct, leaderLane);
             bool isOct = survivesToNext && (oct == k);
             uvec4 octBallot = subgroupBallot(isOct);
             uint octCount = subgroupBallotBitCount(octBallot);
-            if (octCount > 0u) {
-                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-                uint octBase = 0u;
-                if (subgroupElect()) {
-                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
+            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+            uint octBase = 0u;
+            if (gl_SubgroupInvocationID == leaderLane) {
+                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
+            }
+            octBase = subgroupBroadcast(octBase, leaderLane);
+            if (isOct) {
+                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                if (octBase + octSlot < pc.maxQueueCapacity) {
+                    outGeoms[dest] = nextGeom;
+                    outStates[dest] = nextState;
                 }
-                octBase = subgroupBroadcastFirst(octBase);
-                if (isOct) {
-                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                    if (octBase + octSlot < pc.maxQueueCapacity) {
-                        secondaryIndices[dest] = targetIdx;
-                    }
-                }
+            }
+            activeMask &= ~octBallot.x;
+        }
+    } else {
+        // Standard single-queue linear compaction (for secondarySortMode == 0: None, or 2: Spatial Index)
+        uvec4 ballot = subgroupBallot(survivesToNext);
+        uint laneSlot = subgroupBallotExclusiveBitCount(ballot);
+        uint waveActiveCount = subgroupBallotBitCount(ballot);
+
+        uint waveGlobalOffset = 0u;
+        if (subgroupElect()) {
+            waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+        }
+        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
+
+        if (survivesToNext) {
+            uint targetIdx = waveGlobalOffset + laneSlot;
+            if (targetIdx < pc.maxQueueCapacity) {
+                outGeoms[targetIdx] = nextGeom;
+                outStates[targetIdx] = nextState;
             }
         }
     }
@@ -508,14 +486,16 @@ void main() {
             dgcStream.commands[b * 16u + 7u].y = 1u;
             dgcStream.commands[b * 16u + 7u].z = 1u;
 
-            // Slots 8..15: Option 1 Directional DGC intersect dispatches
+            // Slots 8..15: Producer-Side Binning Directional DGC intersect dispatches
             uint totalIntersectWgs = 0u;
+            uint totalOctantRays = 0u;
             if (pc.secondarySortMode == 1u) {
                 for (uint k = 0u; k < 8u; ++k) {
                     uint octCnt = queueCounters.octantCounts[k];
                     queueCounters.currentOctantCounts[k] = octCnt;
                     uint octGroups = (octCnt + 31u) / 32u;
                     totalIntersectWgs += octGroups;
+                    totalOctantRays += octCnt;
 
                     indirect.commands[b * 16u + 8u + k].x = octGroups;
                     indirect.commands[b * 16u + 8u + k].y = 1u;
@@ -531,8 +511,10 @@ void main() {
                 }
             } else {
                 totalIntersectWgs = intersectGroups;
+                totalOctantRays = nextCount;
             }
             queueCounters.totalIntersectWorkgroups = totalIntersectWgs;
+            queueCounters.secondaryRayCount = totalOctantRays;
 
             if (pc.secondarySortMode == 2u) {
                 indirect.commands[b * 16u + 8u].x = intersectGroups;
@@ -542,7 +524,7 @@ void main() {
             }
 
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? totalOctantRays : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;

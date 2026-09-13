@@ -310,6 +310,14 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"dielectric_refraction\": {},\n", stats.enable_refraction ? "true" : "false")
         << std::format("      \"soft_shadows\": {},\n", stats.enable_shadows ? "true" : "false")
         << std::format("      \"aces_tonemapping\": {}\n", stats.aces_tonemap ? "true" : "false")
+        << "    },\n"
+        << "    \"display_and_color\": {\n"
+        << std::format("      \"hdr_display_active\": {},\n", stats.is_hdr_display ? "true" : "false")
+        << std::format("      \"hdr_mode\": \"{}\",\n", stats.hdr_mode_str)
+        << std::format("      \"swapchain_format\": \"{}\",\n", stats.swapchain_format_str)
+        << std::format("      \"swapchain_color_space\": \"{}\",\n", stats.swapchain_color_space_str)
+        << std::format("      \"hdr_peak_nits\": {:.1f},\n", stats.hdr_peak_nits)
+        << std::format("      \"hdr_paper_white_nits\": {:.1f}\n", stats.hdr_paper_white_nits)
         << "    },\n";
 
     std::string safeScenePath = stats.scene_path;

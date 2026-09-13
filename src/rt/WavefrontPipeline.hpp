@@ -29,6 +29,11 @@ struct WavefrontSceneData {
     bool enableNrc = false;
     uint32_t nrcBounce = 2;
     float nrcTrainRatio = 0.03f;
+    glm::vec3 boundsMin = glm::vec3(-1000.0f);
+    glm::vec3 boundsMax = glm::vec3(1000.0f);
+    bool streamlineSecondaryShading = true;
+    bool enableDistanceClamping = true;
+    float maxSecondaryRayDistance = 0.0f; // 0 = automatic scene bounding diameter * 1.25
 };
 
 class WavefrontPipeline {
@@ -50,7 +55,9 @@ public:
                       const std::vector<char>& shadeEmissiveCode = {},
                       const std::vector<char>& shadePassthroughCode = {},
                       const std::vector<char>& raySortCode = {},
-                      bool supportsExecutionSet = false);
+                      bool supportsExecutionSet = false,
+                      const std::vector<char>& shadeDiffuseSecCode = {},
+                      const std::vector<char>& shadeComplexSecCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -131,7 +138,9 @@ private:
                          const std::vector<char>& shadeComplexCode,
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadePassthroughCode,
-                         const std::vector<char>& raySortCode);
+                         const std::vector<char>& raySortCode,
+                         const std::vector<char>& shadeDiffuseSecCode = {},
+                         const std::vector<char>& shadeComplexSecCode = {});
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -151,7 +160,7 @@ private:
     std::unique_ptr<Buffer> m_rayGeomQueueB;  // 32B RayGeometry
     std::unique_ptr<Buffer> m_rayStateQueueA; // 32B RayState
     std::unique_ptr<Buffer> m_rayStateQueueB; // 32B RayState
-    std::unique_ptr<Buffer> m_rayHitQueue;    // 16B RayHit
+    std::unique_ptr<Buffer> m_rayHitQueue;    // 32B RayHit
     std::unique_ptr<Buffer> m_materialIndexQueue; // 4B index * 4 archetypes (Index-Based Material Queues)
     std::unique_ptr<Buffer> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
     std::unique_ptr<Buffer> m_shadowQueue;    // 32B PackedShadowRay
@@ -177,7 +186,12 @@ private:
     VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_raySortPipeline = VK_NULL_HANDLE;
+
+    std::vector<VkPipeline> m_primaryMatPipelines;
+    std::vector<VkPipeline> m_secondaryMatPipelines;
 
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };

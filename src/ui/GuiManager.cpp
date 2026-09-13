@@ -508,6 +508,21 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
             ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
             ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Work Lists & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
+            if (config.pipeline_type == PipelineType::Wavefront) {
+                const char* wfSortStr = "Dual (Spatial-Morton + Material)";
+                if (config.wavefront_sort_mode == WavefrontSortMode::None) wfSortStr = "None (Monolithic)";
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) wfSortStr = "Archetype (BSDF Buckets)";
+                else if (config.wavefront_sort_mode == WavefrontSortMode::BDA) wfSortStr = "BDA (Queue Pointers)";
+
+                const char* secSortStr = "None (Linear Queue)";
+                if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) secSortStr = "Directional DGC (Producer-Side Binning)";
+                else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) secSortStr = "Spatial Morton (Index Sort)";
+
+                ImGui::Text("Material Sort:      %s", wfSortStr);
+                ImGui::Text("Secondary Sort:     %s", secSortStr);
+                ImGui::Text("Secondary Shading:  %s", config.streamline_secondary_shading ? "Streamlined (1-Sample NEE + Lambertian)" : "Full Primary Math (4-Cand RIS + GGX)");
+                ImGui::Text("Distance Clamping:  %s", config.distance_clamping ? "Scene-Scale Invariant (D_scene * 1.25)" : "Disabled (10,000m)");
+            }
             ImGui::Text("Ray Scheduling:     RDNA4 Hardware BVH Traversal (Wave32)");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
@@ -906,6 +921,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     settingsChanged = true;
                 }
             }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Color Space & HDR Pipeline:");
+            ImGui::BulletText("Color Space: %s", stats.swapchain_color_space_str.c_str());
+            ImGui::BulletText("Swap Format: %s", stats.swapchain_format_str.c_str());
+            ImGui::BulletText("HDR Mode:    %s", stats.hdr_mode_str.c_str());
+            if (stats.is_hdr_display) {
+                if (ImGui::SliderFloat("Peak Luminance", &config.hdr_peak_nits, 400.0f, 4000.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+                if (ImGui::SliderFloat("Paper White", &config.hdr_paper_white_nits, 80.0f, 500.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+            }
             ImGui::Separator();
         }
 
@@ -1017,11 +1046,99 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
             if (ImGui::RadioButton("Wavefront Path Tracing (Work Lists & DGC)", &pipeType, 0)) {
                 config.pipeline_type = PipelineType::Wavefront;
+                settingsChanged = true;
             }
             if (ImGui::RadioButton("Dedicated RTP (VK_KHR_ray_tracing_pipeline)", &pipeType, 1)) {
                 config.pipeline_type = PipelineType::RTP;
+                settingsChanged = true;
             }
             ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
+
+            if (config.pipeline_type == PipelineType::Wavefront) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Wavefront Material Sorting:");
+                const char* sortModes[] = {
+                    "None (Monolithic Shading Kernel)",
+                    "Archetype (BSDF Buckets via Wave-Ballot)",
+                    "BDA (Buffer Device Address Lock-Free Queues)",
+                    "Dual (3D Spatial-Morton + Material Dual-Binning)"
+                };
+                int currentSort = 3;
+                if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 0;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 1;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::BDA) currentSort = 2;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 3;
+
+                if (ImGui::Combo("Material Sort Mode##WfSort", &currentSort, sortModes, IM_ARRAYSIZE(sortModes))) {
+                    if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::None;
+                    else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
+                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::BDA;
+                    else if (currentSort == 3) config.wavefront_sort_mode = WavefrontSortMode::Dual;
+                    settingsChanged = true;
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Secondary Ray Coherency Sort:");
+                const char* secSortModes[] = {
+                    "None (Linear Unsorted Queue)",
+                    "Directional DGC (Producer-Side Binning, 8 Bins)",
+                    "Spatial Morton (512-Bin Global Counting Sort)"
+                };
+                int currentSecSort = 0;
+                if (config.secondary_sort_mode == SecondarySortMode::None) currentSecSort = 0;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) currentSecSort = 1;
+                else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) currentSecSort = 2;
+
+                if (ImGui::Combo("Secondary Ray Sort##SecSort", &currentSecSort, secSortModes, IM_ARRAYSIZE(secSortModes))) {
+                    if (currentSecSort == 0) config.secondary_sort_mode = SecondarySortMode::None;
+                    else if (currentSecSort == 1) config.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+                    else if (currentSecSort == 2) config.secondary_sort_mode = SecondarySortMode::SpatialIndex;
+                    settingsChanged = true;
+                }
+
+                if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 8 Dedicated Octant Sub-Queues (Zero Indirection Buffer, Contiguous)");
+                } else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "  -> 512 Spatial-Directional Bins (3-Pass Wave32 Counting Sort)");
+                } else {
+                    ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
+                }
+
+                if (ImGui::Checkbox("Streamline Secondary Shading##SecShade", &config.streamline_secondary_shading)) {
+                    settingsChanged = true;
+                }
+                if (config.streamline_secondary_shading) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 1-Sample NEE + Lambertian (Bounces >= 1, -17%% ISA footprint)");
+                } else {
+                    ImGui::TextDisabled("  -> Full 4-candidate RIS & microfacet GGX on all bounces");
+                }
+
+                if (ImGui::Checkbox("Scene-Scale Distance Clamping##DistClamp", &config.distance_clamping)) {
+                    settingsChanged = true;
+                }
+                if (config.distance_clamping) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Clamped to D_scene * 1.25 (Unit-invariant BVH early-out)");
+                } else {
+                    ImGui::TextDisabled("  -> Default static bound (10,000m)");
+                }
+
+                // Wavefront Tile Size
+                const char* wfTileSizes[] = {
+                    "Full Frame (Monolithic Queue)",
+                    "256x256 (Cache-Resident)",
+                    "512x512 (Extended Tile)"
+                };
+                int currentWfTile = 0;
+                if (config.wavefront_tile_size == 256) currentWfTile = 1;
+                else if (config.wavefront_tile_size == 512) currentWfTile = 2;
+
+                if (ImGui::Combo("Wavefront Tile Size##WfTile", &currentWfTile, wfTileSizes, IM_ARRAYSIZE(wfTileSizes))) {
+                    if (currentWfTile == 0) config.wavefront_tile_size = 0;
+                    else if (currentWfTile == 1) config.wavefront_tile_size = 256;
+                    else if (currentWfTile == 2) config.wavefront_tile_size = 512;
+                    settingsChanged = true;
+                }
+            }
 
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Acceleration Structure Telemetry:");
