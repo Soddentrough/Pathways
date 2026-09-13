@@ -123,8 +123,16 @@ bool ImageDumper::savePNG16(const std::string& filepath, uint32_t width, uint32_
     ihdr[12] = 0; // Interlace: None
     writeChunk("IHDR", ihdr, 13);
 
-    // 3. IDAT chunk
-    writeChunk("IDAT", compressedData.data(), static_cast<uint32_t>(destLen));
+    // 3. IDAT chunk(s) (split into 64KB blocks for robust compatibility across PNG decoders)
+    constexpr size_t MAX_IDAT_CHUNK = 65536;
+    size_t remaining = destLen;
+    size_t offset = 0;
+    while (remaining > 0) {
+        uint32_t chunkSize = static_cast<uint32_t>(std::min(remaining, MAX_IDAT_CHUNK));
+        writeChunk("IDAT", compressedData.data() + offset, chunkSize);
+        offset += chunkSize;
+        remaining -= chunkSize;
+    }
 
     // 4. IEND chunk
     writeChunk("IEND", nullptr, 0);

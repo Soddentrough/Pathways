@@ -111,6 +111,88 @@ struct Light {
         } \
     } while(false)
 
+// 64-byte hierarchical 3D Light Tree node layout (FEAT-02)
+struct LightTreeNode {
+    vec4 bboxMin;   // xyz: bboxMin, w: radiant flux (Phi)
+    vec4 bboxMax;   // xyz: bboxMax, w: coneAngleCos
+    vec4 coneAxis;  // xyz: cone center axis, w: padding
+    uvec4 children; // x: leftChild (or lightIdx if leaf), y: rightChild, z: isLeaf, w: padding
+};
+
+// Evaluate spatial importance metric of a LightTree node from surface hit point x with normal n
+float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode node) {
+    float flux = node.bboxMin.w;
+    if (flux <= 1e-7) return 0.0;
+
+    vec3 bMin = node.bboxMin.xyz;
+    vec3 bMax = node.bboxMax.xyz;
+
+    // Point-to-box minimum squared distance
+    vec3 clampedPoint = clamp(hitPoint, bMin, bMax);
+    vec3 delta = hitPoint - clampedPoint;
+    float distSq = max(dot(delta, delta), 1e-4);
+
+    // Direction vector from hitPoint to node centroid
+    vec3 boxCentroid = 0.5 * (bMin + bMax);
+    vec3 toNode = boxCentroid - hitPoint;
+    float centerDist = length(toNode);
+    vec3 dir = (centerDist > 1e-4) ? (toNode / centerDist) : hitNormal;
+
+    // Surface normal orientation: clamp to small positive floor to allow grazing lights
+    float cosTheta = max(dot(hitNormal, dir), 0.05);
+
+    // Light orientation bounding cone weighting
+    float coneCos = node.bboxMax.w;
+    float cosCone = 1.0;
+    if (coneCos > -0.99) {
+        vec3 coneAxis = node.coneAxis.xyz;
+        float cosLightDir = dot(coneAxis, -dir);
+        cosCone = clamp((cosLightDir - coneCos) / max(1.0 - coneCos, 1e-3), 0.05, 1.0);
+    }
+
+    return (flux * cosTheta * cosCone) / distSq;
+}
+
+// O(log N) stochastic descent down the 3D Light Tree (FEAT-02)
+#define SAMPLE_LIGHT_TREE(numLights, hitPoint, hitNormal, seed, outIdx, outPdf) \
+    do { \
+        if ((numLights) <= 1u) { \
+            outIdx = 0u; \
+            outPdf = 1.0; \
+        } else { \
+            uint nodeIdx_ = 0u; \
+            float pathProb_ = 1.0; \
+            for (uint depth_ = 0u; depth_ < 32u; ++depth_) { \
+                LightTreeNode node_ = lightNodes[nodeIdx_]; \
+                if (node_.children.z == 1u /* isLeaf */) { \
+                    outIdx = node_.children.x; \
+                    break; \
+                } \
+                uint leftIdx_ = node_.children.x; \
+                uint rightIdx_ = node_.children.y; \
+                float impLeft_ = evalLightTreeNodeImportance(hitPoint, hitNormal, lightNodes[leftIdx_]); \
+                float impRight_ = evalLightTreeNodeImportance(hitPoint, hitNormal, lightNodes[rightIdx_]); \
+                float totalImp_ = impLeft_ + impRight_; \
+                if (totalImp_ <= 1e-12) { \
+                    impLeft_ = 0.5; \
+                    totalImp_ = 1.0; \
+                } \
+                float probLeft_ = clamp(impLeft_ / totalImp_, 0.001, 0.999); \
+                if (randFloat(seed) < probLeft_) { \
+                    nodeIdx_ = leftIdx_; \
+                    pathProb_ *= probLeft_; \
+                } else { \
+                    nodeIdx_ = rightIdx_; \
+                    pathProb_ *= (1.0 - probLeft_); \
+                } \
+            } \
+            if (lightNodes[nodeIdx_].children.z == 1u) { \
+                outIdx = lightNodes[nodeIdx_].children.x; \
+            } \
+            outPdf = max(pathProb_, 1e-6); \
+        } \
+    } while(false)
+
 // 32-bit Octahedral normal/direction encoding (Cigolle et al.)
 vec2 octSign(vec2 v) {
     return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);

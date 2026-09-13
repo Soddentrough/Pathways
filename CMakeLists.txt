@@ -442,6 +442,15 @@ target_include_directories(test_dgc_async_queue PRIVATE
 target_link_libraries(test_dgc_async_queue PRIVATE Vulkan::Vulkan)
 add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue)
 
+add_executable(test_light_tree
+    tests/test_light_tree.cpp
+)
+target_include_directories(test_light_tree PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+add_test(NAME LightTree COMMAND test_light_tree)
+
 
 
 

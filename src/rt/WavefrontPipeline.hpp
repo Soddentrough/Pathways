@@ -77,7 +77,9 @@ public:
                                 VkBuffer nrcTrainBuffer = VK_NULL_HANDLE,
                                 VkBuffer nrcCountersBuffer = VK_NULL_HANDLE,
                                 VkImageView motionVectorImageView = VK_NULL_HANDLE,
-                                VkImageView normalDepthImageView = VK_NULL_HANDLE);
+                                VkImageView normalDepthImageView = VK_NULL_HANDLE,
+                                VkBuffer lightTreeBuffer = VK_NULL_HANDLE,
+                                VkDeviceSize lightTreeSize = 0);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);

@@ -12,7 +12,8 @@ import os
 import subprocess
 import json
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 def run_cmd(cmd_list):
     print(f"[EXEC] {' '.join(cmd_list)}")

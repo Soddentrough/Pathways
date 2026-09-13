@@ -129,6 +129,10 @@ layout(std430, binding = 22) buffer InOutNRCCounters {
     NRCCountersBuffer nrcCounters;
 };
 
+layout(std430, binding = 25) readonly buffer LightTreeBuffer {
+    LightTreeNode lightNodes[];
+};
+
 #if !IS_SECONDARY_BOUNCE
 #include "wavefront_shadow_inline.glsl"
 #endif
@@ -319,7 +323,11 @@ void main() {
             if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
-                SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+                if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
+                    SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
+                } else {
+                    SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+                }
 
                 Light light = lights[lightIdx];
                 vec3 lightDir;
@@ -417,7 +425,11 @@ void main() {
                 for (uint c = 0u; c < M; ++c) {
                     uint lightIdx = 0u;
                     float lightSelectPdf = 1.0;
-                    SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+                    if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
+                        SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
+                    } else {
+                        SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+                    }
 
                     Light light = lights[lightIdx];
                     vec3 lightPoint;

@@ -149,6 +149,7 @@ void Config::printUsage(const char* progName) {
               << "  --temporal-accum, --tra Enable motion-vector guided temporal accumulation [default: disabled]\n"
               << "  --bmfr                  Enable experimental Blockwise Multi-Order Feature Regression [default: disabled]\n"
               << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'temporal' (Temporal Accumulation), or 'bmfr'\n"
+              << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n\n"
@@ -357,6 +358,8 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
             Logger::warn("A-Trous Wavelet denoiser has been removed. Use --temporal-accum or --bmfr.");
+        } else if (arg == "--light-tree") {
+            cfg.enable_light_tree = true;
         } else if (arg == "--nrc") {
             cfg.enable_nrc = true;
         } else if (arg == "--nrc-bounce" && i + 1 < argc) {

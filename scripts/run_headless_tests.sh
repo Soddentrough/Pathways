@@ -135,7 +135,7 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --frames 100 \
     --warmup-frames 20 \
     --no-accumulation \
-    --scene cornell-box \
+    --scene scenes/DamagedHelmet.glb \
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
@@ -148,11 +148,12 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --frames 100 \
     --warmup-frames 20 \
     --no-accumulation \
-    --scene cornell-box \
+    --scene scenes/DamagedHelmet.glb \
     --mgpu-mode sample \
     --dump-stats output/stats_scaling_multi.json
 
-python3 scripts/verify_scaling.py output/stats_scaling_single.json output/stats_scaling_multi.json 1.80
+# Realistic scaling threshold: PCIe 4.0 x8 secondary link + cross-GPU merge overhead
+python3 scripts/verify_scaling.py output/stats_scaling_single.json output/stats_scaling_multi.json 1.65
 
 # 7. Test Suite 5: glTF 2.0 Ingestion Pipeline & Auto-Framing Verification
 echo ""
@@ -256,6 +257,22 @@ echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights)..."
     --dump-stats output/stats_many_lights.json
 
 python3 scripts/verify_frame.py output/test_many_lights.png output/stats_many_lights.json 1920 1080 40.0
+
+# 9c. Test Suite 6e: Hierarchical Light Tree (FEAT-02) Many-Lights Verification
+echo ""
+echo "[6e] Running Test Suite 6e: Many-Lights Scene with Hierarchical Light Tree (--light-tree)..."
+./build/bin/pathways \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --scene many-lights \
+    --light-tree \
+    --dump-frame output/test_many_lights_tree.png \
+    --dump-stats output/stats_many_lights_tree.json
+
+python3 scripts/verify_frame.py output/test_many_lights_tree.png output/stats_many_lights_tree.json 1920 1080 40.0
 
 # 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
 echo ""

@@ -3,6 +3,7 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
+#include "scene/LightTree.hpp"
 #include <glm/detail/type_half.hpp>
 
 #include <fstream>
@@ -649,7 +650,20 @@ void Engine::initScene() {
     );
     if (!m_sceneData.lights.empty()) {
         buildLightAliasTable(m_sceneData.lights);
+        buildLightTree(m_sceneData.lights, m_sceneData.lightTreeNodes);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
+    }
+
+    // Light tree buffer (FEAT-02)
+    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    m_lightTreeBuffer = std::make_unique<Buffer>(
+        allocator, lightTreeSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.lightTreeNodes.empty()) {
+        m_lightTreeBuffer->copyFrom(m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size());
     }
 
     // Camera UBOs (Double-buffered)
@@ -883,7 +897,20 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     );
     if (!m_sceneData.lights.empty()) {
         buildLightAliasTable(m_sceneData.lights);
+        buildLightTree(m_sceneData.lights, m_sceneData.lightTreeNodes);
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
+    }
+
+    // Light tree buffer (FEAT-02)
+    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    m_lightTreeBuffer = std::make_unique<Buffer>(
+        allocator, lightTreeSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!m_sceneData.lightTreeNodes.empty()) {
+        m_lightTreeBuffer->copyFrom(m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size());
     }
 
     // Rebuild Acceleration Structures (BLAS & TLAS)
@@ -2445,7 +2472,9 @@ void Engine::updateWavefrontSceneDescriptors() {
             nrcTrainBuf,
             nrcCountBuf,
             m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE,
-            m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE
+            m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE,
+            m_lightTreeBuffer ? m_lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
+            m_lightTreeBuffer ? m_lightTreeBuffer->getSize() : 0
         );
     }
 
@@ -3254,6 +3283,7 @@ void Engine::renderFrame() {
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
+    if (m_config.enable_light_tree)     flags |= (1 << 7);
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }

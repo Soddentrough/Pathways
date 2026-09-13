@@ -79,6 +79,7 @@ GpuDeviceNode::~GpuDeviceNode() {
     sphereBuffer.reset();
     materialBuffer.reset();
     lightBuffer.reset();
+    lightTreeBuffer.reset();
 
     if (shadowClassifyPipeline) vkDestroyPipeline(device, shadowClassifyPipeline, nullptr);
     if (shadowFilterPipeline) vkDestroyPipeline(device, shadowFilterPipeline, nullptr);
@@ -746,6 +747,17 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secNode->lightBuffer->copyFrom(scene.lights.data(), sizeof(LightGPU) * scene.lights.size());
     }
 
+    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    secNode->lightTreeBuffer = std::make_unique<Buffer>(
+        secAlloc, lightTreeSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.lightTreeNodes.empty()) {
+        secNode->lightTreeBuffer->copyFrom(scene.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size());
+    }
+
     VkDeviceSize uboSize = sizeof(CameraUniform);
     for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
         secNode->cameraUBOs[i] = std::make_unique<Buffer>(
@@ -1308,7 +1320,9 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             texInfos,
             VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
             secNode->motionVectorImage ? secNode->motionVectorImage->getImageView() : VK_NULL_HANDLE,
-            secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE
+            secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE,
+            secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
+            secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getSize() : 0
         );
     }
 }
@@ -2004,6 +2018,17 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
     );
     if (!scene.lights.empty()) {
         secNode->lightBuffer->copyFrom(scene.lights.data(), sizeof(LightGPU) * scene.lights.size());
+    }
+
+    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    secNode->lightTreeBuffer = std::make_unique<Buffer>(
+        secAlloc, lightTreeSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!scene.lightTreeNodes.empty()) {
+        secNode->lightTreeBuffer->copyFrom(scene.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size());
     }
 
     // 2. Rebuild secondary AS

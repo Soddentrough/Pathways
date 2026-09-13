@@ -122,7 +122,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCTrainQueue
         { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },           // NRCCounters
         { 23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMotionVectorImage
-        { 24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // uNormalDepthImage
+        { 24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uNormalDepthImage
+        { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }            // LightTreeBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -292,9 +293,11 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                               const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
                                                VkBuffer nrcQueryBuffer,
                                                VkBuffer nrcTrainBuffer,
-                                               VkBuffer nrcCountersBuffer,
-                                               VkImageView motionVectorImageView,
-                                               VkImageView normalDepthImageView) {
+                                                VkBuffer nrcCountersBuffer,
+                                                VkImageView motionVectorImageView,
+                                                VkImageView normalDepthImageView,
+                                                VkBuffer lightTreeBuffer,
+                                                VkDeviceSize lightTreeSize) {
     if (frameSlot >= 2) frameSlot = 0;
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
@@ -315,6 +318,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorBufferInfo nrcQueryInfo{ actualNrcQuery, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo nrcTrainInfo{ actualNrcTrain, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo nrcCountersInfo{ actualNrcCounters, 0, VK_WHOLE_SIZE };
+
+    VkBuffer actualLightTree = (lightTreeBuffer != VK_NULL_HANDLE) ? lightTreeBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkDeviceSize actualLightTreeSize = (lightTreeBuffer != VK_NULL_HANDLE && lightTreeSize > 0) ? lightTreeSize : VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo lightTreeInfo{ actualLightTree, 0, actualLightTreeSize };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -354,6 +361,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
 
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 24, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }

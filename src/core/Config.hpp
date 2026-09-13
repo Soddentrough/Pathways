@@ -83,6 +83,7 @@ struct Config {
     bool enable_shadows = true;
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
     bool enable_direct_light = true;
+    bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;

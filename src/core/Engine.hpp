@@ -97,6 +97,7 @@ private:
     std::unique_ptr<Buffer> m_sphereBuffer;
     std::unique_ptr<Buffer> m_materialBuffer;
     std::unique_ptr<Buffer> m_lightBuffer;
+    std::unique_ptr<Buffer> m_lightTreeBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
 

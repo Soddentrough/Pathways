@@ -6,6 +6,7 @@
 #include <cstdint>
 #include "scene/Material.hpp"
 #include "scene/Light.hpp"
+#include "scene/LightTree.hpp"
 
 namespace pathways {
 
@@ -52,6 +53,7 @@ struct SceneData {
     std::vector<SphereGPU> spheres;
     std::vector<MaterialGPU> materials;
     std::vector<LightGPU> lights;
+    std::vector<LightTreeNodeGPU> lightTreeNodes;
     std::vector<TextureData> textures;
     std::vector<MeshRange> meshRanges;
     uint32_t numOpaqueTriangles = 0;
