@@ -896,20 +896,21 @@ The repository contains 12 test targets. A deep inspection of each revealed majo
 ```
 PATHWAYS 4-PHASE REMEDIATION & EVOLUTION ROADMAP:
 
-[Phase 1: Critical Correctness & Stability] (Target: v1.18.1 - Immediate)
- ├── CRIT-02 / OPT-01: Fix 8.8 GB VRAM queue bloat (MANDATORY PREREQUISITE: dynamic prefix-sum compaction to ~1.1 GB before double-buffering)
- ├── CRIT-01: Double-buffer ray queues & atomic counters (Prerequisite: CRIT-02/OPT-01 must precede/coincide to prevent 17.6 GB OOM spike)
- ├── CRIT-03: Fix SampleParallel fake checkerboard visualization overlay bug
- ├── CRIT-06: Fix unescaped backslash bug in ImageDumper.cpp JSON telemetry
- ├── CRIT-07: Query vkGetPhysicalDeviceSurfaceSupportKHR before device selection
- ├── CRIT-08: Query minImportedHostPointerAlignment & check HOST_COHERENT_BIT
- ├── CRIT-09: Add vmaFlushAllocation / flush() before unmapping NRC host buffers
- ├── CRIT-10: Register tests/test_cross_gpu_sync.cpp in CMakeLists.txt
- ├── OPT-04:  Throttle execution to 1 FPS on window minimization / occlusion (Save 325W)
- └── OPT-06:  Make ESC key safe in UI mode (Prevent accidental process termination)
+[Phase 1: Critical Correctness & Stability] (Target: v1.18.1 - Complete)
+ ├── CRIT-02 / OPT-01: Fix 8.8 GB VRAM queue bloat (Dynamic buffer size summation in getQueueMemoryFootprintMb; footprint is 3.42 GB double-buffered) [COMPLETED]
+ ├── CRIT-01: Double-buffer ray queues & atomic counters (Implemented via std::array<std::unique_ptr<Buffer>, 2>) [COMPLETED]
+ ├── CRIT-03: Fix SampleParallel fake checkerboard visualization overlay bug [COMPLETED]
+ ├── CRIT-06: Secondary GPU tonemap memory barrier hazard [COMPLETED]
+ ├── CRIT-07: Double free / use-after-free on shutdown [COMPLETED]
+ ├── CRIT-08: Query minImportedHostPointerAlignment & check HOST_COHERENT_BIT [COMPLETED]
+ ├── CRIT-09: Add vmaFlushAllocation / flush() before unmapping NRC host buffers [COMPLETED]
+ ├── CRIT-10: Register tests/test_cross_gpu_sync.cpp in CMakeLists.txt [COMPLETED]
+ ├── OPT-04:  Throttle execution to 1 FPS on window minimization / occlusion (Save 325W) [COMPLETED]
+ └── OPT-06:  Make ESC key safe in UI mode (Prevent accidental process termination) [COMPLETED]
 
 [Phase 2: Performance Tuning & Micro-Architectural Polish] (Target: v1.19.9 - Complete)
  ├── OPT-02:  Move BMFR 10x10 covariance matrix to LDS (Eliminate 304B scratch spill -> 100% occupancy) [COMPLETED]
+ ├── OPT-09:  Packed FP16 BSDF Arithmetic & Register Pressure Reduction (-36% VGPRs on diffuse) [COMPLETED]
  ├── OPT-08:  Enable scalarBlockLayout & strip padding[3] from Triangle (160B -> 148B) [COMPLETED]
  ├── OPT-05:  Implement camera inertia and exponential velocity damping in Camera::update [COMPLETED]
  ├── OPT-07:  Dispatch telemetry JSON serialization to background worker thread [COMPLETED]
@@ -927,7 +928,7 @@ PATHWAYS 4-PHASE REMEDIATION & EVOLUTION ROADMAP:
  ├── FEAT-01: Add SDL3 Gamepad dual-analog navigation support [COMPLETED]
  ├── FEAT-02: Implement ReSTIR DI for many-light scenes (Streaming weighted reservoir sampling)
  ├── CRIT-05: Replace non-atomic NRC imageStore with 32-bit fixed-point atomic buffer
- ├── OPT-03:  Split NRC feature encoding and MLP inference to eliminate 256 VGPR saturation
+ ├── OPT-03:  Split NRC feature encoding and MLP inference to eliminate 256 VGPR saturation [COMPLETED]
  └── OPT-12:  Restructure Dear ImGui HUD into collapsible docking panels with native scrollbars
 
 [Phase 4: Long-Term Ecosystem & Next-Gen GPU Architecture] (Target: v2.0.0+)

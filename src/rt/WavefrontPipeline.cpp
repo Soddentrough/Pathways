@@ -959,9 +959,21 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 }
 
 double WavefrontPipeline::getQueueMemoryFootprintMb() const {
-    // geomA(16B*8) + geomB(16B*8) + stateA(32B*8) + stateB(32B*8) + hit(32B*8) + shadow(32B) + matIndices(24B) + secIndices(32B) = 1112B
-    double bytes = static_cast<double>(m_maxCapacity) * 1112.0 + 256.0 + 65536.0 * 2.0;
-    return bytes / (1024.0 * 1024.0);
+    VkDeviceSize totalBytes = 0;
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        if (m_rayGeomQueueA[slot]) totalBytes += m_rayGeomQueueA[slot]->getSize();
+        if (m_rayGeomQueueB[slot]) totalBytes += m_rayGeomQueueB[slot]->getSize();
+        if (m_rayStateQueueA[slot]) totalBytes += m_rayStateQueueA[slot]->getSize();
+        if (m_rayStateQueueB[slot]) totalBytes += m_rayStateQueueB[slot]->getSize();
+        if (m_rayHitQueue[slot]) totalBytes += m_rayHitQueue[slot]->getSize();
+        if (m_shadowQueue[slot]) totalBytes += m_shadowQueue[slot]->getSize();
+        if (m_materialIndexQueue[slot]) totalBytes += m_materialIndexQueue[slot]->getSize();
+        if (m_secondaryIndexQueue[slot]) totalBytes += m_secondaryIndexQueue[slot]->getSize();
+        if (m_queueCounters[slot]) totalBytes += m_queueCounters[slot]->getSize();
+        if (m_indirectArgs[slot]) totalBytes += m_indirectArgs[slot]->getSize();
+        if (m_dgcStream[slot]) totalBytes += m_dgcStream[slot]->getSize();
+    }
+    return static_cast<double>(totalBytes) / (1024.0 * 1024.0);
 }
 
 WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces) {
