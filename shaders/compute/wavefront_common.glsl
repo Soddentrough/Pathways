@@ -431,6 +431,21 @@ uint morton3D_10bit(uvec3 v) {
     return (part1By2(v.z) << 2u) | (part1By2(v.y) << 1u) | part1By2(v.x);
 }
 
+// 2D Morton encoding for 8-bit coordinates (16-bit total code)
+uint morton2D_8bit(uvec2 v) {
+    uint x = v.x & 0x000000FFu;
+    x = (x | (x << 4u)) & 0x0F0Fu;
+    x = (x | (x << 2u)) & 0x3333u;
+    x = (x | (x << 1u)) & 0x5555u;
+
+    uint y = v.y & 0x000000FFu;
+    y = (y | (y << 4u)) & 0x0F0Fu;
+    y = (y | (y << 2u)) & 0x3333u;
+    y = (y | (y << 1u)) & 0x5555u;
+
+    return x | (y << 1u);
+}
+
 // Cosine-weighted hemisphere sampling
 vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
     vec2 r = randVec2(seed);

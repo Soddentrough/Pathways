@@ -29,10 +29,10 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
       m_supportsExecutionSet(supportsExecutionSet), m_enableDgcPreprocess(enableDgcPreprocess) {
 
     if (m_tileSize > 0) {
-        m_maxCapacity = std::min(m_tileSize * m_tileSize, m_width * m_height);
-    } else {
-        m_maxCapacity = m_width * m_height;
+        Logger::info("WavefrontPipeline: Host tile slicing (tileSize: {}) is deprecated in favor of compute-internal Morton workgroup tiling. Using monolithic DGC execution.", m_tileSize);
+        m_tileSize = 0;
     }
+    m_maxCapacity = m_width * m_height;
 
     createDescriptorLayout();
     allocateDescriptorSets();
@@ -583,11 +583,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     vkCmdResetQueryPool(cmd, m_queryPools[frameSlot], 0, MAX_WAVEFRONT_TIMESTAMP_QUERIES);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 0);
 
-    uint32_t ts = m_tileSize;
     m_sortMode = sceneData.sortMode;
     m_secondarySortMode = sceneData.secondarySortMode;
-    uint32_t numTilesX = (ts > 0) ? (width + ts - 1) / ts : 1;
-    uint32_t numTilesY = (ts > 0) ? (height + ts - 1) / ts : 1;
     uint32_t fw = (sceneData.fullWidth > 0) ? sceneData.fullWidth : width;
     uint32_t fh = (sceneData.fullHeight > 0) ? sceneData.fullHeight : height;
     uint32_t storeWidth = (sceneData.tileOffsetX == 2u) ? width : fw;
@@ -618,50 +615,41 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     clearDep.pBufferMemoryBarriers = clearBarriers.data();
     vkCmdPipelineBarrier2(cmd, &clearDep);
 
-    // 3. Tile Loop
-    for (uint32_t ty = 0; ty < numTilesY; ++ty) {
-        for (uint32_t tx = 0; tx < numTilesX; ++tx) {
-            uint32_t tileOffsetX = (ts > 0) ? tx * ts : 0;
-            uint32_t tileOffsetY = (ts > 0) ? ty * ts : 0;
-            uint32_t curTileW = (ts > 0) ? std::min(ts, width - tileOffsetX) : width;
-            uint32_t curTileH = (ts > 0) ? std::min(ts, height - tileOffsetY) : height;
+    // 3. Monolithic DGC Frame Recording
+    for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
+        bool shouldProfile = (sampleIdx == 0);
 
-            bool isFirstTile = (tx == 0 && ty == 0);
+        // 3a. Classify & Primary Ray Generation
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
 
-            for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
-                bool shouldProfile = (isFirstTile && sampleIdx == 0);
-
-                // 3a. Classify & Primary Ray Generation
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
-
-                uint32_t classifyPC[21] = {
-                    sceneData.numTriangles,
-                    sceneData.numSpheres,
-                    sceneData.numMaterials,
-                    sceneData.numLights,
-                    curTileW,
-                    curTileH,
-                    sceneData.useMorton,
-                    sceneData.hasEnvMap,
-                    std::bit_cast<uint32_t>(sceneData.envMapIntensity),
-                    m_maxCapacity,
-                    sampleIdx,
-                    sceneData.useHardwareRT,
-                    (sceneData.tileOffsetX != 0u) ? sceneData.tileOffsetX : tileOffsetX,
-                    (sceneData.tileOffsetX != 0u) ? sceneData.tileOffsetY : tileOffsetY,
-                    ts,
-                    ts,
-                    sceneData.sortMode,
-                    sceneData.numOpaqueTriangles,
-                    fw,
-                    fh,
-                    sceneData.captureMlData
-                };
-                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
-                if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
-                vkCmdDispatch(cmd, (curTileW + 7) / 8, (curTileH + 3) / 4, 1);
-                if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], 2);
+        uint32_t classifyPC[21] = {
+            sceneData.numTriangles,
+            sceneData.numSpheres,
+            sceneData.numMaterials,
+            sceneData.numLights,
+            width,
+            height,
+            sceneData.useMorton,
+            sceneData.hasEnvMap,
+            std::bit_cast<uint32_t>(sceneData.envMapIntensity),
+            m_maxCapacity,
+            sampleIdx,
+            sceneData.useHardwareRT,
+            sceneData.tileOffsetX,
+            sceneData.tileOffsetY,
+            0,
+            0,
+            sceneData.sortMode,
+            sceneData.numOpaqueTriangles,
+            fw,
+            fh,
+            sceneData.captureMlData
+        };
+        vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
+        if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
+        vkCmdDispatch(cmd, (width + 7) / 8, (height + 3) / 4, 1);
+        if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], 2);
 
                 // Barrier: Classify -> Bounce 0 Shade (Indirect / DGC dispatch, scoped buffer barriers)
                 std::array<VkBufferMemoryBarrier2, 8> c2sBarriers = {
@@ -1008,8 +996,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         }
                     }
                 } // end multi-bounce loop
-            } // end tx
-        } // end ty
     } // end sampleIdx
 
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], endQuery);
