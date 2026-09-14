@@ -224,11 +224,11 @@ python3 scripts/verify_frame.py output/test_dragon_dispersion.png output/stats_d
     --spp 4 \
     --max-bounces 4 \
     --frames 10 \
-    --scene scenes/CarConcept.glb \
-    --dump-frame output/test_car_concept.png \
-    --dump-stats output/stats_car_concept.json
+    --scene scenes/bmw-m6/bmw_m6_extended.glb \
+    --dump-frame output/test_bmw_m6.png \
+    --dump-stats output/stats_bmw_m6.json
 
-python3 scripts/verify_frame.py output/test_car_concept.png output/stats_car_concept.json 1920 1080 20.0 --max-mean-lum 0.95 --max-blown-pct 50.0
+python3 scripts/verify_frame.py output/test_bmw_m6.png output/stats_bmw_m6.json 1920 1080 20.0 --max-mean-lum 0.95 --max-blown-pct 50.0
 
 ./build/bin/pathways \
     --headless \

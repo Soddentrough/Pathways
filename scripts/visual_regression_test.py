@@ -158,20 +158,20 @@ TEST_CONFIGS = [
         "diff_path": f"{OUTPUT_DIR}/diff_dragon_dispersion.png"
     },
     {
-        "id": "car_concept",
-        "name": "Car Concept (Clearcoat & Metallic Automotive PBR)",
-        "scene": "scenes/CarConcept.glb",
+        "id": "bmw_m6",
+        "name": "BMW M6 (Clearcoat & Metallic Automotive PBR)",
+        "scene": "scenes/bmw-m6/bmw_m6_extended.glb",
         "cmd": [
             "./build/bin/pathways", "--headless",
-            "--scene", "scenes/CarConcept.glb",
+            "--scene", "scenes/bmw-m6/bmw_m6_extended.glb",
             "--width", "1920", "--height", "1080",
             "--spp", "4", "--max-bounces", "4", "--frames", "10",
-            "--dump-frame", f"{OUTPUT_DIR}/test_car_concept.png",
-            "--dump-stats", f"{OUTPUT_DIR}/stats_car_concept.json"
+            "--dump-frame", f"{OUTPUT_DIR}/test_bmw_m6.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_bmw_m6.json"
         ],
-        "render_path": f"{OUTPUT_DIR}/test_car_concept.png",
-        "ref_path": f"{REF_DIR}/car_concept.png",
-        "diff_path": f"{OUTPUT_DIR}/diff_car_concept.png"
+        "render_path": f"{OUTPUT_DIR}/test_bmw_m6.png",
+        "ref_path": f"{REF_DIR}/bmw_m6.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_bmw_m6.png"
     },
     {
         "id": "breakfast_room",

@@ -78,13 +78,13 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to Dragon Dispersion and rendered 3 frames cleanly.");
 
-            // Switch to scene 6: Car Concept
-            if (!engine.loadScene("scenes/CarConcept.glb")) {
-                pathways::Logger::error("Test failed: loadScene Car Concept failed.");
+            // Switch to scene 6: BMW M6
+            if (!engine.loadScene("scenes/bmw-m6/bmw_m6_extended.glb")) {
+                pathways::Logger::error("Test failed: loadScene BMW M6 failed.");
                 return 1;
             }
             for (int i = 0; i < 3; ++i) engine.renderFrame();
-            pathways::Logger::info("[PASS] Switched to Car Concept and rendered 3 frames cleanly.");
+            pathways::Logger::info("[PASS] Switched to BMW M6 and rendered 3 frames cleanly.");
 
             // Switch to scene 7: Cornell Caustic Extended (Tier 1 Research Scene)
             if (!engine.loadScene("scenes/cornell-caustic/cornell_caustic_extended.glb")) {

@@ -42,10 +42,10 @@ DEFAULT_SCENES = {
         "desc": "High geometry, dielectric dispersion and volumetric absorption",
         "camera": None
     },
-    "car_concept": {
-        "name": "Car Concept",
-        "path": "scenes/CarConcept.glb",
-        "desc": "Automotive PBR, clearcoat, iridescence, and complex materials",
+    "bmw_m6": {
+        "name": "BMW M6",
+        "path": "scenes/bmw-m6/bmw_m6_extended.glb",
+        "desc": "Automotive PBR, clearcoat, chrome conductors, and complex materials",
         "camera": None
     },
     "breakfast_room": {

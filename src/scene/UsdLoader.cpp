@@ -161,6 +161,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 gpuMat.clearcoat = cc;
             }
 
+            UsdShadeInput clearcoatRoughnessInput = surfaceShader.GetInput(TfToken("clearcoatRoughness"));
+            if (clearcoatRoughnessInput) {
+                float ccr = 0.0f;
+                clearcoatRoughnessInput.Get(&ccr);
+                gpuMat.clearcoatRoughness = ccr;
+            }
+
             UsdShadeInput emissiveInput = surfaceShader.GetInput(TfToken("emissiveColor"));
             if (emissiveInput) {
                 GfVec3f emission(0.0f, 0.0f, 0.0f);

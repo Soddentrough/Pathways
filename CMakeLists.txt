@@ -549,13 +549,13 @@ endif()
 include(GNUInstallDirs)
 
 set(CURATED_SCENE_FILES
-    scenes/CarConcept.glb
     scenes/DamagedHelmet.glb
     scenes/DragonAttenuation.glb
     scenes/DragonDispersion.glb
 )
 
 set(CURATED_SCENE_DIRS
+    bmw-m6
     breakfast-room
     classroom
     coffee-maker

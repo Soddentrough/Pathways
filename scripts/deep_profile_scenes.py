@@ -50,10 +50,10 @@ SCENES = [
         "desc": "Dense dragon model testing KHR_materials_dispersion and dielectric transmission."
     },
     {
-        "name": "Car Concept",
+        "name": "BMW M6",
         "category": "Automotive PBR & Clearcoat",
-        "path": "scenes/CarConcept.glb",
-        "desc": "Complex automotive concept showcasing clearcoat, anisotropy, iridescence, and detailed materials."
+        "path": "scenes/bmw-m6/bmw_m6_extended.glb",
+        "desc": "Complex automotive model showcasing clearcoat, chrome conductors, and detailed materials."
     },
     {
         "name": "Breakfast Room",
