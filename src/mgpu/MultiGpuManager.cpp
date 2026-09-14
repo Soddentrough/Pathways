@@ -1151,7 +1151,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
                 wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
                 secNode->context->hasDgcExecutionSet(),
-                wfShadeDiffuseSecCode, wfShadeComplexSecCode
+                wfShadeDiffuseSecCode, wfShadeComplexSecCode,
+                config.dgc_preprocess
             );
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");

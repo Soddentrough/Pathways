@@ -804,9 +804,9 @@ The repository contains 12 test targets. A deep inspection of each revealed majo
   - **Bug B (Non-Atomic Storage Image Write Race)**: In `shaders/compute/nrc_encode_infer.comp:212-214`, multiple queries for the same pixel execute concurrent non-atomic `imageLoad` and `imageStore` on `uAccumImage`, corrupting pixels with severe salt-and-pepper noise.
 
 #### 3. Modern DGC vs. GPU Work Graphs
-- Current Baseline: `VK_EXT_device_generated_commands` (`src/rt/DGCManager.cpp:10-99`) uses `vkCmdExecuteGeneratedCommandsEXT` with `VkIndirectExecutionSetEXT`. It requires explicit preprocessing into a 4-slice ring buffer and global VRAM queue flushes with `vkCmdPipelineBarrier2`.
+- Current Baseline: `VK_EXT_device_generated_commands` (`src/rt/DGCManager.cpp`) uses `vkCmdExecuteGeneratedCommandsEXT` with `vkCmdPreprocessGeneratedCommandsEXT` (Tier-1 Explicit Preprocessing). It utilizes a 24-slice ring buffer partitioned across 2 in-flight frames, 4 bounces, and 3 microkernel pass types (Material, Shadow, Intersect), overlapping command processor front-end decode and pre-fetching indirect commands to eliminate front-end latency bubbles.
 - Next-Gen Horizon: GPU Work Graphs (`VK_AMDX_shader_enqueue` / upcoming `VK_KHR_work_graphs`). Work Graphs allow shaders to enqueue nodes directly into on-chip micro-schedulers, storing ray payloads in LDS/registers and eliminating VRAM queue round-trips.
-- **Strategic Verdict**: Maintaining `VK_EXT_device_generated_commands` while awaiting `VK_KHR_work_graphs` is the correct decision (`FUTURE_IDEA_SHADER_ENQUEUE.md:12-15`). Adopting vendor-specific `VK_AMDX_shader_enqueue` today would create vendor lock-in.
+- **Strategic Verdict**: Maintaining `VK_EXT_device_generated_commands` with Tier-1 preprocessing while awaiting `VK_KHR_work_graphs` is the correct decision (`FUTURE_IDEA_SHADER_ENQUEUE.md:12-15`). Adopting vendor-specific `VK_AMDX_shader_enqueue` today would create vendor lock-in.
 
 #### 4. Spatiotemporal Denoising & Reconstruction
 - **BMFR (Blockwise Multi-Order Feature Regression)** (`shaders/compute/bmfr_regression.comp`): Sub-millisecond filtering (~0.4 ms at 1080p, ~1.1 ms at 4K) via Cholesky decomposition. Weakness: independent $8\times 8$ block solutions create discrete boundary seams during camera motion (`GuiManager.cpp:1442`).
@@ -921,7 +921,8 @@ PATHWAYS 4-PHASE REMEDIATION & EVOLUTION ROADMAP:
  ├── SMELL-03: Zero dgcStream.commands when all rays absorb or miss [COMPLETED]
  ├── SMELL-04: Attach requiredSubgroupSize = 32 to RTPipeline.cpp ray tracing stages [COMPLETED]
  ├── SMELL-05-12: Clean up ghost CLI flags, CLI binary options violations, and docs [COMPLETED]
- └── SMELL-13: Compiler warning suppression cleanup in CMakeLists.txt [COMPLETED]
+ ├── SMELL-13: Compiler warning suppression cleanup in CMakeLists.txt [COMPLETED]
+ └── OPT-13:  Tier-1 Explicit DGC Preprocessing (vkCmdPreprocessGeneratedCommandsEXT) with 24-slice ring buffer [COMPLETED]
 
 [Phase 3: SOTA Lighting & Reconstruction Integration] (Target: v1.19.0 - v1.20.0)
  ├── CRIT-04: Dynamically size NRC query queue by SPP & prevent silent ray drop on queue full [COMPLETED]

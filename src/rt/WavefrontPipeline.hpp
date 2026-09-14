@@ -61,7 +61,8 @@ public:
                       const std::vector<char>& raySortCode = {},
                       bool supportsExecutionSet = false,
                       const std::vector<char>& shadeDiffuseSecCode = {},
-                      const std::vector<char>& shadeComplexSecCode = {});
+                      const std::vector<char>& shadeComplexSecCode = {},
+                      bool enableDgcPreprocess = true);
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -160,6 +161,7 @@ private:
     uint32_t m_sortMode = 0;
     uint32_t m_secondarySortMode = 0;
     bool m_supportsExecutionSet = false;
+    bool m_enableDgcPreprocess = true;
 
     // Ray Work Queues & Counter SSBOs (SoA Layout) - Double-buffered per in-flight frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueA;  // 16B RayGeometry

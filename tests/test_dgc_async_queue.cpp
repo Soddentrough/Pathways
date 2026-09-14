@@ -80,6 +80,33 @@ int main() {
                "UNORDERED_SEQUENCES_BIT_EXT must be active");
     std::cout << "  -> DGC layout usage flags (0x3) verified." << std::endl;
 
+    // 6. Verify DGCPassType and Slice Orthogonality
+    std::cout << "[TEST 6] DGCPassType Slicing Orthogonality Across Passes & Bounces..." << std::endl;
+    bool sliceUsed[DGCManager::NUM_SLICES] = { false };
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        for (uint32_t b = 0; b < 4; ++b) {
+            uint32_t matSlice = DGCManager::getSliceIndex(slot, b, DGCManager::PassMaterial);
+            uint32_t shadowSlice = DGCManager::getSliceIndex(slot, b, DGCManager::PassShadow);
+            uint32_t intersectSlice = DGCManager::getSliceIndex(slot, b, DGCManager::PassIntersect);
+
+            check_true(matSlice != shadowSlice, "Material and Shadow slices must be distinct");
+            check_true(shadowSlice != intersectSlice, "Shadow and Intersect slices must be distinct");
+            check_true(matSlice != intersectSlice, "Material and Intersect slices must be distinct");
+
+            check_true(matSlice < DGCManager::NUM_SLICES, "matSlice must be within NUM_SLICES");
+            check_true(shadowSlice < DGCManager::NUM_SLICES, "shadowSlice must be within NUM_SLICES");
+            check_true(intersectSlice < DGCManager::NUM_SLICES, "intersectSlice must be within NUM_SLICES");
+
+            check_true(!sliceUsed[matSlice], "Material slice collision detected");
+            sliceUsed[matSlice] = true;
+            check_true(!sliceUsed[shadowSlice], "Shadow slice collision detected");
+            sliceUsed[shadowSlice] = true;
+            check_true(!sliceUsed[intersectSlice], "Intersect slice collision detected");
+            sliceUsed[intersectSlice] = true;
+        }
+    }
+    std::cout << "  -> DGCPassType 24-slice orthogonal partitioning verified across all bounces." << std::endl;
+
     std::cout << "\n[SUCCESS] All DGC multi-slice ring buffer & queue invariant tests passed!" << std::endl;
     return 0;
 }

@@ -1358,7 +1358,8 @@ void Engine::initPipelines() {
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
         m_context->hasDgcExecutionSet(),
-        wfShadeDiffuseSecCode, wfShadeComplexSecCode
+        wfShadeDiffuseSecCode, wfShadeComplexSecCode,
+        m_config.dgc_preprocess
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -4879,6 +4880,7 @@ FrameStats Engine::getStats() const {
     stats.has_dho = true;
     stats.has_rt_pipeline = (m_rtpKhrPipeline != nullptr);
     stats.has_dgc = (m_rtpKhrPipeline && m_rtpKhrPipeline->isIndirectSupported());
+    stats.dgc_preprocess = m_config.dgc_preprocess;
     stats.has_subgroup_control = m_context->hasSubgroupSizeControl();
     stats.subgroup_size = 32;
     stats.has_dynamic_rendering = true;

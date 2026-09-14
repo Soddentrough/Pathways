@@ -256,7 +256,9 @@ target_compile_definitions(pathways PRIVATE
 )
 
 # Scoped warning suppression for third-party header tinyexr inlined into ImageDumper.cpp
-set_source_files_properties(src/utils/ImageDumper.cpp PROPERTIES COMPILE_OPTIONS "-Wno-array-bounds")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/utils/ImageDumper.cpp PROPERTIES COMPILE_OPTIONS "-Wno-array-bounds")
+endif()
 
 # Windows runtime DLL deployment
 if(WIN32)

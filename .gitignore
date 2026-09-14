@@ -50,6 +50,7 @@ scenes/*/*.png
 .vscode/
 .idea/
 *.swp
+*.bak
 *~
 imgui.ini
 

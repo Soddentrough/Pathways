@@ -72,6 +72,7 @@ struct FrameStats {
     uint32_t rt_handle_align = 16;
     uint32_t rt_max_recursion = 31;
     bool has_dgc = true;
+    bool dgc_preprocess = true;
     uint32_t dgc_max_tokens = 128;
     uint32_t dgc_max_sequences = 1048576;
     uint32_t dgc_max_stride = 2048;
@@ -238,6 +239,9 @@ public:
     static bool savePNG(const std::string& filepath, uint32_t width, uint32_t height, const uint8_t* rgbaPixels);
     static bool savePNG16(const std::string& filepath, uint32_t width, uint32_t height, const uint16_t* rgba16Pixels);
     static bool saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels);
+    static bool savePTTD(const std::string& filepath, uint32_t width, uint32_t height,
+                         uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,
+                         const void* payloadData, size_t payloadBytes);
     static bool saveStatsJSON(const std::string& filepath, const FrameStats& stats);
     static std::string generateDefaultTelemetryPath();
 };

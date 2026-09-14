@@ -17,7 +17,15 @@ struct DGCCommand {
 
 class DGCManager {
 public:
-    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet = false);
+    enum DGCPassType : uint32_t {
+        PassMaterial  = 0,
+        PassShadow    = 1,
+        PassIntersect = 2,
+        PassCount     = 3
+    };
+
+    DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout,
+               bool supportsExecutionSet = false, bool enableExplicitPreprocess = true);
     ~DGCManager();
 
     bool isSupported() const { return m_supported; }
@@ -31,8 +39,9 @@ public:
 
     static constexpr uint32_t NUM_SLICES = 32;
     static inline uint32_t getSliceIndex(uint32_t frameSlot, uint32_t bounce, uint32_t passIndex = 0) {
-        // Double-buffered frameSlot (0..1) with up to 16 bounces, partitioned per pass
-        return ((frameSlot * 16 + bounce) * 1 + passIndex) % NUM_SLICES;
+        // Double-buffered frameSlot (0..1) with up to 4 bounces, partitioned per pass
+        // 2 frame slots * 4 bounces * 3 passes = 24 slices <= 32 slices
+        return ((frameSlot * 4 + (bounce % 4)) * PassCount + (passIndex % PassCount)) % NUM_SLICES;
     }
 
     // Dynamic multi-slice ring buffer controls
@@ -91,8 +100,8 @@ private:
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
     bool m_supported = false;
-    bool m_explicitPreprocess = true;
     bool m_materialDGCSupported = false;
+    bool m_explicitPreprocess = true;
 
     PFN_vkCreateIndirectCommandsLayoutEXT pfn_vkCreateIndirectCommandsLayoutEXT = nullptr;
     PFN_vkDestroyIndirectCommandsLayoutEXT pfn_vkDestroyIndirectCommandsLayoutEXT = nullptr;

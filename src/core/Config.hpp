@@ -84,6 +84,7 @@ struct Config {
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
+    bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool enable_shadow_denoiser = false;
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;
@@ -135,6 +136,12 @@ struct Config {
     std::string dump_hdr_path = "";
     std::string dump_stats_path = "";
     bool dump_8bit_png = false; // Save dumped PNG frames as 8-bit instead of default 10/16-bit (conforms to single-negation rule)
+
+    // ML Neural Reconstruction Dataset Capture (Upways PTTD)
+    std::string capture_training_data_dir = "";
+    uint32_t capture_frames = 0;
+    uint32_t capture_reference_spp = 1;
+    bool capture_normals = false;
 
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);

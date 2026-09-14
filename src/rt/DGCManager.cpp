@@ -7,8 +7,8 @@
 
 namespace pathways {
 
-DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet)
-    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout), m_materialDGCSupported(supportsExecutionSet) {
+DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout pipelineLayout, bool supportsExecutionSet, bool enableExplicitPreprocess)
+    : m_device(device), m_allocator(allocator), m_pipelineLayout(pipelineLayout), m_materialDGCSupported(supportsExecutionSet), m_explicitPreprocess(enableExplicitPreprocess) {
 
     loadFunctionPointers();
     if (getenv("PATHWAYS_DISABLE_DGC")) {
@@ -21,7 +21,12 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         return;
     }
 
-    m_explicitPreprocess = (getenv("PATHWAYS_ENABLE_DGC_PREPROCESS") != nullptr);
+    if (getenv("PATHWAYS_DISABLE_DGC_PREPROCESS")) {
+        m_explicitPreprocess = false;
+    } else if (getenv("PATHWAYS_ENABLE_DGC_PREPROCESS")) {
+        m_explicitPreprocess = true;
+    }
+
     if (!m_explicitPreprocess) {
         Logger::info("DGC baseline active (implicit preprocessing, flags = UNORDERED_SEQUENCES).");
     } else {
@@ -188,10 +193,13 @@ void DGCManager::ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenc
 void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
                                   VkDeviceSize argumentOffset, uint32_t sliceIndex,
                                   uint32_t maxSequenceCount, VkDeviceAddress sequenceCountAddress) {
-    if (!m_supported || !m_explicitPreprocess || !argumentBuffer) return;
+    if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipeline == VK_NULL_HANDLE) return;
 
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
     if (!m_preprocessBuffer) return;
+
+    // Bind initial pipeline before preprocessing
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
     VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % NUM_SLICES) * m_sliceSize;
 
@@ -208,7 +216,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
-    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, VK_NULL_HANDLE);
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
 void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex) {
@@ -242,7 +250,7 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
                               VkDeviceSize argumentOffset, uint32_t sliceIndex,
                               uint32_t maxSequenceCount, bool isPreprocessed,
                               VkDeviceAddress sequenceCountAddress) {
-    if (!argumentBuffer) return;
+    if (!argumentBuffer || pipeline == VK_NULL_HANDLE) return;
 
     if (!m_supported || !m_indirectLayout) {
         // Fallback: Dispatch indirect
@@ -251,6 +259,9 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
     }
 
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
+
+    // Bind initial pipeline before executing generated commands as required by VUID-vkCmdExecuteGeneratedCommandsEXT-indirectCommandsLayout-11053
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
     VkDeviceSize sliceOffset = static_cast<VkDeviceSize>(sliceIndex % NUM_SLICES) * m_sliceSize;
 
@@ -376,7 +387,7 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
     genInfo.maxSequenceCount = sequenceCount;
     genInfo.sequenceCountAddress = sequenceCountAddress;
 
-    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, VK_NULL_HANDLE);
+    pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,

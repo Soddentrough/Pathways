@@ -193,8 +193,11 @@ void Config::printUsage(const char* progName) {
               << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
               << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
               << "  --no-inline-shadows     Disable hybrid inline primary shadows\n"
-              << "  --dump-ui <path.png>    Save full window framebuffer with ImGui UI overlay to PNG\n"
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
+              << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
+              << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
+              << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
+              << "  --capture-normals       Include 3 surface normal channels in ML training tensor (19ch instead of 16ch)\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -285,6 +288,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_hdr_path = argv[++i];
         } else if (arg == "--dump-stats" && i + 1 < argc) {
             cfg.dump_stats_path = argv[++i];
+        } else if ((arg == "--capture-training-data" || arg == "--capture-data") && i + 1 < argc) {
+            cfg.capture_training_data_dir = argv[++i];
+        } else if (arg == "--capture-frames" && i + 1 < argc) {
+            cfg.capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--capture-reference-spp" && i + 1 < argc) {
+            cfg.capture_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--capture-normals") {
+            cfg.capture_normals = true;
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {
@@ -420,6 +431,7 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
         } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
+            cfg.dgc_preprocess = false;
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
         } else if (arg == "--no-inline-shadows") {
             cfg.inline_primary_shadows = false;
@@ -658,7 +670,13 @@ Config Config::parse(int argc, char* argv[]) {
         cfg.fullscreen = false;
     }
 
-    if (cfg.headless && cfg.frame_limit == 0) {
+    if (!cfg.capture_training_data_dir.empty()) {
+        cfg.headless = true;
+        if (cfg.capture_frames == 0) {
+            cfg.capture_frames = 20;
+        }
+        cfg.frame_limit = cfg.capture_frames * (cfg.capture_reference_spp > 0 ? cfg.capture_reference_spp : 1);
+    } else if (cfg.headless && cfg.frame_limit == 0) {
         // In headless mode, default to 1 frame unless explicitly told to run more
         cfg.frame_limit = 1;
     }
