@@ -35,6 +35,17 @@ struct Sphere {
     uint padding[3];
 };
 
+struct InstanceGPU {
+    uint firstTriangle;
+    uint numOpaqueTriangles;
+    uint materialOffset;
+    uint flags;
+};
+
+layout(std430, binding = 30) readonly buffer InstancesBuffer {
+    InstanceGPU instances[];
+};
+
 struct Material {
     vec4 albedo;
     vec4 emissive;
@@ -246,8 +257,11 @@ struct RayHit {
 // 32-byte cache-line aligned ray state (read/written by shade, NEVER touched by intersect)
 struct RayState {
     vec4 throughputSeed;  // rgb: throughput, w: uintBitsToFloat(seed) (16 bytes)
-    vec4 radiancePixel;   // rgb: accumRadiance, w: uintBitsToFloat(pixelIndex) (16 bytes)
+    vec4 radiancePixel;   // rgb: accumRadiance, w: uintBitsToFloat(pixelIndex | specularFlag) (16 bytes)
 };
+
+#define SPECULAR_FLAG_BIT             (1u << 31)
+#define PIXEL_INDEX_MASK              (0x7FFFFFFFu)
 
 #define MATERIAL_ARCHETYPE_DIFFUSE    0u
 #define MATERIAL_ARCHETYPE_DIELECTRIC 1u

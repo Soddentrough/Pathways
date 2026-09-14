@@ -322,11 +322,11 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     }
 
     auto tEnd = std::chrono::steady_clock::now();
-    m_lastBlasBuildTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
-    m_uncompactedBlasSizeKb = sizeInfo.accelerationStructureSize / 1024.0;
-    m_blasSizeKb = (compacted ? compactedSize : sizeInfo.accelerationStructureSize) / 1024.0;
-    m_blasCompacted = compacted;
-    m_blasTriangles = 0;
+    double buildDurationMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    m_lastBlasBuildTimeMs += buildDurationMs;
+    m_uncompactedBlasSizeKb += sizeInfo.accelerationStructureSize / 1024.0;
+    m_blasSizeKb += (compacted ? compactedSize : sizeInfo.accelerationStructureSize) / 1024.0;
+    m_blasCompacted = m_blasCompacted && compacted;
     for (const auto& g : geometries) {
         m_blasTriangles += g.triangleCount;
     }

@@ -139,6 +139,9 @@ void main() {
     int closestTri = -1;
     vec2 closestBary = vec2(0.0);
     int closestSphere = -1;
+    mat4x3 hitW2o = mat4x3(1.0);
+    mat4x3 hitO2w = mat4x3(1.0);
+    uint hitInstMatOffset = 0u;
 
     if (inRange) {
         // Fixed-function hardware BVH traversal with zero shader ALU interrupts
@@ -148,10 +151,15 @@ void main() {
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(rq, true);
+            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            closestTri = int((geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles));
+            InstanceGPU inst = instances[instIdx];
+            closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
             closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+            hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            hitInstMatOffset = inst.materialOffset;
         }
 
         // Procedural Spheres intersection test
@@ -176,16 +184,18 @@ void main() {
             float v = closestBary.y;
             float w = 1.0 - u - v;
             Triangle tri = triangles[closestTri];
-            vec3 hitNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+            vec3 localNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+            vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
             vec2 hitUv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
                          u * vec2(tri.v1.position.w, tri.v1.normal.w) +
                          v * vec2(tri.v2.position.w, tri.v2.normal.w);
             vec4 geomTan = w * tri.v0.tangent + u * tri.v1.tangent + v * tri.v2.tangent;
             float tanLen = length(geomTan.xyz);
             vec3 tanDir = tanLen > 1e-4 ? (geomTan.xyz / tanLen) : vec3(1.0, 0.0, 0.0);
+            tanDir = normalize(mat3(hitO2w) * tanDir);
             float tanSign = tri.v0.tangent.w != 0.0 ? tri.v0.tangent.w : 1.0;
 
-            uint matId = tri.materialId;
+            uint matId = tri.materialId + hitInstMatOffset;
             hit.hitData0 = vec4(closestT,
                                uintBitsToFloat(matId),
                                uintBitsToFloat(packOct32(hitNormal)),

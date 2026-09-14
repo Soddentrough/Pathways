@@ -48,6 +48,26 @@ struct MeshRange {
     uint32_t triangleCount = 0;
 };
 
+struct InstanceGPU {
+    uint32_t firstTriangle = 0;      // Start index in triangles[] buffer
+    uint32_t numOpaqueTriangles = 0; // Number of opaque triangles in this prototype
+    uint32_t materialOffset = 0;     // Optional material ID offset
+    uint32_t flags = 0;              // Flags / metadata
+};
+static_assert(sizeof(InstanceGPU) == 16, "InstanceGPU must be 16 bytes (std430 aligned)");
+
+struct BlasGeometryRange {
+    uint32_t firstTriangle = 0;
+    uint32_t triangleCount = 0;
+    uint32_t numOpaqueTriangles = 0;
+};
+
+struct SceneInstance {
+    uint32_t blasIndex = 0;
+    glm::mat4 transform = glm::mat4(1.0f);
+    uint32_t customIndex = 0;
+};
+
 struct SceneData {
     std::vector<TriangleGPU> triangles;
     std::vector<SphereGPU> spheres;
@@ -57,6 +77,11 @@ struct SceneData {
     std::vector<TextureData> textures;
     std::vector<MeshRange> meshRanges;
     uint32_t numOpaqueTriangles = 0;
+
+    // Multi-BLAS & Hardware Ray Tracing Instancing
+    std::vector<BlasGeometryRange> blasRanges; // If empty, monolithic single-BLAS is used
+    std::vector<SceneInstance> instances;      // If empty, 1 identity instance is generated
+    std::vector<InstanceGPU> instanceData;     // Uploaded to InstancesBuffer (binding 30)
 
     bool hasCamera = false;
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);

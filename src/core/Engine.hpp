@@ -15,6 +15,7 @@
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/NRCManager.hpp"
+#include "rt/UpwaysPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
 #include "core/QualityGovernor.hpp"
@@ -60,6 +61,7 @@ public:
     Swapchain* getSwapchain() const { return m_swapchain.get(); }
     QualityGovernor* getGovernor() const { return m_governor.get(); }
     NRCManager* getNrcManager() const { return m_nrcManager.get(); }
+    UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
 
 private:
     void initVulkan();
@@ -102,10 +104,16 @@ private:
     std::unique_ptr<Buffer> m_uiDumpBuffer;
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
-    std::unique_ptr<Buffer> m_asVertexBuffer;
+    std::unique_ptr<Buffer> m_asIndexBuffer;
+    std::unique_ptr<Buffer> m_instanceBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;
     std::unique_ptr<AccelerationStructure> m_blas;
+    std::vector<std::unique_ptr<AccelerationStructure>> m_blases;
     std::unique_ptr<AccelerationStructure> m_tlas;
+
+    void createAccelerationStructures();
+    void uploadToDeviceBuffer(Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize);
+    void uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount);
 
     // GPU-Timeline TLAS Instance & Scratch Buffers (Tier 3)
     std::unique_ptr<Buffer> m_tlasInstanceBuffer;
@@ -210,6 +218,14 @@ private:
     // Screen-Space Motion Vectors (used by ray tracer and temporal reconstruction passes)
     std::unique_ptr<Image> m_motionVectorImage;
 
+    // ML Training Data Capture Targets (Upways neural denoiser & continuous upscaler)
+    std::unique_ptr<Image> m_mlAlbedoRoughnessImage;
+    std::unique_ptr<Image> m_mlSpecularMotionImage;
+    std::unique_ptr<Image> m_mlDiffuseImage;
+    std::unique_ptr<Image> m_mlSpecularImage;
+    void runTrainingDataCapture();
+    void captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp);
+
     // Temporal Radiance Accumulation & wRLS Outlier Rejection
     std::array<std::unique_ptr<Image>, 2> m_temporalHistory;
     uint32_t m_temporalPingPong = 0;
@@ -244,6 +260,17 @@ private:
     void destroyBmfrPipelines();
     void updateBmfrDescriptors();
     bool dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot);
+
+    // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
+    std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
+    VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+
+    void createUpwaysPipelines();
+    void createUpwaysResources();
+    void destroyUpwaysResources();
+    void destroyUpwaysPipelines();
+    void updateUpwaysDescriptors();
+    bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory);
 
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;

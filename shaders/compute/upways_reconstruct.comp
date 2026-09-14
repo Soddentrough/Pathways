@@ -1,0 +1,274 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "upways_common.glsl"
+
+// Wave32 compute workgroup: 32 threads processing M=16 pixels using 16x16 WMMA
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE_M = 16u;
+
+// Descriptors
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uAccumImage;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uNormalDepthImage;
+layout(set = 0, binding = 2, rg16f)   readonly uniform image2D uMotionVectorImage;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughnessImage;
+layout(set = 0, binding = 4, rgba16f) readonly uniform image2D uSpecularMotionImage;
+layout(set = 0, binding = 5, rgba16f) readonly uniform image2D uDiffuseImage;
+layout(set = 0, binding = 6, rgba16f) readonly uniform image2D uSpecularImage;
+layout(set = 0, binding = 7, rgba16f) readonly uniform image2D uHistoryImage;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutputImage;
+layout(set = 0, binding = 9, rgba16f) writeonly uniform image2D uHistoryOutputImage;
+
+layout(std430, set = 0, binding = 10) readonly buffer WeightBuffer {
+    float16_t weights[];
+};
+
+layout(push_constant) uniform UpwaysPushConstants {
+    int inputWidth;
+    int inputHeight;
+    int outputWidth;
+    int outputHeight;
+    float invInputWidth;
+    float invInputHeight;
+    float invOutputWidth;
+    float invOutputHeight;
+    uint frameIndex;
+    uint resetHistory;
+    uint cameraMoved;
+    uint superResMode;      // 0 = 1:1 Denoising, 1 = 2x Super-Resolution
+    float depthThreshold;
+    float normalThreshold;
+    float blendAlpha;
+    uint pad;
+} pc;
+
+// Shared memory for 16 pixels x 16 input features (512 bytes)
+shared float16_t s_features[16 * 16];
+shared float16_t s_hidden[16 * 16];
+shared ivec2     s_pixelCoords[16];
+shared vec3      s_albedo[16];
+shared vec3      s_f0[16];
+shared vec3      s_rawLogDiff[16];
+shared vec3      s_rawLogSpec[16];
+shared vec3      s_warpedHistDiff[16];
+shared vec3      s_warpedHistSpec[16];
+shared float     s_confidence[16];
+shared float     s_currentDepth[16];
+
+void main() {
+    uint pixelBase = gl_WorkGroupID.x * TILE_M;
+    uint totalPixels = uint(pc.outputWidth * pc.outputHeight);
+    if (pixelBase >= totalPixels) return;
+
+    uint tid = gl_LocalInvocationIndex;
+
+    // Step 1: Initialize shared memory
+    if (tid < 16u) {
+        uint pIdx = pixelBase + tid;
+        if (pIdx < totalPixels) {
+            int outY = int(pIdx / uint(pc.outputWidth));
+            int outX = int(pIdx % uint(pc.outputWidth));
+            ivec2 outCoord = ivec2(outX, outY);
+            s_pixelCoords[tid] = outCoord;
+
+            // Compute input buffer sampling coordinate (1:1 or 2x super-resolution)
+            ivec2 inCoord = (pc.superResMode != 0u) ? (outCoord / 2) : outCoord;
+            inCoord = clamp(inCoord, ivec2(0), ivec2(pc.inputWidth - 1, pc.inputHeight - 1));
+
+            // 1. Sample G-buffers
+            vec4 nd = imageLoad(uNormalDepthImage, inCoord);
+            vec3 normal = nd.xyz;
+            float depth = nd.w;
+            s_currentDepth[tid] = depth;
+
+            vec4 ar = imageLoad(uAlbedoRoughnessImage, inCoord);
+            vec3 albedo = clamp(ar.rgb, vec3(0.0), vec3(1.0));
+            float roughness = clamp(ar.w, 0.0, 1.0);
+            s_albedo[tid] = albedo;
+
+            vec3 f0 = upwaysComputeF0(albedo, roughness);
+            s_f0[tid] = f0;
+
+            vec2 vSurface = imageLoad(uMotionVectorImage, inCoord).xy;
+            vec4 sm = imageLoad(uSpecularMotionImage, inCoord);
+            vec2 vSpecular = (length(sm.xy) > 1e-4) ? sm.xy : vSurface;
+            float dHit = sm.z;
+
+            // 2. Sample raw Monte Carlo radiance (diffuse & specular)
+            vec3 rawDiff = imageLoad(uDiffuseImage, inCoord).rgb;
+            vec3 rawSpec = imageLoad(uSpecularImage, inCoord).rgb;
+            vec4 rawAccum = imageLoad(uAccumImage, inCoord);
+            if (dot(rawDiff, rawDiff) == 0.0 && dot(rawSpec, rawSpec) == 0.0 && dot(rawAccum.rgb, rawAccum.rgb) > 0.0) {
+                rawDiff = rawAccum.rgb * 0.7;
+                rawSpec = rawAccum.rgb * 0.3;
+            }
+
+            // 3. Physical Demodulation
+            vec3 demodDiff = rawDiff / (albedo + vec3(1e-3));
+            vec3 demodSpec = rawSpec / max(f0, vec3(0.04));
+
+            // 4. Invertible Log Compression (mu = 16.0)
+            vec3 logDiff = upwaysLogTransform(demodDiff);
+            vec3 logSpec = upwaysLogTransform(demodSpec);
+            s_rawLogDiff[tid] = logDiff;
+            s_rawLogSpec[tid] = logSpec;
+
+            // 5. Dual-Stream Temporal Reprojection
+            vec2 inUV = (vec2(inCoord) + 0.5) * vec2(pc.invInputWidth, pc.invInputHeight);
+            vec2 prevSurfUV = inUV - vSurface;
+            vec2 prevSpecUV = inUV - vSpecular;
+
+            bool surfValid = (prevSurfUV.x >= 0.0 && prevSurfUV.x <= 1.0 && prevSurfUV.y >= 0.0 && prevSurfUV.y <= 1.0);
+            bool specValid = (prevSpecUV.x >= 0.0 && prevSpecUV.x <= 1.0 && prevSpecUV.y >= 0.0 && prevSpecUV.y <= 1.0);
+
+            ivec2 histSurfCoord = ivec2(prevSurfUV * vec2(pc.outputWidth, pc.outputHeight));
+            ivec2 histSpecCoord = ivec2(prevSpecUV * vec2(pc.outputWidth, pc.outputHeight));
+
+            histSurfCoord = clamp(histSurfCoord, ivec2(0), ivec2(pc.outputWidth - 1, pc.outputHeight - 1));
+            histSpecCoord = clamp(histSpecCoord, ivec2(0), ivec2(pc.outputWidth - 1, pc.outputHeight - 1));
+
+            vec4 histSurf = imageLoad(uHistoryImage, histSurfCoord);
+            vec4 histSpec = imageLoad(uHistoryImage, histSpecCoord);
+
+            float prevDepth = histSurf.w;
+            float depthDelta = (depth > 0.0 && prevDepth > 0.0) ? (abs(depth - prevDepth) / (depth + 1e-3)) : 0.0;
+            float confidence = 0.0;
+            if (surfValid && pc.resetHistory == 0u && depthDelta < pc.depthThreshold) {
+                confidence = clamp(1.0 - depthDelta * 20.0, 0.0, 1.0);
+                if (pc.cameraMoved != 0u) {
+                    confidence *= 0.85;
+                }
+            }
+            s_confidence[tid] = confidence;
+            s_warpedHistDiff[tid] = histSurf.rgb;
+            s_warpedHistSpec[tid] = histSpec.rgb;
+
+            // 6. Assemble 16-channel feature vector for neural inference:
+            // 0..2: logDiff, 3..5: logSpec, 6..8: albedo, 9: roughness, 10: depth, 11: dHit, 12..13: vSurf, 14..15: vSpec
+            s_features[tid * 16u + 0u]  = float16_t(logDiff.r);
+            s_features[tid * 16u + 1u]  = float16_t(logDiff.g);
+            s_features[tid * 16u + 2u]  = float16_t(logDiff.b);
+            s_features[tid * 16u + 3u]  = float16_t(logSpec.r);
+            s_features[tid * 16u + 4u]  = float16_t(logSpec.g);
+            s_features[tid * 16u + 5u]  = float16_t(logSpec.b);
+            s_features[tid * 16u + 6u]  = float16_t(albedo.r);
+            s_features[tid * 16u + 7u]  = float16_t(albedo.g);
+            s_features[tid * 16u + 8u]  = float16_t(albedo.b);
+            s_features[tid * 16u + 9u]  = float16_t(roughness);
+            s_features[tid * 16u + 10u] = float16_t(1.0 / (1.0 + depth));
+            s_features[tid * 16u + 11u] = float16_t(1.0 / (1.0 + dHit));
+            s_features[tid * 16u + 12u] = float16_t(vSurface.x);
+            s_features[tid * 16u + 13u] = float16_t(vSurface.y);
+            s_features[tid * 16u + 14u] = float16_t(vSpecular.x);
+            s_features[tid * 16u + 15u] = float16_t(vSpecular.y);
+        } else {
+            s_pixelCoords[tid] = ivec2(-1);
+            s_confidence[tid] = 0.0;
+            for (uint c = 0u; c < 16u; ++c) {
+                s_features[tid * 16u + c] = float16_t(0.0);
+            }
+        }
+    }
+    barrier();
+
+    // Step 2: Wave32 Cooperative Matrix Neural Inference (16x16 WMMA)
+    // Layer 1: 16 -> 16 MLP Feature Projection
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> inTile;
+    coopMatLoad(inTile, s_features, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w1;
+    coopMatLoad(w1, weights, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1;
+    acc1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+    acc1 = coopMatMulAdd(inTile, w1, acc1);
+
+    // Apply GELU activation with finite range clamp
+    for (uint i = 0u; i < acc1.length(); ++i) {
+        float16_t val = acc1[i];
+        if (isnan(float(val)) || isinf(float(val))) val = float16_t(0.0);
+        val = clamp(val, float16_t(-8.0), float16_t(8.0));
+        acc1[i] = upwaysGelu(val);
+    }
+
+    coopMatStore(acc1, s_hidden, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Layer 2: 16 -> 16 Reconstruction & Temporal Latent Update
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> hidTile;
+    coopMatLoad(hidTile, s_hidden, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w2;
+    coopMatLoad(w2, weights, 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2;
+    acc2 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+    acc2 = coopMatMulAdd(hidTile, w2, acc2);
+
+    for (uint i = 0u; i < acc2.length(); ++i) {
+        float16_t val = acc2[i];
+        if (isnan(float(val)) || isinf(float(val))) val = float16_t(0.0);
+        acc2[i] = clamp(val, float16_t(-2.0), float16_t(2.0));
+    }
+
+    coopMatStore(acc2, s_features, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Step 3: Reconstruction, Temporal Blend, and Physical Remodulation
+    if (tid < 16u) {
+        ivec2 outCoord = s_pixelCoords[tid];
+        if (outCoord.x >= 0 && outCoord.x < pc.outputWidth && outCoord.y < pc.outputHeight) {
+            vec3 deltaDiff = vec3(
+                float(s_features[tid * 16u + 0u]),
+                float(s_features[tid * 16u + 1u]),
+                float(s_features[tid * 16u + 2u])
+            );
+            vec3 deltaSpec = vec3(
+                float(s_features[tid * 16u + 3u]),
+                float(s_features[tid * 16u + 4u]),
+                float(s_features[tid * 16u + 5u])
+            );
+
+            if (isnan(deltaDiff.r) || isnan(deltaDiff.g) || isnan(deltaDiff.b)) deltaDiff = vec3(0.0);
+            if (isnan(deltaSpec.r) || isnan(deltaSpec.g) || isnan(deltaSpec.b)) deltaSpec = vec3(0.0);
+            deltaDiff = clamp(deltaDiff, vec3(-1.0), vec3(1.0));
+            deltaSpec = clamp(deltaSpec, vec3(-1.0), vec3(1.0));
+
+            vec3 cleanLogDiff = clamp(s_rawLogDiff[tid] + deltaDiff, vec3(0.0), vec3(6.0));
+            vec3 cleanLogSpec = clamp(s_rawLogSpec[tid] + deltaSpec, vec3(0.0), vec3(6.0));
+
+            // Temporal History Gating
+            float conf = s_confidence[tid];
+            float alpha = max(pc.blendAlpha, 1.0 - conf * 0.92);
+            vec3 blendedLogDiff = (dot(s_warpedHistDiff[tid], s_warpedHistDiff[tid]) > 1e-5) ? mix(s_warpedHistDiff[tid], cleanLogDiff, alpha) : cleanLogDiff;
+            vec3 blendedLogSpec = (dot(s_warpedHistSpec[tid], s_warpedHistSpec[tid]) > 1e-5) ? mix(s_warpedHistSpec[tid], cleanLogSpec, alpha) : cleanLogSpec;
+
+            // Invertible Log Decompression
+            vec3 cleanDemodDiff = upwaysInverseLogTransform(blendedLogDiff);
+            vec3 cleanDemodSpec = upwaysInverseLogTransform(blendedLogSpec);
+
+            // Remodulation with Target Resolution Albedo & Fresnel F0
+            vec3 albedo = s_albedo[tid];
+            vec3 f0 = max(s_f0[tid], vec3(0.04));
+            vec3 finalRadiance = cleanDemodDiff * albedo + cleanDemodSpec * f0;
+
+            // Numerical sanity clamp (prevent NaNs or Inf)
+            if (isnan(finalRadiance.r) || isnan(finalRadiance.g) || isnan(finalRadiance.b) ||
+                isinf(finalRadiance.r) || isinf(finalRadiance.g) || isinf(finalRadiance.b)) {
+                finalRadiance = vec3(0.0);
+            }
+            finalRadiance = clamp(finalRadiance, vec3(0.0), vec3(65000.0));
+
+            // Write final HDR radiance to output image (consumed by Tonemapper)
+            imageStore(uOutputImage, outCoord, vec4(finalRadiance, 1.0));
+
+            // Write history state for next frame's temporal warping
+            vec3 storedLog = (dot(blendedLogSpec, blendedLogSpec) > dot(blendedLogDiff, blendedLogDiff)) ? blendedLogSpec : blendedLogDiff;
+            imageStore(uHistoryOutputImage, outCoord, vec4(storedLog, s_currentDepth[tid]));
+        }
+    }
+}

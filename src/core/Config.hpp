@@ -41,7 +41,8 @@ enum class SecondarySortMode {
 enum class DenoiserMode {
     None,     // Raw stochastic path traced output (unfiltered progressive)
     Temporal, // Motion-vector guided Temporal Radiance Accumulation [Default]
-    BMFR      // Blockwise Multi-Order Feature Regression [Experimental]
+    BMFR,     // Blockwise Multi-Order Feature Regression [Experimental]
+    Upways    // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
 };
 
 struct Config {
@@ -91,12 +92,14 @@ struct Config {
     bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
     float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
-    DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
-    bool enable_temporal_accum = false;   // Motion-vector guided temporal accumulation [Default: disabled, opt-in via --temporal-accum / --denoiser temporal]
+    DenoiserMode denoiser_mode = DenoiserMode::Temporal; // Default: Temporal Radiance Accumulation (TRA)
+    bool enable_temporal_accum = true;    // Motion-vector guided temporal accumulation [Default: enabled, negate via --no-temporal-accum]
     bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled, opt-in via --bmfr]
     float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
     float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth
     float temporal_max_history = 32.0f;   // Maximum temporal history sample accumulation limit
+    bool upways_superres = false;         // Upways 2x Continuous Super-Resolution (e.g. 1080p -> 4K)
+    std::string upways_weights_path = ""; // Custom path to upways_weights.bin
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
     uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)
@@ -121,6 +124,7 @@ struct Config {
     uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
+    float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
 
     // Camera view overrides (useful for headless testing & reproducible framing)

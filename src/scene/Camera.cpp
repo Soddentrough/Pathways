@@ -139,13 +139,24 @@ void Camera::resetToDefault() {
 }
 
 void Camera::update(float deltaTime) {
-    // Exponential smoothing / velocity inertia damping (OPT-05)
-    if (glm::length(m_velocity) > 0.0001f) {
-        float decay = 14.0f;
-        float alpha = 1.0f - std::exp(-decay * deltaTime);
-        m_velocity = glm::mix(m_velocity, glm::vec3(0.0f), alpha);
-        m_position += m_velocity * deltaTime;
-        m_moved = true;
+    if (deltaTime <= 0.0f) {
+        return;
+    }
+    // Camera velocity damping and perceptible movement thresholding (R1).
+    // If camera was actively moved this frame (m_moved == true), velocity is actively driven
+    // and must not be decayed. Damping applies only when un-driven to eliminate residual coasting (< 50 ms).
+    if (!m_moved) {
+        constexpr float VELOCITY_THRESHOLD = 0.001f;
+        if (glm::length(m_velocity) > VELOCITY_THRESHOLD) {
+            float decay = 30.0f;
+            float alpha = 1.0f - std::exp(-decay * deltaTime);
+            m_velocity = glm::mix(m_velocity, glm::vec3(0.0f), alpha);
+            if (glm::length(m_velocity) <= VELOCITY_THRESHOLD) {
+                m_velocity = glm::vec3(0.0f);
+            }
+        } else {
+            m_velocity = glm::vec3(0.0f);
+        }
     }
 }
 
@@ -189,11 +200,17 @@ void Camera::endOrbit() {
 }
 
 void Camera::processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl, bool arcStrafe) {
+    if (deltaTime <= 0.0f) {
+        return;
+    }
+
     if (std::abs(forward) < 0.001f && std::abs(strafe) < 0.001f && std::abs(vertical) < 0.001f) {
+        m_velocity = glm::vec3(0.0f);
         return;
     }
 
     if (arcStrafe && m_orbiting) {
+        glm::vec3 prevPos = m_position;
         // Arc-strafe / turntable orbit around m_orbitPivot
         glm::vec3 r = m_position - m_orbitPivot;
         float currentDist = glm::length(r);
@@ -241,22 +258,28 @@ void Camera::processFpsInput(float forward, float strafe, float vertical, float 
         m_pitch = glm::degrees(std::asin(std::clamp(dir.y, -0.999f, 0.999f)));
         m_yaw = glm::degrees(std::atan2(dir.z, dir.x));
         updateVectors();
+        m_velocity = (m_position - prevPos) / deltaTime;
         m_moved = true;
         return;
     }
 
-    // Standard FPS movement (records velocity for inertia glide in update())
+    // Standard FPS movement (supports analog magnitude scaling and unit diagonal clamp)
     glm::vec3 moveDir = m_front * forward + m_right * strafe + m_worldUp * vertical;
-    if (glm::length(moveDir) > 0.0001f) {
-        moveDir = glm::normalize(moveDir);
-        float currentSpeed = getEffectiveSpeed(sprint, crawl);
-        m_velocity = moveDir * currentSpeed;
-        m_position += moveDir * (currentSpeed * deltaTime);
+    float moveLen = glm::length(moveDir);
+    if (moveLen > 0.001f) {
+        float inputMag = std::min(moveLen, 1.0f);
+        glm::vec3 dir = moveDir / moveLen;
+        float currentSpeed = getEffectiveSpeed(sprint, crawl) * inputMag;
+        m_velocity = dir * currentSpeed;
+        m_position += dir * (currentSpeed * deltaTime);
         m_moved = true;
+    } else {
+        m_velocity = glm::vec3(0.0f);
     }
 }
 
 void Camera::processKeyboard(char direction, float deltaTime) {
+    if (deltaTime <= 0.0f) return;
     float velocity = getEffectiveSpeed(false, false) * deltaTime;
     glm::vec3 prevPos = m_position;
 
@@ -267,8 +290,12 @@ void Camera::processKeyboard(char direction, float deltaTime) {
     if (direction == 'E' || direction == 'e') m_position += m_worldUp * velocity;
     if (direction == 'Q' || direction == 'q') m_position -= m_worldUp * velocity;
 
-    if (glm::length(m_position - prevPos) > 0.0001f) {
+    float distMoved = glm::length(m_position - prevPos);
+    if (distMoved > 0.001f) {
+        m_velocity = (m_position - prevPos) / deltaTime;
         m_moved = true;
+    } else {
+        m_velocity = glm::vec3(0.0f);
     }
 }
 

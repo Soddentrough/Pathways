@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <exception>
+#include <filesystem>
 
 int main(int argc, char* argv[]) {
     try {
@@ -110,6 +111,16 @@ int main(int argc, char* argv[]) {
             engine.setMgpuMode(pathways::MultiGpuMode::Off);
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched back to Single-GPU and rendered 3 frames cleanly.");
+
+            // Switch to scene 8: Point Instanced Med City (OpenUSD Scene)
+            if (std::filesystem::exists("scenes/PointInstancedMedCity/PointInstancedMedCity.usd")) {
+                if (!engine.loadScene("scenes/PointInstancedMedCity/PointInstancedMedCity.usd")) {
+                    pathways::Logger::error("Test failed: loadScene PointInstancedMedCity USD failed.");
+                    return 1;
+                }
+                for (int i = 0; i < 3; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Switched to Point Instanced Med City (OpenUSD) and rendered 3 frames cleanly.");
+            }
 
             engine.printExecutionSummary();
             auto stats = engine.getStats();

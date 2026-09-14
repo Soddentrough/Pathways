@@ -7,6 +7,8 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -78,6 +80,7 @@ layout(push_constant) uniform PushConstants {
     uint frameIndex;
     uint sppSampleIndex;
     uint numOpaqueTriangles;
+    uint captureMlData;
 } pc;
 
 void main() {
@@ -92,6 +95,7 @@ void main() {
     vec2 radRG = unpackHalf2x16(sRay.dirPixelRad.z);
     vec2 radB_pad = unpackHalf2x16(sRay.dirPixelRad.w);
     vec3 radiance = vec3(radRG, radB_pad.x);
+    float isSpecular = radB_pad.y;
 
     if (length(radiance) <= 1e-5) return;
 
@@ -112,10 +116,12 @@ void main() {
                               0xFF, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         while (rayQueryProceedEXT(rq)) {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
                 uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
                 uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
-                uint matId = triangles[triIdx].materialId;
+                InstanceGPU inst = instances[instIdx];
+                uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+                uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 Material mat = materials[matId];
                 if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
                     continue;
@@ -141,10 +147,12 @@ void main() {
             }
         }
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
-            Material m = materials[triangles[triIdx].materialId];
+            InstanceGPU inst = instances[instIdx];
+            uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+            Material m = materials[triangles[triIdx].materialId + inst.materialOffset];
             if (m.type != 3u && m.type != 2u && m.transmission <= 0.05) {
                 occluded = true;
             }
@@ -170,5 +178,15 @@ void main() {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (pc.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
         vec4 prev = imageLoad(uAccumImage, pixelCoord);
         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), 0.0));
+
+        if (pc.captureMlData != 0u) {
+            if (isSpecular > 0.5) {
+                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, radiance, seed), 0.0));
+            } else {
+                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radiance, seed), 0.0));
+            }
+        }
     }
 }

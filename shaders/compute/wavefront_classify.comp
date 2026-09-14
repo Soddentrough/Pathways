@@ -11,8 +11,12 @@
 layout(local_size_x = 8, local_size_y = 4) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 8) uniform sampler2D sceneTextures[512];
 layout(binding = 23, rg16f) uniform image2D uMotionVectorImage;
 layout(binding = 24, rgba16f) uniform image2D uNormalDepthImage;
+layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
+layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -117,6 +121,7 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint fullWidth;
     uint fullHeight;
+    uint captureMlData;
 } pc;
 
 void main() {
@@ -171,6 +176,8 @@ void main() {
     RayGeometry geom;
     RayHit hit;
     RayState state;
+    vec2 hitUv = vec2(0.0);
+    uint matId = 0u;
 
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
@@ -189,6 +196,9 @@ void main() {
         vec2 closestBary = vec2(0.0);
         int closestSphere = -1;
         vec3 closestSphereNorm = vec3(0.0, 1.0, 0.0);
+        mat4x3 hitW2o = mat4x3(1.0);
+        mat4x3 hitO2w = mat4x3(1.0);
+        uint hitInstMatOffset = 0u;
 
         // Hardware BVH Traversal with 100% fixed-function opaque traversal
         rayQueryEXT rq;
@@ -197,10 +207,15 @@ void main() {
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(rq, true);
+            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            closestTri = int((geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles));
+            InstanceGPU inst = instances[instIdx];
+            closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
             closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+            hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            hitInstMatOffset = inst.materialOffset;
         }
 
         // Test procedural spheres
@@ -235,6 +250,10 @@ void main() {
 
             vec4 prev = imageLoad(uAccumImage, storeCoord);
             imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
+            if (pc.captureMlData != 0u) {
+                vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
+                imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+            }
         } else {
             // Hit! Setup SoA state
             isActive = true;
@@ -242,24 +261,24 @@ void main() {
             geom.originPackedDir = vec4(origin, uintBitsToFloat(packOct32(direction)));
 
             archetype = MATERIAL_ARCHETYPE_DIFFUSE;
-            vec2 hitUv = vec2(0.0);
-            uint matId = 0u;
 
             if (closestTri >= 0) {
                 float u = closestBary.x;
                 float v = closestBary.y;
                 float w = 1.0 - u - v;
                 Triangle tri = triangles[closestTri];
-                hitNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+                vec3 localNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+                hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
                 hitUv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
                         u * vec2(tri.v1.position.w, tri.v1.normal.w) +
                         v * vec2(tri.v2.position.w, tri.v2.normal.w);
                 vec4 geomTan = w * tri.v0.tangent + u * tri.v1.tangent + v * tri.v2.tangent;
                 float tanLen = length(geomTan.xyz);
                 vec3 tanDir = tanLen > 1e-4 ? (geomTan.xyz / tanLen) : vec3(1.0, 0.0, 0.0);
+                tanDir = normalize(mat3(hitO2w) * tanDir);
                 float tanSign = tri.v0.tangent.w != 0.0 ? tri.v0.tangent.w : 1.0;
 
-                matId = tri.materialId;
+                matId = tri.materialId + hitInstMatOffset;
                 hit.hitData0 = vec4(closestT,
                                    uintBitsToFloat(matId),
                                    uintBitsToFloat(packOct32(hitNormal)),
@@ -289,8 +308,10 @@ void main() {
                 }
             }
 
+            bool isSpecular = (archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC);
+            uint packedPixel = pixelIndex | (isSpecular ? SPECULAR_FLAG_BIT : 0u);
             state.throughputSeed = vec4(vec3(invSpp), uintBitsToFloat(seed));
-            state.radiancePixel = vec4(0.0, 0.0, 0.0, uintBitsToFloat(pixelIndex));
+            state.radiancePixel = vec4(0.0, 0.0, 0.0, uintBitsToFloat(packedPixel));
         }
 
         if (pc.sppSampleIndex == 0u) {
@@ -316,6 +337,57 @@ void main() {
             }
             imageStore(uMotionVectorImage, pixelCoord, vec4(vSurface, 0.0, 0.0));
             imageStore(uNormalDepthImage, pixelCoord, vec4(primaryNormal, primaryDepth));
+
+            if (pc.captureMlData != 0u) {
+                vec3 albedoVal = vec3(0.0);
+                float roughnessVal = 1.0;
+                vec2 vSpecular = vSurface;
+                float dHit = 10000.0;
+
+                if (closestTri >= 0 || closestSphere >= 0) {
+                    if (matId < pc.numMaterials) {
+                        Material mat = materials[matId];
+                        albedoVal = mat.albedo.rgb;
+                        if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
+                            albedoVal *= texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb;
+                        }
+                        roughnessVal = mat.roughness;
+                        if (mat.mrTex > 0u && mat.mrTex <= 512u) {
+                            roughnessVal *= texture(sceneTextures[mat.mrTex - 1u], hitUv).g;
+                        }
+                    }
+
+                    vec3 primaryHitPoint = origin + direction * closestT;
+                    vec3 reflDir = reflect(direction, hitNormal);
+
+                    rayQueryEXT rqSpec;
+                    rayQueryInitializeEXT(rqSpec, topLevelAS,
+                                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                          0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
+                    rayQueryProceedEXT(rqSpec);
+                    if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                        float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
+                        vec3 specHitPt = primaryHitPoint + reflDir * specT;
+                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
+                        vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
+                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
+                        }
+                        dHit = specT;
+                    } else {
+                        vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
+                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
+                        vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
+                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
+                        }
+                        dHit = 10000.0;
+                    }
+                }
+
+                imageStore(uMlAlbedoRoughnessImage, pixelCoord, vec4(albedoVal, roughnessVal));
+                imageStore(uMlSpecularMotionImage, pixelCoord, vec4(vSpecular, dHit, 0.0));
+            }
         }
     }
 

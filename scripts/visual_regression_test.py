@@ -50,7 +50,6 @@ TEST_CONFIGS = [
             "--spp", "1", "--max-bounces", "4",
             "--frames", "60", "--warmup-frames", "10",
             "--camera-motion",
-            "--temporal-accum",
             "--dump-frame", f"{OUTPUT_DIR}/test_classroom_wf_motion.png",
             "--dump-stats", f"{OUTPUT_DIR}/stats_classroom_wf_motion.json"
         ],
@@ -86,7 +85,6 @@ TEST_CONFIGS = [
             "--spp", "1", "--max-bounces", "4",
             "--frames", "60", "--warmup-frames", "10",
             "--camera-motion",
-            "--temporal-accum",
             "--dump-frame", f"{OUTPUT_DIR}/test_lr_motion_test.png",
             "--dump-stats", f"{OUTPUT_DIR}/stats_lr_motion_test.json"
         ],

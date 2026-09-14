@@ -10,6 +10,8 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -147,6 +149,7 @@ layout(push_constant) uniform PushConstants {
     float nrcTrainRatio;
     uint frameIndex;
     uint numOpaqueTriangles;
+    uint captureMlData;
 } pc;
 
 void main() {
@@ -178,8 +181,11 @@ void main() {
         vec3 throughput = state.throughputSeed.rgb;
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
-        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
+        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
+        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
+        bool isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
         uint bounce = pc.currentBounce;
+        bool sampledSpecularLobe = false;
 
         // 0. Check if secondary ray hit sky / environment (Miss)
         if (hitType == 2u) {
@@ -195,6 +201,15 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            if (pc.captureMlData != 0u) {
+                if (isSpecularPath) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                } else {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                }
+            }
             // Ray terminates here (survivesToNext remains false)
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
@@ -228,7 +243,7 @@ void main() {
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(hitPoint + rayDir * EPSILON, uintBitsToFloat(packOct32(rayDir)));
                 nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(rawPixel));
             } else {
                 // Emissive radiance evaluation
                 vec3 emissive = mat.emissive.rgb;
@@ -456,11 +471,20 @@ void main() {
                                             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                             vec4 prev = imageLoad(uAccumImage, pixelCoord);
                                             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), 0.0));
+                                            if (pc.captureMlData != 0u) {
+                                                if (isSpecularPath) {
+                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, unshadowed, seed), 0.0));
+                                                } else {
+                                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, unshadowed, seed), 0.0));
+                                                }
+                                            }
                                         }
                                     } else {
                                         hasShadowRay = true;
                                         shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                        shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                        shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                                     }
                                 } else {
                                     accumRadiance += unshadowed;
@@ -507,6 +531,7 @@ void main() {
                     if (!pathTerminated) {
                         if (transmission > 0.01 || mat.type == 2u /* DIELECTRIC / REFRACTION */) {
                             isDelta = true;
+                            sampledSpecularLobe = true;
                             if (!enableRefraction) {
                                 nextDirection = sampleCosineHemisphere(hitNormal, seed);
                                 nextOrigin = hitPoint + hitNormal * EPSILON;
@@ -535,6 +560,7 @@ void main() {
 
                             if (xi < clearcoatProb) {
                                 // Clearcoat specular lobe: GGX microfacet sampling with clearcoatNormal
+                                sampledSpecularLobe = true;
                                 vec3 Hc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
                                 vec3 L = reflect(-V, Hc);
                                 float NcDotL = dot(clearcoatNormal, L);
@@ -552,6 +578,7 @@ void main() {
                                     nextDirection = L;
                                 } else {
                                     // Fallback to diffuse
+                                    sampledSpecularLobe = false;
                                     nextDirection = sampleCosineHemisphere(hitNormal, seed);
                                     vec3 H_diff = normalize(V + nextDirection);
                                     vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
@@ -559,6 +586,7 @@ void main() {
                                 }
                             } else if (xi < clearcoatProb + baseSpecProb) {
                                 // Base Specular lobe: GGX microfacet sampling
+                                sampledSpecularLobe = true;
                                 vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
                                 vec3 L = reflect(-V, H);
                                 float NdotL = dot(hitNormal, L);
@@ -577,6 +605,7 @@ void main() {
                                     nextDirection = L;
                                 } else {
                                     // Fallback to diffuse
+                                    sampledSpecularLobe = false;
                                     nextDirection = sampleCosineHemisphere(hitNormal, seed);
                                     vec3 H_diff = normalize(V + nextDirection);
                                     vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
@@ -585,6 +614,7 @@ void main() {
                                 }
                             } else {
                                 // Diffuse lobe: Cosine-weighted hemisphere sampling
+                                sampledSpecularLobe = false;
                                 nextDirection = sampleCosineHemisphere(hitNormal, seed);
                                 vec3 H_diff = normalize(V + nextDirection);
                                 vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
@@ -618,7 +648,8 @@ void main() {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                         nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                        uint nextPackedPixel = pixelIndex | ((isSpecularPath || sampledSpecularLobe) ? SPECULAR_FLAG_BIT : 0u);
+                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPackedPixel));
                     }
                 }
 
@@ -627,6 +658,15 @@ void main() {
                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                     vec4 prev = imageLoad(uAccumImage, pixelCoord);
                     imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+                    if (pc.captureMlData != 0u) {
+                        if (isSpecularPath) {
+                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                        } else {
+                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                        }
+                    }
                 }
             }
         }

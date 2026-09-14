@@ -146,9 +146,12 @@ void Config::printUsage(const char* progName) {
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --temporal-accum, --tra Enable motion-vector guided temporal accumulation [default: disabled]\n"
+              << "  --no-temporal-accum, --no-tra  Disable motion-vector guided temporal accumulation [default: enabled]\n"
               << "  --bmfr                  Enable experimental Blockwise Multi-Order Feature Regression [default: disabled]\n"
-              << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'temporal' (Temporal Accumulation), or 'bmfr'\n"
+              << "  --denoiser <mode>       Denoising mode: 'temporal' (Temporal Accumulation [default]), 'none' (Pure MC), 'bmfr', 'upways' (Wave32 WMMA), or 'upways_sr' (2x Super-Resolution)\n"
+              << "  --upways                Enable Upways Neural Denoising with Wave32 WMMA\n"
+              << "  --upways-sr             Enable Upways Continuous Super-Resolution (2.0x upscaling)\n"
+              << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin)\n"
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
@@ -180,6 +183,7 @@ void Config::printUsage(const char* progName) {
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
+              << "  --gamepad-deadzone <float> Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)\n"
               << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
               << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
               << "  --camera-target <x,y,z> Set camera target look-at point (or --cam-target)\n"
@@ -330,7 +334,17 @@ Config Config::parse(int argc, char* argv[]) {
             ++i;
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
-            if (mode == "bmfr") {
+            if (mode == "upways") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
+                cfg.upways_superres = false;
+                cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
+                cfg.upways_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "bmfr") {
                 cfg.enable_bmfr = true;
                 cfg.enable_temporal_accum = true;
                 cfg.denoiser_mode = DenoiserMode::BMFR;
@@ -345,7 +359,17 @@ Config Config::parse(int argc, char* argv[]) {
             }
         } else if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
-            if (mode == "bmfr") {
+            if (mode == "upways") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
+                cfg.upways_superres = false;
+                cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.enable_bmfr = false;
+                cfg.enable_temporal_accum = false;
+                cfg.upways_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "bmfr") {
                 cfg.enable_bmfr = true;
                 cfg.enable_temporal_accum = true;
                 cfg.denoiser_mode = DenoiserMode::BMFR;
@@ -358,17 +382,31 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.enable_temporal_accum = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
+        } else if (arg == "--upways") {
+            cfg.enable_bmfr = false;
+            cfg.enable_temporal_accum = false;
+            cfg.upways_superres = false;
+            cfg.denoiser_mode = DenoiserMode::Upways;
+        } else if (arg == "--upways-sr" || arg == "--upways-superres") {
+            cfg.enable_bmfr = false;
+            cfg.enable_temporal_accum = false;
+            cfg.upways_superres = true;
+            cfg.denoiser_mode = DenoiserMode::Upways;
+        } else if (arg == "--upways-weights" && i + 1 < argc) {
+            cfg.upways_weights_path = argv[++i];
+        } else if (arg.starts_with("--upways-weights=")) {
+            cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
         } else if (arg == "--bmfr") {
             cfg.enable_bmfr = true;
             cfg.enable_temporal_accum = true;
             cfg.denoiser_mode = DenoiserMode::BMFR;
-        } else if (arg == "--temporal-accum" || arg == "--tra") {
-            cfg.enable_temporal_accum = true;
-            if (cfg.denoiser_mode == DenoiserMode::None) {
-                cfg.denoiser_mode = DenoiserMode::Temporal;
+        } else if (arg == "--no-temporal-accum" || arg == "--no-tra") {
+            cfg.enable_temporal_accum = false;
+            if (cfg.denoiser_mode == DenoiserMode::Temporal) {
+                cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
-            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --temporal-accum or --bmfr.");
+            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr or --no-temporal-accum to configure denoising.");
         } else if (arg == "--light-tree") {
             cfg.enable_light_tree = true;
         } else if (arg == "--nrc") {
@@ -441,6 +479,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.double_buffered_shared_mem = false;
         } else if (arg == "--camera-motion") {
             cfg.camera_motion = true;
+        } else if (arg == "--gamepad-deadzone" && i + 1 < argc) {
+            cfg.gamepad_deadzone = std::clamp(std::stof(argv[++i]), 0.01f, 0.50f);
+        } else if (arg.starts_with("--gamepad-deadzone=")) {
+            cfg.gamepad_deadzone = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.01f, 0.50f);
         } else if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {
             std::string combinedStr = argv[++i];
             auto nums = parseNumbers(combinedStr);

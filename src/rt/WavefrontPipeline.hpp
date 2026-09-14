@@ -38,6 +38,7 @@ struct WavefrontSceneData {
     uint32_t tileOffsetY = 0;             // Multi-GPU Checkerboard tile size (16, 32, 64, 128; defaults to 64 if 0)
     uint32_t fullWidth = 0;               // Full unclipped frame resolution width
     uint32_t fullHeight = 0;              // Full unclipped frame resolution height
+    uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
 };
 
 class WavefrontPipeline {
@@ -84,7 +85,13 @@ public:
                                 VkImageView motionVectorImageView = VK_NULL_HANDLE,
                                 VkImageView normalDepthImageView = VK_NULL_HANDLE,
                                 VkBuffer lightTreeBuffer = VK_NULL_HANDLE,
-                                VkDeviceSize lightTreeSize = 0);
+                                VkDeviceSize lightTreeSize = 0,
+                                VkImageView mlAlbedoRoughnessImageView = VK_NULL_HANDLE,
+                                VkImageView mlSpecularMotionImageView = VK_NULL_HANDLE,
+                                VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
+                                VkImageView mlSpecularImageView = VK_NULL_HANDLE,
+                                VkBuffer instanceBuffer = VK_NULL_HANDLE,
+                                VkDeviceSize instanceSize = 0);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
     void setTileSize(uint32_t tileSize);

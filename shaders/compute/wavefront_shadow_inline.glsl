@@ -18,10 +18,12 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                               0xFF, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         while (rayQueryProceedEXT(rq)) {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
                 uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
                 uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
-                uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + numOpaqueTriangles);
-                uint matId = triangles[triIdx].materialId;
+                InstanceGPU inst = instances[instIdx];
+                uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+                uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 Material mat = materials[matId];
                 if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
                     continue;
@@ -47,10 +49,12 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
             }
         }
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + numOpaqueTriangles);
-            Material m = materials[triangles[triIdx].materialId];
+            InstanceGPU inst = instances[instIdx];
+            uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+            Material m = materials[triangles[triIdx].materialId + inst.materialOffset];
             if (m.type != 3u && m.type != 2u && m.transmission <= 0.05) {
                 occluded = true;
             }

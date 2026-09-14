@@ -60,11 +60,9 @@ void main() {
         return;
     }
 
-    float invTotal = (pc.totalSamples > 1u) ? (1.0 / float(pc.totalSamples)) : 1.0;
-
     // 1. Fetch current frame radiance
     vec4 currData = imageLoad(uCurrentRadiance, pixelCoord);
-    vec3 C_curr = currData.rgb * invTotal;
+    vec3 C_curr = (pc.totalSamples > 1u) ? (currData.rgb / float(pc.totalSamples)) : currData.rgb;
     if (isInvalid(C_curr)) {
         C_curr = vec3(0.0);
     }

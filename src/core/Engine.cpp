@@ -3,11 +3,13 @@
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
+#include "scene/UsdLoader.hpp"
 #include "scene/LightTree.hpp"
 #include <glm/detail/type_half.hpp>
 
 #include <fstream>
 #include <filesystem>
+#include <format>
 #include <numeric>
 #include <algorithm>
 #include <thread>
@@ -173,6 +175,9 @@ Engine::Engine(const Config& config) : m_config(config) {
     if (physicalDevices.size() >= 2) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
+    // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
+    m_sceneData.triangles.clear();
+    m_sceneData.triangles.shrink_to_fit();
     initPipelines();
     initSyncObjects();
     initQueryPool();
@@ -259,7 +264,13 @@ Engine::~Engine() {
     destroyTemporalAccumPipelines();
     destroyBmfrResources();
     destroyBmfrPipelines();
+    destroyUpwaysResources();
+    destroyUpwaysPipelines();
     m_motionVectorImage.reset();
+    m_mlAlbedoRoughnessImage.reset();
+    m_mlSpecularMotionImage.reset();
+    m_mlDiffuseImage.reset();
+    m_mlSpecularImage.reset();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
 
@@ -278,6 +289,8 @@ Engine::~Engine() {
     m_tlasInstanceBuffer.reset();
     m_tlasInputInstancesBuffer.reset();
     m_tlasScratchBuffer.reset();
+    m_instanceBuffer.reset();
+    m_blases.clear();
 
     if (m_descriptorPool) vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     m_secTransferBuffer.reset();
@@ -417,8 +430,31 @@ void Engine::initVulkan() {
     m_motionVectorImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
+
+    if (!m_config.capture_training_data_dir.empty() || m_config.denoiser_mode == DenoiserMode::Upways) {
+        m_mlAlbedoRoughnessImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlSpecularMotionImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlDiffuseImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlSpecularImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
 
     // Transition layouts to GENERAL
     VkCommandBufferBeginInfo beginInfo{};
@@ -445,6 +481,29 @@ void Engine::initVulkan() {
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    if (m_mlAlbedoRoughnessImage) {
+        m_mlAlbedoRoughnessImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlSpecularMotionImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlDiffuseImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlSpecularImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
+
     vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -455,6 +514,308 @@ void Engine::initVulkan() {
     submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
     vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
+}
+
+void Engine::uploadToDeviceBuffer(Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize) {
+    if (dataSize == 0 || !srcData) return;
+    VkDevice device = m_context->getDevice();
+    VkQueue queue = m_context->getGraphicsQueue();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    const VkDeviceSize maxChunkSize = 64 * 1024 * 1024; // 64 MB bounded staging buffer
+    VkDeviceSize stagingSize = std::min(dataSize, maxChunkSize);
+
+    Buffer stagingBuffer(
+        allocator, stagingSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+
+    VkDeviceSize offset = 0;
+    while (offset < dataSize) {
+        VkDeviceSize currentChunk = std::min(maxChunkSize, dataSize - offset);
+        std::memcpy(stagingBuffer.map(), static_cast<const uint8_t*>(srcData) + offset, currentChunk);
+        stagingBuffer.flush(0, currentChunk);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = offset;
+        copyRegion.size = currentChunk;
+        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), dstBuffer.getBuffer(), 1, &copyRegion);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        offset += currentChunk;
+    }
+
+    vkFreeCommandBuffers(device, m_commandPool, 1, &cmd);
+}
+
+void Engine::uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount) {
+    if (triangleCount == 0) {
+        uint32_t dummy[3] = { 0, 3, 6 };
+        uploadToDeviceBuffer(dstBuffer, dummy, sizeof(dummy));
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+    VkQueue queue = m_context->getGraphicsQueue();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    const uint32_t chunkTriangles = 1048576; // 1M triangles = 12 MB chunk
+    VkDeviceSize stagingSize = std::min(static_cast<VkDeviceSize>(triangleCount), static_cast<VkDeviceSize>(chunkTriangles)) * 3 * sizeof(uint32_t);
+
+    Buffer stagingBuffer(
+        allocator, stagingSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+
+    uint32_t* mappedStaging = static_cast<uint32_t*>(stagingBuffer.map());
+
+    uint32_t triOffset = 0;
+    while (triOffset < triangleCount) {
+        uint32_t currentChunkTriangles = std::min(chunkTriangles, triangleCount - triOffset);
+        for (uint32_t i = 0; i < currentChunkTriangles; ++i) {
+            uint32_t k = triOffset + i;
+            mappedStaging[i * 3 + 0] = 10 * k + 0;
+            mappedStaging[i * 3 + 1] = 10 * k + 3;
+            mappedStaging[i * 3 + 2] = 10 * k + 6;
+        }
+        VkDeviceSize currentBytes = currentChunkTriangles * 3 * sizeof(uint32_t);
+        stagingBuffer.flush(0, currentBytes);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = static_cast<VkDeviceSize>(triOffset) * 3 * sizeof(uint32_t);
+        copyRegion.size = currentBytes;
+        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), dstBuffer.getBuffer(), 1, &copyRegion);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        triOffset += currentChunkTriangles;
+    }
+
+    vkFreeCommandBuffers(device, m_commandPool, 1, &cmd);
+}
+
+void Engine::createAccelerationStructures() {
+    if (!m_context->hasRayTracing()) return;
+
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    m_tlas.reset();
+    m_blas.reset();
+    m_blases.clear();
+    m_asIndexBuffer.reset();
+    m_instanceBuffer.reset();
+    m_asManager.reset();
+
+    uint32_t numTriangles = static_cast<uint32_t>(m_numTriangles);
+    VkDeviceSize indexBufferSize = std::max(static_cast<VkDeviceSize>(sizeof(uint32_t) * 3 * numTriangles), static_cast<VkDeviceSize>(sizeof(uint32_t) * 3));
+    m_asIndexBuffer = std::make_unique<Buffer>(
+        allocator, indexBufferSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    uploadIndexBuffer(*m_asIndexBuffer, numTriangles);
+
+    m_asManager = std::make_unique<AccelerationStructureManager>(
+        device, allocator,
+        m_context->getGraphicsQueue(), m_context->getGraphicsQueueFamily()
+    );
+
+    // 1. Instance Buffer (std430, binding 30)
+    std::vector<InstanceGPU> instanceUpload;
+    if (!m_sceneData.instanceData.empty()) {
+        instanceUpload = m_sceneData.instanceData;
+    } else {
+        InstanceGPU defaultInst{};
+        defaultInst.firstTriangle = 0;
+        defaultInst.numOpaqueTriangles = m_numOpaqueTriangles;
+        defaultInst.materialOffset = 0;
+        defaultInst.flags = 0;
+        instanceUpload.push_back(defaultInst);
+    }
+
+    VkDeviceSize instanceBufferSize = sizeof(InstanceGPU) * instanceUpload.size();
+    m_instanceBuffer = std::make_unique<Buffer>(
+        allocator, instanceBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    uploadToDeviceBuffer(*m_instanceBuffer, instanceUpload.data(), instanceBufferSize);
+
+    // 2. Acceleration Structures
+    VkDeviceAddress vertexBaseAddr = m_triangleBuffer->getDeviceAddress(device);
+    VkDeviceAddress indexBaseAddr = m_asIndexBuffer->getDeviceAddress(device);
+
+    if (!m_sceneData.blasRanges.empty()) {
+        // Multi-BLAS path
+        m_asManager->resetStats();
+        for (const auto& range : m_sceneData.blasRanges) {
+            std::vector<ASGeometryInput> geoms;
+            if (range.numOpaqueTriangles > 0) {
+                ASGeometryInput geomOpaque{};
+                geomOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * 3 * sizeof(uint32_t);
+                geomOpaque.vertexCount = 10 * (range.firstTriangle + range.numOpaqueTriangles);
+                geomOpaque.triangleCount = range.numOpaqueTriangles;
+                geomOpaque.vertexStride = 16;
+                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.isOpaque = true;
+                geoms.push_back(geomOpaque);
+            }
+            uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
+            if (numNonOpaque > 0) {
+                ASGeometryInput geomNonOpaque{};
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * 3 * sizeof(uint32_t);
+                geomNonOpaque.vertexCount = 10 * (range.firstTriangle + range.triangleCount);
+                geomNonOpaque.triangleCount = numNonOpaque;
+                geomNonOpaque.vertexStride = 16;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.isOpaque = false;
+                geoms.push_back(geomNonOpaque);
+            }
+            if (geoms.empty()) {
+                ASGeometryInput dummyGeom{};
+                dummyGeom.vertexBufferAddress = vertexBaseAddr;
+                dummyGeom.indexBufferAddress = indexBaseAddr;
+                dummyGeom.vertexCount = 10;
+                dummyGeom.triangleCount = 1;
+                dummyGeom.vertexStride = 16;
+                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.isOpaque = true;
+                geoms.push_back(dummyGeom);
+            }
+            m_blases.push_back(m_asManager->buildBLAS(geoms));
+        }
+
+        std::vector<ASInstanceInput> asInstances;
+        asInstances.reserve(m_sceneData.instances.size());
+        for (const auto& inst : m_sceneData.instances) {
+            ASInstanceInput asInst{};
+            uint32_t bIdx = std::min(inst.blasIndex, static_cast<uint32_t>(m_blases.size() - 1));
+            asInst.blasAddress = m_blases[bIdx]->getDeviceAddress();
+            asInst.transform = inst.transform;
+            asInst.customIndex = inst.customIndex;
+            asInst.mask = 0xFF;
+            asInst.hitGroupId = 0;
+            asInst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(asInst);
+        }
+        m_tlas = m_asManager->buildTLAS(asInstances);
+        if (!m_tlas) {
+            throw std::runtime_error("Hardware Ray Tracing Multi-BLAS TLAS build failed.");
+        }
+        initTlasBuffers(static_cast<uint32_t>(asInstances.size()));
+        Logger::info("Hardware Ray Tracing Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
+                     m_blases.size(), asInstances.size());
+    } else {
+        // Monolithic single-BLAS path
+        std::vector<ASGeometryInput> geoms;
+        if (m_numOpaqueTriangles > 0) {
+            ASGeometryInput geomOpaque{};
+            geomOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomOpaque.indexBufferAddress = indexBaseAddr;
+            geomOpaque.vertexCount = 10 * m_numOpaqueTriangles;
+            geomOpaque.triangleCount = m_numOpaqueTriangles;
+            geomOpaque.vertexStride = 16;
+            geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomOpaque.isOpaque = true;
+            geoms.push_back(geomOpaque);
+        }
+
+        uint32_t numNonOpaque = numTriangles - m_numOpaqueTriangles;
+        if (numNonOpaque > 0) {
+            ASGeometryInput geomNonOpaque{};
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(m_numOpaqueTriangles) * 3 * sizeof(uint32_t);
+            geomNonOpaque.vertexCount = 10 * numTriangles;
+            geomNonOpaque.triangleCount = numNonOpaque;
+            geomNonOpaque.vertexStride = 16;
+            geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomNonOpaque.isOpaque = false;
+            geoms.push_back(geomNonOpaque);
+        }
+
+        if (geoms.empty()) {
+            ASGeometryInput dummyGeom{};
+            dummyGeom.vertexBufferAddress = vertexBaseAddr;
+            dummyGeom.indexBufferAddress = indexBaseAddr;
+            dummyGeom.vertexCount = 10;
+            dummyGeom.triangleCount = 1;
+            dummyGeom.vertexStride = 16;
+            dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+            dummyGeom.isOpaque = true;
+            geoms.push_back(dummyGeom);
+        }
+
+        m_blas = m_asManager->buildBLAS(geoms);
+
+        ASInstanceInput inst{};
+        inst.blasAddress = m_blas->getDeviceAddress();
+        inst.transform = glm::mat4(1.0f);
+        inst.customIndex = 0;
+        inst.mask = 0xFF;
+        inst.hitGroupId = 0;
+        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+        m_tlas = m_asManager->buildTLAS({ inst });
+        if (!m_tlas) {
+            throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
+        }
+        initTlasBuffers(1);
+        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (Monolithic BLAS & TLAS).");
+    }
+    Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
 }
 
 void Engine::initScene() {
@@ -524,11 +885,47 @@ void Engine::initScene() {
                     if (std::filesystem::exists(subCandidate)) {
                         resolvedScene = subCandidate.string();
                     }
+                } else {
+                    // Try looking under scenesDir/<stem>/<filename>
+                    std::string stem = std::filesystem::path(resolvedScene).stem().string();
+                    auto nested = scenesDir / stem / resolvedScene;
+                    if (std::filesystem::exists(nested)) {
+                        resolvedScene = nested.string();
+                    }
+                }
+            }
+
+            // If resolvedScene is a directory, find the primary scene file within it
+            if (std::filesystem::exists(resolvedScene) && std::filesystem::is_directory(resolvedScene)) {
+                std::filesystem::path dirPath(resolvedScene);
+                std::string dirName = dirPath.filename().string();
+                std::string underscoreDir = dirName;
+                std::replace(underscoreDir.begin(), underscoreDir.end(), '-', '_');
+
+                std::vector<std::filesystem::path> candidates = {
+                    dirPath / (dirName + ".usd"),
+                    dirPath / (underscoreDir + ".usd"),
+                    dirPath / (dirName + "_extended.glb"),
+                    dirPath / (underscoreDir + "_extended.glb"),
+                    dirPath / (dirName + ".glb"),
+                    dirPath / (underscoreDir + ".glb"),
+                    dirPath / (dirName + ".usda"),
+                    dirPath / (dirName + ".usdc")
+                };
+                for (const auto& c : candidates) {
+                    if (std::filesystem::exists(c)) {
+                        resolvedScene = c.string();
+                        break;
+                    }
                 }
             }
 
             Logger::info("Loading user specified scene: {}", resolvedScene);
-            m_sceneData = GltfLoader::loadSceneData(resolvedScene);
+            if (UsdLoader::isUsdFile(resolvedScene)) {
+                m_sceneData = UsdLoader::loadSceneData(resolvedScene);
+            } else {
+                m_sceneData = GltfLoader::loadSceneData(resolvedScene);
+            }
             m_currentSceneIndex = -1;
             for (size_t i = 0; i < m_availableScenes.size(); ++i) {
                 std::error_code ec;
@@ -604,16 +1001,17 @@ void Engine::initScene() {
         }
     }
 
-    // Triangle buffer
+    // Triangle buffer (pure DEVICE_LOCAL VRAM with AS read-only bit & bounded staging upload)
     VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * m_sceneData.triangles.size(), sizeof(TriangleGPU));
     m_triangleBuffer = std::make_unique<Buffer>(
         allocator, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (!m_sceneData.triangles.empty()) {
-        m_triangleBuffer->copyFrom(m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
+        uploadToDeviceBuffer(*m_triangleBuffer, m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
     }
 
     // Sphere buffer
@@ -678,92 +1076,8 @@ void Engine::initScene() {
     }
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
-    if (m_context->hasRayTracing()) {
-        std::vector<Vertex> asVertices;
-        if (!m_sceneData.triangles.empty()) {
-            asVertices.reserve(m_sceneData.triangles.size() * 3);
-            for (const auto& tri : m_sceneData.triangles) {
-                asVertices.push_back(tri.v0);
-                asVertices.push_back(tri.v1);
-                asVertices.push_back(tri.v2);
-            }
-        } else {
-            Vertex v{};
-            asVertices.assign(3, v);
-        }
+    createAccelerationStructures();
 
-        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
-        m_asVertexBuffer = std::make_unique<Buffer>(
-            allocator, vertexBufferSize,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-        );
-        m_asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
-
-        m_asManager = std::make_unique<AccelerationStructureManager>(
-            m_context->getDevice(), allocator,
-            m_context->getGraphicsQueue(), m_context->getGraphicsQueueFamily()
-        );
-
-        std::vector<ASGeometryInput> geoms;
-        VkDeviceAddress vertexBaseAddr = m_asVertexBuffer->getDeviceAddress(m_context->getDevice());
-
-        if (m_numOpaqueTriangles > 0) {
-            ASGeometryInput geomOpaque{};
-            geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = 0;
-            geomOpaque.vertexCount = m_numOpaqueTriangles * 3;
-            geomOpaque.triangleCount = m_numOpaqueTriangles;
-            geomOpaque.vertexStride = sizeof(Vertex);
-            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
-
-        uint32_t numNonOpaque = static_cast<uint32_t>(m_sceneData.triangles.size()) - m_numOpaqueTriangles;
-        if (numNonOpaque > 0) {
-            ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(m_numOpaqueTriangles * 3) * sizeof(Vertex);
-            geomNonOpaque.indexBufferAddress = 0;
-            geomNonOpaque.vertexCount = numNonOpaque * 3;
-            geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = sizeof(Vertex);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
-        }
-
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = 0;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(Vertex);
-            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-
-        m_blas = m_asManager->buildBLAS(geoms);
-
-        ASInstanceInput inst{};
-        inst.blasAddress = m_blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-
-        m_tlas = m_asManager->buildTLAS({ inst });
-        if (!m_tlas) {
-            throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
-        }
-        initTlasBuffers(1);
-        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (BLAS & TLAS).");
-        Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
-    }
 
     // Textures & HDRI Environment Map Initialization
     VkDevice device = m_context->getDevice();
@@ -824,7 +1138,11 @@ void Engine::requestSceneChange(const std::string& filepath) {
             return ProceduralScene::createManyLightsScene();
         } else {
             Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
-            return GltfLoader::loadSceneData(filepath);
+            if (UsdLoader::isUsdFile(filepath)) {
+                return UsdLoader::loadSceneData(filepath);
+            } else {
+                return GltfLoader::loadSceneData(filepath);
+            }
         }
     });
 }
@@ -858,12 +1176,13 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * m_sceneData.triangles.size(), sizeof(TriangleGPU));
     m_triangleBuffer = std::make_unique<Buffer>(
         allocator, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (!m_sceneData.triangles.empty()) {
-        m_triangleBuffer->copyFrom(m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
+        uploadToDeviceBuffer(*m_triangleBuffer, m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
     }
 
     VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * m_sceneData.spheres.size(), sizeof(SphereGPU));
@@ -914,95 +1233,8 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     }
 
     // Rebuild Acceleration Structures (BLAS & TLAS)
-    if (m_context->hasRayTracing()) {
-        m_tlas.reset();
-        m_blas.reset();
-        m_asVertexBuffer.reset();
-        m_asManager.reset();
+    createAccelerationStructures();
 
-        std::vector<Vertex> asVertices;
-        if (!m_sceneData.triangles.empty()) {
-            asVertices.reserve(m_sceneData.triangles.size() * 3);
-            for (const auto& tri : m_sceneData.triangles) {
-                asVertices.push_back(tri.v0);
-                asVertices.push_back(tri.v1);
-                asVertices.push_back(tri.v2);
-            }
-        } else {
-            Vertex v{};
-            asVertices.assign(3, v);
-        }
-
-        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
-        m_asVertexBuffer = std::make_unique<Buffer>(
-            allocator, vertexBufferSize,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-        );
-        m_asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
-
-        m_asManager = std::make_unique<AccelerationStructureManager>(
-            device, allocator,
-            m_context->getGraphicsQueue(), m_context->getGraphicsQueueFamily()
-        );
-
-        std::vector<ASGeometryInput> geoms;
-        VkDeviceAddress vertexBaseAddr = m_asVertexBuffer->getDeviceAddress(device);
-
-        if (m_numOpaqueTriangles > 0) {
-            ASGeometryInput geomOpaque{};
-            geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = 0;
-            geomOpaque.vertexCount = m_numOpaqueTriangles * 3;
-            geomOpaque.triangleCount = m_numOpaqueTriangles;
-            geomOpaque.vertexStride = sizeof(Vertex);
-            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
-
-        uint32_t numNonOpaque = static_cast<uint32_t>(m_sceneData.triangles.size()) - m_numOpaqueTriangles;
-        if (numNonOpaque > 0) {
-            ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(m_numOpaqueTriangles * 3) * sizeof(Vertex);
-            geomNonOpaque.indexBufferAddress = 0;
-            geomNonOpaque.vertexCount = numNonOpaque * 3;
-            geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = sizeof(Vertex);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
-        }
-
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = 0;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(Vertex);
-            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-
-        m_blas = m_asManager->buildBLAS(geoms);
-
-        ASInstanceInput inst{};
-        inst.blasAddress = m_blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-
-        m_tlas = m_asManager->buildTLAS({ inst });
-        if (!m_tlas) {
-            throw std::runtime_error("Hardware Ray Tracing TLAS rebuild failed.");
-        }
-        initTlasBuffers(1);
-    }
 
     // Reload scene textures
     VkQueue queue = m_context->getGraphicsQueue();
@@ -1095,6 +1327,10 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_resetAccumulation = true;
     m_frameTimesMs.clear();
 
+    // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
+    m_sceneData.triangles.clear();
+    m_sceneData.triangles.shrink_to_fit();
+
     Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
     return true;
 }
@@ -1108,8 +1344,13 @@ bool Engine::loadScene(const std::string& filepath) {
         Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
         newScene = ProceduralScene::createManyLightsScene();
     } else {
-        Logger::info("Loading glTF scene '{}'...", filepath);
-        newScene = GltfLoader::loadSceneData(filepath);
+        if (UsdLoader::isUsdFile(filepath)) {
+            Logger::info("Loading OpenUSD scene '{}'...", filepath);
+            newScene = UsdLoader::loadSceneData(filepath);
+        } else {
+            Logger::info("Loading glTF scene '{}'...", filepath);
+            newScene = GltfLoader::loadSceneData(filepath);
+        }
     }
     return applyLoadedScene(std::move(newScene), filepath);
 }
@@ -1139,9 +1380,31 @@ void Engine::partitionSceneGeometry() {
         return (mat.alphaMode == ALPHA_MODE_OPAQUE && mat.transmission <= 0.05f && mat.type != MATERIAL_DIELECTRIC);
     };
 
-    auto it = std::stable_partition(m_sceneData.triangles.begin(), m_sceneData.triangles.end(), isOpaqueTriangle);
-    m_numOpaqueTriangles = static_cast<uint32_t>(std::distance(m_sceneData.triangles.begin(), it));
-    m_sceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+    if (!m_sceneData.blasRanges.empty()) {
+        uint32_t totalOpaque = 0;
+        for (auto& range : m_sceneData.blasRanges) {
+            if (range.firstTriangle + range.triangleCount <= m_sceneData.triangles.size()) {
+                auto rangeBegin = m_sceneData.triangles.begin() + range.firstTriangle;
+                auto rangeEnd = rangeBegin + range.triangleCount;
+                auto it = std::stable_partition(rangeBegin, rangeEnd, isOpaqueTriangle);
+                range.numOpaqueTriangles = static_cast<uint32_t>(std::distance(rangeBegin, it));
+                totalOpaque += range.numOpaqueTriangles;
+            }
+        }
+        for (size_t i = 0; i < m_sceneData.instances.size(); ++i) {
+            uint32_t bIdx = m_sceneData.instances[i].blasIndex;
+            if (bIdx < m_sceneData.blasRanges.size() && i < m_sceneData.instanceData.size()) {
+                m_sceneData.instanceData[i].firstTriangle = m_sceneData.blasRanges[bIdx].firstTriangle;
+                m_sceneData.instanceData[i].numOpaqueTriangles = m_sceneData.blasRanges[bIdx].numOpaqueTriangles;
+            }
+        }
+        m_numOpaqueTriangles = totalOpaque;
+        m_sceneData.numOpaqueTriangles = totalOpaque;
+    } else {
+        auto it = std::stable_partition(m_sceneData.triangles.begin(), m_sceneData.triangles.end(), isOpaqueTriangle);
+        m_numOpaqueTriangles = static_cast<uint32_t>(std::distance(m_sceneData.triangles.begin(), it));
+        m_sceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+    }
 
     Logger::info("Geometry Partitioning: {} Opaque triangles, {} Non-Opaque triangles (Total: {})",
                  m_numOpaqueTriangles, m_sceneData.triangles.size() - m_numOpaqueTriangles, m_sceneData.triangles.size());
@@ -1359,7 +1622,7 @@ void Engine::initPipelines() {
         wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
         m_context->hasDgcExecutionSet(),
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-        m_config.dgc_preprocess
+        true // enableDgcPreprocess
     );
     Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
 
@@ -1479,6 +1742,10 @@ void Engine::initPipelines() {
     createBmfrPipelines();
     createBmfrResources();
 
+    // 10b. Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
+    createUpwaysPipelines();
+    createUpwaysResources();
+
     // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
     initTlasUpdatePipeline();
 
@@ -1577,6 +1844,7 @@ void Engine::updateAllImageDescriptors() {
     updateWavefrontSceneDescriptors();
     updateTemporalAccumDescriptors();
     updateBmfrDescriptors();
+    updateUpwaysDescriptors();
 }
 
 void Engine::createShadowDenoiserPipelines() {
@@ -1697,7 +1965,7 @@ void Engine::createShadowDenoiserResources() {
 
     m_normalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     m_prevNormalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -2152,10 +2420,10 @@ void Engine::createBmfrPipelines() {
 
     // 2. Descriptor Pool (2 temporal sets + 1 raw set + 1 tonemap set)
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 4;
+    poolInfo.maxSets = 8;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_bmfrDescPool) != VK_SUCCESS) {
@@ -2392,6 +2660,116 @@ bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
     return true;
 }
 
+void Engine::createUpwaysPipelines() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    try {
+        auto upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
+        VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
+            device,
+            m_context->getPhysicalDevice(),
+            allocator,
+            m_config.width,
+            m_config.height,
+            upwaysCode,
+            m_config.upways_weights_path,
+            m_config.upways_superres,
+            format
+        );
+        Logger::info("Upways Neural Reconstruction Pipeline initialized successfully.");
+    } catch (const std::exception& e) {
+        Logger::warn("UpwaysPipeline initialization failed: {}", e.what());
+    }
+}
+
+void Engine::destroyUpwaysPipelines() {
+    m_upwaysPipeline.reset();
+}
+
+void Engine::createUpwaysResources() {
+    VkDevice device = m_context->getDevice();
+
+    if (m_bmfrDescPool && m_tonemapDescLayout) {
+        VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        tmAllocInfo.descriptorPool = m_bmfrDescPool;
+        tmAllocInfo.descriptorSetCount = 1;
+        tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
+        if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapUpwaysDescSet) != VK_SUCCESS) {
+            Logger::warn("Failed to allocate Tonemap Upways descriptor set");
+            m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+        }
+    }
+
+    if (m_upwaysPipeline) {
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+        m_upwaysPipeline->transitionInitialLayouts(m_commandBuffers[0]);
+
+        vkEndCommandBuffer(m_commandBuffers[0]);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(m_context->getGraphicsQueue());
+    }
+
+    updateUpwaysDescriptors();
+}
+
+void Engine::destroyUpwaysResources() {
+    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+}
+
+void Engine::updateUpwaysDescriptors() {
+    if (!m_upwaysPipeline || !m_accumImage || !m_outputImage) {
+        return;
+    }
+
+    VkImageView normDepthView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView motionView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView albedoView = m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+
+    m_upwaysPipeline->updateDescriptors(
+        m_accumImage->getImageView(),
+        normDepthView,
+        motionView,
+        albedoView,
+        specMotionView,
+        diffView,
+        specView
+    );
+
+    if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage()) {
+        VkDevice device = m_context->getDevice();
+        VkDescriptorImageInfo inInfo{ VK_NULL_HANDLE, m_upwaysPipeline->getOutputImage()->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+        std::vector<VkWriteDescriptorSet> writes;
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapUpwaysDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapUpwaysDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr });
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
+    if (m_config.denoiser_mode != DenoiserMode::Upways || !m_upwaysPipeline) {
+        return false;
+    }
+    m_upwaysPipeline->recordFrame(cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame);
+    return true;
+}
+
 void Engine::updateSceneDescriptors() {
     VkDevice device = m_context->getDevice();
 
@@ -2475,7 +2853,13 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE,
             m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE,
             m_lightTreeBuffer ? m_lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
-            m_lightTreeBuffer ? m_lightTreeBuffer->getSize() : 0
+            m_lightTreeBuffer ? m_lightTreeBuffer->getSize() : 0,
+            m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE,
+            m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE,
+            m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : VK_NULL_HANDLE,
+            m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE,
+            m_instanceBuffer ? m_instanceBuffer->getBuffer() : VK_NULL_HANDLE,
+            m_instanceBuffer ? m_instanceBuffer->getSize() : 0
         );
     }
 
@@ -2570,14 +2954,15 @@ void Engine::initTlasBuffers(uint32_t instanceCount) {
     }
 
     // 4. Initialize instance 0 with default transform and BLAS address
-    if (m_blas && m_tlasInputInstancesBuffer) {
+    VkDeviceAddress defaultBlasAddr = !m_blases.empty() ? m_blases[0]->getDeviceAddress() : (m_blas ? m_blas->getDeviceAddress() : 0);
+    if (defaultBlasAddr != 0 && m_tlasInputInstancesBuffer) {
         ASInstanceGPUData initData{};
         initData.transform = glm::mat4(1.0f);
         initData.customIndex = 0;
         initData.mask = 0xFF;
         initData.hitGroupId = 0;
         initData.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        initData.blasAddress = m_blas->getDeviceAddress();
+        initData.blasAddress = defaultBlasAddr;
         initData.pad0 = 0;
         initData.pad1 = 0;
         m_tlasInputInstancesBuffer->copyFrom(&initData, sizeof(ASInstanceGPUData));
@@ -2781,6 +3166,16 @@ void Engine::initQueryPool() {
 void Engine::setCameraMode(bool active) {
     if (m_cameraMode == active) return;
     m_cameraMode = active;
+    if (!m_cameraMode) {
+        m_gamepadLeftX = 0.0f;
+        m_gamepadLeftY = 0.0f;
+        m_gamepadRightX = 0.0f;
+        m_gamepadRightY = 0.0f;
+        m_gamepadLeftTrigger = 0.0f;
+        m_gamepadRightTrigger = 0.0f;
+        m_gamepadBtnA = false;
+        m_gamepadBtnB = false;
+    }
     if (m_window) {
         m_window->setRelativeMouseMode(m_cameraMode);
     }
@@ -2892,13 +3287,24 @@ bool Engine::handleEvent(const SDL_Event& e) {
             Logger::info("Gamepad disconnected.");
             SDL_CloseGamepad(m_gamepad);
             m_gamepad = nullptr;
+            m_gamepadLeftX = 0.0f;
+            m_gamepadLeftY = 0.0f;
+            m_gamepadRightX = 0.0f;
+            m_gamepadRightY = 0.0f;
+            m_gamepadLeftTrigger = 0.0f;
+            m_gamepadRightTrigger = 0.0f;
+            m_gamepadBtnA = false;
+            m_gamepadBtnB = false;
         }
         return true;
     }
     if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-        constexpr float DEADZONE = 0.15f;
-        float val = static_cast<float>(e.gaxis.value) / 32767.0f;
-        if (std::abs(val) < DEADZONE) val = 0.0f;
+        float deadzone = std::clamp(m_config.gamepad_deadzone, 0.01f, 0.50f);
+        float rawVal = static_cast<float>(e.gaxis.value) / 32767.0f;
+        float val = 0.0f;
+        if (std::abs(rawVal) >= deadzone) {
+            val = std::copysign((std::abs(rawVal) - deadzone) / (1.0f - deadzone), rawVal);
+        }
 
         if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) m_gamepadLeftX = val;
         else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) m_gamepadLeftY = -val;
@@ -2953,7 +3359,11 @@ void Engine::updateInput() {
     auto now = std::chrono::high_resolution_clock::now();
     float dt = std::chrono::duration<float>(now - m_lastFrameTime).count();
     m_lastFrameTime = now;
-    if (dt <= 0.0f || dt > 0.1f) dt = 0.016f;
+    if (dt <= 0.0f) {
+        dt = 0.016f;
+    } else if (dt > 0.1f) {
+        dt = 0.1f;
+    }
 
     if (!m_cameraMode || m_config.headless || !m_camera) {
         return;
@@ -3036,7 +3446,6 @@ void Engine::renderFrame() {
     VkQueue queue = m_context->getGraphicsQueue();
 
     vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
 
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -3234,16 +3643,18 @@ void Engine::renderFrame() {
         m_camera->processMouseMovement(2.0f, 0.0f);
     }
 
-    // Reset accumulation if camera moved or UI settings changed
-    m_cameraMovedLastFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
+    // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
+    bool cameraMovedThisFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
+    bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
-    bool accumReset = m_cameraMovedLastFrame || hardReset;
+    bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
     if (accumReset) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
         if (m_camera) m_camera->resetMoved();
         m_resetAccumulation = false;
     }
+    m_cameraMovedLastFrame = cameraMovedThisFrame;
 
     if (m_governor) {
         if (m_governor->getConfig().targetFps != m_config.target_fps) {
@@ -3302,7 +3713,7 @@ void Engine::renderFrame() {
     uint32_t imageIndex = 0;
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->acquireNextImage(m_imageAvailableSemaphores[m_currentFrame], &imageIndex);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR ||
+        if (res == VK_ERROR_OUT_OF_DATE_KHR ||
             m_config.width != m_swapchain->getExtent().width ||
             m_config.height != m_swapchain->getExtent().height) {
             int curW = 0, curH = 0;
@@ -3310,6 +3721,10 @@ void Engine::renderFrame() {
             uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
             uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
             onResize(targetW, targetH, /*forceRecreate=*/true);
+            return;
+        }
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+            Logger::error("vkAcquireNextImageKHR failed with error: {}", static_cast<int>(res));
             return;
         }
     }
@@ -3435,6 +3850,7 @@ void Engine::renderFrame() {
                 wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
                 wfSceneData.enableDistanceClamping = m_config.distance_clamping;
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
@@ -3576,20 +3992,29 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
-        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
+        bool upwaysRun = false;
+        if (m_config.denoiser_mode == DenoiserMode::Upways) {
+            upwaysRun = !accumReachedCutoff ? dispatchUpways(cmd, resetTemporal) : false;
+        }
+
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
         uint32_t temporalOutputSlot = 0;
-        if (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
+        if (!upwaysRun && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
             temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
         }
 
         // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = !accumReachedCutoff ? dispatchBmfr(cmd, temporalOutputSlot) : false;
+        bool bmfrRun = (!upwaysRun && !accumReachedCutoff) ? dispatchBmfr(cmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (bmfrRun) {
+        if (upwaysRun) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (bmfrRun) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else if (temporalOutputSlot > 0) {
@@ -3600,10 +4025,17 @@ void Engine::renderFrame() {
             tonemapConstants.totalSamples = m_accumulatedSamples;
         }
 
+        uint32_t tmGroupsX = groupsX;
+        uint32_t tmGroupsY = groupsY;
+        if (upwaysRun && m_upwaysPipeline && m_upwaysPipeline->isSuperResEnabled()) {
+            tmGroupsX = (m_upwaysPipeline->getOutputWidth() + 15) / 16;
+            tmGroupsY = (m_upwaysPipeline->getOutputHeight() + 15) / 16;
+        }
+
         tonemapConstants.visualizeSplit = 0;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        vkCmdDispatch(cmd, tmGroupsX, tmGroupsY, 1);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else {
         // --- Multi-GPU Path (Checkerboard Tiling or Sample Parallelism) ---
@@ -3802,6 +4234,7 @@ void Engine::renderFrame() {
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
                 wfSceneData.fullWidth = m_config.width;
                 wfSceneData.fullHeight = m_config.height;
+                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);
@@ -3975,17 +4408,29 @@ void Engine::renderFrame() {
         mergeDep.pMemoryBarriers = &mergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
-        uint32_t temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
+        bool upwaysRun = false;
+        if (m_config.denoiser_mode == DenoiserMode::Upways) {
+            upwaysRun = dispatchUpways(activeCmd, resetTemporal);
+        }
+
+        // Temporal Radiance Accumulation & wRLS Outlier Rejection
+        uint32_t temporalOutputSlot = 0;
+        if (!upwaysRun && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
+            temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
+        }
 
         // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = dispatchBmfr(activeCmd, temporalOutputSlot);
+        bool bmfrRun = !upwaysRun ? dispatchBmfr(activeCmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (bmfrRun) {
+        if (upwaysRun) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (bmfrRun) {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else if (temporalOutputSlot > 0) {
@@ -3994,6 +4439,13 @@ void Engine::renderFrame() {
         } else {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
             tonemapConstants.totalSamples = m_accumulatedSamples;
+        }
+
+        uint32_t mgpuTmGroupsX = groupsX;
+        uint32_t mgpuTmGroupsY = groupsY;
+        if (upwaysRun && m_upwaysPipeline && m_upwaysPipeline->isSuperResEnabled()) {
+            mgpuTmGroupsX = (m_upwaysPipeline->getOutputWidth() + 15) / 16;
+            mgpuTmGroupsY = (m_upwaysPipeline->getOutputHeight() + 15) / 16;
         }
 
         bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
@@ -4013,7 +4465,7 @@ void Engine::renderFrame() {
         tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
         vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(activeCmd, groupsX, groupsY, 1);
+        vkCmdDispatch(activeCmd, mgpuTmGroupsX, mgpuTmGroupsY, 1);
 
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     }
@@ -4275,6 +4727,7 @@ void Engine::renderFrame() {
     submitInfo.signalSemaphoreInfoCount = static_cast<uint32_t>(signalSemaphoreInfos.size());
     submitInfo.pSignalSemaphoreInfos = signalSemaphoreInfos.data();
 
+    vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
     vkQueueSubmit2(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
 
     if (!m_config.headless && m_swapchain) {
@@ -4880,7 +5333,7 @@ FrameStats Engine::getStats() const {
     stats.has_dho = true;
     stats.has_rt_pipeline = (m_rtpKhrPipeline != nullptr);
     stats.has_dgc = (m_rtpKhrPipeline && m_rtpKhrPipeline->isIndirectSupported());
-    stats.dgc_preprocess = m_config.dgc_preprocess;
+    stats.dgc_preprocess = true;
     stats.has_subgroup_control = m_context->hasSubgroupSizeControl();
     stats.subgroup_size = 32;
     stats.has_dynamic_rendering = true;
@@ -5065,7 +5518,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
 
-    // 2. Recreate render finish semaphores for new swapchain image count
+    // 2. Recreate sync objects (semaphores and fences) for new swapchain
     for (auto sem : m_renderFinishedSemaphores) {
         if (sem != VK_NULL_HANDLE) {
             vkDestroySemaphore(device, sem, nullptr);
@@ -5078,6 +5531,24 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_renderFinishedSemaphores.resize(numSwapImages);
     for (size_t i = 0; i < numSwapImages; ++i) {
         vkCreateSemaphore(device, &semInfo, nullptr, &m_renderFinishedSemaphores[i]);
+    }
+
+    for (auto& sem : m_imageAvailableSemaphores) {
+        if (sem != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, sem, nullptr);
+            sem = VK_NULL_HANDLE;
+        }
+        vkCreateSemaphore(device, &semInfo, nullptr, &sem);
+    }
+
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_inFlightFences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, m_inFlightFences[i], nullptr);
+            m_inFlightFences[i] = VK_NULL_HANDLE;
+        }
+        vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFences[i]);
     }
 
     // 3. Recreate Accumulation & Output Images
@@ -5111,8 +5582,31 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_motionVectorImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
+
+    if (!m_config.capture_training_data_dir.empty() || m_config.denoiser_mode == DenoiserMode::Upways) {
+        m_mlAlbedoRoughnessImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlSpecularMotionImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlDiffuseImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_mlSpecularImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
 
     // Transition images to GENERAL layout
     vkResetCommandBuffer(m_commandBuffers[0], 0);
@@ -5140,6 +5634,29 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    if (m_mlAlbedoRoughnessImage) {
+        m_mlAlbedoRoughnessImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlSpecularMotionImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlDiffuseImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        m_mlSpecularImage->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
+
     vkEndCommandBuffer(m_commandBuffers[0]);
 
     VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -5162,6 +5679,11 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     createTemporalAccumResources();
     destroyBmfrResources();
     createBmfrResources();
+    destroyUpwaysResources();
+    if (m_upwaysPipeline) {
+        m_upwaysPipeline->resize(m_config.width, m_config.height);
+    }
+    createUpwaysResources();
     updateAllImageDescriptors();
     updateMergeDescriptors();
 
@@ -5209,8 +5731,9 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
-    key.denoiser = (m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR :
-                   (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None ? DenoiserMode::Temporal : DenoiserMode::None);
+    key.denoiser = (m_config.denoiser_mode == DenoiserMode::Upways) ? DenoiserMode::Upways :
+                   ((m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR :
+                   (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None ? DenoiserMode::Temporal : DenoiserMode::None));
     key.enable_nrc = m_config.enable_nrc;
     key.width = m_config.width;
     key.height = m_config.height;
@@ -5365,7 +5888,383 @@ void Engine::printExecutionSummary() const {
     Logger::info("========================================================================================");
 }
 
+void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp) {
+    VkDevice device = m_context->getDevice();
+    VkQueue queue = m_context->getGraphicsQueue();
+    VmaAllocator allocator = m_context->getAllocator();
+    uint32_t width = m_config.width;
+    uint32_t height = m_config.height;
+
+    if (!m_wavefrontPipeline || !m_accumImage || !m_camera) {
+        Logger::error("Cannot capture training frame: Wavefront pipeline, accum image, or camera is null!");
+        return;
+    }
+
+    uint32_t flags = 0;
+    if (m_config.enable_direct_light)    flags |= (1 << 0);
+    if (m_config.enable_indirect_light)  flags |= (1 << 1);
+    flags |= (1 << 2); // Specular
+    if (m_config.enable_refraction)      flags |= (1 << 3);
+    if (m_config.enable_shadows)         flags |= (1 << 4);
+    if (m_sceneHasNonOpaque)             flags |= (1 << 5);
+    if (m_config.inline_primary_shadows) flags |= (1 << 6);
+    if (m_config.enable_light_tree)      flags |= (1 << 7);
+    if (m_config.enable_shadow_denoiser) flags |= (1 << 20);
+
+    VkClearColorValue clearZero{};
+    clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;
+    VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    auto clearImage = [&](VkCommandBuffer cmd, Image* img) {
+        if (!img) return;
+        img->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdClearColorImage(cmd, img->getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearZero, 1, &colorRange);
+        img->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    };
+
+    if (isReference) {
+        // --- GROUND TRUTH REFERENCE CAPTURE PASS ---
+        // 1. Clear accumImage to zero before progressive accumulation
+        {
+            VkCommandBuffer cmd = m_commandBuffers[0];
+            vkResetCommandBuffer(cmd, 0);
+
+            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd, &beginInfo);
+            clearImage(cmd, m_accumImage.get());
+            vkEndCommandBuffer(cmd);
+
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = cmd;
+            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            submitInfo.commandBufferInfoCount = 1;
+            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue);
+        }
+
+        // 2. Accumulate in batches of 16 SPP
+        uint32_t remainingSpp = spp;
+        uint32_t currentSppOffset = 0;
+        constexpr uint32_t BATCH_SIZE = 16;
+
+        WavefrontSceneData wfSceneData{};
+        wfSceneData.numTriangles = m_numTriangles;
+        wfSceneData.numSpheres = m_numSpheres;
+        wfSceneData.numMaterials = m_numMaterials;
+        wfSceneData.numLights = m_numLights;
+        wfSceneData.hasEnvMap = m_environmentMap ? 1u : 0u;
+        wfSceneData.envMapIntensity = 1.0f;
+        wfSceneData.useHardwareRT = 1u;
+        wfSceneData.useMorton = 1u;
+        wfSceneData.accumulateHistory = 1u;
+        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+        wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+        wfSceneData.cameraFlags = flags;
+        wfSceneData.boundsMin = m_sceneData.boundsMin;
+        wfSceneData.boundsMax = m_sceneData.boundsMax;
+        wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+        wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+        wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.captureMlData = 0;
+
+        while (remainingSpp > 0) {
+            uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
+            wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
+
+            // ubo with spp = 1 so samples accumulate full unscaled radiance
+            CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, m_config.max_bounces, flags,
+                                                         false, width, height, 0);
+            m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
+
+            VkCommandBuffer cmd = m_commandBuffers[0];
+            vkResetCommandBuffer(cmd, 0);
+
+            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd, &beginInfo);
+
+            m_wavefrontPipeline->recordFrame(cmd, 0, width, height, batchSpp, m_config.max_bounces, wfSceneData);
+
+            vkEndCommandBuffer(cmd);
+
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = cmd;
+            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            submitInfo.commandBufferInfoCount = 1;
+            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue);
+
+            remainingSpp -= batchSpp;
+            currentSppOffset += batchSpp;
+        }
+
+        // 3. Read back accumImage and write PTTD reference file
+        bool isFp16 = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT);
+        VkDeviceSize accumPixelBytes = isFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+        VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width) * height * accumPixelBytes;
+
+        Buffer stagingAccum(allocator, stagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+        {
+            VkCommandBuffer cmd = m_commandBuffers[0];
+            vkResetCommandBuffer(cmd, 0);
+
+            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd, &beginInfo);
+
+            m_accumImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+            VkBufferImageCopy copyRegion{};
+            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.imageSubresource.layerCount = 1;
+            copyRegion.imageExtent = { width, height, 1 };
+
+            vkCmdCopyImageToBuffer(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingAccum.getBuffer(), 1, &copyRegion);
+
+            m_accumImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+            vkEndCommandBuffer(cmd);
+
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = cmd;
+            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            submitInfo.commandBufferInfoCount = 1;
+            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue);
+        }
+
+        stagingAccum.invalidate();
+        std::vector<uint16_t> refPayload(static_cast<size_t>(width) * height * 4);
+        uint16_t sppFp16 = glm::detail::toFloat16(static_cast<float>(spp));
+
+        if (isFp16) {
+            const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
+            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
+                refPayload[p * 4 + 0] = src[p * 4 + 0];
+                refPayload[p * 4 + 1] = src[p * 4 + 1];
+                refPayload[p * 4 + 2] = src[p * 4 + 2];
+                refPayload[p * 4 + 3] = sppFp16;
+            }
+            stagingAccum.unmap();
+        } else {
+            const float* src = static_cast<const float*>(stagingAccum.map());
+            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
+                refPayload[p * 4 + 0] = glm::detail::toFloat16(src[p * 4 + 0]);
+                refPayload[p * 4 + 1] = glm::detail::toFloat16(src[p * 4 + 1]);
+                refPayload[p * 4 + 2] = glm::detail::toFloat16(src[p * 4 + 2]);
+                refPayload[p * 4 + 3] = sppFp16;
+            }
+            stagingAccum.unmap();
+        }
+
+        std::string refPath = std::format("{}/frame_{:05d}_reference.bin", m_config.capture_training_data_dir, frameIdx);
+        ImageDumper::savePTTD(refPath, width, height, 4, 0 /* Float16 */,
+                              frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t));
+        Logger::info("  -> Saved reference: {} (4 channels, {} SPP)", refPath, spp);
+
+    } else {
+        // --- 1-SPP NOISY INPUT + ML FEATURE EXTRACTION PASS ---
+        // 1. Clear accum and ML images to zero
+        VkCommandBuffer cmd = m_commandBuffers[0];
+        vkResetCommandBuffer(cmd, 0);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        clearImage(cmd, m_accumImage.get());
+        clearImage(cmd, m_mlDiffuseImage.get());
+        clearImage(cmd, m_mlSpecularImage.get());
+        clearImage(cmd, m_mlAlbedoRoughnessImage.get());
+        clearImage(cmd, m_mlSpecularMotionImage.get());
+        clearImage(cmd, m_motionVectorImage.get());
+        clearImage(cmd, m_normalDepthImage.get());
+
+        // 2. Set camera UBO
+        CameraUniform ubo = m_camera->getUniformData(frameIdx, 1, m_config.max_bounces, flags,
+                                                     false, width, height, 0);
+        m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
+
+        // 3. Dispatch 1-SPP with captureMlData = 1
+        WavefrontSceneData wfSceneData{};
+        wfSceneData.numTriangles = m_numTriangles;
+        wfSceneData.numSpheres = m_numSpheres;
+        wfSceneData.numMaterials = m_numMaterials;
+        wfSceneData.numLights = m_numLights;
+        wfSceneData.hasEnvMap = m_environmentMap ? 1u : 0u;
+        wfSceneData.envMapIntensity = 1.0f;
+        wfSceneData.useHardwareRT = 1u;
+        wfSceneData.frameIndex = frameIdx;
+        wfSceneData.useMorton = 1u;
+        wfSceneData.accumulateHistory = 0u;
+        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+        wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+        wfSceneData.cameraFlags = flags;
+        wfSceneData.boundsMin = m_sceneData.boundsMin;
+        wfSceneData.boundsMax = m_sceneData.boundsMax;
+        wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+        wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+        wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.captureMlData = 1;
+
+        m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_config.max_bounces, wfSceneData);
+
+        // 4. Staging copy for 6 ML images
+        VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
+        VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
+        VkDeviceSize rg16Size   = numPixels * 2 * sizeof(uint16_t);
+
+        VkDeviceSize offsetDiff = 0;
+        VkDeviceSize offsetSpec = offsetDiff + rgba16Size;
+        VkDeviceSize offsetAR   = offsetSpec + rgba16Size;
+        VkDeviceSize offsetND   = offsetAR   + rgba16Size;
+        VkDeviceSize offsetSM   = offsetND   + rgba16Size;
+        VkDeviceSize offsetMV   = offsetSM   + rgba16Size;
+        VkDeviceSize totalInputStagingSize = offsetMV + rg16Size;
+
+        Buffer stagingInput(allocator, totalInputStagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+        auto copyImgToBuffer = [&](Image* img, VkDeviceSize bufOffset) {
+            if (!img) return;
+            img->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+            VkBufferImageCopy region{};
+            region.bufferOffset = bufOffset;
+            region.bufferRowLength = width;
+            region.bufferImageHeight = height;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { width, height, 1 };
+
+            vkCmdCopyImageToBuffer(cmd, img->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingInput.getBuffer(), 1, &region);
+
+            img->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        };
+
+        copyImgToBuffer(m_mlDiffuseImage.get(), offsetDiff);
+        copyImgToBuffer(m_mlSpecularImage.get(), offsetSpec);
+        copyImgToBuffer(m_mlAlbedoRoughnessImage.get(), offsetAR);
+        copyImgToBuffer(m_normalDepthImage.get(), offsetND);
+        copyImgToBuffer(m_mlSpecularMotionImage.get(), offsetSM);
+        copyImgToBuffer(m_motionVectorImage.get(), offsetMV);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        stagingInput.invalidate();
+        const uint8_t* basePtr = static_cast<const uint8_t*>(stagingInput.map());
+        const uint16_t* diffPixels = reinterpret_cast<const uint16_t*>(basePtr + offsetDiff);
+        const uint16_t* specPixels = reinterpret_cast<const uint16_t*>(basePtr + offsetSpec);
+        const uint16_t* arPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetAR);
+        const uint16_t* ndPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetND);
+        const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
+        const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
+
+        uint32_t outChannels = m_config.capture_normals ? 19 : 16;
+        std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
+
+        for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+            inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
+            inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
+            inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
+            inputPayload[p * outChannels + 3]  = specPixels[p * 4 + 0]; // specular R
+            inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 1]; // specular G
+            inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 2]; // specular B
+            inputPayload[p * outChannels + 6]  = arPixels[p * 4 + 0];   // albedo R
+            inputPayload[p * outChannels + 7]  = arPixels[p * 4 + 1];   // albedo G
+            inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 2];   // albedo B
+            inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 3];   // roughness
+            inputPayload[p * outChannels + 10] = ndPixels[p * 4 + 3];   // linear depth
+            inputPayload[p * outChannels + 11] = smPixels[p * 4 + 2];   // specular hit distance
+            inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
+            inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+            inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
+            inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
+            if (m_config.capture_normals) {
+                inputPayload[p * outChannels + 16] = ndPixels[p * 4 + 0]; // normal X
+                inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1]; // normal Y
+                inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2]; // normal Z
+            }
+        }
+        stagingInput.unmap();
+
+        std::string inpPath = std::format("{}/frame_{:05d}_input.bin", m_config.capture_training_data_dir, frameIdx);
+        ImageDumper::savePTTD(inpPath, width, height, outChannels, 0 /* Float16 */,
+                              frameIdx, 1, inputPayload.data(), inputPayload.size() * sizeof(uint16_t));
+        Logger::info("  -> Saved input    : {} ({} channels, 1 SPP)", inpPath, outChannels);
+    }
+}
+
+void Engine::runTrainingDataCapture() {
+    Logger::info("========================================================================================");
+    Logger::info("  Pathways -> Upways Training Data Capture Pipeline (DGC Wavefront / Wave32)");
+    Logger::info("  Target Directory : {}", m_config.capture_training_data_dir);
+    Logger::info("  Frames to Capture: {}", m_config.capture_frames);
+    Logger::info("  Reference SPP    : {}", m_config.capture_reference_spp);
+    Logger::info("  Capture Normals  : {}", m_config.capture_normals ? "YES (19 channels)" : "NO (16 channels)");
+    Logger::info("========================================================================================");
+
+    std::filesystem::create_directories(m_config.capture_training_data_dir);
+
+    // Warm up camera
+    if (m_camera) {
+        m_camera->resetMoved();
+    }
+
+    for (uint32_t f = 0; f < m_config.capture_frames; ++f) {
+        Logger::info("--- Capturing Training Frame [{}/{}] ---", f + 1, m_config.capture_frames);
+
+        // 1. Render Ground Truth Reference Frame
+        captureTrainingFrame(f, /*isReference=*/true, m_config.capture_reference_spp);
+
+        // 2. Render 1-SPP Noisy Input Frame (with ML demux features & motion vectors)
+        captureTrainingFrame(f, /*isReference=*/false, 1);
+
+        // 3. Move camera for next frame if multi-frame sequence
+        if (m_camera) {
+            m_camera->processMouseMovement(2.0f, 0.0f);
+        }
+    }
+
+    Logger::info("========================================================================================");
+    Logger::info("  Training Data Capture COMPLETE! {} frames written to {}",
+                 m_config.capture_frames, m_config.capture_training_data_dir);
+    Logger::info("========================================================================================");
+}
+
 void Engine::run() {
+    if (!m_config.capture_training_data_dir.empty()) {
+        runTrainingDataCapture();
+        return;
+    }
     Logger::info("Starting Pathways render loop...");
 
     while (!m_window->shouldClose()) {

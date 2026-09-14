@@ -44,6 +44,9 @@ struct GltfScene {
     std::vector<Camera> cameras;
     std::vector<TextureData> textures;
     std::string assetName;
+    std::vector<std::string> extensionsUsed;
+    std::vector<std::string> extensionsRequired;
+    bool hasMeshQuantization = false;
 };
 
 class GltfLoader {

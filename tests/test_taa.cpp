@@ -49,9 +49,9 @@ int main() {
         std::cout << "[TEST 1] Command-Line Configuration & Flag Parsing..." << std::endl;
         Config configDefault;
         check_true(!configDefault.enable_taa, "Default TAA is off");
-        check_true(!configDefault.enable_temporal_accum, "Default Temporal Accum is off");
+        check_true(configDefault.enable_temporal_accum, "Default Temporal Accum is on");
         check_true(!configDefault.enable_bmfr, "Default BMFR is off");
-        check_true(configDefault.denoiser_mode == DenoiserMode::None, "Default DenoiserMode is None");
+        check_true(configDefault.denoiser_mode == DenoiserMode::Temporal, "Default DenoiserMode is Temporal");
 
         const char* argv1[] = { "pathways", "--bmfr" };
         Config c1 = Config::parse(2, const_cast<char**>(argv1));
@@ -59,10 +59,15 @@ int main() {
         check_true(c1.enable_temporal_accum, "--bmfr keeps temporal accum enabled");
         check_true(c1.denoiser_mode == DenoiserMode::BMFR, "--bmfr sets mode to BMFR");
 
-        const char* argv2[] = { "pathways", "--temporal-accum" };
+        const char* argv2[] = { "pathways", "--no-temporal-accum" };
         Config c2 = Config::parse(2, const_cast<char**>(argv2));
-        check_true(c2.enable_temporal_accum, "--temporal-accum enables temporal accum");
-        check_true(c2.denoiser_mode == DenoiserMode::Temporal, "--temporal-accum sets mode to Temporal");
+        check_true(!c2.enable_temporal_accum, "--no-temporal-accum disables temporal accum");
+        check_true(c2.denoiser_mode == DenoiserMode::None, "--no-temporal-accum sets mode to None");
+
+        const char* argvNoTra[] = { "pathways", "--no-tra" };
+        Config cNoTra = Config::parse(2, const_cast<char**>(argvNoTra));
+        check_true(!cNoTra.enable_temporal_accum, "--no-tra disables temporal accum");
+        check_true(cNoTra.denoiser_mode == DenoiserMode::None, "--no-tra sets mode to None");
 
         const char* argvDenNone[] = { "pathways", "--denoiser", "none" };
         Config cDenNone = Config::parse(3, const_cast<char**>(argvDenNone));

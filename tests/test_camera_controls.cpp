@@ -344,6 +344,170 @@ int main() {
         std::cout << "[PASS] Camera view override application verified." << std::endl;
     }
 
+    // 20. Camera Inertia Damping & Accumulation Responsiveness (< 50 ms Latency)
+    {
+        Camera camResponsiveness(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+
+        // Active keypress generates motion and non-zero velocity
+        camResponsiveness.resetMoved();
+        camResponsiveness.processFpsInput(1.0f, 0.0f, 0.0f, 0.016f, false);
+        check_true(camResponsiveness.hasMoved(), "Camera must report moved during active input");
+        check_true(glm::length(camResponsiveness.getVelocity()) > 0.1f, "Camera velocity must be non-zero during movement");
+
+        // Releasing WASD keys immediately halts velocity and signals stationary state (< 50 ms latency)
+        camResponsiveness.resetMoved();
+        camResponsiveness.processFpsInput(0.0f, 0.0f, 0.0f, 0.016f, false);
+        camResponsiveness.update(0.016f);
+        check_true(!camResponsiveness.hasMoved(), "Releasing movement keys must immediately stop camera and transition to accumulation (< 50 ms)");
+        assert_near(glm::length(camResponsiveness.getVelocity()), 0.0f, 0.0001f, "Camera velocity must be 0 after releasing keys");
+
+        // Subsequent frame remains stationary without sub-pixel drift
+        glm::vec3 posStationary = camResponsiveness.getPosition();
+        camResponsiveness.update(0.016f);
+        assert_near(camResponsiveness.getPosition().x, posStationary.x, 0.0001f, "Stationary position X");
+        assert_near(camResponsiveness.getPosition().y, posStationary.y, 0.0001f, "Stationary position Y");
+        assert_near(camResponsiveness.getPosition().z, posStationary.z, 0.0001f, "Stationary position Z");
+        check_true(!camResponsiveness.hasMoved(), "Stationary camera must not trigger movement flag on subsequent frame");
+        assert_near(glm::length(camResponsiveness.getVelocity()), 0.0f, 0.0001f, "Camera velocity remains 0 when stationary");
+
+        // Mouse look stopping consistency
+        camResponsiveness.resetMoved();
+        camResponsiveness.processMouseMovement(15.0f, -10.0f);
+        check_true(camResponsiveness.hasMoved(), "Mouse look must report moved during active look");
+        camResponsiveness.resetMoved();
+        camResponsiveness.processMouseMovement(0.0f, 0.0f);
+        camResponsiveness.update(0.016f);
+        check_true(!camResponsiveness.hasMoved(), "Ceasing mouse movement must immediately trigger accumulation");
+
+        std::cout << "[PASS] Camera inertia damping & zero-latency accumulation responsiveness verified (< 50 ms)." << std::endl;
+    }
+
+    // 21. Analog Stick Proportional Deflection & Sub-Threshold Deadzone
+    {
+        Camera camAnalog(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+
+        // Full deflection (1.0) vs half deflection (0.5)
+        glm::vec3 posStart = camAnalog.getPosition();
+        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, 0.1f, false);
+        float fullDist = glm::length(camAnalog.getPosition() - posStart);
+
+        camAnalog.lookAt(posStart, glm::vec3(0.0f, 1.0f, 0.0f));
+        camAnalog.processFpsInput(0.5f, 0.0f, 0.0f, 0.1f, false);
+        float halfDist = glm::length(camAnalog.getPosition() - posStart);
+
+        assert_near(halfDist, fullDist * 0.5f, 0.005f, "Half stick deflection must produce half displacement");
+        assert_near(glm::length(camAnalog.getVelocity()), camAnalog.getBaseSpeed() * 0.5f, 0.01f, "Half stick velocity");
+
+        // Sub-threshold deadzone (< 0.001f) produces zero motion
+        camAnalog.resetMoved();
+        glm::vec3 posBeforeDeadzone = camAnalog.getPosition();
+        camAnalog.processFpsInput(0.0005f, 0.0005f, 0.0f, 0.016f, false);
+        check_true(!camAnalog.hasMoved(), "Sub-threshold input (< 0.001f) must not trigger moved flag");
+        assert_near(camAnalog.getPosition().x, posBeforeDeadzone.x, 0.00001f, "Deadzone position X");
+        assert_near(camAnalog.getPosition().z, posBeforeDeadzone.z, 0.00001f, "Deadzone position Z");
+        assert_near(glm::length(camAnalog.getVelocity()), 0.0f, 0.00001f, "Deadzone velocity zero");
+
+        // Non-positive deltaTime robustness guard
+        camAnalog.resetMoved();
+        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, 0.0f, false);
+        check_true(!camAnalog.hasMoved(), "dt=0 must not trigger moved flag");
+        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, -0.016f, false);
+        check_true(!camAnalog.hasMoved(), "Negative dt must not trigger moved flag");
+
+        std::cout << "[PASS] Analog stick proportional deflection & sub-threshold deadzone verified." << std::endl;
+    }
+
+    // 22. Active Frame Velocity Stability, Arc-Strafe Velocity Telemetry & Stationary Damping
+    {
+        Camera camRobust(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+
+        // 22a. Active frame velocity must NOT decay when update(dt) is called during active movement
+        camRobust.processFpsInput(1.0f, 0.0f, 0.0f, 0.016f, false);
+        float expectedSpeed = camRobust.getBaseSpeed();
+        assert_near(glm::length(camRobust.getVelocity()), expectedSpeed, 0.01f, "Pre-update velocity");
+        camRobust.update(0.016f);
+        assert_near(glm::length(camRobust.getVelocity()), expectedSpeed, 0.01f, "Active frame velocity preserved across update(dt)");
+
+        // 22b. Arc-strafe velocity telemetry
+        glm::vec3 pivot(0.0f, 1.0f, 0.0f);
+        camRobust.lookAt(glm::vec3(0.0f, 1.0f, 3.0f), pivot);
+        camRobust.startOrbit(pivot);
+        camRobust.processFpsInput(0.0f, 1.0f, 0.0f, 0.05f, false, false, true); // Arc strafe right
+        check_true(camRobust.hasMoved(), "Arc-strafe must set moved flag");
+        check_true(glm::length(camRobust.getVelocity()) > 0.5f, "Arc-strafe must compute non-zero tangential velocity");
+        camRobust.endOrbit();
+
+        // 22c. Damping executes when un-driven (!hasMoved())
+        camRobust.resetMoved();
+        // Artificially simulate residual velocity on un-driven camera
+        check_true(!camRobust.hasMoved(), "Camera moved reset");
+        float velBeforeDamp = glm::length(camRobust.getVelocity());
+        check_true(velBeforeDamp > 0.0f, "Residual velocity present");
+        camRobust.update(0.05f); // Un-driven update decays velocity
+        float velAfterDamp = glm::length(camRobust.getVelocity());
+        check_true(velAfterDamp < velBeforeDamp, "Un-driven velocity must decay");
+
+        std::cout << "[PASS] Active frame velocity preservation, arc-strafe velocity & stationary damping verified." << std::endl;
+    }
+
+    // 23. Frame Time Spike Clamping, Key Release Robustness & Configurable Gamepad Deadzone
+    {
+        // 23a. Frame-rate drop dt clamping (eliminates 6x speed collapse / micro-stutter at < 15 FPS)
+        auto clampDt = [](float rawDt) -> float {
+            if (rawDt <= 0.0f) return 0.016f;
+            if (rawDt > 0.1f) return 0.1f;
+            return rawDt;
+        };
+
+        float dt9Fps = 1.0f / 9.0f; // ~0.111s
+        float dtClamped = clampDt(dt9Fps);
+        assert_near(dtClamped, 0.1f, 0.001f, "9 FPS dt must clamp to 0.1s instead of collapsing to 0.016s");
+
+        // Active movement across clamped dt
+        Camera camSpike(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+        glm::vec3 posStart = camSpike.getPosition();
+        camSpike.processFpsInput(1.0f, 0.0f, 0.0f, dtClamped, false);
+        float distAdvanced = glm::length(camSpike.getPosition() - posStart);
+        assert_near(distAdvanced, camSpike.getBaseSpeed() * 0.1f, 0.01f, "Advancement during clamped spike");
+
+        // 23b. Key release occurring during large frame spike (dt = 0.15s)
+        camSpike.resetMoved();
+        camSpike.processFpsInput(0.0f, 0.0f, 0.0f, clampDt(0.15f), false);
+        camSpike.update(clampDt(0.15f));
+        check_true(!camSpike.hasMoved(), "Key release during frame spike must immediately signal stationary (< 50 ms)");
+        assert_near(glm::length(camSpike.getVelocity()), 0.0f, 0.0001f, "Zero velocity on key release during spike");
+
+        // 23c. Configurable gamepad deadzone continuous remapping & CLI flag parsing
+        auto remapAxis = [](float rawVal, float deadzone) -> float {
+            deadzone = std::clamp(deadzone, 0.01f, 0.50f);
+            if (std::abs(rawVal) >= deadzone) {
+                return std::copysign((std::abs(rawVal) - deadzone) / (1.0f - deadzone), rawVal);
+            }
+            return 0.0f;
+        };
+
+        // Standard deadzone (0.15)
+        assert_near(remapAxis(0.10f, 0.15f), 0.0f, 0.0001f, "Below standard deadzone is zero");
+        assert_near(remapAxis(0.151f, 0.15f), 0.00117f, 0.001f, "Continuous ramp above standard deadzone");
+        assert_near(remapAxis(1.0f, 0.15f), 1.0f, 0.0001f, "Full deflection with standard deadzone");
+
+        // Custom worn-hardware deadzone (0.25)
+        assert_near(remapAxis(0.20f, 0.25f), 0.0f, 0.0001f, "0.20 drift rejected by 0.25 deadzone");
+        assert_near(remapAxis(0.251f, 0.25f), 0.00133f, 0.001f, "Continuous ramp above custom deadzone");
+        assert_near(remapAxis(1.0f, 0.25f), 1.0f, 0.0001f, "Full deflection with custom deadzone");
+
+        // CLI flag parsing verification
+        const char* argvDeadzone[] = { "pathways", "--gamepad-deadzone", "0.22" };
+        Config cfgDeadzone = Config::parse(3, const_cast<char**>(argvDeadzone));
+        assert_near(cfgDeadzone.gamepad_deadzone, 0.22f, 0.001f, "Config parses --gamepad-deadzone");
+
+        const char* argvDeadzoneEq[] = { "pathways", "--gamepad-deadzone=0.30" };
+        Config cfgDeadzoneEq = Config::parse(2, const_cast<char**>(argvDeadzoneEq));
+        assert_near(cfgDeadzoneEq.gamepad_deadzone, 0.30f, 0.001f, "Config parses --gamepad-deadzone=");
+
+        std::cout << "[PASS] Frame time spike clamping, key release robustness & configurable gamepad deadzone verified." << std::endl;
+    }
+
     std::cout << "==========================================================" << std::endl;
     std::cout << "  All Camera & FPS Navigation Unit Tests PASSED Cleanly!" << std::endl;
     std::cout << "==========================================================" << std::endl;

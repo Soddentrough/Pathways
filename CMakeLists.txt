@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.19.9 LANGUAGES C CXX)
+project(Pathways VERSION 1.19.11 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -154,6 +154,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/raytrace_comp.comp
     ${SHADER_DIR}/compute/wavefront_persistent.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
+    ${SHADER_DIR}/compute/upways_reconstruct.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -170,7 +171,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl
+            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})
@@ -249,11 +250,42 @@ target_include_directories(pathways PRIVATE
     ${BIN_SPV_DIR}
 )
 
-# Definitions
 target_compile_definitions(pathways PRIVATE
     SHADER_DIR="${SPV_OUTPUT_DIR}"
     VK_ENABLE_BETA_EXTENSIONS=0
 )
+
+# OpenUSD (Pixar USD) Support
+if(EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/usr/lib64/cmake/pxr/pxrConfig.cmake")
+    find_package(OpenGL QUIET)
+    find_package(pxr QUIET)
+    if(pxr_FOUND)
+        message(STATUS "OpenUSD (pxr) found: ${PXR_VERSION}")
+        if(TARGET hioAvif)
+            set_target_properties(hioAvif PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "/usr/include"
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "/usr/include"
+            )
+        endif()
+        if(TARGET usd_m)
+            set_target_properties(usd_m PROPERTIES INTERFACE_LINK_LIBRARIES "TBB::tbb")
+            get_target_property(_usd_dirs usd_m INTERFACE_INCLUDE_DIRECTORIES)
+            if(_usd_dirs)
+                list(FILTER _usd_dirs EXCLUDE REGEX "rav1e|svt-av1|libvmaf")
+                set_target_properties(usd_m PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${_usd_dirs}")
+            endif()
+        endif()
+        find_package(Python3 COMPONENTS Development QUIET)
+        target_compile_definitions(pathways PRIVATE PATHWAYS_ENABLE_USD=1)
+        target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES} Python3::Python)
+        target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            set_source_files_properties(src/scene/UsdLoader.cpp PROPERTIES COMPILE_OPTIONS "-Wno-deprecated")
+        endif()
+    endif()
+else()
+    message(STATUS "OpenUSD prerequisites not fully installed (requires usd-devel, imath-devel, python3-materialx, libXt-devel). Building without native OpenUSD support.")
+endif()
 
 # Scoped warning suppression for third-party header tinyexr inlined into ImageDumper.cpp
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -433,6 +465,17 @@ target_include_directories(test_nrc_wmma PRIVATE
 target_link_libraries(test_nrc_wmma PRIVATE Vulkan::Vulkan)
 add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 
+# Upways Neural Denoiser & Super-Resolution Wave32 WMMA Unit Test Target
+add_executable(test_upways_pipeline
+    tests/test_upways_pipeline.cpp
+)
+target_include_directories(test_upways_pipeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
+add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
+
 # DGC Multi-Slice Ring Buffer & Dedicated Compute Queue Unit Test Target
 add_executable(test_dgc_async_queue
     tests/test_dgc_async_queue.cpp
@@ -452,6 +495,50 @@ target_include_directories(test_light_tree PRIVATE
     ${THIRD_PARTY_DIR}/glm
 )
 add_test(NAME LightTree COMMAND test_light_tree)
+
+# glTF KHR_mesh_quantization & Fast Ingestion Unit Test Target
+add_executable(test_mesh_quantization
+    tests/test_mesh_quantization.cpp
+    src/scene/GltfLoader.cpp
+    src/scene/ProceduralScene.cpp
+    src/scene/Camera.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_mesh_quantization PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+    ${THIRD_PARTY_DIR}/cgltf
+    ${THIRD_PARTY_DIR}/stb
+)
+target_link_libraries(test_mesh_quantization PRIVATE Threads::Threads)
+if(UNIX)
+    target_link_libraries(test_mesh_quantization PRIVATE m)
+endif()
+add_test(NAME MeshQuantization COMMAND test_mesh_quantization)
+
+# OpenUSD Native Scene Ingestion Unit Test Target
+if(pxr_FOUND)
+    add_executable(test_usd_loader
+        tests/test_usd_loader.cpp
+        src/scene/UsdLoader.cpp
+        src/scene/ProceduralScene.cpp
+        src/core/Logger.cpp
+    )
+    target_include_directories(test_usd_loader PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${THIRD_PARTY_DIR}/glm
+    )
+    target_include_directories(test_usd_loader SYSTEM PRIVATE
+        ${PXR_INCLUDE_DIRS}
+        ${Python3_INCLUDE_DIRS}
+    )
+    target_compile_definitions(test_usd_loader PRIVATE PATHWAYS_ENABLE_USD=1)
+    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} Python3::Python)
+    if(UNIX)
+        target_link_libraries(test_usd_loader PRIVATE m)
+    endif()
+    add_test(NAME UsdLoader COMMAND test_usd_loader)
+endif()
 
 
 
@@ -474,6 +561,8 @@ set(CURATED_SCENE_DIRS
     coffee-maker
     cornell-caustic
     living-room
+    PointInstancedMedCity
+    Kitchen_set
 )
 
 if(WIN32)
@@ -502,7 +591,11 @@ if(WIN32)
                     DESTINATION "scenes/${SCENE_DIR}"
                     FILES_MATCHING
                     PATTERN "*_extended.glb"
+                    PATTERN "*.usd"
+                    PATTERN "*.usda"
+                    PATTERN "*.usdc"
                     PATTERN "LICENSE.txt"
+                    PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
         endif()
     endforeach()
@@ -531,7 +624,11 @@ else()
                     DESTINATION "${CMAKE_INSTALL_DATADIR}/pathways/scenes/${SCENE_DIR}"
                     FILES_MATCHING
                     PATTERN "*_extended.glb"
+                    PATTERN "*.usd"
+                    PATTERN "*.usda"
+                    PATTERN "*.usdc"
                     PATTERN "LICENSE.txt"
+                    PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
         endif()
     endforeach()

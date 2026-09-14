@@ -534,12 +534,18 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
-            if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
+            if (config.denoiser_mode == DenoiserMode::Upways) {
+                if (config.upways_superres) {
+                    ImGui::Text("Denoising:    Upways Super-Resolution (2.0x 4K Wave32 WMMA)");
+                } else {
+                    ImGui::Text("Denoising:    Upways Neural Denoiser (Wave32 WMMA)");
+                }
+            } else if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
                 ImGui::Text("Denoising:    BMFR (Feature Regression) [Experimental]");
             } else if (config.enable_temporal_accum && config.denoiser_mode != DenoiserMode::None) {
-                ImGui::Text("Denoising:    Temporal Accumulation (wRLS)");
+                ImGui::Text("Denoising:    Temporal Accumulation (wRLS) [Default]");
             } else {
-                ImGui::Text("Denoising:    Off (Pure Monte Carlo) [Default]");
+                ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -658,7 +664,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             if (sceneHeaderOpen) {
                 // Category Filter Tabs
-                static int sceneCategoryFilter = 0; // 0: All, 1: Showcase, 2: Research, 3: Custom, 4: Procedural
+                static int sceneCategoryFilter = 0; // 0: All, 1: Showcase, 2: Research, 3: USD, 4: Custom, 5: Procedural
 
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 3.0f));
                 auto drawFilterTab = [&](const char* name, int filterIdx) {
@@ -684,9 +690,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::SameLine();
                 drawFilterTab("Research", 2);
                 ImGui::SameLine();
-                drawFilterTab("Custom", 3);
+                drawFilterTab("USD", 3);
                 ImGui::SameLine();
-                drawFilterTab("Procedural", 4);
+                drawFilterTab("Custom", 4);
+                ImGui::SameLine();
+                drawFilterTab("Procedural", 5);
                 ImGui::PopStyleVar();
 
                 ImGui::Spacing();
@@ -723,8 +731,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                             const auto& sc = availableScenes[i];
                             if (sceneCategoryFilter == 1 && sc.group != "Showcase") continue;
                             if (sceneCategoryFilter == 2 && sc.group != "Research") continue;
-                            if (sceneCategoryFilter == 3 && sc.group != "Custom") continue;
-                            if (sceneCategoryFilter == 4 && sc.group != "Procedural") continue;
+                            if (sceneCategoryFilter == 3 && sc.group != "USD Scenes") continue;
+                            if (sceneCategoryFilter == 4 && sc.group != "Custom") continue;
+                            if (sceneCategoryFilter == 5 && sc.group != "Procedural") continue;
 
                             ImGui::TableNextRow();
                             ImGui::TableNextColumn();
@@ -973,6 +982,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 float sens = camera->getSensitivity();
                 if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.02f, 0.5f, "%.2f")) {
                     camera->setSensitivity(sens);
+                }
+
+                if (ImGui::SliderFloat("Gamepad Deadzone", &config.gamepad_deadzone, 0.02f, 0.40f, "%.2f")) {
+                    config.gamepad_deadzone = std::clamp(config.gamepad_deadzone, 0.01f, 0.50f);
                 }
 
                 float fov = camera->getFov();
@@ -1403,12 +1416,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 5. Post-Processing & Denoising
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char* denoiserModes[] = {
-                "None (Pure Monte Carlo) [Default]",
-                "Temporal Radiance Accumulation (Motion-Vector Guided)",
-                "BMFR (Blockwise Feature Regression) [Experimental]"
+                "None (Pure Monte Carlo)",
+                "Temporal Radiance Accumulation (Motion-Vector Guided) [Default]",
+                "BMFR (Blockwise Feature Regression) [Experimental]",
+                "Upways Neural Denoiser (Wave32 WMMA)",
+                "Upways Continuous Super-Resolution (2.0x 4K)"
             };
             int currentDenoiser = 0;
-            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
+            if (config.denoiser_mode == DenoiserMode::Upways) {
+                currentDenoiser = config.upways_superres ? 4 : 3;
+            } else if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
                 currentDenoiser = 2;
             } else if (config.denoiser_mode == DenoiserMode::Temporal && config.enable_temporal_accum) {
                 currentDenoiser = 1;
@@ -1429,12 +1446,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     config.denoiser_mode = DenoiserMode::BMFR;
                     config.enable_temporal_accum = true;
                     config.enable_bmfr = true;
+                } else if (currentDenoiser == 3) {
+                    config.denoiser_mode = DenoiserMode::Upways;
+                    config.upways_superres = false;
+                    config.enable_temporal_accum = false;
+                    config.enable_bmfr = false;
+                } else if (currentDenoiser == 4) {
+                    config.denoiser_mode = DenoiserMode::Upways;
+                    config.upways_superres = true;
+                    config.enable_temporal_accum = false;
+                    config.enable_bmfr = false;
                 }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select active denoising architecture. None (Pure Monte Carlo) is default for unbiased reference rendering.");
+                ImGui::SetTooltip("Select active denoising architecture. Temporal Radiance Accumulation is default for real-time motion stability.");
             }
 
             if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {

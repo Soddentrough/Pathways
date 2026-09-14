@@ -1,4 +1,5 @@
 #include "scene/SceneRegistry.hpp"
+#include "scene/UsdLoader.hpp"
 #include "core/Logger.hpp"
 #include "cgltf.h"
 
@@ -78,6 +79,10 @@ static bool populateSceneMetadata(SceneEntry& entry) {
         return false;
     }
     entry.fileSizeBytes = std::filesystem::file_size(entry.filepath, ec);
+
+    if (UsdLoader::isUsdFile(entry.filepath)) {
+        return UsdLoader::populateMetadata(entry.filepath, entry.triangleCount, entry.materialCount);
+    }
 
     cgltf_options options{};
     cgltf_data* data = nullptr;
@@ -171,15 +176,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
 
     std::vector<SceneEntry> fileEntries;
 
-    // 1. Scan standalone scenes directly under scenes/ (Showcase)
+    // 1. Scan standalone scenes directly under scenes/ (Showcase & USD)
     for (const auto& item : fs::directory_iterator(scenesDir)) {
         if (item.is_regular_file()) {
             std::string ext = item.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-            if (ext == ".glb" || ext == ".gltf") {
+            if (ext == ".glb" || ext == ".gltf" || ext == ".usd" || ext == ".usda" || ext == ".usdc") {
                 std::string stem = item.path().stem().string();
                 std::string label = formatSceneName(stem);
-                SceneEntry e{ label, item.path().string(), "Showcase" };
+                std::string group = UsdLoader::isUsdFile(item.path().string()) ? "USD Scenes" : "Showcase";
+                SceneEntry e{ label, item.path().string(), group };
                 if (populateSceneMetadata(e)) {
                     fileEntries.push_back(e);
                 }
@@ -193,18 +199,28 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             std::string dirName = item.path().filename().string();
             std::string dirTitle = formatSceneName(dirName);
 
-            // Look for extended and core models
+            // Look for extended and core models or usd scenes
             fs::path extGlb = item.path() / (dirName + "_extended.glb");
             fs::path coreGlb = item.path() / (dirName + "_core.glb");
+            fs::path usdScene = item.path() / (dirName + ".usd");
 
             // Handle underscore variations (e.g. coffee-maker vs coffee_maker)
             std::string underscoreDir = dirName;
             std::replace(underscoreDir.begin(), underscoreDir.end(), '-', '_');
             if (!fs::exists(extGlb)) extGlb = item.path() / (underscoreDir + "_extended.glb");
             if (!fs::exists(coreGlb)) coreGlb = item.path() / (underscoreDir + "_core.glb");
+            if (!fs::exists(usdScene)) usdScene = item.path() / (underscoreDir + ".usd");
 
             bool hasExt = fs::exists(extGlb);
             bool hasCore = fs::exists(coreGlb);
+            bool hasUsd = fs::exists(usdScene);
+
+            if (hasUsd) {
+                SceneEntry e{ dirTitle, usdScene.string(), "USD Scenes" };
+                if (populateSceneMetadata(e)) {
+                    fileEntries.push_back(e);
+                }
+            }
 
             if (hasExt && hasCore) {
                 SceneEntry e{ dirTitle + " (Extended)", extGlb.string(), "Research" };
@@ -228,15 +244,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                 }
             }
 
-            // Also check for any other glb/gltf files in this directory
+            // Also check for any other glb/gltf/usd files in this directory
             for (const auto& subItem : fs::directory_iterator(item.path())) {
                 if (subItem.is_regular_file()) {
                     std::string subExt = subItem.path().extension().string();
                     std::transform(subExt.begin(), subExt.end(), subExt.begin(), [](unsigned char c) { return std::tolower(c); });
-                    if (subExt == ".glb" || subExt == ".gltf") {
-                        if (subItem.path() != extGlb && subItem.path() != coreGlb) {
+                    if (subExt == ".glb" || subExt == ".gltf" || subExt == ".usd" || subExt == ".usda" || subExt == ".usdc") {
+                        if (subItem.path() != extGlb && subItem.path() != coreGlb && subItem.path() != usdScene) {
                             std::string subStem = subItem.path().stem().string();
-                            SceneEntry e{ dirTitle + " - " + formatSceneName(subStem), subItem.path().string(), "Custom" };
+                            std::string group = UsdLoader::isUsdFile(subItem.path().string()) ? "USD Scenes" : "Custom";
+                            SceneEntry e{ dirTitle + " - " + formatSceneName(subStem), subItem.path().string(), group };
                             if (populateSceneMetadata(e)) {
                                 fileEntries.push_back(e);
                             }
@@ -247,13 +264,14 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
         }
     }
 
-    // Sort file entries: Showcase first, then Research, then Custom; within groups alphabetically
+    // Sort file entries: Showcase first, then Research, then USD Scenes, then Custom; within groups alphabetically
     std::sort(fileEntries.begin(), fileEntries.end(), [](const SceneEntry& a, const SceneEntry& b) {
         auto groupPriority = [](const std::string& g) {
             if (g == "Showcase") return 1;
             if (g == "Research") return 2;
-            if (g == "Custom") return 3;
-            return 4;
+            if (g == "USD Scenes") return 3;
+            if (g == "Custom") return 4;
+            return 5;
         };
         int pa = groupPriority(a.group);
         int pb = groupPriority(b.group);

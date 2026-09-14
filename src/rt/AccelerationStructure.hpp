@@ -86,6 +86,16 @@ public:
                          bool updateMode = false);
 
     // Telemetry stats
+    void resetStats() {
+        m_lastBlasBuildTimeMs = 0.0;
+        m_blasSizeKb = 0.0;
+        m_uncompactedBlasSizeKb = 0.0;
+        m_blasCompacted = true;
+        m_blasTriangles = 0;
+        m_lastTlasBuildTimeMs = 0.0;
+        m_tlasSizeKb = 0.0;
+        m_tlasInstances = 0;
+    }
     double getLastBlasBuildTimeMs() const { return m_lastBlasBuildTimeMs; }
     double getBlasSizeKb() const { return m_blasSizeKb; }
     double getUncompactedBlasSizeKb() const { return m_uncompactedBlasSizeKb; }
@@ -102,7 +112,7 @@ private:
     double m_lastBlasBuildTimeMs = 0.0;
     double m_blasSizeKb = 0.0;
     double m_uncompactedBlasSizeKb = 0.0;
-    bool m_blasCompacted = false;
+    bool m_blasCompacted = true;
     uint32_t m_blasTriangles = 0;
     double m_lastTlasBuildTimeMs = 0.0;
     double m_tlasSizeKb = 0.0;

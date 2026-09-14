@@ -105,6 +105,7 @@ public:
     bool hasMoved() const { return m_moved; }
     void resetMoved() { m_moved = false; }
     void resetPrevViewProj() { m_hasPrevViewProj = false; }
+    glm::vec3 getVelocity() const { return m_velocity; }
 
 private:
     void updateVectors();

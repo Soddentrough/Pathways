@@ -55,6 +55,296 @@ static void parallelMemcpy(void* dst, const void* src, size_t size, size_t numTh
     }
 }
 
+static void uploadToDeviceBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize) {
+    if (dataSize == 0 || !srcData) return;
+    VkDevice device = secNode.context->getDevice();
+    VkQueue queue = secNode.context->getGraphicsQueue();
+    VmaAllocator allocator = secNode.context->getAllocator();
+
+    const VkDeviceSize maxChunkSize = 64 * 1024 * 1024; // 64 MB bounded staging buffer
+    VkDeviceSize stagingSize = std::min(dataSize, maxChunkSize);
+
+    Buffer stagingBuffer(
+        allocator, stagingSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = secNode.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+
+    VkDeviceSize offset = 0;
+    while (offset < dataSize) {
+        VkDeviceSize currentChunk = std::min(maxChunkSize, dataSize - offset);
+        std::memcpy(stagingBuffer.map(), static_cast<const uint8_t*>(srcData) + offset, currentChunk);
+        stagingBuffer.flush(0, currentChunk);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = offset;
+        copyRegion.size = currentChunk;
+        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), dstBuffer.getBuffer(), 1, &copyRegion);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        offset += currentChunk;
+    }
+
+    vkFreeCommandBuffers(device, secNode.commandPool, 1, &cmd);
+}
+
+static void uploadIndexBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, uint32_t triangleCount) {
+    if (triangleCount == 0) {
+        uint32_t dummy[3] = { 0, 3, 6 };
+        uploadToDeviceBufferSec(secNode, dstBuffer, dummy, sizeof(dummy));
+        return;
+    }
+
+    VkDevice device = secNode.context->getDevice();
+    VkQueue queue = secNode.context->getGraphicsQueue();
+    VmaAllocator allocator = secNode.context->getAllocator();
+
+    const uint32_t chunkTriangles = 1048576; // 1M triangles = 12 MB chunk
+    VkDeviceSize stagingSize = std::min(static_cast<VkDeviceSize>(triangleCount), static_cast<VkDeviceSize>(chunkTriangles)) * 3 * sizeof(uint32_t);
+
+    Buffer stagingBuffer(
+        allocator, stagingSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = secNode.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+
+    uint32_t* mappedStaging = static_cast<uint32_t*>(stagingBuffer.map());
+
+    uint32_t triOffset = 0;
+    while (triOffset < triangleCount) {
+        uint32_t currentChunkTriangles = std::min(chunkTriangles, triangleCount - triOffset);
+        for (uint32_t i = 0; i < currentChunkTriangles; ++i) {
+            uint32_t k = triOffset + i;
+            mappedStaging[i * 3 + 0] = 10 * k + 0;
+            mappedStaging[i * 3 + 1] = 10 * k + 3;
+            mappedStaging[i * 3 + 2] = 10 * k + 6;
+        }
+        VkDeviceSize currentBytes = currentChunkTriangles * 3 * sizeof(uint32_t);
+        stagingBuffer.flush(0, currentBytes);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = static_cast<VkDeviceSize>(triOffset) * 3 * sizeof(uint32_t);
+        copyRegion.size = currentBytes;
+        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), dstBuffer.getBuffer(), 1, &copyRegion);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        triOffset += currentChunkTriangles;
+    }
+
+    vkFreeCommandBuffers(device, secNode.commandPool, 1, &cmd);
+}
+
+static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const SceneData& scene) {
+    if (!secNode.context->hasRayTracing()) return;
+
+    VkDevice secDevice = secNode.context->getDevice();
+    VmaAllocator secAlloc = secNode.context->getAllocator();
+
+    secNode.tlas.reset();
+    secNode.blas.reset();
+    secNode.blases.clear();
+    secNode.asIndexBuffer.reset();
+    secNode.instanceBuffer.reset();
+    secNode.asManager.reset();
+
+    uint32_t numTriangles = static_cast<uint32_t>(scene.triangles.size());
+    VkDeviceSize indexBufferSize = std::max(static_cast<VkDeviceSize>(sizeof(uint32_t) * 3 * numTriangles), static_cast<VkDeviceSize>(sizeof(uint32_t) * 3));
+    secNode.asIndexBuffer = std::make_unique<Buffer>(
+        secAlloc, indexBufferSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    uploadIndexBufferSec(secNode, *secNode.asIndexBuffer, numTriangles);
+
+    secNode.asManager = std::make_unique<AccelerationStructureManager>(
+        secDevice, secAlloc,
+        secNode.context->getGraphicsQueue(), secNode.context->getGraphicsQueueFamily()
+    );
+
+    // 1. Instance buffer (std430, binding 30)
+    std::vector<InstanceGPU> instanceUpload;
+    if (!scene.instanceData.empty()) {
+        instanceUpload = scene.instanceData;
+    } else {
+        InstanceGPU defaultInst{};
+        defaultInst.firstTriangle = 0;
+        defaultInst.numOpaqueTriangles = scene.numOpaqueTriangles;
+        defaultInst.materialOffset = 0;
+        defaultInst.flags = 0;
+        instanceUpload.push_back(defaultInst);
+    }
+
+    VkDeviceSize instanceBufferSize = sizeof(InstanceGPU) * instanceUpload.size();
+    secNode.instanceBuffer = std::make_unique<Buffer>(
+        secAlloc, instanceBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    uploadToDeviceBufferSec(secNode, *secNode.instanceBuffer, instanceUpload.data(), instanceBufferSize);
+
+    // 2. Acceleration Structures
+    VkDeviceAddress vertexBaseAddr = secNode.triangleBuffer->getDeviceAddress(secDevice);
+    VkDeviceAddress indexBaseAddr = secNode.asIndexBuffer->getDeviceAddress(secDevice);
+
+    if (!scene.blasRanges.empty()) {
+        // Multi-BLAS path
+        secNode.asManager->resetStats();
+        for (const auto& range : scene.blasRanges) {
+            std::vector<ASGeometryInput> geoms;
+            if (range.numOpaqueTriangles > 0) {
+                ASGeometryInput geomOpaque{};
+                geomOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * 3 * sizeof(uint32_t);
+                geomOpaque.vertexCount = 10 * (range.firstTriangle + range.numOpaqueTriangles);
+                geomOpaque.triangleCount = range.numOpaqueTriangles;
+                geomOpaque.vertexStride = 16;
+                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.isOpaque = true;
+                geoms.push_back(geomOpaque);
+            }
+            uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
+            if (numNonOpaque > 0) {
+                ASGeometryInput geomNonOpaque{};
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * 3 * sizeof(uint32_t);
+                geomNonOpaque.vertexCount = 10 * (range.firstTriangle + range.triangleCount);
+                geomNonOpaque.triangleCount = numNonOpaque;
+                geomNonOpaque.vertexStride = 16;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.isOpaque = false;
+                geoms.push_back(geomNonOpaque);
+            }
+            if (geoms.empty()) {
+                ASGeometryInput dummyGeom{};
+                dummyGeom.vertexBufferAddress = vertexBaseAddr;
+                dummyGeom.indexBufferAddress = indexBaseAddr;
+                dummyGeom.vertexCount = 10;
+                dummyGeom.triangleCount = 1;
+                dummyGeom.vertexStride = 16;
+                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.isOpaque = true;
+                geoms.push_back(dummyGeom);
+            }
+            secNode.blases.push_back(secNode.asManager->buildBLAS(geoms));
+        }
+
+        std::vector<ASInstanceInput> asInstances;
+        asInstances.reserve(scene.instances.size());
+        for (const auto& inst : scene.instances) {
+            ASInstanceInput asInst{};
+            uint32_t bIdx = std::min(inst.blasIndex, static_cast<uint32_t>(secNode.blases.size() - 1));
+            asInst.blasAddress = secNode.blases[bIdx]->getDeviceAddress();
+            asInst.transform = inst.transform;
+            asInst.customIndex = inst.customIndex;
+            asInst.mask = 0xFF;
+            asInst.hitGroupId = 0;
+            asInst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(asInst);
+        }
+        secNode.tlas = secNode.asManager->buildTLAS(asInstances);
+        Logger::info("Secondary GPU Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
+                     secNode.blases.size(), asInstances.size());
+    } else {
+        // Monolithic single-BLAS path
+        std::vector<ASGeometryInput> geoms;
+        if (scene.numOpaqueTriangles > 0) {
+            ASGeometryInput geomOpaque{};
+            geomOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomOpaque.indexBufferAddress = indexBaseAddr;
+            geomOpaque.vertexCount = 10 * scene.numOpaqueTriangles;
+            geomOpaque.triangleCount = scene.numOpaqueTriangles;
+            geomOpaque.vertexStride = 16;
+            geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomOpaque.isOpaque = true;
+            geoms.push_back(geomOpaque);
+        }
+        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
+        if (numNonOpaque > 0) {
+            ASGeometryInput geomNonOpaque{};
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+            geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles) * 3 * sizeof(uint32_t);
+            geomNonOpaque.vertexCount = 10 * numTriangles;
+            geomNonOpaque.triangleCount = numNonOpaque;
+            geomNonOpaque.vertexStride = 16;
+            geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomNonOpaque.isOpaque = false;
+            geoms.push_back(geomNonOpaque);
+        }
+        if (geoms.empty()) {
+            ASGeometryInput dummyGeom{};
+            dummyGeom.vertexBufferAddress = vertexBaseAddr;
+            dummyGeom.indexBufferAddress = indexBaseAddr;
+            dummyGeom.vertexCount = 10;
+            dummyGeom.triangleCount = 1;
+            dummyGeom.vertexStride = 16;
+            dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+            dummyGeom.isOpaque = true;
+            geoms.push_back(dummyGeom);
+        }
+        secNode.blas = secNode.asManager->buildBLAS(geoms);
+
+        ASInstanceInput inst{};
+        inst.blasAddress = secNode.blas->getDeviceAddress();
+        inst.transform = glm::mat4(1.0f);
+        inst.customIndex = 0;
+        inst.mask = 0xFF;
+        inst.hitGroupId = 0;
+        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+        secNode.tlas = secNode.asManager->buildTLAS({ inst });
+        Logger::info("Secondary GPU Acceleration Structures initialized successfully (Monolithic BLAS & TLAS).");
+    }
+}
+
 GpuDeviceNode::~GpuDeviceNode() {
     if (!context) return;
     VkDevice device = context->getDevice();
@@ -702,16 +992,17 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    // 4. Scene Buffers on secondary device
+    // 4. Scene Buffers on secondary device (pure DEVICE_LOCAL VRAM with staging upload)
     VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * scene.triangles.size(), sizeof(TriangleGPU));
     secNode->triangleBuffer = std::make_unique<Buffer>(
         secAlloc, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (!scene.triangles.empty()) {
-        secNode->triangleBuffer->copyFrom(scene.triangles.data(), sizeof(TriangleGPU) * scene.triangles.size());
+        uploadToDeviceBufferSec(*secNode, *secNode->triangleBuffer, scene.triangles.data(), sizeof(TriangleGPU) * scene.triangles.size());
     }
 
     VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * scene.spheres.size(), sizeof(SphereGPU));
@@ -758,6 +1049,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secNode->lightTreeBuffer->copyFrom(scene.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size());
     }
 
+    // Camera UBOs on secondary device
     VkDeviceSize uboSize = sizeof(CameraUniform);
     for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
         secNode->cameraUBOs[i] = std::make_unique<Buffer>(
@@ -769,88 +1061,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 
     // Hardware Acceleration Structures on secondary device (VK_KHR_ray_query)
-    if (secNode->context->hasRayTracing()) {
-        std::vector<Vertex> asVertices;
-        if (!scene.triangles.empty()) {
-            asVertices.reserve(scene.triangles.size() * 3);
-            for (const auto& tri : scene.triangles) {
-                asVertices.push_back(tri.v0);
-                asVertices.push_back(tri.v1);
-                asVertices.push_back(tri.v2);
-            }
-        } else {
-            Vertex v{};
-            asVertices.assign(3, v);
-        }
-
-        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
-        secNode->asVertexBuffer = std::make_unique<Buffer>(
-            secAlloc, vertexBufferSize,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-        );
-        secNode->asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
-
-        secNode->asManager = std::make_unique<AccelerationStructureManager>(
-            secDevice, secAlloc,
-            secNode->context->getGraphicsQueue(), secNode->context->getGraphicsQueueFamily()
-        );
-
-        std::vector<ASGeometryInput> geoms;
-        VkDeviceAddress vertexBaseAddr = secNode->asVertexBuffer->getDeviceAddress(secDevice);
-
-        if (scene.numOpaqueTriangles > 0) {
-            ASGeometryInput geomOpaque{};
-            geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = 0;
-            geomOpaque.vertexCount = scene.numOpaqueTriangles * 3;
-            geomOpaque.triangleCount = scene.numOpaqueTriangles;
-            geomOpaque.vertexStride = sizeof(Vertex);
-            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
-
-        uint32_t numNonOpaque = static_cast<uint32_t>(scene.triangles.size()) - scene.numOpaqueTriangles;
-        if (numNonOpaque > 0) {
-            ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles * 3) * sizeof(Vertex);
-            geomNonOpaque.indexBufferAddress = 0;
-            geomNonOpaque.vertexCount = numNonOpaque * 3;
-            geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = sizeof(Vertex);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
-        }
-
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = 0;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(Vertex);
-            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-
-        secNode->blas = secNode->asManager->buildBLAS(geoms);
-
-        ASInstanceInput inst{};
-        inst.blasAddress = secNode->blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-
-        secNode->tlas = secNode->asManager->buildTLAS({ inst });
-        Logger::info("Secondary GPU Acceleration Structures initialized successfully (BLAS & TLAS).");
-        Logger::info("Secondary GPU RT Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations");
-    }
+    createSecondaryAccelerationStructures(*secNode, scene);
 
     // Textures & HDRI Environment Map on secondary device
     VkQueue secQueue = secNode->context->getGraphicsQueue();
@@ -1323,7 +1534,10 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             secNode->motionVectorImage ? secNode->motionVectorImage->getImageView() : VK_NULL_HANDLE,
             secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE,
             secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
-            secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getSize() : 0
+            secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getSize() : 0,
+            VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+            secNode->instanceBuffer ? secNode->instanceBuffer->getBuffer() : VK_NULL_HANDLE,
+            secNode->instanceBuffer ? secNode->instanceBuffer->getSize() : 0
         );
     }
 }
@@ -1984,12 +2198,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
     VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * scene.triangles.size(), sizeof(TriangleGPU));
     secNode->triangleBuffer = std::make_unique<Buffer>(
         secAlloc, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (!scene.triangles.empty()) {
-        secNode->triangleBuffer->copyFrom(scene.triangles.data(), sizeof(TriangleGPU) * scene.triangles.size());
+        uploadToDeviceBufferSec(*secNode, *secNode->triangleBuffer, scene.triangles.data(), sizeof(TriangleGPU) * scene.triangles.size());
     }
 
     VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * scene.spheres.size(), sizeof(SphereGPU));
@@ -2037,86 +2252,7 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
     }
 
     // 2. Rebuild secondary AS
-    if (secNode->context->hasRayTracing()) {
-        std::vector<Vertex> asVertices;
-        if (!scene.triangles.empty()) {
-            asVertices.reserve(scene.triangles.size() * 3);
-            for (const auto& tri : scene.triangles) {
-                asVertices.push_back(tri.v0);
-                asVertices.push_back(tri.v1);
-                asVertices.push_back(tri.v2);
-            }
-        } else {
-            Vertex v{};
-            asVertices.assign(3, v);
-        }
-
-        VkDeviceSize vertexBufferSize = sizeof(Vertex) * asVertices.size();
-        secNode->asVertexBuffer = std::make_unique<Buffer>(
-            secAlloc, vertexBufferSize,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-        );
-        secNode->asVertexBuffer->copyFrom(asVertices.data(), vertexBufferSize);
-
-        secNode->asManager = std::make_unique<AccelerationStructureManager>(
-            secDevice, secAlloc,
-            secNode->context->getGraphicsQueue(), secNode->context->getGraphicsQueueFamily()
-        );
-
-        std::vector<ASGeometryInput> geoms;
-        VkDeviceAddress vertexBaseAddr = secNode->asVertexBuffer->getDeviceAddress(secDevice);
-
-        if (scene.numOpaqueTriangles > 0) {
-            ASGeometryInput geomOpaque{};
-            geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = 0;
-            geomOpaque.vertexCount = scene.numOpaqueTriangles * 3;
-            geomOpaque.triangleCount = scene.numOpaqueTriangles;
-            geomOpaque.vertexStride = sizeof(Vertex);
-            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
-
-        uint32_t numNonOpaque = static_cast<uint32_t>(scene.triangles.size()) - scene.numOpaqueTriangles;
-        if (numNonOpaque > 0) {
-            ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles * 3) * sizeof(Vertex);
-            geomNonOpaque.indexBufferAddress = 0;
-            geomNonOpaque.vertexCount = numNonOpaque * 3;
-            geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = sizeof(Vertex);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
-        }
-
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = 0;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(Vertex);
-            dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-
-        secNode->blas = secNode->asManager->buildBLAS(geoms);
-
-        ASInstanceInput inst{};
-        inst.blasAddress = secNode->blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-
-        secNode->tlas = secNode->asManager->buildTLAS({ inst });
-    }
+    createSecondaryAccelerationStructures(*secNode, scene);
 
     // 3. Upload scene textures on secondary device
     secNode->sceneTextures.clear();

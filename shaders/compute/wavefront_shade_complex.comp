@@ -14,6 +14,8 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -157,6 +159,7 @@ layout(push_constant) uniform PushConstants {
     float nrcTrainRatio;
     uint frameIndex;
     uint numOpaqueTriangles;
+    uint captureMlData;
 } pc;
 
 void main() {
@@ -190,7 +193,9 @@ void main() {
         f16vec3 throughput = f16vec3(state.throughputSeed.rgb);
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
-        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
+        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
+        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
+        bool isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
         uint bounce = pc.currentBounce;
 
         if (hitType == 2u) {
@@ -206,6 +211,15 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            if (pc.captureMlData != 0u) {
+                if (isSpecularPath) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                } else {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                }
+            }
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
@@ -393,7 +407,7 @@ void main() {
                             if (enableShadows) {
                                 hasShadowRay = true;
                                 shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
-                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                             } else {
                                 accumRadiance += vec3(unshadowed);
                             }
@@ -554,11 +568,20 @@ void main() {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                         vec4 prev = imageLoad(uAccumImage, pixelCoord);
                                         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                        if (pc.captureMlData != 0u) {
+                                            if (isSpecularPath) {
+                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
+                                            } else {
+                                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
+                                            }
+                                        }
                                     }
                                 } else {
                                     hasShadowRay = true;
                                     shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 0.0)));
+                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                                 }
                             } else {
                                 accumRadiance += vec3(unshadowed);
@@ -675,13 +698,23 @@ void main() {
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                 nextState.throughputSeed = vec4(vec3(throughput), uintBitsToFloat(seed));
-                nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(pixelIndex));
+                uint nextPackedPixel = pixelIndex | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u);
+                nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPackedPixel));
             }
 
             if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+                if (pc.captureMlData != 0u) {
+                    if (isSpecularPath) {
+                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                    } else {
+                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                        imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                    }
+                }
             }
         }
     }

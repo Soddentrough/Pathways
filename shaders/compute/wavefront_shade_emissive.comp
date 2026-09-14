@@ -10,6 +10,8 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -131,6 +133,7 @@ layout(push_constant) uniform PushConstants {
     float nrcTrainRatio;
     uint frameIndex;
     uint numOpaqueTriangles;
+    uint captureMlData;
 } pc;
 
 void main() {
@@ -156,7 +159,9 @@ void main() {
         vec3 throughput = state.throughputSeed.rgb;
         uint seed = floatBitsToUint(state.throughputSeed.w);
         vec3 accumRadiance = state.radiancePixel.rgb;
-        uint pixelIndex = floatBitsToUint(state.radiancePixel.w);
+        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
+        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
+        bool isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
 
         if (hitType == 2u) {
             // Sky miss fallback
@@ -172,6 +177,15 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            if (pc.captureMlData != 0u) {
+                if (isSpecularPath) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                } else {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                }
+            }
         } else {
             if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
 
@@ -185,6 +199,15 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            if (pc.captureMlData != 0u) {
+                if (isSpecularPath) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                } else {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                }
+            }
         }
     }
 

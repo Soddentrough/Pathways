@@ -59,6 +59,8 @@ struct ConfigKey {
             denoiserStr = " [BMFR]";
         } else if (denoiser == DenoiserMode::None) {
             denoiserStr = " [Pure MC]";
+        } else if (denoiser == DenoiserMode::Upways) {
+            denoiserStr = " [Upways]";
         }
         std::string nrcStr = enable_nrc ? " [NRC]" : "";
         return std::format("[{}]{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);

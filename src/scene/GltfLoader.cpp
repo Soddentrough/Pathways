@@ -39,6 +39,27 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
 
     outScene.assetName = std::filesystem::path(filepath).stem().string();
 
+    // Track used and required extensions
+    for (size_t i = 0; i < data->extensions_used_count; ++i) {
+        if (data->extensions_used[i]) {
+            outScene.extensionsUsed.emplace_back(data->extensions_used[i]);
+            if (std::strcmp(data->extensions_used[i], "KHR_mesh_quantization") == 0) {
+                outScene.hasMeshQuantization = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < data->extensions_required_count; ++i) {
+        if (data->extensions_required[i]) {
+            outScene.extensionsRequired.emplace_back(data->extensions_required[i]);
+            if (std::strcmp(data->extensions_required[i], "KHR_mesh_quantization") == 0) {
+                outScene.hasMeshQuantization = true;
+            }
+        }
+    }
+    if (outScene.hasMeshQuantization) {
+        Logger::info("glTF: KHR_mesh_quantization extension detected and enabled for '{}'", outScene.assetName);
+    }
+
     // Determine sRGB status for textures (baseColor and emissive textures are sRGB in glTF 2.0)
     std::vector<bool> textureIsSrgb(data->textures_count, false);
     for (size_t i = 0; i < data->materials_count; ++i) {
@@ -379,39 +400,136 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             size_t vertexCount = posAccessor->count;
             outPrim.vertices.resize(vertexCount);
 
-            for (size_t v = 0; v < vertexCount; ++v) {
-                float pos[3] = {0, 0, 0};
-                cgltf_accessor_read_float(posAccessor, v, pos, 3);
-                outPrim.vertices[v].position = glm::vec4(pos[0], pos[1], pos[2], 0.0f);
-
-                if (normAccessor) {
-                    float norm[3] = {0, 1, 0};
-                    cgltf_accessor_read_float(normAccessor, v, norm, 3);
-                    outPrim.vertices[v].normal = glm::vec4(norm[0], norm[1], norm[2], 0.0f);
+            // Batch unpack positions
+            std::vector<float> posData(vertexCount * 3);
+            cgltf_accessor_unpack_floats(posAccessor, posData.data(), posData.size());
+            if (posAccessor->normalized) {
+                if (posAccessor->component_type == cgltf_component_type_r_8 || posAccessor->component_type == cgltf_component_type_r_16) {
+                    for (float& p : posData) {
+                        p = std::clamp(p, -1.0f, 1.0f);
+                    }
                 } else {
-                    outPrim.vertices[v].normal = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                    for (float& p : posData) {
+                        p = std::clamp(p, 0.0f, 1.0f);
+                    }
+                }
+            }
+
+            // Batch unpack normals
+            std::vector<float> normData;
+            if (normAccessor) {
+                normData.resize(vertexCount * 3);
+                cgltf_accessor_unpack_floats(normAccessor, normData.data(), normData.size());
+                if (normAccessor->normalized) {
+                    for (float& n : normData) {
+                        n = std::clamp(n, -1.0f, 1.0f);
+                    }
+                }
+            }
+
+            // Batch unpack texture coordinates
+            std::vector<float> texData;
+            if (texAccessor) {
+                texData.resize(vertexCount * 2);
+                cgltf_accessor_unpack_floats(texAccessor, texData.data(), texData.size());
+                if (texAccessor->normalized) {
+                    if (texAccessor->component_type == cgltf_component_type_r_8 || texAccessor->component_type == cgltf_component_type_r_16) {
+                        for (float& t : texData) {
+                            t = std::clamp(t, -1.0f, 1.0f);
+                        }
+                    } else {
+                        for (float& t : texData) {
+                            t = std::clamp(t, 0.0f, 1.0f);
+                        }
+                    }
                 }
 
-                if (texAccessor) {
-                    float uv[2] = {0, 0};
-                    cgltf_accessor_read_float(texAccessor, v, uv, 2);
-                    outPrim.vertices[v].position.w = uv[0];
-                    outPrim.vertices[v].normal.w = uv[1];
+                // Dequantize unnormalized texture coordinates if KHR_texture_transform is present on primitive material
+                const cgltf_texture_view* transformTexView = nullptr;
+                if (prim.material) {
+                    if (prim.material->has_pbr_metallic_roughness && prim.material->pbr_metallic_roughness.base_color_texture.has_transform) {
+                        transformTexView = &prim.material->pbr_metallic_roughness.base_color_texture;
+                    } else if (prim.material->has_pbr_specular_glossiness && prim.material->pbr_specular_glossiness.diffuse_texture.has_transform) {
+                        transformTexView = &prim.material->pbr_specular_glossiness.diffuse_texture;
+                    } else if (prim.material->normal_texture.has_transform) {
+                        transformTexView = &prim.material->normal_texture;
+                    } else if (prim.material->emissive_texture.has_transform) {
+                        transformTexView = &prim.material->emissive_texture;
+                    }
+                }
+
+                if (transformTexView) {
+                    float sx = transformTexView->transform.scale[0];
+                    float sy = transformTexView->transform.scale[1];
+                    float ox = transformTexView->transform.offset[0];
+                    float oy = transformTexView->transform.offset[1];
+                    float r = transformTexView->transform.rotation;
+                    float cosR = std::cos(r);
+                    float sinR = std::sin(r);
+                    for (size_t v = 0; v < vertexCount; ++v) {
+                        float u = texData[v * 2 + 0];
+                        float w_v = texData[v * 2 + 1];
+                        texData[v * 2 + 0] = u * cosR * sx - w_v * sinR * sy + ox;
+                        texData[v * 2 + 1] = u * sinR * sx + w_v * cosR * sy + oy;
+                    }
+                }
+            }
+
+            // Batch unpack tangents
+            std::vector<float> tanData;
+            if (tanAccessor) {
+                tanData.resize(vertexCount * 4);
+                cgltf_accessor_unpack_floats(tanAccessor, tanData.data(), tanData.size());
+                if (tanAccessor->normalized) {
+                    for (float& t : tanData) {
+                        t = std::clamp(t, -1.0f, 1.0f);
+                    }
+                }
+            }
+
+            for (size_t v = 0; v < vertexCount; ++v) {
+                float u = texAccessor ? texData[v * 2 + 0] : 0.0f;
+                float w_v = texAccessor ? texData[v * 2 + 1] : 0.0f;
+
+                outPrim.vertices[v].position = glm::vec4(
+                    posData[v * 3 + 0],
+                    posData[v * 3 + 1],
+                    posData[v * 3 + 2],
+                    u
+                );
+
+                if (normAccessor) {
+                    glm::vec3 n(normData[v * 3 + 0], normData[v * 3 + 1], normData[v * 3 + 2]);
+                    float len2 = glm::dot(n, n);
+                    if (len2 > 1e-10f) {
+                        n /= std::sqrt(len2);
+                    } else {
+                        n = glm::vec3(0.0f, 1.0f, 0.0f);
+                    }
+                    outPrim.vertices[v].normal = glm::vec4(n, w_v);
+                } else {
+                    outPrim.vertices[v].normal = glm::vec4(0.0f, 0.0f, 0.0f, w_v);
                 }
 
                 if (tanAccessor) {
-                    float tan[4] = {1, 0, 0, 1};
-                    cgltf_accessor_read_float(tanAccessor, v, tan, 4);
-                    outPrim.vertices[v].tangent = glm::vec4(tan[0], tan[1], tan[2], tan[3]);
+                    glm::vec3 t(tanData[v * 4 + 0], tanData[v * 4 + 1], tanData[v * 4 + 2]);
+                    float len2 = glm::dot(t, t);
+                    if (len2 > 1e-10f) {
+                        t /= std::sqrt(len2);
+                    } else {
+                        t = glm::vec3(1.0f, 0.0f, 0.0f);
+                    }
+                    float sign = (tanData[v * 4 + 3] < 0.0f) ? -1.0f : 1.0f;
+                    outPrim.vertices[v].tangent = glm::vec4(t, sign);
+                } else {
+                    outPrim.vertices[v].tangent = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
             }
 
             // Indices
             if (prim.indices) {
                 outPrim.indices.resize(prim.indices->count);
-                for (size_t idx = 0; idx < prim.indices->count; ++idx) {
-                    outPrim.indices[idx] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, idx));
-                }
+                cgltf_accessor_unpack_indices(prim.indices, outPrim.indices.data(), sizeof(uint32_t), prim.indices->count);
             } else {
                 outPrim.indices.resize(vertexCount);
                 for (size_t idx = 0; idx < vertexCount; ++idx) {

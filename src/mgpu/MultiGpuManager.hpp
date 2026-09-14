@@ -56,9 +56,11 @@ struct GpuDeviceNode {
     std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> cameraUBOs;
 
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)
-    std::unique_ptr<Buffer> asVertexBuffer;
+    std::unique_ptr<Buffer> asIndexBuffer;
+    std::unique_ptr<Buffer> instanceBuffer;
     std::unique_ptr<AccelerationStructureManager> asManager;
     std::unique_ptr<AccelerationStructure> blas;
+    std::vector<std::unique_ptr<AccelerationStructure>> blases;
     std::unique_ptr<AccelerationStructure> tlas;
 
     // Secondary Textures & Environment Map (Bindings 7 & 8)
