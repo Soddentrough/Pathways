@@ -145,7 +145,8 @@ struct Config {
     std::string capture_training_data_dir = "";
     uint32_t capture_frames = 0;
     uint32_t capture_reference_spp = 1;
-    bool capture_normals = false;
+    bool capture_normals = true;
+    uint32_t capture_channels = 20; // 16, 19, or 20 (PTTD v2 default)
 
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);

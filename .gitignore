@@ -10,6 +10,7 @@ compile_commands.json
 output/
 telemetry/
 scratch/
+data/dataset*/
 /*.png
 /*.exr
 /*.json
@@ -31,6 +32,8 @@ scenes/Bedroom_1.gltf
 scenes/*/
 
 # Re-include Tier 1 shipped research scenes
+!scenes/bmw-m6/
+!scenes/bmw-m6/**
 !scenes/breakfast-room/
 !scenes/breakfast-room/**
 !scenes/coffee-maker/
@@ -41,10 +44,17 @@ scenes/*/
 !scenes/classroom/**
 !scenes/living-room/
 !scenes/living-room/**
+!scenes/modern-hall/
+!scenes/modern-hall/**
+!scenes/PointInstancedMedCity/
+!scenes/PointInstancedMedCity/**
+!scenes/Kitchen_set/
+!scenes/Kitchen_set/**
 
-# Inside shipped scene subdirectories, exclude duplicate core models and reference PNG renders
+# Inside shipped scene subdirectories, exclude duplicate core models, temporary backups, and reference PNG renders
 scenes/*/*_core.glb
 scenes/*/*.png
+*.orig
 
 # IDE / Editor / UI state
 .vscode/

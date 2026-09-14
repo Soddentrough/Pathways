@@ -197,11 +197,12 @@ void Config::printUsage(const char* progName) {
               << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
               << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
               << "  --no-inline-shadows     Disable hybrid inline primary shadows\n"
-              << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
               << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
               << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
-              << "  --capture-normals       Include 3 surface normal channels in ML training tensor (19ch instead of 16ch)\n"
+              << "  --capture-channels <int> Number of channels: 16, 19, or 20 (default: 20 PTTD v2)\n"
+              << "  --capture-normals       Include surface normals (20ch PTTD v2 stream [default: on])\n"
+              << "  --no-capture-normals    Legacy 16-channel export without surface normals\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -298,8 +299,17 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--capture-reference-spp" && i + 1 < argc) {
             cfg.capture_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--capture-channels" && i + 1 < argc) {
+            cfg.capture_channels = static_cast<uint32_t>(std::stoul(argv[++i]));
+            cfg.capture_normals = (cfg.capture_channels >= 19);
         } else if (arg == "--capture-normals") {
             cfg.capture_normals = true;
+            if (cfg.capture_channels < 19) {
+                cfg.capture_channels = 20;
+            }
+        } else if (arg == "--no-capture-normals") {
+            cfg.capture_normals = false;
+            cfg.capture_channels = 16;
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {

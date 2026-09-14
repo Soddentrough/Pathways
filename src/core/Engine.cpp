@@ -6188,30 +6188,74 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
 
-        uint32_t outChannels = m_config.capture_normals ? 19 : 16;
+        uint32_t outChannels = m_config.capture_channels;
+        if (outChannels != 16 && outChannels != 19 && outChannels != 20) {
+            outChannels = 20;
+        }
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
 
-        for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
-            inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
-            inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
-            inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
-            inputPayload[p * outChannels + 3]  = specPixels[p * 4 + 0]; // specular R
-            inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 1]; // specular G
-            inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 2]; // specular B
-            inputPayload[p * outChannels + 6]  = arPixels[p * 4 + 0];   // albedo R
-            inputPayload[p * outChannels + 7]  = arPixels[p * 4 + 1];   // albedo G
-            inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 2];   // albedo B
-            inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 3];   // roughness
-            inputPayload[p * outChannels + 10] = ndPixels[p * 4 + 3];   // linear depth
-            inputPayload[p * outChannels + 11] = smPixels[p * 4 + 2];   // specular hit distance
-            inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
-            inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
-            inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
-            inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
-            if (m_config.capture_normals) {
-                inputPayload[p * outChannels + 16] = ndPixels[p * 4 + 0]; // normal X
-                inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1]; // normal Y
-                inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2]; // normal Z
+        if (outChannels == 20) {
+            // PTTD v2: 20-channel aligned format (5 x vec4)
+            // Vector 0 (Ch 00..03): Diffuse Radiance RGB + Roughness
+            // Vector 1 (Ch 04..07): Specular Radiance RGB + Metallic
+            // Vector 2 (Ch 08..11): Base Color Albedo RGB + Linear Depth
+            // Vector 3 (Ch 12..15): Surface MV XY + Specular MV XY
+            // Vector 4 (Ch 16..19): Surface Normals XYZ + Specular Hit Dist
+            for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+                // Vector 0: Diffuse Radiance RGB + Roughness
+                inputPayload[p * 20 + 0]  = diffPixels[p * 4 + 0]; // diffuse R
+                inputPayload[p * 20 + 1]  = diffPixels[p * 4 + 1]; // diffuse G
+                inputPayload[p * 20 + 2]  = diffPixels[p * 4 + 2]; // diffuse B
+                inputPayload[p * 20 + 3]  = arPixels[p * 4 + 3];   // roughness
+
+                // Vector 1: Specular Radiance RGB + Metallic
+                inputPayload[p * 20 + 4]  = specPixels[p * 4 + 0]; // specular R
+                inputPayload[p * 20 + 5]  = specPixels[p * 4 + 1]; // specular G
+                inputPayload[p * 20 + 6]  = specPixels[p * 4 + 2]; // specular B
+                inputPayload[p * 20 + 7]  = smPixels[p * 4 + 3];   // metallic
+
+                // Vector 2: Base Color Albedo RGB + Linear Depth
+                inputPayload[p * 20 + 8]  = arPixels[p * 4 + 0];   // albedo R
+                inputPayload[p * 20 + 9]  = arPixels[p * 4 + 1];   // albedo G
+                inputPayload[p * 20 + 10] = arPixels[p * 4 + 2];   // albedo B
+                inputPayload[p * 20 + 11] = ndPixels[p * 4 + 3];   // linear depth
+
+                // Vector 3: Surface Motion XY + Specular Motion XY
+                inputPayload[p * 20 + 12] = mvPixels[p * 2 + 0];   // surface motion X
+                inputPayload[p * 20 + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+                inputPayload[p * 20 + 14] = smPixels[p * 4 + 0];   // specular motion X
+                inputPayload[p * 20 + 15] = smPixels[p * 4 + 1];   // specular motion Y
+
+                // Vector 4: Surface Normals XYZ + Specular Hit Distance
+                inputPayload[p * 20 + 16] = ndPixels[p * 4 + 0];   // normal X
+                inputPayload[p * 20 + 17] = ndPixels[p * 4 + 1];   // normal Y
+                inputPayload[p * 20 + 18] = ndPixels[p * 4 + 2];   // normal Z
+                inputPayload[p * 20 + 19] = smPixels[p * 4 + 2];   // specular hit distance
+            }
+        } else {
+            // Legacy 16 / 19 channels (PTTD v1)
+            for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+                inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
+                inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
+                inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
+                inputPayload[p * outChannels + 3]  = specPixels[p * 4 + 0]; // specular R
+                inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 1]; // specular G
+                inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 2]; // specular B
+                inputPayload[p * outChannels + 6]  = arPixels[p * 4 + 0];   // albedo R
+                inputPayload[p * outChannels + 7]  = arPixels[p * 4 + 1];   // albedo G
+                inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 2];   // albedo B
+                inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 3];   // roughness
+                inputPayload[p * outChannels + 10] = ndPixels[p * 4 + 3];   // linear depth
+                inputPayload[p * outChannels + 11] = smPixels[p * 4 + 2];   // specular hit distance
+                inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
+                inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+                inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
+                inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
+                if (outChannels >= 19) {
+                    inputPayload[p * outChannels + 16] = ndPixels[p * 4 + 0]; // normal X
+                    inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1]; // normal Y
+                    inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2]; // normal Z
+                }
             }
         }
         stagingInput.unmap();
@@ -6229,7 +6273,9 @@ void Engine::runTrainingDataCapture() {
     Logger::info("  Target Directory : {}", m_config.capture_training_data_dir);
     Logger::info("  Frames to Capture: {}", m_config.capture_frames);
     Logger::info("  Reference SPP    : {}", m_config.capture_reference_spp);
-    Logger::info("  Capture Normals  : {}", m_config.capture_normals ? "YES (19 channels)" : "NO (16 channels)");
+    Logger::info("  Capture Channels : {} (PTTD v{})", m_config.capture_channels,
+                 m_config.capture_channels == 20 ? 2 : 1);
+    Logger::info("  Capture Normals  : {}", m_config.capture_normals ? "YES" : "NO");
     Logger::info("========================================================================================");
 
     std::filesystem::create_directories(m_config.capture_training_data_dir);

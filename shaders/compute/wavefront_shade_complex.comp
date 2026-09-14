@@ -519,9 +519,7 @@ void main() {
                         float D = distributionGGX(NdotH, alphaRoughness);
                         float Vis = visibilitySmithGGXCorrelated(selectedNdotL, NdotV, alphaRoughness);
                         f16vec3 specBrdf = enableSpecular ? (float16_t(clamp(D * Vis, 0.0, 65500.0)) * F) : f16vec3(0.0);
-
                         f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI));
-                        f16vec3 baseBrdf = diffBrdf + specBrdf;
 
                         float diffPdf = selectedNdotL * INV_PI;
                         float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
@@ -542,7 +540,8 @@ void main() {
                             float Gc = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
                             float Fc = fresnelSchlick(clamp(dot(V, H), 0.0, 1.0), 1.5) * clearcoat;
                             f16vec3 clearcoatBrdf = f16vec3(clamp(Dc * Gc * Fc, 0.0, 65500.0));
-                            baseBrdf = baseBrdf * float16_t(1.0 - Fc) + clearcoatBrdf;
+                            diffBrdf = diffBrdf * float16_t(1.0 - Fc);
+                            specBrdf = specBrdf * float16_t(1.0 - Fc) + clearcoatBrdf;
                         }
 
                         if (length(sheenColor) > float16_t(1e-4)) {
@@ -550,14 +549,17 @@ void main() {
                             float V_sheen = 1.0 / (4.0 * max(selectedNdotL + NdotV - selectedNdotL * NdotV, 1e-4));
                             f16vec3 sheenBrdf = sheenColor * float16_t(D_sheen * V_sheen);
                             float16_t maxSheen = clamp(max(sheenColor.r, max(sheenColor.g, sheenColor.b)), float16_t(0.0), float16_t(1.0));
-                            baseBrdf = baseBrdf * (float16_t(1.0) - maxSheen) + sheenBrdf;
+                            diffBrdf = diffBrdf * (float16_t(1.0) - maxSheen);
+                            specBrdf = specBrdf * (float16_t(1.0) - maxSheen) + sheenBrdf;
                         }
 
                         float risWeight = totalWeightSum / (float(M) * selectedTarget);
                         float factor = selectedNdotL * misWeight * risWeight;
                         vec3 directLightRadiance = clamp(selectedLightEmission * factor, vec3(0.0), vec3(65500.0));
-                        secDirectL = baseBrdf * f16vec3(directLightRadiance);
-                        f16vec3 unshadowed = throughput * secDirectL;
+                        f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
+                        f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
+                        secDirectL = diffUnshadowed + specUnshadowed;
+                        f16vec3 unshadowed = secDirectL;
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
@@ -574,7 +576,9 @@ void main() {
                                                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
                                             } else {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
+                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), 0.0));
+                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), 0.0));
                                             }
                                         }
                                     }
@@ -593,6 +597,7 @@ void main() {
 #endif
 
             // Indirect Bounce
+            bool sampledSpecularLobe = false;
             nextDirection = vec3(0.0);
             vec3 nextOrigin;
 
@@ -625,6 +630,7 @@ void main() {
                     }
                 }
             } else if (enableRefraction && (transmission > 0.001 || mat.type == 2u)) {
+                sampledSpecularLobe = true;
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
                 float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);
                 float fresnel = fresnelSchlick(cosTheta, iorVal);
@@ -646,12 +652,14 @@ void main() {
             } else {
                 float lobeSelect = randFloat(seed);
                 if (lobeSelect < clearcoatProb) {
+                    sampledSpecularLobe = true;
                     vec3 H_cc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
                     nextDirection = reflect(-V, H_cc);
                     nextOrigin = hitPoint + clearcoatNormal * EPSILON;
                     float Fc = fresnelSchlick(clamp(dot(V, H_cc), 0.0, 1.0), 1.5) * clearcoat;
                     throughput *= float16_t(Fc / max(clearcoatProb, 1e-4));
                 } else if (lobeSelect < (clearcoatProb + baseSpecProb)) {
+                    sampledSpecularLobe = true;
                     vec3 H_spec = sampleGGX(hitNormal, alphaRoughness, seed);
                     nextDirection = reflect(-V, H_spec);
                     nextOrigin = hitPoint + hitNormal * EPSILON;
@@ -698,7 +706,7 @@ void main() {
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                 nextState.throughputSeed = vec4(vec3(throughput), uintBitsToFloat(seed));
-                uint nextPackedPixel = pixelIndex | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u);
+                uint nextPackedPixel = pixelIndex | ((isSpecularPath || sampledSpecularLobe) ? SPECULAR_FLAG_BIT : 0u);
                 nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPackedPixel));
             }
 
@@ -707,7 +715,7 @@ void main() {
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
                 if (pc.captureMlData != 0u) {
-                    if (isSpecularPath) {
+                    if (isSpecularPath || sampledSpecularLobe) {
                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                         imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
                     } else {

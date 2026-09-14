@@ -130,6 +130,10 @@ jobs:
           # Copy compiled shaders
           cp build/shaders/*.spv package/shaders/ 2>/dev/null || cp build/bin/shaders/*.spv package/shaders/ 2>/dev/null || true
           cp -r scenes/* package/scenes/ 2>/dev/null || true
+          if [ -d "data" ]; then
+            mkdir -p package/data
+            cp -r data/* package/data/ 2>/dev/null || true
+          fi
           cp README.md package/ 2>/dev/null || true
           (cd package && 7z a -tzip ../pathways-windows-x64.zip *)
 

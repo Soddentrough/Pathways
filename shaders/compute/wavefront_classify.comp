@@ -343,6 +343,7 @@ void main() {
                 float roughnessVal = 1.0;
                 vec2 vSpecular = vSurface;
                 float dHit = 10000.0;
+                float metallicVal = 0.0;
 
                 if (closestTri >= 0 || closestSphere >= 0) {
                     if (matId < pc.numMaterials) {
@@ -352,8 +353,14 @@ void main() {
                             albedoVal *= texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb;
                         }
                         roughnessVal = mat.roughness;
+                        metallicVal = mat.metallic;
                         if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                            roughnessVal *= texture(sceneTextures[mat.mrTex - 1u], hitUv).g;
+                            vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
+                            roughnessVal *= mrSample.g;
+                            metallicVal *= mrSample.b;
+                        }
+                        if (mat.type == 1u /* MATERIAL_METALLIC */) {
+                            metallicVal = max(metallicVal, 1.0);
                         }
                     }
 
@@ -386,7 +393,7 @@ void main() {
                 }
 
                 imageStore(uMlAlbedoRoughnessImage, pixelCoord, vec4(albedoVal, roughnessVal));
-                imageStore(uMlSpecularMotionImage, pixelCoord, vec4(vSpecular, dHit, 0.0));
+                imageStore(uMlSpecularMotionImage, pixelCoord, vec4(vSpecular, dHit, metallicVal));
             }
         }
     }

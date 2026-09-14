@@ -73,7 +73,7 @@ endif()
 
 # Windows definitions and toolchain options
 if(WIN32)
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
@@ -561,6 +561,7 @@ set(CURATED_SCENE_DIRS
     coffee-maker
     cornell-caustic
     living-room
+    modern-hall
     PointInstancedMedCity
     Kitchen_set
 )
@@ -600,6 +601,9 @@ if(WIN32)
         endif()
     endforeach()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION data/models)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico" DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
@@ -642,6 +646,9 @@ else()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.png")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.png DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/1024x1024/apps)
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.png DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)

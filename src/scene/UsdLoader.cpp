@@ -1094,13 +1094,11 @@ bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTrian
     }
 
     outTriangles = totalTris;
-    if (matCount > 0) {
-        outMaterials = matCount;
-    } else if (!uniqueDisplayColors.empty()) {
-        outMaterials = static_cast<uint32_t>(uniqueDisplayColors.size() + 1);
-    } else {
-        outMaterials = 1;
+    uint32_t totalMats = matCount + static_cast<uint32_t>(uniqueDisplayColors.size());
+    if (!uniqueDisplayColors.empty()) {
+        totalMats += 1; // Default fallback material at slot 0
     }
+    outMaterials = (totalMats > 0) ? totalMats : 1;
     return true;
 #else
     (void)filepath;

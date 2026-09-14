@@ -368,8 +368,8 @@ def Xform "Root"
         unsetenv("PATHWAYS_USD_MAX_INSTANCES");
 
         check_true(!cityScene.triangles.empty(), "PointInstancedMedCity must produce triangles");
-        check_true(cityScene.triangles.size() == 9832, "PointInstancedMedCity must load exactly 9832 prototype triangles across 8 BLASes");
-        check_true(cityScene.materials.size() == 12, "PointInstancedMedCity must extract 12 authored materials (pure USD ground truth, no synthetic terrain)");
+        check_true(cityScene.triangles.size() == 27456, "PointInstancedMedCity must load exactly 27456 triangles (17624 non-instanced ground/sea + 9832 prototype triangles across 9 BLASes)");
+        check_true(cityScene.materials.size() == 14, "PointInstancedMedCity must extract 14 authored materials (12 prototype materials + 2 terrain/sea materials)");
         check_true(cityScene.hasCamera, "PointInstancedMedCity must have camera configured");
         check_true(!cityScene.lights.empty(), "PointInstancedMedCity must have lighting configured");
         check_true(!cityScene.meshRanges.empty(), "PointInstancedMedCity must define mesh ranges");
@@ -391,7 +391,7 @@ def Xform "Root"
         bool metaOk = UsdLoader::populateMetadata(medCityPath.string(), metaTris, metaMats);
         check_true(metaOk, "populateMetadata must succeed");
         check_true(metaTris > 0, "populateMetadata must report >0 triangles (not 0 tris)");
-        check_true(metaMats == 12, "populateMetadata must report 12 materials");
+        check_true(metaMats == 14, "populateMetadata must report 14 materials");
         std::cout << "[PASS] populateMetadata returned: " << metaTris << " triangles, " << metaMats << " materials" << std::endl;
 
         // Step 10: Verify Kitchen_set.usd

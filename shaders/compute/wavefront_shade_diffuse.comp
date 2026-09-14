@@ -477,8 +477,10 @@ void main() {
                         float risWeight = totalWeightSum / (float(M) * selectedTarget);
                         float factor = selectedNdotL * misWeight * risWeight;
                         vec3 directLightRadiance = clamp(selectedLightEmission * factor, vec3(0.0), vec3(65500.0));
-                        secDirectL = combinedBrdf * f16vec3(directLightRadiance);
-                        f16vec3 unshadowed = throughput * secDirectL;
+                        f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
+                        f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
+                        secDirectL = diffUnshadowed + specUnshadowed;
+                        f16vec3 unshadowed = secDirectL;
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
@@ -495,7 +497,9 @@ void main() {
                                                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
                                             } else {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
+                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), 0.0));
+                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), 0.0));
                                             }
                                         }
                                     }
