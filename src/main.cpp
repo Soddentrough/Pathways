@@ -38,13 +38,13 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Initial scene rendered 3 frames cleanly.");
 
-            // Switch to scene 1: Coffee Maker
-            if (!engine.loadScene("scenes/coffee-maker/coffee_maker_extended.glb")) {
+            // Switch to scene 1: Coffee Maker (OpenUSD)
+            if (!engine.loadScene("scenes/coffee-maker/coffee_maker.usda")) {
                 pathways::Logger::error("Test failed: loadScene coffee maker failed.");
                 return 1;
             }
             for (int i = 0; i < 3; ++i) engine.renderFrame();
-            pathways::Logger::info("[PASS] Switched to Coffee Maker and rendered 3 frames cleanly.");
+            pathways::Logger::info("[PASS] Switched to Coffee Maker (OpenUSD) and rendered 3 frames cleanly.");
 
             // Switch to scene 2: Damaged Helmet
             if (!engine.loadScene("scenes/DamagedHelmet.glb")) {

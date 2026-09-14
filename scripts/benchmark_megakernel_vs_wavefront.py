@@ -67,9 +67,9 @@ DEFAULT_SCENES = {
         "camera": None
     },
     "coffee_maker": {
-        "name": "Coffee Maker Extended",
-        "path": "scenes/coffee-maker/coffee_maker_extended.glb",
-        "desc": "Complex specular/transmission reflection and refraction",
+        "name": "Coffee Maker (OpenUSD)",
+        "path": "scenes/coffee-maker/coffee_maker.usda",
+        "desc": "Complex specular/transmission reflection and refraction in OpenUSD",
         "camera": None
     },
     "cornell_caustic": {

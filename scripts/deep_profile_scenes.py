@@ -69,9 +69,9 @@ SCENES = [
     },
     {
         "name": "Coffee Maker",
-        "category": "Multi-Material Stress",
-        "path": "scenes/coffee-maker/coffee_maker_extended.glb",
-        "desc": "High-frequency glossy conductors, dielectric glass, and diffuse bodies."
+        "category": "Multi-Material Stress (OpenUSD)",
+        "path": "scenes/coffee-maker/coffee_maker.usda",
+        "desc": "High-frequency glossy conductors, dielectric glass, and diffuse bodies in native OpenUSD."
     },
     {
         "name": "Classroom",
