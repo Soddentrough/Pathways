@@ -988,7 +988,9 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                      data.triangles.size(), data.materials.size(), data.lights.size());
     }
     return data;
-
+#else
+    Logger::warn("UsdLoader: OpenUSD support is disabled in this build. Cannot load '{}'", filepath);
+    return ProceduralScene::createCornellBox();
 #endif
 }
 

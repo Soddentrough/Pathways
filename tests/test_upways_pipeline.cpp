@@ -113,6 +113,8 @@ int main() {
     std::vector<std::string> searchPaths = {
         "data/models/upways_weights.bin",
         "../data/models/upways_weights.bin",
+        "../../data/models/upways_weights.bin",
+        "../../../data/models/upways_weights.bin",
         "/home/naoki/Development/Pathways/data/models/upways_weights.bin",
         "/home/naoki/Development/Upways/checkpoints/run_multiscene_superres/vulkan_export/upways_weights.bin"
     };

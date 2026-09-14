@@ -72,6 +72,8 @@ void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
     }
     candidates.push_back("data/models/upways_weights.bin");
     candidates.push_back("../data/models/upways_weights.bin");
+    candidates.push_back("../../data/models/upways_weights.bin");
+    candidates.push_back("../../../data/models/upways_weights.bin");
     candidates.push_back("/home/naoki/Development/Pathways/data/models/upways_weights.bin");
     candidates.push_back("/home/naoki/Development/Upways/checkpoints/run_multiscene_superres/vulkan_export/upways_weights.bin");
     candidates.push_back("upways_weights.bin");
