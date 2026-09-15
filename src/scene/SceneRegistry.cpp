@@ -88,7 +88,13 @@ static bool populateSceneMetadata(SceneEntry& entry) {
     entry.fileSizeBytes = std::filesystem::file_size(entry.filepath, ec);
 
     if (UsdLoader::isUsdFile(entry.filepath)) {
-        return UsdLoader::populateMetadata(entry.filepath, entry.triangleCount, entry.materialCount) && (entry.triangleCount > 0);
+        // Attempt metadata extraction; if it fails (e.g. non-USD build or Windows resolver fallback),
+        // retain the entry with 0 counts so USD scenes remain in the UI dropdown list by default.
+        if (!UsdLoader::populateMetadata(entry.filepath, entry.triangleCount, entry.materialCount) || entry.triangleCount == 0) {
+            entry.triangleCount = 0;
+            entry.materialCount = 0;
+        }
+        return true;
     }
 
     cgltf_options options{};
@@ -270,6 +276,10 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             // Also check for any other glb/gltf/usd files in this directory
             for (const auto& subItem : fs::directory_iterator(item.path())) {
                 if (subItem.is_regular_file()) {
+                    std::error_code ec;
+                    if (fs::file_size(subItem.path(), ec) < 100) {
+                        continue; // Skip Windows Git symlink text files (e.g. 17-byte ClassicCar.usdc)
+                    }
                     std::string subExt = subItem.path().extension().string();
                     std::transform(subExt.begin(), subExt.end(), subExt.begin(), [](unsigned char c) { return std::tolower(c); });
                     if (subExt == ".glb" || subExt == ".gltf" || subExt == ".usd" || subExt == ".usda" || subExt == ".usdc") {

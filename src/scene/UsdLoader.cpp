@@ -124,11 +124,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         fs::path p1 = baseDir / relPath;
         if (fs::exists(p1)) return p1;
 
-        // 2. In textures/ or "textures and hdri"/ subdirectories
+        // 2. In textures/, "textures and hdri"/, or usd/textures/ subdirectories
         fs::path p2 = baseDir / "textures" / relPath.filename();
         if (fs::exists(p2)) return p2;
         fs::path p3 = baseDir / "textures and hdri" / relPath.filename();
         if (fs::exists(p3)) return p3;
+        fs::path p4 = baseDir / "usd" / "textures" / relPath.filename();
+        if (fs::exists(p4)) return p4;
 
         // 3. Handle Blender export suffixes like foo.jpg.001.jpg or foo.001.png
         std::string stem = relPath.filename().stem().string();
@@ -137,7 +139,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         size_t dotPos = stem.rfind('.');
         if (dotPos != std::string::npos) {
             std::string stripped = stem.substr(0, dotPos);
-            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri"}) {
+            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri", baseDir / "usd" / "textures"}) {
                 fs::path p = dir / (stripped + ext);
                 if (fs::exists(p)) return p;
                 fs::path pBase = dir / stripped;
@@ -147,7 +149,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
 
         // 4. Try alternate image extensions (.png <-> .jpg <-> .jpeg <-> .exr)
         for (const auto& altExt : {".png", ".jpg", ".jpeg", ".exr"}) {
-            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri"}) {
+            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri", baseDir / "usd" / "textures"}) {
                 fs::path p = dir / (stem + altExt);
                 if (fs::exists(p)) return p;
                 if (dotPos != std::string::npos) {

@@ -274,6 +274,24 @@ echo "[6e] Running Test Suite 6e: Many-Lights Scene with Hierarchical Light Tree
 
 python3 scripts/verify_frame.py output/test_many_lights_tree.png output/stats_many_lights_tree.json 1920 1080 40.0
 
+# 9d. Test Suite 6f: OpenUSD Scene Ingestion & Regression Verification (Buick Riviera)
+if [ -f "scenes/BuickRiviera/BuickRiviera.usdc" ]; then
+    echo ""
+    echo "[6f] Running Test Suite 6f: OpenUSD Scene Ingestion & Path Tracing (Buick Riviera)..."
+    ./build/bin/pathways \
+        --headless \
+        --width 1920 \
+        --height 1080 \
+        --spp 4 \
+        --max-bounces 4 \
+        --frames 2 \
+        --scene scenes/BuickRiviera/BuickRiviera.usdc \
+        --dump-frame output/test_buick_usd.png \
+        --dump-stats output/stats_buick_usd.json
+
+    python3 scripts/verify_frame.py output/test_buick_usd.png output/stats_buick_usd.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 15.0
+fi
+
 # 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
 echo ""
 echo "[7/8] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."

@@ -895,6 +895,16 @@ void Engine::initScene() {
                 }
             }
 
+            // Map legacy ClassicCar aliases to BuickRiviera if ClassicCar does not exist as a valid scene
+            if (!std::filesystem::exists(resolvedScene) || (std::filesystem::is_regular_file(resolvedScene) && std::filesystem::file_size(resolvedScene) < 100)) {
+                if (resolvedScene.find("ClassicCar") != std::string::npos || resolvedScene.find("classic_car") != std::string::npos) {
+                    auto buickCandidate = scenesDir / "BuickRiviera" / "BuickRiviera.usdc";
+                    if (std::filesystem::exists(buickCandidate)) {
+                        resolvedScene = buickCandidate.string();
+                    }
+                }
+            }
+
             // If resolvedScene is a directory, find the primary scene file within it
             if (std::filesystem::exists(resolvedScene) && std::filesystem::is_directory(resolvedScene)) {
                 std::filesystem::path dirPath(resolvedScene);

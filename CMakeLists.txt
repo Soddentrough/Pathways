@@ -256,7 +256,7 @@ target_compile_definitions(pathways PRIVATE
 )
 
 # OpenUSD (Pixar USD) Support
-if(EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/usr/lib64/cmake/pxr/pxrConfig.cmake")
+if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/usr/lib64/cmake/pxr/pxrConfig.cmake"))
     find_package(OpenGL QUIET)
     find_package(pxr QUIET)
     if(pxr_FOUND)
@@ -563,10 +563,12 @@ set(CURATED_SCENE_DIRS
     classroom
     coffee-maker
     cornell-caustic
+    glass-of-water
     living-room
     modern-hall
     PointInstancedMedCity
     Kitchen_set
+    BuickRiviera
 )
 
 if(WIN32)
@@ -598,6 +600,10 @@ if(WIN32)
                     PATTERN "*.usd"
                     PATTERN "*.usda"
                     PATTERN "*.usdc"
+                    PATTERN "*.png"
+                    PATTERN "*.jpg"
+                    PATTERN "*.jpeg"
+                    PATTERN "*.exr"
                     PATTERN "LICENSE.txt"
                     PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
@@ -634,6 +640,10 @@ else()
                     PATTERN "*.usd"
                     PATTERN "*.usda"
                     PATTERN "*.usdc"
+                    PATTERN "*.png"
+                    PATTERN "*.jpg"
+                    PATTERN "*.jpeg"
+                    PATTERN "*.exr"
                     PATTERN "LICENSE.txt"
                     PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
