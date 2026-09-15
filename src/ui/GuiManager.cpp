@@ -1416,8 +1416,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 5. Post-Processing & Denoising
         if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char* denoiserModes[] = {
-                "None (Pure Monte Carlo)",
-                "Temporal Radiance Accumulation (Motion-Vector Guided) [Default]",
+                "None (Pure Monte Carlo) [Default]",
+                "Temporal Radiance Accumulation (Motion-Vector Guided)",
                 "BMFR (Blockwise Feature Regression) [Experimental]",
                 "Upways Neural Denoiser (Wave32 WMMA)",
                 "Upways Continuous Super-Resolution (2.0x 4K)"
@@ -1461,7 +1461,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select active denoising architecture. Temporal Radiance Accumulation is default for real-time motion stability.");
+                ImGui::SetTooltip("Select active denoising architecture. None (Pure Monte Carlo) is default for unbiased reference rendering.");
             }
 
             if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {

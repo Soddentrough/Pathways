@@ -14,6 +14,12 @@
 #include <vector>
 #include <cstdlib>
 
+#include "stb_image.h"
+
+#define TINYEXR_USE_MINIZ 0
+#include <zlib.h>
+#include "tinyexr.h"
+
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
 
 #include <pxr/pxr.h>
@@ -26,9 +32,11 @@
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 #include <pxr/usd/usdShade/shader.h>
+#include <pxr/usd/usdShade/connectableAPI.h>
 #include <pxr/usd/usdLux/rectLight.h>
 #include <pxr/usd/usdLux/diskLight.h>
 #include <pxr/usd/usdLux/sphereLight.h>
@@ -92,7 +100,261 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
     glm::mat4 scaleMatrix = glm::scale(glm::mat4(1.0f), glm::vec3(scaleFactor));
     glm::mat4 stageTransform = upAxisMatrix * scaleMatrix;
 
-    // 2. Material Cache
+    // 2. Texture & Material Caches
+    std::unordered_map<std::string, uint32_t> loadedTextures;
+    std::unordered_map<std::string, uint32_t> packedMrTextures;
+
+    auto resolveTexturePath = [&](const std::string& authoredPath) -> std::filesystem::path {
+        if (authoredPath.empty()) return {};
+        namespace fs = std::filesystem;
+        fs::path authored(authoredPath);
+        if (authored.is_absolute() && fs::exists(authored)) {
+            return authored;
+        }
+
+        fs::path baseDir = fs::path(filepath).parent_path();
+
+        std::string cleanStr = authored.generic_string();
+        if (cleanStr.rfind("./", 0) == 0) {
+            cleanStr = cleanStr.substr(2);
+        }
+        fs::path relPath(cleanStr);
+
+        // 1. Relative to baseDir
+        fs::path p1 = baseDir / relPath;
+        if (fs::exists(p1)) return p1;
+
+        // 2. In textures/ or "textures and hdri"/ subdirectories
+        fs::path p2 = baseDir / "textures" / relPath.filename();
+        if (fs::exists(p2)) return p2;
+        fs::path p3 = baseDir / "textures and hdri" / relPath.filename();
+        if (fs::exists(p3)) return p3;
+
+        // 3. Handle Blender export suffixes like foo.jpg.001.jpg or foo.001.png
+        std::string stem = relPath.filename().stem().string();
+        std::string ext = relPath.filename().extension().string();
+
+        size_t dotPos = stem.rfind('.');
+        if (dotPos != std::string::npos) {
+            std::string stripped = stem.substr(0, dotPos);
+            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri"}) {
+                fs::path p = dir / (stripped + ext);
+                if (fs::exists(p)) return p;
+                fs::path pBase = dir / stripped;
+                if (fs::exists(pBase)) return pBase;
+            }
+        }
+
+        // 4. Try alternate image extensions (.png <-> .jpg <-> .jpeg <-> .exr)
+        for (const auto& altExt : {".png", ".jpg", ".jpeg", ".exr"}) {
+            for (const auto& dir : {baseDir, baseDir / "textures", baseDir / "textures and hdri"}) {
+                fs::path p = dir / (stem + altExt);
+                if (fs::exists(p)) return p;
+                if (dotPos != std::string::npos) {
+                    std::string stripped = stem.substr(0, dotPos);
+                    fs::path pStrip = dir / (stripped + altExt);
+                    if (fs::exists(pStrip)) return pStrip;
+                }
+            }
+        }
+
+        return {};
+    };
+
+    auto loadSingleImage = [](const std::filesystem::path& imgPath, TextureData& outTex, bool isSrgb) -> bool {
+        outTex.isSrgb = isSrgb;
+        std::string ext = imgPath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+
+        if (ext == ".exr") {
+            float* rgba = nullptr;
+            int w = 0, h = 0;
+            const char* err = nullptr;
+            int ret = LoadEXR(&rgba, &w, &h, imgPath.string().c_str(), &err);
+            if (ret == TINYEXR_SUCCESS && rgba && w > 0 && h > 0) {
+                outTex.width = static_cast<uint32_t>(w);
+                outTex.height = static_cast<uint32_t>(h);
+                outTex.pixels.resize(w * h * 4);
+                for (int i = 0; i < w * h * 4; ++i) {
+                    outTex.pixels[i] = static_cast<uint8_t>(std::clamp(rgba[i] * 255.0f, 0.0f, 255.0f));
+                }
+                free(rgba);
+                return true;
+            } else {
+                if (rgba) free(rgba);
+                if (err) {
+                    FreeEXRErrorMessage(err);
+                }
+                return false;
+            }
+        } else {
+            int w = 0, h = 0, comp = 0;
+            stbi_uc* rawPixels = stbi_load(imgPath.string().c_str(), &w, &h, &comp, 4);
+            if (rawPixels && w > 0 && h > 0) {
+                outTex.width = static_cast<uint32_t>(w);
+                outTex.height = static_cast<uint32_t>(h);
+                outTex.pixels.assign(rawPixels, rawPixels + (w * h * 4));
+                stbi_image_free(rawPixels);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto getOrCreateTexture = [&](const std::filesystem::path& imgPath, bool isSrgb) -> uint32_t {
+        if (imgPath.empty()) return 0;
+        std::string key = imgPath.string() + (isSrgb ? "_srgb" : "_linear");
+        auto it = loadedTextures.find(key);
+        if (it != loadedTextures.end()) return it->second;
+
+        TextureData texData{};
+        if (loadSingleImage(imgPath, texData, isSrgb)) {
+            uint32_t idx = static_cast<uint32_t>(data.textures.size()) + 1; // 1-based index
+            data.textures.push_back(std::move(texData));
+            loadedTextures[key] = idx;
+            return idx;
+        }
+        return 0;
+    };
+
+    auto getOrCreateMrTexture = [&](const std::filesystem::path& roughPath,
+                                    const std::filesystem::path& metalPath,
+                                    float defaultRoughness,
+                                    float defaultMetallic) -> uint32_t {
+        if (roughPath.empty() && metalPath.empty()) return 0;
+
+        std::string key = roughPath.string() + "|" + metalPath.string();
+        auto it = packedMrTextures.find(key);
+        if (it != packedMrTextures.end()) return it->second;
+
+        TextureData roughTex{};
+        TextureData metalTex{};
+        bool hasRough = !roughPath.empty() && loadSingleImage(roughPath, roughTex, false);
+        bool hasMetal = !metalPath.empty() && loadSingleImage(metalPath, metalTex, false);
+
+        if (!hasRough && !hasMetal) return 0;
+
+        uint32_t w = hasRough ? roughTex.width : metalTex.width;
+        uint32_t h = hasRough ? roughTex.height : metalTex.height;
+
+        TextureData packedTex{};
+        packedTex.width = w;
+        packedTex.height = h;
+        packedTex.isSrgb = false;
+        packedTex.pixels.resize(w * h * 4);
+
+        uint8_t defR = static_cast<uint8_t>(std::clamp(defaultRoughness * 255.0f, 0.0f, 255.0f));
+        uint8_t defM = static_cast<uint8_t>(std::clamp(defaultMetallic * 255.0f, 0.0f, 255.0f));
+
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                uint32_t dstIdx = (y * w + x) * 4;
+
+                uint8_t rVal = defR;
+                if (hasRough) {
+                    uint32_t rx = (x * roughTex.width) / w;
+                    uint32_t ry = (y * roughTex.height) / h;
+                    uint32_t srcIdx = (ry * roughTex.width + rx) * 4;
+                    rVal = roughTex.pixels[srcIdx];
+                }
+
+                uint8_t mVal = defM;
+                if (hasMetal) {
+                    uint32_t mx = (x * metalTex.width) / w;
+                    uint32_t my = (y * metalTex.height) / h;
+                    uint32_t srcIdx = (my * metalTex.width + mx) * 4;
+                    mVal = metalTex.pixels[srcIdx];
+                }
+
+                packedTex.pixels[dstIdx + 0] = 255;  // R: Occlusion
+                packedTex.pixels[dstIdx + 1] = rVal; // G: Roughness
+                packedTex.pixels[dstIdx + 2] = mVal; // B: Metallic
+                packedTex.pixels[dstIdx + 3] = 255;  // A: 1.0
+            }
+        }
+
+        uint32_t idx = static_cast<uint32_t>(data.textures.size()) + 1;
+        data.textures.push_back(std::move(packedTex));
+        packedMrTextures[key] = idx;
+        return idx;
+    };
+
+    auto getTextureFileFromInput = [](const UsdShadeInput& input) -> std::string {
+        if (!input) return "";
+        UsdShadeSourceInfoVector sources = input.GetConnectedSources();
+        if (sources.empty()) return "";
+        UsdPrim srcPrim = sources[0].source.GetPrim();
+        if (!srcPrim || !srcPrim.IsA<UsdShadeShader>()) return "";
+        UsdShadeShader texShader(srcPrim);
+        UsdShadeInput fileIn = texShader.GetInput(TfToken("file"));
+        if (!fileIn) return "";
+
+        SdfAssetPath assetPath;
+        if (fileIn.Get(&assetPath)) {
+            std::string p = assetPath.GetResolvedPath();
+            if (p.empty()) p = assetPath.GetAssetPath();
+            return p;
+        }
+        std::string strPath;
+        if (fileIn.Get(&strPath)) {
+            return strPath;
+        }
+        return "";
+    };
+
+    struct TextureTransform2D {
+        glm::vec2 scale{1.0f, 1.0f};
+        glm::vec2 translation{0.0f, 0.0f};
+        float rotation{0.0f};
+    };
+    std::vector<TextureTransform2D> materialTransforms;
+
+    auto getTextureTransformFromInput = [](const UsdShadeInput& input) -> TextureTransform2D {
+        TextureTransform2D xform{};
+        if (!input) return xform;
+        UsdShadeSourceInfoVector sources = input.GetConnectedSources();
+        if (sources.empty()) return xform;
+        UsdPrim texPrim = sources[0].source.GetPrim();
+        if (!texPrim || !texPrim.IsA<UsdShadeShader>()) return xform;
+        UsdShadeShader texShader(texPrim);
+
+        UsdShadeInput stIn = texShader.GetInput(TfToken("st"));
+        if (!stIn) stIn = texShader.GetInput(TfToken("uv"));
+        if (!stIn) return xform;
+
+        UsdShadeSourceInfoVector stSources = stIn.GetConnectedSources();
+        if (stSources.empty()) return xform;
+        UsdPrim xformPrim = stSources[0].source.GetPrim();
+        if (!xformPrim || !xformPrim.IsA<UsdShadeShader>()) return xform;
+
+        UsdShadeShader xformShader(xformPrim);
+        TfToken shaderId;
+        if (xformShader.GetIdAttr().Get(&shaderId) && shaderId == TfToken("UsdTransform2d")) {
+            UsdShadeInput scaleIn = xformShader.GetInput(TfToken("scale"));
+            if (scaleIn) {
+                GfVec2f s(1.0f, 1.0f);
+                if (scaleIn.Get(&s)) {
+                    xform.scale = glm::vec2(s[0], s[1]);
+                }
+            }
+            UsdShadeInput transIn = xformShader.GetInput(TfToken("translation"));
+            if (transIn) {
+                GfVec2f t(0.0f, 0.0f);
+                if (transIn.Get(&t)) {
+                    xform.translation = glm::vec2(t[0], t[1]);
+                }
+            }
+            UsdShadeInput rotIn = xformShader.GetInput(TfToken("rotation"));
+            if (rotIn) {
+                float r = 0.0f;
+                if (rotIn.Get(&r)) {
+                    xform.rotation = r;
+                }
+            }
+        }
+        return xform;
+    };
+
     std::unordered_map<std::string, uint32_t> materialCache;
     auto getOrCreateMaterial = [&](const UsdShadeMaterial& usdMat) -> uint32_t {
         if (!usdMat) return 0;
@@ -109,6 +371,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         gpuMat.ior = 1.5f;
         gpuMat.type = MATERIAL_DIFFUSE;
 
+        std::string matName = usdMat.GetPath().GetName();
+        std::string primName = usdMat.GetPrim().GetName().GetString();
+        std::string lowerMatName = matName;
+        std::transform(lowerMatName.begin(), lowerMatName.end(), lowerMatName.begin(), [](unsigned char c) { return std::tolower(c); });
+
+        TextureTransform2D matXform{};
+
         UsdShadeShader surfaceShader = usdMat.ComputeSurfaceSource();
         if (surfaceShader) {
             // Check UsdPreviewSurface attributes
@@ -116,8 +385,29 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             if (!diffuseInput) diffuseInput = surfaceShader.GetInput(TfToken("baseColor"));
             if (diffuseInput) {
                 GfVec3f color(0.8f, 0.8f, 0.8f);
-                diffuseInput.Get(&color);
+                bool hasAuthoredColor = diffuseInput.Get(&color);
                 gpuMat.albedo = glm::vec4(color[0], color[1], color[2], 1.0f);
+
+                matXform = getTextureTransformFromInput(diffuseInput);
+
+                std::string texFile = getTextureFileFromInput(diffuseInput);
+                std::string lowerTex = texFile;
+                std::transform(lowerTex.begin(), lowerTex.end(), lowerTex.begin(), [](unsigned char c) { return std::tolower(c); });
+
+                if (lowerTex.find("anisotropy") != std::string::npos || lowerMatName.find("fiber") != std::string::npos || lowerMatName.find("carbon") != std::string::npos) {
+                    // Anisotropy level masks are mistakenly connected as diffuseColor in some Blender USD exports.
+                    // Carbon fiber roof has a dark charcoal base albedo.
+                    gpuMat.albedo = glm::vec4(0.04f, 0.04f, 0.04f, 1.0f);
+                    gpuMat.roughness = 0.35f;
+                } else if (!texFile.empty()) {
+                    auto resolved = resolveTexturePath(texFile);
+                    if (!resolved.empty()) {
+                        gpuMat.albedoTex = getOrCreateTexture(resolved, true);
+                        if (!hasAuthoredColor) {
+                            gpuMat.albedo = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+                        }
+                    }
+                }
             }
 
             UsdShadeInput metallicInput = surfaceShader.GetInput(TfToken("metallic"));
@@ -137,6 +427,29 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 gpuMat.roughness = roughness;
             }
 
+            // Metallic / Roughness textures
+            std::string roughFile = roughnessInput ? getTextureFileFromInput(roughnessInput) : "";
+            std::string metalFile = metallicInput ? getTextureFileFromInput(metallicInput) : "";
+            if (!roughFile.empty() || !metalFile.empty()) {
+                auto resolvedRough = resolveTexturePath(roughFile);
+                auto resolvedMetal = resolveTexturePath(metalFile);
+                gpuMat.mrTex = getOrCreateMrTexture(resolvedRough, resolvedMetal, gpuMat.roughness, gpuMat.metallic);
+            }
+
+            UsdShadeInput normalInput = surfaceShader.GetInput(TfToken("normal"));
+            if (normalInput) {
+                if (matXform.scale == glm::vec2(1.0f, 1.0f)) {
+                    matXform = getTextureTransformFromInput(normalInput);
+                }
+                std::string normFile = getTextureFileFromInput(normalInput);
+                if (!normFile.empty()) {
+                    auto resolved = resolveTexturePath(normFile);
+                    if (!resolved.empty()) {
+                        gpuMat.normalTex = getOrCreateTexture(resolved, false);
+                    }
+                }
+            }
+
             UsdShadeInput iorInput = surfaceShader.GetInput(TfToken("ior"));
             if (iorInput) {
                 float ior = 1.5f;
@@ -154,18 +467,39 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 }
             }
 
+            // Glass material heuristic (name-based, tag-based, or low roughness dielectric)
+            bool isGlass = (lowerMatName.find("glass") != std::string::npos ||
+                            primName.find("glass") != std::string::npos ||
+                            lowerMatName.find("window") != std::string::npos ||
+                            lowerMatName.find("windshield") != std::string::npos ||
+                            (lowerMatName.rfind("g4", 0) == 0) ||
+                            (lowerMatName.size() == 2 && lowerMatName[0] == 'g' && std::isdigit(lowerMatName[1])) ||
+                            (gpuMat.roughness <= 0.05f && gpuMat.metallic == 0.0f && gpuMat.ior >= 1.4f && (lowerMatName[0] == 'g' || lowerMatName[0] == 'w')));
+
+            if (isGlass) {
+                gpuMat.type = MATERIAL_DIELECTRIC;
+                gpuMat.transmission = 1.0f;
+                gpuMat.ior = 1.5f;
+                gpuMat.roughness = 0.0f;
+                gpuMat.thickness = 0.0f; // Explicitly thin-walled transmission
+                // Preserve color tint for colored glass (e.g. taillights, turn signals), default clear to white
+                if (std::abs(gpuMat.albedo.r - 0.8f) < 0.05f && std::abs(gpuMat.albedo.g - 0.8f) < 0.05f && std::abs(gpuMat.albedo.b - 0.8f) < 0.05f) {
+                    gpuMat.albedo = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+                }
+            }
+
             UsdShadeInput clearcoatInput = surfaceShader.GetInput(TfToken("clearcoat"));
             if (clearcoatInput) {
                 float cc = 0.0f;
                 clearcoatInput.Get(&cc);
-                gpuMat.clearcoat = cc;
+                gpuMat.clearcoat = std::clamp(cc, 0.0f, 1.0f);
             }
 
             UsdShadeInput clearcoatRoughnessInput = surfaceShader.GetInput(TfToken("clearcoatRoughness"));
             if (clearcoatRoughnessInput) {
                 float ccr = 0.0f;
                 clearcoatRoughnessInput.Get(&ccr);
-                gpuMat.clearcoatRoughness = ccr;
+                gpuMat.clearcoatRoughness = std::clamp(ccr, 0.04f, 1.0f);
             }
 
             UsdShadeInput emissiveInput = surfaceShader.GetInput(TfToken("emissiveColor"));
@@ -176,11 +510,38 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 if (glm::length(glm::vec3(gpuMat.emissive)) > 1e-3f) {
                     gpuMat.type = MATERIAL_EMISSIVE;
                 }
+                std::string emissiveFile = getTextureFileFromInput(emissiveInput);
+                if (!emissiveFile.empty()) {
+                    auto resolved = resolveTexturePath(emissiveFile);
+                    if (!resolved.empty()) {
+                        gpuMat.emissiveTex = getOrCreateTexture(resolved, true);
+                    }
+                }
+            }
+        }
+
+        // Foliage and bark heuristics for untextured botanical materials (e.g. Botaniq assets without exported shader networks)
+        if (gpuMat.albedoTex == 0 && gpuMat.type == MATERIAL_DIFFUSE) {
+            if (lowerMatName.find("leaf") != std::string::npos || lowerMatName.find("leaves") != std::string::npos || lowerMatName.find("foliage") != std::string::npos) {
+                if (lowerMatName.find("autumn") != std::string::npos || lowerMatName.find("orange") != std::string::npos || lowerMatName.find("yellow") != std::string::npos) {
+                    gpuMat.albedo = glm::vec4(0.82f, 0.48f, 0.12f, 1.0f); // Warm autumn foliage
+                } else {
+                    gpuMat.albedo = glm::vec4(0.12f, 0.28f, 0.08f, 1.0f); // Lush summer green foliage
+                }
+                gpuMat.roughness = 0.65f;
+            } else if (lowerMatName.find("bark") != std::string::npos || lowerMatName.find("trunk") != std::string::npos) {
+                if (lowerMatName.find("populus") != std::string::npos || lowerMatName.find("birch") != std::string::npos) {
+                    gpuMat.albedo = glm::vec4(0.48f, 0.45f, 0.40f, 1.0f); // Light birch/aspen bark
+                } else {
+                    gpuMat.albedo = glm::vec4(0.16f, 0.12f, 0.08f, 1.0f); // Dark oak bark
+                }
+                gpuMat.roughness = 0.85f;
             }
         }
 
         uint32_t newId = static_cast<uint32_t>(data.materials.size());
         data.materials.push_back(gpuMat);
+        materialTransforms.push_back(matXform);
         materialCache[matPath] = newId;
         return newId;
     };
@@ -202,6 +563,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         gpuMat.type = MATERIAL_DIFFUSE;
         uint32_t newId = static_cast<uint32_t>(data.materials.size());
         data.materials.push_back(gpuMat);
+        materialTransforms.push_back(TextureTransform2D{});
         colorMaterialCache[key] = newId;
         return newId;
     };
@@ -213,6 +575,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         defaultMat.metallic = 0.0f;
         defaultMat.type = MATERIAL_DIFFUSE;
         data.materials.push_back(defaultMat);
+        materialTransforms.push_back(TextureTransform2D{});
     }
 
     // Determine initial evaluation time code
@@ -226,7 +589,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
     std::vector<UsdGeomPointInstancer> pointInstancers;
     std::vector<SdfPath> allPrototypeTargets;
 
-    for (const UsdPrim& prim : stage->Traverse()) {
+    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
         if (prim.IsA<UsdGeomPointInstancer>()) {
             UsdGeomPointInstancer inst(prim);
             pointInstancers.push_back(inst);
@@ -239,7 +602,8 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
     }
 
     // 4. Traverse Stage Prims: Regular Geometry & Lights
-    for (const UsdPrim& prim : stage->Traverse()) {
+    bool hasDomeLight = false;
+    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
         // --- Process Meshes ---
         if (prim.IsA<UsdGeomMesh>()) {
             // If this mesh is part of any PointInstancer prototype hierarchy, skip it here
@@ -294,10 +658,11 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             UsdGeomPrimvarsAPI primvarsAPI(mesh);
             UsdGeomPrimvar stPrimvar = primvarsAPI.GetPrimvar(TfToken("st"));
             if (!stPrimvar) stPrimvar = primvarsAPI.GetPrimvar(TfToken("uv"));
+            if (!stPrimvar) stPrimvar = primvarsAPI.GetPrimvar(TfToken("UVMap"));
             if (stPrimvar) {
-                stPrimvar.Get(&uvs, evalTime);
+                stPrimvar.ComputeFlattened(&uvs, evalTime);
                 if (uvs.empty() && evalTime != UsdTimeCode::Default()) {
-                    stPrimvar.Get(&uvs, UsdTimeCode::Default());
+                    stPrimvar.ComputeFlattened(&uvs, UsdTimeCode::Default());
                 }
                 uvInterp = stPrimvar.GetInterpolation();
             }
@@ -308,6 +673,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             UsdShadeMaterial boundMat = bindingAPI.ComputeBoundMaterial();
             if (boundMat) {
                 defaultMatId = getOrCreateMaterial(boundMat);
+            } else {
+                // If mesh has no bound material, check for a matching Material_001 on the stage
+                UsdPrim mat001 = stage->GetPrimAtPath(SdfPath("/root/_materials/Material_001"));
+                if (mat001 && mat001.IsA<UsdShadeMaterial>()) {
+                    boundMat = UsdShadeMaterial(mat001);
+                    defaultMatId = getOrCreateMaterial(boundMat);
+                }
             }
 
             UsdGeomPrimvar dispColorPrim = primvarsAPI.GetPrimvar(TfToken("displayColor"));
@@ -326,6 +698,27 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 }
             }
 
+            // Check for per-face GeomSubsets
+            std::vector<uint32_t> faceMaterials(faceVertexCounts.size(), defaultMatId);
+            std::vector<UsdGeomSubset> subsets = UsdGeomSubset::GetAllGeomSubsets(mesh);
+            for (const auto& subset : subsets) {
+                UsdShadeMaterialBindingAPI subBinding(subset.GetPrim());
+                UsdShadeMaterial subMat = subBinding.ComputeBoundMaterial();
+                if (subMat) {
+                    uint32_t subMatId = getOrCreateMaterial(subMat);
+                    VtIntArray subIndices;
+                    subset.GetIndicesAttr().Get(&subIndices, evalTime);
+                    if (subIndices.empty() && evalTime != UsdTimeCode::Default()) {
+                        subset.GetIndicesAttr().Get(&subIndices, UsdTimeCode::Default());
+                    }
+                    for (int fIdx : subIndices) {
+                        if (fIdx >= 0 && static_cast<size_t>(fIdx) < faceMaterials.size()) {
+                            faceMaterials[fIdx] = subMatId;
+                        }
+                    }
+                }
+            }
+
             // Polygon Triangulation & Vertex Assembly
             size_t indexOffset = 0;
             for (size_t f = 0; f < faceVertexCounts.size(); ++f) {
@@ -335,8 +728,8 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     continue;
                 }
 
-                uint32_t faceMatId = defaultMatId;
-                if (!boundMat && !dispColors.empty() && dispColorInterp == UsdGeomTokens->uniform && f < dispColors.size()) {
+                uint32_t faceMatId = faceMaterials[f];
+                if (!boundMat && subsets.empty() && !dispColors.empty() && dispColorInterp == UsdGeomTokens->uniform && f < dispColors.size()) {
                     faceMatId = getOrCreateColorMaterial(dispColors[f]);
                 }
 
@@ -373,8 +766,18 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                             uv = glm::vec2(uvs[indexOffset + localIdx][0], uvs[indexOffset + localIdx][1]);
                         }
                     }
+                    if (faceMatId < materialTransforms.size()) {
+                        const auto& xf = materialTransforms[faceMatId];
+                        if (xf.rotation != 0.0f) {
+                            float rad = glm::radians(xf.rotation);
+                            float cosR = std::cos(rad);
+                            float sinR = std::sin(rad);
+                            uv = glm::vec2(uv.x * cosR - uv.y * sinR, uv.x * sinR + uv.y * cosR);
+                        }
+                        uv = uv * xf.scale + xf.translation;
+                    }
                     v.position.w = uv.x;
-                    v.normal.w = uv.y;
+                    v.normal.w = 1.0f - uv.y;
                     v.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
 
                     return v;
@@ -440,6 +843,10 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             }
         }
         // --- Process Lights (UsdLux) ---
+        else if (prim.IsA<UsdLuxDomeLight>()) {
+            hasDomeLight = true;
+            Logger::info("UsdLoader: Detected UsdLuxDomeLight at '{}'", prim.GetPath().GetString());
+        }
         else if (prim.IsA<UsdLuxRectLight>() || prim.IsA<UsdLuxDiskLight>() ||
                  prim.IsA<UsdLuxSphereLight>() || prim.IsA<UsdLuxDistantLight>()) {
             GfMatrix4d usdWorldMat = xformCache.GetLocalToWorldTransform(prim);
@@ -451,6 +858,8 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             float intensity = 1.0f;
             float exposure = 0.0f;
 
+            float fluxScale = intensity * std::pow(2.0f, exposure);
+
             if (prim.IsA<UsdLuxRectLight>()) {
                 UsdLuxRectLight rl(prim);
                 rl.GetColorAttr().Get(&color);
@@ -460,10 +869,17 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 rl.GetWidthAttr().Get(&width);
                 rl.GetHeightAttr().Get(&height);
 
-                gpuLight.position = glm::vec4(pos, LIGHT_AREA_QUAD);
-                gpuLight.u = glm::vec4(glm::vec3(M[0]) * width * 0.5f, 0.0f);
-                gpuLight.v = glm::vec4(glm::vec3(M[1]) * height * 0.5f, 0.0f);
+                glm::vec3 uVec = glm::vec3(M[0]) * width;
+                glm::vec3 vVec = glm::vec3(M[1]) * height;
+                glm::vec3 corner = pos - 0.5f * (uVec + vVec);
+                float area = glm::length(glm::cross(uVec, vVec));
+
+                gpuLight.position = glm::vec4(corner, LIGHT_AREA_QUAD);
+                gpuLight.u = glm::vec4(uVec, 0.0f);
+                gpuLight.v = glm::vec4(vVec, 0.0f);
                 gpuLight.normal = glm::vec4(-glm::normalize(glm::vec3(M[2])), 0.0f);
+                fluxScale = intensity * std::pow(2.0f, exposure);
+                gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, area);
             } else if (prim.IsA<UsdLuxDistantLight>()) {
                 UsdLuxDistantLight dl(prim);
                 dl.GetColorAttr().Get(&color);
@@ -473,12 +889,14 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 glm::vec3 dirToLight = glm::normalize(glm::vec3(M[2]));
                 gpuLight.position = glm::vec4(pos, LIGHT_DIRECTIONAL);
                 gpuLight.normal = glm::vec4(dirToLight, 0.0f);
+                fluxScale = intensity * std::pow(2.0f, exposure);
+                gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
             } else {
                 gpuLight.position = glm::vec4(pos, LIGHT_AREA_QUAD);
+                fluxScale = intensity * std::pow(2.0f, exposure);
+                gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
             }
 
-            float fluxScale = intensity * std::pow(2.0f, exposure);
-            gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
             data.lights.push_back(gpuLight);
         }
         // --- Process Cameras (UsdGeomCamera) ---
@@ -626,10 +1044,11 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 UsdGeomPrimvarsAPI pAPI(protoMesh);
                 UsdGeomPrimvar stPrim = pAPI.GetPrimvar(TfToken("st"));
                 if (!stPrim) stPrim = pAPI.GetPrimvar(TfToken("uv"));
+                if (!stPrim) stPrim = pAPI.GetPrimvar(TfToken("UVMap"));
                 if (stPrim) {
-                    stPrim.Get(&uvs, instEvalTime);
+                    stPrim.ComputeFlattened(&uvs, instEvalTime);
                     if (uvs.empty() && instEvalTime != UsdTimeCode::Default()) {
-                        stPrim.Get(&uvs, UsdTimeCode::Default());
+                        stPrim.ComputeFlattened(&uvs, UsdTimeCode::Default());
                     }
                     uvInterp = stPrim.GetInterpolation();
                 }
@@ -657,6 +1076,27 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     }
                 }
 
+                // Check for per-face GeomSubsets in prototype mesh
+                std::vector<uint32_t> protoFaceMaterials(fvc.size(), defaultMeshMatId);
+                std::vector<UsdGeomSubset> pSubsets = UsdGeomSubset::GetAllGeomSubsets(protoMesh);
+                for (const auto& subset : pSubsets) {
+                    UsdShadeMaterialBindingAPI subBinding(subset.GetPrim());
+                    UsdShadeMaterial subMat = subBinding.ComputeBoundMaterial();
+                    if (subMat) {
+                        uint32_t subMatId = getOrCreateMaterial(subMat);
+                        VtIntArray subIndices;
+                        subset.GetIndicesAttr().Get(&subIndices, instEvalTime);
+                        if (subIndices.empty() && instEvalTime != UsdTimeCode::Default()) {
+                            subset.GetIndicesAttr().Get(&subIndices, UsdTimeCode::Default());
+                        }
+                        for (int fIdx : subIndices) {
+                            if (fIdx >= 0 && static_cast<size_t>(fIdx) < protoFaceMaterials.size()) {
+                                protoFaceMaterials[fIdx] = subMatId;
+                            }
+                        }
+                    }
+                }
+
                 size_t indexOffset = 0;
                 for (size_t f = 0; f < fvc.size(); ++f) {
                     int count = fvc[f];
@@ -665,8 +1105,8 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                         continue;
                     }
 
-                    uint32_t faceMatId = defaultMeshMatId;
-                    if (!boundMat && !dispColors.empty() && dispColorInterp == UsdGeomTokens->uniform && f < dispColors.size()) {
+                    uint32_t faceMatId = protoFaceMaterials[f];
+                    if (!boundMat && pSubsets.empty() && !dispColors.empty() && dispColorInterp == UsdGeomTokens->uniform && f < dispColors.size()) {
                         faceMatId = getOrCreateColorMaterial(dispColors[f]);
                     }
 
@@ -700,7 +1140,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                             }
                         }
                         v.position.w = uv.x;
-                        v.normal.w = uv.y;
+                        v.normal.w = 1.0f - uv.y;
                         v.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
                         return v;
                     };
@@ -906,8 +1346,8 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
 
             // Compute viewing direction: elevated 3/4 vantage
             // Wide outdoor scenes benefit from an azimuth angle for 3/4 depth parallax
-            float azimuthDeg = (extent.x > 50.0f) ? 14.0f : 0.0f;
-            float pitchDeg = (extent.y < extent.x * 0.4f) ? 14.0f : 10.0f;
+            float azimuthDeg = (extent.x > 50.0f) ? 18.0f : 28.0f;
+            float pitchDeg = (extent.y < extent.x * 0.4f) ? 14.0f : 12.0f;
 
             float radAzimuth = glm::radians(azimuthDeg);
             float radPitch = glm::radians(pitchDeg);
@@ -958,7 +1398,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                          data.cameraTarget.x, data.cameraTarget.y, data.cameraTarget.z, finalDist);
         }
 
-        if (data.lights.empty()) {
+        if (data.lights.empty() && !hasDomeLight) {
             float lightSide = maxDim * 0.8f;
             float lightY = bMax.y + maxDim * 0.6f;
             LightGPU defaultLight{};
@@ -967,7 +1407,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
             defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
             float area = lightSide * lightSide;
-            defaultLight.emission = glm::vec4(30.0f, 30.0f, 30.0f, area);
+            defaultLight.emission = glm::vec4(15.0f, 15.0f, 15.0f, area);
             data.lights.push_back(defaultLight);
         }
 
@@ -1007,11 +1447,32 @@ bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTrian
 
     UsdTimeCode evalTime = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
     std::vector<UsdGeomPointInstancer> pointInstancers;
+    std::vector<SdfPath> allPrototypeTargets;
 
-    for (const UsdPrim& prim : stage->Traverse()) {
+    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
+        if (prim.IsA<UsdGeomPointInstancer>()) {
+            UsdGeomPointInstancer inst(prim);
+            pointInstancers.push_back(inst);
+            SdfPathVector targets;
+            inst.GetPrototypesRel().GetTargets(&targets);
+            for (const auto& tgt : targets) {
+                allPrototypeTargets.push_back(tgt);
+            }
+        }
+    }
+
+    for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
         if (prim.IsA<UsdShadeMaterial>()) {
             matCount++;
         } else if (prim.IsA<UsdGeomMesh>()) {
+            bool isPointInstancerProto = false;
+            for (const auto& tgt : allPrototypeTargets) {
+                if (prim.GetPath().HasPrefix(tgt)) {
+                    isPointInstancerProto = true;
+                    break;
+                }
+            }
+
             UsdGeomMesh mesh(prim);
             VtIntArray faceVertexCounts;
             mesh.GetFaceVertexCountsAttr().Get(&faceVertexCounts, evalTime);
@@ -1024,7 +1485,8 @@ bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTrian
             }
             std::string pathStr = prim.GetPath().GetString();
             protoTris[pathStr] = meshTris;
-            if (pathStr.find("/Prototypes") == std::string::npos &&
+            if (!isPointInstancerProto &&
+                pathStr.find("/Prototypes") == std::string::npos &&
                 pathStr.find("/prototypes") == std::string::npos &&
                 pathStr.find("prototype") == std::string::npos) {
                 totalTris += meshTris;
@@ -1044,8 +1506,6 @@ bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTrian
                     uniqueDisplayColors.insert(colKey);
                 }
             }
-        } else if (prim.IsA<UsdGeomPointInstancer>()) {
-            pointInstancers.push_back(UsdGeomPointInstancer(prim));
         }
     }
 
@@ -1099,7 +1559,7 @@ bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTrian
         totalMats += 1; // Default fallback material at slot 0
     }
     outMaterials = (totalMats > 0) ? totalMats : 1;
-    return true;
+    return (totalTris > 0);
 #else
     (void)filepath;
     outTriangles = 0;

@@ -90,10 +90,22 @@ struct Config {
     float shadow_denoiser_depth_sigma = 0.02f;
     float shadow_denoiser_normal_power = 16.0f;
     bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
-    float taa_blend_alpha = 0.10f;        // TAA temporal blend factor (0.10 current, 0.90 history)
-    float taa_clipping_gamma = 2.25f;     // TAA variance clipping bounding box multiplier (optimized for stochastic 1-SPP)
-    DenoiserMode denoiser_mode = DenoiserMode::Temporal; // Default: Temporal Radiance Accumulation (TRA)
-    bool enable_temporal_accum = true;    // Motion-vector guided temporal accumulation [Default: enabled, negate via --no-temporal-accum]
+    // Denoiser Defaults & Rationale:
+    // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None, enable_temporal_accum = false).
+    // Changing this default to DenoiserMode::Temporal (or enable_temporal_accum = true) causes a severe
+    // "Star Wars hyperspace jump" radial streak artifact during interactive camera translation/zoom:
+    // 1. At 1 SPP, incoming radiance is discrete, high-contrast stochastic Monte Carlo noise.
+    // 2. Camera forward/backward motion creates an outward/inward radial optical flow vector field.
+    // 3. Temporal accumulation (EMA alpha = 0.25, 75% history retention) persists noise grains across ~15 frames
+    //    (0.75^15 ~= 0.013), dragging each grain along the radial motion vectors by 50-100 pixels.
+    // 4. Hundreds of thousands of grains tracing radial lines simultaneously produce needle-like streaks
+    //    (radial-to-tangential gradient ratio R = <|grad_theta|> / <|grad_r|> increases from 0.999 to >1.075).
+    // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise (R = 0.999)
+    // with zero motion trails during interactive navigation, and seamless progressive convergence (up to 2048 spp)
+    // when stationary. Temporal accumulation should remain opt-in (--temporal-accum / --tra) or paired with
+    // spatial regression filtering (BMFR / Upways).
+    DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
+    bool enable_temporal_accum = false;   // Motion-vector guided temporal accumulation [Default: disabled, opt-in via --temporal-accum / --denoiser temporal]
     bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled, opt-in via --bmfr]
     float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
     float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth

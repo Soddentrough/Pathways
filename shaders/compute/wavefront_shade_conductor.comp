@@ -354,7 +354,7 @@ void main() {
                         float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                         float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
-                        float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, sqrt(ax), sqrt(ay))
+                        float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, ax, ay)
                                           : distributionGGX(NdotH, alphaRoughness);
                         float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
                         f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
@@ -428,22 +428,25 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
                     pathTerminated = true;
                 } else {
-                vec3 H = isAniso ? sampleAnisotropicGGX(hitNormal, T, B, sqrt(ax), sqrt(ay), seed)
+                vec3 H = isAniso ? sampleAnisotropicGGX(hitNormal, T, B, ax, ay, seed)
                                  : sampleGGX(hitNormal, alphaRoughness, seed);
                 nextDirection = reflect(-V, H);
                 vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
 
                 float NdotL_next = dot(hitNormal, nextDirection);
                 if (NdotL_next <= 0.0) {
-                    pathTerminated = true;
-                } else {
-                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                    f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotH), F0);
-                    float G_sample = visibilitySmithGGXCorrelated(NdotL_next, NdotV, alphaRoughness);
+                    // Grazing rejection fallback: reflect into upper hemisphere along macro normal
+                    nextDirection = reflect(-V, hitNormal);
+                    NdotL_next = clamp(dot(hitNormal, nextDirection), 0.001, 1.0);
+                    H = normalize(V + nextDirection);
+                }
+                float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotH), F0);
+                float G_sample = visibilitySmithGGXCorrelated(NdotL_next, NdotV, alphaRoughness);
 
-                    // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
-                    throughput *= F_sample * float16_t(4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4));
+                // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
+                throughput *= F_sample * float16_t(clamp(4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4), 0.0, 10.0));
 
                     float pathLum = float(dot(throughput * float16_t(max(ubo.spp, 1u)), f16vec3(0.2126, 0.7152, 0.0722)));
                     if (pathLum < 0.001) {
@@ -471,7 +474,6 @@ void main() {
                     }
                 }
             }
-        }
 
         if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));

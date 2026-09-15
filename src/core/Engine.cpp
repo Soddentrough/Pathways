@@ -3706,20 +3706,25 @@ void Engine::renderFrame() {
         flags |= (1 << 23); // Camera motion / history reset flag
     }
 
-    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
-                                                 m_config.enable_taa, m_config.width, m_config.height, 0);
-    m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
-
     uint32_t imageIndex = 0;
     if (!m_config.headless && m_swapchain) {
-        VkResult res = m_swapchain->acquireNextImage(m_imageAvailableSemaphores[m_currentFrame], &imageIndex);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR ||
+        int curW = 0, curH = 0;
+        SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
+        uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
+        uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+
+        if (targetW != m_swapchain->getExtent().width ||
+            targetH != m_swapchain->getExtent().height ||
             m_config.width != m_swapchain->getExtent().width ||
             m_config.height != m_swapchain->getExtent().height) {
-            int curW = 0, curH = 0;
+            onResize(targetW, targetH, /*forceRecreate=*/true);
+        }
+
+        VkResult res = m_swapchain->acquireNextImage(m_imageAvailableSemaphores[m_currentFrame], &imageIndex);
+        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
             SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
-            uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
-            uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+            targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
+            targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
             onResize(targetW, targetH, /*forceRecreate=*/true);
             return;
         }
@@ -3728,6 +3733,10 @@ void Engine::renderFrame() {
             return;
         }
     }
+
+    CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
+                                                 m_config.enable_taa, m_config.width, m_config.height, 0);
+    m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -4112,7 +4121,7 @@ void Engine::renderFrame() {
 
             if (m_config.enable_taa) {
                 uboSec = m_camera->getUniformData(m_frameIndex, secSpp, activeBounces, flags,
-                                                  true, m_config.width, m_config.height, 4);
+                                                  true, m_config.width, m_config.height, 4, false);
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
@@ -5379,6 +5388,18 @@ FrameStats Engine::getStats() const {
     }
 
     for (const auto& tally : m_configTallies) {
+        if (tally.frameCount <= 2 && m_configTallies.size() > 1) {
+            bool hasSubstantial = false;
+            for (const auto& other : m_configTallies) {
+                if (other.frameCount >= 5) {
+                    hasSubstantial = true;
+                    break;
+                }
+            }
+            if (hasSubstantial) {
+                continue;
+            }
+        }
         FrameStats::ConfigTallySummary s;
         s.label = tally.label;
         s.frame_count = tally.frameCount;
@@ -5518,37 +5539,13 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_config.width = m_swapchain->getExtent().width;
     m_config.height = m_swapchain->getExtent().height;
 
-    // 2. Recreate sync objects (semaphores and fences) for new swapchain
-    for (auto sem : m_renderFinishedSemaphores) {
-        if (sem != VK_NULL_HANDLE) {
-            vkDestroySemaphore(device, sem, nullptr);
-        }
-    }
-    m_renderFinishedSemaphores.clear();
-
+    // 2. Ensure render finished semaphores cover all swapchain images (never destroy in-use sync objects during resize)
     VkSemaphoreCreateInfo semInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     uint32_t numSwapImages = m_swapchain->getImageCount();
-    m_renderFinishedSemaphores.resize(numSwapImages);
-    for (size_t i = 0; i < numSwapImages; ++i) {
-        vkCreateSemaphore(device, &semInfo, nullptr, &m_renderFinishedSemaphores[i]);
-    }
-
-    for (auto& sem : m_imageAvailableSemaphores) {
-        if (sem != VK_NULL_HANDLE) {
-            vkDestroySemaphore(device, sem, nullptr);
-            sem = VK_NULL_HANDLE;
-        }
+    while (m_renderFinishedSemaphores.size() < numSwapImages) {
+        VkSemaphore sem = VK_NULL_HANDLE;
         vkCreateSemaphore(device, &semInfo, nullptr, &sem);
-    }
-
-    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        if (m_inFlightFences[i] != VK_NULL_HANDLE) {
-            vkDestroyFence(device, m_inFlightFences[i], nullptr);
-            m_inFlightFences[i] = VK_NULL_HANDLE;
-        }
-        vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFences[i]);
+        m_renderFinishedSemaphores.push_back(sem);
     }
 
     // 3. Recreate Accumulation & Output Images
@@ -5710,6 +5707,12 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     // 9. Invalidate accumulation
     m_frameIndex = 0;
     m_resetAccumulation = true;
+
+    // 10. Prune transient startup tallies if window layout resizes during engine initialization settling phase
+    if (m_totalFramesRendered <= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT + 2) {
+        m_configTallies.clear();
+        m_frameTimesMs.clear();
+    }
 }
 
 std::string Engine::getActiveSceneName() const {
@@ -5784,13 +5787,38 @@ void Engine::printExecutionSummary() const {
         return;
     }
 
+    // Prune transient startup tallies (e.g. <= 2 frames sampled before window settled)
+    // when a primary configuration exists
+    std::vector<const ConfigStatsTally*> activeTallies;
+    for (const auto& tally : m_configTallies) {
+        if (tally.frameCount <= 2 && m_configTallies.size() > 1) {
+            bool hasSubstantial = false;
+            for (const auto& other : m_configTallies) {
+                if (other.frameCount >= 5) {
+                    hasSubstantial = true;
+                    break;
+                }
+            }
+            if (hasSubstantial) {
+                continue; // Skip startup transient tally
+            }
+        }
+        activeTallies.push_back(&tally);
+    }
+
+    if (activeTallies.empty()) {
+        for (const auto& tally : m_configTallies) {
+            activeTallies.push_back(&tally);
+        }
+    }
+
     Logger::info("  Pathways Hybrid Path Tracing Engine - Execution Summary ({} Configuration{})",
-                 m_configTallies.size(), m_configTallies.size() == 1 ? "" : "s");
+                 activeTallies.size(), activeTallies.size() == 1 ? "" : "s");
     Logger::info("========================================================================================");
 
-    for (size_t i = 0; i < m_configTallies.size(); ++i) {
-        const auto& tally = m_configTallies[i];
-        Logger::info("  [Config {}/{}] {}", i + 1, m_configTallies.size(), tally.label);
+    for (size_t i = 0; i < activeTallies.size(); ++i) {
+        const auto& tally = *activeTallies[i];
+        Logger::info("  [Config {}/{}] {}", i + 1, activeTallies.size(), tally.label);
         Logger::info("    Frames Sampled:      {}", tally.frameCount);
         Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
         Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
@@ -5819,18 +5847,18 @@ void Engine::printExecutionSummary() const {
                          tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
             // Find single GPU baseline for speedup calculation
             double baselineMs = 0.0;
-            for (const auto& other : m_configTallies) {
-                if (other.key.scene_name == tally.key.scene_name &&
-                    other.key.pipeline_type == tally.key.pipeline_type &&
-                    other.key.mgpu_mode == MultiGpuMode::Off &&
-                    other.key.width == tally.key.width &&
-                    other.key.height == tally.key.height &&
-                    other.key.spp == tally.key.spp &&
-                    other.key.max_bounces == tally.key.max_bounces &&
-                    other.key.accum_format == tally.key.accum_format &&
-                    other.key.denoiser == tally.key.denoiser &&
-                    other.key.enable_nrc == tally.key.enable_nrc) {
-                    baselineMs = other.getAvgFrameTimeMs();
+            for (const auto* other : activeTallies) {
+                if (other->key.scene_name == tally.key.scene_name &&
+                    other->key.pipeline_type == tally.key.pipeline_type &&
+                    other->key.mgpu_mode == MultiGpuMode::Off &&
+                    other->key.width == tally.key.width &&
+                    other->key.height == tally.key.height &&
+                    other->key.spp == tally.key.spp &&
+                    other->key.max_bounces == tally.key.max_bounces &&
+                    other->key.accum_format == tally.key.accum_format &&
+                    other->key.denoiser == tally.key.denoiser &&
+                    other->key.enable_nrc == tally.key.enable_nrc) {
+                    baselineMs = other->getAvgFrameTimeMs();
                     break;
                 }
             }
@@ -5878,7 +5906,7 @@ void Engine::printExecutionSummary() const {
 
         Logger::info("    Ray Throughput:      {:.2f} GigaRays/sec", tally.getRayThroughput() * 1e-9);
         Logger::info("    Sub-8ms Budget:      {}", tally.isTargetAchieved() ? "\033[32mACHIEVED\033[0m" : "\033[33mEXCEEDED\033[0m");
-        if (i + 1 < m_configTallies.size()) {
+        if (i + 1 < activeTallies.size()) {
             Logger::info("  --------------------------------------------------------------------------------------");
         }
     }
@@ -5978,9 +6006,9 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
             wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
 
-            // ubo with spp = 1 so samples accumulate full unscaled radiance
+            // ubo with spp = 1 so samples accumulate full unscaled radiance; do not clobber m_prevViewProj
             CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, m_config.max_bounces, flags,
-                                                         false, width, height, 0);
+                                                         false, width, height, 0, /*updatePrev=*/false);
             m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
             VkCommandBuffer cmd = m_commandBuffers[0];
@@ -6095,9 +6123,9 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         clearImage(cmd, m_motionVectorImage.get());
         clearImage(cmd, m_normalDepthImage.get());
 
-        // 2. Set camera UBO
+        // 2. Set camera UBO (advances m_prevViewProj to track true velocity)
         CameraUniform ubo = m_camera->getUniformData(frameIdx, 1, m_config.max_bounces, flags,
-                                                     false, width, height, 0);
+                                                     false, width, height, 0, /*updatePrev=*/true);
         m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
         // 3. Dispatch 1-SPP with captureMlData = 1
@@ -6154,8 +6182,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             region.imageSubresource.layerCount = 1;
             region.imageExtent = { width, height, 1 };
-
-            vkCmdCopyImageToBuffer(cmd, img->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingInput.getBuffer(), 1, &region);
+            vkCmdCopyImageToBuffer(cmd, img->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   stagingInput.getBuffer(), 1, &region);
 
             img->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
@@ -6189,52 +6217,36 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
 
         uint32_t outChannels = m_config.capture_channels;
-        if (outChannels != 16 && outChannels != 19 && outChannels != 20) {
-            outChannels = 20;
-        }
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
 
-        if (outChannels == 20) {
-            // PTTD v2: 20-channel aligned format (5 x vec4)
-            // Vector 0 (Ch 00..03): Diffuse Radiance RGB + Roughness
-            // Vector 1 (Ch 04..07): Specular Radiance RGB + Metallic
-            // Vector 2 (Ch 08..11): Base Color Albedo RGB + Linear Depth
-            // Vector 3 (Ch 12..15): Surface MV XY + Specular MV XY
-            // Vector 4 (Ch 16..19): Surface Normals XYZ + Specular Hit Dist
-            for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
-                // Vector 0: Diffuse Radiance RGB + Roughness
-                inputPayload[p * 20 + 0]  = diffPixels[p * 4 + 0]; // diffuse R
-                inputPayload[p * 20 + 1]  = diffPixels[p * 4 + 1]; // diffuse G
-                inputPayload[p * 20 + 2]  = diffPixels[p * 4 + 2]; // diffuse B
-                inputPayload[p * 20 + 3]  = arPixels[p * 4 + 3];   // roughness
-
-                // Vector 1: Specular Radiance RGB + Metallic
-                inputPayload[p * 20 + 4]  = specPixels[p * 4 + 0]; // specular R
-                inputPayload[p * 20 + 5]  = specPixels[p * 4 + 1]; // specular G
-                inputPayload[p * 20 + 6]  = specPixels[p * 4 + 2]; // specular B
-                inputPayload[p * 20 + 7]  = smPixels[p * 4 + 3];   // metallic
-
-                // Vector 2: Base Color Albedo RGB + Linear Depth
-                inputPayload[p * 20 + 8]  = arPixels[p * 4 + 0];   // albedo R
-                inputPayload[p * 20 + 9]  = arPixels[p * 4 + 1];   // albedo G
-                inputPayload[p * 20 + 10] = arPixels[p * 4 + 2];   // albedo B
-                inputPayload[p * 20 + 11] = ndPixels[p * 4 + 3];   // linear depth
-
-                // Vector 3: Surface Motion XY + Specular Motion XY
-                inputPayload[p * 20 + 12] = mvPixels[p * 2 + 0];   // surface motion X
-                inputPayload[p * 20 + 13] = mvPixels[p * 2 + 1];   // surface motion Y
-                inputPayload[p * 20 + 14] = smPixels[p * 4 + 0];   // specular motion X
-                inputPayload[p * 20 + 15] = smPixels[p * 4 + 1];   // specular motion Y
-
-                // Vector 4: Surface Normals XYZ + Specular Hit Distance
-                inputPayload[p * 20 + 16] = ndPixels[p * 4 + 0];   // normal X
-                inputPayload[p * 20 + 17] = ndPixels[p * 4 + 1];   // normal Y
-                inputPayload[p * 20 + 18] = ndPixels[p * 4 + 2];   // normal Z
-                inputPayload[p * 20 + 19] = smPixels[p * 4 + 2];   // specular hit distance
-            }
-        } else {
-            // Legacy 16 / 19 channels (PTTD v1)
-            for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+        for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+            if (outChannels >= 20) {
+                // Vector 0 (Ch 00..03): Diffuse Radiance RGB + Roughness
+                inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
+                inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
+                inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
+                inputPayload[p * outChannels + 3]  = arPixels[p * 4 + 3];   // roughness
+                // Vector 1 (Ch 04..07): Specular Radiance RGB + Metallic
+                inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 0]; // specular R
+                inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 1]; // specular G
+                inputPayload[p * outChannels + 6]  = specPixels[p * 4 + 2]; // specular B
+                inputPayload[p * outChannels + 7]  = diffPixels[p * 4 + 3]; // metallic
+                // Vector 2 (Ch 08..11): Base Color Albedo RGB + Linear Depth
+                inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 0];   // albedo R
+                inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 1];   // albedo G
+                inputPayload[p * outChannels + 10] = arPixels[p * 4 + 2];   // albedo B
+                inputPayload[p * outChannels + 11] = ndPixels[p * 4 + 3];   // linear depth
+                // Vector 3 (Ch 12..15): Surface Motion XY + Specular Motion XY
+                inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
+                inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+                inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
+                inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
+                // Vector 4 (Ch 16..19): Surface Normal XYZ + Specular Hit Distance
+                inputPayload[p * outChannels + 16] = ndPixels[p * 4 + 0];   // normal X
+                inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1];   // normal Y
+                inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2];   // normal Z
+                inputPayload[p * outChannels + 19] = smPixels[p * 4 + 2];   // specular hit distance
+            } else {
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
                 inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
                 inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
@@ -6288,11 +6300,11 @@ void Engine::runTrainingDataCapture() {
     for (uint32_t f = 0; f < m_config.capture_frames; ++f) {
         Logger::info("--- Capturing Training Frame [{}/{}] ---", f + 1, m_config.capture_frames);
 
-        // 1. Render Ground Truth Reference Frame
-        captureTrainingFrame(f, /*isReference=*/true, m_config.capture_reference_spp);
-
-        // 2. Render 1-SPP Noisy Input Frame (with ML demux features & motion vectors)
+        // 1. Render 1-SPP Noisy Input Frame FIRST (evaluates true inter-frame motion vectors from f-1 to f)
         captureTrainingFrame(f, /*isReference=*/false, 1);
+
+        // 2. Render Ground Truth Reference Frame SECOND (same camera pose)
+        captureTrainingFrame(f, /*isReference=*/true, m_config.capture_reference_spp);
 
         // 3. Move camera for next frame if multi-frame sequence
         if (m_camera) {

@@ -75,6 +75,7 @@ def main():
         "--frames", "60",
         "--warmup-frames", "10",
         "--camera-motion",
+        "--temporal-accum",
         "--dump-frame", wf_png,
         "--dump-stats", wf_stats
     ]
@@ -217,6 +218,7 @@ def main():
         "--frames", "60",
         "--warmup-frames", "10",
         "--camera-motion",
+        "--temporal-accum",
         "--dump-frame", lr_mot_png,
         "--dump-stats", lr_mot_json
     ]
@@ -263,77 +265,10 @@ def main():
             print(f"\033[32m[PASS]\033[0m Dynamic motion energy retention: {retention:.1f}% >= 70.0%")
 
     # -------------------------------------------------------------------------
-    # Test 4: Living Room BMFR Denoiser Camera Motion Stability (1080p)
+    # Test 4: Automated Before/After Golden Reference Verification
     # -------------------------------------------------------------------------
     print("\n====================================================================")
-    print("  [TEST 4] Living Room BMFR Denoiser Camera Motion Stability (1080p)")
-    print("====================================================================")
-    bmfr_png = "output/test_lr_bmfr_motion_test.png"
-    bmfr_stats = "output/stats_lr_bmfr_motion_test.json"
-    cmd_bmfr = [
-        bin_path,
-        "--headless",
-        "--scene", "scenes/living-room/living_room_extended.glb",
-        "--width", "1920",
-        "--height", "1080",
-        "--spp", "1",
-        "--max-bounces", "4",
-        "--frames", "60",
-        "--warmup-frames", "10",
-        "--bmfr",
-        "--camera-motion",
-        "--dump-frame", bmfr_png,
-        "--dump-stats", bmfr_stats
-    ]
-    ok_bmfr, _ = run_cmd(cmd_bmfr)
-    if not ok_bmfr:
-        print("[FAIL] Living Room BMFR motion run failed")
-        all_passed = False
-    else:
-        m_bmfr = analyze_image(bmfr_png, "Living Room BMFR Motion")
-        with open(bmfr_stats, "r") as f:
-            st_b = json.load(f)
-        avg_ms_b = st_b["performance"]["avg_frame_time_ms"]
-        fps_b = st_b["performance"]["avg_fps"]
-        print(f"       Latency: {avg_ms_b:.3f} ms ({fps_b:.1f} FPS)")
-
-        if m_bmfr["mean_lum"] < 0.08 or m_bmfr["mean_lum"] > 0.15:
-            print(f"[FAIL] BMFR motion mean luminance {m_bmfr['mean_lum']:.4f} out of bounds [0.08, 0.15]")
-            all_passed = False
-        else:
-            print(f"\033[32m[PASS]\033[0m BMFR motion luminance: {m_bmfr['mean_lum']:.4f} in [0.08, 0.15]")
-
-        if m_bmfr["shadow_pct"] > 65.0:
-            print(f"[FAIL] BMFR motion shadow percentage {m_bmfr['shadow_pct']:.2f}% exceeds 65% ceiling")
-            all_passed = False
-        else:
-            print(f"\033[32m[PASS]\033[0m BMFR motion shadow retention: {m_bmfr['shadow_pct']:.2f}% <= 65.0%")
-
-        if m_bmfr["blown_pct"] > 1.0:
-            print(f"[FAIL] BMFR motion blown-out pixels {m_bmfr['blown_pct']:.2f}% exceeds 1.0%")
-            all_passed = False
-        else:
-            print(f"\033[32m[PASS]\033[0m BMFR motion blown-out pixels: {m_bmfr['blown_pct']:.2f}% <= 1.0%")
-
-        if avg_ms_b > 5.0:
-            print(f"\033[33m[WARN]\033[0m BMFR latency {avg_ms_b:.3f} ms slightly above 5.0 ms target")
-        else:
-            print(f"\033[32m[PASS]\033[0m BMFR sub-5ms budget achieved: {avg_ms_b:.3f} ms <= 5.0 ms")
-
-        # Strict chromatic balance assertions: enforce no green/yellow tint regression
-        gb_diff = abs(m_bmfr["mean_rgb"][1] - m_bmfr["mean_rgb"][2])
-        blue_ratio = m_bmfr["mean_rgb"][2] / max(max(m_bmfr["mean_rgb"][0], m_bmfr["mean_rgb"][1]), 1e-4)
-        if gb_diff > 0.035 or blue_ratio < 0.80:
-            print(f"[FAIL] BMFR color cast / green tint detected: |G - B| = {gb_diff:.4f} > 0.035 or Blue ratio = {blue_ratio:.2f} < 0.80")
-            all_passed = False
-        else:
-            print(f"\033[32m[PASS]\033[0m BMFR chromatic balance preserved: |G - B| = {gb_diff:.4f} <= 0.035, Blue ratio = {blue_ratio:.2f} >= 0.80")
-
-    # -------------------------------------------------------------------------
-    # Test 5: Automated Before/After Golden Reference Verification
-    # -------------------------------------------------------------------------
-    print("\n====================================================================")
-    print("  [TEST 5] Before/After Golden Reference Verification & Anomaly Detection")
+    print("  [TEST 4] Before/After Golden Reference Verification & Anomaly Detection")
     print("====================================================================")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
     try:

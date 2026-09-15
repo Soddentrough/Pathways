@@ -182,7 +182,7 @@ void main() {
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
         vec2 jitter = randVec2(seed) - vec2(0.5);
-        vec2 uv = (vec2(pixelCoord) + jitter) / vec2(float(fw), float(fh));
+        vec2 uv = (vec2(pixelCoord) + vec2(0.5) + jitter) / vec2(float(fw), float(fh));
         vec2 d = uv * 2.0 - 1.0;
 
         vec4 target = ubo.projInverse * vec4(d.x, d.y, 1.0, 1.0);

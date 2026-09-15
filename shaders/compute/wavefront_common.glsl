@@ -469,6 +469,21 @@ float fresnelSchlick(float cosTheta, float refIdx) {
     return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// Physically correct dielectric Fresnel supporting internal and external boundaries
+float fresnelDielectric(float cosThetaI, float eta) {
+    float sinThetaI2 = max(0.0, 1.0 - cosThetaI * cosThetaI);
+    float sinThetaT2 = (eta * eta) * sinThetaI2;
+    if (sinThetaT2 >= 1.0) {
+        return 1.0; // Total Internal Reflection (TIR)
+    }
+    float cosT = sqrt(max(0.0, 1.0 - sinThetaT2));
+    float r0 = (1.0 - eta) / (1.0 + eta);
+    r0 = r0 * r0;
+    float cosEval = (eta > 1.0) ? cosT : cosThetaI;
+    float x = clamp(1.0 - cosEval, 0.0, 1.0);
+    return r0 + (1.0 - r0) * (x * x * x * x * x);
+}
+
 // Fresnel-Schlick approximation with vector F0 (Cook-Torrance PBR)
 vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
     return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);

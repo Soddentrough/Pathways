@@ -93,7 +93,7 @@ public:
                                 VkBuffer instanceBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize instanceSize = 0);
 
-    void resize(uint32_t width, uint32_t height, uint32_t tileSize = 256);
+    void resize(uint32_t width, uint32_t height, uint32_t tileSize = 0);
     void setTileSize(uint32_t tileSize);
     uint32_t getTileSize() const { return m_tileSize; }
 

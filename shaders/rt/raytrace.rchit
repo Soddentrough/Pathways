@@ -305,6 +305,21 @@ float fresnelSchlick(float cosTheta, float refIdx) {
     return r0 + (1.0 - r0) * (x2 * x2 * x);
 }
 
+float fresnelDielectric(float cosThetaI, float eta) {
+    float sinThetaI2 = max(0.0, 1.0 - cosThetaI * cosThetaI);
+    float sinThetaT2 = (eta * eta) * sinThetaI2;
+    if (sinThetaT2 >= 1.0) {
+        return 1.0;
+    }
+    float cosT = sqrt(max(0.0, 1.0 - sinThetaT2));
+    float r0 = (1.0 - eta) / (1.0 + eta);
+    r0 = r0 * r0;
+    float cosEval = (eta > 1.0) ? cosT : cosThetaI;
+    float x = clamp(1.0 - cosEval, 0.0, 1.0);
+    float x2 = x * x;
+    return r0 + (1.0 - r0) * (x2 * x2 * x);
+}
+
 vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
     float x = clamp(1.0 - cosTheta, 0.0, 1.0);
     float x2 = x * x;
@@ -693,14 +708,18 @@ void main() {
             float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
 
             bool cannotRefract = refractionRatio * sinTheta > 1.0;
-            float reflectProb = fresnelSchlick(cosTheta, refractionRatio);
+            float reflectProb = fresnelDielectric(cosTheta, refractionRatio);
 
+            vec3 throughputMod;
             if (cannotRefract || reflectProb > randFloat(prd.seed)) {
+                // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                 nextDirection = reflect(unitDir, hitNormal);
                 prd.nextOrigin = hitPoint + hitNormal * EPSILON;
+                throughputMod = transmittance;
             } else {
                 nextDirection = refract(unitDir, hitNormal, refractionRatio);
                 prd.nextOrigin = hitPoint - hitNormal * EPSILON;
+                throughputMod = baseColor.rgb * transmittance;
             }
             if (isPrimary) {
                 int currentPx = int(prd.pad % pc.tileWidth);
@@ -717,9 +736,9 @@ void main() {
                 prd.packedAlbedoRG = 0u;
                 prd.packedAlbedoB_Roughness = 0u;
             }
-            prd.packedThroughputRG = packHalf2x16(baseColor.rg * transmittance.rg);
+            prd.packedThroughputRG = packHalf2x16(throughputMod.rg);
             uint flags = 1u | 2u | 8u; // hit = true, isDelta = true, isSpecular = true
-            prd.packedThroughputB_Flags = (packHalf2x16(vec2(baseColor.b * transmittance.b, 0.0)) & 0xFFFFu) | (flags << 16u);
+            prd.packedThroughputB_Flags = (packHalf2x16(vec2(throughputMod.b, 0.0)) & 0xFFFFu) | (flags << 16u);
             prd.packedNextDir = packOct32(normalize(nextDirection));
             prd.lastBsdfPdf = 1.0;
             prd.pad = 0u;

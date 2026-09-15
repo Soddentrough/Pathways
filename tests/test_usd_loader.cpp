@@ -418,6 +418,111 @@ def Xform "Root"
                       << " triangles, " << kScene.materials.size() << " materials, "
                       << kScene.lights.size() << " lights" << std::endl;
         }
+
+        // Step 11: Verify Kitchen_set_instanced.usd (USD Native Instancing)
+        std::filesystem::path kitchenInstPath = "scenes/Kitchen_set/Kitchen_set_instanced.usd";
+        if (!std::filesystem::exists(kitchenInstPath)) {
+            kitchenInstPath = "../scenes/Kitchen_set/Kitchen_set_instanced.usd";
+        }
+        if (std::filesystem::exists(kitchenInstPath)) {
+            std::cout << "[Step 11] Testing UsdLoader on Kitchen_set_instanced.usd..." << std::endl;
+            uint64_t kiTris = 0;
+            uint32_t kiMats = 0;
+            bool kiMetaOk = UsdLoader::populateMetadata(kitchenInstPath.string(), kiTris, kiMats);
+            check_true(kiMetaOk, "populateMetadata must succeed for Kitchen_set_instanced");
+            check_true(kiTris > 0, "Kitchen_set_instanced metadata must report >0 triangles");
+            std::cout << "  Kitchen_set_instanced metadata: " << kiTris << " triangles, " << kiMats << " materials" << std::endl;
+            SceneData kiScene = UsdLoader::loadSceneData(kitchenInstPath.string());
+            check_true(!kiScene.triangles.empty(), "Kitchen_set_instanced must produce triangles");
+            std::cout << "[PASS] Kitchen_set_instanced successfully loaded: " << kiScene.triangles.size()
+                      << " triangles, " << kiScene.materials.size() << " materials, "
+                      << kiScene.lights.size() << " lights" << std::endl;
+        }
+
+        // Step 12: Verify Castle.usdc
+        std::filesystem::path castlePath = "scenes/Castle/Castle.usdc";
+        if (!std::filesystem::exists(castlePath)) {
+            castlePath = "../scenes/Castle/Castle.usdc";
+        }
+        if (std::filesystem::exists(castlePath)) {
+            std::cout << "[Step 12] Testing UsdLoader on Castle.usdc..." << std::endl;
+            uint64_t cTris = 0;
+            uint32_t cMats = 0;
+            bool cMetaOk = UsdLoader::populateMetadata(castlePath.string(), cTris, cMats);
+            check_true(cMetaOk, "populateMetadata must succeed for Castle.usdc");
+            check_true(cTris > 0, "Castle.usdc metadata must report >0 triangles");
+            std::cout << "  Castle metadata: " << cTris << " triangles, " << cMats << " materials" << std::endl;
+            SceneData cScene = UsdLoader::loadSceneData(castlePath.string());
+            check_true(!cScene.triangles.empty(), "Castle must produce triangles");
+            std::cout << "  Castle Camera: pos=(" << cScene.cameraPosition.x << ", "
+                      << cScene.cameraPosition.y << ", " << cScene.cameraPosition.z << "), target=("
+                      << cScene.cameraTarget.x << ", " << cScene.cameraTarget.y << ", "
+                      << cScene.cameraTarget.z << "), fov=" << cScene.cameraFov << " deg, hasCamera=" << cScene.hasCamera << std::endl;
+            // Inspect materials and tree shader prims on Castle stage
+            pxr::UsdStageRefPtr cStage = pxr::UsdStage::Open(castlePath.string());
+            if (cStage) {
+                pxr::UsdPrim leafMatPrim = cStage->GetPrimAtPath(pxr::SdfPath("/root/_materials/bq_Leaf_Quercus_robur"));
+                if (leafMatPrim) {
+                    std::cout << "  leafMat children: ";
+                    for (const auto& child : leafMatPrim.GetChildren()) {
+                        std::cout << child.GetName().GetString() << " (" << child.GetTypeName().GetString() << ") ";
+                    }
+                    std::cout << std::endl;
+                    for (const auto& attr : leafMatPrim.GetAttributes()) {
+                        pxr::VtValue val;
+                        attr.Get(&val);
+                        std::cout << "    Attr: " << attr.GetName().GetString() << " = " << val << std::endl;
+                    }
+                    for (const auto& rel : leafMatPrim.GetRelationships()) {
+                        pxr::SdfPathVector targets;
+                        rel.GetTargets(&targets);
+                        for (const auto& t : targets) {
+                            std::cout << "    Rel: " << rel.GetName().GetString() << " -> " << t.GetString() << std::endl;
+                        }
+                    }
+                }
+            }
+
+            std::cout << "[PASS] Castle successfully loaded: " << cScene.triangles.size()
+                      << " triangles, " << cScene.materials.size() << " materials, "
+                      << cScene.textures.size() << " textures, "
+                      << cScene.lights.size() << " lights" << std::endl;
+        }
+
+        // Step 13: Verify Buick Riviera (buick rivera-ANKA3DCITY_.usdc)
+        std::filesystem::path carPath = "scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
+        if (!std::filesystem::exists(carPath)) {
+            carPath = "../scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
+        }
+        if (!std::filesystem::exists(carPath)) {
+            carPath = "scenes/ClassicCar/usd/buick rivera-ANKA3DCITY_.usdc";
+        }
+        if (!std::filesystem::exists(carPath)) {
+            carPath = "../scenes/ClassicCar/usd/buick rivera-ANKA3DCITY_.usdc";
+        }
+        if (std::filesystem::exists(carPath)) {
+            std::cout << "[Step 13] Testing UsdLoader on Buick Riviera..." << std::endl;
+            uint64_t carTris = 0;
+            uint32_t carMats = 0;
+            bool carMetaOk = UsdLoader::populateMetadata(carPath.string(), carTris, carMats);
+            check_true(carMetaOk, "populateMetadata must succeed for Buick Riviera");
+            check_true(carTris > 0, "Buick Riviera metadata must report >0 triangles");
+            std::cout << "  Buick Riviera metadata: " << carTris << " triangles, " << carMats << " materials" << std::endl;
+            SceneData carScene = UsdLoader::loadSceneData(carPath.string());
+            check_true(!carScene.triangles.empty(), "Buick Riviera must produce triangles");
+            std::cout << "  Buick Riviera Camera: pos=(" << carScene.cameraPosition.x << ", "
+                      << carScene.cameraPosition.y << ", " << carScene.cameraPosition.z << "), target=("
+                      << carScene.cameraTarget.x << ", " << carScene.cameraTarget.y << ", "
+                      << carScene.cameraTarget.z << "), fov=" << carScene.cameraFov << " deg, hasCamera=" << carScene.hasCamera << std::endl;
+            std::cout << "  Buick Riviera Textures loaded: " << carScene.textures.size() << std::endl;
+            check_true(!carScene.textures.empty(), "Buick Riviera must have textures loaded");
+            std::cout << "  Buick Riviera Bounds: min=(" << carScene.boundsMin.x << ", " << carScene.boundsMin.y << ", " << carScene.boundsMin.z
+                      << ") max=(" << carScene.boundsMax.x << ", " << carScene.boundsMax.y << ", " << carScene.boundsMax.z << ")" << std::endl;
+            std::cout << "[PASS] Buick Riviera successfully loaded: " << carScene.triangles.size()
+                      << " triangles, " << carScene.materials.size() << " materials, "
+                      << carScene.textures.size() << " textures, "
+                      << carScene.lights.size() << " lights" << std::endl;
+        }
     }
 
     std::cout << "==========================================================" << std::endl;

@@ -55,7 +55,7 @@ public:
                           uint32_t maxSequenceCount = 1, VkDeviceAddress sequenceCountAddress = 0);
 
     // Synchronization barrier between preprocessing and execution (sliceIndex == UINT32_MAX synchronizes entire buffer)
-    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX);
+    void recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex = UINT32_MAX, uint32_t sliceCount = 1);
 
     // Execute generated commands (with execution set + dispatch token)
     void recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,

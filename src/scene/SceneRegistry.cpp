@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,12 @@ std::string SceneEntry::formatComboPreview() const {
 }
 
 std::string SceneRegistry::formatSceneName(const std::string& rawName) {
+    if (rawName == "ClassicCar" || rawName == "classic_car" || rawName == "classic-car" ||
+        rawName == "BuickRiviera" || rawName == "buick_riviera" || rawName == "buick-riviera" ||
+        rawName == "buick_rivera" || rawName == "buick-rivera") {
+        return "Buick Riviera";
+    }
+
     std::string out;
     bool capitalizeNext = true;
     for (size_t i = 0; i < rawName.size(); ++i) {
@@ -81,7 +88,7 @@ static bool populateSceneMetadata(SceneEntry& entry) {
     entry.fileSizeBytes = std::filesystem::file_size(entry.filepath, ec);
 
     if (UsdLoader::isUsdFile(entry.filepath)) {
-        return UsdLoader::populateMetadata(entry.filepath, entry.triangleCount, entry.materialCount);
+        return UsdLoader::populateMetadata(entry.filepath, entry.triangleCount, entry.materialCount) && (entry.triangleCount > 0);
     }
 
     cgltf_options options{};
@@ -175,6 +182,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     }
 
     std::vector<SceneEntry> fileEntries;
+    std::unordered_set<std::string> seenCanonicalPaths;
+
+    auto addUniqueEntry = [&](const SceneEntry& e) {
+        std::error_code ec;
+        std::string canon = fs::canonical(e.filepath, ec).string();
+        if (canon.empty()) canon = e.filepath;
+        if (seenCanonicalPaths.insert(canon).second) {
+            fileEntries.push_back(e);
+        }
+    };
 
     // 1. Scan standalone scenes directly under scenes/ (Showcase & USD)
     for (const auto& item : fs::directory_iterator(scenesDir)) {
@@ -187,7 +204,7 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                 std::string group = UsdLoader::isUsdFile(item.path().string()) ? "USD Scenes" : "Showcase";
                 SceneEntry e{ label, item.path().string(), group };
                 if (populateSceneMetadata(e)) {
-                    fileEntries.push_back(e);
+                    addUniqueEntry(e);
                 }
             }
         }
@@ -202,45 +219,51 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             // Look for extended and core models or usd scenes
             fs::path extGlb = item.path() / (dirName + "_extended.glb");
             fs::path coreGlb = item.path() / (dirName + "_core.glb");
-            fs::path usdScene = item.path() / (dirName + ".usd");
+            fs::path usdScene;
 
             // Handle underscore variations (e.g. coffee-maker vs coffee_maker)
             std::string underscoreDir = dirName;
             std::replace(underscoreDir.begin(), underscoreDir.end(), '-', '_');
             if (!fs::exists(extGlb)) extGlb = item.path() / (underscoreDir + "_extended.glb");
             if (!fs::exists(coreGlb)) coreGlb = item.path() / (underscoreDir + "_core.glb");
-            if (!fs::exists(usdScene)) usdScene = item.path() / (underscoreDir + ".usd");
+
+            for (const auto& ext : {".usd", ".usdc", ".usda"}) {
+                fs::path p1 = item.path() / (dirName + ext);
+                if (fs::exists(p1)) { usdScene = p1; break; }
+                fs::path p2 = item.path() / (underscoreDir + ext);
+                if (fs::exists(p2)) { usdScene = p2; break; }
+            }
 
             bool hasExt = fs::exists(extGlb);
             bool hasCore = fs::exists(coreGlb);
-            bool hasUsd = fs::exists(usdScene);
+            bool hasUsd = !usdScene.empty();
 
             if (hasUsd) {
                 SceneEntry e{ dirTitle, usdScene.string(), "USD Scenes" };
                 if (populateSceneMetadata(e)) {
-                    fileEntries.push_back(e);
+                    addUniqueEntry(e);
                 }
             }
 
             if (hasExt && hasCore) {
                 SceneEntry e{ dirTitle + " (Extended)", extGlb.string(), "Research" };
                 if (populateSceneMetadata(e)) {
-                    fileEntries.push_back(e);
+                    addUniqueEntry(e);
                 }
 
                 SceneEntry c{ dirTitle + " (Core)", coreGlb.string(), "Research" };
                 if (populateSceneMetadata(c)) {
-                    fileEntries.push_back(c);
+                    addUniqueEntry(c);
                 }
             } else if (hasExt) {
                 SceneEntry e{ dirTitle, extGlb.string(), "Research" };
                 if (populateSceneMetadata(e)) {
-                    fileEntries.push_back(e);
+                    addUniqueEntry(e);
                 }
             } else if (hasCore) {
                 SceneEntry e{ dirTitle, coreGlb.string(), "Research" };
                 if (populateSceneMetadata(e)) {
-                    fileEntries.push_back(e);
+                    addUniqueEntry(e);
                 }
             }
 
@@ -253,9 +276,15 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                         if (subItem.path() != extGlb && subItem.path() != coreGlb && subItem.path() != usdScene) {
                             std::string subStem = subItem.path().stem().string();
                             std::string group = UsdLoader::isUsdFile(subItem.path().string()) ? "USD Scenes" : "Custom";
-                            SceneEntry e{ dirTitle + " - " + formatSceneName(subStem), subItem.path().string(), group };
+                            std::string labelName;
+                            if (subStem.rfind(dirName, 0) == 0 || subStem.rfind(underscoreDir, 0) == 0) {
+                                labelName = formatSceneName(subStem);
+                            } else {
+                                labelName = dirTitle + " - " + formatSceneName(subStem);
+                            }
+                            SceneEntry e{ labelName, subItem.path().string(), group };
                             if (populateSceneMetadata(e)) {
-                                fileEntries.push_back(e);
+                                addUniqueEntry(e);
                             }
                         }
                     }

@@ -326,7 +326,10 @@ VkSurfaceKHR Window::createSurface(VkInstance instance) {
         throw std::runtime_error(std::string("Failed to create Vulkan surface: ") + SDL_GetError());
     }
 
-    SDL_PumpEvents();
+    SDL_SyncWindow(m_window);
+    for (int p = 0; p < 8; ++p) {
+        SDL_PumpEvents();
+    }
     int actualW = 0, actualH = 0;
     SDL_GetWindowSizeInPixels(m_window, &actualW, &actualH);
     if (actualW > 0 && actualH > 0) {

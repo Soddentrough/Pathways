@@ -207,6 +207,9 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
+            if (bounce > 0u) {
+                skyColor = min(skyColor, vec3(30.0));
+            }
             accumRadiance += vec3(throughput) * skyColor;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -280,7 +283,7 @@ void main() {
             f16vec3 diffuseColor = baseColor * float16_t(1.0 - metallic);
             vec3 V = -rayDir;
 
-            float clearcoat = mat.clearcoat;
+            float clearcoat = clamp(mat.clearcoat, 0.0, 1.0);
             if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
                 clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1u], hitUv).r;
             }
@@ -633,9 +636,10 @@ void main() {
                 sampledSpecularLobe = true;
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
                 float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);
-                float fresnel = fresnelSchlick(cosTheta, iorVal);
+                float fresnel = fresnelDielectric(cosTheta, eta);
 
                 if (randFloat(seed) < fresnel) {
+                    // Specular reflection: achromatic Fresnel reflection
                     nextDirection = reflect(rayDir, hitNormal);
                     nextOrigin = hitPoint + hitNormal * EPSILON;
                 } else {
@@ -643,12 +647,13 @@ void main() {
                     if (length(refracted) > 1e-4) {
                         nextDirection = normalize(refracted);
                         nextOrigin = hitPoint - hitNormal * EPSILON;
+                        throughput *= baseColor;
                     } else {
+                        // Total Internal Reflection fallback
                         nextDirection = reflect(rayDir, hitNormal);
                         nextOrigin = hitPoint + hitNormal * EPSILON;
                     }
                 }
-                throughput *= baseColor;
             } else {
                 float lobeSelect = randFloat(seed);
                 if (lobeSelect < clearcoatProb) {
@@ -656,6 +661,9 @@ void main() {
                     vec3 H_cc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
                     nextDirection = reflect(-V, H_cc);
                     nextOrigin = hitPoint + clearcoatNormal * EPSILON;
+                    if (dot(clearcoatNormal, nextDirection) <= 0.0) {
+                        nextDirection = reflect(-V, clearcoatNormal);
+                    }
                     float Fc = fresnelSchlick(clamp(dot(V, H_cc), 0.0, 1.0), 1.5) * clearcoat;
                     throughput *= float16_t(Fc / max(clearcoatProb, 1e-4));
                 } else if (lobeSelect < (clearcoatProb + baseSpecProb)) {
@@ -663,6 +671,9 @@ void main() {
                     vec3 H_spec = sampleGGX(hitNormal, alphaRoughness, seed);
                     nextDirection = reflect(-V, H_spec);
                     nextOrigin = hitPoint + hitNormal * EPSILON;
+                    if (dot(hitNormal, nextDirection) <= 0.0) {
+                        nextDirection = reflect(-V, hitNormal);
+                    }
                     float VdotH = clamp(dot(V, H_spec), 0.0, 1.0);
                     f16vec3 F_spec = fresnelSchlickVec(float16_t(VdotH), F0);
                     float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;

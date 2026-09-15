@@ -122,6 +122,41 @@ int main(int argc, char* argv[]) {
                 pathways::Logger::info("[PASS] Switched to Point Instanced Med City (OpenUSD) and rendered 3 frames cleanly.");
             }
 
+            // Switch to scene 9: Castle (OpenUSD Scene)
+            if (std::filesystem::exists("scenes/Castle/Castle.usdc")) {
+                if (!engine.loadScene("scenes/Castle/Castle.usdc")) {
+                    pathways::Logger::error("Test failed: loadScene Castle USD failed.");
+                    return 1;
+                }
+                for (int i = 0; i < 3; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Switched to Castle (OpenUSD) and rendered 3 frames cleanly.");
+
+                // Dynamically switch to Dual-GPU Checkerboard on Castle
+                pathways::Logger::info("Switching to Dual-GPU Checkerboard on Castle...");
+                engine.setMgpuMode(pathways::MultiGpuMode::CheckerboardTile);
+                for (int i = 0; i < 5; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Dual-GPU Checkerboard rendered 5 frames on Castle cleanly.");
+
+                // Now switch to another scene (e.g. Damaged Helmet) WHILE Multi-GPU is active!
+                pathways::Logger::info("Switching scene to Damaged Helmet WHILE Dual-GPU is active...");
+                if (!engine.loadScene("scenes/DamagedHelmet.glb")) {
+                    pathways::Logger::error("Test failed: loadScene DamagedHelmet while MGPU active failed.");
+                    return 1;
+                }
+                for (int i = 0; i < 3; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Switched to Damaged Helmet while Dual-GPU active.");
+
+                // Now switch BACK to Castle WHILE Multi-GPU is active!
+                pathways::Logger::info("Switching scene back to Castle WHILE Dual-GPU is active...");
+                if (!engine.loadScene("scenes/Castle/Castle.usdc")) {
+                    pathways::Logger::error("Test failed: loadScene Castle while MGPU active failed.");
+                    return 1;
+                }
+                for (int i = 0; i < 3; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Switched back to Castle while Dual-GPU active.");
+                engine.setMgpuMode(pathways::MultiGpuMode::Off);
+            }
+
             engine.printExecutionSummary();
             auto stats = engine.getStats();
             if (stats.validation_errors > 0) {

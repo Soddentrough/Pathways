@@ -423,6 +423,21 @@ float fresnelSchlick(float cosTheta, float refIdx) {
     return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// Physically correct dielectric Fresnel supporting internal and external boundaries
+float fresnelDielectric(float cosThetaI, float eta) {
+    float sinThetaI2 = max(0.0, 1.0 - cosThetaI * cosThetaI);
+    float sinThetaT2 = (eta * eta) * sinThetaI2;
+    if (sinThetaT2 >= 1.0) {
+        return 1.0; // Total Internal Reflection (TIR)
+    }
+    float cosT = sqrt(max(0.0, 1.0 - sinThetaT2));
+    float r0 = (1.0 - eta) / (1.0 + eta);
+    r0 = r0 * r0;
+    float cosEval = (eta > 1.0) ? cosT : cosThetaI;
+    float x = clamp(1.0 - cosEval, 0.0, 1.0);
+    return r0 + (1.0 - r0) * (x * x * x * x * x);
+}
+
 // Fresnel-Schlick approximation with vector F0 (Cook-Torrance PBR)
 vec3 fresnelSchlickVec(float cosTheta, vec3 F0) {
     return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
@@ -742,17 +757,33 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                 float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
 
                 bool cannotRefract = refractionRatio * sinTheta > 1.0;
-                float reflectProb = fresnelSchlick(cosTheta, refractionRatio);
+                float reflectProb = fresnelDielectric(cosTheta, refractionRatio);
+
+                bool isThinWalled = (mat.thickness <= 0.001);
+                if (isThinWalled) {
+                    if (!hit.frontFace) {
+                        reflectProb = 0.0;
+                        cannotRefract = false;
+                    } else {
+                        reflectProb = (2.0 * reflectProb) / (1.0 + reflectProb);
+                    }
+                }
 
                 if (cannotRefract || reflectProb > randFloat(seed)) {
+                    // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(unitDir, hitNormal);
                     currentRay.origin = hit.point + hitNormal * EPSILON;
                 } else {
-                    nextDirection = refract(unitDir, hitNormal, refractionRatio);
-                    currentRay.origin = hit.point - hitNormal * EPSILON;
+                    if (isThinWalled) {
+                        nextDirection = unitDir;
+                        currentRay.origin = hit.point + unitDir * (EPSILON * 2.0);
+                    } else {
+                        nextDirection = refract(unitDir, hitNormal, refractionRatio);
+                        currentRay.origin = hit.point - hitNormal * EPSILON;
+                    }
+                    throughput *= baseColor.rgb;
                 }
                 currentRay.direction = normalize(nextDirection);
-                throughput *= baseColor.rgb;
                 isDelta = true;
                 lastBsdfPdf = 1.0;
                 continue;
@@ -779,11 +810,11 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                     throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
                     nextDirection = L;
                 } else {
-                    // Fallback to diffuse
+                    // Fallback to diffuse normalized by clearcoat sample probability
                     nextDirection = sampleCosineHemisphere(hitNormal, seed);
                     vec3 H_diff = normalize(V + nextDirection);
                     vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                    throughput *= (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                    throughput *= (vec3(1.0) - F_diff) * diffuseColor / max(clearcoatProb, 1e-4);
                 }
             } else if (xi < clearcoatProb + baseSpecProb) {
                 // Base Specular lobe: GGX microfacet sampling
@@ -793,7 +824,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
 
                 if (NdotL > 0.0) {
                     float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                    float NdotH = clamp(dot(hitNormal, H), 0.001, 1.0);
+                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                     float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
                     float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
@@ -804,12 +835,12 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                     throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
                     nextDirection = L;
                 } else {
-                    // Fallback to diffuse
+                    // Fallback to diffuse normalized by baseSpecProb sample probability
                     nextDirection = sampleCosineHemisphere(hitNormal, seed);
                     vec3 H_diff = normalize(V + nextDirection);
                     vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
                     float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                    throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+                    throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(baseSpecProb, 1e-4);
                 }
             } else {
                 // Diffuse lobe: Cosine-weighted hemisphere sampling

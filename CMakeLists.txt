@@ -523,17 +523,20 @@ if(pxr_FOUND)
         src/scene/UsdLoader.cpp
         src/scene/ProceduralScene.cpp
         src/core/Logger.cpp
+        src/utils/ImageDumper.cpp
     )
     target_include_directories(test_usd_loader PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${THIRD_PARTY_DIR}/glm
+        ${THIRD_PARTY_DIR}/stb
+        ${THIRD_PARTY_DIR}/tinyexr
     )
     target_include_directories(test_usd_loader SYSTEM PRIVATE
         ${PXR_INCLUDE_DIRS}
         ${Python3_INCLUDE_DIRS}
     )
     target_compile_definitions(test_usd_loader PRIVATE PATHWAYS_ENABLE_USD=1)
-    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} Python3::Python)
+    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} Python3::Python ZLIB::ZLIB)
     if(UNIX)
         target_link_libraries(test_usd_loader PRIVATE m)
     endif()

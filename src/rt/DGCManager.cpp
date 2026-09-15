@@ -219,7 +219,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 
-void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex) {
+void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceIndex, uint32_t sliceCount) {
     if (!m_supported || !m_explicitPreprocess || !m_preprocessBuffer) return;
 
     VkBufferMemoryBarrier2 bufferBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
@@ -233,7 +233,7 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceInde
 
     if (sliceIndex != UINT32_MAX && (static_cast<VkDeviceSize>(sliceIndex % NUM_SLICES) * m_sliceSize < m_preprocessBuffer->getSize())) {
         bufferBarrier.offset = static_cast<VkDeviceSize>(sliceIndex % NUM_SLICES) * m_sliceSize;
-        bufferBarrier.size = m_sliceSize;
+        bufferBarrier.size = std::min(static_cast<VkDeviceSize>(sliceCount) * m_sliceSize, m_preprocessBuffer->getSize() - bufferBarrier.offset);
     } else {
         bufferBarrier.offset = 0;
         bufferBarrier.size = VK_WHOLE_SIZE;
@@ -297,8 +297,12 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
 
 void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
                                          const std::vector<VkPipeline>& secondaryPipelines) {
-    bool enableMaterialDGC = (getenv("PATHWAYS_ENABLE_MATERIAL_DGC") != nullptr);
-    if (!enableMaterialDGC || !m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || primaryPipelines.empty()) {
+    bool disabledViaEnv = (getenv("PATHWAYS_DISABLE_MATERIAL_DGC") != nullptr) ||
+                          (getenv("PATHWAYS_DISABLE_DGC_EXECSET") != nullptr);
+    bool enabledViaEnv = (getenv("PATHWAYS_ENABLE_MATERIAL_DGC") != nullptr) ||
+                         (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr);
+    bool enableMaterialDGC = (!disabledViaEnv) && enabledViaEnv;
+    if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
         Logger::info("Material microkernels active via GPU multi-dispatch indirect work-lists (6 specialized pipelines).");
         return;

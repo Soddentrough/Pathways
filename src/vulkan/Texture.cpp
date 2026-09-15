@@ -2,8 +2,11 @@
 #include "core/Logger.hpp"
 #include "assets/BlueNoise64.hpp"
 
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+#define TINYEXR_USE_MINIZ 0
+#include <zlib.h>
+#include "tinyexr.h"
 
 #include <algorithm>
 #include <cmath>
@@ -280,6 +283,24 @@ std::unique_ptr<Texture> Texture::loadFromFile(
         );
         stbi_image_free(data);
         Logger::info("Loaded HDRI environment map: {} ({}x{}, 32-bit Float)", filepath, w, h);
+        return tex;
+    } else if (ext == ".exr") {
+        float* rgba = nullptr;
+        const char* err = nullptr;
+        int ret = LoadEXR(&rgba, &w, &h, filepath.c_str(), &err);
+        if (ret != TINYEXR_SUCCESS || !rgba || w <= 0 || h <= 0) {
+            Logger::error("Failed to load EXR image: {} ({})", filepath, err ? err : "unknown error");
+            if (err) FreeEXRErrorMessage(err);
+            return nullptr;
+        }
+        size_t byteSize = static_cast<size_t>(w) * h * 4 * sizeof(float);
+        auto tex = createFromPixels(
+            device, allocator, queue, pool,
+            static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+            VK_FORMAT_R32G32B32A32_SFLOAT, rgba, byteSize, true
+        );
+        free(rgba);
+        Logger::info("Loaded EXR environment map: {} ({}x{}, 32-bit Float)", filepath, w, h);
         return tex;
     } else {
         stbi_uc* data = stbi_load(filepath.c_str(), &w, &h, &comp, 4);

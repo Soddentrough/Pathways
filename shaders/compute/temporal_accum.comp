@@ -133,6 +133,9 @@ void main() {
     if (validHistory) {
         // In camera motion, cap effective sample count to 4.0 so ghost trails fade within 3-4 frames
         // and prevent bright highlights from bleeding into deep contact shadows.
+        // NOTE: At 1-SPP without preceding spatial filtering (BMFR/Upways), accumulating raw stochastic
+        // noise across frames creates radial motion trails along the camera's optical flow field. Default
+        // interactive navigation therefore defaults to Pure Monte Carlo (DenoiserMode::None) in Config.hpp.
         float maxMotionSamples = min(pc.maxHistorySamples, 4.0);
         N_curr = min(historyVal.a + 1.0, maxMotionSamples);
         float alpha = 1.0 / max(N_curr, 1.0);

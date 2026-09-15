@@ -6,6 +6,7 @@
 #include <cctype>
 #include <string_view>
 #include <cstdlib>
+#include <filesystem>
 
 namespace pathways {
 
@@ -144,11 +145,9 @@ void Config::printUsage(const char* progName) {
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
-              << "  --accum-format <fmt>    HDR Accumulation Format: 'rgba16' (16-bit Half HDR [default]) or 'rgba32' (32-bit Float HDR)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --no-temporal-accum, --no-tra  Disable motion-vector guided temporal accumulation [default: enabled]\n"
-              << "  --bmfr                  Enable experimental Blockwise Multi-Order Feature Regression [default: disabled]\n"
-              << "  --denoiser <mode>       Denoising mode: 'temporal' (Temporal Accumulation [default]), 'none' (Pure MC), 'bmfr', 'upways' (Wave32 WMMA), or 'upways_sr' (2x Super-Resolution)\n"
+              << "  --temporal-accum, --tra Enable motion-vector guided temporal accumulation [default: disabled]\n"
+              << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'temporal' (Temporal Accumulation), 'bmfr', 'upways' (Wave32 WMMA), or 'upways_sr' (2x Super-Resolution)\n"
               << "  --upways                Enable Upways Neural Denoising with Wave32 WMMA\n"
               << "  --upways-sr             Enable Upways Continuous Super-Resolution (2.0x upscaling)\n"
               << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin)\n"
@@ -410,13 +409,20 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_bmfr = true;
             cfg.enable_temporal_accum = true;
             cfg.denoiser_mode = DenoiserMode::BMFR;
+        } else if (arg == "--temporal-accum" || arg == "--tra") {
+            // Explicit opt-in for temporal radiance accumulation. Default remains Pure Monte Carlo
+            // to avoid radial hyperspace motion trails under 1-SPP interactive camera translation.
+            cfg.enable_temporal_accum = true;
+            if (cfg.denoiser_mode == DenoiserMode::None) {
+                cfg.denoiser_mode = DenoiserMode::Temporal;
+            }
         } else if (arg == "--no-temporal-accum" || arg == "--no-tra") {
             cfg.enable_temporal_accum = false;
             if (cfg.denoiser_mode == DenoiserMode::Temporal) {
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
-            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr or --no-temporal-accum to configure denoising.");
+            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr or --temporal-accum to configure denoising.");
         } else if (arg == "--light-tree") {
             cfg.enable_light_tree = true;
         } else if (arg == "--nrc") {
@@ -485,6 +491,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.inline_primary_shadows = false;
         } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
             setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
+            setEnvVar("PATHWAYS_ENABLE_MATERIAL_DGC", "1");
+        } else if (arg == "--no-dgc-execset" || arg == "--no-dgc-tier2-execset") {
+            setEnvVar("PATHWAYS_DISABLE_DGC_EXECSET", "1");
+            setEnvVar("PATHWAYS_DISABLE_MATERIAL_DGC", "1");
         } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
         } else if (arg == "--camera-motion") {
@@ -731,6 +741,28 @@ Config Config::parse(int argc, char* argv[]) {
     } else if (cfg.headless && cfg.frame_limit == 0) {
         // In headless mode, default to 1 frame unless explicitly told to run more
         cfg.frame_limit = 1;
+    }
+
+    // Auto-detect co-located scene HDRI environment map if not explicitly specified
+    if (cfg.hdri_path.empty() && !cfg.scene_path.empty()) {
+        std::filesystem::path sp(cfg.scene_path);
+        std::filesystem::path sceneDir = sp.has_parent_path() ? sp.parent_path() : std::filesystem::current_path();
+
+        std::vector<std::filesystem::path> hdriCandidates = {
+            sceneDir / "textures and hdri" / "golden_gate_hills_2k.exr",
+            sceneDir / "textures" / "studio_small_08_4k.exr",
+            sceneDir / "textures" / "studio_small_08_4k.hdr",
+            sceneDir / ".." / "textures" / "studio_small_08_4k.exr",
+            sceneDir / "textures and hdri" / "golden_gate_hills_2k.hdr",
+        };
+        for (const auto& cand : hdriCandidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(cand, ec)) {
+                cfg.hdri_path = cand.string();
+                Logger::info("Config: Auto-detected scene HDRI environment map: '{}'", cfg.hdri_path);
+                break;
+            }
+        }
     }
 
     return cfg;

@@ -358,7 +358,8 @@ glm::mat4 Camera::getProjectionMatrix() const {
 }
 
 CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags,
-                                     bool enableTaa, uint32_t width, uint32_t height, uint32_t phaseOffset) const {
+                                     bool enableTaa, uint32_t width, uint32_t height, uint32_t phaseOffset,
+                                     bool updatePrev) const {
     CameraUniform ubo{};
     glm::mat4 view = getViewMatrix();
     glm::mat4 proj = getProjectionMatrix();
@@ -382,8 +383,10 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     ubo.projInverse = glm::inverse(proj);
     ubo.unjitteredViewProj = unjitteredViewProj;
     ubo.prevViewProj = m_hasPrevViewProj ? m_prevViewProj : unjitteredViewProj;
-    m_prevViewProj = unjitteredViewProj; // Store unjittered for velocity estimation
-    m_hasPrevViewProj = true;
+    if (updatePrev) {
+        m_prevViewProj = unjitteredViewProj; // Store unjittered for velocity estimation
+        m_hasPrevViewProj = true;
+    }
 
     ubo.position = glm::vec4(m_position, 1.0f);
     ubo.viewParams = glm::vec4(m_fov, m_aspect, m_near, m_far);

@@ -191,6 +191,7 @@ static std::vector<MaterialGPU> createDefaultCornellBoxMaterials() {
     matGlass.metallic = 0.0f;
     matGlass.ior = 1.52f; // Crown glass
     matGlass.transmission = 1.0f;
+    matGlass.thickness = 1.0f;
     matGlass.type = MATERIAL_DIELECTRIC;
     materials.push_back(matGlass);
 

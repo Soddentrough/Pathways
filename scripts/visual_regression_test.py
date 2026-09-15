@@ -93,24 +93,6 @@ TEST_CONFIGS = [
         "diff_path": f"{OUTPUT_DIR}/diff_living_room_1080p_motion.png"
     },
     {
-        "id": "living_room_1080p_bmfr",
-        "name": "Living Room 1080p (BMFR Regression Denoiser)",
-        "scene": "scenes/living-room/living_room_extended.glb",
-        "cmd": [
-            "./build/bin/pathways", "--headless",
-            "--scene", "scenes/living-room/living_room_extended.glb",
-            "--width", "1920", "--height", "1080",
-            "--spp", "1", "--max-bounces", "4",
-            "--frames", "60", "--warmup-frames", "10",
-            "--bmfr", "--camera-motion",
-            "--dump-frame", f"{OUTPUT_DIR}/test_lr_bmfr_motion_test.png",
-            "--dump-stats", f"{OUTPUT_DIR}/stats_lr_bmfr_motion_test.json"
-        ],
-        "render_path": f"{OUTPUT_DIR}/test_lr_bmfr_motion_test.png",
-        "ref_path": f"{REF_DIR}/living_room_1080p_bmfr.png",
-        "diff_path": f"{OUTPUT_DIR}/diff_living_room_1080p_bmfr.png"
-    },
-    {
         "id": "cornell_1080p",
         "name": "Cornell Box 1080p (16 SPP Full Quality)",
         "scene": "Procedural Cornell Box",

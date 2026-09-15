@@ -39,6 +39,21 @@ Suite root: `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`
 - **Headless Tests**: `./scripts/run_headless_tests.sh`
 - **Execution Policy**: Standard build tools (`cmake`, `ninja`, `g++`, `gdb`) and project binaries are pre-authorized.
 
+## Proportional Verification & Test Execution
+Always calibrate verification depth strictly to the nature and scope of the modifications. Never launch heavy end-to-end test suites for minor or non-functional edits.
+
+1. **Tier 0: Non-Functional Edits (Comments, Documentation, Formatting, Config Strings)**:
+   - **Action**: DO NOT run `./scripts/run_headless_tests.sh`, `python3 tests/test_image_quality.py`, or benchmark suites.
+   - If C++/GLSL files were touched, at most run a fast incremental compile check (`ninja -C build -j16`) to confirm syntax. Report back immediately without running regression suites.
+
+2. **Tier 1: Targeted Local Logic & Component Changes**:
+   - **Action**: Run only the specific relevant test binary or CTest filter (e.g. `ctest -R CameraControls`).
+   - Do not trigger full-engine headless or multi-GPU regression sweeps unless multiple subsystems are touched.
+
+3. **Tier 2: Core Rendering Pipelines, Shaders, Synchronization & Multi-GPU**:
+   - **Action**: Run the full headless regression suite (`./scripts/run_headless_tests.sh`) and image quality verification (`python3 tests/test_image_quality.py`).
+   - Use only when shader algorithms, memory barriers, DGC dispatch queues, or multi-GPU transport paths are modified, or when explicitly requested by the user.
+
 ## Command-Line Option & CLI Guidelines
 - **Binary / Mutually Exclusive Options Rule**: When an option represents a mutually exclusive binary condition, there must be only **ONE** option, which is to negate the default state.
   - If a feature is **disabled by default**, provide only the flag to enable it (e.g., `--bmfr`). Do NOT add a redundant `--no-<feature>` flag.
