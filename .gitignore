@@ -19,6 +19,7 @@ data/dataset*/
 CMakeUserPresets.json
 *.spv
 *.zip
+*.rar
 
 # Scene assets
 # Generated test artifacts and loose debug textures
@@ -42,6 +43,8 @@ scenes/*/
 !scenes/cornell-caustic/**
 !scenes/classroom/
 !scenes/classroom/**
+!scenes/glass-of-water/
+!scenes/glass-of-water/**
 !scenes/living-room/
 !scenes/living-room/**
 !scenes/modern-hall/
@@ -50,6 +53,8 @@ scenes/*/
 !scenes/PointInstancedMedCity/**
 !scenes/Kitchen_set/
 !scenes/Kitchen_set/**
+!scenes/BuickRiviera/
+!scenes/BuickRiviera/**
 
 # Inside shipped scene subdirectories, exclude duplicate core models, temporary backups, and reference PNG renders
 scenes/*/*_core.glb
