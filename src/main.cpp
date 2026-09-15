@@ -122,20 +122,21 @@ int main(int argc, char* argv[]) {
                 pathways::Logger::info("[PASS] Switched to Point Instanced Med City (OpenUSD) and rendered 3 frames cleanly.");
             }
 
-            // Switch to scene 9: Castle (OpenUSD Scene)
-            if (std::filesystem::exists("scenes/Castle/Castle.usdc")) {
-                if (!engine.loadScene("scenes/Castle/Castle.usdc")) {
-                    pathways::Logger::error("Test failed: loadScene Castle USD failed.");
+            // Switch to scene 9: Buick Riviera (OpenUSD Scene)
+            std::string buickPath = "scenes/BuickRiviera/BuickRiviera.usdc";
+            if (std::filesystem::exists(buickPath)) {
+                if (!engine.loadScene(buickPath)) {
+                    pathways::Logger::error("Test failed: loadScene Buick Riviera USD failed.");
                     return 1;
                 }
                 for (int i = 0; i < 3; ++i) engine.renderFrame();
-                pathways::Logger::info("[PASS] Switched to Castle (OpenUSD) and rendered 3 frames cleanly.");
+                pathways::Logger::info("[PASS] Switched to Buick Riviera (OpenUSD) and rendered 3 frames cleanly.");
 
-                // Dynamically switch to Dual-GPU Checkerboard on Castle
-                pathways::Logger::info("Switching to Dual-GPU Checkerboard on Castle...");
+                // Dynamically switch to Dual-GPU Checkerboard on Buick Riviera
+                pathways::Logger::info("Switching to Dual-GPU Checkerboard on Buick Riviera...");
                 engine.setMgpuMode(pathways::MultiGpuMode::CheckerboardTile);
                 for (int i = 0; i < 5; ++i) engine.renderFrame();
-                pathways::Logger::info("[PASS] Dual-GPU Checkerboard rendered 5 frames on Castle cleanly.");
+                pathways::Logger::info("[PASS] Dual-GPU Checkerboard rendered 5 frames on Buick Riviera cleanly.");
 
                 // Now switch to another scene (e.g. Damaged Helmet) WHILE Multi-GPU is active!
                 pathways::Logger::info("Switching scene to Damaged Helmet WHILE Dual-GPU is active...");
@@ -146,14 +147,14 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < 3; ++i) engine.renderFrame();
                 pathways::Logger::info("[PASS] Switched to Damaged Helmet while Dual-GPU active.");
 
-                // Now switch BACK to Castle WHILE Multi-GPU is active!
-                pathways::Logger::info("Switching scene back to Castle WHILE Dual-GPU is active...");
-                if (!engine.loadScene("scenes/Castle/Castle.usdc")) {
-                    pathways::Logger::error("Test failed: loadScene Castle while MGPU active failed.");
+                // Now switch BACK to Buick Riviera WHILE Multi-GPU is active!
+                pathways::Logger::info("Switching scene back to Buick Riviera WHILE Dual-GPU is active...");
+                if (!engine.loadScene(buickPath)) {
+                    pathways::Logger::error("Test failed: loadScene Buick Riviera while MGPU active failed.");
                     return 1;
                 }
                 for (int i = 0; i < 3; ++i) engine.renderFrame();
-                pathways::Logger::info("[PASS] Switched back to Castle while Dual-GPU active.");
+                pathways::Logger::info("[PASS] Switched back to Buick Riviera while Dual-GPU active.");
                 engine.setMgpuMode(pathways::MultiGpuMode::Off);
             }
 

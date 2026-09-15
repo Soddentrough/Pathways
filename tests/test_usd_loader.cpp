@@ -439,69 +439,13 @@ def Xform "Root"
                       << kiScene.lights.size() << " lights" << std::endl;
         }
 
-        // Step 12: Verify Castle.usdc
-        std::filesystem::path castlePath = "scenes/Castle/Castle.usdc";
-        if (!std::filesystem::exists(castlePath)) {
-            castlePath = "../scenes/Castle/Castle.usdc";
-        }
-        if (std::filesystem::exists(castlePath)) {
-            std::cout << "[Step 12] Testing UsdLoader on Castle.usdc..." << std::endl;
-            uint64_t cTris = 0;
-            uint32_t cMats = 0;
-            bool cMetaOk = UsdLoader::populateMetadata(castlePath.string(), cTris, cMats);
-            check_true(cMetaOk, "populateMetadata must succeed for Castle.usdc");
-            check_true(cTris > 0, "Castle.usdc metadata must report >0 triangles");
-            std::cout << "  Castle metadata: " << cTris << " triangles, " << cMats << " materials" << std::endl;
-            SceneData cScene = UsdLoader::loadSceneData(castlePath.string());
-            check_true(!cScene.triangles.empty(), "Castle must produce triangles");
-            std::cout << "  Castle Camera: pos=(" << cScene.cameraPosition.x << ", "
-                      << cScene.cameraPosition.y << ", " << cScene.cameraPosition.z << "), target=("
-                      << cScene.cameraTarget.x << ", " << cScene.cameraTarget.y << ", "
-                      << cScene.cameraTarget.z << "), fov=" << cScene.cameraFov << " deg, hasCamera=" << cScene.hasCamera << std::endl;
-            // Inspect materials and tree shader prims on Castle stage
-            pxr::UsdStageRefPtr cStage = pxr::UsdStage::Open(castlePath.string());
-            if (cStage) {
-                pxr::UsdPrim leafMatPrim = cStage->GetPrimAtPath(pxr::SdfPath("/root/_materials/bq_Leaf_Quercus_robur"));
-                if (leafMatPrim) {
-                    std::cout << "  leafMat children: ";
-                    for (const auto& child : leafMatPrim.GetChildren()) {
-                        std::cout << child.GetName().GetString() << " (" << child.GetTypeName().GetString() << ") ";
-                    }
-                    std::cout << std::endl;
-                    for (const auto& attr : leafMatPrim.GetAttributes()) {
-                        pxr::VtValue val;
-                        attr.Get(&val);
-                        std::cout << "    Attr: " << attr.GetName().GetString() << " = " << val << std::endl;
-                    }
-                    for (const auto& rel : leafMatPrim.GetRelationships()) {
-                        pxr::SdfPathVector targets;
-                        rel.GetTargets(&targets);
-                        for (const auto& t : targets) {
-                            std::cout << "    Rel: " << rel.GetName().GetString() << " -> " << t.GetString() << std::endl;
-                        }
-                    }
-                }
-            }
-
-            std::cout << "[PASS] Castle successfully loaded: " << cScene.triangles.size()
-                      << " triangles, " << cScene.materials.size() << " materials, "
-                      << cScene.textures.size() << " textures, "
-                      << cScene.lights.size() << " lights" << std::endl;
-        }
-
-        // Step 13: Verify Buick Riviera (buick rivera-ANKA3DCITY_.usdc)
+        // Step 12: Verify Buick Riviera (buick rivera-ANKA3DCITY_.usdc)
         std::filesystem::path carPath = "scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
         if (!std::filesystem::exists(carPath)) {
             carPath = "../scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
         }
-        if (!std::filesystem::exists(carPath)) {
-            carPath = "scenes/ClassicCar/usd/buick rivera-ANKA3DCITY_.usdc";
-        }
-        if (!std::filesystem::exists(carPath)) {
-            carPath = "../scenes/ClassicCar/usd/buick rivera-ANKA3DCITY_.usdc";
-        }
         if (std::filesystem::exists(carPath)) {
-            std::cout << "[Step 13] Testing UsdLoader on Buick Riviera..." << std::endl;
+            std::cout << "[Step 12] Testing UsdLoader on Buick Riviera..." << std::endl;
             uint64_t carTris = 0;
             uint32_t carMats = 0;
             bool carMetaOk = UsdLoader::populateMetadata(carPath.string(), carTris, carMats);
