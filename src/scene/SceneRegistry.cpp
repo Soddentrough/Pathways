@@ -189,13 +189,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
 
     std::vector<SceneEntry> fileEntries;
     std::unordered_set<std::string> seenCanonicalPaths;
+    std::unordered_set<std::string> seenLabels;
 
     auto addUniqueEntry = [&](const SceneEntry& e) {
         std::error_code ec;
         std::string canon = fs::canonical(e.filepath, ec).string();
         if (canon.empty()) canon = e.filepath;
         if (seenCanonicalPaths.insert(canon).second) {
-            fileEntries.push_back(e);
+            if (seenLabels.insert(e.label).second) {
+                fileEntries.push_back(e);
+            }
         }
     };
 
@@ -233,7 +236,8 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             if (!fs::exists(extGlb)) extGlb = item.path() / (underscoreDir + "_extended.glb");
             if (!fs::exists(coreGlb)) coreGlb = item.path() / (underscoreDir + "_core.glb");
 
-            for (const auto& ext : {".usd", ".usdc", ".usda"}) {
+            // Priority for primary USD: .usdc (binary crate), then .usd, then .usda
+            for (const auto& ext : {".usdc", ".usd", ".usda"}) {
                 fs::path p1 = item.path() / (dirName + ext);
                 if (fs::exists(p1)) { usdScene = p1; break; }
                 fs::path p2 = item.path() / (underscoreDir + ext);
@@ -273,7 +277,7 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                 }
             }
 
-            // Also check for any other glb/gltf/usd files in this directory
+            // Also check for any other distinct glb/gltf/usd files in this directory (e.g. Bistro Interior vs Exterior)
             for (const auto& subItem : fs::directory_iterator(item.path())) {
                 if (subItem.is_regular_file()) {
                     std::error_code ec;
@@ -285,12 +289,26 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                     if (subExt == ".glb" || subExt == ".gltf" || subExt == ".usd" || subExt == ".usda" || subExt == ".usdc") {
                         if (subItem.path() != extGlb && subItem.path() != coreGlb && subItem.path() != usdScene) {
                             std::string subStem = subItem.path().stem().string();
+
+                            // Skip alternate file formats or instanced duplicates of already registered primary scenes
+                            if (hasUsd && (subStem == usdScene.stem().string() || subStem == dirName || subStem == underscoreDir ||
+                                           subStem.ends_with("_instanced") || subStem.ends_with("-instanced"))) {
+                                continue;
+                            }
+                            if ((hasExt || hasCore) && (subStem == dirName || subStem == underscoreDir ||
+                                                        subStem.ends_with("_core") || subStem.ends_with("_extended"))) {
+                                continue;
+                            }
+
                             std::string group = UsdLoader::isUsdFile(subItem.path().string()) ? "USD Scenes" : "Custom";
                             std::string labelName;
                             if (subStem.rfind(dirName, 0) == 0 || subStem.rfind(underscoreDir, 0) == 0) {
                                 labelName = formatSceneName(subStem);
                             } else {
                                 labelName = dirTitle + " - " + formatSceneName(subStem);
+                            }
+                            if (labelName == dirTitle || seenLabels.contains(labelName)) {
+                                continue;
                             }
                             SceneEntry e{ labelName, subItem.path().string(), group };
                             if (populateSceneMetadata(e)) {
