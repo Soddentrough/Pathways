@@ -279,20 +279,20 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 gpuMat.thicknessTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.volume.thickness_texture.texture)) + 1;
             }
         } else if (gpuMat.type == MATERIAL_DIELECTRIC || gpuMat.transmission > 0.05f) {
-            std::string matNameLower = mat.name ? mat.name : "";
-            for (auto& c : matNameLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            bool isThin = (matNameLower.find("windscreen") != std::string::npos ||
-                           matNameLower.find("windshield") != std::string::npos ||
-                           matNameLower.find("headlight") != std::string::npos ||
-                           matNameLower.find("window") != std::string::npos ||
-                           matNameLower.find("thin") != std::string::npos ||
-                           matNameLower.find("pane") != std::string::npos ||
-                           matNameLower.find("lightglass") != std::string::npos);
-            if (isThin) {
-                gpuMat.thickness = 0.0f;
+            // Check if material has explicit PBRT extras indicating solid volumetric dielectric
+            bool isPbrtVolumetric = false;
+            if (mat.extras.data && mat.extras.data[0] != '\0') {
+                std::string_view extrasStr(mat.extras.data);
+                if (extrasStr.find("\"dielectric\"") != std::string_view::npos ||
+                    extrasStr.find("\"glass\"") != std::string_view::npos) {
+                    isPbrtVolumetric = true;
+                }
+            }
+            if (isPbrtVolumetric) {
+                gpuMat.thickness = 1.0f; // PBRT volumetric dielectric
             } else {
-                // Default 3D refractive volume thickness so Snell refraction is executed for closed liquid/glass assets
-                gpuMat.thickness = 1.0f;
+                // glTF 2.0 specification: KHR_materials_transmission without KHR_materials_volume is strictly thin-walled
+                gpuMat.thickness = 0.0f;
             }
         }
 

@@ -229,7 +229,7 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
         return false;
     }
 
-    // Fallback for scenes with alpha masks or transmission
+    bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT, 0xFF, origin, tMin, dir, tMax);
     while (rayQueryProceedEXT(rq)) {
@@ -240,9 +240,10 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
             uint matId = triangles[triIdx].materialId;
             Material mat = materials[matId];
             bool isDielectric = (mat.type == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
-            bool isThinWalled = (mat.thickness <= 0.001);
-            bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-            if (mat.type == 3u /* Skip EMISSIVE */ || isThinWalled || (!enableCaustics && isDielectric)) {
+            if (mat.type == 3u /* Skip EMISSIVE */ || (!enableCaustics && isDielectric)) {
+                continue;
+            }
+            if (enableCaustics && isDielectric && mat.thickness <= 0.001) {
                 continue;
             }
             if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {

@@ -362,10 +362,17 @@ def Xform "Root"
         // Test 7: Ingest PointInstancedMedCity via UsdLoader::loadSceneData
         // -------------------------------------------------------------------------
         std::cout << "[Step 8] Testing UsdLoader::loadSceneData on PointInstancedMedCity.usd..." << std::endl;
-        // Test with 500 instances for fast unit-test verification
+#ifdef _WIN32
+        _putenv_s("PATHWAYS_USD_MAX_INSTANCES", "500");
+#else
         setenv("PATHWAYS_USD_MAX_INSTANCES", "500", 1);
+#endif
         SceneData cityScene = UsdLoader::loadSceneData(medCityPath.string());
+#ifdef _WIN32
+        _putenv_s("PATHWAYS_USD_MAX_INSTANCES", "");
+#else
         unsetenv("PATHWAYS_USD_MAX_INSTANCES");
+#endif
 
         check_true(!cityScene.triangles.empty(), "PointInstancedMedCity must produce triangles");
         check_true(cityScene.triangles.size() == 27456, "PointInstancedMedCity must load exactly 27456 triangles (17624 non-instanced ground/sea + 9832 prototype triangles across 9 BLASes)");

@@ -124,6 +124,16 @@ void main() {
         } else if ((currND.w < 5000.0) != (prevND.w < 5000.0)) {
             validHistory = false;
             historyVal = vec4(C_curr, 1.0);
+        } else if (currND.w >= 5000.0) {
+            // Both curr and prev center landed on sky, but bilinear footprint may touch geometry edge
+            float d00 = imageLoad(uPrevNormalDepth, p00).w;
+            float d10 = imageLoad(uPrevNormalDepth, p10).w;
+            float d01 = imageLoad(uPrevNormalDepth, p01).w;
+            float d11 = imageLoad(uPrevNormalDepth, p11).w;
+            if (d00 < 5000.0 || d10 < 5000.0 || d01 < 5000.0 || d11 < 5000.0) {
+                validHistory = false;
+                historyVal = vec4(C_curr, 1.0);
+            }
         }
     }
 
@@ -131,6 +141,34 @@ void main() {
     vec3 C_final = C_curr;
     float N_curr = 1.0;
     if (validHistory) {
+        // Neighborhood 3x3 statistics in YCoCg space for variance bounding box clamping
+        vec3 m1 = vec3(0.0);
+        vec3 m2 = vec3(0.0);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 tapCoord = clamp(pixelCoord + ivec2(dx, dy), ivec2(0), pc.imageSize - 1);
+                vec3 tapColor = imageLoad(uCurrentRadiance, tapCoord).rgb;
+                if (pc.totalSamples > 1u) {
+                    tapColor /= float(pc.totalSamples);
+                }
+                if (isInvalid(tapColor)) {
+                    tapColor = C_curr;
+                }
+                vec3 ycocg = RGBToYCoCg(tapColor);
+                m1 += ycocg;
+                m2 += ycocg * ycocg;
+            }
+        }
+        vec3 mu = m1 * (1.0 / 9.0);
+        vec3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mu * mu, vec3(0.0)));
+        float gamma = (pc.clampingGamma > 0.0) ? pc.clampingGamma : 1.25;
+        vec3 boxMin = mu - gamma * sigma;
+        vec3 boxMax = mu + gamma * sigma;
+
+        vec3 histYCoCg = RGBToYCoCg(historyVal.rgb);
+        histYCoCg = clamp(histYCoCg, boxMin, boxMax);
+        historyVal.rgb = YCoCgToRGB(histYCoCg);
+
         // In camera motion, cap effective sample count to 4.0 so ghost trails fade within 3-4 frames
         // and prevent bright highlights from bleeding into deep contact shadows.
         // NOTE: At 1-SPP without preceding spatial filtering (BMFR/Upways), accumulating raw stochastic

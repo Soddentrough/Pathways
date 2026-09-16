@@ -75,7 +75,7 @@ endif()
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_link_options(-static-libgcc -static-libstdc++)
+        # Use dynamic runtime consistent with OpenUSD (libusd_ms.dll) and TBB runtime DLLs
     endif()
     set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
     set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
@@ -261,7 +261,7 @@ target_compile_definitions(pathways PRIVATE
 # OpenUSD (Pixar USD) Support
 if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/usr/lib64/cmake/pxr/pxrConfig.cmake"))
     find_package(OpenGL QUIET)
-    find_package(pxr QUIET)
+    find_package(pxr QUIET HINTS "$ENV{USD_ROOT}" "$ENV{PXR_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/../USD" "C:/Users/naoki/Development/USD")
     if(pxr_FOUND)
         message(STATUS "OpenUSD (pxr) found: ${PXR_VERSION}")
         if(TARGET hioAvif)
@@ -280,8 +280,12 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
         endif()
         find_package(Python3 COMPONENTS Development QUIET)
         target_compile_definitions(pathways PRIVATE PATHWAYS_ENABLE_USD=1)
-        target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES} Python3::Python)
-        target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+        target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES})
+        if(TARGET Python3::Python)
+            target_link_libraries(pathways PRIVATE Python3::Python)
+            target_include_directories(pathways SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+        endif()
+        target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS})
         if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             set_source_files_properties(src/scene/UsdLoader.cpp PROPERTIES COMPILE_OPTIONS "-Wno-deprecated")
         endif()
@@ -300,11 +304,18 @@ if(WIN32)
     # Collect extra runtime DLLs (e.g. zlib1.dll, libwinpthread-1.dll) from toolchain directory
     get_filename_component(COMPILER_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     set(EXTRA_RUNTIME_DLLS "")
-    foreach(DLL_NAME zlib1.dll libwinpthread-1.dll)
+    foreach(DLL_NAME zlib1.dll libwinpthread-1.dll libtbb12.dll libstdc++-6.dll libgcc_s_seh-1.dll)
         if(EXISTS "${COMPILER_DIR}/${DLL_NAME}")
             list(APPEND EXTRA_RUNTIME_DLLS "${COMPILER_DIR}/${DLL_NAME}")
         endif()
     endforeach()
+    if(pxr_FOUND)
+        foreach(CANDIDATE_DLL "${PXR_CMAKE_DIR}/lib/libusd_ms.dll" "${PXR_CMAKE_DIR}/bin/libusd_ms.dll")
+            if(EXISTS "${CANDIDATE_DLL}")
+                list(APPEND EXTRA_RUNTIME_DLLS "${CANDIDATE_DLL}")
+            endif()
+        endforeach()
+    endif()
 
     # Guard deployment: copy runtime DLLs if any exist, avoid empty argument errors
     add_custom_command(TARGET pathways POST_BUILD
@@ -322,6 +333,15 @@ if(WIN32)
                 ${EXTRA_RUNTIME_DLLS}
                 $<TARGET_FILE_DIR:pathways>
             COMMENT "Deploying extra toolchain runtime DLLs"
+        )
+    endif()
+
+    if(pxr_FOUND AND EXISTS "${PXR_CMAKE_DIR}/lib/usd")
+        add_custom_command(TARGET pathways POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${PXR_CMAKE_DIR}/lib/usd"
+                "$<TARGET_FILE_DIR:pathways>/usd"
+            COMMENT "Deploying OpenUSD runtime plugin directory"
         )
     endif()
 endif()
@@ -553,10 +573,13 @@ if(pxr_FOUND)
     )
     target_include_directories(test_usd_loader SYSTEM PRIVATE
         ${PXR_INCLUDE_DIRS}
-        ${Python3_INCLUDE_DIRS}
     )
     target_compile_definitions(test_usd_loader PRIVATE PATHWAYS_ENABLE_USD=1)
-    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} Python3::Python ZLIB::ZLIB)
+    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} ZLIB::ZLIB)
+    if(TARGET Python3::Python)
+        target_include_directories(test_usd_loader SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+        target_link_libraries(test_usd_loader PRIVATE Python3::Python)
+    endif()
     if(UNIX)
         target_link_libraries(test_usd_loader PRIVATE m)
     endif()
@@ -599,6 +622,10 @@ if(WIN32)
     install(PROGRAMS $<TARGET_RUNTIME_DLLS:pathways> DESTINATION ${CMAKE_INSTALL_BINDIR})
     if(EXTRA_RUNTIME_DLLS)
         install(PROGRAMS ${EXTRA_RUNTIME_DLLS} DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+
+    if(pxr_FOUND AND EXISTS "${PXR_CMAKE_DIR}/lib/usd")
+        install(DIRECTORY "${PXR_CMAKE_DIR}/lib/usd" DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
 
     # Install SPIR-V shaders directly adjacent to executable

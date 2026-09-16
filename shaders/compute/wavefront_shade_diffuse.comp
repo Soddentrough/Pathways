@@ -286,17 +286,19 @@ void main() {
             }
 
             bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-            bool alreadyApplied = (rawPixel & CAUSTIC_APPLIED_BIT) != 0u;
-            if (enableCaustics && !pathTerminated && !alreadyApplied) {
-                ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec3 causticIrr = imageLoad(uCausticImage, pCoord).rgb;
-                if (dot(causticIrr, causticIrr) > 1e-8) {
-                    vec3 causticRad = vec3(throughput) * (vec3(diffuseColor) * INV_PI) * causticIrr;
-                    accumRadiance += causticRad;
-                    rawPixel |= CAUSTIC_APPLIED_BIT;
-                    if (pc.captureMlData != 0u) {
-                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), 0.0));
+            if (enableCaustics && !pathTerminated) {
+                bool alreadyApplied = (rawPixel & CAUSTIC_APPLIED_BIT) != 0u;
+                if (!alreadyApplied) {
+                    ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                    vec3 causticIrr = imageLoad(uCausticImage, pCoord).rgb;
+                    if (dot(causticIrr, causticIrr) > 1e-8) {
+                        vec3 causticRad = vec3(throughput) * (vec3(diffuseColor) * INV_PI) * causticIrr;
+                        accumRadiance += causticRad;
+                        rawPixel |= CAUSTIC_APPLIED_BIT;
+                        if (pc.captureMlData != 0u) {
+                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
+                            imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), 0.0));
+                        }
                     }
                 }
             }
@@ -530,6 +532,30 @@ void main() {
                             }
                         }
                     }
+                }
+            }
+
+            // Ambient Skylight Irradiance:
+            // When an environment map is present, illuminate open-air diffuse surfaces with ambient daylight.
+            // This prevents shadowed surfaces in outdoor scenes from collapsing into pitch-black voids (0,0,0)
+            // and eliminates extreme high-contrast noise and horizon bleeding.
+            if (!pathTerminated && enableDirect && pc.hasEnvMap == 1u) {
+                float upFactor = clamp(hitNormal.y * 0.5 + 0.5, 0.0, 1.0);
+                float zenithFactor = clamp(hitNormal.y, 0.0, 1.0);
+                vec3 skyZenith = vec3(0.08, 0.18, 0.45);
+                vec3 skyHorizon = vec3(0.65, 0.55, 0.45);
+                vec3 groundReflect = vec3(0.08, 0.07, 0.06);
+                vec3 upperSky = mix(skyHorizon, skyZenith, pow(zenithFactor, 0.6));
+                vec3 skyHemisphere = mix(groundReflect, upperSky, upFactor) * pc.envMapIntensity;
+
+                vec3 ambientRad = vec3(diffuseColor) * skyHemisphere * 0.22;
+
+                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, ambientRad, seed), 0.0));
+                if (pc.captureMlData != 0u) {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, ambientRad, seed), 0.0));
                 }
             }
 #endif

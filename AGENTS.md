@@ -37,7 +37,30 @@ Suite root: `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`
 - **Build**: `cmake --build build -j16` (or `ninja -C build -j16`)
 - **Main Binary**: `./build/bin/pathways`
 - **Headless Tests**: `./scripts/run_headless_tests.sh`
-- **Execution Policy**: Standard build tools (`cmake`, `ninja`, `g++`, `gdb`) and project binaries are pre-authorized.
+- **Execution Policy (Pre-Authorized & Auto-Approved Commands)**:
+  Standard build tools, project binaries, and the following top 10 safe read-only and verification commands are pre-authorized for automatic execution:
+  1. `git status` (including `-s`, `--short`)
+  2. `git diff` (including `--stat`, path-specific diffs)
+  3. `git log -n <N> --oneline` (and `git log HEAD..origin/main --oneline`)
+  4. `git fetch origin` (and `git branch -a`, `git remote -v`)
+  5. `.\build.ps1 -Test` (or `powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test`)
+  6. `.\scripts\run_headless_tests.ps1` (or `powershell -ExecutionPolicy Bypass -File .\scripts\run_headless_tests.ps1`)
+  7. `cmake --preset windows-clang-release` / `cmake --build --preset windows-release`
+  8. `ninja -C build/windows-clang-release -j16` (or `ninja -C build -j16`)
+  9. `ctest --test-dir build/windows-clang-release -R <regex> --output-on-failure`
+  10. `.\build\windows-clang-release\bin\pathways.exe --headless --frames 1 --width 1280 --height 720 --dump-frame <path>` (and `--help`)
+  *Native Tools (Always Auto-Approved)*: `view_file`, `grep_search`, `find_by_name`, `list_dir`.
+
+- **Development Tools Allow List (Auto-Approved Tools & Binaries)**:
+  All standard development operations involving compilers, linkers, debuggers, build systems, process management, and diagnostic utilities are pre-authorized:
+  - **Compilers**: `clang`, `clang++`, `clang-cl`, `gcc`, `g++`, `glslc`, `cl.exe`, `rga`
+  - **Linkers**: `lld`, `ld.lld`, `lld-link`, `ld`, `llvm-ar`, `ar`, `ranlib`, `link.exe`
+  - **Debuggers & Profilers**: `gdb`, `lldb`, `cdb`, `rgd`, `rra`, `rgp`, `amd-smi`, `vulkaninfo`
+  - **Build Systems & Make**: `cmake`, `ninja` (capped at `-j16`), `make`, `mingw32-make`, `ctest`
+  - **Process Viewing & Management**: `Get-Process`, `Stop-Process`, `Wait-Process`, `tasklist`, `taskkill`
+  - **Binary Inspection**: `dumpbin`, `objdump`, `llvm-objdump`, `nm`, `llvm-nm`, `strings`, `llvm-strings`, `readelf`
+  - **Runtime & Scripting**: `python`, `python3`, `pacman`, `powershell`, `pwsh`, `cmd.exe`
+  - **Project Binaries**: `.\build.ps1`, `.\scripts\run_headless_tests.ps1`, `build\windows-clang-release\bin\*`, `./build/bin/pathways`
 
 ## Proportional Verification & Test Execution
 Always calibrate verification depth strictly to the nature and scope of the modifications. Never launch heavy end-to-end test suites for minor or non-functional edits.

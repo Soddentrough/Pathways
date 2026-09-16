@@ -239,9 +239,12 @@ std::unique_ptr<Texture> Texture::createProceduralHdrSky(
                     radiance += sunColor;
                 }
             } else {
-                // Ground reflection / warm dark earth albedo
+                // Atmospheric aerial perspective haze smoothly blending horizon into earth ground reflection
                 float groundFactor = std::clamp(-dir.y, 0.0f, 1.0f);
-                radiance = glm::mix(glm::vec3(0.08f, 0.07f, 0.06f), glm::vec3(0.02f, 0.02f, 0.025f), groundFactor);
+                glm::vec3 deepGround = glm::mix(glm::vec3(0.08f, 0.07f, 0.06f), glm::vec3(0.02f, 0.02f, 0.025f), groundFactor);
+                glm::vec3 horizonHaze(0.65f, 0.55f, 0.45f);
+                float haze = std::exp(-groundFactor * 14.0f);
+                radiance = glm::mix(deepGround, horizonHaze, haze);
             }
 
             pixels[y * width + x] = glm::vec4(radiance, 1.0f);

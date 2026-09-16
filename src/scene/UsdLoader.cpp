@@ -13,6 +13,7 @@
 #include <atomic>
 #include <vector>
 #include <cstdlib>
+#include <mutex>
 
 #include "stb_image.h"
 
@@ -23,6 +24,7 @@
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
 
 #include <pxr/pxr.h>
+#include <pxr/usd/usd/primDefinition.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/mesh.h>
@@ -45,6 +47,17 @@
 #include <pxr/base/gf/vec2f.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/matrix4d.h>
+#include <pxr/base/plug/registry.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
@@ -55,6 +68,60 @@ static inline glm::mat4 gfToGlmMatrix(const pxr::GfMatrix4d& m) {
         dst[i] = static_cast<float>(src[i]);
     }
     return glm::make_mat4(dst);
+}
+
+static void ensurePluginsRegistered() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        namespace fs = std::filesystem;
+        std::vector<fs::path> searchCandidates;
+
+        // 1. Candidate paths relative to running executable
+#ifdef _WIN32
+        wchar_t exePathBuf[MAX_PATH];
+        if (GetModuleFileNameW(NULL, exePathBuf, MAX_PATH) > 0) {
+            fs::path exeDir = fs::path(exePathBuf).parent_path();
+            searchCandidates.push_back(exeDir / "usd" / "plugInfo.json");
+            searchCandidates.push_back(exeDir / ".." / "lib" / "usd" / "plugInfo.json");
+        }
+#else
+        std::error_code ec;
+        fs::path exeDir = fs::canonical("/proc/self/exe", ec).parent_path();
+        if (!ec) {
+            searchCandidates.push_back(exeDir / "usd" / "plugInfo.json");
+            searchCandidates.push_back(exeDir / ".." / "lib" / "usd" / "plugInfo.json");
+        }
+#endif
+
+        // 2. Environment variables USD_ROOT or PXR_ROOT
+        const char* usdRootEnv = std::getenv("USD_ROOT");
+        if (usdRootEnv && *usdRootEnv) {
+            searchCandidates.push_back(fs::path(usdRootEnv) / "lib" / "usd" / "plugInfo.json");
+        }
+        const char* pxrRootEnv = std::getenv("PXR_ROOT");
+        if (pxrRootEnv && *pxrRootEnv) {
+            searchCandidates.push_back(fs::path(pxrRootEnv) / "lib" / "usd" / "plugInfo.json");
+        }
+
+        // 3. Known installation candidate paths
+#ifdef _WIN32
+        searchCandidates.push_back("C:/Users/naoki/Development/USD/lib/usd/plugInfo.json");
+#else
+        searchCandidates.push_back("/usr/lib64/usd/plugInfo.json");
+        searchCandidates.push_back("/usr/lib/usd/plugInfo.json");
+        searchCandidates.push_back("/usr/local/lib/usd/plugInfo.json");
+#endif
+
+        for (const auto& candidate : searchCandidates) {
+            if (fs::exists(candidate)) {
+                auto registered = PlugRegistry::GetInstance().RegisterPlugins(candidate.generic_string());
+                pathways::Logger::info("UsdLoader: Discovered OpenUSD plugins at '{}' (registered {} plugins)",
+                             candidate.generic_string(), registered.size());
+                return;
+            }
+        }
+        pathways::Logger::warn("UsdLoader: No plugInfo.json found in candidate paths. OpenUSD plugin loading may fail.");
+    });
 }
 
 #endif
@@ -76,6 +143,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
     }
 
     Logger::info("UsdLoader: Opening OpenUSD Stage: '{}'", filepath);
+    ensurePluginsRegistered();
     UsdStageRefPtr stage = UsdStage::Open(filepath);
     if (!stage) {
         Logger::error("UsdLoader: Failed to open USD stage: '{}'", filepath);
@@ -1418,16 +1486,27 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         }
 
         if (data.lights.empty() && !hasDomeLight) {
-            float lightSide = maxDim * 0.8f;
-            float lightY = bMax.y + maxDim * 0.6f;
-            LightGPU defaultLight{};
-            defaultLight.position = glm::vec4(center.x - lightSide * 0.5f, lightY, center.z - lightSide * 0.5f, LIGHT_AREA_QUAD);
-            defaultLight.u = glm::vec4(lightSide, 0.0f, 0.0f, 0.0f);
-            defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
-            defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
-            float area = lightSide * lightSide;
-            defaultLight.emission = glm::vec4(15.0f, 15.0f, 15.0f, area);
-            data.lights.push_back(defaultLight);
+            if (maxDim > 50.0f) {
+                // Large outdoor scene: generate physical directional sun light matching procedural sky
+                glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
+                LightGPU sunLight{};
+                sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
+                sunLight.normal = glm::vec4(sunDir, 0.0f);
+                sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
+                data.lights.push_back(sunLight);
+                Logger::info("UsdLoader: Outdoor scene extent ({:.1f} m); added directional sun light matching sky dome", maxDim);
+            } else {
+                float lightSide = maxDim * 0.8f;
+                float lightY = bMax.y + maxDim * 0.6f;
+                LightGPU defaultLight{};
+                defaultLight.position = glm::vec4(center.x - lightSide * 0.5f, lightY, center.z - lightSide * 0.5f, LIGHT_AREA_QUAD);
+                defaultLight.u = glm::vec4(lightSide, 0.0f, 0.0f, 0.0f);
+                defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
+                defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+                float area = lightSide * lightSide;
+                defaultLight.emission = glm::vec4(15.0f, 15.0f, 15.0f, area);
+                data.lights.push_back(defaultLight);
+            }
         }
 
         MeshRange range{};
@@ -1456,6 +1535,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
 bool UsdLoader::populateMetadata(const std::string& filepath, uint64_t& outTriangles, uint32_t& outMaterials) {
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
     if (!std::filesystem::exists(filepath)) return false;
+    ensurePluginsRegistered();
     UsdStageRefPtr stage = UsdStage::Open(filepath);
     if (!stage) return false;
 

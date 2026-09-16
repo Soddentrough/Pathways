@@ -23,6 +23,7 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
 
         // Pass 2: Only rays that clear solid architecture test alpha-tested / non-opaque geometry
         if (!occluded) {
+            bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
             rayQueryEXT rqAlpha;
             rayQueryInitializeEXT(rqAlpha, topLevelAS,
                                   gl_RayFlagsCullOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
@@ -37,9 +38,10 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                     uint matId = triangles[triIdx].materialId + inst.materialOffset;
                     Material mat = materials[matId];
                     bool isDielectric = (mat.type == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
-                    bool isThinWalled = (mat.thickness <= 0.001);
-                    bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
-                    if (mat.type == 3u /* Skip EMISSIVE */ || isThinWalled || (!enableCaustics && isDielectric)) {
+                    if (mat.type == 3u /* Skip EMISSIVE */ || (!enableCaustics && isDielectric)) {
+                        continue;
+                    }
+                    if (enableCaustics && isDielectric && mat.thickness <= 0.001) {
                         continue;
                     }
                     if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {
@@ -69,13 +71,13 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
     }
 
     if (!occluded && numSpheres > 0u) {
+        bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
         for (uint i = 0; i < numSpheres; ++i) {
             uint sMatId = spheres[i].materialId;
             Material sMat = materials[sMatId];
             bool isDielectric = (sMat.type == 2u || sMat.transmission > 0.05);
-            bool isThinWalled = (sMat.thickness <= 0.001);
-            bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
-            if (sMat.type == 3u || isThinWalled || (!enableCaustics && isDielectric)) continue;
+            if (sMat.type == 3u || (!enableCaustics && isDielectric)) continue;
+            if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
             float spT;
             vec3 spNorm;
             if (intersectSphere(origin, dir, spheres[i], EPSILON, maxDist - EPSILON * 2.0, spT, spNorm)) {

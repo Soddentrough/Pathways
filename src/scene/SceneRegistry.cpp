@@ -230,6 +230,10 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     // 1. Scan standalone scenes directly under scenes/ (Showcase & USD)
     for (const auto& item : fs::directory_iterator(scenesDir)) {
         if (item.is_regular_file()) {
+            std::error_code ec;
+            if (fs::file_size(item.path(), ec) < 100) {
+                continue; // Skip broken symlinks / small text stubs
+            }
             std::string ext = item.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
             if (ext == ".glb" || ext == ".gltf" || ext == ".usd" || ext == ".usda" || ext == ".usdc") {
@@ -280,17 +284,8 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
                 }
             }
 
-            if (hasExt && hasCore) {
-                SceneEntry e{ dirTitle + " (Extended)", extGlb.string(), "Research" };
-                if (populateSceneMetadata(e)) {
-                    addUniqueEntry(e);
-                }
-
-                SceneEntry c{ dirTitle + " (Core)", coreGlb.string(), "Research" };
-                if (populateSceneMetadata(c)) {
-                    addUniqueEntry(c);
-                }
-            } else if (hasExt) {
+            // For research scenes, prefer the full-fidelity extended model, falling back to core
+            if (hasExt) {
                 SceneEntry e{ dirTitle, extGlb.string(), "Research" };
                 if (populateSceneMetadata(e)) {
                     addUniqueEntry(e);
@@ -374,7 +369,10 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
         }
     }
 
-    Logger::info("SceneRegistry: Discovered and indexed {} scene(s) in '{}'.", entries.size(), scenesDir);
+    Logger::info("SceneRegistry: Discovered and indexed {} canonical scene(s) in '{}':", entries.size(), scenesDir);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Logger::info("  Scene #{:02d}: [{}] {} ({})", i + 1, entries[i].group, entries[i].label, entries[i].filepath.empty() ? "Built-in" : entries[i].filepath);
+    }
     return entries;
 }
 
