@@ -121,6 +121,11 @@ struct Config {
     uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
     float nrc_train_ratio = 0.03f;        // Ratio of paths (2%-5%, default 0.03 = 3%) continuing tracing to ground truth depth for training
 
+    // Caustics & Forward Photon Injection (Vulkan 1.4 hardware rayQueryEXT)
+    bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]
+    uint32_t caustic_photons = 1048576;   // Number of caustic photons traced per frame (default: 1048576 = 1024x1024)
+    bool enable_sppm = false;             // Stochastic Progressive Photon Mapping for offline reference convergence [Default: false, opt-in via --sppm]
+
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
     enum class MgpuTransferMode {

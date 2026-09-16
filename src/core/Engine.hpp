@@ -272,6 +272,38 @@ private:
     void updateUpwaysDescriptors();
     bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory);
 
+    // Real-Time Caustics (Photon Injection + Atomic Splatting + Bilateral Filter)
+    std::unique_ptr<Buffer> m_causticPhotonBuffer;
+    std::unique_ptr<Buffer> m_causticAtomicBuffer;
+    std::unique_ptr<Image> m_filteredCausticImage;
+    std::unique_ptr<Image> m_prevCausticImage;
+
+    VkDescriptorSetLayout m_causticTraceDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_causticSplatDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_causticFilterDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_causticDescPool = VK_NULL_HANDLE;
+
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticTraceDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticSplatDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticFilterDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+    VkPipelineLayout m_causticTracePipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_causticSplatPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_causticFilterPipelineLayout = VK_NULL_HANDLE;
+
+    VkPipeline m_causticTracePipeline = VK_NULL_HANDLE;
+    VkPipeline m_causticSplatPipeline = VK_NULL_HANDLE;
+    VkPipeline m_causticFilterPipeline = VK_NULL_HANDLE;
+
+    void createCausticsPipelines();
+    void createCausticsResources();
+    void destroyCausticsResources();
+    void destroyCausticsPipelines();
+    void updateCausticsDescriptors();
+    void dispatchCausticTrace(VkCommandBuffer cmd, uint32_t frameSlot);
+    void dispatchCausticSplatAndFilter(VkCommandBuffer cmd, uint32_t frameSlot);
+    void dispatchCaustics(VkCommandBuffer cmd, uint32_t frameSlot);
+
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";

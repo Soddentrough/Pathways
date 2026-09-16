@@ -154,7 +154,10 @@ void Config::printUsage(const char* progName) {
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
-              << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n\n"
+              << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
+              << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
+              << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
+              << "  --sppm                  Enable Stochastic Progressive Photon Mapping for offline reference convergence\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor to track target FPS\n"
@@ -435,6 +438,15 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.nrc_train_ratio = std::stof(argv[++i]);
         } else if (arg.starts_with("--nrc-train-ratio=")) {
             cfg.nrc_train_ratio = std::stof(arg.substr(arg.find('=') + 1));
+        } else if (arg == "--caustics") {
+            cfg.enable_caustics = true;
+        } else if (arg == "--caustic-photons" && i + 1 < argc) {
+            cfg.caustic_photons = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--caustic-photons=")) {
+            cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--sppm") {
+            cfg.enable_caustics = true;
+            cfg.enable_sppm = true;
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {

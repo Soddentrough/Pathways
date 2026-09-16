@@ -266,6 +266,8 @@ Engine::~Engine() {
     destroyBmfrPipelines();
     destroyUpwaysResources();
     destroyUpwaysPipelines();
+    destroyCausticsResources();
+    destroyCausticsPipelines();
     m_motionVectorImage.reset();
     m_mlAlbedoRoughnessImage.reset();
     m_mlSpecularMotionImage.reset();
@@ -1529,7 +1531,8 @@ void Engine::initPipelines() {
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1773,6 +1776,18 @@ void Engine::initPipelines() {
     // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
     initTlasUpdatePipeline();
 
+    // 12. Real-Time Caustics (Forward Photon Injection + Atomic Splatting + Cross-Bilateral Filtering)
+    createCausticsPipelines();
+    createCausticsResources();
+
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->setPostClassifyCallback([this](VkCommandBuffer cmd, uint32_t frameSlot) {
+            if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                dispatchCausticSplatAndFilter(cmd, frameSlot);
+            }
+        });
+    }
+
     updateAllImageDescriptors();
 }
 
@@ -1801,6 +1816,10 @@ void Engine::updateAllImageDescriptors() {
         mvImageInfo.imageView = m_motionVectorImage->getImageView();
         mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
+
+    VkDescriptorImageInfo causticInfo{};
+    causticInfo.imageView = m_filteredCausticImage ? m_filteredCausticImage->getImageView() : accumImageInfo.imageView;
+    causticInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -1840,6 +1859,14 @@ void Engine::updateAllImageDescriptors() {
                 w14.pImageInfo = &mvImageInfo;
                 writes.push_back(w14);
             }
+
+            VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            w15.dstSet = m_rtDescSets[i];
+            w15.dstBinding = 15;
+            w15.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w15.descriptorCount = 1;
+            w15.pImageInfo = &causticInfo;
+            writes.push_back(w15);
         }
     }
 
@@ -1869,6 +1896,7 @@ void Engine::updateAllImageDescriptors() {
     updateTemporalAccumDescriptors();
     updateBmfrDescriptors();
     updateUpwaysDescriptors();
+    updateCausticsDescriptors();
 }
 
 void Engine::createShadowDenoiserPipelines() {
@@ -2794,6 +2822,569 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
     return true;
 }
 
+// === REAL-TIME CAUSTICS (PHOTON INJECTION + ATOMIC SPLATTING + BILATERAL FILTER) ===
+
+void Engine::createCausticsPipelines() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Descriptor Set Layouts
+    // 1a. Trace Layout: Triangles(2), Spheres(3), Materials(4), Lights(5), TLAS(6), Textures(8), Photons(20)
+    std::vector<VkDescriptorSetLayoutBinding> traceBindings = {
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo traceLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    traceLayoutInfo.bindingCount = static_cast<uint32_t>(traceBindings.size());
+    traceLayoutInfo.pBindings = traceBindings.data();
+    if (vkCreateDescriptorSetLayout(device, &traceLayoutInfo, nullptr, &m_causticTraceDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic trace descriptor set layout");
+    }
+
+    // 1b. Splat Layout: CameraUBO(1), NormalDepth(12), Photons(20), AtomicBuffer(21)
+    std::vector<VkDescriptorSetLayoutBinding> splatBindings = {
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo splatLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    splatLayoutInfo.bindingCount = static_cast<uint32_t>(splatBindings.size());
+    splatLayoutInfo.pBindings = splatBindings.data();
+    if (vkCreateDescriptorSetLayout(device, &splatLayoutInfo, nullptr, &m_causticSplatDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic splat descriptor set layout");
+    }
+
+    // 1c. Filter Layout: CameraUBO(1), NormalDepth(12), MotionVector(14), AtomicBuffer(21), FilteredCaustic(22), PrevCaustic(23)
+    std::vector<VkDescriptorSetLayoutBinding> filterBindings = {
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo filterLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    filterLayoutInfo.bindingCount = static_cast<uint32_t>(filterBindings.size());
+    filterLayoutInfo.pBindings = filterBindings.data();
+    if (vkCreateDescriptorSetLayout(device, &filterLayoutInfo, nullptr, &m_causticFilterDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic filter descriptor set layout");
+    }
+
+    // 2. Descriptor Pool
+    std::vector<VkDescriptorPoolSize> poolSizes = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 },
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 8 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = 16;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_causticDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustics descriptor pool");
+    }
+
+    // Allocate Sets (MAX_FRAMES_IN_FLIGHT = 2 each)
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        allocInfo.descriptorPool = m_causticDescPool;
+        allocInfo.descriptorSetCount = 1;
+
+        allocInfo.pSetLayouts = &m_causticTraceDescLayout;
+        if (vkAllocateDescriptorSets(device, &allocInfo, &m_causticTraceDescSets[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate caustic trace descriptor set");
+        }
+
+        allocInfo.pSetLayouts = &m_causticSplatDescLayout;
+        if (vkAllocateDescriptorSets(device, &allocInfo, &m_causticSplatDescSets[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate caustic splat descriptor set");
+        }
+
+        allocInfo.pSetLayouts = &m_causticFilterDescLayout;
+        if (vkAllocateDescriptorSets(device, &allocInfo, &m_causticFilterDescSets[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate caustic filter descriptor set");
+        }
+    }
+
+    // 3. Pipeline Layouts
+    // 3a. Trace Pipeline Layout
+    VkPushConstantRange tracePCRange{};
+    tracePCRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    tracePCRange.offset = 0;
+    tracePCRange.size = sizeof(uint32_t) * 8 + sizeof(float) * 8; // 64 bytes
+    VkPipelineLayoutCreateInfo tracePipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    tracePipeLayoutInfo.setLayoutCount = 1;
+    tracePipeLayoutInfo.pSetLayouts = &m_causticTraceDescLayout;
+    tracePipeLayoutInfo.pushConstantRangeCount = 1;
+    tracePipeLayoutInfo.pPushConstantRanges = &tracePCRange;
+    if (vkCreatePipelineLayout(device, &tracePipeLayoutInfo, nullptr, &m_causticTracePipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic trace pipeline layout");
+    }
+
+    // 3b. Splat Pipeline Layout
+    VkPushConstantRange splatPCRange{};
+    splatPCRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    splatPCRange.offset = 0;
+    splatPCRange.size = sizeof(uint32_t) * 3 + sizeof(float) + sizeof(glm::vec4) * 2; // 48 bytes
+    VkPipelineLayoutCreateInfo splatPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    splatPipeLayoutInfo.setLayoutCount = 1;
+    splatPipeLayoutInfo.pSetLayouts = &m_causticSplatDescLayout;
+    splatPipeLayoutInfo.pushConstantRangeCount = 1;
+    splatPipeLayoutInfo.pPushConstantRanges = &splatPCRange;
+    if (vkCreatePipelineLayout(device, &splatPipeLayoutInfo, nullptr, &m_causticSplatPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic splat pipeline layout");
+    }
+
+    // 3c. Filter Pipeline Layout
+    VkPushConstantRange filterPCRange{};
+    filterPCRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    filterPCRange.offset = 0;
+    filterPCRange.size = sizeof(uint32_t) * 4; // 16 bytes
+    VkPipelineLayoutCreateInfo filterPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    filterPipeLayoutInfo.setLayoutCount = 1;
+    filterPipeLayoutInfo.pSetLayouts = &m_causticFilterDescLayout;
+    filterPipeLayoutInfo.pushConstantRangeCount = 1;
+    filterPipeLayoutInfo.pPushConstantRanges = &filterPCRange;
+    if (vkCreatePipelineLayout(device, &filterPipeLayoutInfo, nullptr, &m_causticFilterPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create caustic filter pipeline layout");
+    }
+
+    // 4. Compute Pipelines (Wave32 optimized for RDNA 4)
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+    };
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    auto traceCode = loadShaderSPIRV("caustic_photon_trace.comp.spv");
+    VkShaderModule traceMod = createShaderModule(traceCode);
+    VkComputePipelineCreateInfo tracePipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    tracePipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, traceMod, "main", nullptr };
+    if (m_context->hasSubgroupSizeControl()) tracePipeInfo.stage.pNext = &subgroupSize32;
+    tracePipeInfo.layout = m_causticTracePipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &tracePipeInfo, nullptr, &m_causticTracePipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, traceMod, nullptr);
+        throw std::runtime_error("Failed to create caustic trace compute pipeline");
+    }
+    vkDestroyShaderModule(device, traceMod, nullptr);
+
+    auto splatCode = loadShaderSPIRV("caustic_splat.comp.spv");
+    VkShaderModule splatMod = createShaderModule(splatCode);
+    VkComputePipelineCreateInfo splatPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    splatPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, splatMod, "main", nullptr };
+    if (m_context->hasSubgroupSizeControl()) splatPipeInfo.stage.pNext = &subgroupSize32;
+    splatPipeInfo.layout = m_causticSplatPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &splatPipeInfo, nullptr, &m_causticSplatPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, splatMod, nullptr);
+        throw std::runtime_error("Failed to create caustic splat compute pipeline");
+    }
+    vkDestroyShaderModule(device, splatMod, nullptr);
+
+    auto filterCode = loadShaderSPIRV("caustic_filter.comp.spv");
+    VkShaderModule filterMod = createShaderModule(filterCode);
+    VkComputePipelineCreateInfo filterPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    filterPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, filterMod, "main", nullptr };
+    if (m_context->hasSubgroupSizeControl()) filterPipeInfo.stage.pNext = &subgroupSize32;
+    filterPipeInfo.layout = m_causticFilterPipelineLayout;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &filterPipeInfo, nullptr, &m_causticFilterPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, filterMod, nullptr);
+        throw std::runtime_error("Failed to create caustic filter compute pipeline");
+    }
+    vkDestroyShaderModule(device, filterMod, nullptr);
+
+    Logger::info("Real-time Caustics pipelines (Wave32 trace, splat, bilateral filter) created successfully.");
+}
+
+void Engine::destroyCausticsPipelines() {
+    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
+    if (!device) return;
+
+    if (m_causticTracePipeline) { vkDestroyPipeline(device, m_causticTracePipeline, nullptr); m_causticTracePipeline = VK_NULL_HANDLE; }
+    if (m_causticSplatPipeline) { vkDestroyPipeline(device, m_causticSplatPipeline, nullptr); m_causticSplatPipeline = VK_NULL_HANDLE; }
+    if (m_causticFilterPipeline) { vkDestroyPipeline(device, m_causticFilterPipeline, nullptr); m_causticFilterPipeline = VK_NULL_HANDLE; }
+
+    if (m_causticTracePipelineLayout) { vkDestroyPipelineLayout(device, m_causticTracePipelineLayout, nullptr); m_causticTracePipelineLayout = VK_NULL_HANDLE; }
+    if (m_causticSplatPipelineLayout) { vkDestroyPipelineLayout(device, m_causticSplatPipelineLayout, nullptr); m_causticSplatPipelineLayout = VK_NULL_HANDLE; }
+    if (m_causticFilterPipelineLayout) { vkDestroyPipelineLayout(device, m_causticFilterPipelineLayout, nullptr); m_causticFilterPipelineLayout = VK_NULL_HANDLE; }
+
+    if (m_causticDescPool) { vkDestroyDescriptorPool(device, m_causticDescPool, nullptr); m_causticDescPool = VK_NULL_HANDLE; }
+
+    if (m_causticTraceDescLayout) { vkDestroyDescriptorSetLayout(device, m_causticTraceDescLayout, nullptr); m_causticTraceDescLayout = VK_NULL_HANDLE; }
+    if (m_causticSplatDescLayout) { vkDestroyDescriptorSetLayout(device, m_causticSplatDescLayout, nullptr); m_causticSplatDescLayout = VK_NULL_HANDLE; }
+    if (m_causticFilterDescLayout) { vkDestroyDescriptorSetLayout(device, m_causticFilterDescLayout, nullptr); m_causticFilterDescLayout = VK_NULL_HANDLE; }
+
+    m_causticTraceDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_causticSplatDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_causticFilterDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+}
+
+void Engine::createCausticsResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    uint32_t w = m_config.width;
+    uint32_t h = m_config.height;
+
+    // 1. Photon Buffer (64 bytes per CausticPhotonHit)
+    uint32_t photonCount = std::max(m_config.caustic_photons, 65536u);
+    VkDeviceSize photonBufferSize = static_cast<VkDeviceSize>(photonCount) * 64;
+    m_causticPhotonBuffer = std::make_unique<Buffer>(
+        allocator, photonBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // 2. Atomic Accumulation Buffer (3x uint32_t per pixel: fixed-point Q16.16 RGB)
+    VkDeviceSize atomicBufferSize = static_cast<VkDeviceSize>(w * h) * 3 * sizeof(uint32_t);
+    m_causticAtomicBuffer = std::make_unique<Buffer>(
+        allocator, atomicBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+    );
+
+    // 3. Filtered Caustic Image & Previous History Image (RGBA16F)
+    m_filteredCausticImage = std::make_unique<Image>(
+        device, allocator, w, h,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    m_prevCausticImage = std::make_unique<Image>(
+        device, allocator, w, h,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    // Transition images to GENERAL layout and clear atomic buffer
+    VkCommandBuffer cmd = m_commandBuffers[0];
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    m_filteredCausticImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_prevCausticImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    vkCmdFillBuffer(cmd, m_causticAtomicBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+
+    VkClearColorValue clearZero{};
+    VkImageSubresourceRange sRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(cmd, m_filteredCausticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &sRange);
+    vkCmdClearColorImage(cmd, m_prevCausticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &sRange);
+
+    vkEndCommandBuffer(cmd);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
+
+    updateCausticsDescriptors();
+    Logger::info("Real-time Caustics GPU resources allocated successfully.");
+}
+
+void Engine::destroyCausticsResources() {
+    m_causticPhotonBuffer.reset();
+    m_causticAtomicBuffer.reset();
+    m_filteredCausticImage.reset();
+    m_prevCausticImage.reset();
+}
+
+void Engine::updateCausticsDescriptors() {
+    VkDevice device = m_context->getDevice();
+    if (!m_causticDescPool || !m_causticPhotonBuffer || !m_causticAtomicBuffer ||
+        !m_filteredCausticImage || !m_prevCausticImage || !m_normalDepthImage ||
+        !m_motionVectorImage || !m_triangleBuffer) {
+        return;
+    }
+
+    VkDescriptorBufferInfo triInfo{ m_triangleBuffer->getBuffer(), 0, m_triangleBuffer->getSize() };
+    VkDescriptorBufferInfo sphereInfo{ m_sphereBuffer->getBuffer(), 0, m_sphereBuffer->getSize() };
+    VkDescriptorBufferInfo matInfo{ m_materialBuffer->getBuffer(), 0, m_materialBuffer->getSize() };
+    VkDescriptorBufferInfo lightInfo{ m_lightBuffer->getBuffer(), 0, m_lightBuffer->getSize() };
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+    asInfo.accelerationStructureCount = 1;
+    VkAccelerationStructureKHR tlasHandle = m_tlas ? m_tlas->getHandle() : VK_NULL_HANDLE;
+    asInfo.pAccelerationStructures = &tlasHandle;
+
+    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
+    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
+        if (i < m_sceneTextures.size() && m_sceneTextures[i]) {
+            texInfos[i] = m_sceneTextures[i]->getDescriptorInfo();
+        } else {
+            texInfos[i] = m_dummyWhite->getDescriptorInfo();
+        }
+    }
+
+    VkDescriptorBufferInfo photonBufInfo{ m_causticPhotonBuffer->getBuffer(), 0, m_causticPhotonBuffer->getSize() };
+    VkDescriptorBufferInfo atomicBufInfo{ m_causticAtomicBuffer->getBuffer(), 0, m_causticAtomicBuffer->getSize() };
+
+    VkDescriptorImageInfo ndImageInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mvImageInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo filteredCausticInfo{ VK_NULL_HANDLE, m_filteredCausticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevCausticInfo{ VK_NULL_HANDLE, m_prevCausticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::array<VkDescriptorBufferInfo, MAX_FRAMES_IN_FLIGHT> camInfos;
+    std::array<VkDescriptorBufferInfo, MAX_FRAMES_IN_FLIGHT> instanceInfos;
+    VkBuffer actualInstanceBuffer = (m_instanceBuffer && m_instanceBuffer->getBuffer() != VK_NULL_HANDLE) ? m_instanceBuffer->getBuffer() : m_triangleBuffer->getBuffer();
+    VkDeviceSize actualInstanceSize = (m_instanceBuffer && m_instanceBuffer->getSize() > 0) ? m_instanceBuffer->getSize() : m_triangleBuffer->getSize();
+
+    std::vector<VkWriteDescriptorSet> writes;
+
+    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
+        if (!m_cameraUBOs[slot]) continue;
+        camInfos[slot] = { m_cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
+        instanceInfos[slot] = { actualInstanceBuffer, 0, actualInstanceSize };
+
+        // 1. Caustic Trace Set
+        VkDescriptorSet traceSet = m_causticTraceDescSets[slot];
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr });
+        if (tlasHandle != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, traceSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
+        }
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &photonBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfos[slot], nullptr });
+
+        // 2. Caustic Splat Set
+        VkDescriptorSet splatSet = m_causticSplatDescSets[slot];
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, splatSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &camInfos[slot], nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, splatSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, splatSet, 20, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &photonBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, splatSet, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicBufInfo, nullptr });
+
+        // 3. Caustic Filter Set
+        VkDescriptorSet filterSet = m_causticFilterDescSets[slot];
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &camInfos[slot], nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &filteredCausticInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 23, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevCausticInfo, nullptr, nullptr });
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::dispatchCausticTrace(VkCommandBuffer cmd, uint32_t frameSlot) {
+    if (!m_causticTracePipeline || !m_causticPhotonBuffer || m_numLights == 0) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticTracePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticTracePipelineLayout, 0, 1, &m_causticTraceDescSets[frameSlot], 0, nullptr);
+
+    struct CausticTracePC {
+        uint32_t numTriangles;
+        uint32_t numSpheres;
+        uint32_t numMaterials;
+        uint32_t numLights;
+        uint32_t photonCount;
+        uint32_t frameIndex;
+        uint32_t numOpaqueTriangles;
+        uint32_t maxBounces;
+        glm::vec4 targetBBoxMin;
+        glm::vec4 targetBBoxMax;
+    } pc;
+
+    pc.numTriangles = m_numTriangles;
+    pc.numSpheres = m_numSpheres;
+    pc.numMaterials = m_numMaterials;
+    pc.numLights = m_numLights;
+    pc.photonCount = m_config.caustic_photons;
+    pc.frameIndex = m_frameIndex;
+    pc.numOpaqueTriangles = m_numOpaqueTriangles;
+    pc.maxBounces = 4u;
+    pc.targetBBoxMin = glm::vec4(m_sceneData.dielectricBoundsMin, m_sceneData.hasDielectrics ? 1.0f : 0.0f);
+    pc.targetBBoxMax = glm::vec4(m_sceneData.dielectricBoundsMax, 0.0f);
+
+    vkCmdPushConstants(cmd, m_causticTracePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groups = (m_config.caustic_photons + 255) / 256;
+    vkCmdDispatch(cmd, groups, 1, 1);
+
+    // Barrier: Photon buffer write -> Photon buffer read in Splat pass
+    VkBufferMemoryBarrier2 photonBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+    photonBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    photonBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    photonBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    photonBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    photonBarrier.buffer = m_causticPhotonBuffer->getBuffer();
+    photonBarrier.offset = 0;
+    photonBarrier.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &photonBarrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+void Engine::dispatchCausticSplatAndFilter(VkCommandBuffer cmd, uint32_t frameSlot) {
+    if (!m_causticSplatPipeline || !m_causticFilterPipeline ||
+        !m_causticAtomicBuffer || !m_causticPhotonBuffer || !m_filteredCausticImage) return;
+
+    // 1. Fast GPU atomic accumulator buffer clear
+    vkCmdFillBuffer(cmd, m_causticAtomicBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+
+    // 2. Barrier: FillBuffer -> Compute Shader Read/Write & NormalDepth Image Read Barrier
+    VkBufferMemoryBarrier2 fillBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+    fillBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    fillBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    fillBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    fillBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    fillBarrier.buffer = m_causticAtomicBuffer->getBuffer();
+    fillBarrier.offset = 0;
+    fillBarrier.size = VK_WHOLE_SIZE;
+
+    VkImageMemoryBarrier2 ndBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    ndBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    ndBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    ndBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    ndBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    ndBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ndBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ndBarrier.image = m_normalDepthImage->getImage();
+    ndBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo preSplatDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    preSplatDep.bufferMemoryBarrierCount = 1;
+    preSplatDep.pBufferMemoryBarriers = &fillBarrier;
+    preSplatDep.imageMemoryBarrierCount = 1;
+    preSplatDep.pImageMemoryBarriers = &ndBarrier;
+    vkCmdPipelineBarrier2(cmd, &preSplatDep);
+
+    // 3. Dispatch Splat Pass
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticSplatPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticSplatPipelineLayout, 0, 1, &m_causticSplatDescSets[frameSlot], 0, nullptr);
+
+    struct CausticSplatPC {
+        uint32_t width;
+        uint32_t height;
+        uint32_t photonCount;
+        float fov;
+        glm::vec4 targetBBoxMin;
+        glm::vec4 targetBBoxMax;
+    } splatPC;
+    splatPC.width = m_config.width;
+    splatPC.height = m_config.height;
+    splatPC.photonCount = m_config.caustic_photons;
+    splatPC.fov = m_camera ? m_camera->getFov() : 45.0f;
+    splatPC.targetBBoxMin = glm::vec4(m_sceneData.dielectricBoundsMin, m_sceneData.hasDielectrics ? 1.0f : 0.0f);
+    splatPC.targetBBoxMax = glm::vec4(m_sceneData.dielectricBoundsMax, 0.0f);
+
+    vkCmdPushConstants(cmd, m_causticSplatPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(splatPC), &splatPC);
+    uint32_t splatGroups = (m_config.caustic_photons + 255) / 256;
+    vkCmdDispatch(cmd, splatGroups, 1, 1);
+
+    // 4. Barrier: Splat atomic writes -> Filter read
+    VkBufferMemoryBarrier2 splatToFilterBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+    splatToFilterBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    splatToFilterBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    splatToFilterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    splatToFilterBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    splatToFilterBarrier.buffer = m_causticAtomicBuffer->getBuffer();
+    splatToFilterBarrier.offset = 0;
+    splatToFilterBarrier.size = VK_WHOLE_SIZE;
+
+    VkDependencyInfo filterDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    filterDep.bufferMemoryBarrierCount = 1;
+    filterDep.pBufferMemoryBarriers = &splatToFilterBarrier;
+    vkCmdPipelineBarrier2(cmd, &filterDep);
+
+    // 5. Dispatch Bilateral Filter & Temporal Accumulation
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticFilterPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_causticFilterPipelineLayout, 0, 1, &m_causticFilterDescSets[frameSlot], 0, nullptr);
+
+    uint32_t accumHist = 0u;
+    if (m_config.progressive_accumulation && !m_cameraMovedLastFrame) {
+        accumHist = 2u; // stationary progressive
+    } else if (m_config.enable_taa || m_config.enable_temporal_accum) {
+        accumHist = 1u; // dynamic temporal
+    }
+
+    struct CausticFilterPC {
+        uint32_t width;
+        uint32_t height;
+        uint32_t frameIndex;
+        uint32_t accumulateHistory;
+    } filterPC;
+    filterPC.width = m_config.width;
+    filterPC.height = m_config.height;
+    filterPC.frameIndex = m_frameIndex;
+    filterPC.accumulateHistory = accumHist;
+
+    vkCmdPushConstants(cmd, m_causticFilterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(filterPC), &filterPC);
+    uint32_t filterGroupsX = (m_config.width + 15) / 16;
+    uint32_t filterGroupsY = (m_config.height + 15) / 16;
+    vkCmdDispatch(cmd, filterGroupsX, filterGroupsY, 1);
+
+    // 6. Barrier: Filter write -> Copy to Prev Image & Shading Read
+    VkImageMemoryBarrier2 filterPostBarrier[2] = {};
+    filterPostBarrier[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    filterPostBarrier[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    filterPostBarrier[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    filterPostBarrier[0].dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    filterPostBarrier[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    filterPostBarrier[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    filterPostBarrier[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    filterPostBarrier[0].image = m_filteredCausticImage->getImage();
+    filterPostBarrier[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    filterPostBarrier[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    filterPostBarrier[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    filterPostBarrier[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    filterPostBarrier[1].dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    filterPostBarrier[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    filterPostBarrier[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    filterPostBarrier[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    filterPostBarrier[1].image = m_prevCausticImage->getImage();
+    filterPostBarrier[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo copyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    copyDep.imageMemoryBarrierCount = 2;
+    copyDep.pImageMemoryBarriers = filterPostBarrier;
+    vkCmdPipelineBarrier2(cmd, &copyDep);
+
+    VkImageCopy copyRegion{};
+    copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    copyRegion.extent = { m_config.width, m_config.height, 1 };
+    vkCmdCopyImage(cmd, m_filteredCausticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                   m_prevCausticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
+
+    // Final barrier: m_filteredCausticImage ready for shader read in Bounce 0 shade
+    VkImageMemoryBarrier2 finalBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    finalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    finalBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    finalBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    finalBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    finalBarrier.image = m_filteredCausticImage->getImage();
+    finalBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo finalDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    finalDep.imageMemoryBarrierCount = 1;
+    finalDep.pImageMemoryBarriers = &finalBarrier;
+    vkCmdPipelineBarrier2(cmd, &finalDep);
+}
+
+void Engine::dispatchCaustics(VkCommandBuffer cmd, uint32_t frameSlot) {
+    if (!m_config.enable_caustics || !m_sceneData.hasDielectrics || m_numLights == 0) return;
+    dispatchCausticTrace(cmd, frameSlot);
+    dispatchCausticSplatAndFilter(cmd, frameSlot);
+}
+
 void Engine::updateSceneDescriptors() {
     VkDevice device = m_context->getDevice();
 
@@ -2837,6 +3428,7 @@ void Engine::updateSceneDescriptors() {
     }
 
     updateWavefrontSceneDescriptors();
+    updateCausticsDescriptors();
 }
 
 void Engine::updateWavefrontSceneDescriptors() {
@@ -2883,7 +3475,8 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : VK_NULL_HANDLE,
             m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE,
             m_instanceBuffer ? m_instanceBuffer->getBuffer() : VK_NULL_HANDLE,
-            m_instanceBuffer ? m_instanceBuffer->getSize() : 0
+            m_instanceBuffer ? m_instanceBuffer->getSize() : 0,
+            m_filteredCausticImage ? m_filteredCausticImage->getImageView() : VK_NULL_HANDLE
         );
     }
 
@@ -3727,6 +4320,7 @@ void Engine::renderFrame() {
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree)     flags |= (1 << 7);
+    if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
     if (m_config.enable_shadow_denoiser) {
         flags |= (1 << 20);
     }
@@ -3892,6 +4486,10 @@ void Engine::renderFrame() {
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
                 wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
 
+                if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                    dispatchCausticTrace(cmd, m_currentFrame);
+                }
+
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
                                                  activeSpp, activeBounces, wfSceneData);
 
@@ -3903,6 +4501,9 @@ void Engine::renderFrame() {
                                                  1e-3f, 1024);
                 }
             } else {
+            if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                dispatchCaustics(cmd, m_currentFrame);
+            }
             // === DEDICATED HARDWARE RAY TRACING PIPELINE (VK_KHR_ray_tracing_pipeline) ===
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
@@ -4276,6 +4877,10 @@ void Engine::renderFrame() {
                 wfSceneData.fullHeight = m_config.height;
                 wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
 
+                if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                    dispatchCausticTrace(cmd, m_currentFrame);
+                }
+
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);
 
@@ -4287,6 +4892,9 @@ void Engine::renderFrame() {
                                                  1e-3f, 1024);
                 }
             } else {
+                if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                    dispatchCaustics(cmd, m_currentFrame);
+                }
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
                 VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
@@ -5737,6 +6345,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_upwaysPipeline->resize(m_config.width, m_config.height);
     }
     createUpwaysResources();
+    destroyCausticsResources();
+    createCausticsResources();
+    updateCausticsDescriptors();
     updateAllImageDescriptors();
     updateMergeDescriptors();
 

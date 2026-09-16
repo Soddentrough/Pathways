@@ -1,0 +1,143 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
+} ubo;
+
+layout(binding = 12, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 14, rg16f) uniform readonly image2D uMotionVectorImage;
+
+layout(std430, binding = 21) buffer CausticAtomicBuffer {
+    uint causticAtomicBuffer[];
+};
+
+layout(binding = 22, rgba16f) uniform writeonly image2D uFilteredCausticImage;
+layout(binding = 23, rgba16f) uniform readonly image2D uPrevCausticImage;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint accumulateHistory;
+} pc;
+
+shared vec3 s_rawIrr[20][20];
+shared vec4 s_normDepth[20][20];
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - 2;
+    uint tid = gl_LocalInvocationIndex;
+
+    // 1. Cooperative LDS tile load with 2-pixel apron (400 elements loaded across 256 threads)
+    for (uint i = tid; i < 400u; i += 256u) {
+        int ly = int(i / 20u);
+        int lx = int(i % 20u);
+        ivec2 gCoord = clamp(tileOrigin + ivec2(lx, ly), ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
+
+        uint gIdx = uint(gCoord.y * int(pc.width) + gCoord.x);
+        uint gBase = gIdx * 3u;
+        s_rawIrr[ly][lx] = vec3(float(causticAtomicBuffer[gBase + 0u]),
+                                float(causticAtomicBuffer[gBase + 1u]),
+                                float(causticAtomicBuffer[gBase + 2u])) / 65536.0;
+        s_normDepth[ly][lx] = imageLoad(uNormalDepthImage, gCoord);
+    }
+
+    barrier();
+
+    if (pixelCoord.x >= int(pc.width) || pixelCoord.y >= int(pc.height)) return;
+
+    int smX = int(gl_LocalInvocationID.x) + 2;
+    int smY = int(gl_LocalInvocationID.y) + 2;
+
+    vec4 centerGbuf = s_normDepth[smY][smX];
+    vec3 centerNorm = centerGbuf.xyz;
+    float centerDepth = centerGbuf.w;
+    vec3 centerRawIrr = s_rawIrr[smY][smX];
+
+    if (centerDepth >= 9000.0) {
+        // Sky / void
+        imageStore(uFilteredCausticImage, pixelCoord, vec4(0.0));
+        return;
+    }
+
+    // 2. 5x5 Cross-Bilateral Spatial Reconstruction completely out of on-chip LDS
+    vec3 accumIrr = vec3(0.0);
+    float totalWeight = 0.0;
+
+    const float sigmaDepth = max(centerDepth * 0.05, 0.02);
+    const float sigmaNorm = 16.0;
+    const float kernelWeights[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+
+    [[unroll]] for (int dy = -2; dy <= 2; ++dy) {
+        float wy = kernelWeights[dy + 2];
+        int ty = smY + dy;
+
+        [[unroll]] for (int dx = -2; dx <= 2; ++dx) {
+            float wx = kernelWeights[dx + 2];
+            int tx = smX + dx;
+
+            vec3 tapRawIrr = s_rawIrr[ty][tx];
+            vec4 tapGbuf = s_normDepth[ty][tx];
+            vec3 tapNorm = tapGbuf.xyz;
+            float tapDepth = tapGbuf.w;
+
+            // Depth difference weight
+            float depthDiff = abs(centerDepth - tapDepth);
+            float wDepth = exp(-depthDiff / sigmaDepth);
+
+            // Normal cosine similarity weight
+            float normDot = max(0.0, dot(centerNorm, tapNorm));
+            float wNorm = pow(normDot, sigmaNorm);
+
+            float weight = (wx * wy) * wDepth * wNorm;
+            accumIrr += tapRawIrr * weight;
+            totalWeight += weight;
+        }
+    }
+
+    vec3 spatialFiltered = (totalWeight > 1e-4) ? (accumIrr / totalWeight) : centerRawIrr;
+
+    // 2. Motion-Vector Guided Temporal Accumulation
+    vec3 finalIrr = spatialFiltered;
+
+    if (pc.accumulateHistory != 0u && pc.frameIndex > 0u) {
+        vec2 mv = imageLoad(uMotionVectorImage, pixelCoord).xy;
+        // Motion vectors are in clip delta coordinates [-1, 1], scale to pixel delta
+        vec2 prevPixCoord = vec2(pixelCoord) - mv * vec2(pc.width, pc.height);
+        ivec2 prevI = ivec2(round(prevPixCoord));
+
+        if (prevI.x >= 0 && prevI.x < int(pc.width) && prevI.y >= 0 && prevI.y < int(pc.height)) {
+            vec4 prevGbuf = imageLoad(uNormalDepthImage, prevI);
+            float prevDepth = prevGbuf.w;
+            vec3 prevNorm = prevGbuf.xyz;
+
+            // Disocclusion validation
+            if (abs(prevDepth - centerDepth) / max(centerDepth, 1e-3) < 0.05 &&
+                dot(prevNorm, centerNorm) > 0.85) {
+                vec3 prevIrr = imageLoad(uPrevCausticImage, prevI).rgb;
+
+                // Temporal blend: 15% new sample, 85% history for smooth temporal integration
+                float alpha = (pc.accumulateHistory == 2u) ? (1.0 / float(pc.frameIndex + 1u)) : 0.15;
+                finalIrr = mix(prevIrr, spatialFiltered, alpha);
+            }
+        }
+    }
+
+    imageStore(uFilteredCausticImage, pixelCoord, vec4(finalIrr, 1.0));
+}

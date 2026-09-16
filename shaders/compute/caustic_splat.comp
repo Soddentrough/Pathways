@@ -1,0 +1,158 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
+} ubo;
+
+layout(binding = 12, rgba16f) uniform readonly image2D uNormalDepthImage;
+
+struct CausticPhotonHit {
+    vec4 positionRoughness; // xyz: hit position, w: roughness
+    vec4 normalDist;        // xyz: surface normal, w: distance from light
+    vec4 flux;              // rgb: radiant flux, w: flags (1.0 = valid)
+    vec4 incidentDir;       // xyz: incoming photon direction, w: material type
+};
+
+layout(std430, binding = 20) readonly buffer CausticPhotonsBuffer {
+    CausticPhotonHit inPhotons[];
+};
+
+layout(std430, binding = 21) buffer CausticAtomicBuffer {
+    uint causticAtomicBuffer[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint photonCount;
+    float fov;
+    vec4 targetBBoxMin;
+    vec4 targetBBoxMax;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.photonCount) return;
+
+    CausticPhotonHit p = inPhotons[idx];
+    if (p.flux.w <= 0.5) return; // Inactive photon
+
+    vec3 worldPos = p.positionRoughness.xyz;
+    vec3 worldNormal = p.normalDist.xyz;
+    vec3 flux = p.flux.rgb;
+
+    // Project world hit position to camera clip space
+    vec4 clip = ubo.unjitteredViewProj * vec4(worldPos, 1.0);
+    if (clip.w <= 0.001) return; // Behind camera
+
+    vec3 ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) return; // Out of frustum
+
+    // Map NDC [-1, 1] to pixel coordinates [0, width-1] x [0, height-1]
+    ivec2 pixelCoord = ivec2((ndc.xy * 0.5 + 0.5) * vec2(pc.width, pc.height));
+    if (pixelCoord.x < 0 || pixelCoord.x >= int(pc.width) ||
+        pixelCoord.y < 0 || pixelCoord.y >= int(pc.height)) return;
+
+    // G-Buffer depth and normal verification
+    vec4 gbuf = imageLoad(uNormalDepthImage, pixelCoord);
+    float gbufDepth = gbuf.w;
+    vec3 gbufNormal = gbuf.xyz;
+
+    float photonCamDist = length(worldPos - ubo.position.xyz);
+    float depthDiff = photonCamDist - gbufDepth;
+
+    // Discard photons that are substantially in front of the visible primary surface
+    if (depthDiff < -max(0.05 * gbufDepth, 0.05)) {
+        return;
+    }
+
+    bool onPrimarySurface = (abs(depthDiff) <= max(0.08 * gbufDepth, 0.15));
+    if (onPrimarySurface) {
+        if (dot(gbufNormal, worldNormal) < 0.2) {
+            return; // Normal mismatch on primary surface
+        }
+    } else {
+        // Photon is behind primary surface. Only valid if primary surface is inside the dielectric volume
+        if (pc.targetBBoxMin.w < 0.5) return;
+        vec3 bMin = pc.targetBBoxMin.xyz - vec3(0.05);
+        vec3 bMax = pc.targetBBoxMax.xyz + vec3(0.05);
+        vec3 primaryHitPoint = ubo.position.xyz + normalize(worldPos - ubo.position.xyz) * gbufDepth;
+        bool primaryInDielectric = all(greaterThanEqual(primaryHitPoint, bMin)) && all(lessThanEqual(primaryHitPoint, bMax));
+        if (!primaryInDielectric) {
+            return; // Primary surface is an opaque occluder blocking the photon
+        }
+    }
+
+    // Camera ray direction to hit point
+    vec3 toCam = normalize(ubo.position.xyz - worldPos);
+    float cosThetaCam = max(0.1, dot(worldNormal, toCam));
+
+    // Exact pixel footprint area on receiver surface
+    // In camera view space at unit distance, pixel width is 2*|projInverse[0][0]|/width, height is 2*|projInverse[1][1]|/height
+    float pixelSolidAngle = (4.0 * abs(ubo.projInverse[0][0] * ubo.projInverse[1][1])) / float(pc.width * pc.height);
+    float pixelArea = (photonCamDist * photonCamDist * pixelSolidAngle) / cosThetaCam;
+
+    // Physical irradiance: E = dPhi / dA
+    // Clamping at 1e-7 avoids division by zero while preserving scale.
+    vec3 irradiance = flux / max(pixelArea, 1e-7);
+
+    // Clamp extreme single-photon spikes to avoid fixed-point buffer overflow
+    irradiance = clamp(irradiance, vec3(0.0), vec3(32000.0));
+    uvec3 baseFixed = uvec3(irradiance * 65536.0 + 0.5);
+    if ((baseFixed.x | baseFixed.y | baseFixed.z) == 0u) return;
+
+    // Fast path for interior pixels (99%+ of valid photons) with fully unrolled shifts
+    bool isInterior = (pixelCoord.x > 0 && pixelCoord.x < int(pc.width) - 1 &&
+                       pixelCoord.y > 0 && pixelCoord.y < int(pc.height) - 1);
+
+    if (isInterior) {
+        [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+            uint sy = (dy == 0) ? 1u : 2u;
+            uint rowBase = uint((pixelCoord.y + dy) * int(pc.width) + pixelCoord.x) * 3u;
+
+            [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+                uint shift = sy + ((dx == 0) ? 1u : 2u);
+                uvec3 fixedIrr = baseFixed >> shift;
+                uint base = rowBase + uint(dx * 3);
+
+                if (fixedIrr.x > 0u) atomicAdd(causticAtomicBuffer[base + 0u], fixedIrr.x);
+                if (fixedIrr.y > 0u) atomicAdd(causticAtomicBuffer[base + 1u], fixedIrr.y);
+                if (fixedIrr.z > 0u) atomicAdd(causticAtomicBuffer[base + 2u], fixedIrr.z);
+            }
+        }
+    } else {
+        // Fallback for screen border pixels
+        for (int dy = -1; dy <= 1; ++dy) {
+            int py = pixelCoord.y + dy;
+            if (py < 0 || py >= int(pc.height)) continue;
+            uint sy = (dy == 0) ? 1u : 2u;
+
+            for (int dx = -1; dx <= 1; ++dx) {
+                int px = pixelCoord.x + dx;
+                if (px < 0 || px >= int(pc.width)) continue;
+                uint shift = sy + ((dx == 0) ? 1u : 2u);
+                uvec3 fixedIrr = baseFixed >> shift;
+                uint base = uint(py * int(pc.width) + px) * 3u;
+
+                if (fixedIrr.x > 0u) atomicAdd(causticAtomicBuffer[base + 0u], fixedIrr.x);
+                if (fixedIrr.y > 0u) atomicAdd(causticAtomicBuffer[base + 1u], fixedIrr.y);
+                if (fixedIrr.z > 0u) atomicAdd(causticAtomicBuffer[base + 2u], fixedIrr.z);
+            }
+        }
+    }
+}

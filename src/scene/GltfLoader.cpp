@@ -278,6 +278,22 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             if (mat.volume.thickness_texture.texture) {
                 gpuMat.thicknessTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.volume.thickness_texture.texture)) + 1;
             }
+        } else if (gpuMat.type == MATERIAL_DIELECTRIC || gpuMat.transmission > 0.05f) {
+            std::string matNameLower = mat.name ? mat.name : "";
+            for (auto& c : matNameLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            bool isThin = (matNameLower.find("windscreen") != std::string::npos ||
+                           matNameLower.find("windshield") != std::string::npos ||
+                           matNameLower.find("headlight") != std::string::npos ||
+                           matNameLower.find("window") != std::string::npos ||
+                           matNameLower.find("thin") != std::string::npos ||
+                           matNameLower.find("pane") != std::string::npos ||
+                           matNameLower.find("lightglass") != std::string::npos);
+            if (isThin) {
+                gpuMat.thickness = 0.0f;
+            } else {
+                // Default 3D refractive volume thickness so Snell refraction is executed for closed liquid/glass assets
+                gpuMat.thickness = 1.0f;
+            }
         }
 
         if (mat.has_specular) {
@@ -852,6 +868,26 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     if (meshInfos.empty()) {
         minBound = glm::vec3(-1.0f);
         maxBound = glm::vec3(1.0f);
+    }
+
+    // Compute Dielectric Target Bounding Box for Caustic Photon Injection
+    for (const auto& tri : data.triangles) {
+        if (tri.materialId < data.materials.size()) {
+            const auto& mat = data.materials[tri.materialId];
+            if ((mat.type == MATERIAL_DIELECTRIC || mat.transmission > 0.05f) && mat.thickness > 0.001f) {
+                data.hasDielectrics = true;
+                glm::vec3 p0(tri.v0.position);
+                glm::vec3 p1(tri.v1.position);
+                glm::vec3 p2(tri.v2.position);
+                data.dielectricBoundsMin = glm::min(data.dielectricBoundsMin, glm::min(p0, glm::min(p1, p2)));
+                data.dielectricBoundsMax = glm::max(data.dielectricBoundsMax, glm::max(p0, glm::max(p1, p2)));
+            }
+        }
+    }
+    if (data.hasDielectrics) {
+        Logger::info("Dielectric Caustic Target Bounding Box: [({:.3f}, {:.3f}, {:.3f}) to ({:.3f}, {:.3f}, {:.3f})]",
+                     data.dielectricBoundsMin.x, data.dielectricBoundsMin.y, data.dielectricBoundsMin.z,
+                     data.dielectricBoundsMax.x, data.dielectricBoundsMax.y, data.dielectricBoundsMax.z);
     }
 
     glm::vec3 center = (minBound + maxBound) * 0.5f;

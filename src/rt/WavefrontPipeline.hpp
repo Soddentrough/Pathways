@@ -8,6 +8,7 @@
 #include <vector>
 #include <array>
 #include <string>
+#include <functional>
 
 namespace pathways {
 
@@ -91,7 +92,8 @@ public:
                                 VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
                                 VkImageView mlSpecularImageView = VK_NULL_HANDLE,
                                 VkBuffer instanceBuffer = VK_NULL_HANDLE,
-                                VkDeviceSize instanceSize = 0);
+                                VkDeviceSize instanceSize = 0,
+                                VkImageView causticImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t tileSize = 0);
     void setTileSize(uint32_t tileSize);
@@ -137,7 +139,11 @@ public:
     DGCManager* getDGCManager() const { return m_dgcManager.get(); }
     bool supportsExecutionSet() const { return m_supportsExecutionSet; }
 
+    using PostClassifyCallback = std::function<void(VkCommandBuffer cmd, uint32_t frameSlot)>;
+    void setPostClassifyCallback(PostClassifyCallback cb) { m_postClassifyCallback = std::move(cb); }
+
 private:
+    PostClassifyCallback m_postClassifyCallback = nullptr;
     void createDescriptorLayout();
     void allocateDescriptorSets();
     void allocateQueues(uint32_t capacity);

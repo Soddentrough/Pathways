@@ -1,0 +1,227 @@
+#version 460
+#extension GL_EXT_ray_query : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 8) uniform sampler2D sceneTextures[512];
+
+layout(std430, binding = 2) readonly buffer TrianglesBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 3) readonly buffer SpheresBuffer {
+    Sphere spheres[];
+};
+
+layout(std430, binding = 4) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 5) readonly buffer LightsBuffer {
+    Light lights[];
+};
+
+struct CausticPhotonHit {
+    vec4 positionRoughness; // xyz: hit position, w: roughness
+    vec4 normalDist;        // xyz: surface normal, w: distance from light
+    vec4 flux;              // rgb: radiant flux, w: flags (1.0 = valid, 0.0 = inactive)
+    vec4 incidentDir;       // xyz: incoming photon direction, w: material type
+};
+
+layout(std430, binding = 20) writeonly buffer CausticPhotonsBuffer {
+    CausticPhotonHit outPhotons[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint numTriangles;
+    uint numSpheres;
+    uint numMaterials;
+    uint numLights;
+    uint photonCount;
+    uint frameIndex;
+    uint numOpaqueTriangles;
+    uint maxBounces;
+    vec4 targetBBoxMin; // xyz: min, w: hasTarget
+    vec4 targetBBoxMax; // xyz: max, w: pad
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.photonCount) return;
+
+    // Initialize output slot as inactive
+    outPhotons[idx].flux = vec4(0.0);
+    outPhotons[idx].positionRoughness = vec4(0.0);
+    outPhotons[idx].normalDist = vec4(0.0);
+    outPhotons[idx].incidentDir = vec4(0.0);
+
+    if (pc.numLights == 0u) return;
+
+    uint seed = uint(idx * 1973u + pc.frameIndex * 9277u) | 1u;
+
+    // 1. Select light source uniformly
+    uint lightIdx = uint(randFloat(seed) * float(pc.numLights)) % pc.numLights;
+    Light light = lights[lightIdx];
+    float lightPickPdf = 1.0 / float(pc.numLights);
+
+    vec3 lightPos;
+    vec3 lightNormal = light.normal.xyz;
+    float lightArea = light.emission.w;
+    vec3 emission = light.emission.rgb;
+
+    if (light.position.w == 0.0 /* Area Quad Light */) {
+        vec2 uv = randVec2(seed);
+        if (uv.x + uv.y > 1.0) {
+            uv = vec2(1.0 - uv.x, 1.0 - uv.y);
+        }
+        lightPos = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
+        if (lightArea <= 0.0) {
+            lightArea = 0.5 * length(cross(light.u.xyz, light.v.xyz));
+        }
+    } else if (uint(light.position.w) == 1u /* Spot Light */) {
+        lightPos = light.position.xyz;
+        lightArea = 1.0;
+    } else {
+        // Point / Directional fallback
+        lightPos = light.position.xyz;
+        lightArea = 1.0;
+    }
+
+    // 2. Sample photon emission direction targeted toward dielectric geometry
+    vec3 dir;
+    float coneSolidAngle;
+
+    if (pc.targetBBoxMin.w > 0.5) {
+        vec3 bMin = pc.targetBBoxMin.xyz;
+        vec3 bMax = pc.targetBBoxMax.xyz;
+        vec3 bCenter = 0.5 * (bMin + bMax);
+        float bRadius = length(bMax - bMin) * 0.55; // 10% safety margin
+
+        vec3 toCenter = bCenter - lightPos;
+        float distToCenter = length(toCenter);
+        vec3 coneAxis = (distToCenter > 1e-4) ? (toCenter / distToCenter) : lightNormal;
+
+        float sinThetaMax = clamp(bRadius / max(distToCenter, bRadius * 1.01), 0.05, 0.999);
+        float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMax * sinThetaMax));
+
+        // Sample uniform cone
+        float u1 = randFloat(seed);
+        float u2 = randFloat(seed);
+        float cosTheta = mix(cosThetaMax, 1.0, u1);
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+        float phi = TWO_PI * u2;
+
+        vec3 up = abs(coneAxis.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+        vec3 right = normalize(cross(up, coneAxis));
+        vec3 forward = cross(coneAxis, right);
+
+        dir = normalize(right * (cos(phi) * sinTheta) + forward * (sin(phi) * sinTheta) + coneAxis * cosTheta);
+        coneSolidAngle = TWO_PI * (1.0 - cosThetaMax);
+    } else {
+        // Cosine hemisphere emission from area light
+        vec3 localDir = sampleCosineHemisphere(lightNormal, seed);
+        dir = localDir;
+        coneSolidAngle = PI;
+    }
+
+    float cosLight = max(0.0, dot(lightNormal, dir));
+    if (cosLight <= 0.0 && light.position.w == 0.0) {
+        return; // Emitted away from area light forward face
+    }
+    if (light.position.w != 0.0) cosLight = 1.0;
+
+    // Initial photon radiant flux
+    vec3 photonFlux = (emission * cosLight * lightArea * coneSolidAngle) / (float(pc.photonCount) * lightPickPdf);
+
+    vec3 rayOrigin = lightPos + lightNormal * EPSILON;
+    vec3 rayDir = dir;
+    vec3 throughput = vec3(1.0);
+    bool hasHitDielectric = false;
+    uint maxBounces = pc.maxBounces > 0u ? pc.maxBounces : 4u;
+
+    // 3. Trace photon forward through specular/dielectric refractive boundaries
+    for (uint bounce = 0; bounce < maxBounces; ++bounce) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, EPSILON, rayDir, 10000.0);
+        rayQueryProceedEXT(rq);
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            break; // Flew into empty sky
+        }
+
+        float hitT = rayQueryGetIntersectionTEXT(rq, true);
+        uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        InstanceGPU inst = instances[instIdx];
+        uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+        uint matId = triangles[triIdx].materialId + inst.materialOffset;
+        Material mat = materials[matId];
+
+        mat4x3 hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+        vec3 hitPoint = rayOrigin + rayDir * hitT;
+
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float u = bary.x, v = bary.y, w = 1.0 - u - v;
+        Triangle tri = triangles[triIdx];
+        vec3 localNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+        vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
+
+        bool isDielectric = (mat.type == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);
+
+        if (isDielectric) {
+            hasHitDielectric = true;
+            bool frontFace = dot(rayDir, hitNormal) < 0.0;
+            vec3 geomN = frontFace ? hitNormal : -hitNormal;
+
+            float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+            float eta = frontFace ? (1.0 / iorVal) : iorVal;
+
+            float cosTheta = min(dot(-rayDir, geomN), 1.0);
+            float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+            bool cannotRefract = eta * sinTheta > 1.0;
+            float reflectProb = fresnelDielectric(cosTheta, eta);
+
+            // Refract vs Reflect
+            if (cannotRefract || randFloat(seed) < reflectProb) {
+                // Fresnel reflection
+                rayDir = reflect(rayDir, geomN);
+                rayOrigin = hitPoint + geomN * EPSILON;
+            } else {
+                // Snell's Law refraction
+                rayDir = normalize(refract(rayDir, geomN, eta));
+                rayOrigin = hitPoint - geomN * EPSILON;
+                throughput *= mat.albedo.rgb;
+
+                // Volumetric Beer-Lambert absorption on exit
+                if (!frontFace && mat.attenuationColor.w > 0.0) {
+                    vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+                    throughput *= exp(-sigma_a * hitT);
+                }
+            }
+        } else {
+            // Hit a non-dielectric (receiver surface!)
+            if (hasHitDielectric && mat.type != 3u /* Not emissive light */) {
+                // Successfully formed a caustic path (L -> S+ -> D)!
+                vec3 finalFlux = photonFlux * throughput;
+                float fluxLum = dot(finalFlux, vec3(0.2126, 0.7152, 0.0722));
+
+                if (fluxLum > 1e-7) {
+                    outPhotons[idx].positionRoughness = vec4(hitPoint, mat.roughness);
+                    outPhotons[idx].normalDist = vec4(hitNormal, length(hitPoint - lightPos));
+                    outPhotons[idx].flux = vec4(finalFlux, 1.0); // 1.0 = valid active hit
+                    outPhotons[idx].incidentDir = vec4(rayDir, float(mat.type));
+                }
+            }
+            break;
+        }
+    }
+}

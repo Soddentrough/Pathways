@@ -100,6 +100,7 @@ struct GpuDeviceNode {
 
     // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
     std::unique_ptr<Image> motionVectorImage;
+    std::unique_ptr<Image> causticImage;
 
     ~GpuDeviceNode();
 };

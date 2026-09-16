@@ -99,6 +99,11 @@ struct SceneData {
     float focalDistance = 2.7f;
     glm::vec3 centralTarget = glm::vec3(0.0f, 1.0f, 0.0f);
 
+    // Dielectric Geometry Bounding Box for Caustic Photon Injection
+    bool hasDielectrics = false;
+    glm::vec3 dielectricBoundsMin = glm::vec3(1e9f);
+    glm::vec3 dielectricBoundsMax = glm::vec3(-1e9f);
+
     // Fast CPU raycast against scene geometry for camera pivot targeting
     bool raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDist,
                  float& outHitDist, glm::vec3& outHitPoint, std::string* outHitName = nullptr) const;

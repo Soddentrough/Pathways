@@ -261,7 +261,8 @@ struct RayState {
 };
 
 #define SPECULAR_FLAG_BIT             (1u << 31)
-#define PIXEL_INDEX_MASK              (0x7FFFFFFFu)
+#define CAUSTIC_APPLIED_BIT           (1u << 30)
+#define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
 
 #define MATERIAL_ARCHETYPE_DIFFUSE    0u
 #define MATERIAL_ARCHETYPE_DIELECTRIC 1u

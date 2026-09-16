@@ -1124,7 +1124,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1175,6 +1176,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_FORMAT_R16G16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
+    secNode->causticImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = secNode->accumTarget->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1221,7 +1226,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr }
         };
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -1386,6 +1392,16 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
+    secNode->causticImage->transitionLayout(
+        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+    VkClearColorValue blackClr{};
+    VkImageSubresourceRange clearRng{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(secNode->commandBuffers[0], secNode->causticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &blackClr, 1, &clearRng);
+
     secNode->accumTarget->transitionLayout(
         secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
@@ -1537,7 +1553,8 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getSize() : 0,
             VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
             secNode->instanceBuffer ? secNode->instanceBuffer->getBuffer() : VK_NULL_HANDLE,
-            secNode->instanceBuffer ? secNode->instanceBuffer->getSize() : 0
+            secNode->instanceBuffer ? secNode->instanceBuffer->getSize() : 0,
+            secNode->causticImage ? secNode->causticImage->getImageView() : VK_NULL_HANDLE
         );
     }
 }
@@ -2062,6 +2079,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_FORMAT_R16G16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
+        node->causticImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
         // Transition secondary targets to GENERAL layout and clear accumulation
         vkResetCommandBuffer(node->commandBuffers[0], 0);
         VkCommandBufferBeginInfo beginInfo{};
@@ -2119,6 +2140,15 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdClearColorImage(node->commandBuffers[0], node->accumTarget->getImage(),
+                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+
+        node->causticImage->transitionLayout(
+            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        vkCmdClearColorImage(node->commandBuffers[0], node->causticImage->getImage(),
                              VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
 
         vkEndCommandBuffer(node->commandBuffers[0]);

@@ -132,6 +132,7 @@ layout(binding = 8) uniform sampler2D sceneTextures[512];
 
 layout(binding = 11, rgba16f) uniform image2D uDirectLightImage;
 layout(binding = 12, rgba16f) uniform image2D uNormalDepthImage;
+layout(binding = 15, rgba16f) uniform readonly image2D uCausticImage;
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -238,7 +239,10 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
             uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             uint matId = triangles[triIdx].materialId;
             Material mat = materials[matId];
-            if (mat.type == 3u /* Skip EMISSIVE */ || mat.type == 2u /* Skip DIELECTRIC */ || mat.transmission > 0.05) {
+            bool isDielectric = (mat.type == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
+            bool isThinWalled = (mat.thickness <= 0.001);
+            bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
+            if (mat.type == 3u /* Skip EMISSIVE */ || isThinWalled || (!enableCaustics && isDielectric)) {
                 continue;
             }
             if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {
@@ -685,6 +689,19 @@ void main() {
                     accumSpecular += directSpecular;
                 }
             }
+        }
+    }
+
+    bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
+    if (enableCaustics && mat.type != 3u && transmission < 0.1 && mat.type != 2u && metallic < 0.2) {
+        int currentPx = int(prd.pad % pc.tileWidth);
+        int currentPy = int(prd.pad / pc.tileWidth);
+        ivec2 baseCoord = ivec2(currentPx, currentPy);
+        vec3 causticIrr = imageLoad(uCausticImage, baseCoord).rgb;
+        if (dot(causticIrr, causticIrr) > 1e-8) {
+            vec3 causticDiff = causticIrr * (diffuseColor * INV_PI);
+            accumRadiance += causticDiff;
+            accumDiffuse += causticDiff;
         }
     }
 

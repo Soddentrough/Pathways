@@ -329,7 +329,9 @@ SceneData ProceduralScene::createCornellBox() {
     // 3. Metallic / Mirror Sphere in the foreground
     tStart = static_cast<uint32_t>(scene.triangles.size());
     addSphere(scene.triangles, glm::vec3(0.1f, 0.25f, 0.35f), 0.25f, 5);
-    recordRange("Mirror Sphere", tStart);
+    scene.hasDielectrics = true;
+    scene.dielectricBoundsMin = glm::vec3(-0.4f, 0.35f, -0.35f) - glm::vec3(0.35f);
+    scene.dielectricBoundsMax = glm::vec3(-0.4f, 0.35f, -0.35f) + glm::vec3(0.35f);
 
     scene.hasCamera = true;
     scene.cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);

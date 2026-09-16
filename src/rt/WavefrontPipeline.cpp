@@ -129,7 +129,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMlSpecularMotionImage
         { 28, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMlDiffuseImage
         { 29, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // uMlSpecularImage
-        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // InstancesBuffer
+        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // InstancesBuffer
+        { 31, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // uCausticImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -309,7 +310,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkImageView mlDiffuseImageView,
                                                 VkImageView mlSpecularImageView,
                                                 VkBuffer instanceBuffer,
-                                                VkDeviceSize instanceSize) {
+                                                VkDeviceSize instanceSize,
+                                                VkImageView causticImageView) {
     if (frameSlot >= 2) frameSlot = 0;
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
@@ -325,6 +327,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo diffImageInfo{ VK_NULL_HANDLE, diffView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView specView = (mlSpecularImageView != VK_NULL_HANDLE) ? mlSpecularImageView : accumImageView;
     VkDescriptorImageInfo specImageInfo{ VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : accumImageView;
+    VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorBufferInfo camInfo{ cameraUBO, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo triInfo{ triangleBuffer, 0, triSize };
@@ -393,6 +397,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 31, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticImageInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -695,6 +700,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         c2sDep.bufferMemoryBarrierCount = static_cast<uint32_t>(c2sBarriers.size());
         c2sDep.pBufferMemoryBarriers = c2sBarriers.data();
         vkCmdPipelineBarrier2(cmd, &c2sDep);
+
+        if (sampleIdx == 0 && m_postClassifyCallback) {
+            m_postClassifyCallback(cmd, frameSlot);
+        }
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
 

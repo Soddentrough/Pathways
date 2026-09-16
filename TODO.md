@@ -627,3 +627,16 @@ https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AnimationPoi
 
 1. KHR_mesh_quantization
 https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/MeshoptCubeTest
+
+---
+
+## 7. glTF 2.1 Multi-File Scene Composition & Upstream Ecosystem Tracking
+
+- **Status:** Backlog / Awaiting Upstream Stabilization
+- **Architectural Decision:** Retain strict focus on standardized intermediate formats (glTF 2.0/2.1 and OpenUSD) instead of maintaining reverse-engineered native `.blend` binary parsers.
+- **Upstream Dependencies to Monitor:**
+  1. **Parsers (`cgltf` / `tinygltf`):** Upstream adoption of glTF 2.1 core schemas (`files[]`, `externalAssets[]`, `node.externalAsset`).
+  2. **DCC Exporters (`glTF-Blender-IO`):** Native export of collection instances and linked libraries as unbaked `externalAssets` references rather than monolithic baked `.glb` files.
+  3. **Schema Validation (`glTF-Validator`):** Official 2.1 JSON Schema validation support for multi-file asset manifests.
+  4. **Engine Integration Target:** Once upstream parsers stabilize, extend `GltfLoader` to resolve `externalAssets` into Pathways' multi-BLAS/TLAS instancing pipeline (`SceneData::blasRanges` & `SceneData::instances`).
+
