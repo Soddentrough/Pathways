@@ -279,6 +279,7 @@ private:
     std::atomic<bool> m_isSceneLoading{false};
     std::string m_loadingScenePath = "";
     std::string m_loadingSceneName = "";
+    std::chrono::steady_clock::time_point m_sceneLoadingStartTime;
     bool m_pendingMgpuModeChange = false;
     MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
     bool m_pendingAccumFormatChange = false;

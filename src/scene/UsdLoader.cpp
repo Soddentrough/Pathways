@@ -653,6 +653,12 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 mesh.GetNormalsAttr().Get(&normals, UsdTimeCode::Default());
             }
             TfToken normInterp = mesh.GetNormalsInterpolation();
+            TfToken orientation = UsdGeomTokens->rightHanded;
+            mesh.GetOrientationAttr().Get(&orientation, evalTime);
+            if (orientation.IsEmpty() && evalTime != UsdTimeCode::Default()) {
+                mesh.GetOrientationAttr().Get(&orientation, UsdTimeCode::Default());
+            }
+            bool isLeftHanded = (orientation == UsdGeomTokens->leftHanded);
 
             // Extract UV coordinates
             VtArray<GfVec2f> uvs;
@@ -744,12 +750,12 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     v.position = glm::vec4(p[0], p[1], p[2], 0.0f);
 
                     // Normal
-                    glm::vec3 n(0.0f, 1.0f, 0.0f);
+                    glm::vec3 n(0.0f, 0.0f, 0.0f);
                     if (!normals.empty()) {
                         if (normInterp == UsdGeomTokens->uniform && f < normals.size()) {
                             GfVec3f usdNorm = normals[f];
                             n = glm::vec3(usdNorm[0], usdNorm[1], usdNorm[2]);
-                        } else if (normInterp == UsdGeomTokens->vertex && globalIdx < static_cast<int>(normals.size())) {
+                        } else if ((normInterp == UsdGeomTokens->vertex || normInterp == UsdGeomTokens->varying) && globalIdx < static_cast<int>(normals.size())) {
                             GfVec3f usdNorm = normals[globalIdx];
                             n = glm::vec3(usdNorm[0], usdNorm[1], usdNorm[2]);
                         } else if (normInterp == UsdGeomTokens->faceVarying && (indexOffset + localIdx) < normals.size()) {
@@ -762,7 +768,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     // UV
                     glm::vec2 uv(0.0f);
                     if (!uvs.empty()) {
-                        if (uvInterp == UsdGeomTokens->vertex && globalIdx < static_cast<int>(uvs.size())) {
+                        if ((uvInterp == UsdGeomTokens->vertex || uvInterp == UsdGeomTokens->varying) && globalIdx < static_cast<int>(uvs.size())) {
                             uv = glm::vec2(uvs[globalIdx][0], uvs[globalIdx][1]);
                         } else if (uvInterp == UsdGeomTokens->faceVarying && (indexOffset + localIdx) < uvs.size()) {
                             uv = glm::vec2(uvs[indexOffset + localIdx][0], uvs[indexOffset + localIdx][1]);
@@ -785,11 +791,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     return v;
                 };
 
-                // Fan triangulation: (0, i, i + 1)
+                // Fan triangulation: (0, i, i + 1) for CCW rightHanded, (0, i + 1, i) for CW leftHanded
                 for (int i = 1; i < count - 1; ++i) {
+                    int idx1 = isLeftHanded ? (i + 1) : i;
+                    int idx2 = isLeftHanded ? i : (i + 1);
                     Vertex v0 = getVertex(0);
-                    Vertex v1 = getVertex(i);
-                    Vertex v2 = getVertex(i + 1);
+                    Vertex v1 = getVertex(idx1);
+                    Vertex v2 = getVertex(idx2);
 
                     TriangleGPU tri{};
                     glm::vec4 p0 = M * glm::vec4(glm::vec3(v0.position), 1.0f);
@@ -1040,6 +1048,12 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     protoMesh.GetNormalsAttr().Get(&normals, UsdTimeCode::Default());
                 }
                 TfToken normInterp = protoMesh.GetNormalsInterpolation();
+                TfToken orientation = UsdGeomTokens->rightHanded;
+                protoMesh.GetOrientationAttr().Get(&orientation, instEvalTime);
+                if (orientation.IsEmpty() && instEvalTime != UsdTimeCode::Default()) {
+                    protoMesh.GetOrientationAttr().Get(&orientation, UsdTimeCode::Default());
+                }
+                bool isLeftHanded = (orientation == UsdGeomTokens->leftHanded);
 
                 VtArray<GfVec2f> uvs;
                 TfToken uvInterp = UsdGeomTokens->constant;
@@ -1118,12 +1132,12 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                         GfVec3f p = pts[gIdx];
                         v.position = meshLocalToProto * glm::vec4(p[0], p[1], p[2], 1.0f);
 
-                        glm::vec3 n(0.0f, 1.0f, 0.0f);
+                        glm::vec3 n(0.0f, 0.0f, 0.0f);
                         if (!normals.empty()) {
                             if (normInterp == UsdGeomTokens->uniform && f < normals.size()) {
                                 GfVec3f usdNorm = normals[f];
                                 n = glm::vec3(usdNorm[0], usdNorm[1], usdNorm[2]);
-                            } else if (normInterp == UsdGeomTokens->vertex && gIdx < static_cast<int>(normals.size())) {
+                            } else if ((normInterp == UsdGeomTokens->vertex || normInterp == UsdGeomTokens->varying) && gIdx < static_cast<int>(normals.size())) {
                                 GfVec3f usdNorm = normals[gIdx];
                                 n = glm::vec3(usdNorm[0], usdNorm[1], usdNorm[2]);
                             } else if (normInterp == UsdGeomTokens->faceVarying && (indexOffset + localIdx) < normals.size()) {
@@ -1135,7 +1149,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
 
                         glm::vec2 uv(0.0f);
                         if (!uvs.empty()) {
-                            if (uvInterp == UsdGeomTokens->vertex && gIdx < static_cast<int>(uvs.size())) {
+                            if ((uvInterp == UsdGeomTokens->vertex || uvInterp == UsdGeomTokens->varying) && gIdx < static_cast<int>(uvs.size())) {
                                 uv = glm::vec2(uvs[gIdx][0], uvs[gIdx][1]);
                             } else if (uvInterp == UsdGeomTokens->faceVarying && (indexOffset + localIdx) < uvs.size()) {
                                 uv = glm::vec2(uvs[indexOffset + localIdx][0], uvs[indexOffset + localIdx][1]);
@@ -1147,10 +1161,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                         return v;
                     };
 
+                    // Fan triangulation: (0, i, i + 1) for CCW rightHanded, (0, i + 1, i) for CW leftHanded
                     for (int i = 1; i < count - 1; ++i) {
+                        int idx1 = isLeftHanded ? (i + 1) : i;
+                        int idx2 = isLeftHanded ? i : (i + 1);
                         Vertex v0 = getLocalVertex(0);
-                        Vertex v1 = getLocalVertex(i);
-                        Vertex v2 = getLocalVertex(i + 1);
+                        Vertex v1 = getLocalVertex(idx1);
+                        Vertex v2 = getLocalVertex(idx2);
 
                         glm::vec3 p0_3 = glm::vec3(v0.position);
                         glm::vec3 p1_3 = glm::vec3(v1.position);

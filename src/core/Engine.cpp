@@ -1130,14 +1130,28 @@ void Engine::requestSceneChange(const std::string& filepath) {
         return;
     }
     m_loadingScenePath = filepath;
-    m_loadingSceneName = std::filesystem::path(filepath).stem().string();
-    if (m_loadingSceneName.empty() || filepath == "__procedural_cornell_box__") {
-        m_loadingSceneName = "Cornell Box";
-    } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
-        m_loadingSceneName = "Many-Lights Cornell Box";
+
+    std::string prettyName;
+    for (const auto& sc : m_availableScenes) {
+        if (sc.filepath == filepath) {
+            prettyName = sc.label;
+            break;
+        }
     }
+    if (prettyName.empty()) {
+        std::string stem = std::filesystem::path(filepath).stem().string();
+        if (stem.empty() || filepath == "__procedural_cornell_box__") {
+            prettyName = "Procedural Cornell Box";
+        } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
+            prettyName = "Procedural Many-Lights";
+        } else {
+            prettyName = SceneRegistry::formatSceneName(stem);
+        }
+    }
+    m_loadingSceneName = prettyName;
+    m_sceneLoadingStartTime = std::chrono::steady_clock::now();
     m_isSceneLoading.store(true);
-    Logger::info("Initiating asynchronous scene load for '{}'...", filepath);
+    Logger::info("Initiating asynchronous scene load for '{}' ({})...", filepath, m_loadingSceneName);
 
     m_sceneLoadingFuture = std::async(std::launch::async, [filepath]() -> SceneData {
         if (filepath.empty() || filepath == "__procedural_cornell_box__") {
@@ -3646,25 +3660,31 @@ void Engine::renderFrame() {
         m_frameTimesMs.clear();
     }
 
-    // Update smooth continuous FPS keyboard navigation
-    updateInput();
+    bool sceneLoadingActive = m_isSceneLoading.load() || m_pendingSceneChange;
 
-    if (m_config.camera_motion && m_camera) {
-        m_camera->processMouseMovement(2.0f, 0.0f);
+    // Update smooth continuous FPS keyboard navigation
+    if (!sceneLoadingActive) {
+        updateInput();
+
+        if (m_config.camera_motion && m_camera) {
+            m_camera->processMouseMovement(2.0f, 0.0f);
+        }
     }
 
     // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
-    bool cameraMovedThisFrame = (m_camera && m_camera->hasMoved()) || m_config.camera_motion;
+    bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved()) || m_config.camera_motion);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
-    if (accumReset) {
+    if (accumReset && !sceneLoadingActive) {
         m_frameIndex = 0;
         m_accumulatedSamples = 0;
         if (m_camera) m_camera->resetMoved();
         m_resetAccumulation = false;
     }
-    m_cameraMovedLastFrame = cameraMovedThisFrame;
+    if (!sceneLoadingActive) {
+        m_cameraMovedLastFrame = cameraMovedThisFrame;
+    }
 
     if (m_governor) {
         if (m_governor->getConfig().targetFps != m_config.target_fps) {
@@ -3687,9 +3707,10 @@ void Engine::renderFrame() {
     bool accumReachedCutoff = (m_config.progressive_accumulation &&
                                m_config.max_accum_frames > 0 &&
                                m_accumulatedSamples >= m_config.max_accum_frames);
+    bool skipRayTracing = accumReachedCutoff || sceneLoadingActive;
     m_accumulationComplete = accumReachedCutoff;
     if (m_config.progressive_accumulation) {
-        if (!accumReachedCutoff) {
+        if (!skipRayTracing) {
             m_accumulatedSamples++;
         }
     } else {
@@ -3817,7 +3838,7 @@ void Engine::renderFrame() {
             m_tlasNeedsGpuUpdate = false;
         }
 
-        if (!accumReachedCutoff) {
+        if (!skipRayTracing) {
             bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
             if (useWavefront) {
                 if (m_config.enable_nrc && m_nrcManager) {
@@ -4016,17 +4037,17 @@ void Engine::renderFrame() {
         m_temporalResetRequested = false;
         bool upwaysRun = false;
         if (m_config.denoiser_mode == DenoiserMode::Upways) {
-            upwaysRun = !accumReachedCutoff ? dispatchUpways(cmd, resetTemporal) : false;
+            upwaysRun = !skipRayTracing ? dispatchUpways(cmd, resetTemporal) : false;
         }
 
         // Temporal Radiance Accumulation & wRLS Outlier Rejection
         uint32_t temporalOutputSlot = 0;
         if (!upwaysRun && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
-            temporalOutputSlot = !accumReachedCutoff ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+            temporalOutputSlot = !skipRayTracing ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
         }
 
         // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = (!upwaysRun && !accumReachedCutoff) ? dispatchBmfr(cmd, temporalOutputSlot) : false;
+        bool bmfrRun = (!upwaysRun && !skipRayTracing) ? dispatchBmfr(cmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
@@ -4157,7 +4178,7 @@ void Engine::renderFrame() {
         uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : 0u;
 
         // 1. Launch secondary GPU concurrently for current frame
-        if (!accumReachedCutoff) {
+        if (!skipRayTracing) {
             m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
                                        m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
                                        hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
@@ -4196,7 +4217,7 @@ void Engine::renderFrame() {
         };
 
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) or Wavefront Pipeline
-        if (!accumReachedCutoff) {
+        if (!skipRayTracing) {
             bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
             uint32_t primDispatchSpp = (activeMode == MultiGpuMode::SampleParallel) ? primSpp : activeSpp;
             if (useWavefront) {
@@ -4402,7 +4423,7 @@ void Engine::renderFrame() {
         vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
         // Merge Pass
-        if (!accumReachedCutoff) {
+        if (!skipRayTracing) {
             vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
@@ -4431,18 +4452,18 @@ void Engine::renderFrame() {
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
         bool upwaysRun = false;
-        if (m_config.denoiser_mode == DenoiserMode::Upways) {
+        if (!skipRayTracing && m_config.denoiser_mode == DenoiserMode::Upways) {
             upwaysRun = dispatchUpways(activeCmd, resetTemporal);
         }
 
         // Temporal Radiance Accumulation & wRLS Outlier Rejection
         uint32_t temporalOutputSlot = 0;
-        if (!upwaysRun && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
+        if (!upwaysRun && !skipRayTracing && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
             temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
         }
 
         // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = !upwaysRun ? dispatchBmfr(activeCmd, temporalOutputSlot) : false;
+        bool bmfrRun = (!upwaysRun && !skipRayTracing) ? dispatchBmfr(activeCmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
@@ -4582,9 +4603,27 @@ void Engine::renderFrame() {
                 m_resetAccumulation = true;
                 if (!m_config.headless) m_frameTimesMs.clear();
             }
-            if (guiActions.sceneChanged && !guiActions.newScenePath.empty()) {
+            if (guiActions.sceneChanged) {
                 m_pendingSceneChange = true;
                 m_pendingScenePath = guiActions.newScenePath;
+                std::string targetLabel;
+                for (const auto& entry : m_availableScenes) {
+                    if (entry.filepath == guiActions.newScenePath) {
+                        targetLabel = entry.label;
+                        break;
+                    }
+                }
+                if (targetLabel.empty()) {
+                    if (guiActions.newScenePath.empty() || guiActions.newScenePath == "__procedural_cornell_box__") {
+                        targetLabel = "Procedural Cornell Box";
+                    } else if (guiActions.newScenePath == "procedural:many-lights" || guiActions.newScenePath == "many-lights" || guiActions.newScenePath == "many_lights") {
+                        targetLabel = "Procedural Many-Lights";
+                    } else {
+                        targetLabel = SceneRegistry::formatSceneName(std::filesystem::path(guiActions.newScenePath).stem().string());
+                    }
+                }
+                m_loadingSceneName = targetLabel;
+                m_sceneLoadingStartTime = std::chrono::steady_clock::now();
             }
             if (guiActions.mgpuModeChanged) {
                 m_pendingMgpuModeChange = true;
@@ -4696,7 +4735,7 @@ void Engine::renderFrame() {
     vkEndCommandBuffer(activeCmd);
 
     // Wait for secondary GPU completion of slot and PCIe transfer (if MGPU)
-    if (isMgpu && !accumReachedCutoff) {
+    if (isMgpu && !skipRayTracing) {
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         m_mgpu->syncAndTransfer(slot, dstHost, frameBytes);
     }
@@ -4714,7 +4753,7 @@ void Engine::renderFrame() {
         waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         waitSemaphoreInfos.push_back(waitRt);
 
-        if (m_mgpu->isCrossGpuSyncActive() && !accumReachedCutoff) {
+        if (m_mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
             uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
             VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
             if (secSem != VK_NULL_HANDLE) {
@@ -5146,6 +5185,13 @@ FrameStats Engine::getStats() const {
     stats.max_accum_frames = m_config.max_accum_frames;
     stats.accumulation_complete = m_accumulationComplete;
     stats.validation_errors = m_context->getValidationErrors();
+
+    stats.is_scene_loading = m_isSceneLoading.load() || m_pendingSceneChange;
+    stats.loading_scene_name = m_loadingSceneName;
+    if (stats.is_scene_loading) {
+        auto now = std::chrono::steady_clock::now();
+        stats.loading_elapsed_sec = std::chrono::duration<float>(now - m_sceneLoadingStartTime).count();
+    }
 
     stats.current_frame_time_ms = m_lastFrameTimeMs;
     stats.current_fps = m_lastFrameTimeMs > 0.0001 ? (1000.0 / m_lastFrameTimeMs) : 0.0;

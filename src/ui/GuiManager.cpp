@@ -712,6 +712,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     previewText = "Procedural Cornell Box  [2.0K tris, 7 mats]";
                 }
 
+                // If a scene load is currently in-flight, disable selection controls to prevent duplicate requests
+                ImGui::BeginDisabled(stats.is_scene_loading);
+
                 // Styled prominent dropdown combo
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.16f, 0.26f, 1.0f));
@@ -800,6 +803,28 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         actions->newSceneIndex = 0;
                         settingsChanged = true;
                     }
+                }
+
+                ImGui::EndDisabled();
+
+                // Prominent Activity Banner when Scene Loading is in Progress
+                if (stats.is_scene_loading) {
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.10f, 0.04f, 0.90f));
+                    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.78f, 0.25f, 0.90f));
+                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+
+                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                        int dotCount = static_cast<int>(ImGui::GetTime() * 4.0) % 4;
+                        std::string dots(dotCount, '.');
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f),
+                            "LOADING SCENE%s  [%.1fs]", dots.c_str(), stats.loading_elapsed_sec);
+                        ImGui::TextColored(ImVec4(0.40f, 0.85f, 1.0f, 1.0f), "Target: %s", stats.loading_scene_name.c_str());
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopStyleVar(2);
+                    ImGui::PopStyleColor(2);
                 }
 
                 // Active Scene Information Card
@@ -1581,6 +1606,75 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::End();
         }
+    }
+
+    // 5. Global Viewport Scene Loading Overlay & Scrim
+    if (stats.is_scene_loading) {
+        // Subtle dark scrim over the viewport to dim the paused/frozen previous scene
+        ImDrawList* bgDraw = ImGui::GetBackgroundDrawList();
+        if (bgDraw) {
+            bgDraw->AddRectFilled(ImVec2(0, 0), ImVec2(dispW, dispH), IM_COL32(6, 10, 16, 160));
+        }
+
+        float modalW = std::min(520.0f, dispW - 40.0f);
+        float modalX = (dispW - modalW) * 0.5f;
+        float modalY = std::max(60.0f, dispH * 0.36f);
+
+        ImGui::SetNextWindowPos(ImVec2(modalX, modalY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(modalW, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.75f, 1.0f, 0.90f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 20.0f));
+
+        ImGuiWindowFlags modalFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("##SceneLoadingModal", nullptr, modalFlags)) {
+            int dotCount = static_cast<int>(ImGui::GetTime() * 4.0) % 4;
+            std::string dots(dotCount, '.');
+
+            ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "PATHWAYS SCENE LOADER");
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.28f, 1.0f), "[%.1fs]", stats.loading_elapsed_sec);
+
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::TextColored(ImVec4(0.70f, 0.75f, 0.80f, 1.0f), "Target Scene:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", stats.loading_scene_name.c_str());
+
+            // Look up asset metadata from availableScenes if matching
+            for (const auto& sc : availableScenes) {
+                if (sc.label == stats.loading_scene_name || sc.filepath == stats.loading_scene_name) {
+                    ImGui::TextDisabled("Asset Catalog: %s triangles | %u materials | [%s]",
+                        sc.formatTriangles().c_str(), sc.materialCount, sc.group.c_str());
+                    break;
+                }
+            }
+
+            ImGui::Spacing();
+
+            // Smooth animated activity pulse bar
+            float t = static_cast<float>(ImGui::GetTime());
+            float progressFraction = 0.5f + 0.5f * std::sin(t * 3.5f);
+            char timerBuf[64];
+            std::snprintf(timerBuf, sizeof(timerBuf), "Loading: %.1fs", stats.loading_elapsed_sec);
+            ImGui::ProgressBar(progressFraction, ImVec2(-1.0f, 16.0f), timerBuf);
+
+            ImGui::Spacing();
+            char statusBuf[128];
+            std::snprintf(statusBuf, sizeof(statusBuf), "Parsing asset & staging GPU buffers%s", dots.c_str());
+            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%s", statusBuf);
+            ImGui::TextDisabled("Ray tracing is paused on all GPUs to eliminate contention.");
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor(2);
+
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Wait);
     }
 
     ImGui::Render();

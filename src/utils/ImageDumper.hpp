@@ -118,6 +118,11 @@ struct FrameStats {
     float cam_pitch = 0.0f;
     float cam_fov = 45.0f;
 
+    // Dynamic Scene Loading Telemetry
+    bool is_scene_loading = false;
+    std::string loading_scene_name = "";
+    float loading_elapsed_sec = 0.0f;
+
     // Real-Time Performance & Benchmark Metrics
     uint32_t total_frames = 0;
     uint32_t total_samples = 0;
