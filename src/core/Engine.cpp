@@ -110,6 +110,41 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_lastLogTime = std::chrono::steady_clock::now();
 
     Logger::info("Initializing Pathways Engine...");
+
+    // Point instancing CLI options and environment variable parsing
+    {
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        if (cmdline) {
+            std::string arg;
+            std::vector<std::string> args;
+            while (std::getline(cmdline, arg, '\0')) {
+                args.push_back(arg);
+            }
+            for (size_t i = 1; i < args.size(); ++i) {
+                if ((args[i] == "--instance-density" || args[i] == "--density") && i + 1 < args.size()) {
+                    m_config.instance_density = std::clamp(std::stof(args[++i]), 0.0f, 1.0f);
+                } else if (args[i].starts_with("--instance-density=")) {
+                    m_config.instance_density = std::clamp(std::stof(args[i].substr(args[i].find('=') + 1)), 0.0f, 1.0f);
+                } else if (args[i].starts_with("--density=")) {
+                    m_config.instance_density = std::clamp(std::stof(args[i].substr(args[i].find('=') + 1)), 0.0f, 1.0f);
+                } else if ((args[i] == "--cull-distance" || args[i] == "--cull-dist") && i + 1 < args.size()) {
+                    m_config.cull_distance = std::max(0.0f, std::stof(args[++i]));
+                } else if (args[i].starts_with("--cull-distance=") || args[i].starts_with("--cull-dist=")) {
+                    m_config.cull_distance = std::max(0.0f, std::stof(args[i].substr(args[i].find('=') + 1)));
+                }
+            }
+        }
+        if (const char* envDensity = std::getenv("PATHWAYS_INSTANCE_DENSITY")) {
+            m_config.instance_density = std::clamp(std::stof(envDensity), 0.0f, 1.0f);
+        }
+        if (const char* envCull = std::getenv("PATHWAYS_CULL_DISTANCE")) {
+            m_config.cull_distance = std::max(0.0f, std::stof(envCull));
+        }
+        if (m_config.instance_density < 0.999f || m_config.cull_distance > 0.0f) {
+            Logger::info("Point Instancing Configuration: instance-density={:.2f}, cull-distance={:.1f}m",
+                         m_config.instance_density, m_config.cull_distance);
+        }
+    }
     m_window = std::make_unique<Window>(m_config);
 
     if (!m_config.headless) {
@@ -944,7 +979,11 @@ void Engine::initScene() {
 
             Logger::info("Loading user specified scene: {}", resolvedScene);
             if (UsdLoader::isUsdFile(resolvedScene)) {
-                m_sceneData = UsdLoader::loadSceneData(resolvedScene);
+                UsdLoadOptions options{};
+                options.instanceDensity = m_config.instance_density;
+                options.cullDistance = m_config.cull_distance;
+                options.cameraPosOverride = m_config.camera_pos;
+                m_sceneData = UsdLoader::loadSceneData(resolvedScene, options);
             } else {
                 m_sceneData = GltfLoader::loadSceneData(resolvedScene);
             }
@@ -1132,6 +1171,12 @@ void Engine::initScene() {
 
     if (!m_config.hdri_path.empty() && std::filesystem::exists(m_config.hdri_path)) {
         m_environmentMap = Texture::loadFromFile(device, allocator, queue, pool, m_config.hdri_path);
+    } else if (!m_sceneData.domeLightHdriPath.empty() && std::filesystem::exists(m_sceneData.domeLightHdriPath)) {
+        m_environmentMap = Texture::loadFromFile(device, allocator, queue, pool, m_sceneData.domeLightHdriPath);
+        if (m_environmentMap) {
+            Logger::info("Loaded DomeLight HDRI from USD scene: '{}' (intensity: {:.2f})",
+                         m_sceneData.domeLightHdriPath, m_sceneData.domeLightIntensity);
+        }
     }
     if (!m_environmentMap) {
         bool isCyber = (m_config.hdri_path == "night" || m_config.hdri_path == "night-sky" ||
@@ -1196,7 +1241,12 @@ void Engine::requestSceneChange(const std::string& filepath) {
     m_isSceneLoading.store(true);
     Logger::info("Initiating asynchronous scene load for '{}' ({})...", filepath, m_loadingSceneName);
 
-    m_sceneLoadingFuture = std::async(std::launch::async, [filepath]() -> SceneData {
+    UsdLoadOptions usdOptions{};
+    usdOptions.instanceDensity = m_config.instance_density;
+    usdOptions.cullDistance = m_config.cull_distance;
+    usdOptions.cameraPosOverride = m_config.camera_pos;
+
+    m_sceneLoadingFuture = std::async(std::launch::async, [filepath, usdOptions]() -> SceneData {
         if (filepath.empty() || filepath == "__procedural_cornell_box__") {
             Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
             return ProceduralScene::createCornellBox();
@@ -1209,7 +1259,7 @@ void Engine::requestSceneChange(const std::string& filepath) {
         } else {
             Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
             if (UsdLoader::isUsdFile(filepath)) {
-                return UsdLoader::loadSceneData(filepath);
+                return UsdLoader::loadSceneData(filepath, usdOptions);
             } else {
                 return GltfLoader::loadSceneData(filepath);
             }
@@ -1453,7 +1503,11 @@ bool Engine::loadScene(const std::string& filepath) {
     } else {
         if (UsdLoader::isUsdFile(filepath)) {
             Logger::info("Loading OpenUSD scene '{}'...", filepath);
-            newScene = UsdLoader::loadSceneData(filepath);
+            UsdLoadOptions options{};
+            options.instanceDensity = m_config.instance_density;
+            options.cullDistance = m_config.cull_distance;
+            options.cameraPosOverride = m_config.camera_pos;
+            newScene = UsdLoader::loadSceneData(filepath, options);
         } else {
             Logger::info("Loading glTF scene '{}'...", filepath);
             newScene = GltfLoader::loadSceneData(filepath);
@@ -1873,6 +1927,7 @@ void Engine::initPipelines() {
 }
 
 void Engine::updateAllImageDescriptors() {
+    if (!m_accumImage || !m_outputImage) return;
     VkDevice device = m_context->getDevice();
     VkDescriptorImageInfo accumImageInfo{};
     accumImageInfo.imageView = m_accumImage->getImageView();
@@ -2168,7 +2223,10 @@ void Engine::destroyShadowDenoiserResources() {
 void Engine::updateShadowDenoiserDescriptors() {
     if (m_shadowClassifyDescSets[0] == VK_NULL_HANDLE || m_shadowClassifyDescSets[1] == VK_NULL_HANDLE ||
         m_shadowFilterDescSet == VK_NULL_HANDLE ||
-        !m_directLightImage || !m_normalDepthImage || !m_tileMetaDataBuffer) return;
+        !m_directLightImage || !m_normalDepthImage || !m_shadowFilterPingImage ||
+        !m_accumImage || !m_tileMetaDataBuffer ||
+        !m_momentsImages[0] || !m_momentsImages[1] ||
+        !m_depthImages[0] || !m_depthImages[1]) return;
     VkDevice device = m_context->getDevice();
 
     VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, m_directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -2819,12 +2877,13 @@ void Engine::createUpwaysPipelines() {
 
 void Engine::destroyUpwaysPipelines() {
     m_upwaysPipeline.reset();
+    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
 }
 
 void Engine::createUpwaysResources() {
     VkDevice device = m_context->getDevice();
 
-    if (m_bmfrDescPool && m_tonemapDescLayout) {
+    if (m_bmfrDescPool && m_tonemapDescLayout && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         tmAllocInfo.descriptorPool = m_bmfrDescPool;
         tmAllocInfo.descriptorSetCount = 1;
@@ -2858,7 +2917,7 @@ void Engine::createUpwaysResources() {
 }
 
 void Engine::destroyUpwaysResources() {
-    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    // Note: Descriptor set m_tonemapUpwaysDescSet persists across resizes; reset occurs in destroyUpwaysPipelines().
 }
 
 void Engine::updateUpwaysDescriptors() {
@@ -6448,9 +6507,6 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     createUpwaysResources();
     destroyCausticsResources();
     createCausticsResources();
-    updateCausticsDescriptors();
-    updateAllImageDescriptors();
-    updateMergeDescriptors();
 
     if (m_nrcManager) {
         m_nrcManager->resize(m_config.width, m_config.height);
@@ -6458,8 +6514,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->resize(m_config.width, m_config.height, m_config.wavefront_tile_size);
-        updateWavefrontSceneDescriptors();
     }
+
+    updateAllImageDescriptors();
+    updateMergeDescriptors();
 
     // 5. Reset UI dump buffer if allocated
     if (m_uiDumpBuffer) {

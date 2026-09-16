@@ -1506,10 +1506,10 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 15: Ground District Plaza Tile 16m x 16m (CYBER_BLAS_PLAZA_DISTRICT)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Foundation concrete bed (Mat 0: Foundation Concrete)
-        addBox(scene.triangles, glm::vec3(0.0f, -0.3f, 0.0f), glm::vec3(16.0f, 0.6f, 16.0f), 0.0f, 0);
+        // Foundation concrete bed (Mat 0: Foundation Concrete) with subsurface overlap
+        addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.2f, 0.7f, 16.2f), 0.0f, 0);
         // Wet reflective plaza pavement surface (Mat 4: Wet Reflective Pavement)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(15.9f, 0.04f, 15.9f), 0.0f, 4);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(16.0f, 0.04f, 16.0f), 0.0f, 4);
         // Rough basalt curb borders (Mat 20: Rough Basalt)
         addBox(scene.triangles, glm::vec3( 7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 20);
         addBox(scene.triangles, glm::vec3(-7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 20);
@@ -1537,8 +1537,8 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 16: Multi-Lane Urban Arterial Avenue 16m x 16m (CYBER_BLAS_ROAD_AVENUE)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Foundation concrete bed (Mat 0: Foundation Concrete)
-        addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.0f, 0.7f, 16.0f), 0.0f, 0);
+        // Foundation concrete bed (Mat 0: Foundation Concrete) with subsurface overlap
+        addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.2f, 0.7f, 16.2f), 0.0f, 0);
 
         // Asphalt roadway surface (Mat 20: Rough Basalt / Dark Asphalt)
         addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(10.0f, 0.04f, 16.0f), 0.0f, 20);
@@ -1588,8 +1588,8 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 17: Urban 4-Way Intersection 16m x 16m (CYBER_BLAS_ROAD_INTERSECTION)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Foundation concrete bed (Mat 0)
-        addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.0f, 0.7f, 16.0f), 0.0f, 0);
+        // Foundation concrete bed (Mat 0) with subsurface overlap
+        addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.2f, 0.7f, 16.2f), 0.0f, 0);
 
         // Asphalt crossing area (Mat 20)
         addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(16.0f, 0.04f, 16.0f), 0.0f, 20);
@@ -1638,11 +1638,11 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 18: Expansive Dark Urban Industrial Apron 32m x 32m (CYBER_BLAS_PERIMETER_GROUND)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Deep sub-base foundation slab (Mat 0)
-        addBox(scene.triangles, glm::vec3(0.0f, -0.45f, 0.0f), glm::vec3(32.0f, 0.9f, 32.0f), 0.0f, 0);
+        // Deep sub-base foundation slab (Mat 0) with generous subterranean overlap
+        addBox(scene.triangles, glm::vec3(0.0f, -0.45f, 0.0f), glm::vec3(32.4f, 0.9f, 32.4f), 0.0f, 0);
 
         // Dark industrial asphalt composite surface (Mat 20: Rough Basalt)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.015f, 0.0f), glm::vec3(31.8f, 0.03f, 31.8f), 0.0f, 20);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.015f, 0.0f), glm::vec3(32.0f, 0.03f, 32.0f), 0.0f, 20);
 
         // Recessed utility drainage / ventilation channel grates (Mat 28: Perforated Acoustic/Ventilation Mesh)
         addBox(scene.triangles, glm::vec3(-10.0f, 0.025f, 0.0f), glm::vec3(1.2f, 0.02f, 30.0f), 0.0f, 28);
@@ -1716,7 +1716,7 @@ SceneData ProceduralScene::createCyberCityScene() {
     // 2a. Expansive Ground Network: Plazas, Boulevards, Intersections & Perimeter Apron
     // 1. Central Plaza District under Megatowers (14x14 grid minus central boulevard corridor)
     for (int gx = -7; gx < 7; ++gx) {
-        if (gx == -1 || gx == 0) continue; // Reserved for Central Grand Boulevard at X = 0
+        if (gx == -1 || gx == 0) continue; // Reserved for Central Grand Boulevard corridor at X in [-16, +16]
         for (int gz = -7; gz < 7; ++gz) {
             float px = (static_cast<float>(gx) + 0.5f) * 16.0f;
             float pz = (static_cast<float>(gz) + 0.5f) * 16.0f;
@@ -1725,35 +1725,55 @@ SceneData ProceduralScene::createCyberCityScene() {
         }
     }
 
-    // 2. Central Grand Boulevard (14 avenue segments along X = 0)
+    // 2. Central Grand Boulevard Corridor (X in [-16, +16], 14 rows along Z in [-112, +112])
     for (int gz = -7; gz < 7; ++gz) {
         float pz = (static_cast<float>(gz) + 0.5f) * 16.0f;
+
+        // Center 16m multi-lane avenue (spanning X in [-8, +8])
         glm::mat4 M = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, pz));
         addInstance(CYBER_BLAS_ROAD_AVENUE, M);
 
         // Physical downward sodium streetlights on both sidewalks
         addSpotLight(glm::vec3(-4.9f, 6.2f, pz), glm::vec3(0.15f, -1.0f, 0.0f), glm::vec3(1.0f, 0.75f, 0.2f), 55.0f, 35.0f, 65.0f);
         addSpotLight(glm::vec3( 4.9f, 6.2f, pz), glm::vec3(-0.15f, -1.0f, 0.0f), glm::vec3(1.0f, 0.75f, 0.2f), 55.0f, 35.0f, 65.0f);
+
+        // Left 8m Grand Promenade (spanning X in [-16, -8], centered at px = -12.0m)
+        glm::mat4 mLeft = glm::translate(glm::mat4(1.0f), glm::vec3(-12.0f, 0.0f, pz)) *
+                          glm::scale(glm::mat4(1.0f), glm::vec3(0.5f, 1.0f, 1.0f));
+        addInstance(CYBER_BLAS_PLAZA_DISTRICT, mLeft);
+
+        // Right 8m Grand Promenade (spanning X in [+8, +16], centered at px = +12.0m)
+        glm::mat4 mRight = glm::translate(glm::mat4(1.0f), glm::vec3(12.0f, 0.0f, pz)) *
+                           glm::scale(glm::mat4(1.0f), glm::vec3(0.5f, 1.0f, 1.0f));
+        addInstance(CYBER_BLAS_PLAZA_DISTRICT, mRight);
     }
 
     // 3. Perimeter Arterial Ring Boulevards (North & South at Z = +-120m, East & West at X = +-120m)
-    // 3a. North and South Boulevards (East-West axis)
+    // 3a. North and South Boulevards (East-West axis along Z = +-120m)
     for (float pz : {-120.0f, 120.0f}) {
-        // Center intersection at X = 0
+        // Center intersection at X = 0 (spanning X in [-8, +8])
         glm::mat4 mCenter = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, pz));
         addInstance(CYBER_BLAS_ROAD_INTERSECTION, mCenter);
         addSpotLight(glm::vec3(0.0f, 6.6f, pz), glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(1.0f, 0.75f, 0.2f), 45.0f, 30.0f, 60.0f);
 
-        // Corner intersections at X = +-120m
+        // 8m East-West road connectors flanking center intersection (spanning X in [-16, -8] and [+8, +16])
+        for (float px : {-12.0f, 12.0f}) {
+            glm::mat4 mConn = glm::translate(glm::mat4(1.0f), glm::vec3(px, 0.0f, pz)) *
+                              glm::scale(glm::mat4(1.0f), glm::vec3(0.5f, 1.0f, 1.0f)) *
+                              glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            addInstance(CYBER_BLAS_ROAD_AVENUE, mConn);
+        }
+
+        // Corner intersections at X = +-120m (spanning X in [+-112, +-128], Z in [+-112, +-128])
         for (float px : {-120.0f, 120.0f}) {
             glm::mat4 mCorner = glm::translate(glm::mat4(1.0f), glm::vec3(px, 0.0f, pz));
             addInstance(CYBER_BLAS_ROAD_INTERSECTION, mCorner);
             addSpotLight(glm::vec3(px, 6.6f, pz), glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(1.0f, 0.75f, 0.2f), 45.0f, 30.0f, 60.0f);
         }
 
-        // East-West road segments between center and corners
+        // East-West road segments between center connectors and corners (X in [-112, -16] and [+16, +112])
         for (int gx = -7; gx < 7; ++gx) {
-            if (gx == -1 || gx == 0) continue; // Center intersection
+            if (gx == -1 || gx == 0) continue; // Covered by center intersection & connectors
             float px = (static_cast<float>(gx) + 0.5f) * 16.0f;
             glm::mat4 M = glm::translate(glm::mat4(1.0f), glm::vec3(px, 0.0f, pz)) *
                           glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
@@ -1763,9 +1783,9 @@ SceneData ProceduralScene::createCyberCityScene() {
         }
     }
 
-    // 3b. East and West Boulevards (North-South axis)
+    // 3b. East and West Boulevards (North-South axis along X = +-120m, all 14 rows Z in [-112, +112])
     for (float px : {-120.0f, 120.0f}) {
-        for (int gz = -6; gz < 6; ++gz) {
+        for (int gz = -7; gz < 7; ++gz) {
             float pz = (static_cast<float>(gz) + 0.5f) * 16.0f;
             glm::mat4 M = glm::translate(glm::mat4(1.0f), glm::vec3(px, 0.0f, pz));
             addInstance(CYBER_BLAS_ROAD_AVENUE, M);

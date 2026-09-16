@@ -316,6 +316,17 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {
             cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+        } else if (arg.starts_with("--mgpu=")) {
+            std::string mode = arg.substr(7);
+            if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
+            else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
+                Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            }
+            else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
+            else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
@@ -327,8 +338,28 @@ Config Config::parse(int argc, char* argv[]) {
             else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
+        } else if (arg.starts_with("--mgpu-mode=")) {
+            std::string mode = arg.substr(12);
+            if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
+            else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
+                Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            }
+            else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
+            else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-transfer" && i + 1 < argc) {
             std::string tmode = argv[++i];
+            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
+            } else if (tmode == "staging" || tmode == "cpu") {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Staging;
+            } else {
+                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
+            }
+        } else if (arg.starts_with("--mgpu-transfer=")) {
+            std::string tmode = arg.substr(16);
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {

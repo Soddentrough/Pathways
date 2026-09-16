@@ -276,6 +276,7 @@ void NRCManager::allocateDescriptorSets() {
 }
 
 void NRCManager::updateDescriptors(VkImageView accumImageView) {
+    if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer) return;
     // Update resolve descriptor set image binding (0) and buffer binding (1)
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };

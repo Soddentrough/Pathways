@@ -238,6 +238,11 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
             if (ext == ".glb" || ext == ".gltf" || ext == ".usd" || ext == ".usda" || ext == ".usdc") {
                 std::string stem = item.path().stem().string();
+                std::string lowerStem = stem;
+                std::transform(lowerStem.begin(), lowerStem.end(), lowerStem.begin(), [](unsigned char c) { return std::tolower(c); });
+                if (lowerStem == "scanlands") {
+                    continue; // In-development testbed: not included in default scene registry
+                }
                 std::string label = formatSceneName(stem);
                 std::string group = UsdLoader::isUsdFile(item.path().string()) ? "USD Scenes" : "Showcase";
                 SceneEntry e{ label, item.path().string(), group };
@@ -252,6 +257,11 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     for (const auto& item : fs::directory_iterator(scenesDir)) {
         if (item.is_directory()) {
             std::string dirName = item.path().filename().string();
+            std::string lowerDir = dirName;
+            std::transform(lowerDir.begin(), lowerDir.end(), lowerDir.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (lowerDir == "scanlands") {
+                continue; // In-development testbed: not included in default scene registry
+            }
             std::string dirTitle = formatSceneName(dirName);
 
             // Look for extended and core models or usd scenes

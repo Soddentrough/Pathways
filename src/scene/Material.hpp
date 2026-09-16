@@ -18,6 +18,12 @@ enum AlphaMode : uint32_t {
     ALPHA_MODE_BLEND = 2
 };
 
+enum MaterialFlags : uint32_t {
+    MATERIAL_FLAG_NONE               = 0,
+    MATERIAL_FLAG_PROCEDURAL_TERRAIN = (1u << 9),
+    MATERIAL_FLAG_PROCEDURAL_WATER   = (1u << 11)
+};
+
 struct MaterialGPU {
     glm::vec4 albedo = glm::vec4(1.0f);        // 16 bytes (offset 0) - baseColorFactor (linear RGBA)
     glm::vec4 emissive = glm::vec4(0.0f);      // 16 bytes (offset 16) - emissiveFactor * emissiveStrength (linear RGB)
@@ -60,7 +66,12 @@ struct MaterialGPU {
     float iridescenceIor = 1.3f;               // 4 bytes (offset 180) - KHR_materials_iridescence IOR
     float iridescenceThickness = 0.0f;         // 4 bytes (offset 184) - KHR_materials_iridescence thickness
     uint32_t sheenTex = 0;                     // 4 bytes (offset 188) - KHR_materials_sheen texture
+
+    // Thin-Walled Diffuse Transmission (offsets 192-208)
+    float diffuseTransmission = 0.0f;          // 4 bytes (offset 192) - diffuse transmission factor [0, 1]
+    uint32_t diffuseTransmissionTex = 0;       // 4 bytes (offset 196) - diffuse transmission texture (R)
+    glm::vec2 diffuseTransPad = glm::vec2(0.0f); // 8 bytes (offsets 200, 204) - padding for 16B std430 alignment
 };
-static_assert(sizeof(MaterialGPU) == 192, "MaterialGPU must be exactly 192 bytes (std430 aligned)");
+static_assert(sizeof(MaterialGPU) == 208, "MaterialGPU must be exactly 208 bytes (std430 aligned)");
 
 } // namespace pathways

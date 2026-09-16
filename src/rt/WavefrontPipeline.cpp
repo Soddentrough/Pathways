@@ -313,6 +313,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkDeviceSize instanceSize,
                                                 VkImageView causticImageView) {
     if (frameSlot >= 2) frameSlot = 0;
+    if (accumImageView == VK_NULL_HANDLE) return;
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView mvView = (motionVectorImageView != VK_NULL_HANDLE) ? motionVectorImageView : accumImageView;

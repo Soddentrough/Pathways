@@ -104,6 +104,10 @@ struct SceneData {
     glm::vec3 dielectricBoundsMin = glm::vec3(1e9f);
     glm::vec3 dielectricBoundsMax = glm::vec3(-1e9f);
 
+    // Environment Map & Dome Light Ingestion
+    std::string domeLightHdriPath;
+    float domeLightIntensity = 1.0f;
+
     // Fast CPU raycast against scene geometry for camera pivot targeting
     bool raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDist,
                  float& outHitDist, glm::vec3& outHitPoint, std::string* outHitName = nullptr) const;

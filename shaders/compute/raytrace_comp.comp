@@ -82,6 +82,11 @@ struct Material {
     float iridescenceIor;
     float iridescenceThickness;
     uint sheenTex;
+
+    // Thin-Walled Diffuse Transmission (offsets 192-208)
+    float diffuseTransmission;
+    uint diffuseTransmissionTex;
+    vec2 diffuseTransPad;
 };
 
 struct Light {

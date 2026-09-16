@@ -88,6 +88,11 @@ struct Material {
     float iridescenceIor;
     float iridescenceThickness;
     uint sheenTex;
+
+    // Thin-Walled Diffuse Transmission (offsets 192-208)
+    float diffuseTransmission;
+    uint diffuseTransmissionTex;
+    vec2 diffuseTransPad;
 };
 
 struct Light {
@@ -272,13 +277,17 @@ struct RayState {
 #define MATERIAL_ARCHETYPE_ALPHAMASK  5u
 #define NUM_MATERIAL_ARCHETYPES       6u
 
+#define MATERIAL_TYPE_MASK               0x000000FFu
+#define MATERIAL_FLAG_PROCEDURAL_TERRAIN (1u << 9)
+#define MATERIAL_FLAG_PROCEDURAL_WATER   (1u << 11)
+
 uint getMaterialArchetype(Material mat) {
     // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures
     if (mat.alphaMode == 1u /* ALPHA_MODE_MASK */ && mat.albedoTex > 0u) {
         return MATERIAL_ARCHETYPE_ALPHAMASK;
     }
     // 2. Pure emissive mesh lights: pure emitters without scattering BSDF
-    if (mat.type == 3u /* MATERIAL_EMISSIVE */ ||
+    if ((mat.type & 0xFFu) == 3u /* MATERIAL_EMISSIVE */ ||
         (length(mat.emissive.rgb) > 0.1 && mat.albedoTex == 0u && length(mat.albedo.rgb) < 0.05 && mat.metallic < 0.01 && mat.transmission < 0.01)) {
         return MATERIAL_ARCHETYPE_EMISSIVE;
     }
@@ -286,12 +295,12 @@ uint getMaterialArchetype(Material mat) {
     if (mat.clearcoat > 0.001 || mat.clearcoatTex > 0u || length(mat.sheenColor) > 0.001 || mat.sheenTex > 0u) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
-    // 4. Pure dielectric transmission / refraction / glass / dispersion
-    if (mat.transmission > 0.001 || mat.type == 2u /* MATERIAL_DIELECTRIC */ || mat.dispersion > 0.001) {
+    // 4. Pure dielectric transmission / refraction / glass / dispersion / procedural water
+    if (mat.transmission > 0.001 || (mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || (mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u || mat.dispersion > 0.001) {
         return MATERIAL_ARCHETYPE_DIELECTRIC;
     }
     // 5. Metallic conductors (GGX microfacet specular reflection, anisotropy, iridescence)
-    if (mat.type == 1u /* MATERIAL_METALLIC */ || mat.metallic > 0.5 || mat.anisotropyStrength > 0.001 || mat.iridescence > 0.001) {
+    if ((mat.type & 0xFFu) == 1u /* MATERIAL_METALLIC */ || mat.metallic > 0.5 || mat.anisotropyStrength > 0.001 || mat.iridescence > 0.001) {
         return MATERIAL_ARCHETYPE_CONDUCTOR;
     }
     // 6. Dielectric diffuse base + GGX specular dual-lobe PBR (plastics, wood, stone, cloth)

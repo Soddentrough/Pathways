@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_image_load_formatted : require
 
 #include "wavefront_common.glsl"
+#include "procedural_noise.glsl"
 
 layout(local_size_x = 32) in;
 
@@ -157,6 +158,8 @@ void main() {
         uint matId = floatBitsToUint(hit.hitData0.y);
         vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
         vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
+        vec3 geomTan = unpackOct32(floatBitsToUint(hit.hitData1.x));
+        float tanSign = hit.hitData1.y;
         uint primId = floatBitsToUint(hit.hitData1.z);
         uint hitType = floatBitsToUint(hit.hitData1.w);
 
@@ -191,6 +194,29 @@ void main() {
             hitNormal = frontFace ? hitNormal : -hitNormal;
 
             Material mat = materials[matId];
+            bool isWater = ((mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (mat.normalTex == 0xFFFFFF03u);
+            if (isWater && frontFace) {
+                float time = float(pc.frameIndex) * 0.01666667;
+                vec3 waveOffset;
+                vec3 waveN = evaluateWaterWaves(hitPoint, time, waveOffset);
+                hitNormal = normalize(mix(hitNormal, waveN, clamp(mat.normalScale, 0.0, 1.0)));
+            } else if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                normalMap.xy *= mat.normalScale;
+                normalMap = normalize(normalMap);
+
+                vec3 orthoTan = geomTan - dot(geomTan, hitNormal) * hitNormal;
+                float tanLenSq = dot(orthoTan, orthoTan);
+                if (tanLenSq > 1e-6) {
+                    geomTan = orthoTan * inversesqrt(tanLenSq);
+                } else {
+                    vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+                    geomTan = normalize(cross(up, hitNormal));
+                }
+                vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
+                mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
+                hitNormal = normalize(tbn * normalMap);
+            }
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
@@ -236,7 +262,7 @@ void main() {
                     reflectProb = mix(reflectProb, clamp(dot(iridColor, vec3(0.333)), 0.0, 1.0), mat.iridescence);
                 }
 
-                bool isThinWalled = (mat.thickness <= 0.001);
+                bool isThinWalled = (mat.thickness <= 0.001) && !isWater;
                 if (isThinWalled) {
                     if (!frontFace) {
                         // Exiting thin-walled slab (e.g. 4mm double-walled car glass): passthrough with 0 reflection to avoid TIR trapping
@@ -270,8 +296,12 @@ void main() {
                 // Volumetric Beer-Lambert absorption (physical ray traversal distance)
                 if (!isThinWalled) {
                     float mediumDist = !frontFace ? hitT : 0.0;
-                    if (mat.attenuationColor.w > 0.0 && mediumDist > 0.0) {
-                        vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+                    vec4 atten = mat.attenuationColor;
+                    if (isWater && atten.w <= 0.0) {
+                        atten = vec4(0.3, 0.7, 0.9, 4.0);
+                    }
+                    if (atten.w > 0.0 && mediumDist > 0.0) {
+                        vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
                         throughput *= exp(-sigma_a * mediumDist);
                     }
                 }

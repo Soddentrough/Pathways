@@ -109,15 +109,6 @@ private:
 
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
-
-    // Cached views for descriptor updates on resize
-    VkImageView m_lastAccumView = VK_NULL_HANDLE;
-    VkImageView m_lastNormalDepthView = VK_NULL_HANDLE;
-    VkImageView m_lastMotionVectorView = VK_NULL_HANDLE;
-    VkImageView m_lastAlbedoRoughnessView = VK_NULL_HANDLE;
-    VkImageView m_lastSpecularMotionView = VK_NULL_HANDLE;
-    VkImageView m_lastDiffuseView = VK_NULL_HANDLE;
-    VkImageView m_lastSpecularView = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

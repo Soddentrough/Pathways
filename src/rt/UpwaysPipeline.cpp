@@ -241,15 +241,7 @@ void UpwaysPipeline::updateDescriptors(
     VkImageView diffuseImageView,
     VkImageView specularImageView
 ) {
-    m_lastAccumView = accumImageView;
-    m_lastNormalDepthView = normalDepthImageView;
-    m_lastMotionVectorView = motionVectorImageView;
-    m_lastAlbedoRoughnessView = albedoRoughnessImageView;
-    m_lastSpecularMotionView = specularMotionImageView;
-    m_lastDiffuseView = diffuseImageView;
-    m_lastSpecularView = specularImageView;
-
-    if (!m_outputImage || !m_historyImages[0] || !m_historyImages[1] || !m_weightBuffer) {
+    if (accumImageView == VK_NULL_HANDLE || !m_outputImage || !m_historyImages[0] || !m_historyImages[1] || !m_weightBuffer) {
         return;
     }
 
@@ -343,16 +335,7 @@ void UpwaysPipeline::resize(uint32_t width, uint32_t height) {
     m_outputHeight = m_superRes ? (m_inputHeight * 2) : m_inputHeight;
 
     initImages();
-    updateDescriptors(
-        m_lastAccumView,
-        m_lastNormalDepthView,
-        m_lastMotionVectorView,
-        m_lastAlbedoRoughnessView,
-        m_lastSpecularMotionView,
-        m_lastDiffuseView,
-        m_lastSpecularView
-    );
-
+    // Note: Descriptors are updated by the host Engine via updateDescriptors() with freshly created image views.
     Logger::info("UpwaysPipeline resized: Input {}x{}, Output {}x{}", m_inputWidth, m_inputHeight, m_outputWidth, m_outputHeight);
 }
 

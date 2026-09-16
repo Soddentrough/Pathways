@@ -165,6 +165,10 @@ struct Config {
     bool capture_normals = true;
     uint32_t capture_channels = 20; // 16, 19, or 20 (PTTD v2 default)
 
+    // Asset Ingestion & Point Instancing (Scanlands)
+    float instance_density = 1.0f; // Scale factor for point instancing (0.0 to 1.0, default: 1.0)
+    float cull_distance = 0.0f;    // Max distance in meters from camera to cull instances (0 = disabled)
+
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);
 };

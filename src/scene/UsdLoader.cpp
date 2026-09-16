@@ -135,7 +135,7 @@ bool UsdLoader::isUsdFile(const std::string& filepath) {
     return (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz");
 }
 
-SceneData UsdLoader::loadSceneData(const std::string& filepath) {
+SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOptions& options) {
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
     if (!std::filesystem::exists(filepath)) {
         Logger::error("UsdLoader: File not found: '{}'", filepath);
@@ -445,6 +445,10 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         std::string primName = usdMat.GetPrim().GetName().GetString();
         std::string lowerMatName = matName;
         std::transform(lowerMatName.begin(), lowerMatName.end(), lowerMatName.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::string lowerMatPath = matPath;
+        std::transform(lowerMatPath.begin(), lowerMatPath.end(), lowerMatPath.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::string lowerPrimName = primName;
+        std::transform(lowerPrimName.begin(), lowerPrimName.end(), lowerPrimName.begin(), [](unsigned char c) { return std::tolower(c); });
 
         TextureTransform2D matXform{};
 
@@ -475,6 +479,20 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                         gpuMat.albedoTex = getOrCreateTexture(resolved, true);
                         if (!hasAuthoredColor) {
                             gpuMat.albedo = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+                        }
+
+                        // Foliage alpha mask mode (ALPHA_MODE_MASK) for leaf cards and botanical cutouts
+                        if (lowerMatName.find("leaf") != std::string::npos ||
+                            lowerMatName.find("leaves") != std::string::npos ||
+                            lowerMatName.find("branch") != std::string::npos ||
+                            lowerMatName.find("foliage") != std::string::npos ||
+                            lowerMatName.find("plant") != std::string::npos ||
+                            lowerTex.find("leaf") != std::string::npos ||
+                            lowerTex.find("leaves") != std::string::npos ||
+                            lowerTex.find("branch") != std::string::npos ||
+                            lowerTex.find("foliage") != std::string::npos) {
+                            gpuMat.alphaMode = ALPHA_MODE_MASK;
+                            gpuMat.alphaCutoff = 0.5f;
                         }
                     }
                 }
@@ -537,6 +555,16 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 }
             }
 
+            UsdShadeInput opacityThresholdInput = surfaceShader.GetInput(TfToken("opacityThreshold"));
+            if (opacityThresholdInput) {
+                float ot = 0.0f;
+                opacityThresholdInput.Get(&ot);
+                if (ot > 0.0f) {
+                    gpuMat.alphaMode = ALPHA_MODE_MASK;
+                    gpuMat.alphaCutoff = ot;
+                }
+            }
+
             // Glass material heuristic (name-based, tag-based, or low roughness dielectric)
             bool isGlass = (lowerMatName.find("glass") != std::string::npos ||
                             primName.find("glass") != std::string::npos ||
@@ -588,6 +616,51 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                     }
                 }
             }
+
+            // Parse thin-walled diffuse transmission from USD shader inputs
+            UsdShadeInput diffTransInput = surfaceShader.GetInput(TfToken("diffuseTransmission"));
+            if (!diffTransInput) {
+                diffTransInput = surfaceShader.GetInput(TfToken("diffuse_transmission"));
+            }
+            if (diffTransInput) {
+                float dt = 0.0f;
+                diffTransInput.Get(&dt);
+                gpuMat.diffuseTransmission = std::clamp(dt, 0.0f, 1.0f);
+            }
+
+            UsdShadeInput diffTransColorInput = surfaceShader.GetInput(TfToken("diffuseTransmissionColor"));
+            if (diffTransColorInput) {
+                GfVec3f dtc(1.0f, 1.0f, 1.0f);
+                diffTransColorInput.Get(&dtc);
+                // When diffuseTransmissionColor is provided, modulate diffuseTransmission
+                if (gpuMat.diffuseTransmission <= 0.001f) {
+                    gpuMat.diffuseTransmission = std::clamp((dtc[0] + dtc[1] + dtc[2]) / 3.0f, 0.0f, 1.0f);
+                }
+            }
+        }
+
+        // Botanical & foliage heuristics for thin-walled forward transmission
+        bool isFoliage = (lowerMatName.find("leaf") != std::string::npos ||
+                          lowerMatName.find("leaves") != std::string::npos ||
+                          lowerMatName.find("foliage") != std::string::npos ||
+                          lowerMatName.find("branch") != std::string::npos ||
+                          lowerMatName.find("flora") != std::string::npos ||
+                          lowerMatName.find("needle") != std::string::npos ||
+                          lowerMatName.find("plant") != std::string::npos ||
+                          lowerMatPath.find("leaf") != std::string::npos ||
+                          lowerMatPath.find("branch") != std::string::npos ||
+                          lowerPrimName.find("leaf") != std::string::npos ||
+                          lowerPrimName.find("branch") != std::string::npos);
+
+        if (isFoliage) {
+            if (gpuMat.diffuseTransmission <= 0.001f) {
+                gpuMat.diffuseTransmission = 0.40f; // Physical thin-walled forward transmission for leaves
+            }
+            // For branch leaf cards with textures, enforce ALPHA_MODE_MASK
+            if (gpuMat.alphaMode == ALPHA_MODE_OPAQUE && (gpuMat.albedoTex != 0 || gpuMat.transmissionTex != 0)) {
+                gpuMat.alphaMode = ALPHA_MODE_MASK;
+                gpuMat.alphaCutoff = 0.5f;
+            }
         }
 
         // Foliage and bark heuristics for untextured botanical materials (e.g. Botaniq assets without exported shader networks)
@@ -607,6 +680,50 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
                 }
                 gpuMat.roughness = 0.85f;
             }
+        }
+
+        // Procedural Water & Terrain auto-tagging
+        auto isSpecificWater = [](const std::string& str) {
+            if (str.empty()) return false;
+            // Exclude seabed/underwater terrain
+            if (str.find("underwater") != std::string::npos) return false;
+            return (str.find("water") != std::string::npos ||
+                    str.find("ocean") != std::string::npos ||
+                    str.find("lake") != std::string::npos ||
+                    str.find("sea") != std::string::npos ||
+                    str.find("river") != std::string::npos);
+        };
+
+        bool isWaterKeyword = isSpecificWater(lowerMatName) ||
+                              isSpecificWater(lowerMatPath) ||
+                              isSpecificWater(lowerPrimName);
+
+        bool isTerrainKeyword = (lowerMatName.find("terrain") != std::string::npos ||
+                                 lowerMatName.find("underwater") != std::string::npos || // Seabed is terrain
+                                 lowerMatName.find("landscape") != std::string::npos ||
+                                 lowerMatName.find("ground") != std::string::npos ||
+                                 lowerMatName.find("rock") != std::string::npos ||
+                                 lowerMatName.find("cliff") != std::string::npos ||
+                                 lowerMatName.find("sand") != std::string::npos ||
+                                 lowerMatName.find("seabed") != std::string::npos ||
+                                 lowerMatPath.find("terrain") != std::string::npos ||
+                                 lowerMatPath.find("underwater") != std::string::npos ||
+                                 lowerPrimName.find("terrain") != std::string::npos);
+
+        if (isWaterKeyword) {
+            gpuMat.type = MATERIAL_DIELECTRIC | MATERIAL_FLAG_PROCEDURAL_WATER;
+            gpuMat.transmission = 1.0f;
+            gpuMat.ior = 1.333f;
+            gpuMat.roughness = 0.02f;
+            if (gpuMat.thickness <= 0.001f) {
+                gpuMat.thickness = 1.0f; // Enable volumetric Beer-Lambert absorption
+            }
+            if (gpuMat.attenuationColor.w <= 0.0f) {
+                // Natural water attenuation: absorbs red exponentially, preserves deep cyan/blue
+                gpuMat.attenuationColor = glm::vec4(0.3f, 0.7f, 0.9f, 4.0f);
+            }
+        } else if (isTerrainKeyword) {
+            gpuMat.type |= MATERIAL_FLAG_PROCEDURAL_TERRAIN;
         }
 
         uint32_t newId = static_cast<uint32_t>(data.materials.size());
@@ -676,6 +793,17 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
     for (const UsdPrim& prim : stage->Traverse(UsdTraverseInstanceProxies())) {
         // --- Process Meshes ---
         if (prim.IsA<UsdGeomMesh>()) {
+            std::string primPathStr = prim.GetPath().GetString();
+            std::string lowerPrimPath = primPathStr;
+            std::transform(lowerPrimPath.begin(), lowerPrimPath.end(), lowerPrimPath.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+
+            if (lowerPrimPath.find("separator") != std::string::npos ||
+                lowerPrimPath.find("cloud") != std::string::npos) {
+                Logger::info("UsdLoader: Skipping atmospheric occlusion prim '{}'", primPathStr);
+                continue;
+            }
+
             // If this mesh is part of any PointInstancer prototype hierarchy, skip it here
             bool isPrototypePrim = false;
             for (const auto& tgt : allPrototypeTargets) {
@@ -923,7 +1051,31 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         // --- Process Lights (UsdLux) ---
         else if (prim.IsA<UsdLuxDomeLight>()) {
             hasDomeLight = true;
+            UsdLuxDomeLight dome(prim);
             Logger::info("UsdLoader: Detected UsdLuxDomeLight at '{}'", prim.GetPath().GetString());
+
+            SdfAssetPath texAsset;
+            dome.GetTextureFileAttr().Get(&texAsset, evalTime);
+            if (texAsset.GetAssetPath().empty() && evalTime != UsdTimeCode::Default()) {
+                dome.GetTextureFileAttr().Get(&texAsset, UsdTimeCode::Default());
+            }
+
+            std::string rawPath = texAsset.GetAssetPath();
+            if (!rawPath.empty()) {
+                auto resolved = resolveTexturePath(rawPath);
+                if (!resolved.empty() && std::filesystem::exists(resolved)) {
+                    data.domeLightHdriPath = resolved.string();
+                    Logger::info("UsdLoader: Resolved UsdLuxDomeLight HDRI texture: '{}'", data.domeLightHdriPath);
+                } else {
+                    Logger::warn("UsdLoader: DomeLight texture '{}' could not be resolved", rawPath);
+                }
+            }
+
+            float intensity = 1.0f;
+            dome.GetIntensityAttr().Get(&intensity);
+            float exposure = 0.0f;
+            dome.GetExposureAttr().Get(&exposure);
+            data.domeLightIntensity = intensity * std::pow(2.0f, exposure);
         }
         else if (prim.IsA<UsdLuxRectLight>() || prim.IsA<UsdLuxDiskLight>() ||
                  prim.IsA<UsdLuxSphereLight>() || prim.IsA<UsdLuxDistantLight>()) {
@@ -1327,7 +1479,23 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
         Logger::info("UsdLoader: Instancing PointInstancer '{}': {} instances referencing {} prototype BLASes (Total Unique Prototypes: {})",
                      instPrim.GetPath().GetString(), numInstances, targets.size(), protoPathToBlas.size());
 
+        // Density downsampling and camera-relative distance culling
+        glm::vec3 cameraRef = options.cameraPosOverride.value_or(data.cameraPosition);
+        bool hasDensityCull = (options.instanceDensity < 0.999f);
+        bool hasCullDist = (options.cullDistance > 0.0f);
+
+        size_t keptCount = 0;
         for (size_t i = 0; i < numInstances; ++i) {
+            // 1. Deterministic density downsampling using instance ID hashing
+            if (hasDensityCull) {
+                uint32_t h = (static_cast<uint32_t>(i) * 0x85ebca6bu) ^ (static_cast<uint32_t>(i) >> 13);
+                h = (h * 0xc2b2ae35u) ^ (h >> 16);
+                float norm = static_cast<float>(h & 0xFFFF) / 65535.0f;
+                if (norm > options.instanceDensity) {
+                    continue;
+                }
+            }
+
             int pIdx = protoIndices[i];
             if (pIdx < 0 || static_cast<size_t>(pIdx) >= targets.size()) continue;
             std::string tPath = targets[pIdx].GetString();
@@ -1338,6 +1506,15 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             GfMatrix4d xf = xforms[i];
             glm::mat4 instMat = gfToGlmMatrix(xf);
             glm::mat4 M = stageTransform * instWorld * instMat;
+
+            // 2. Camera-relative distance culling
+            if (hasCullDist) {
+                glm::vec3 instPos = glm::vec3(M[3]);
+                float d = glm::distance(instPos, cameraRef);
+                if (d > options.cullDistance) {
+                    continue;
+                }
+            }
 
             uint32_t customIdx = static_cast<uint32_t>(data.instanceData.size());
             SceneInstance sInst{};
@@ -1352,6 +1529,12 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath) {
             instGPU.materialOffset = 0;
             instGPU.flags = 0;
             data.instanceData.push_back(instGPU);
+            keptCount++;
+        }
+
+        if (hasDensityCull || hasCullDist) {
+            Logger::info("UsdLoader: Filtered PointInstancer '{}': {} active instances retained out of {} (density={:.2f}, cullDistance={:.1f}m)",
+                         instPrim.GetPath().GetString(), keptCount, numInstances, options.instanceDensity, options.cullDistance);
         }
     }
 

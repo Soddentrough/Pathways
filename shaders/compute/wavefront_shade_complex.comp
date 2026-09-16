@@ -284,6 +284,12 @@ void main() {
             f16vec3 diffuseColor = baseColor * float16_t(1.0 - metallic);
             vec3 V = -rayDir;
 
+            float diffTrans = clamp(mat.diffuseTransmission, 0.0, 1.0);
+            if (mat.diffuseTransmissionTex > 0u && mat.diffuseTransmissionTex <= 512u) {
+                diffTrans *= texture(sceneTextures[mat.diffuseTransmissionTex - 1u], hitUv).r;
+            }
+            diffTrans = clamp(diffTrans, 0.0, 1.0);
+
             float clearcoat = clamp(mat.clearcoat, 0.0, 1.0);
             if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
                 clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1u], hitUv).r;
@@ -399,25 +405,28 @@ void main() {
                     validLight = true;
                 }
 
-                float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
-                if (validLight && NdotL > 0.0) {
+                float lightDirDotN = dot(hitNormal, lightDir);
+                bool isTransmitted = (lightDirDotN < 0.0 && diffTrans > 0.001);
+                float NdotL = isTransmitted ? -lightDirDotN : clamp(lightDirDotN, 0.0, 1.0);
+                if (validLight && NdotL > 0.0 && (lightDirDotN > 0.0 || isTransmitted)) {
                     float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
                     if (NdotV > 0.0) {
-                        vec3 H = normalize(V + lightDir);
+                        vec3 H = normalize(V + (isTransmitted ? -lightDir : lightDir));
                         float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                         float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
                         f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
                         float D = distributionGGX(NdotH, alphaRoughness);
                         float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                        f16vec3 specBrdf = enableSpecular ? (float16_t(clamp(D * Vis, 0.0, 65500.0)) * F) : f16vec3(0.0);
-                        f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI));
+                        f16vec3 specBrdf = (!isTransmitted && enableSpecular) ? (float16_t(clamp(D * Vis, 0.0, 65500.0)) * F) : f16vec3(0.0);
+                        float transFactor = isTransmitted ? diffTrans : (1.0 - diffTrans);
+                        f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI * transFactor));
                         f16vec3 baseBrdf = diffBrdf + specBrdf;
 
                         float lightPdfEff = max(lightPdf * lightSelectPdf, 1e-6);
-                        float diffPdf = NdotL * INV_PI;
-                        float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                        float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + baseSpecProb * specPdf;
+                        float diffPdf = NdotL * INV_PI * transFactor;
+                        float specPdf = isTransmitted ? 0.0 : ((D * NdotH) / max(4.0 * VdotH, 1e-4));
+                        float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + (isTransmitted ? 0.0 : (baseSpecProb * specPdf));
                         float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + bsdfPdf)) : 1.0;
 
                         float factor = (NdotL / lightPdfEff) * misWeight;
@@ -428,7 +437,8 @@ void main() {
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
                                 hasShadowRay = true;
-                                shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, lightDist);
+                                vec3 shadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
+                                shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
                                 shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                             } else {
                                 accumRadiance += vec3(unshadowed);
@@ -451,6 +461,7 @@ void main() {
                 float selectedLightPdf = 1.0;
                 float selectedLightSelectPdf = 1.0;
                 float selectedNdotL = 0.0;
+                bool selectedIsTrans = false;
                 float selectedTarget = 0.0;
                 float totalWeightSum = 0.0;
                 bool hasCandidate = false;
@@ -509,9 +520,12 @@ void main() {
                         validLightSample = true;
                     }
 
-                    float NdotL = clamp(dot(hitNormal, lightDir), 0.0, 1.0);
-                    if (validLightSample && NdotL > 0.0) {
-                        float target = max(dot(lightEmission, vec3(proxyLumWeight)) * NdotL, 1e-6);
+                    float rawNdotL = dot(hitNormal, lightDir);
+                    bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
+                    float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
+                    if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
+                        float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
+                        float target = max(dot(lightEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
                         float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
                         float weight = target / sourcePdf;
 
@@ -524,6 +538,7 @@ void main() {
                             selectedLightPdf = lightPdf;
                             selectedLightSelectPdf = lightSelectPdf;
                             selectedNdotL = NdotL;
+                            selectedIsTrans = isTrans;
                             selectedTarget = target;
                             hasCandidate = true;
                         }
@@ -533,19 +548,21 @@ void main() {
                 if (hasCandidate && selectedTarget > 1e-6) {
                     float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
                     if (NdotV > 0.0) {
-                        vec3 H = normalize(V + selectedLightDir);
+                        vec3 H = normalize(V + (selectedIsTrans ? -selectedLightDir : selectedLightDir));
                         float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                         float VdotH = clamp(dot(V, H), 0.0, 1.0);
 
                         f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
                         float D = distributionGGX(NdotH, alphaRoughness);
                         float Vis = visibilitySmithGGXCorrelated(selectedNdotL, NdotV, alphaRoughness);
-                        f16vec3 specBrdf = enableSpecular ? (float16_t(clamp(D * Vis, 0.0, 65500.0)) * F) : f16vec3(0.0);
-                        f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI));
+                        f16vec3 specBrdf = (!selectedIsTrans && enableSpecular) ? (float16_t(clamp(D * Vis, 0.0, 65500.0)) * F) : f16vec3(0.0);
 
-                        float diffPdf = selectedNdotL * INV_PI;
-                        float specPdf = (D * NdotH) / max(4.0 * VdotH, 1e-4);
-                        float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + baseSpecProb * specPdf;
+                        float transFactor = selectedIsTrans ? diffTrans : (1.0 - diffTrans);
+                        f16vec3 diffBrdf = (f16vec3(1.0) - F) * (diffuseColor * float16_t(INV_PI * transFactor));
+
+                        float diffPdf = selectedNdotL * INV_PI * transFactor;
+                        float specPdf = selectedIsTrans ? 0.0 : ((D * NdotH) / max(4.0 * VdotH, 1e-4));
+                        float bsdfPdf = (1.0 - baseSpecProb) * diffPdf + (selectedIsTrans ? 0.0 : (baseSpecProb * specPdf));
 
                         float misWeight = 1.0;
                         Light selLight = lights[selectedLightIdx];
@@ -554,7 +571,7 @@ void main() {
                             misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                         }
 
-                        if (clearcoat > 0.001 && enableSpecular) {
+                        if (!selectedIsTrans && clearcoat > 0.001 && enableSpecular) {
                             float NcDotH = clamp(dot(clearcoatNormal, H), 0.0, 1.0);
                             float NcDotL = clamp(dot(clearcoatNormal, selectedLightDir), 0.0, 1.0);
                             float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
@@ -566,7 +583,7 @@ void main() {
                             specBrdf = specBrdf * float16_t(1.0 - Fc) + clearcoatBrdf;
                         }
 
-                        if (length(sheenColor) > float16_t(1e-4)) {
+                        if (!selectedIsTrans && length(sheenColor) > float16_t(1e-4)) {
                             float D_sheen = evalSheenCharlie(NdotH, sheenRoughness);
                             float V_sheen = 1.0 / (4.0 * max(selectedNdotL + NdotV - selectedNdotL * NdotV, 1e-4));
                             f16vec3 sheenBrdf = sheenColor * float16_t(D_sheen * V_sheen);
@@ -585,8 +602,9 @@ void main() {
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
+                                vec3 shadowOrigin = selectedIsTrans ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
                                 if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                    bool occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
+                                    bool occluded = traceShadowRayInline(shadowOrigin, selectedLightDir, selectedLightDist,
                                                                          (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
                                     if (!occluded) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -606,7 +624,7 @@ void main() {
                                     }
                                 } else {
                                     hasShadowRay = true;
-                                    shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
+                                    shadowCandidate.originDist = vec4(shadowOrigin, selectedLightDist);
                                     shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                                 }
                             } else {
@@ -721,13 +739,21 @@ void main() {
                     float scale = (1.0 - Fc) / max(baseSpecProb, 1e-4);
                     throughput *= F_spec * float16_t(scale);
                 } else {
-                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                    nextOrigin = hitPoint + hitNormal * EPSILON;
-                    vec3 H_diff = normalize(V + nextDirection);
-                    f16vec3 F_diff = fresnelSchlickVec(float16_t(clamp(dot(V, H_diff), 0.0, 1.0)), F0);
-                    float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
+                    // Diffuse lobe (reflection or transmission)
+                    bool isTrans = (diffTrans > 0.001 && randFloat(seed) < diffTrans);
+                    if (isTrans) {
+                        nextDirection = sampleCosineHemisphere(-hitNormal, seed);
+                        nextOrigin = hitPoint - hitNormal * EPSILON;
+                    } else {
+                        nextDirection = sampleCosineHemisphere(hitNormal, seed);
+                        nextOrigin = hitPoint + hitNormal * EPSILON;
+                    }
+                    vec3 H_diff = normalize(V + (isTrans ? -nextDirection : nextDirection));
+                    float VdotH_diff = clamp(dot(V, H_diff), 0.0, 1.0);
+                    f16vec3 F_diff = fresnelSchlickVec(float16_t(VdotH_diff), F0);
+                    float Fc = isTrans ? 0.0 : (fresnelSchlick(VdotH_diff, 1.5) * clearcoat);
                     f16vec3 diffFactor = diffuseColor;
-                    if (length(sheenColor) > float16_t(1e-4)) {
+                    if (!isTrans && length(sheenColor) > float16_t(1e-4)) {
                         float16_t maxSheen = clamp(max(sheenColor.r, max(sheenColor.g, sheenColor.b)), float16_t(0.0), float16_t(1.0));
                         diffFactor = mix(diffFactor, sheenColor, maxSheen * float16_t(0.5));
                     }
