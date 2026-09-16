@@ -108,6 +108,8 @@ struct FrameStats {
     float hdr_paper_white_nits = 200.0f;
     std::string scene_path = "";
     uint32_t num_triangles = 0;
+    uint64_t num_instanced_triangles = 0;
+    uint32_t num_instances = 0;
     uint32_t num_spheres = 0;
     uint32_t num_materials = 0;
     uint32_t num_lights = 0;
@@ -213,6 +215,7 @@ struct FrameStats {
         double blas_build_time_ms = 0.0;
         double blas_size_kb = 0.0;
         uint32_t blas_triangles = 0;
+        uint64_t num_instanced_triangles = 0;
         double tlas_build_time_ms = 0.0;
         double tlas_size_kb = 0.0;
         uint32_t tlas_instances = 0;

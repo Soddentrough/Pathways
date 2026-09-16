@@ -12,6 +12,8 @@ struct SceneEntry {
     std::string filepath;
     std::string group; // "Procedural", "Showcase", "Research", "Custom"
     uint64_t triangleCount = 0;
+    uint64_t instancedTriangleCount = 0;
+    uint32_t instanceCount = 0;
     uint32_t materialCount = 0;
     uint64_t fileSizeBytes = 0;
 

@@ -328,6 +328,8 @@ private:
     // Scene metadata
     SceneData m_sceneData;
     uint32_t m_numTriangles = 0;
+    uint64_t m_numInstancedTriangles = 0;
+    uint32_t m_numInstances = 1;
     uint32_t m_numOpaqueTriangles = 0;
     uint32_t m_numSpheres = 0;
     uint32_t m_numMaterials = 0;
@@ -349,9 +351,11 @@ private:
     MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;
     std::vector<double> m_frameTimesMs;
     double m_lastFrameTimeMs = 0.0;
+    double m_lastActiveRenderFrameTimeMs = 0.0;
     double m_lastGpuRtMs = 0.0;
     double m_lastSecGpuMs = 0.0;
     double m_lastTonemapMs = 0.0;
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotSkippedRayTracing = {false, false};
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastLogTime;

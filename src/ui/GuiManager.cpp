@@ -15,6 +15,20 @@
 
 namespace pathways {
 
+static std::string formatInstCount(uint64_t count) {
+    if (count >= 1'000'000) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2fM", static_cast<double>(count) / 1'000'000.0);
+        return buf;
+    }
+    if (count >= 1'000) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1fK", static_cast<double>(count) / 1'000.0);
+        return buf;
+    }
+    return std::to_string(count);
+}
+
 GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice physicalDevice,
                        VkDevice device, uint32_t queueFamily, VkQueue queue,
                        VkFormat colorFormat, uint32_t minImageCount, uint32_t imageCount)
@@ -531,7 +545,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 5. Scene Complexity Telemetry
         if (ImGui::CollapsingHeader("Scene Complexity", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
+            if (stats.num_instanced_triangles > stats.num_triangles) {
+                ImGui::Text("Geometry:     %u Base Tris (%s Instanced across %u Instances), %u Spheres",
+                            stats.num_triangles, formatInstCount(stats.num_instanced_triangles).c_str(),
+                            stats.num_instances, stats.num_spheres);
+            } else {
+                ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
+            }
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
             if (config.denoiser_mode == DenoiserMode::Upways) {
@@ -843,7 +863,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         ImGui::Text("  > Geometry: ");
                         ImGui::SameLine();
                         uint32_t activeTris = (stats.num_triangles > 0) ? stats.num_triangles : static_cast<uint32_t>(cur.triangleCount);
-                        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%u Triangles (%s)", activeTris, cur.formatTriangles().c_str());
+                        if (stats.num_instanced_triangles > activeTris) {
+                            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%u Base Tris (%s Instanced across %u instances)",
+                                               activeTris, formatInstCount(stats.num_instanced_triangles).c_str(), stats.num_instances);
+                        } else {
+                            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%u Triangles (%s)", activeTris, cur.formatTriangles().c_str());
+                        }
                         if (stats.num_spheres > 0) {
                             ImGui::SameLine();
                             ImGui::Text("(%u Spheres)", stats.num_spheres);

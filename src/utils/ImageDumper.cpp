@@ -340,6 +340,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
     out << "    \"scene\": {\n"
         << std::format("      \"path\": \"{}\",\n", safeScenePath)
         << std::format("      \"num_triangles\": {},\n", stats.num_triangles)
+        << std::format("      \"num_instanced_triangles\": {},\n", stats.num_instanced_triangles)
+        << std::format("      \"num_instances\": {},\n", stats.num_instances)
         << std::format("      \"num_spheres\": {},\n", stats.num_spheres)
         << std::format("      \"num_materials\": {},\n", stats.num_materials)
         << std::format("      \"num_lights\": {},\n", stats.num_lights)
@@ -411,6 +413,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"blas_build_time_ms\": {:.3f},\n", stats.blas_build_time_ms)
         << std::format("      \"blas_size_kb\": {:.2f},\n", stats.blas_size_kb)
         << std::format("      \"blas_triangles\": {},\n", stats.blas_triangles)
+        << std::format("      \"num_instanced_triangles\": {},\n", stats.num_instanced_triangles)
         << std::format("      \"tlas_build_time_ms\": {:.3f},\n", stats.tlas_build_time_ms)
         << std::format("      \"tlas_size_kb\": {:.2f},\n", stats.tlas_size_kb)
         << std::format("      \"tlas_instances\": {},\n", stats.tlas_instances)

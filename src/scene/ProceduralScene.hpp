@@ -113,6 +113,7 @@ class ProceduralScene {
 public:
     static SceneData createCornellBox();
     static SceneData createManyLightsScene(uint32_t gridDim = 8);
+    static SceneData createCyberCityScene();
 };
 
 } // namespace pathways

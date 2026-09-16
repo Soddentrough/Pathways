@@ -876,6 +876,16 @@ void Engine::initScene() {
             Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
             m_sceneData = ProceduralScene::createManyLightsScene();
             m_currentSceneIndex = 1;
+        } else if (m_config.scene_path == "cyber-city" || m_config.scene_path == "cyber_city" || m_config.scene_path == "procedural:cyber-city" || m_config.scene_path == "procedural:cyber_city" || m_config.scene_path == "Procedural Cyber City") {
+            Logger::info("Loading Procedural Cyber City Megastructure...");
+            m_sceneData = ProceduralScene::createCyberCityScene();
+            m_currentSceneIndex = -1;
+            for (size_t i = 0; i < m_availableScenes.size(); ++i) {
+                if (m_availableScenes[i].filepath == "procedural:cyber-city") {
+                    m_currentSceneIndex = static_cast<int>(i);
+                    break;
+                }
+            }
         } else {
             std::string resolvedScene = m_config.scene_path;
             if (!std::filesystem::exists(resolvedScene)) {
@@ -965,11 +975,31 @@ void Engine::initScene() {
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
     m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
+
+    uint64_t totalInstTris = 0;
+    if (!m_sceneData.instances.empty() && !m_sceneData.blasRanges.empty()) {
+        for (const auto& inst : m_sceneData.instances) {
+            if (inst.blasIndex < m_sceneData.blasRanges.size()) {
+                totalInstTris += m_sceneData.blasRanges[inst.blasIndex].triangleCount;
+            }
+        }
+        m_numInstances = static_cast<uint32_t>(m_sceneData.instances.size());
+    } else {
+        totalInstTris = m_numTriangles;
+        m_numInstances = 1;
+    }
+    m_numInstancedTriangles = totalInstTris;
+
     updateSceneTransparencyFlag();
     partitionSceneGeometry();
 
-    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
-                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    if (m_numInstancedTriangles > m_numTriangles) {
+        Logger::info("Active Scene: {} Base Triangles ({} Instanced across {} Instances), {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numInstancedTriangles, m_numInstances, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    } else {
+        Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    }
 
     if (m_camera) {
         m_camera->setSceneScale(m_sceneData.sceneRadius, m_sceneData.focalDistance, m_sceneData.centralTarget);
@@ -1104,8 +1134,17 @@ void Engine::initScene() {
         m_environmentMap = Texture::loadFromFile(device, allocator, queue, pool, m_config.hdri_path);
     }
     if (!m_environmentMap) {
-        m_environmentMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
-        Logger::info("Generated physical procedural HDRI sky dome (512x256, 32-bit Float).");
+        bool isCyber = (m_config.hdri_path == "night" || m_config.hdri_path == "night-sky" ||
+                        m_config.scene_path == "cyber-city" || m_config.scene_path == "procedural:cyber-city" ||
+                        m_config.scene_path == "procedural:cyber_city" || m_config.scene_path == "cyber_city" ||
+                        m_config.scene_path == "Procedural Cyber City");
+        if (isCyber) {
+            m_environmentMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
+            Logger::info("Generated procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
+        } else {
+            m_environmentMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
+            Logger::info("Generated physical procedural HDRI sky dome (512x256, 32-bit Float).");
+        }
     }
 
     m_sceneTextures.clear();
@@ -1146,6 +1185,8 @@ void Engine::requestSceneChange(const std::string& filepath) {
             prettyName = "Procedural Cornell Box";
         } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
             prettyName = "Procedural Many-Lights";
+        } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
+            prettyName = "Procedural Cyber City";
         } else {
             prettyName = SceneRegistry::formatSceneName(stem);
         }
@@ -1162,6 +1203,9 @@ void Engine::requestSceneChange(const std::string& filepath) {
         } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
             Logger::info("Dynamic Scene Switch: Loading Procedural Many-Lights Cornell Box (64 Lights)...");
             return ProceduralScene::createManyLightsScene();
+        } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
+            Logger::info("Dynamic Scene Switch: Loading Procedural Cyber City Megastructure...");
+            return ProceduralScene::createCyberCityScene();
         } else {
             Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
             if (UsdLoader::isUsdFile(filepath)) {
@@ -1190,11 +1234,31 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
     m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
+
+    uint64_t totalInstTris = 0;
+    if (!m_sceneData.instances.empty() && !m_sceneData.blasRanges.empty()) {
+        for (const auto& inst : m_sceneData.instances) {
+            if (inst.blasIndex < m_sceneData.blasRanges.size()) {
+                totalInstTris += m_sceneData.blasRanges[inst.blasIndex].triangleCount;
+            }
+        }
+        m_numInstances = static_cast<uint32_t>(m_sceneData.instances.size());
+    } else {
+        totalInstTris = m_numTriangles;
+        m_numInstances = 1;
+    }
+    m_numInstancedTriangles = totalInstTris;
+
     updateSceneTransparencyFlag();
     partitionSceneGeometry();
 
-    Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
-                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    if (m_numInstancedTriangles > m_numTriangles) {
+        Logger::info("Active Scene: {} Base Triangles ({} Instanced across {} Instances), {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numInstancedTriangles, m_numInstances, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    } else {
+        Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+    }
 
     // Recreate primary buffers
     VmaAllocator allocator = m_context->getAllocator();
@@ -1279,6 +1343,20 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
             m_sceneTextures.push_back(std::move(tex));
         } else {
             m_sceneTextures.push_back(Texture::createDummyWhite(device, allocator, queue, pool));
+        }
+    }
+
+    // Adapt procedural HDRI sky dome to scene type if no explicit file path was specified
+    if (m_config.hdri_path.empty() || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
+        bool isCyber = (filepath == "cyber-city" || filepath == "procedural:cyber-city" ||
+                        filepath == "procedural:cyber_city" || filepath == "cyber_city" ||
+                        filepath == "Procedural Cyber City");
+        if (isCyber || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
+            m_environmentMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
+            Logger::info("Switched to procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
+        } else {
+            m_environmentMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
+            Logger::info("Restored procedural Day HDRI sky dome (512x256, 32-bit Float).");
         }
     }
 
@@ -1369,6 +1447,9 @@ bool Engine::loadScene(const std::string& filepath) {
     } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
         Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
         newScene = ProceduralScene::createManyLightsScene();
+    } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
+        Logger::info("Loading Procedural Cyber City Megastructure...");
+        newScene = ProceduralScene::createCyberCityScene();
     } else {
         if (UsdLoader::isUsdFile(filepath)) {
             Logger::info("Loading OpenUSD scene '{}'...", filepath);
@@ -4088,38 +4169,47 @@ void Engine::renderFrame() {
             ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
             : (gpuRtMs + gpuTonemapMs);
 
-        m_lastGpuRtMs = gpuRtMs;
-        m_lastSecGpuMs = secGpuMs;
+        bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
         m_lastTonemapMs = gpuTonemapMs;
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
-        if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
-            if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
-                m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
-                static int wfProfCount = 0;
-                bool isBenchmarkMilestone = m_config.benchmark && (++wfProfCount == 10 || (m_config.frame_limit > 0 && m_totalFramesRendered + 1 >= m_config.frame_limit));
-                if (isBenchmarkMilestone || getenv("PATHWAYS_PROFILE_WF")) {
-                    m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
-                }
-            }
-        }
 
-        if (totalGpuMs > 0.01) {
-            m_lastFrameTimeMs = totalGpuMs;
-            if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
-                m_frameTimesMs.push_back(m_lastFrameTimeMs);
-                if (!m_config.headless && m_frameTimesMs.size() > 60) {
-                    m_frameTimesMs.erase(m_frameTimesMs.begin());
-                }
-                WavefrontStageSample wfSample;
-                if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
-                    wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
-                    wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
-                    for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                        wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+        if (!completedSlotSkipped) {
+            m_lastGpuRtMs = gpuRtMs;
+            m_lastSecGpuMs = secGpuMs;
+
+            if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
+                if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
+                    m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                    static int wfProfCount = 0;
+                    bool isBenchmarkMilestone = m_config.benchmark && (++wfProfCount == 10 || (m_config.frame_limit > 0 && m_totalFramesRendered + 1 >= m_config.frame_limit));
+                    if (isBenchmarkMilestone || getenv("PATHWAYS_PROFILE_WF")) {
+                        m_wavefrontPipeline->printProfilingBreakdown(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                     }
                 }
-                recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
             }
+
+            if (totalGpuMs > 0.01) {
+                m_lastActiveRenderFrameTimeMs = totalGpuMs;
+                m_lastFrameTimeMs = totalGpuMs;
+                if (m_totalFramesRendered >= m_config.warmup_frames + MAX_FRAMES_IN_FLIGHT) {
+                    m_frameTimesMs.push_back(m_lastFrameTimeMs);
+                    if (!m_config.headless && m_frameTimesMs.size() > 60) {
+                        m_frameTimesMs.erase(m_frameTimesMs.begin());
+                    }
+                    WavefrontStageSample wfSample;
+                    if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
+                        wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                        wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
+                        for (const auto& bp : m_lastWavefrontProfile.bounces) {
+                            wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                        }
+                    }
+                    recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
+                }
+            }
+        } else if (m_lastActiveRenderFrameTimeMs > 0.01) {
+            // Keep reported frame time locked to the last active rendering frame
+            m_lastFrameTimeMs = m_lastActiveRenderFrameTimeMs;
         }
 
         // Update Dynamic Quality Governor with measured GPU timings
@@ -4302,6 +4392,7 @@ void Engine::renderFrame() {
                                m_accumulatedSamples >= m_config.max_accum_frames);
     bool skipRayTracing = accumReachedCutoff || sceneLoadingActive;
     m_accumulationComplete = accumReachedCutoff;
+    m_slotSkippedRayTracing[m_currentFrame] = skipRayTracing;
     if (m_config.progressive_accumulation) {
         if (!skipRayTracing) {
             m_accumulatedSamples++;
@@ -5226,6 +5317,8 @@ void Engine::renderFrame() {
                         targetLabel = "Procedural Cornell Box";
                     } else if (guiActions.newScenePath == "procedural:many-lights" || guiActions.newScenePath == "many-lights" || guiActions.newScenePath == "many_lights") {
                         targetLabel = "Procedural Many-Lights";
+                    } else if (guiActions.newScenePath == "procedural:cyber-city" || guiActions.newScenePath == "procedural:cyber_city" || guiActions.newScenePath == "cyber-city" || guiActions.newScenePath == "cyber_city" || guiActions.newScenePath == "Procedural Cyber City") {
+                        targetLabel = "Procedural Cyber City";
                     } else {
                         targetLabel = SceneRegistry::formatSceneName(std::filesystem::path(guiActions.newScenePath).stem().string());
                     }
@@ -5423,6 +5516,10 @@ void Engine::renderFrame() {
     // High-precision frame pacing if target FPS is set
     if (m_governor && m_config.target_fps > 0) {
         m_governor->paceFrame(m_currentFrameStartTime);
+    } else if (accumReachedCutoff && !m_config.headless) {
+        // When progressive accumulation cutoff is reached and scene is static, pace at 60 Hz
+        // to prevent runaway CPU/GPU utilization presenting identical frames
+        SDL_Delay(16);
     }
 
     m_frameIndex++;
@@ -5503,12 +5600,14 @@ void Engine::dumpOutputFiles() {
             ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
             : (gpuRtMs + gpuTonemapMs);
 
+        uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
+        bool lastSlotSkipped = m_slotSkippedRayTracing[lastCompletedSlot];
+
         if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline && m_totalFramesRendered > 0) {
-            uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
             m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(lastCompletedSlot, m_timestampPeriod, m_config.max_bounces);
         }
 
-        if (totalGpuMs > 0.01) {
+        if (!lastSlotSkipped && totalGpuMs > 0.01) {
             m_lastGpuRtMs = gpuRtMs;
             m_lastSecGpuMs = secGpuMs;
             m_lastTonemapMs = gpuTonemapMs;
@@ -5895,6 +5994,8 @@ FrameStats Engine::getStats() const {
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
     stats.tonemap_time_ms = m_lastTonemapMs;
     stats.num_triangles = m_numTriangles;
+    stats.num_instanced_triangles = m_numInstancedTriangles;
+    stats.num_instances = m_numInstances;
     stats.num_spheres = m_numSpheres;
     stats.num_materials = m_numMaterials;
     stats.num_lights = m_numLights;

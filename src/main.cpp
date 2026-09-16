@@ -54,6 +54,14 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to Damaged Helmet and rendered 3 frames cleanly.");
 
+            // Switch to scene 2b: Procedural Cyber City
+            if (!engine.loadScene("procedural:cyber-city")) {
+                pathways::Logger::error("Test failed: loadScene procedural:cyber-city failed.");
+                return 1;
+            }
+            for (int i = 0; i < 3; ++i) engine.renderFrame();
+            pathways::Logger::info("[PASS] Switched to Procedural Cyber City and rendered 3 frames cleanly.");
+
             // Switch to scene 3: Living Room
             if (!engine.loadScene("scenes/living-room/living_room_extended.glb")) {
                 pathways::Logger::error("Test failed: loadScene Living Room failed.");

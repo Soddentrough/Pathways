@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.20.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.21.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -518,6 +518,23 @@ if(UNIX)
     target_link_libraries(test_mesh_quantization PRIVATE m)
 endif()
 add_test(NAME MeshQuantization COMMAND test_mesh_quantization)
+
+# Procedural Cyber City Megastructure Unit Test Target
+add_executable(test_procedural_cyber_city
+    tests/test_procedural_cyber_city.cpp
+    src/scene/ProceduralScene.cpp
+    src/scene/Camera.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_procedural_cyber_city PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_procedural_cyber_city PRIVATE Threads::Threads)
+if(UNIX)
+    target_link_libraries(test_procedural_cyber_city PRIVATE m)
+endif()
+add_test(NAME ProceduralCyberCity COMMAND test_procedural_cyber_city)
 
 # OpenUSD Native Scene Ingestion Unit Test Target
 if(pxr_FOUND)

@@ -15,6 +15,19 @@ namespace pathways {
 
 std::string SceneEntry::formatTriangles() const {
     if (triangleCount == 0) return "0 tris";
+    if (instancedTriangleCount > triangleCount) {
+        char buf[64];
+        if (instancedTriangleCount >= 1'000'000) {
+            std::snprintf(buf, sizeof(buf), "%.1fK Base / %.2fM Inst",
+                          static_cast<double>(triangleCount) / 1'000.0,
+                          static_cast<double>(instancedTriangleCount) / 1'000'000.0);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%llu Base / %llu Inst",
+                          static_cast<unsigned long long>(triangleCount),
+                          static_cast<unsigned long long>(instancedTriangleCount));
+        }
+        return buf;
+    }
     if (triangleCount >= 1'000'000) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.2fM tris", static_cast<double>(triangleCount) / 1'000'000.0);
@@ -177,6 +190,18 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     manyLights.materialCount = 7;
     manyLights.fileSizeBytes = 0;
     entries.push_back(manyLights);
+
+    // 0c. Add Procedural Cyber City as index 2
+    SceneEntry cyberCity;
+    cyberCity.label = "Procedural Cyber City";
+    cyberCity.filepath = "procedural:cyber-city";
+    cyberCity.group = "Procedural";
+    cyberCity.triangleCount = 11700; // 19 modular BLAS prototypes
+    cyberCity.instancedTriangleCount = 3800000; // Over 3.8M instanced triangles
+    cyberCity.instanceCount = 4000; // Hardware TLAS instances
+    cyberCity.materialCount = 48;
+    cyberCity.fileSizeBytes = 0;
+    entries.push_back(cyberCity);
 
     if (scenesDir.empty()) {
         return entries;

@@ -52,6 +52,11 @@ public:
         uint32_t width = 512, uint32_t height = 256
     );
 
+    static std::unique_ptr<Texture> createProceduralNightHdrSky(
+        VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+        uint32_t width = 2048, uint32_t height = 1024
+    );
+
     static std::unique_ptr<Texture> loadFromFile(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
         const std::string& filepath

@@ -256,6 +256,146 @@ std::unique_ptr<Texture> Texture::createProceduralHdrSky(
     );
 }
 
+std::unique_ptr<Texture> Texture::createProceduralNightHdrSky(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    uint32_t width, uint32_t height
+) {
+    std::vector<glm::vec4> pixels(width * height);
+    const float PI = 3.14159265358979323846f;
+    glm::vec3 moonDir = glm::normalize(glm::vec3(-0.45f, 0.65f, -0.60f));
+
+    for (uint32_t y = 0; y < height; ++y) {
+        float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+        float theta = v * PI;
+        float cosTheta = std::cos(theta);
+        float sinTheta = std::sin(theta);
+
+        for (uint32_t x = 0; x < width; ++x) {
+            float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
+            float phi = (u * 2.0f - 1.0f) * PI;
+
+            glm::vec3 dir = glm::normalize(glm::vec3(
+                sinTheta * std::cos(phi),
+                cosTheta,
+                sinTheta * std::sin(phi)
+            ));
+
+            glm::vec3 radiance(0.0f);
+
+            if (dir.y > 0.0f) {
+                // 1. Base cosmic midnight sky gradient (zenith is obsidian navy)
+                float skyFactor = std::pow(dir.y, 0.55f);
+                glm::vec3 zenithColor(0.0004f, 0.0008f, 0.0022f);
+                glm::vec3 horizonColor(0.0080f, 0.0050f, 0.0150f);
+                radiance = glm::mix(horizonColor, zenithColor, skyFactor);
+
+                // 2. Urban horizon light pollution (cyber cyan, magenta, and amber glows from the megacity)
+                float haze = std::exp(-dir.y * 11.0f);
+                float cyanGlow = std::max(0.0f, std::sin(phi * 2.0f + 0.8f));
+                float magentaGlow = std::max(0.0f, std::cos(phi * 3.0f - 1.2f));
+                float amberGlow = std::max(0.0f, std::sin(phi * 1.5f + 2.5f));
+                glm::vec3 cityLight = (glm::vec3(0.006f, 0.022f, 0.032f) * cyanGlow +
+                                       glm::vec3(0.028f, 0.004f, 0.018f) * magentaGlow +
+                                       glm::vec3(0.022f, 0.014f, 0.003f) * amberGlow) * haze;
+                radiance += cityLight;
+
+                // 3. Cyber Lunar Body (HDR Moon) with limb-darkening and atmospheric Mie halo
+                float cosMoon = glm::dot(dir, moonDir);
+                if (cosMoon > 0.9996f) {
+                    float limb = std::pow((cosMoon - 0.9996f) / (1.0f - 0.9996f), 0.35f);
+                    radiance += glm::vec3(14.0f, 15.5f, 18.0f) * (0.4f + 0.6f * limb);
+                }
+                float g = 0.94f;
+                float corona = 0.06f * (1.0f - g * g) / std::pow(1.0f + g * g - 2.0f * g * cosMoon, 1.5f);
+                radiance += glm::vec3(0.04f, 0.07f, 0.12f) * corona;
+            } else {
+                // Ground reflection / dark asphalt & foundation albedo
+                float groundFactor = std::clamp(-dir.y, 0.0f, 1.0f);
+                radiance = glm::mix(glm::vec3(0.005f, 0.006f, 0.009f), glm::vec3(0.001f, 0.001f, 0.002f), groundFactor);
+            }
+
+            pixels[y * width + x] = glm::vec4(radiance, 1.0f);
+        }
+    }
+
+    // 4. Procedural Starfield: 2,400 deterministic stars with continuous sub-pixel Gaussian falloff
+    // Completely eliminates blocky/square pixel artifacts and cell boundary clipping
+    uint32_t rngState = 0x853c49e6u;
+    auto lcg = [&rngState]() -> float {
+        rngState = rngState * 1664525u + 1013904223u;
+        return static_cast<float>(rngState & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
+    };
+
+    for (int s = 0; s < 2400; ++s) {
+        float u = lcg();
+        float elev = lcg();
+        if (elev < 0.04f) continue; // Keep above immediate horizon haze
+        float v = (1.0f - elev) * 0.5f; // Upper hemisphere: v in [0, 0.48]
+
+        float phi = (u * 2.0f - 1.0f) * PI;
+        float theta = v * PI;
+        glm::vec3 sDir(
+            std::sin(theta) * std::cos(phi),
+            std::cos(theta),
+            std::sin(theta) * std::sin(phi)
+        );
+
+        if (glm::dot(sDir, moonDir) > 0.995f) continue;
+
+        float magRnd = lcg();
+        float brightness = 0.25f + 1.25f * std::pow(magRnd, 4.0f);
+
+        float colorRnd = lcg();
+        glm::vec3 starColor;
+        if (colorRnd < 0.45f) {
+            starColor = glm::vec3(0.85f, 0.95f, 1.4f); // B-class blue-white
+        } else if (colorRnd < 0.75f) {
+            starColor = glm::vec3(1.0f, 1.0f, 1.0f);   // A/F-class pure white
+        } else if (colorRnd < 0.92f) {
+            starColor = glm::vec3(1.3f, 1.1f, 0.8f);   // G/K-class warm gold
+        } else {
+            starColor = glm::vec3(1.5f, 0.7f, 0.5f);   // M-class crimson giant
+        }
+
+        float cx = u * static_cast<float>(width);
+        float cy = v * static_cast<float>(height);
+        float sigma = 0.50f + 0.15f * (brightness > 1.0f ? 1.0f : 0.0f);
+        float twoSigmaSq = 2.0f * sigma * sigma;
+        float maxR = 2.4f * sigma;
+
+        int cyi = static_cast<int>(cy);
+        int cxi = static_cast<int>(cx);
+        int ky = std::min(static_cast<int>(std::ceil(maxR)), 3);
+
+        for (int dy = -ky; dy <= ky; ++dy) {
+            int py = cyi + dy;
+            if (py < 0 || py >= static_cast<int>(height)) continue;
+            float latFactor = std::max(0.15f, std::sin(static_cast<float>(py + 0.5f) / static_cast<float>(height) * PI));
+            float dY = static_cast<float>(py) + 0.5f - cy;
+
+            int curKx = std::min(static_cast<int>(std::ceil(maxR / latFactor)), 6);
+            for (int dx = -curKx; dx <= curKx; ++dx) {
+                int px = (cxi + dx + static_cast<int>(width)) % static_cast<int>(width);
+                float dX = (static_cast<float>(cxi + dx) + 0.5f - cx) * latFactor;
+                float dist = std::sqrt(dX * dX + dY * dY);
+                if (dist >= maxR) continue;
+
+                // Hann-windowed Gaussian taper: continuously and smoothly vanishes to 0 at maxR
+                float window = 0.5f * (1.0f + std::cos(PI * dist / maxR));
+                float w = std::exp(-dist * dist / twoSigmaSq) * window;
+                pixels[py * width + px] += glm::vec4(starColor * (brightness * w), 0.0f);
+            }
+        }
+    }
+
+    size_t byteSize = pixels.size() * sizeof(glm::vec4);
+    return createFromPixels(
+        device, allocator, queue, pool,
+        width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
+        pixels.data(), byteSize, true
+    );
+}
+
 std::unique_ptr<Texture> Texture::loadFromFile(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
     const std::string& filepath

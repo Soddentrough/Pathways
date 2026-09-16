@@ -1075,7 +1075,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secNode->environmentMap = Texture::loadFromFile(secDevice, secAlloc, secQueue, secPool, config.hdri_path);
     }
     if (!secNode->environmentMap) {
-        secNode->environmentMap = Texture::createProceduralHdrSky(secDevice, secAlloc, secQueue, secPool);
+        bool isCyber = (config.scene_path == "cyber-city" || config.scene_path == "procedural:cyber-city" ||
+                        config.scene_path == "procedural:cyber_city" || config.scene_path == "cyber_city" ||
+                        config.scene_path == "Procedural Cyber City" || config.hdri_path == "night" || config.hdri_path == "night-sky");
+        if (isCyber) {
+            secNode->environmentMap = Texture::createProceduralNightHdrSky(secDevice, secAlloc, secQueue, secPool);
+        } else {
+            secNode->environmentMap = Texture::createProceduralHdrSky(secDevice, secAlloc, secQueue, secPool);
+        }
     }
 
     secNode->sceneTextures.clear();
@@ -2298,6 +2305,19 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
             secNode->sceneTextures.push_back(std::move(tex));
         } else {
             secNode->sceneTextures.push_back(Texture::createDummyWhite(secDevice, secAlloc, secQueue, secPool));
+        }
+    }
+
+    // 3b. Adapt procedural HDRI sky dome to scene type on secondary GPU
+    if (m_config.hdri_path.empty() || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
+        bool isCyber = (m_config.hdri_path == "night" || m_config.hdri_path == "night-sky" ||
+                        m_config.scene_path == "cyber-city" || m_config.scene_path == "procedural:cyber-city" ||
+                        m_config.scene_path == "procedural:cyber_city" || m_config.scene_path == "cyber_city" ||
+                        m_config.scene_path == "Procedural Cyber City");
+        if (isCyber) {
+            secNode->environmentMap = Texture::createProceduralNightHdrSky(secDevice, secAlloc, secQueue, secPool);
+        } else {
+            secNode->environmentMap = Texture::createProceduralHdrSky(secDevice, secAlloc, secQueue, secPool);
         }
     }
 
