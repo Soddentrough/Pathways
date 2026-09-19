@@ -165,7 +165,7 @@ Engine::Engine(const Config& config) : m_config(config) {
         // In our architecture, context creates instance then window creates surface
     }
 
-    m_context = std::make_unique<VulkanContext>(m_config);
+    m_context = std::make_unique<VulkanContext>(m_config, VK_NULL_HANDLE, "Primary GPU / Display");
 
     if (!m_config.headless && m_window) {
         m_window->setTitle(std::format("Pathways - Vulkan 1.4 Path Tracer ({})", m_context->getShortArchName()));
@@ -237,6 +237,10 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     startHwMonThread();
 
+    m_lastRenderScale = m_config.render_scale;
+    m_lastUpscalerMode = m_config.upscaler_mode;
+    m_lastTileSize = m_config.tile_size;
+
     // Initialize Dynamic Quality Governor
     GovernorConfig govCfg{};
     govCfg.targetFps = m_config.target_fps;
@@ -293,14 +297,12 @@ Engine::~Engine() {
 
     m_wavefrontPipeline.reset();
     m_rtpKhrPipeline.reset();
-    destroyShadowDenoiserResources();
-    destroyShadowDenoiserPipelines();
-    destroyTemporalAccumResources();
-    destroyTemporalAccumPipelines();
-    destroyBmfrResources();
-    destroyBmfrPipelines();
+    destroyGBufferResources();
+    destroyPostProcessDescPool();
     destroyUpwaysResources();
     destroyUpwaysPipelines();
+    destroyFsr3Resources();
+    destroyFsr3Pipelines();
     destroyCausticsResources();
     destroyCausticsPipelines();
     m_motionVectorImage.reset();
@@ -310,14 +312,19 @@ Engine::~Engine() {
     m_mlSpecularImage.reset();
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
+    if (m_accumRunningAvgPipeline) vkDestroyPipeline(device, m_accumRunningAvgPipeline, nullptr);
 
     if (m_rtpPipelineLayout) vkDestroyPipelineLayout(device, m_rtpPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
     if (m_mergePipelineLayout) vkDestroyPipelineLayout(device, m_mergePipelineLayout, nullptr);
+    if (m_accumRunningAvgPipelineLayout) vkDestroyPipelineLayout(device, m_accumRunningAvgPipelineLayout, nullptr);
 
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
+    if (m_accumRunningAvgDescLayout) vkDestroyDescriptorSetLayout(device, m_accumRunningAvgDescLayout, nullptr);
+
+    for (auto& img : m_frameImages) img.reset();
 
     if (m_updateTlasPipeline) vkDestroyPipeline(device, m_updateTlasPipeline, nullptr);
     if (m_updateTlasPipelineLayout) vkDestroyPipelineLayout(device, m_updateTlasPipelineLayout, nullptr);
@@ -438,25 +445,25 @@ void Engine::initVulkan() {
     vkAllocateCommandBuffers(device, &allocInfo, m_postCommandBuffers.data());
 
     // Create Render Target Images
-    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_frameImages[i] = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            frameFmt,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        accumFmt,
+        VK_FORMAT_R32G32B32A32_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    if (m_swapchain && !m_config.headless) {
-        VkFormat swapFmt = m_swapchain->getFormat();
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
-        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
-            outputFmt = swapFmt;
-        } else if (m_swapchain->isHdr()) {
-            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
-        } else {
-            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        }
+    // Internal post-process and tonemapping target is strictly 10-bit (or 16-bit float for scRGB HDR).
+    // The internal pipeline is never degraded to 8-bit; SDR 8-bit presentation occurs via blit to the swapchain.
+    VkFormat outputFmt = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless && m_swapchain->isHdr() && m_swapchain->getFormat() == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
     }
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
@@ -470,34 +477,43 @@ void Engine::initVulkan() {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    if (!m_config.capture_training_data_dir.empty() || m_config.denoiser_mode == DenoiserMode::Upways) {
-        m_mlAlbedoRoughnessImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlSpecularMotionImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlDiffuseImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlSpecularImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-    }
+    // G-Buffer Albedo & Roughness (Required for ML / Upways passes)
+    m_mlAlbedoRoughnessImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    m_mlSpecularMotionImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_mlDiffuseImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_mlSpecularImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
 
     // Transition layouts to GENERAL
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_frameImages[i]->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
 
     m_accumImage->transitionLayout(
         m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -524,6 +540,8 @@ void Engine::initVulkan() {
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
+    }
+    if (m_mlSpecularMotionImage) {
         m_mlSpecularMotionImage->transitionLayout(
             m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
@@ -1169,28 +1187,10 @@ void Engine::initScene() {
     m_dummyNormal = Texture::createDummyNormal(device, allocator, queue, pool);
     m_blueNoiseTexture = Texture::createBlueNoise64(device, allocator, queue, pool);
 
-    if (!m_config.hdri_path.empty() && std::filesystem::exists(m_config.hdri_path)) {
-        m_environmentMap = Texture::loadFromFile(device, allocator, queue, pool, m_config.hdri_path);
-    } else if (!m_sceneData.domeLightHdriPath.empty() && std::filesystem::exists(m_sceneData.domeLightHdriPath)) {
-        m_environmentMap = Texture::loadFromFile(device, allocator, queue, pool, m_sceneData.domeLightHdriPath);
-        if (m_environmentMap) {
-            Logger::info("Loaded DomeLight HDRI from USD scene: '{}' (intensity: {:.2f})",
-                         m_sceneData.domeLightHdriPath, m_sceneData.domeLightIntensity);
-        }
-    }
-    if (!m_environmentMap) {
-        bool isCyber = (m_config.hdri_path == "night" || m_config.hdri_path == "night-sky" ||
-                        m_config.scene_path == "cyber-city" || m_config.scene_path == "procedural:cyber-city" ||
-                        m_config.scene_path == "procedural:cyber_city" || m_config.scene_path == "cyber_city" ||
-                        m_config.scene_path == "Procedural Cyber City");
-        if (isCyber) {
-            m_environmentMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
-            Logger::info("Generated procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
-        } else {
-            m_environmentMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
-            Logger::info("Generated physical procedural HDRI sky dome (512x256, 32-bit Float).");
-        }
-    }
+    m_environmentMap = Texture::createSceneEnvironmentMap(
+        device, allocator, queue, pool,
+        m_config.hdri_path, m_config.scene_path, m_sceneData.domeLightHdriPath
+    );
 
     m_sceneTextures.clear();
     for (const auto& texData : m_sceneData.textures) {
@@ -1277,6 +1277,31 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     vkDeviceWaitIdle(device);
     if (m_mgpu && m_mgpu->getSecondaryContext()) {
         vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
+    }
+
+    m_config.scene_path = filepath;
+    if (!m_config.custom_hdri) {
+        m_config.hdri_path = "";
+        std::filesystem::path sp(filepath);
+        std::filesystem::path sceneDir = sp.has_parent_path() ? sp.parent_path() : std::filesystem::current_path();
+        std::vector<std::filesystem::path> hdriCandidates = {
+            sceneDir / "textures and hdri" / "golden_gate_hills_2k.exr",
+            sceneDir / "textures" / "studio_small_08_4k.exr",
+            sceneDir / "textures" / "studio_small_08_4k.hdr",
+            sceneDir / ".." / "textures" / "studio_small_08_4k.exr",
+            sceneDir / "textures and hdri" / "golden_gate_hills_2k.hdr",
+        };
+        for (const auto& cand : hdriCandidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(cand, ec)) {
+                m_config.hdri_path = cand.string();
+                Logger::info("Engine: Auto-detected scene HDRI environment map: '{}'", m_config.hdri_path);
+                break;
+            }
+        }
+    }
+    if (m_mgpu) {
+        m_mgpu->setConfig(m_config);
     }
 
     m_sceneData = std::move(newScene);
@@ -1396,26 +1421,18 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
         }
     }
 
-    // Adapt procedural HDRI sky dome to scene type if no explicit file path was specified
-    if (m_config.hdri_path.empty() || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
-        bool isCyber = (filepath == "cyber-city" || filepath == "procedural:cyber-city" ||
-                        filepath == "procedural:cyber_city" || filepath == "cyber_city" ||
-                        filepath == "Procedural Cyber City");
-        if (isCyber || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
-            m_environmentMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
-            Logger::info("Switched to procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
-        } else {
-            m_environmentMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
-            Logger::info("Restored procedural Day HDRI sky dome (512x256, 32-bit Float).");
-        }
-    }
+    // Unified HDRI sky dome synchronization across scenes
+    m_environmentMap = Texture::createSceneEnvironmentMap(
+        device, allocator, queue, pool,
+        m_config.hdri_path, filepath, m_sceneData.domeLightHdriPath
+    );
 
     // Update primary descriptor sets
     updateSceneDescriptors();
 
     // Secondary GPU reload
     if (m_mgpu && m_mgpu->isSecondaryInitialized()) {
-        m_mgpu->loadScene(m_sceneData);
+        m_mgpu->loadScene(m_sceneData, filepath);
     }
 
     // Update camera framing
@@ -1714,6 +1731,12 @@ void Engine::initPipelines() {
     outputImageInfo.imageView = m_outputImage->getImageView();
     outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+    std::vector<VkDescriptorImageInfo> frameImageInfos(MAX_FRAMES_IN_FLIGHT);
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        frameImageInfos[i].imageView = m_frameImages[i]->getImageView();
+        frameImageInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
     std::vector<VkDescriptorBufferInfo> uboBufferInfos(MAX_FRAMES_IN_FLIGHT);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         uboBufferInfos[i] = { m_cameraUBOs[i]->getBuffer(), 0, sizeof(CameraUniform) };
@@ -1721,7 +1744,7 @@ void Engine::initPipelines() {
 
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &frameImageInfos[i], nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboBufferInfos[i], nullptr });
     }
     // Tonemap set
@@ -1771,17 +1794,15 @@ void Engine::initPipelines() {
     auto wfShadeComplexCode = loadShaderSPIRV("wavefront_shade_complex.comp.spv");
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
-    auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
     auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
         m_config.width, m_config.height,
-        m_config.wavefront_tile_size,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
-        wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
+        wfShadeEmissiveCode, wfShadePassthroughCode,
         m_context->hasDgcExecutionSet(),
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
         true // enableDgcPreprocess
@@ -1843,7 +1864,11 @@ void Engine::initPipelines() {
     std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{};
     mergeLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1864,7 +1889,7 @@ void Engine::initPipelines() {
     VkPushConstantRange mergePushConstant{};
     mergePushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     mergePushConstant.offset = 0;
-    mergePushConstant.size = sizeof(uint32_t) * 6; // width, height, spp, mode, formatMode, dynamicRatioPermille
+    mergePushConstant.size = sizeof(uint32_t) * 8; // width, height, secondarySpp, tileSize, formatMode, mergeMode, primarySpp, pad
 
     VkPipelineLayoutCreateInfo mergePipeLayoutInfo{};
     mergePipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1892,21 +1917,22 @@ void Engine::initPipelines() {
 
     Logger::info("Multi-GPU merge compute pipeline (Wave32) created successfully.");
 
-    // 8. FidelityFX Shadow Denoiser Resources & Pipelines
-    createShadowDenoiserPipelines();
-    createShadowDenoiserResources();
+    // 7b. Running Average Accumulation Pipeline (FP16 -> FP32)
+    createAccumRunningAvgPipeline();
 
-    // 9. Temporal Radiance Accumulation & wRLS Outlier Rejection
-    createTemporalAccumPipelines();
-    createTemporalAccumResources();
+    // 8. G-Buffer Resources (Direct Light & Surface Normals/Depth)
+    createGBufferResources();
 
-    // 10. Blockwise Multi-Order Feature Regression (BMFR)
-    createBmfrPipelines();
-    createBmfrResources();
+    // 9. Post-Processing Descriptors (Upscalers & Tonemapping)
+    createPostProcessDescPool();
 
-    // 10b. Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
+    // 10a. Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
     createUpwaysPipelines();
     createUpwaysResources();
+
+    // 10c. AMD FidelityFX Super Resolution 3.1
+    createFsr3Pipelines();
+    createFsr3Resources();
 
     // 11. GPU TLAS Instance Writer & Refit Pipeline (Tier 3)
     initTlasUpdatePipeline();
@@ -1957,6 +1983,15 @@ void Engine::updateAllImageDescriptors() {
     causticInfo.imageView = m_filteredCausticImage ? m_filteredCausticImage->getImageView() : accumImageInfo.imageView;
     causticInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+    std::array<VkDescriptorImageInfo, MAX_FRAMES_IN_FLIGHT> frameImageInfos;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (m_frameImages[i]) {
+            frameImageInfos[i].sampler = VK_NULL_HANDLE;
+            frameImageInfos[i].imageView = m_frameImages[i]->getImageView();
+            frameImageInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+
     std::vector<VkWriteDescriptorSet> writes;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_rtDescSets[i] != VK_NULL_HANDLE) {
@@ -1965,7 +2000,7 @@ void Engine::updateAllImageDescriptors() {
             w0.dstBinding = 0;
             w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w0.descriptorCount = 1;
-            w0.pImageInfo = &accumImageInfo;
+            w0.pImageInfo = &frameImageInfos[i];
             writes.push_back(w0);
 
             if (m_directLightImage && m_normalDepthImage) {
@@ -1996,13 +2031,15 @@ void Engine::updateAllImageDescriptors() {
                 writes.push_back(w14);
             }
 
-            VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            w15.dstSet = m_rtDescSets[i];
-            w15.dstBinding = 15;
-            w15.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            w15.descriptorCount = 1;
-            w15.pImageInfo = &causticInfo;
-            writes.push_back(w15);
+            if (m_filteredCausticImage) {
+                VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                w15.dstSet = m_rtDescSets[i];
+                w15.dstBinding = 15;
+                w15.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w15.descriptorCount = 1;
+                w15.pImageInfo = &causticInfo;
+                writes.push_back(w15);
+            }
         }
     }
 
@@ -2029,124 +2066,127 @@ void Engine::updateAllImageDescriptors() {
     }
 
     updateWavefrontSceneDescriptors();
-    updateTemporalAccumDescriptors();
-    updateBmfrDescriptors();
     updateUpwaysDescriptors();
+    updateFsr3Descriptors();
     updateCausticsDescriptors();
+    updateAccumRunningAvgDescriptors();
 }
 
-void Engine::createShadowDenoiserPipelines() {
+void Engine::createAccumRunningAvgPipeline() {
     VkDevice device = m_context->getDevice();
 
-    // 1. Create Descriptor Set Layouts
-    std::vector<VkDescriptorSetLayoutBinding> classifyBindings = {
+    // 1. Descriptor Set Layout
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
-    VkDescriptorSetLayoutCreateInfo classifyLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    classifyLayoutInfo.bindingCount = static_cast<uint32_t>(classifyBindings.size());
-    classifyLayoutInfo.pBindings = classifyBindings.data();
-    vkCreateDescriptorSetLayout(device, &classifyLayoutInfo, nullptr, &m_shadowClassifyDescLayout);
 
-    std::vector<VkDescriptorSetLayoutBinding> filterBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_accumRunningAvgDescLayout);
+
+    // 2. Allocate Descriptor Sets (one per frame in flight)
+    std::array<VkDescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> layouts = {
+        m_accumRunningAvgDescLayout, m_accumRunningAvgDescLayout
     };
-    VkDescriptorSetLayoutCreateInfo filterLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    filterLayoutInfo.bindingCount = static_cast<uint32_t>(filterBindings.size());
-    filterLayoutInfo.pBindings = filterBindings.data();
-    vkCreateDescriptorSetLayout(device, &filterLayoutInfo, nullptr, &m_shadowFilterDescLayout);
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_descriptorPool;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts.data();
+    vkAllocateDescriptorSets(device, &allocInfo, m_accumRunningAvgDescSets.data());
 
-    // 2. Allocate Descriptor Sets
-    std::array<VkDescriptorSetLayout, 2> classifyLayouts = { m_shadowClassifyDescLayout, m_shadowClassifyDescLayout };
-    VkDescriptorSetAllocateInfo classifyAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    classifyAllocInfo.descriptorPool = m_descriptorPool;
-    classifyAllocInfo.descriptorSetCount = 2;
-    classifyAllocInfo.pSetLayouts = classifyLayouts.data();
-    vkAllocateDescriptorSets(device, &classifyAllocInfo, m_shadowClassifyDescSets);
+    updateAccumRunningAvgDescriptors();
 
-    VkDescriptorSetAllocateInfo filterAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    filterAllocInfo.descriptorPool = m_descriptorPool;
-    filterAllocInfo.descriptorSetCount = 1;
-    filterAllocInfo.pSetLayouts = &m_shadowFilterDescLayout;
-    vkAllocateDescriptorSets(device, &filterAllocInfo, &m_shadowFilterDescSet);
+    // 3. Pipeline Layout with Push Constants
+    VkPushConstantRange pushConstant{};
+    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(uint32_t) * 3 + sizeof(float); // width, height, sampleCount, invSpp (16 bytes)
 
-    // 3. Create Pipeline Layouts
-    VkPushConstantRange classifyPcRange{};
-    classifyPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    classifyPcRange.offset = 0;
-    classifyPcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 16 + sizeof(uint32_t) * 4;
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{};
+    pipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_accumRunningAvgDescLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pushConstant;
+    vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_accumRunningAvgPipelineLayout);
 
-    VkPipelineLayoutCreateInfo classifyPlInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    classifyPlInfo.setLayoutCount = 1;
-    classifyPlInfo.pSetLayouts = &m_shadowClassifyDescLayout;
-    classifyPlInfo.pushConstantRangeCount = 1;
-    classifyPlInfo.pPushConstantRanges = &classifyPcRange;
-    vkCreatePipelineLayout(device, &classifyPlInfo, nullptr, &m_shadowClassifyPipelineLayout);
+    // 4. Compute Pipeline
+    auto shaderCode = loadShaderSPIRV("accum_running_avg.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(shaderCode);
 
-    VkPushConstantRange filterPcRange{};
-    filterPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    filterPcRange.offset = 0;
-    filterPcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(int32_t) + sizeof(float) * 2 + sizeof(uint32_t) * 3;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
 
-    VkPipelineLayoutCreateInfo filterPlInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    filterPlInfo.setLayoutCount = 1;
-    filterPlInfo.pSetLayouts = &m_shadowFilterDescLayout;
-    filterPlInfo.pushConstantRangeCount = 1;
-    filterPlInfo.pPushConstantRanges = &filterPcRange;
-    vkCreatePipelineLayout(device, &filterPlInfo, nullptr, &m_shadowFilterPipelineLayout);
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shaderModule;
+    pipelineInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        pipelineInfo.stage.pNext = &subgroupSize32;
+    }
+    pipelineInfo.layout = m_accumRunningAvgPipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_accumRunningAvgPipeline);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
 
-    // 4. Create Compute Pipelines
-    auto classifyCode = loadShaderSPIRV("ffx_shadow_tileclassify.comp.spv");
-    VkShaderModule classifyShaderModule = createShaderModule(classifyCode);
-    VkComputePipelineCreateInfo classifyPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    classifyPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, classifyShaderModule, "main", nullptr };
-    classifyPipeInfo.layout = m_shadowClassifyPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &classifyPipeInfo, nullptr, &m_shadowClassifyPipeline);
-    vkDestroyShaderModule(device, classifyShaderModule, nullptr);
-
-    auto filterCode = loadShaderSPIRV("ffx_shadow_filter.comp.spv");
-    VkShaderModule filterShaderModule = createShaderModule(filterCode);
-    VkComputePipelineCreateInfo filterPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    filterPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, filterShaderModule, "main", nullptr };
-    filterPipeInfo.layout = m_shadowFilterPipelineLayout;
-    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &filterPipeInfo, nullptr, &m_shadowFilterPipeline);
-    vkDestroyShaderModule(device, filterShaderModule, nullptr);
-
-    Logger::info("FidelityFX Shadow Denoiser pipelines created successfully.");
+    Logger::info("Running average accumulation compute pipeline (FP16 -> FP32) created successfully.");
 }
 
-void Engine::destroyShadowDenoiserPipelines() {
-    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
-    if (!device) return;
+void Engine::updateAccumRunningAvgDescriptors() {
+    if (!m_accumImage) return;
+    VkDevice device = m_context->getDevice();
 
-    if (m_shadowClassifyPipeline) { vkDestroyPipeline(device, m_shadowClassifyPipeline, nullptr); m_shadowClassifyPipeline = VK_NULL_HANDLE; }
-    if (m_shadowFilterPipeline) { vkDestroyPipeline(device, m_shadowFilterPipeline, nullptr); m_shadowFilterPipeline = VK_NULL_HANDLE; }
-    if (m_shadowClassifyPipelineLayout) { vkDestroyPipelineLayout(device, m_shadowClassifyPipelineLayout, nullptr); m_shadowClassifyPipelineLayout = VK_NULL_HANDLE; }
-    if (m_shadowFilterPipelineLayout) { vkDestroyPipelineLayout(device, m_shadowFilterPipelineLayout, nullptr); m_shadowFilterPipelineLayout = VK_NULL_HANDLE; }
-    if (m_shadowClassifyDescLayout) { vkDestroyDescriptorSetLayout(device, m_shadowClassifyDescLayout, nullptr); m_shadowClassifyDescLayout = VK_NULL_HANDLE; }
-    if (m_shadowFilterDescLayout) { vkDestroyDescriptorSetLayout(device, m_shadowFilterDescLayout, nullptr); m_shadowFilterDescLayout = VK_NULL_HANDLE; }
-    m_shadowClassifyDescSets[0] = VK_NULL_HANDLE;
-    m_shadowClassifyDescSets[1] = VK_NULL_HANDLE;
-    m_shadowFilterDescSet = VK_NULL_HANDLE;
+    VkDescriptorImageInfo historyInfo{};
+    historyInfo.imageView = m_accumImage->getImageView();
+    historyInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    std::array<VkDescriptorImageInfo, MAX_FRAMES_IN_FLIGHT> frameInfos;
+    std::vector<VkWriteDescriptorSet> writes;
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (!m_frameImages[i] || m_accumRunningAvgDescSets[i] == VK_NULL_HANDLE) continue;
+
+        frameInfos[i].sampler = VK_NULL_HANDLE;
+        frameInfos[i].imageView = m_frameImages[i]->getImageView();
+        frameInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // Binding 0: readonly uCurrentFrame
+        VkWriteDescriptorSet w0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w0.dstSet = m_accumRunningAvgDescSets[i];
+        w0.dstBinding = 0;
+        w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w0.descriptorCount = 1;
+        w0.pImageInfo = &frameInfos[i];
+        writes.push_back(w0);
+
+        // Binding 1: uHistoryAccum
+        VkWriteDescriptorSet w1{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w1.dstSet = m_accumRunningAvgDescSets[i];
+        w1.dstBinding = 1;
+        w1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w1.descriptorCount = 1;
+        w1.pImageInfo = &historyInfo;
+        writes.push_back(w1);
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
 }
 
-void Engine::createShadowDenoiserResources() {
+void Engine::createGBufferResources() {
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
     uint32_t w = m_config.width;
     uint32_t h = m_config.height;
 
-    // 1. Allocate Image Resources
+    // Allocate Image Resources
     m_directLightImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
@@ -2159,27 +2199,6 @@ void Engine::createShadowDenoiserResources() {
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    m_shadowFilterPingImage = std::make_unique<Image>(device, allocator, w, h,
-        VK_FORMAT_R16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-    for (int i = 0; i < 2; ++i) {
-        m_momentsImages[i] = std::make_unique<Image>(device, allocator, w, h,
-            VK_FORMAT_R16G16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-        m_depthImages[i] = std::make_unique<Image>(device, allocator, w, h,
-            VK_FORMAT_R16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    }
-
-    uint32_t tilesX = (w + 7) / 8;
-    uint32_t tilesY = (h + 7) / 8;
-    VkDeviceSize tileBufferSize = static_cast<VkDeviceSize>(tilesX * tilesY) * sizeof(uint32_t);
-    m_tileMetaDataBuffer = std::make_unique<Buffer>(allocator, tileBufferSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-
     // Transition images to GENERAL layout
     VkCommandBuffer cmd = m_commandBuffers[0];
     vkResetCommandBuffer(cmd, 0);
@@ -2188,11 +2207,6 @@ void Engine::createShadowDenoiserResources() {
     m_directLightImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    m_shadowFilterPingImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    for (int i = 0; i < 2; ++i) {
-        m_momentsImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        m_depthImages[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    }
     vkEndCommandBuffer(cmd);
     VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
     cmdSubmitInfo.commandBuffer = cmd;
@@ -2203,413 +2217,21 @@ void Engine::createShadowDenoiserResources() {
     vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
 
-    m_shadowPingPongIndex = 0;
-    updateShadowDenoiserDescriptors();
-    Logger::info("FidelityFX Shadow Denoiser resources allocated successfully.");
+    updateMergeDescriptors();
+    Logger::info("G-Buffer resources allocated successfully.");
 }
 
-void Engine::destroyShadowDenoiserResources() {
+void Engine::destroyGBufferResources() {
     m_directLightImage.reset();
     m_normalDepthImage.reset();
     m_prevNormalDepthImage.reset();
-    m_shadowFilterPingImage.reset();
-    m_momentsImages[0].reset();
-    m_momentsImages[1].reset();
-    m_depthImages[0].reset();
-    m_depthImages[1].reset();
-    m_tileMetaDataBuffer.reset();
 }
 
-void Engine::updateShadowDenoiserDescriptors() {
-    if (m_shadowClassifyDescSets[0] == VK_NULL_HANDLE || m_shadowClassifyDescSets[1] == VK_NULL_HANDLE ||
-        m_shadowFilterDescSet == VK_NULL_HANDLE ||
-        !m_directLightImage || !m_normalDepthImage || !m_shadowFilterPingImage ||
-        !m_accumImage || !m_tileMetaDataBuffer ||
-        !m_momentsImages[0] || !m_momentsImages[1] ||
-        !m_depthImages[0] || !m_depthImages[1]) return;
+void Engine::createPostProcessDescPool() {
     VkDevice device = m_context->getDevice();
-
-    VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, m_directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pingInfo{ VK_NULL_HANDLE, m_shadowFilterPingImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo tileBufInfo{ m_tileMetaDataBuffer->getBuffer(), 0, m_tileMetaDataBuffer->getSize() };
-
-    VkDescriptorImageInfo momentsInfo0{ VK_NULL_HANDLE, m_momentsImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo momentsInfo1{ VK_NULL_HANDLE, m_momentsImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo depthInfo0{ VK_NULL_HANDLE, m_depthImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo depthInfo1{ VK_NULL_HANDLE, m_depthImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes = {
-        // Set 0: prev = [0], curr = [1]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[0], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-
-        // Set 1: prev = [1], curr = [0]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowClassifyDescSets[1], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-
-        // Filter descriptor writes
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_shadowFilterDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr }
-    };
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
-
-void Engine::createTemporalAccumPipelines() {
-    VkDevice device = m_context->getDevice();
-
-    // 1. Descriptor Set Layout
-    std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentRadiance
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uMotionVectors
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uHistoryRadiance
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uOutputRadiance
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uCurrentNormalDepth
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uPrevNormalDepth
-    };
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    layoutInfo.pBindings = bindings.data();
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_temporalAccumDescSetLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create Temporal Accumulation descriptor set layout");
-    }
-
-    // 2. Descriptor Pool (2 temporal sets + 2 tonemap temporal sets)
-    std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
-    };
-    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 4;
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_temporalAccumDescPool) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create Temporal Accumulation descriptor pool");
-    }
-
-    // Allocate temporal sets
-    std::array<VkDescriptorSetLayout, 2> tempLayouts = { m_temporalAccumDescSetLayout, m_temporalAccumDescSetLayout };
-    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_temporalAccumDescPool;
-    allocInfo.descriptorSetCount = 2;
-    allocInfo.pSetLayouts = tempLayouts.data();
-    if (vkAllocateDescriptorSets(device, &allocInfo, m_temporalAccumDescSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Temporal Accumulation descriptor sets");
-    }
-
-    // Allocate tonemap descriptor sets
-    std::array<VkDescriptorSetLayout, 2> tmLayouts = { m_tonemapDescLayout, m_tonemapDescLayout };
-    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    tmAllocInfo.descriptorPool = m_temporalAccumDescPool;
-    tmAllocInfo.descriptorSetCount = 2;
-    tmAllocInfo.pSetLayouts = tmLayouts.data();
-    if (vkAllocateDescriptorSets(device, &tmAllocInfo, m_tonemapTemporalDescSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Tonemap Temporal descriptor sets");
-    }
-
-    // 3. Pipeline Layout
-    VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 3 + sizeof(uint32_t) * 3;
-
-    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    pipeLayoutInfo.setLayoutCount = 1;
-    pipeLayoutInfo.pSetLayouts = &m_temporalAccumDescSetLayout;
-    pipeLayoutInfo.pushConstantRangeCount = 1;
-    pipeLayoutInfo.pPushConstantRanges = &pcRange;
-    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_temporalAccumPipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create Temporal Accumulation pipeline layout");
-    }
-
-    // 4. Compute Pipeline
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
-    };
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    auto code = loadShaderSPIRV("temporal_accum.comp.spv");
-    VkShaderModule shaderModule = createShaderModule(code);
-
-    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-    if (m_context->hasSubgroupSizeControl()) {
-        pipeInfo.stage.pNext = &subgroupSize32;
-    }
-    pipeInfo.layout = m_temporalAccumPipelineLayout;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_temporalAccumPipeline) != VK_SUCCESS) {
-        vkDestroyShaderModule(device, shaderModule, nullptr);
-        throw std::runtime_error("Failed to create Temporal Accumulation pipeline");
-    }
-    vkDestroyShaderModule(device, shaderModule, nullptr);
-
-    Logger::info("Temporal Radiance Accumulation pipeline (Wave32) created successfully.");
-}
-
-void Engine::destroyTemporalAccumPipelines() {
-    VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
-    if (!device) return;
-
-    if (m_temporalAccumPipeline) {
-        vkDestroyPipeline(device, m_temporalAccumPipeline, nullptr);
-        m_temporalAccumPipeline = VK_NULL_HANDLE;
-    }
-    if (m_temporalAccumPipelineLayout) {
-        vkDestroyPipelineLayout(device, m_temporalAccumPipelineLayout, nullptr);
-        m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
-    }
-    if (m_temporalAccumDescPool) {
-        vkDestroyDescriptorPool(device, m_temporalAccumDescPool, nullptr);
-        m_temporalAccumDescPool = VK_NULL_HANDLE;
-    }
-    if (m_temporalAccumDescSetLayout) {
-        vkDestroyDescriptorSetLayout(device, m_temporalAccumDescSetLayout, nullptr);
-        m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
-    }
-    m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-}
-
-void Engine::createTemporalAccumResources() {
-    VkDevice device = m_context->getDevice();
-    VmaAllocator allocator = m_context->getAllocator();
-    uint32_t w = m_config.width;
-    uint32_t h = m_config.height;
-
-    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-
-    for (int i = 0; i < 2; ++i) {
-        m_temporalHistory[i] = std::make_unique<Image>(
-            device, allocator, w, h,
-            format,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-    }
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
-
-    for (int i = 0; i < 2; ++i) {
-        m_temporalHistory[i]->transitionLayout(
-            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
-
-    vkEndCommandBuffer(m_commandBuffers[0]);
-
-    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
-
-    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-
-    m_temporalPingPong = 0;
-    m_temporalResetRequested = true;
-
-    updateTemporalAccumDescriptors();
-}
-
-void Engine::destroyTemporalAccumResources() {
-    m_temporalHistory[0].reset();
-    m_temporalHistory[1].reset();
-}
-
-void Engine::updateTemporalAccumDescriptors() {
-    if (!m_temporalAccumDescPool || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_motionVectorImage || !m_outputImage) {
+    if (m_postProcessDescPool != VK_NULL_HANDLE) {
         return;
     }
-
-    VkDevice device = m_context->getDevice();
-
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, m_motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo currNdInfo{ VK_NULL_HANDLE, m_normalDepthImage ? m_normalDepthImage->getImageView() : m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo prevNdInfo{ VK_NULL_HANDLE, m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : currNdInfo.imageView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes;
-
-    // Set 0: accum + mv + hist0 (in) -> hist1 (out) + currNd + prevNd
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[0], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
-
-    // Set 1: accum + mv + hist1 (in) -> hist0 (out) + currNd + prevNd
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currNdInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_temporalAccumDescSets[1], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdInfo, nullptr, nullptr });
-
-    // Tonemap Set 0: hist0 -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
-
-    // Tonemap Set 1: hist1 -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapTemporalDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
-
-uint32_t Engine::dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory) {
-    if (!m_config.enable_temporal_accum || m_config.denoiser_mode == DenoiserMode::None || !m_temporalAccumPipeline) {
-        return 0; // indicates temporal accum not run
-    }
-
-    uint32_t inSlot = m_temporalPingPong;
-    uint32_t outSlot = 1 - m_temporalPingPong;
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalAccumPipelineLayout, 0, 1, &m_temporalAccumDescSets[inSlot], 0, nullptr);
-
-    struct TemporalAccumPushConstants {
-        int32_t imageSize[2];
-        float invImageSize[2];
-        float clampingGamma;
-        float outlierH;
-        float maxHistorySamples;
-        uint32_t resetHistory;
-        uint32_t cameraMoved;
-        uint32_t totalSamples;
-    } pc;
-
-    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
-    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
-    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
-    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
-    pc.clampingGamma = m_config.temporal_clamping_gamma;
-    pc.outlierH = m_config.temporal_outlier_h;
-    pc.maxHistorySamples = static_cast<float>(m_config.temporal_max_history);
-    pc.resetHistory = resetHistory ? 1u : 0u;
-    pc.cameraMoved = m_cameraMovedLastFrame ? 1u : 0u;
-    pc.totalSamples = m_accumulatedSamples;
-
-    vkCmdPushConstants(cmd, m_temporalAccumPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-
-    uint32_t groupsX = (m_config.width + 15) / 16;
-    uint32_t groupsY = (m_config.height + 15) / 16;
-    vkCmdDispatch(cmd, groupsX, groupsY, 1);
-
-    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.image = m_temporalHistory[outSlot]->getImage();
-    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = 1;
-    dep.pImageMemoryBarriers = &postBarrier;
-    vkCmdPipelineBarrier2(cmd, &dep);
-
-    // Copy current frame normal and depth to previous buffer for next frame's disocclusion testing
-    if (m_normalDepthImage && m_prevNormalDepthImage) {
-        VkImageCopy copyRegion{};
-        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.extent = { m_config.width, m_config.height, 1 };
-
-        VkImageMemoryBarrier2 preCopyBarriers[2] = {};
-        preCopyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-        preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        preCopyBarriers[0].image = m_normalDepthImage->getImage();
-        preCopyBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-        preCopyBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        preCopyBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        preCopyBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        preCopyBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        preCopyBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        preCopyBarriers[1].image = m_prevNormalDepthImage->getImage();
-        preCopyBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-        VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        preDep.imageMemoryBarrierCount = 2;
-        preDep.pImageMemoryBarriers = preCopyBarriers;
-        vkCmdPipelineBarrier2(cmd, &preDep);
-
-        vkCmdCopyImage(cmd,
-            m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-            m_prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-            1, &copyRegion);
-
-        VkImageMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        postCopyBarrier.image = m_prevNormalDepthImage->getImage();
-        postCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-        VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        postDep.imageMemoryBarrierCount = 1;
-        postDep.pImageMemoryBarriers = &postCopyBarrier;
-        vkCmdPipelineBarrier2(cmd, &postDep);
-    }
-
-    m_temporalPingPong = outSlot;
-    return outSlot + 1; // 1 => history[0], 2 => history[1]
-}
-
-void Engine::createBmfrPipelines() {
-    VkDevice device = m_context->getDevice();
-
-    // 1. Descriptor Set Layout
-    std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uInputRadiance
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }, // uNormalDepth
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }  // uOutputRadiance
-    };
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    layoutInfo.pBindings = bindings.data();
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_bmfrDescSetLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create BMFR descriptor set layout");
-    }
-
-    // 2. Descriptor Pool (2 temporal sets + 1 raw set + 1 tonemap set)
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
     };
@@ -2617,238 +2239,21 @@ void Engine::createBmfrPipelines() {
     poolInfo.maxSets = 8;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_bmfrDescPool) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create BMFR descriptor pool");
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_postProcessDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create post-processing descriptor pool");
     }
-
-    // Allocate BMFR sets (2 for history ping-pong)
-    std::array<VkDescriptorSetLayout, 2> bmfrLayouts = { m_bmfrDescSetLayout, m_bmfrDescSetLayout };
-    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    allocInfo.descriptorPool = m_bmfrDescPool;
-    allocInfo.descriptorSetCount = 2;
-    allocInfo.pSetLayouts = bmfrLayouts.data();
-    if (vkAllocateDescriptorSets(device, &allocInfo, m_bmfrDescSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate BMFR descriptor sets");
-    }
-
-    VkDescriptorSetAllocateInfo rawAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    rawAllocInfo.descriptorPool = m_bmfrDescPool;
-    rawAllocInfo.descriptorSetCount = 1;
-    rawAllocInfo.pSetLayouts = &m_bmfrDescSetLayout;
-    if (vkAllocateDescriptorSets(device, &rawAllocInfo, &m_bmfrRawDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate BMFR raw descriptor set");
-    }
-
-    // Allocate Tonemap BMFR set
-    VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    tmAllocInfo.descriptorPool = m_bmfrDescPool;
-    tmAllocInfo.descriptorSetCount = 1;
-    tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
-    if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapBmfrDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Tonemap BMFR descriptor set");
-    }
-
-    // 3. Pipeline Layout
-    VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcRange.offset = 0;
-    pcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 2 + sizeof(uint32_t) * 2;
-
-    VkPipelineLayoutCreateInfo pipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    pipeLayoutInfo.setLayoutCount = 1;
-    pipeLayoutInfo.pSetLayouts = &m_bmfrDescSetLayout;
-    pipeLayoutInfo.pushConstantRangeCount = 1;
-    pipeLayoutInfo.pPushConstantRanges = &pcRange;
-    if (vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_bmfrPipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create BMFR pipeline layout");
-    }
-
-    // 4. Compute Pipeline
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
-    };
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    auto code = loadShaderSPIRV("bmfr_regression.comp.spv");
-    VkShaderModule shaderModule = createShaderModule(code);
-
-    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-    if (m_context->hasSubgroupSizeControl()) {
-        pipeInfo.stage.pNext = &subgroupSize32;
-    }
-    pipeInfo.layout = m_bmfrPipelineLayout;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_bmfrPipeline) != VK_SUCCESS) {
-        vkDestroyShaderModule(device, shaderModule, nullptr);
-        throw std::runtime_error("Failed to create BMFR pipeline");
-    }
-    vkDestroyShaderModule(device, shaderModule, nullptr);
-
-    Logger::info("Blockwise Multi-Order Feature Regression (BMFR) pipeline (Wave32) created successfully.");
 }
 
-void Engine::destroyBmfrPipelines() {
+void Engine::destroyPostProcessDescPool() {
     VkDevice device = m_context ? m_context->getDevice() : VK_NULL_HANDLE;
     if (!device) return;
 
-    if (m_bmfrPipeline) {
-        vkDestroyPipeline(device, m_bmfrPipeline, nullptr);
-        m_bmfrPipeline = VK_NULL_HANDLE;
+    if (m_postProcessDescPool) {
+        vkDestroyDescriptorPool(device, m_postProcessDescPool, nullptr);
+        m_postProcessDescPool = VK_NULL_HANDLE;
     }
-    if (m_bmfrPipelineLayout) {
-        vkDestroyPipelineLayout(device, m_bmfrPipelineLayout, nullptr);
-        m_bmfrPipelineLayout = VK_NULL_HANDLE;
-    }
-    if (m_bmfrDescPool) {
-        vkDestroyDescriptorPool(device, m_bmfrDescPool, nullptr);
-        m_bmfrDescPool = VK_NULL_HANDLE;
-    }
-    if (m_bmfrDescSetLayout) {
-        vkDestroyDescriptorSetLayout(device, m_bmfrDescSetLayout, nullptr);
-        m_bmfrDescSetLayout = VK_NULL_HANDLE;
-    }
-    m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    m_bmfrRawDescSet = VK_NULL_HANDLE;
-    m_tonemapBmfrDescSet = VK_NULL_HANDLE;
-}
-
-void Engine::createBmfrResources() {
-    VkDevice device = m_context->getDevice();
-    VmaAllocator allocator = m_context->getAllocator();
-    uint32_t w = m_config.width;
-    uint32_t h = m_config.height;
-
-    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-
-    m_bmfrOutputImage = std::make_unique<Image>(
-        device, allocator, w, h,
-        format,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    );
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
-
-    m_bmfrOutputImage->transitionLayout(
-        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-
-    vkEndCommandBuffer(m_commandBuffers[0]);
-
-    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
-
-    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-    vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());
-
-    updateBmfrDescriptors();
-}
-
-void Engine::destroyBmfrResources() {
-    m_bmfrOutputImage.reset();
-}
-
-void Engine::updateBmfrDescriptors() {
-    if (!m_bmfrDescPool || !m_bmfrOutputImage || !m_temporalHistory[0] || !m_temporalHistory[1] || !m_accumImage || !m_normalDepthImage || !m_outputImage) {
-        return;
-    }
-
-    VkDevice device = m_context->getDevice();
-
-    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_temporalHistory[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_temporalHistory[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo rawInfo{ VK_NULL_HANDLE, m_accumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo ndInfo{ VK_NULL_HANDLE, m_normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo bmfrOutInfo{ VK_NULL_HANDLE, m_bmfrOutputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outputInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes;
-
-    // BMFR Set 0: hist0 -> bmfrOut
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist0Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
-
-    // BMFR Set 1: hist1 -> bmfrOut
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hist1Info, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
-
-    // BMFR Raw Set: accumImage -> bmfrOut
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_bmfrRawDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
-
-    // Tonemap BMFR Set: bmfrOut -> output
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &bmfrOutInfo, nullptr, nullptr });
-    writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapBmfrDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outputInfo, nullptr, nullptr });
-
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
-
-bool Engine::dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot) {
-    if ((!m_config.enable_bmfr && m_config.denoiser_mode != DenoiserMode::BMFR) || !m_bmfrPipeline || !m_bmfrOutputImage || !m_normalDepthImage) {
-        return false;
-    }
-
-    VkDescriptorSet targetDescSet = VK_NULL_HANDLE;
-    if (temporalSlot == 1) {
-        targetDescSet = m_bmfrDescSets[0];
-    } else if (temporalSlot == 2) {
-        targetDescSet = m_bmfrDescSets[1];
-    } else {
-        targetDescSet = m_bmfrRawDescSet;
-    }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bmfrPipelineLayout, 0, 1, &targetDescSet, 0, nullptr);
-
-    struct BmfrPushConstants {
-        int32_t imageSize[2];
-        float invImageSize[2];
-        float lambda;
-        float maxDepth;
-        uint32_t tileSize;
-        uint32_t pad;
-    } pc;
-
-    pc.imageSize[0] = static_cast<int32_t>(m_config.width);
-    pc.imageSize[1] = static_cast<int32_t>(m_config.height);
-    pc.invImageSize[0] = 1.0f / static_cast<float>(m_config.width);
-    pc.invImageSize[1] = 1.0f / static_cast<float>(m_config.height);
-    pc.lambda = 0.05f;
-    pc.maxDepth = 50.0f;
-    pc.tileSize = 8;
-    pc.pad = 0;
-
-    vkCmdPushConstants(cmd, m_bmfrPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-
-    uint32_t groupsX = (m_config.width + 7) / 8;
-    uint32_t groupsY = (m_config.height + 7) / 8;
-    vkCmdDispatch(cmd, groupsX, groupsY, 1);
-
-    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.image = m_bmfrOutputImage->getImage();
-    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = 1;
-    dep.pImageMemoryBarriers = &postBarrier;
-    vkCmdPipelineBarrier2(cmd, &dep);
-
-    return true;
+    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    m_tonemapFsr3DescSet = VK_NULL_HANDLE;
 }
 
 void Engine::createUpwaysPipelines() {
@@ -2856,17 +2261,31 @@ void Engine::createUpwaysPipelines() {
     VmaAllocator allocator = m_context->getAllocator();
 
     try {
-        auto upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
+        auto upwaysCode = loadShaderSPIRV("neural_reconstruct.comp.spv");
+        if (upwaysCode.empty()) {
+            upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
+        }
         VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
+        uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+            static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+        uint32_t inH = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+            static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+        uint32_t outW = m_config.width;
+        uint32_t outH = m_config.height;
+        isSuperRes = (inW < outW || inH < outH || isSuperRes);
+
         m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
             device,
             m_context->getPhysicalDevice(),
             allocator,
-            m_config.width,
-            m_config.height,
+            inW,
+            inH,
+            outW,
+            outH,
             upwaysCode,
             m_config.upways_weights_path,
-            m_config.upways_superres,
+            isSuperRes,
             format
         );
         Logger::info("Upways Neural Reconstruction Pipeline initialized successfully.");
@@ -2883,9 +2302,9 @@ void Engine::destroyUpwaysPipelines() {
 void Engine::createUpwaysResources() {
     VkDevice device = m_context->getDevice();
 
-    if (m_bmfrDescPool && m_tonemapDescLayout && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
+    if (m_postProcessDescPool && m_tonemapDescLayout && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        tmAllocInfo.descriptorPool = m_bmfrDescPool;
+        tmAllocInfo.descriptorPool = m_postProcessDescPool;
         tmAllocInfo.descriptorSetCount = 1;
         tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
         if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapUpwaysDescSet) != VK_SUCCESS) {
@@ -2927,10 +2346,10 @@ void Engine::updateUpwaysDescriptors() {
 
     VkImageView normDepthView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
     VkImageView motionView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView albedoView = m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView albedoView = m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE);
+    VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : motionView;
+    VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_accumImage->getImageView();
+    VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : m_accumImage->getImageView();
 
     m_upwaysPipeline->updateDescriptors(
         m_accumImage->getImageView(),
@@ -2955,10 +2374,411 @@ void Engine::updateUpwaysDescriptors() {
 }
 
 bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
-    if (m_config.denoiser_mode != DenoiserMode::Upways || !m_upwaysPipeline) {
+    if ((m_config.denoiser_mode != DenoiserMode::Upways && m_config.upscaler_mode != UpscalerMode::Upways) || !m_upwaysPipeline) {
         return false;
     }
-    m_upwaysPipeline->recordFrame(cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame);
+
+    bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
+    uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+        static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+    uint32_t inH = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+        static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+    uint32_t outW = m_config.width;
+    uint32_t outH = m_config.height;
+    isSuperRes = (inW < outW || inH < outH || isSuperRes);
+
+    if (m_upwaysPipeline->getInputWidth() != inW || m_upwaysPipeline->getInputHeight() != inH ||
+        m_upwaysPipeline->getOutputWidth() != outW || m_upwaysPipeline->getOutputHeight() != outH ||
+        m_upwaysPipeline->isSuperResEnabled() != isSuperRes) {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+        updateUpwaysDescriptors();
+    }
+
+    uint32_t totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u;
+    m_upwaysPipeline->recordFrame(cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame, 0, 0, 0, 0, 0, totalSamples);
+    return true;
+}
+
+
+// === AMD FIDELITYFX SUPER RESOLUTION 3.1 ===
+
+void Engine::createFsr3Pipelines() {
+    if (m_config.upscaler_mode != UpscalerMode::FSR3) {
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    try {
+        auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
+        auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
+        VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        uint32_t renderW = (m_config.render_scale < 1.0f) ?
+            static_cast<uint32_t>(m_config.width * m_config.render_scale) :
+            m_config.width;
+        uint32_t renderH = (m_config.render_scale < 1.0f) ?
+            static_cast<uint32_t>(m_config.height * m_config.render_scale) :
+            m_config.height;
+
+        m_fsr3Upscaler = std::make_unique<Fsr3Upscaler>(
+            device,
+            m_context->getPhysicalDevice(),
+            allocator,
+            renderW,
+            renderH,
+            m_config.width,
+            m_config.height,
+            upscaleCode,
+            rcasCode,
+            format,
+            "[GPU 0 Primary Viewport]"
+        );
+
+        // 4K Blend Pipeline for SampleBlend multi-GPU resolve
+        std::vector<VkDescriptorSetLayoutBinding> blendBindings = {
+            { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        };
+        VkDescriptorSetLayoutCreateInfo blendLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        blendLayoutInfo.bindingCount = static_cast<uint32_t>(blendBindings.size());
+        blendLayoutInfo.pBindings = blendBindings.data();
+        if (vkCreateDescriptorSetLayout(device, &blendLayoutInfo, nullptr, &m_fsr3BlendDescLayout) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create FSR3 blend descriptor set layout");
+        }
+
+        VkPushConstantRange blendPcRange{};
+        blendPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        blendPcRange.offset = 0;
+        blendPcRange.size = sizeof(uint32_t) * 2 + sizeof(float) * 2;
+
+        VkPipelineLayoutCreateInfo blendPipeLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        blendPipeLayoutInfo.setLayoutCount = 1;
+        blendPipeLayoutInfo.pSetLayouts = &m_fsr3BlendDescLayout;
+        blendPipeLayoutInfo.pushConstantRangeCount = 1;
+        blendPipeLayoutInfo.pPushConstantRanges = &blendPcRange;
+        if (vkCreatePipelineLayout(device, &blendPipeLayoutInfo, nullptr, &m_fsr3BlendPipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create FSR3 blend pipeline layout");
+        }
+
+        auto blendCode = loadShaderSPIRV("fsr3_blend.comp.spv");
+        VkShaderModule blendModule = createShaderModule(blendCode);
+
+        VkComputePipelineCreateInfo blendPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        blendPipeInfo.layout = m_fsr3BlendPipelineLayout;
+        blendPipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        blendPipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        blendPipeInfo.stage.module = blendModule;
+        blendPipeInfo.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+        subgroupSize32.requiredSubgroupSize = 32;
+        if (m_context->hasSubgroupSizeControl()) {
+            blendPipeInfo.stage.pNext = &subgroupSize32;
+        }
+
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &blendPipeInfo, nullptr, &m_fsr3BlendPipeline) != VK_SUCCESS) {
+            vkDestroyShaderModule(device, blendModule, nullptr);
+            throw std::runtime_error("Failed to create FSR3 blend compute pipeline");
+        }
+        vkDestroyShaderModule(device, blendModule, nullptr);
+
+        VkDescriptorPoolSize blendPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
+        VkDescriptorPoolCreateInfo blendPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        blendPoolInfo.maxSets = 1;
+        blendPoolInfo.poolSizeCount = 1;
+        blendPoolInfo.pPoolSizes = &blendPoolSize;
+        if (vkCreateDescriptorPool(device, &blendPoolInfo, nullptr, &m_fsr3BlendDescPool) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create FSR3 blend descriptor pool");
+        }
+
+        VkDescriptorSetAllocateInfo blendAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        blendAllocInfo.descriptorPool = m_fsr3BlendDescPool;
+        blendAllocInfo.descriptorSetCount = 1;
+        blendAllocInfo.pSetLayouts = &m_fsr3BlendDescLayout;
+        if (vkAllocateDescriptorSets(device, &blendAllocInfo, &m_fsr3BlendDescSet) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate FSR3 blend descriptor set");
+        }
+
+        Logger::info("AMD FSR 3.1 Super-Resolution & SampleBlend Pipelines initialized successfully.");
+    } catch (const std::exception& e) {
+        Logger::warn("Fsr3Upscaler initialization failed: {}", e.what());
+    }
+}
+
+void Engine::destroyFsr3Pipelines() {
+    VkDevice device = m_context->getDevice();
+    if (m_fsr3BlendPipeline) {
+        vkDestroyPipeline(device, m_fsr3BlendPipeline, nullptr);
+        m_fsr3BlendPipeline = VK_NULL_HANDLE;
+    }
+    if (m_fsr3BlendPipelineLayout) {
+        vkDestroyPipelineLayout(device, m_fsr3BlendPipelineLayout, nullptr);
+        m_fsr3BlendPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_fsr3BlendDescLayout) {
+        vkDestroyDescriptorSetLayout(device, m_fsr3BlendDescLayout, nullptr);
+        m_fsr3BlendDescLayout = VK_NULL_HANDLE;
+    }
+    if (m_fsr3BlendDescPool) {
+        vkDestroyDescriptorPool(device, m_fsr3BlendDescPool, nullptr);
+        m_fsr3BlendDescPool = VK_NULL_HANDLE;
+    }
+    m_fsr3BlendDescSet = VK_NULL_HANDLE;
+    m_fsr3Upscaler.reset();
+    m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+}
+
+void Engine::createFsr3Resources() {
+    if (m_config.upscaler_mode != UpscalerMode::FSR3) {
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+
+    if (m_postProcessDescPool && m_tonemapDescLayout && m_tonemapFsr3DescSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        tmAllocInfo.descriptorPool = m_postProcessDescPool;
+        tmAllocInfo.descriptorSetCount = 1;
+        tmAllocInfo.pSetLayouts = &m_tonemapDescLayout;
+        if (vkAllocateDescriptorSets(device, &tmAllocInfo, &m_tonemapFsr3DescSet) != VK_SUCCESS) {
+            Logger::warn("Failed to allocate Tonemap FSR3 descriptor set");
+            m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+        }
+    }
+
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+
+    // m_secAccumImage holds the secondary GPU's transferred 4K upscaled frame in Approach 2 (Sample Parallelism)
+    if (!m_secAccumImage || m_secAccumImage->getWidth() != m_config.width || m_secAccumImage->getHeight() != m_config.height) {
+        m_secAccumImage = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height, format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+        );
+    }
+
+    updateFsr3Descriptors();
+}
+
+void Engine::destroyFsr3Resources() {
+    m_secAccumImage.reset();
+}
+
+void Engine::updateFsr3Descriptors() {
+    if (!m_fsr3Upscaler || !m_outputImage) {
+        return;
+    }
+
+    VkDevice device = m_context->getDevice();
+    if (m_tonemapFsr3DescSet != VK_NULL_HANDLE && m_fsr3Upscaler->getOutputImage()) {
+        VkDescriptorImageInfo inInfo{ VK_NULL_HANDLE, m_fsr3Upscaler->getOutputImage()->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+        std::vector<VkWriteDescriptorSet> writes;
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapFsr3DescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_tonemapFsr3DescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr });
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+
+    if (m_fsr3BlendDescSet != VK_NULL_HANDLE && m_fsr3Upscaler->getOutputImage() &&
+        m_secAccumImage) {
+        VkDescriptorImageInfo dstInfo{ VK_NULL_HANDLE, m_fsr3Upscaler->getOutputImage()->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo srcInfo{ VK_NULL_HANDLE, m_secAccumImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+        std::vector<VkWriteDescriptorSet> blendWrites;
+        blendWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_fsr3BlendDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstInfo, nullptr, nullptr });
+        blendWrites.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_fsr3BlendDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &srcInfo, nullptr, nullptr });
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(blendWrites.size()), blendWrites.data(), 0, nullptr);
+    }
+}
+
+bool Engine::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory) {
+    if (m_config.upscaler_mode != UpscalerMode::FSR3) {
+        return false;
+    }
+    if (!m_fsr3Upscaler) {
+        createFsr3Pipelines();
+        createFsr3Resources();
+        updateFsr3Descriptors();
+    }
+    if (!m_fsr3Upscaler || !m_accumImage) {
+        return false;
+    }
+
+    uint32_t renderW = (m_config.render_scale < 1.0f) ?
+        static_cast<uint32_t>(m_config.width * m_config.render_scale) :
+        m_config.width;
+    uint32_t renderH = (m_config.render_scale < 1.0f) ?
+        static_cast<uint32_t>(m_config.height * m_config.render_scale) :
+        m_config.height;
+
+    if (m_fsr3Upscaler->getRenderWidth() != renderW || m_fsr3Upscaler->getRenderHeight() != renderH ||
+        m_fsr3Upscaler->getDisplayWidth() != m_config.width || m_fsr3Upscaler->getDisplayHeight() != m_config.height) {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_fsr3Upscaler->resize(renderW, renderH, m_config.width, m_config.height);
+        updateFsr3Descriptors();
+        updateMergeDescriptors();
+    }
+
+    VkBuffer secBuffer = VK_NULL_HANDLE;
+    if (m_mgpu && m_mgpu->isZeroCopyActive()) {
+        uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
+        secBuffer = m_mgpu->getPrimarySharedBuffer(slot);
+    } else if (m_secTransferBuffer) {
+        secBuffer = m_secTransferBuffer->getBuffer();
+    }
+
+    bool isSampleBlend = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off &&
+                          m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
+                          m_secAccumImage && secBuffer != VK_NULL_HANDLE);
+
+    if (isSampleBlend) {
+        // Approach 2 (Sample Parallelism @ 1 SPP per GPU):
+        // GPU 0 upscales its own internal frame to 4K.
+        // GPU 1 upscales its own internal frame to 4K and sends it to GPU 0.
+        // GPU 0 merges/averages the two 4K frames: L = (L_0 + L_1) / 2.
+
+        // 1. Dispatch Primary GPU FSR 3.1 pass (1440p -> 4K on GPU 0)
+        UpscalerDispatchDesc descPrim{};
+        descPrim.cmd = cmd;
+        descPrim.colorIn = m_accumImage->getImageView();
+        descPrim.depthIn = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
+        descPrim.motionVectorsIn = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
+        descPrim.colorOut = m_fsr3Upscaler->getOutputImage()->getImageView();
+        descPrim.renderWidth = renderW;
+        descPrim.renderHeight = renderH;
+        descPrim.displayWidth = m_config.width;
+        descPrim.displayHeight = m_config.height;
+        glm::vec2 jitter(0.0f);
+        if (m_config.upscaler_mode == UpscalerMode::FSR3) {
+            if (!m_config.progressive_accumulation || m_cameraMovedLastFrame || m_accumulatedSamples <= 1) {
+                jitter = getHaltonJitter(m_frameIndex);
+            }
+        }
+        descPrim.jitterX = jitter.x;
+        descPrim.jitterY = jitter.y;
+        descPrim.enableSharpening = m_config.upscaler_sharpening;
+        descPrim.sharpness = m_config.upscaler_sharpening ? m_config.upscaler_sharpness : 0.0f;
+        descPrim.resetHistory = resetHistory;
+        descPrim.cameraMoved = m_cameraMovedLastFrame;
+        descPrim.frameIndex = m_frameIndex;
+        descPrim.inputIsNormalized = true;
+        descPrim.totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u;
+        m_fsr3Upscaler->recordUpscale(descPrim);
+
+        // 2. Copy secondary transferred 4K radiance buffer (upscaled on GPU 1) into m_secAccumImage
+        m_secAccumImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copyRegion.imageOffset = { 0, 0, 0 };
+        copyRegion.imageExtent = { m_config.width, m_config.height, 1 };
+
+        vkCmdCopyBufferToImage(cmd, secBuffer, m_secAccumImage->getImage(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+        m_secAccumImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+
+        // 3. Barrier: ensure both primary FSR upscale and secondary buffer copy are complete
+        VkMemoryBarrier2 f2bBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        f2bBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        f2bBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        f2bBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        f2bBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        f2bBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+        VkDependencyInfo f2bDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        f2bDep.memoryBarrierCount = 1;
+        f2bDep.pMemoryBarriers = &f2bBarrier;
+        vkCmdPipelineBarrier2(cmd, &f2bDep);
+
+        // 4. 4K Blend Resolve Pass: merge the two 4K frames (50% / 50% averaging)
+        if (m_fsr3BlendPipeline && m_fsr3BlendDescSet != VK_NULL_HANDLE) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fsr3BlendPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fsr3BlendPipelineLayout, 0, 1, &m_fsr3BlendDescSet, 0, nullptr);
+
+            struct BlendPushConstants {
+                uint32_t width;
+                uint32_t height;
+                float weightDst;
+                float weightSrc;
+            } blendPC;
+            blendPC.width = m_config.width;
+            blendPC.height = m_config.height;
+            blendPC.weightDst = 0.5f;
+            blendPC.weightSrc = 0.5f;
+
+            vkCmdPushConstants(cmd, m_fsr3BlendPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(blendPC), &blendPC);
+            uint32_t blendGroupsX = (m_config.width + 15) / 16;
+            uint32_t blendGroupsY = (m_config.height + 15) / 16;
+            vkCmdDispatch(cmd, blendGroupsX, blendGroupsY, 1);
+
+            // Barrier: blend write -> tonemap compute read
+            VkMemoryBarrier2 blendToTmBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            blendToTmBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            blendToTmBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            blendToTmBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            blendToTmBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            blendToTmBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+            VkDependencyInfo blendDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            blendDep.memoryBarrierCount = 1;
+            blendDep.pMemoryBarriers = &blendToTmBarrier;
+            vkCmdPipelineBarrier2(cmd, &blendDep);
+        }
+    } else {
+        // Approach 1 (Tile Mode: Checkerboard / Scanline) OR Single-GPU:
+        // In Approach 1, GPU 0 has already merged secondary GPU's tiles into m_accumImage at internal res.
+        // GPU 0 upscales m_accumImage ONCE to display resolution (4K).
+        UpscalerDispatchDesc desc{};
+        desc.cmd = cmd;
+        desc.colorIn = m_accumImage->getImageView();
+        desc.depthIn = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
+        desc.motionVectorsIn = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
+        desc.colorOut = m_fsr3Upscaler->getOutputImage()->getImageView();
+        desc.renderWidth = renderW;
+        desc.renderHeight = renderH;
+        desc.displayWidth = m_config.width;
+        desc.displayHeight = m_config.height;
+        glm::vec2 jitter(0.0f);
+        if (m_config.upscaler_mode == UpscalerMode::FSR3) {
+            if (!m_config.progressive_accumulation || m_cameraMovedLastFrame || m_accumulatedSamples <= 1) {
+                glm::vec2 jitterPrim = getHaltonJitter(m_frameIndex);
+                bool isMgpuSampleParallel = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off &&
+                    (m_config.mgpu_mode == MultiGpuMode::SampleParallel ||
+                     (m_config.mgpu_mode == MultiGpuMode::Auto && (m_config.spp > 1 || (m_governor && m_config.adaptive_spp)))));
+                if (isMgpuSampleParallel) {
+                    glm::vec2 jitterSec = getHaltonJitter(m_frameIndex + 4);
+                    jitter = (jitterPrim + jitterSec) * 0.5f;
+                } else {
+                    jitter = jitterPrim;
+                }
+            }
+        }
+        desc.jitterX = jitter.x;
+        desc.jitterY = jitter.y;
+        desc.enableSharpening = m_config.upscaler_sharpening;
+        desc.sharpness = m_config.upscaler_sharpening ? m_config.upscaler_sharpness : 0.0f;
+        desc.resetHistory = resetHistory;
+        desc.cameraMoved = m_cameraMovedLastFrame;
+        desc.frameIndex = m_frameIndex;
+        desc.inputIsNormalized = true;
+        desc.totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u;
+
+        m_fsr3Upscaler->recordUpscale(desc);
+    }
     return true;
 }
 
@@ -3448,8 +3268,6 @@ void Engine::dispatchCausticSplatAndFilter(VkCommandBuffer cmd, uint32_t frameSl
     uint32_t accumHist = 0u;
     if (m_config.progressive_accumulation && !m_cameraMovedLastFrame) {
         accumHist = 2u; // stationary progressive
-    } else if (m_config.enable_taa || m_config.enable_temporal_accum) {
-        accumHist = 1u; // dynamic temporal
     }
 
     struct CausticFilterPC {
@@ -3591,10 +3409,10 @@ void Engine::updateWavefrontSceneDescriptors() {
     VkBuffer nrcCountBuf = m_nrcManager ? m_nrcManager->getCounters()->getBuffer() : VK_NULL_HANDLE;
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
-        if (!m_cameraUBOs[slot]) continue;
+        if (!m_cameraUBOs[slot] || !m_frameImages[slot]) continue;
         m_wavefrontPipeline->updateSceneDescriptors(
             slot,
-            m_accumImage->getImageView(),
+            m_frameImages[slot]->getImageView(),
             m_cameraUBOs[slot]->getBuffer(),
             m_triangleBuffer->getBuffer(), m_triangleBuffer->getSize(),
             m_sphereBuffer->getBuffer(), m_sphereBuffer->getSize(),
@@ -3620,21 +3438,46 @@ void Engine::updateWavefrontSceneDescriptors() {
         );
     }
 
-    if (m_nrcManager && m_accumImage) {
-        m_nrcManager->updateDescriptors(m_accumImage->getImageView());
+    if (m_nrcManager && m_frameImages[0]) {
+        m_nrcManager->updateDescriptors(m_frameImages[0]->getImageView());
     }
 }
 
 void Engine::updateMergeDescriptors() {
+    if (!m_accumImage || !m_motionVectorImage || !m_normalDepthImage) {
+        return;
+    }
+
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
 
-    uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+    uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bytesPerPixel;
 
-    VkDescriptorImageInfo accumImageInfo{};
-    accumImageInfo.imageView = m_accumImage->getImageView();
-    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo mvImageInfo{};
+    mvImageInfo.imageView = m_motionVectorImage->getImageView();
+    mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo normDepthInfo{};
+    normDepthInfo.imageView = m_normalDepthImage->getImageView();
+    normDepthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+    uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+
+    uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+    uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+    uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+    uint32_t dispatchWidth = maxTilesPerGpuX * tileSize;
+    uint32_t dispatchHeight = renderH;
+
+    uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 : 16;
+    VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
+    VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
+    VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
     for (uint32_t slot = 0; slot < 2; ++slot) {
         if (m_mergeDescSets[slot] == VK_NULL_HANDLE) continue;
@@ -3659,11 +3502,24 @@ void Engine::updateMergeDescriptors() {
         }
 
         VkDescriptorBufferInfo secBufInfo{ secBuffer, 0, curSize };
+        VkDescriptorBufferInfo secMvInfo{ secBuffer, radOffsetAligned, curSize > radOffsetAligned ? (curSize - radOffsetAligned) : VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo secNdInfo{ secBuffer, mvOffsetAligned, curSize > mvOffsetAligned ? (curSize - mvOffsetAligned) : VK_WHOLE_SIZE };
+
+        VkDescriptorImageInfo frameInfo{};
+        if (m_frameImages[slot]) {
+            frameInfo.sampler = VK_NULL_HANDLE;
+            frameInfo.imageView = m_frameImages[slot]->getImageView();
+            frameInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
 
         std::vector<VkWriteDescriptorSet> mergeWrites = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &frameInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secMvInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secNdInfo, nullptr }
         };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
     }
@@ -4258,7 +4114,11 @@ void Engine::renderFrame() {
                     WavefrontStageSample wfSample;
                     if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                         wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
-                        wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
+                        uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                            static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+                        uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                            static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+                        wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                         for (const auto& bp : m_lastWavefrontProfile.bounces) {
                             wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                         }
@@ -4298,7 +4158,12 @@ void Engine::renderFrame() {
     }
 
     // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
-    if (m_pendingMgpuModeChange || m_pendingAccumFormatChange || m_pendingDoubleBufferChange) {
+    bool scalingOrUpscalerChanged = (m_config.render_scale != m_lastRenderScale) ||
+                                    (m_config.upscaler_mode != m_lastUpscalerMode) ||
+                                    (m_config.tile_size != m_lastTileSize);
+
+    if (m_pendingMgpuModeChange || m_pendingMgpuUpscaleModeChange || m_pendingAccumFormatChange ||
+        m_pendingDoubleBufferChange || m_pendingTileSizeChange || scalingOrUpscalerChanged) {
         VkDevice dev = m_context->getDevice();
         VmaAllocator alloc = m_context->getAllocator();
         vkDeviceWaitIdle(dev);
@@ -4306,28 +4171,41 @@ void Engine::renderFrame() {
             vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
         }
 
+        m_lastRenderScale = m_config.render_scale;
+        m_lastUpscalerMode = m_config.upscaler_mode;
+        m_lastTileSize = m_config.tile_size;
+
+        if (m_pendingMgpuUpscaleModeChange) {
+            m_config.mgpu_upscale_mode = m_newMgpuUpscaleMode;
+            m_pendingMgpuUpscaleModeChange = false;
+        }
+
         if (m_pendingAccumFormatChange) {
             m_config.accum_format = m_newAccumFormat;
             m_pendingAccumFormatChange = false;
 
-            VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-            m_accumImage = std::make_unique<Image>(
-                dev, alloc, m_config.width, m_config.height,
-                accumFmt,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-            );
+            VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+                m_frameImages[i] = std::make_unique<Image>(
+                    dev, alloc, m_config.width, m_config.height,
+                    frameFmt,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                );
+            }
 
-            // Transition m_accumImage to GENERAL
+            // Transition m_frameImages to GENERAL
             vkResetCommandBuffer(m_commandBuffers[0], 0);
             VkCommandBufferBeginInfo transBegin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             transBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(m_commandBuffers[0], &transBegin);
-            m_accumImage->transitionLayout(
-                m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
+            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+                m_frameImages[i]->transitionLayout(
+                    m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                );
+            }
             vkEndCommandBuffer(m_commandBuffers[0]);
             VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
             cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
@@ -4394,7 +4272,29 @@ void Engine::renderFrame() {
 
         if (m_pendingTileSizeChange) {
             m_config.tile_size = m_newTileSize;
+            m_lastTileSize = m_newTileSize;
             m_pendingTileSizeChange = false;
+        }
+
+        if (m_config.upscaler_mode == UpscalerMode::Upways && m_config.render_scale >= 1.0f) {
+            m_config.render_scale = 0.5f;
+            m_lastRenderScale = 0.5f;
+        }
+
+        if (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways) {
+            bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
+            uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+                static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+            uint32_t inH = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+                static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+            uint32_t outW = m_config.width;
+            uint32_t outH = m_config.height;
+            isSuperRes = (inW < outW || inH < outH || isSuperRes);
+
+            if (m_upwaysPipeline) {
+                m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+                updateUpwaysDescriptors();
+            }
         }
 
         updateMergeDescriptors();
@@ -4414,12 +4314,11 @@ void Engine::renderFrame() {
     }
 
     // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
-    bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved()) || m_config.camera_motion);
+    bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
     if (accumReset && !sceneLoadingActive) {
-        m_frameIndex = 0;
         m_accumulatedSamples = 0;
         if (m_camera) m_camera->resetMoved();
         m_resetAccumulation = false;
@@ -4471,12 +4370,6 @@ void Engine::renderFrame() {
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree)     flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
-    if (m_config.enable_shadow_denoiser) {
-        flags |= (1 << 20);
-    }
-    if (m_config.enable_taa) {
-        flags |= (1 << 21);
-    }
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
     }
@@ -4509,14 +4402,21 @@ void Engine::renderFrame() {
         }
     }
 
+    bool isStationaryAccum = m_config.progressive_accumulation && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
+    bool enableJitter = ((m_config.upscaler_mode == UpscalerMode::FSR3) || (m_config.upscaler_mode == UpscalerMode::Upways)) && !isStationaryAccum;
+    uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+    uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
-                                                 m_config.enable_taa, m_config.width, m_config.height, 0);
+                                                 enableJitter, renderW, renderH, 0, /*updatePrev=*/false);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
-    uint32_t rtGroupsX = (m_config.width + 7) / 8;
-    uint32_t rtGroupsY = (m_config.height + 3) / 4;
+    uint32_t rtGroupsX = (renderW + 7) / 8;
+    uint32_t rtGroupsY = (renderH + 3) / 4;
 
     struct TonemapPushConstants {
         float exposure = 1.0f;
@@ -4555,6 +4455,10 @@ void Engine::renderFrame() {
 
     if (!isMgpu) {
         // --- Single GPU Execution Path ---
+        if (m_camera) {
+            m_camera->advanceFrame();
+        }
+
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -4589,68 +4493,94 @@ void Engine::renderFrame() {
                     m_nrcManager->resetCounters(cmd);
                 }
 
+                // Clear per-frame ray tracing target (FP16)
+                VkClearColorValue clearZero = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(cmd, m_frameImages[m_currentFrame]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+
                 bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-                if (needAccumReset && m_accumImage) {
-                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
-
-                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    clearBarrier.image = m_accumImage->getImage();
-                    clearBarrier.subresourceRange = clearRange;
-
-                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                    clearDep.imageMemoryBarrierCount = 1;
-                    clearDep.pImageMemoryBarriers = &clearBarrier;
-                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                if (needAccumReset) {
+                    if (m_accumImage) {
+                        vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
+                    if (m_mlDiffuseImage) {
+                        vkCmdClearColorImage(cmd, m_mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
+                    if (m_mlSpecularImage) {
+                        vkCmdClearColorImage(cmd, m_mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
                 }
 
-                WavefrontSceneData wfSceneData{};
-                wfSceneData.numTriangles = m_numTriangles;
-                wfSceneData.numSpheres = m_numSpheres;
-                wfSceneData.numMaterials = m_numMaterials;
-                wfSceneData.numLights = m_numLights;
-                wfSceneData.hasEnvMap = hasEnvMap;
-                wfSceneData.envMapIntensity = envIntensity;
-                wfSceneData.useHardwareRT = useHwRT;
-                wfSceneData.frameIndex = m_frameIndex;
-                wfSceneData.useMorton = 1u;
-                wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
-                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
-                wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
-                wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
-                wfSceneData.cameraFlags = flags;
-                wfSceneData.enableNrc = m_config.enable_nrc;
-                wfSceneData.nrcBounce = m_config.nrc_bounce;
-                wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
-                wfSceneData.boundsMin = m_sceneData.boundsMin;
-                wfSceneData.boundsMax = m_sceneData.boundsMax;
-                wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
-                wfSceneData.enableDistanceClamping = m_config.distance_clamping;
-                wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
-                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
-
-                if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
-                    dispatchCausticTrace(cmd, m_currentFrame);
+                std::vector<VkImageMemoryBarrier2> clearBarriers;
+                auto addClearBarrier = [&](Image* img) {
+                    if (!img) return;
+                    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    b.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    b.image = img->getImage();
+                    b.subresourceRange = clearRange;
+                    clearBarriers.push_back(b);
+                };
+                addClearBarrier(m_frameImages[m_currentFrame].get());
+                if (needAccumReset) {
+                    addClearBarrier(m_accumImage.get());
+                    addClearBarrier(m_mlDiffuseImage.get());
+                    addClearBarrier(m_mlSpecularImage.get());
                 }
 
-                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, m_config.width, m_config.height,
-                                                 activeSpp, activeBounces, wfSceneData);
+                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                clearDep.imageMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size());
+                clearDep.pImageMemoryBarriers = clearBarriers.data();
+                vkCmdPipelineBarrier2(cmd, &clearDep);
 
-                if (m_config.enable_nrc && m_nrcManager) {
-                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
-                                                  m_sceneData.boundsMin, m_sceneData.boundsMax);
-                    m_nrcManager->recordTraining(cmd, m_frameIndex,
-                                                 m_sceneData.boundsMin, m_sceneData.boundsMax,
-                                                 1e-3f, 1024);
-                }
-            } else {
+            WavefrontSceneData wfSceneData{};
+            wfSceneData.numTriangles = m_numTriangles;
+            wfSceneData.numSpheres = m_numSpheres;
+            wfSceneData.numMaterials = m_numMaterials;
+            wfSceneData.numLights = m_numLights;
+            wfSceneData.hasEnvMap = hasEnvMap;
+            wfSceneData.envMapIntensity = envIntensity;
+            wfSceneData.useHardwareRT = useHwRT;
+            wfSceneData.frameIndex = m_frameIndex;
+            wfSceneData.useMorton = 1u;
+            wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+            wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+            wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
+            wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
+            wfSceneData.cameraFlags = flags;
+            wfSceneData.enableNrc = m_config.enable_nrc;
+            wfSceneData.nrcBounce = m_config.nrc_bounce;
+            wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+            wfSceneData.boundsMin = m_sceneData.boundsMin;
+            wfSceneData.boundsMax = m_sceneData.boundsMax;
+            wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
+            wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+            wfSceneData.indirectClamp = m_config.indirect_clamp;
+            wfSceneData.fullWidth = renderW;
+            wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                        m_config.upscaler_mode == UpscalerMode::Upways ||
+                                        m_config.upways_superres ||
+                                        !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
+
+            if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+                dispatchCausticTrace(cmd, m_currentFrame);
+            }
+
+            m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, renderW, renderH,
+                                             activeSpp, activeBounces, wfSceneData);
+
+            if (m_config.enable_nrc && m_nrcManager) {
+                m_nrcManager->recordInference(cmd, renderW, renderH,
+                                              m_sceneData.boundsMin, m_sceneData.boundsMax);
+                m_nrcManager->recordTraining(cmd, m_frameIndex,
+                                             m_sceneData.boundsMin, m_sceneData.boundsMax,
+                                             1e-3f, 1024);
+            }
+        } else {
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                 dispatchCaustics(cmd, m_currentFrame);
             }
@@ -4658,8 +4588,8 @@ void Engine::renderFrame() {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &m_rtDescSets[m_currentFrame], 0, nullptr);
 
-            uint32_t traceW = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
-            uint32_t traceH = (m_config.render_scale < 1.0f) ? static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+            uint32_t traceW = renderW;
+            uint32_t traceH = renderH;
 
             uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
             uint32_t rtPushConstants[16] = {
@@ -4670,7 +4600,7 @@ void Engine::renderFrame() {
                 envIntensityBits,
                 (m_config.progressive_accumulation && !accumReset) ? 1u : 0u, // accumulateHistory
                 fracSppBits,
-                0u, m_numOpaqueTriangles, 0u
+                0u, m_numOpaqueTriangles, std::bit_cast<uint32_t>(m_config.indirect_clamp)
             };
             VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
             vkCmdPushConstants(cmd, m_rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
@@ -4679,91 +4609,6 @@ void Engine::renderFrame() {
         }
         if (m_governor) {
             m_governor->recordDispatch(m_currentFrame, activeSpp, activeBounces);
-        }
-
-        if (m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
-            VkMemoryBarrier2 rtToClassifyBarrier{};
-            rtToClassifyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToClassifyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            rtToClassifyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            rtToClassifyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToClassifyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo classifyDep{};
-            classifyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            classifyDep.memoryBarrierCount = 1;
-            classifyDep.pMemoryBarriers = &rtToClassifyBarrier;
-            vkCmdPipelineBarrier2(cmd, &classifyDep);
-
-            // 1. FidelityFX Shadow Denoiser Tile Classification Pass
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowClassifyPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowClassifyPipelineLayout, 0, 1, &m_shadowClassifyDescSets[m_shadowPingPongIndex], 0, nullptr);
-
-            struct ClassifyPushConstants {
-                int32_t imageDim[2];
-                float invImageDim[2];
-                glm::mat4 prevViewProj;
-                uint32_t frameIndex;
-                float depthDisocclusionThreshold;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-            } classifyPC;
-            classifyPC.imageDim[0] = static_cast<int32_t>(m_config.width);
-            classifyPC.imageDim[1] = static_cast<int32_t>(m_config.height);
-            classifyPC.invImageDim[0] = 1.0f / static_cast<float>(m_config.width);
-            classifyPC.invImageDim[1] = 1.0f / static_cast<float>(m_config.height);
-            classifyPC.prevViewProj = ubo.prevViewProj * (ubo.viewInverse * ubo.projInverse);
-            classifyPC.frameIndex = m_frameIndex;
-            classifyPC.depthDisocclusionThreshold = m_config.shadow_denoiser_depth_sigma;
-            classifyPC.tileOffsetX = 0;
-            classifyPC.tileOffsetY = 0;
-
-            vkCmdPushConstants(cmd, m_shadowClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), &classifyPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            VkMemoryBarrier2 classifyToFilterBarrier{};
-            classifyToFilterBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            classifyToFilterBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            classifyToFilterBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            classifyToFilterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            classifyToFilterBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo filterDep{};
-            filterDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            filterDep.memoryBarrierCount = 1;
-            filterDep.pMemoryBarriers = &classifyToFilterBarrier;
-            vkCmdPipelineBarrier2(cmd, &filterDep);
-
-            // 2. FidelityFX Shadow Denoiser Cross-Bilateral Filter & Direct-Light Resolve Pass
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowFilterPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowFilterPipelineLayout, 0, 1, &m_shadowFilterDescSet, 0, nullptr);
-
-            struct FilterPushConstants {
-                int32_t imageDim[2];
-                float invImageDim[2];
-                int32_t passIndex;
-                float depthSigma;
-                float normalPower;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-            } filterPC;
-            filterPC.imageDim[0] = static_cast<int32_t>(m_config.width);
-            filterPC.imageDim[1] = static_cast<int32_t>(m_config.height);
-            filterPC.invImageDim[0] = 1.0f / static_cast<float>(m_config.width);
-            filterPC.invImageDim[1] = 1.0f / static_cast<float>(m_config.height);
-            filterPC.passIndex = 0;
-            filterPC.depthSigma = m_config.shadow_denoiser_depth_sigma;
-            filterPC.normalPower = m_config.shadow_denoiser_normal_power;
-            filterPC.tileOffsetX = 0;
-            filterPC.tileOffsetY = 0;
-            filterPC.tileSize = m_config.tile_size;
-
-            vkCmdPushConstants(cmd, m_shadowFilterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(filterPC), &filterPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Ping-pong moments and depth image resources for next frame
-            m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
         }
 
         } // end if (!accumReachedCutoff)
@@ -4783,45 +4628,66 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
+        // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
+        if (!skipRayTracing && m_accumRunningAvgPipeline) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+
+            struct {
+                uint32_t width;
+                uint32_t height;
+                uint32_t sampleCount;
+                float invSpp;
+            } avgPC;
+            avgPC.width = renderW;
+            avgPC.height = renderH;
+            avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+            avgPC.invSpp = (activeSpp > 0) ? (1.0f / static_cast<float>(activeSpp)) : 1.0f;
+
+            vkCmdPushConstants(cmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+            vkCmdDispatch(cmd, (renderW + 15) / 16, (renderH + 15) / 16, 1);
+
+            VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+            VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            avgDep.memoryBarrierCount = 1;
+            avgDep.pMemoryBarriers = &avgBarrier;
+            vkCmdPipelineBarrier2(cmd, &avgDep);
+        }
+
         // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
         bool upwaysRun = false;
-        if (m_config.denoiser_mode == DenoiserMode::Upways) {
-            upwaysRun = !skipRayTracing ? dispatchUpways(cmd, resetTemporal) : false;
+        if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+            upwaysRun = dispatchUpways(cmd, resetTemporal);
         }
 
-        // Temporal Radiance Accumulation & wRLS Outlier Rejection
-        uint32_t temporalOutputSlot = 0;
-        if (!upwaysRun && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
-            temporalOutputSlot = !skipRayTracing ? dispatchTemporalAccum(cmd, resetTemporal) : (m_temporalPingPong + 1);
+        // AMD FidelityFX Super Resolution 3.1
+        bool fsr3Run = false;
+        if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+            fsr3Run = dispatchFsr3(cmd, resetTemporal);
         }
-
-        // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = (!upwaysRun && !skipRayTracing) ? dispatchBmfr(cmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (upwaysRun) {
+        if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (bmfrRun) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (temporalOutputSlot > 0) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = m_accumulatedSamples;
+            tonemapConstants.totalSamples = 1u;
         }
 
-        uint32_t tmGroupsX = groupsX;
-        uint32_t tmGroupsY = groupsY;
-        if (upwaysRun && m_upwaysPipeline && m_upwaysPipeline->isSuperResEnabled()) {
-            tmGroupsX = (m_upwaysPipeline->getOutputWidth() + 15) / 16;
-            tmGroupsY = (m_upwaysPipeline->getOutputHeight() + 15) / 16;
-        }
+        uint32_t tmGroupsX = (m_config.width + 15) / 16;
+        uint32_t tmGroupsY = (m_config.height + 15) / 16;
 
         tonemapConstants.visualizeSplit = 0;
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
@@ -4850,7 +4716,6 @@ void Engine::renderFrame() {
         }
         if (activeMode != m_lastActiveMgpuMode) {
             accumReset = true;
-            m_frameIndex = 0;
             m_accumulatedSamples = 0;
             m_lastActiveMgpuMode = activeMode;
         }
@@ -4859,14 +4724,21 @@ void Engine::renderFrame() {
         tileOffsetY_sec = 0u;
         uint32_t tileOffsetX_prim = 1u;
         uint32_t tileOffsetY_prim = 0u;
-        uint32_t dispatchWidth = m_config.width;
-        uint32_t dispatchHeight = (m_config.height + 1) / 2;
-        secAccumHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+        uint32_t mgpuBaseW = renderW;
+        uint32_t mgpuBaseH = renderH;
+        uint32_t dispatchWidth = mgpuBaseW;
+        uint32_t dispatchHeight = (mgpuBaseH + 1) / 2;
+        bool isSampleBlendFsr3 = (m_config.upscaler_mode == UpscalerMode::FSR3 && m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend);
+        uint32_t totalCompositeSpp = 0u;
+        secAccumHistory = 0u;
         uint32_t mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
         uint32_t primSpp = activeSpp;
         uint32_t secSpp = 0u;
 
         uboSec = ubo;
+
+        uint32_t secDispatchWidth = dispatchWidth;
+        uint32_t primDispatchWidth = dispatchWidth;
 
         if (activeMode == MultiGpuMode::CheckerboardTile) {
             mergeMode = 1u;
@@ -4874,23 +4746,37 @@ void Engine::renderFrame() {
             tileOffsetY_sec = m_config.tile_size;
             tileOffsetX_prim = 1u;
             tileOffsetY_prim = m_config.tile_size;
-            dispatchWidth = (m_config.width + 1) / 2;
-            dispatchHeight = m_config.height;
-            secAccumHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
+            uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+            uint32_t numTilesX = (mgpuBaseW + tileSize - 1u) / tileSize;
+            uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+            secDispatchWidth = maxTilesPerGpuX * tileSize;
+            primDispatchWidth = (m_config.pipeline_type == PipelineType::Wavefront) ? mgpuBaseW : secDispatchWidth;
+            dispatchWidth = primDispatchWidth;
+            dispatchHeight = mgpuBaseH;
+            secAccumHistory = 0u; // Secondary renders 1-frame delta; accum_running_avg accumulates merged frame
         } else if (activeMode == MultiGpuMode::SampleParallel) {
             mergeMode = 2u;
             tileOffsetX_sec = 0u;
             tileOffsetY_sec = 0u;
             tileOffsetX_prim = 0u;
             tileOffsetY_prim = 0u;
-            dispatchWidth = m_config.width;
-            dispatchHeight = m_config.height;
-            secAccumHistory = 0u; // Secondary only renders current frame's delta; Primary accumulates
+            secDispatchWidth = mgpuBaseW;
+            primDispatchWidth = mgpuBaseW;
+            dispatchWidth = mgpuBaseW;
+            dispatchHeight = mgpuBaseH;
+            secAccumHistory = isSampleBlendFsr3
+                ? ((m_config.progressive_accumulation && !accumReset) ? 1u : 0u)
+                : 0u; // Secondary only renders current frame's delta in PostMerge; accumulates in SampleBlend
 
             // Split SPP evenly: e.g. spp = 2 -> prim: 1, sec: 1; spp = 16 -> prim: 8, sec: 8
             uint32_t currentTotalSpp = activeSpp;
-            primSpp = (currentTotalSpp + 1) / 2;
-            secSpp = currentTotalSpp / 2;
+            if (isSampleBlendFsr3) {
+                primSpp = std::max(1u, currentTotalSpp / 2u);
+                secSpp = std::max(1u, currentTotalSpp / 2u);
+            } else {
+                primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
+                secSpp = std::max(1u, currentTotalSpp / 2);
+            }
             if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
                 primSpp = m_governor->getState().primSpp;
                 secSpp = m_governor->getState().secSpp;
@@ -4901,18 +4787,25 @@ void Engine::renderFrame() {
             // De-correlate secondary PRNG seed from primary
             uboSec.frameIndex = m_frameIndex + 1000003u;
 
-            if (m_config.enable_taa) {
+            if (enableJitter) {
+                uint32_t phaseOffset = (m_config.mgpu_mode == MultiGpuMode::SampleParallel) ? 4 : 0;
                 uboSec = m_camera->getUniformData(m_frameIndex, secSpp, activeBounces, flags,
-                                                  true, m_config.width, m_config.height, 4, false);
+                                                  true, mgpuBaseW, mgpuBaseH, phaseOffset, false);
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
-            uint32_t totalCompositeSpp = (primSpp + secSpp);
+            totalCompositeSpp = (!isSampleBlendFsr3) ? (primSpp + secSpp) : 0u;
             CameraUniform uboPrim = ubo;
-            if (totalCompositeSpp > 0) {
+            if (m_config.pipeline_type == PipelineType::Wavefront && totalCompositeSpp > 0u) {
                 uboPrim.spp = totalCompositeSpp;
+            } else {
+                uboPrim.spp = primSpp;
             }
             m_cameraUBOs[m_currentFrame]->copyFrom(&uboPrim, sizeof(CameraUniform));
+        }
+
+        if (m_camera) {
+            m_camera->advanceFrame();
         }
 
         if (m_mgpu) {
@@ -4920,20 +4813,29 @@ void Engine::renderFrame() {
         }
 
         if (!m_mgpu->isZeroCopyActive()) {
-            frameBytes = static_cast<size_t>(dispatchWidth) * dispatchHeight * bytesPerPixel;
+            frameBytes = static_cast<size_t>(secDispatchWidth) * dispatchHeight * bytesPerPixel;
             dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
         }
 
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
 
-        uint32_t totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : 0u;
-
         // 1. Launch secondary GPU concurrently for current frame
         if (!skipRayTracing) {
-            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, m_config.width, m_config.height,
+            glm::vec2 jitterSec(0.0f);
+            if (m_config.upscaler_mode == UpscalerMode::FSR3 || m_config.upscaler_mode == UpscalerMode::Upways) {
+                if (!m_config.progressive_accumulation || m_cameraMovedLastFrame || m_accumulatedSamples <= 1) {
+                    jitterSec = getHaltonJitter(m_frameIndex + 4);
+                }
+            }
+            bool isSecMotion = cameraMovedThisFrame || m_cameraMovedLastFrame;
+            m_mgpu->launchSecondaryWork(uboSec, slot, tileOffsetX_sec, tileOffsetY_sec, mgpuBaseW, mgpuBaseH,
                                        m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, useHwRT,
                                        hasEnvMap, envIntensity, secAccumHistory, activeFractionalSpp, dstHost, frameBytes,
-                                       totalCompositeSpp, m_numOpaqueTriangles);
+                                       totalCompositeSpp, m_numOpaqueTriangles,
+                                       isSampleBlendFsr3, renderW, renderH, m_config.width, m_config.height,
+                                       jitterSec, (hardReset || m_temporalResetRequested), isSecMotion, m_frameIndex,
+                                       m_config.upscaler_sharpening, m_config.upscaler_sharpening ? m_config.upscaler_sharpness : 0.0f,
+                                       (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u);
         }
 
         // 2. Concurrently record and execute primary GPU ray tracing asynchronously
@@ -4957,14 +4859,14 @@ void Engine::renderFrame() {
             m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
             tileOffsetX_prim,
             tileOffsetY_prim,
-            m_config.width, m_config.height,
+            mgpuBaseW, mgpuBaseH,
             useHwRT,
             hasEnvMap,
             envIntensityBits,
             (m_config.progressive_accumulation && !accumReset) ? 1u : 0u, // accumulateHistory
             fracSppBits,
             totalCompositeSpp,
-            m_numOpaqueTriangles, 0u
+            m_numOpaqueTriangles, std::bit_cast<uint32_t>(m_config.indirect_clamp)
         };
 
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) or Wavefront Pipeline
@@ -4976,27 +4878,49 @@ void Engine::renderFrame() {
                     m_nrcManager->resetCounters(cmd);
                 }
 
+                // Clear per-frame ray tracing target (FP16)
+                VkClearColorValue clearZero = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+                VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(cmd, m_frameImages[m_currentFrame]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+
                 bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-                if (needAccumReset && m_accumImage) {
-                    VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-                    VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                    vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
-
-                    VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    clearBarrier.image = m_accumImage->getImage();
-                    clearBarrier.subresourceRange = clearRange;
-
-                    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                    clearDep.imageMemoryBarrierCount = 1;
-                    clearDep.pImageMemoryBarriers = &clearBarrier;
-                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                if (needAccumReset) {
+                    if (m_accumImage) {
+                        vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
+                    if (m_mlDiffuseImage) {
+                        vkCmdClearColorImage(cmd, m_mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
+                    if (m_mlSpecularImage) {
+                        vkCmdClearColorImage(cmd, m_mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                    }
                 }
+
+                std::vector<VkImageMemoryBarrier2> clearBarriers;
+                auto addClearBarrier = [&](Image* img) {
+                    if (!img) return;
+                    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    b.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    b.image = img->getImage();
+                    b.subresourceRange = clearRange;
+                    clearBarriers.push_back(b);
+                };
+                addClearBarrier(m_frameImages[m_currentFrame].get());
+                if (needAccumReset) {
+                    addClearBarrier(m_accumImage.get());
+                    addClearBarrier(m_mlDiffuseImage.get());
+                    addClearBarrier(m_mlSpecularImage.get());
+                }
+
+                VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                clearDep.imageMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size());
+                clearDep.pImageMemoryBarriers = clearBarriers.data();
+                vkCmdPipelineBarrier2(cmd, &clearDep);
 
                 WavefrontSceneData wfSceneData{};
                 wfSceneData.numTriangles = m_numTriangles;
@@ -5013,7 +4937,11 @@ void Engine::renderFrame() {
                 wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
                 wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
                 wfSceneData.cameraFlags = flags;
-                wfSceneData.enableNrc = m_config.enable_nrc;
+                bool enableNrcThisFrame = m_config.enable_nrc;
+                if (activeMode == MultiGpuMode::CheckerboardTile) {
+                    enableNrcThisFrame = false; // Secondary GPU has no NRC inference network; disable to maintain tile parity
+                }
+                wfSceneData.enableNrc = enableNrcThisFrame;
                 wfSceneData.nrcBounce = m_config.nrc_bounce;
                 wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
                 wfSceneData.boundsMin = m_sceneData.boundsMin;
@@ -5021,11 +4949,14 @@ void Engine::renderFrame() {
                 wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
                 wfSceneData.enableDistanceClamping = m_config.distance_clamping;
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+                wfSceneData.indirectClamp = m_config.indirect_clamp;
                 wfSceneData.tileOffsetX = tileOffsetX_prim;
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
-                wfSceneData.fullWidth = m_config.width;
-                wfSceneData.fullHeight = m_config.height;
-                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways || !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
+                wfSceneData.fullWidth = mgpuBaseW;
+                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                            m_config.upscaler_mode == UpscalerMode::Upways ||
+                                            m_config.upways_superres ||
+                                            !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
 
                 if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                     dispatchCausticTrace(cmd, m_currentFrame);
@@ -5034,8 +4965,8 @@ void Engine::renderFrame() {
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
                                                  primDispatchSpp, activeBounces, wfSceneData);
 
-                if (m_config.enable_nrc && m_nrcManager) {
-                    m_nrcManager->recordInference(cmd, m_config.width, m_config.height,
+                if (enableNrcThisFrame && m_nrcManager) {
+                    m_nrcManager->recordInference(cmd, mgpuBaseW, mgpuBaseH,
                                                   m_sceneData.boundsMin, m_sceneData.boundsMax);
                     m_nrcManager->recordTraining(cmd, m_frameIndex,
                                                  m_sceneData.boundsMin, m_sceneData.boundsMax,
@@ -5054,91 +4985,6 @@ void Engine::renderFrame() {
             if (m_governor) {
                 m_governor->recordDispatch(m_currentFrame, primDispatchSpp, activeBounces);
             }
-
-            if (!useWavefront && m_config.enable_shadow_denoiser && m_shadowClassifyPipeline && m_shadowFilterPipeline) {
-            VkMemoryBarrier2 rtToClassifyBarrier{};
-            rtToClassifyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            rtToClassifyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-            rtToClassifyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            rtToClassifyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            rtToClassifyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo classifyDep{};
-            classifyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            classifyDep.memoryBarrierCount = 1;
-            classifyDep.pMemoryBarriers = &rtToClassifyBarrier;
-            vkCmdPipelineBarrier2(cmd, &classifyDep);
-
-            // 1. FidelityFX Shadow Denoiser Tile Classification Pass
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowClassifyPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowClassifyPipelineLayout, 0, 1, &m_shadowClassifyDescSets[m_shadowPingPongIndex], 0, nullptr);
-
-            struct ClassifyPushConstants {
-                int32_t imageDim[2];
-                float invImageDim[2];
-                glm::mat4 prevViewProj;
-                uint32_t frameIndex;
-                float depthDisocclusionThreshold;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-            } classifyPC;
-            classifyPC.imageDim[0] = static_cast<int32_t>(m_config.width);
-            classifyPC.imageDim[1] = static_cast<int32_t>(m_config.height);
-            classifyPC.invImageDim[0] = 1.0f / static_cast<float>(m_config.width);
-            classifyPC.invImageDim[1] = 1.0f / static_cast<float>(m_config.height);
-            classifyPC.prevViewProj = ubo.prevViewProj * (ubo.viewInverse * ubo.projInverse);
-            classifyPC.frameIndex = m_frameIndex;
-            classifyPC.depthDisocclusionThreshold = m_config.shadow_denoiser_depth_sigma;
-            classifyPC.tileOffsetX = tileOffsetX_prim;
-            classifyPC.tileOffsetY = tileOffsetY_prim;
-
-            vkCmdPushConstants(cmd, m_shadowClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), &classifyPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            VkMemoryBarrier2 classifyToFilterBarrier{};
-            classifyToFilterBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            classifyToFilterBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            classifyToFilterBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            classifyToFilterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            classifyToFilterBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-            VkDependencyInfo filterDep{};
-            filterDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            filterDep.memoryBarrierCount = 1;
-            filterDep.pMemoryBarriers = &classifyToFilterBarrier;
-            vkCmdPipelineBarrier2(cmd, &filterDep);
-
-            // 2. FidelityFX Shadow Denoiser Cross-Bilateral Filter & Direct-Light Resolve Pass
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowFilterPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowFilterPipelineLayout, 0, 1, &m_shadowFilterDescSet, 0, nullptr);
-
-            struct FilterPushConstants {
-                int32_t imageDim[2];
-                float invImageDim[2];
-                int32_t passIndex;
-                float depthSigma;
-                float normalPower;
-                uint32_t tileOffsetX;
-                uint32_t tileOffsetY;
-                uint32_t tileSize;
-            } filterPC;
-            filterPC.imageDim[0] = static_cast<int32_t>(m_config.width);
-            filterPC.imageDim[1] = static_cast<int32_t>(m_config.height);
-            filterPC.invImageDim[0] = 1.0f / static_cast<float>(m_config.width);
-            filterPC.invImageDim[1] = 1.0f / static_cast<float>(m_config.height);
-            filterPC.passIndex = 0;
-            filterPC.depthSigma = m_config.shadow_denoiser_depth_sigma;
-            filterPC.normalPower = m_config.shadow_denoiser_normal_power;
-            filterPC.tileOffsetX = tileOffsetX_prim;
-            filterPC.tileOffsetY = tileOffsetY_prim;
-            filterPC.tileSize = m_config.tile_size;
-
-            vkCmdPushConstants(cmd, m_shadowFilterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(filterPC), &filterPC);
-            vkCmdDispatch(cmd, (m_config.width + 7) / 8, (m_config.height + 7) / 8, 1);
-
-            // Ping-pong moments and depth image resources for next frame
-            m_shadowPingPongIndex = 1 - m_shadowPingPongIndex;
-        }
 
         } // end if (!accumReachedCutoff)
 
@@ -5169,8 +5015,8 @@ void Engine::renderFrame() {
         // Barrier: Ensure primary RT writes to m_accumImage and secondary DMA host writes are visible before merge compute reads/writes
         VkMemoryBarrier2 rtToMergeBarrier{};
         rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
-        rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
         rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
@@ -5180,16 +5026,16 @@ void Engine::renderFrame() {
         rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
-        // Merge Pass
-        if (!skipRayTracing) {
+        // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
+        if (!skipRayTracing && !isSampleBlendFsr3) {
             vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-            uint32_t mergePC[6] = { m_config.width, m_config.height, m_config.spp, m_config.tile_size, formatMode, mergeMode };
+            uint32_t mergePC[8] = { mgpuBaseW, mgpuBaseH, secSpp, m_config.tile_size, formatMode, mergeMode, primSpp, secDispatchWidth };
             vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
-            uint32_t mergeGroupsX = (m_config.width + 15) / 16;
-            uint32_t mergeGroupsY = (mergeMode == 0u) ? (((m_config.height + 1) / 2 + 15) / 16) : ((m_config.height + 15) / 16);
+            uint32_t mergeGroupsX = (mgpuBaseW + 15) / 16;
+            uint32_t mergeGroupsY = (mergeMode == 0u) ? (((mgpuBaseH + 1) / 2 + 15) / 16) : ((mgpuBaseH + 15) / 16);
             vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
         }
 
@@ -5206,45 +5052,67 @@ void Engine::renderFrame() {
         mergeDep.pMemoryBarriers = &mergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
+        // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
+        if (!skipRayTracing && m_accumRunningAvgPipeline) {
+            vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+
+            struct {
+                uint32_t width;
+                uint32_t height;
+                uint32_t sampleCount;
+                float invSpp;
+            } avgPC;
+            avgPC.width = mgpuBaseW;
+            avgPC.height = mgpuBaseH;
+            avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+            uint32_t totalSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : activeSpp;
+            avgPC.invSpp = (totalSpp > 0) ? (1.0f / static_cast<float>(totalSpp)) : 1.0f;
+
+            vkCmdPushConstants(activeCmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+            vkCmdDispatch(activeCmd, (mgpuBaseW + 15) / 16, (mgpuBaseH + 15) / 16, 1);
+
+            VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+            VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            avgDep.memoryBarrierCount = 1;
+            avgDep.pMemoryBarriers = &avgBarrier;
+            vkCmdPipelineBarrier2(activeCmd, &avgDep);
+        }
+
         // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
         bool upwaysRun = false;
-        if (!skipRayTracing && m_config.denoiser_mode == DenoiserMode::Upways) {
+        if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
             upwaysRun = dispatchUpways(activeCmd, resetTemporal);
         }
 
-        // Temporal Radiance Accumulation & wRLS Outlier Rejection
-        uint32_t temporalOutputSlot = 0;
-        if (!upwaysRun && !skipRayTracing && m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None) {
-            temporalOutputSlot = dispatchTemporalAccum(activeCmd, resetTemporal);
+        // AMD FidelityFX Super Resolution 3.1
+        bool fsr3Run = false;
+        if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+            fsr3Run = dispatchFsr3(activeCmd, resetTemporal);
         }
-
-        // Blockwise Multi-Order Feature Regression (BMFR)
-        bool bmfrRun = (!upwaysRun && !skipRayTracing) ? dispatchBmfr(activeCmd, temporalOutputSlot) : false;
 
         // Tonemapping
         vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (upwaysRun) {
+        if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
+            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
+            tonemapConstants.totalSamples = 1u;
+        } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (bmfrRun) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapBmfrDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (temporalOutputSlot > 0) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapTemporalDescSets[temporalOutputSlot - 1], 0, nullptr);
             tonemapConstants.totalSamples = 1u;
         } else {
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = m_accumulatedSamples;
+            tonemapConstants.totalSamples = 1u;
         }
 
-        uint32_t mgpuTmGroupsX = groupsX;
-        uint32_t mgpuTmGroupsY = groupsY;
-        if (upwaysRun && m_upwaysPipeline && m_upwaysPipeline->isSuperResEnabled()) {
-            mgpuTmGroupsX = (m_upwaysPipeline->getOutputWidth() + 15) / 16;
-            mgpuTmGroupsY = (m_upwaysPipeline->getOutputHeight() + 15) / 16;
-        }
+        uint32_t mgpuTmGroupsX = (m_config.width + 15) / 16;
+        uint32_t mgpuTmGroupsY = (m_config.height + 15) / 16;
 
         bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
         if (isCheckerboard) {
@@ -5388,6 +5256,10 @@ void Engine::renderFrame() {
             if (guiActions.mgpuModeChanged) {
                 m_pendingMgpuModeChange = true;
                 m_newMgpuMode = guiActions.newMgpuMode;
+            }
+            if (guiActions.mgpuUpscaleModeChanged) {
+                m_pendingMgpuUpscaleModeChange = true;
+                m_newMgpuUpscaleMode = guiActions.newMgpuUpscaleMode;
             }
             if (guiActions.accumFormatChanged) {
                 m_pendingAccumFormatChange = true;
@@ -5615,13 +5487,15 @@ void Engine::renderFrame() {
                              curSpp, curBounces, m_config.target_fps);
             }
         } else if (m_mgpu && m_mgpu->isMultiGpuActive()) {
-            Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
+            Logger::info("Frame {:3d} | Dual-GPU Total: {:.3f} ms (GPU 0: {:.3f} ms, GPU 1: {:.3f} ms, Tonemap: {:.3f} ms) | Target <{:.1f}ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs,
-                         totalGpuMs < 8.0 ? "\033[32mPASS\033[0m" : "\033[33mCHECK\033[0m");
+                         m_config.target_frame_time_ms,
+                         totalGpuMs < m_config.target_frame_time_ms ? "\033[32mPASS\033[0m" : "\033[33mCHECK\033[0m");
         } else {
-            Logger::info("Frame {:3d} | Single GPU Total: {:.3f} ms (RT: {:.3f} ms, Tonemap: {:.3f} ms) | Target <8ms: {}",
+            Logger::info("Frame {:3d} | Single GPU Total: {:.3f} ms (RT: {:.3f} ms, Tonemap: {:.3f} ms) | Target <{:.1f}ms: {}",
                          m_totalFramesRendered, totalGpuMs, gpuRtMs, gpuTonemapMs,
-                         totalGpuMs < 8.0 ? "\033[32mPASS\033[0m" : "\033[33mCHECK\033[0m");
+                         m_config.target_frame_time_ms,
+                         totalGpuMs < m_config.target_frame_time_ms ? "\033[32mPASS\033[0m" : "\033[33mCHECK\033[0m");
         }
     }
 }
@@ -5676,7 +5550,11 @@ void Engine::dumpOutputFiles() {
             WavefrontStageSample wfSample;
             if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                 wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
-                wfSample.primaryRays = static_cast<uint64_t>(m_config.width) * m_config.height * m_config.spp;
+                uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                    static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+                uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                    static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+                wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                 for (const auto& bp : m_lastWavefrontProfile.bounces) {
                     wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                 }
@@ -5989,11 +5867,15 @@ FrameStats Engine::getStats() const {
         stats.min_frame_time_ms = *std::min_element(m_frameTimesMs.begin(), m_frameTimesMs.end());
         stats.max_frame_time_ms = *std::max_element(m_frameTimesMs.begin(), m_frameTimesMs.end());
         stats.avg_fps = stats.avg_frame_time_ms > 0.0 ? 1000.0 / stats.avg_frame_time_ms : 0.0;
-        stats.target_achieved = (stats.avg_frame_time_ms < 8.0);
+        stats.target_frame_time_ms = m_config.target_frame_time_ms;
+        stats.target_achieved = (stats.avg_frame_time_ms < m_config.target_frame_time_ms);
 
-        // Rays per second based on active throughput
         double frameTimeForThroughput = stats.current_frame_time_ms > 0.001 ? stats.current_frame_time_ms : stats.avg_frame_time_ms;
-        double raysPerFrame = static_cast<double>(m_config.width) * m_config.height * stats.dynamic_spp * stats.dynamic_bounces;
+        uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+            static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+        uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+            static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+        double raysPerFrame = static_cast<double>(traceW) * traceH * stats.dynamic_spp * stats.dynamic_bounces;
         stats.rays_per_second = (frameTimeForThroughput > 0.0) ? (raysPerFrame / (frameTimeForThroughput / 1000.0)) : 0.0;
     }
 
@@ -6013,13 +5895,11 @@ FrameStats Engine::getStats() const {
     if (m_config.pipeline_type == PipelineType::Wavefront) {
         switch (m_config.wavefront_sort_mode) {
             case WavefrontSortMode::Archetype: stats.wavefront_stats.sort_mode_str = "archetype"; break;
-            case WavefrontSortMode::BDA: stats.wavefront_stats.sort_mode_str = "bda"; break;
             case WavefrontSortMode::Dual: stats.wavefront_stats.sort_mode_str = "dual"; break;
             default: stats.wavefront_stats.sort_mode_str = "none"; break;
         }
         switch (m_config.secondary_sort_mode) {
             case SecondarySortMode::DirectionalDGC: stats.wavefront_stats.secondary_sort_mode_str = "directional"; break;
-            case SecondarySortMode::SpatialIndex: stats.wavefront_stats.secondary_sort_mode_str = "spatial"; break;
             default: stats.wavefront_stats.secondary_sort_mode_str = "none"; break;
         }
         if (m_lastWavefrontProfile.valid) {
@@ -6175,6 +6055,11 @@ FrameStats Engine::getStats() const {
 
     // 5. Engine Settings & State
     stats.visualize_mgpu_split = m_config.visualize_mgpu_split;
+    switch (m_config.upscaler_mode) {
+        case UpscalerMode::FSR3: stats.upscaler_mode_str = "FSR 3.1"; break;
+        case UpscalerMode::Upways: stats.upscaler_mode_str = "Upways"; break;
+        case UpscalerMode::None: default: stats.upscaler_mode_str = "None"; break;
+    }
     stats.render_scale = m_config.render_scale;
     stats.max_bounces = m_config.max_bounces;
     stats.checkerboard_tile_size = m_config.tile_size;
@@ -6235,7 +6120,8 @@ FrameStats Engine::getStats() const {
         s.secondary_gpu_time_ms = tally.getAvgSecondaryRtMs();
         s.tonemap_time_ms = tally.getAvgTonemapMs();
         s.gigarays_per_second = tally.getRayThroughput() * 1e-9;
-        s.target_achieved = tally.isTargetAchieved();
+        s.target_frame_time_ms = m_config.target_frame_time_ms;
+        s.target_achieved = tally.isTargetAchieved(m_config.target_frame_time_ms);
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
             s.pipeline_stages.is_wavefront = true;
@@ -6373,25 +6259,25 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
 
     // 3. Recreate Accumulation & Output Images
-    VkFormat accumFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_frameImages[i] = std::make_unique<Image>(
+            device, allocator, m_config.width, m_config.height,
+            frameFmt,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        accumFmt,
+        VK_FORMAT_R32G32B32A32_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    VkFormat outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    if (m_swapchain && !m_config.headless) {
-        VkFormat swapFmt = m_swapchain->getFormat();
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(m_context->getPhysicalDevice(), swapFmt, &props);
-        if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
-            outputFmt = swapFmt;
-        } else if (m_swapchain->isHdr()) {
-            outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
-        } else {
-            outputFmt = m_config.dump_8bit_png ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-        }
+    // Internal post-process and tonemapping target is strictly 10-bit (or 16-bit float for scRGB HDR).
+    // The internal pipeline is never degraded to 8-bit; SDR 8-bit presentation occurs via blit to the swapchain.
+    VkFormat outputFmt = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (m_swapchain && !m_config.headless && m_swapchain->isHdr() && m_swapchain->getFormat() == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 
     m_outputImage = std::make_unique<Image>(
@@ -6406,28 +6292,27 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
-    if (!m_config.capture_training_data_dir.empty() || m_config.denoiser_mode == DenoiserMode::Upways) {
-        m_mlAlbedoRoughnessImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlSpecularMotionImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlDiffuseImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-        m_mlSpecularImage = std::make_unique<Image>(
-            device, allocator, m_config.width, m_config.height,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
-    }
+    m_mlAlbedoRoughnessImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    m_mlSpecularMotionImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_mlDiffuseImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_mlSpecularImage = std::make_unique<Image>(
+        device, allocator, m_config.width, m_config.height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
 
     // Transition images to GENERAL layout
     vkResetCommandBuffer(m_commandBuffers[0], 0);
@@ -6435,6 +6320,15 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_frameImages[i]->transitionLayout(
+            m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
 
     m_accumImage->transitionLayout(
         m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -6461,6 +6355,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
+    }
+    if (m_mlSpecularMotionImage) {
         m_mlSpecularMotionImage->transitionLayout(
             m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
@@ -6494,17 +6390,32 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_mgpu->resize(m_config.width, m_config.height);
     }
 
-    destroyShadowDenoiserResources();
-    createShadowDenoiserResources();
-    destroyTemporalAccumResources();
-    createTemporalAccumResources();
-    destroyBmfrResources();
-    createBmfrResources();
+    destroyGBufferResources();
+    createGBufferResources();
     destroyUpwaysResources();
     if (m_upwaysPipeline) {
-        m_upwaysPipeline->resize(m_config.width, m_config.height);
+        bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
+        uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+            static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+        uint32_t inH = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+            static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+        uint32_t outW = m_config.width;
+        uint32_t outH = m_config.height;
+        isSuperRes = (inW < outW || inH < outH || isSuperRes);
+        m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
     }
     createUpwaysResources();
+    destroyFsr3Resources();
+    if (m_fsr3Upscaler) {
+        uint32_t renderW = (m_config.render_scale < 1.0f) ?
+            static_cast<uint32_t>(m_config.width * m_config.render_scale) :
+            m_config.width;
+        uint32_t renderH = (m_config.render_scale < 1.0f) ?
+            static_cast<uint32_t>(m_config.height * m_config.render_scale) :
+            m_config.height;
+        m_fsr3Upscaler->resize(renderW, renderH, m_config.width, m_config.height);
+    }
+    createFsr3Resources();
     destroyCausticsResources();
     createCausticsResources();
 
@@ -6513,7 +6424,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
 
     if (m_wavefrontPipeline) {
-        m_wavefrontPipeline->resize(m_config.width, m_config.height, m_config.wavefront_tile_size);
+        m_wavefrontPipeline->resize(m_config.width, m_config.height);
     }
 
     updateAllImageDescriptors();
@@ -6560,9 +6471,7 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.scene_name = getActiveSceneName();
     key.pipeline_type = m_config.pipeline_type;
     key.mgpu_mode = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : MultiGpuMode::Off;
-    key.denoiser = (m_config.denoiser_mode == DenoiserMode::Upways) ? DenoiserMode::Upways :
-                   ((m_config.enable_bmfr || m_config.denoiser_mode == DenoiserMode::BMFR) ? DenoiserMode::BMFR :
-                   (m_config.enable_temporal_accum && m_config.denoiser_mode != DenoiserMode::None ? DenoiserMode::Temporal : DenoiserMode::None));
+    key.denoiser = (m_config.denoiser_mode == DenoiserMode::Upways) ? DenoiserMode::Upways : DenoiserMode::None;
     key.enable_nrc = m_config.enable_nrc;
     key.width = m_config.width;
     key.height = m_config.height;
@@ -6570,6 +6479,9 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.max_bounces = (m_governor && m_config.adaptive_spp && m_governor->getState().active) ? m_governor->getState().currentBounces : m_config.max_bounces;
     key.accum_format = m_config.accum_format;
     key.tile_size = m_config.tile_size;
+    key.upscaler = m_config.upscaler_mode;
+    key.mgpu_upscale_mode = m_config.mgpu_upscale_mode;
+    key.render_scale = m_config.render_scale;
 
     auto updateAsMetrics = [this](ConfigStatsTally& t) {
         if (m_asManager) {
@@ -6731,7 +6643,8 @@ void Engine::printExecutionSummary() const {
         }
 
         Logger::info("    Ray Throughput:      {:.2f} GigaRays/sec", tally.getRayThroughput() * 1e-9);
-        Logger::info("    Sub-8ms Budget:      {}", tally.isTargetAchieved() ? "\033[32mACHIEVED\033[0m" : "\033[33mEXCEEDED\033[0m");
+        Logger::info("    Sub-{:.1f}ms Budget:    {}", m_config.target_frame_time_ms,
+                     tally.isTargetAchieved(m_config.target_frame_time_ms) ? "\033[32mACHIEVED\033[0m" : "\033[33mEXCEEDED\033[0m");
         if (i + 1 < activeTallies.size()) {
             Logger::info("  --------------------------------------------------------------------------------------");
         }
@@ -6763,7 +6676,6 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree)      flags |= (1 << 7);
-    if (m_config.enable_shadow_denoiser) flags |= (1 << 20);
 
     VkClearColorValue clearZero{};
     clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;
@@ -6826,6 +6738,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.indirectClamp = m_config.indirect_clamp;
         wfSceneData.captureMlData = 0;
 
         while (remainingSpp > 0) {
@@ -6975,6 +6888,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.indirectClamp = m_config.indirect_clamp;
         wfSceneData.captureMlData = 1;
 
         m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_config.max_bounces, wfSceneData);

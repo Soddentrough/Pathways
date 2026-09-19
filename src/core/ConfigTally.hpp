@@ -18,7 +18,10 @@ struct ConfigKey {
     uint32_t height = 2160;
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
-    DenoiserMode denoiser = DenoiserMode::Temporal;
+    DenoiserMode denoiser = DenoiserMode::None;
+    UpscalerMode upscaler = UpscalerMode::None;
+    MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+    float render_scale = 1.0f;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
     uint32_t tile_size = 64;
     bool enable_nrc = false;
@@ -28,6 +31,9 @@ struct ConfigKey {
         if (pipeline_type != o.pipeline_type) return false;
         if (mgpu_mode != o.mgpu_mode) return false;
         if (denoiser != o.denoiser) return false;
+        if (upscaler != o.upscaler) return false;
+        if (upscaler != UpscalerMode::None && std::abs(render_scale - o.render_scale) > 0.001f) return false;
+        if (mgpu_mode != MultiGpuMode::Off && upscaler != UpscalerMode::None && mgpu_upscale_mode != o.mgpu_upscale_mode) return false;
         if (enable_nrc != o.enable_nrc) return false;
         if (width != o.width || height != o.height) return false;
         if (spp != o.spp || max_bounces != o.max_bounces) return false;
@@ -55,15 +61,25 @@ struct ConfigKey {
         }
         std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";
         std::string denoiserStr = "";
-        if (denoiser == DenoiserMode::BMFR) {
-            denoiserStr = " [BMFR]";
-        } else if (denoiser == DenoiserMode::None) {
+        if (denoiser == DenoiserMode::None) {
             denoiserStr = " [Pure MC]";
         } else if (denoiser == DenoiserMode::Upways) {
             denoiserStr = " [Upways]";
         }
+        std::string upscalerStr = "";
+        std::string mgpuUpscaleStr = "";
+        if (mgpu_mode != MultiGpuMode::Off && upscaler != UpscalerMode::None) {
+            mgpuUpscaleStr = (mgpu_upscale_mode == MgpuUpscaleMode::PostMerge) ? " [Post-Merge SR]" : " [Sample-Blend SR]";
+        }
+        if (upscaler == UpscalerMode::FSR3) {
+            upscalerStr = " [FSR 3.1]" + mgpuUpscaleStr;
+        } else if (upscaler == UpscalerMode::Upways) {
+            upscalerStr = " [Upways SR]" + mgpuUpscaleStr;
+        } else if (upscaler == UpscalerMode::FSR1) {
+            upscalerStr = " [FSR 1.0]" + mgpuUpscaleStr;
+        }
         std::string nrcStr = enable_nrc ? " [NRC]" : "";
-        return std::format("[{}]{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
+        return std::format("[{}]{}{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, upscalerStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);
     }
 };
 
@@ -209,7 +225,11 @@ struct ConfigStatsTally {
         if (wavefrontSampleCount > 0 && sumPrimaryRays > 0) {
             return sumPrimaryRays / wavefrontSampleCount;
         }
-        return static_cast<uint64_t>(key.width) * key.height * key.spp;
+        uint32_t traceW = (key.render_scale < 1.0f && key.upscaler != UpscalerMode::None) ?
+            static_cast<uint32_t>(key.width * key.render_scale) : key.width;
+        uint32_t traceH = (key.render_scale < 1.0f && key.upscaler != UpscalerMode::None) ?
+            static_cast<uint32_t>(key.height * key.render_scale) : key.height;
+        return static_cast<uint64_t>(traceW) * traceH * key.spp;
     }
 
     std::vector<BounceStageAvg> getAvgBounces() const {
@@ -238,8 +258,8 @@ struct ConfigStatsTally {
         return raysPerFrame / (avgMs * 1e-3);
     }
 
-    bool isTargetAchieved() const {
-        return getAvgFrameTimeMs() < 8.0;
+    bool isTargetAchieved(double targetMs = 8.3) const {
+        return getAvgFrameTimeMs() < targetMs;
     }
 };
 

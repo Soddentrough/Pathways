@@ -280,6 +280,8 @@ struct RayState {
 #define MATERIAL_TYPE_MASK               0x000000FFu
 #define MATERIAL_FLAG_PROCEDURAL_TERRAIN (1u << 9)
 #define MATERIAL_FLAG_PROCEDURAL_WATER   (1u << 11)
+#define MATERIAL_FLAG_PROCEDURAL_PUDDLE  (1u << 12)
+#define MATERIAL_FLAG_PROCEDURAL_HOLO    (1u << 13)
 
 uint getMaterialArchetype(Material mat) {
     // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures
@@ -291,7 +293,11 @@ uint getMaterialArchetype(Material mat) {
         (length(mat.emissive.rgb) > 0.1 && mat.albedoTex == 0u && length(mat.albedo.rgb) < 0.05 && mat.metallic < 0.01 && mat.transmission < 0.01)) {
         return MATERIAL_ARCHETYPE_EMISSIVE;
     }
-    // 3. Multi-layer complex PBR (Clearcoat on top of substrate, or Sheen)
+    // 3. Procedural wet pavement & puddle surfaces (evaluated in diffuse microkernel)
+    if ((mat.type & MATERIAL_FLAG_PROCEDURAL_PUDDLE) != 0u) {
+        return MATERIAL_ARCHETYPE_DIFFUSE;
+    }
+    // 4. Multi-layer complex PBR (Clearcoat on top of substrate, or Sheen)
     if (mat.clearcoat > 0.001 || mat.clearcoatTex > 0u || length(mat.sheenColor) > 0.001 || mat.sheenTex > 0u) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
@@ -396,15 +402,10 @@ vec3 randVec3(inout uint seed) {
     return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
 }
 
-// Unbiased stochastic rounding for FP16 HDR accumulation buffer.
-// Prevents floating-point precision exhaustion and colored contour banding under multi-frame progressive accumulation.
+// Clean floating-point radiance accumulation.
 vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
     if (isnan(val.r) || isnan(val.g) || isnan(val.b) || isinf(val.r) || isinf(val.g) || isinf(val.b)) return accum;
-    if (dot(val, val) < 1e-12) return accum;
-    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
-    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
-    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
-    return max(vec3(0.0), accum + val + dither);
+    return accum + max(val, vec3(0.0));
 }
 
 vec2 directionToEquirectangular(vec3 dir) {
@@ -657,4 +658,26 @@ bool intersectTriangle(vec3 origin, vec3 dir, Triangle tri, float tMin, float tM
     return true;
 }
 
+// Chromaticity-preserving luminance clamping for indirect / secondary bounces
+vec3 clampIndirectRadiance(vec3 rad, float maxLum) {
+    if (maxLum <= 0.0) return rad;
+    float lum = dot(rad, vec3(0.2126, 0.7152, 0.0722));
+    if (lum > maxLum) {
+        return rad * (maxLum / lum);
+    }
+    return rad;
+}
+
+#ifdef GL_EXT_shader_explicit_arithmetic_types_float16
+f16vec3 clampIndirectRadiance(f16vec3 rad, float maxLum) {
+    if (maxLum <= 0.0) return rad;
+    float lum = float(dot(rad, f16vec3(0.2126, 0.7152, 0.0722)));
+    if (lum > maxLum) {
+        return rad * float16_t(maxLum / lum);
+    }
+    return rad;
+}
+#endif
+
 #endif // WAVEFRONT_COMMON_GLSL
+

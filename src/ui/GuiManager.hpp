@@ -22,6 +22,8 @@ struct GuiActions {
     bool refreshPciStatus = false;
     bool mgpuModeChanged = false;
     MultiGpuMode newMgpuMode = MultiGpuMode::Off;
+    bool mgpuUpscaleModeChanged = false;
+    MgpuUpscaleMode newMgpuUpscaleMode = MgpuUpscaleMode::PostMerge;
     bool accumFormatChanged = false;
     AccumFormat newAccumFormat = AccumFormat::RGBA16_SFLOAT;
     bool doubleBufferChanged = false;

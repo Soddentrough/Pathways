@@ -49,6 +49,17 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     style.FrameRounding = 4.0f;
     style.GrabRounding = 4.0f;
 
+    // High-DPI font initialization:
+    // When fractional display scaling is active (e.g. 1.25x on 5120x2160),
+    // Dear ImGui's default 13px bitmap font is resampled with bilinear filtering,
+    // causing text to appear soft or blurry. Explicitly loading the scalable vector font
+    // (ProggyForever) with oversampling guarantees sharp, crisp glyph contours at any DPI scale.
+    ImFontConfig fontCfg;
+    fontCfg.OversampleH = 2;
+    fontCfg.OversampleV = 2;
+    fontCfg.PixelSnapH = true;
+    io.Fonts->AddFontDefaultVector(&fontCfg);
+
     ImGui_ImplSDL3_InitForVulkan(window);
 
     VkPipelineRenderingCreateInfo renderingInfo{};
@@ -424,13 +435,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "[CONVERGED %u/%u] Display: %.1f FPS | GPU: Idle (Paused)",
                                    stats.total_samples, config.max_accum_frames, presFps);
             } else {
-                bool targetPass = currentFrameTime < 8.0f;
+                bool targetPass = currentFrameTime < config.target_frame_time_ms;
                 if (targetPass) {
-                    ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f), "[BUDGET ACHIEVED] Sub-8ms Target (<8.0 ms): %.2f ms | %.1f FPS",
+                    ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.4f, 1.0f), "[BUDGET ACHIEVED] Sub-%.1fms Target (<%.1f ms): %.2f ms | %.1f FPS",
+                                       config.target_frame_time_ms, config.target_frame_time_ms,
                                        currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
                 } else {
-                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[CONVERGING] Frame Latency: %.2f ms | %.1f FPS (Target: <8.0 ms)",
-                                       currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f);
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "[CONVERGING] Frame Latency: %.2f ms | %.1f FPS (Target: <%.1f ms)",
+                                       currentFrameTime, currentFrameTime > 0.0f ? 1000.0f / currentFrameTime : 0.0f, config.target_frame_time_ms);
                 }
             }
         }
@@ -442,13 +454,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         ImGui::Separator();
 
-        // 2. Latency Rolling Graph with 8.0ms Target Budget Line
+        // 2. Latency Rolling Graph with Target Budget Line
         char overlayBuf[64];
         std::snprintf(overlayBuf, sizeof(overlayBuf), "Current: %.2f ms", currentFrameTime);
         float graphMax = std::max(16.0f, historyMax * 1.2f);
         ImGui::PlotLines("Latency", m_frameTimeHistory, static_cast<int>(HISTORY_SIZE), m_historyOffset,
                          overlayBuf, 0.0f, graphMax, ImVec2(hudW - 60.0f, 75.0f));
-        ImGui::TextDisabled("8.0ms Budget Line (120 FPS Target)");
+        ImGui::TextDisabled("%.1fms Budget Line (%.0f FPS Target)", config.target_frame_time_ms, 1000.0f / config.target_frame_time_ms);
 
         ImGui::Separator();
 
@@ -526,11 +538,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 const char* wfSortStr = "Dual (Spatial-Morton + Material)";
                 if (config.wavefront_sort_mode == WavefrontSortMode::None) wfSortStr = "None (Monolithic)";
                 else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) wfSortStr = "Archetype (BSDF Buckets)";
-                else if (config.wavefront_sort_mode == WavefrontSortMode::BDA) wfSortStr = "BDA (Queue Pointers)";
 
                 const char* secSortStr = "None (Linear Queue)";
                 if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) secSortStr = "Directional DGC (Producer-Side Binning)";
-                else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) secSortStr = "Spatial Morton (Index Sort)";
 
                 ImGui::Text("Material Sort:      %s", wfSortStr);
                 ImGui::Text("Secondary Sort:     %s", secSortStr);
@@ -555,17 +565,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
             if (config.denoiser_mode == DenoiserMode::Upways) {
-                if (config.upways_superres) {
-                    ImGui::Text("Denoising:    Upways Super-Resolution (2.0x 4K Wave32 WMMA)");
-                } else {
-                    ImGui::Text("Denoising:    Upways Neural Denoiser (Wave32 WMMA)");
-                }
-            } else if (config.enable_bmfr || config.denoiser_mode == DenoiserMode::BMFR) {
-                ImGui::Text("Denoising:    BMFR (Feature Regression) [Experimental]");
-            } else if (config.enable_temporal_accum && config.denoiser_mode != DenoiserMode::None) {
-                ImGui::Text("Denoising:    Temporal Accumulation (wRLS) [Default]");
+                ImGui::Text("Denoising:    Upways Neural Denoising (Wave32 WMMA)");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
+            }
+            if (config.upscaler_mode == UpscalerMode::FSR3) {
+                ImGui::Text("Upscaling:    AMD FSR 3.1 (Temporal Accumulation, %.2fx)", config.render_scale);
+            } else if (config.upscaler_mode == UpscalerMode::Upways) {
+                ImGui::Text("Upscaling:    Upways Neural Reconstruction (Wave32 WMMA, %.2fx)", config.render_scale);
+            } else if (config.upscaler_mode == UpscalerMode::FSR1) {
+                ImGui::Text("Upscaling:    AMD FSR 1.0 (Spatial EASU + RCAS, %.2fx)", config.render_scale);
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -639,7 +648,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                     ImGui::Unindent(15.0f);
                 }
-                ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED (<8ms)" : "EXCEEDED");
+                ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED" : "EXCEEDED");
             }
         }
         renderMoreDataBelowIndicator("TelemetryHUD");
@@ -1123,20 +1132,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 const char* sortModes[] = {
                     "None (Monolithic Shading Kernel)",
                     "Archetype (BSDF Buckets via Wave-Ballot)",
-                    "BDA (Buffer Device Address Lock-Free Queues)",
                     "Dual (3D Spatial-Morton + Material Dual-Binning)"
                 };
-                int currentSort = 3;
+                int currentSort = 2;
                 if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 0;
                 else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 1;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::BDA) currentSort = 2;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 3;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 2;
 
                 if (ImGui::Combo("Material Sort Mode##WfSort", &currentSort, sortModes, IM_ARRAYSIZE(sortModes))) {
                     if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::None;
                     else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
-                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::BDA;
-                    else if (currentSort == 3) config.wavefront_sort_mode = WavefrontSortMode::Dual;
+                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::Dual;
                     settingsChanged = true;
                 }
 
@@ -1144,25 +1150,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Secondary Ray Coherency Sort:");
                 const char* secSortModes[] = {
                     "None (Linear Unsorted Queue)",
-                    "Directional DGC (Producer-Side Binning, 8 Bins)",
-                    "Spatial Morton (512-Bin Global Counting Sort)"
+                    "Directional DGC (Producer-Side Binning, 8 Bins)"
                 };
                 int currentSecSort = 0;
                 if (config.secondary_sort_mode == SecondarySortMode::None) currentSecSort = 0;
                 else if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) currentSecSort = 1;
-                else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) currentSecSort = 2;
 
                 if (ImGui::Combo("Secondary Ray Sort##SecSort", &currentSecSort, secSortModes, IM_ARRAYSIZE(secSortModes))) {
                     if (currentSecSort == 0) config.secondary_sort_mode = SecondarySortMode::None;
                     else if (currentSecSort == 1) config.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
-                    else if (currentSecSort == 2) config.secondary_sort_mode = SecondarySortMode::SpatialIndex;
                     settingsChanged = true;
                 }
 
                 if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 8 Dedicated Octant Sub-Queues (Zero Indirection Buffer, Contiguous)");
-                } else if (config.secondary_sort_mode == SecondarySortMode::SpatialIndex) {
-                    ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "  -> 512 Spatial-Directional Bins (3-Pass Wave32 Counting Sort)");
                 } else {
                     ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
                 }
@@ -1184,23 +1185,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 } else {
                     ImGui::TextDisabled("  -> Default static bound (10,000m)");
                 }
+            }
 
-                // Wavefront Tile Size
-                const char* wfTileSizes[] = {
-                    "Full Frame (Monolithic Queue)",
-                    "256x256 (Cache-Resident)",
-                    "512x512 (Extended Tile)"
-                };
-                int currentWfTile = 0;
-                if (config.wavefront_tile_size == 256) currentWfTile = 1;
-                else if (config.wavefront_tile_size == 512) currentWfTile = 2;
-
-                if (ImGui::Combo("Wavefront Tile Size##WfTile", &currentWfTile, wfTileSizes, IM_ARRAYSIZE(wfTileSizes))) {
-                    if (currentWfTile == 0) config.wavefront_tile_size = 0;
-                    else if (currentWfTile == 1) config.wavefront_tile_size = 256;
-                    else if (currentWfTile == 2) config.wavefront_tile_size = 512;
-                    settingsChanged = true;
-                }
+            ImGui::Spacing();
+            if (ImGui::SliderFloat("Secondary Ray Clamping##IndClamp", &config.indirect_clamp, 0.0f, 200.0f, config.indirect_clamp <= 0.0f ? "Disabled (Unclamped)" : "%.1f cd/m²")) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (config.indirect_clamp > 0.0f) {
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Indirect luminance clamped to %.1f cd/m² (Firefly suppression)", config.indirect_clamp);
+            } else {
+                ImGui::TextDisabled("  -> Unclamped indirect radiance (Pure Monte Carlo)");
             }
 
             ImGui::Spacing();
@@ -1237,6 +1232,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (actions && selectedMode != config.mgpu_mode) {
                     actions->mgpuModeChanged = true;
                     actions->newMgpuMode = selectedMode;
+                    actions->resetAccumulation = true;
                 }
                 config.mgpu_mode = selectedMode;
                 settingsChanged = true;
@@ -1269,14 +1265,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (actions && chosenSize != config.tile_size) {
                         actions->tileSizeChanged = true;
                         actions->newTileSize = chosenSize;
+                        actions->resetAccumulation = true;
                     }
                     config.tile_size = chosenSize;
                     settingsChanged = true;
                 }
             } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-                uint32_t primSpp = (config.spp + 1) / 2;
-                uint32_t secSpp = config.spp / 2;
+                uint32_t currentTotalSpp = config.spp;
+                uint32_t primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
+                uint32_t secSpp = std::max(1u, currentTotalSpp / 2);
                 ImGui::TextDisabled("  Sample Split: GPU 0 = %u SPP, GPU 1 = %u SPP", primSpp, secSpp);
+            }
+            if (config.mgpu_mode != MultiGpuMode::Off && config.upscaler_mode != UpscalerMode::None) {
+                if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) {
+                    ImGui::TextDisabled("  Topology: PostMerge (64x64 tiles merged on GPU0, then upscaled to 4K)");
+                } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
+                    ImGui::TextDisabled("  Topology: SampleBlend (dual passes upscaled independently, averaged on GPU0)");
+                }
             }
 
             // Accumulation format selection
@@ -1429,6 +1434,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("Soft Area Shadows", &config.enable_shadows)) {
                 settingsChanged = true;
             }
+            if (ImGui::Checkbox("Real-Time Caustics (Photon Splatting)", &config.enable_caustics)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Forward ray-traced photon injection and cross-bilateral filtered caustics for dielectric surfaces. Opt-in via --caustics.");
+            }
 
             ImGui::Separator();
             ImGui::TextDisabled("Neural Radiance Caching (Wave32 WMMA):");
@@ -1463,77 +1475,79 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 5. Post-Processing & Denoising
-        if (ImGui::CollapsingHeader("Post-Processing & Denoising", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const char* denoiserModes[] = {
-                "None (Pure Monte Carlo) [Default]",
-                "Temporal Radiance Accumulation (Motion-Vector Guided)",
-                "BMFR (Blockwise Feature Regression) [Experimental]",
-                "Upways Neural Denoiser (Wave32 WMMA)",
-                "Upways Continuous Super-Resolution (2.0x 4K)"
+        // 5. Post-Processing & Reconstruction
+        if (ImGui::CollapsingHeader("Post-Processing & Reconstruction", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const char* upscalerModes[] = {
+                "Off (1:1 Native Presentation)",
+                "AMD FidelityFX Super Resolution 3.1 (FSR 3.1)",
+                "Upways Neural Super-Resolution (Wave32 WMMA)",
+                "AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)"
             };
-            int currentDenoiser = 0;
-            if (config.denoiser_mode == DenoiserMode::Upways) {
-                currentDenoiser = config.upways_superres ? 4 : 3;
-            } else if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
-                currentDenoiser = 2;
-            } else if (config.denoiser_mode == DenoiserMode::Temporal && config.enable_temporal_accum) {
-                currentDenoiser = 1;
-            } else {
-                currentDenoiser = 0;
-            }
+            int currentUpscaler = 0;
+            if (config.upscaler_mode == UpscalerMode::FSR3) currentUpscaler = 1;
+            else if (config.upscaler_mode == UpscalerMode::Upways) currentUpscaler = 2;
+            else if (config.upscaler_mode == UpscalerMode::FSR1) currentUpscaler = 3;
+            else currentUpscaler = 0;
 
-            if (ImGui::Combo("Denoiser Mode", &currentDenoiser, denoiserModes, IM_ARRAYSIZE(denoiserModes))) {
-                if (currentDenoiser == 0) {
-                    config.denoiser_mode = DenoiserMode::None;
-                    config.enable_temporal_accum = false;
-                    config.enable_bmfr = false;
-                } else if (currentDenoiser == 1) {
-                    config.denoiser_mode = DenoiserMode::Temporal;
-                    config.enable_temporal_accum = true;
-                    config.enable_bmfr = false;
-                } else if (currentDenoiser == 2) {
-                    config.denoiser_mode = DenoiserMode::BMFR;
-                    config.enable_temporal_accum = true;
-                    config.enable_bmfr = true;
-                } else if (currentDenoiser == 3) {
-                    config.denoiser_mode = DenoiserMode::Upways;
-                    config.upways_superres = false;
-                    config.enable_temporal_accum = false;
-                    config.enable_bmfr = false;
-                } else if (currentDenoiser == 4) {
-                    config.denoiser_mode = DenoiserMode::Upways;
+            if (ImGui::Combo("Super-Res Upscaler", &currentUpscaler, upscalerModes, IM_ARRAYSIZE(upscalerModes))) {
+                if (currentUpscaler == 1) {
+                    config.upscaler_mode = UpscalerMode::FSR3;
+                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
+                } else if (currentUpscaler == 2) {
+                    config.upscaler_mode = UpscalerMode::Upways;
                     config.upways_superres = true;
-                    config.enable_temporal_accum = false;
-                    config.enable_bmfr = false;
-                }
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select active denoising architecture. None (Pure Monte Carlo) is default for unbiased reference rendering.");
-            }
-
-            if (config.denoiser_mode == DenoiserMode::BMFR || config.enable_bmfr) {
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
-                    "Warning: BMFR uses discrete 8x8 blocks which may exhibit tile seams and edge artifacts during camera motion.");
-            }
-
-            if (ImGui::Checkbox("Temporal Accumulation (Motion-Vector Guided)", &config.enable_temporal_accum)) {
-                if (config.enable_temporal_accum) {
-                    if (config.denoiser_mode == DenoiserMode::None) {
-                        config.denoiser_mode = DenoiserMode::Temporal;
-                    }
+                    if (config.render_scale >= 1.0f) config.render_scale = 0.5000f;
+                } else if (currentUpscaler == 3) {
+                    config.upscaler_mode = UpscalerMode::FSR1;
+                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
                 } else {
-                    if (config.denoiser_mode == DenoiserMode::Temporal) {
-                        config.denoiser_mode = DenoiserMode::None;
-                    }
+                    config.upscaler_mode = UpscalerMode::None;
+                    config.render_scale = 1.0f;
                 }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Motion-vector guided temporal accumulation with neighborhood clamping and wRLS outlier rejection.");
+                ImGui::SetTooltip("Super-resolution reconstruction upscalers: Temporal FSR 3.1, Upways Neural Reconstruction (Wave32 WMMA), or Spatial FSR 1.0.");
+            }
+
+            if (config.upscaler_mode != UpscalerMode::None) {
+                ImGui::Indent();
+                const char* qualityPresets[] = {
+                    "Custom Scale",
+                    "Quality (1.5x - 1440p -> 4K)",
+                    "Balanced (1.7x)",
+                    "Performance (2.0x - 1080p -> 4K)",
+                    "Ultra Performance (3.0x - 720p -> 4K)"
+                };
+                int currentPreset = 0;
+                if (std::abs(config.render_scale - 0.6667f) < 0.01f) currentPreset = 1;
+                else if (std::abs(config.render_scale - 0.5882f) < 0.01f) currentPreset = 2;
+                else if (std::abs(config.render_scale - 0.5000f) < 0.01f) currentPreset = 3;
+                else if (std::abs(config.render_scale - 0.3333f) < 0.01f) currentPreset = 4;
+
+                if (ImGui::Combo("Quality Preset", &currentPreset, qualityPresets, IM_ARRAYSIZE(qualityPresets))) {
+                    if (currentPreset == 1) config.render_scale = 0.6667f;
+                    else if (currentPreset == 2) config.render_scale = 0.5882f;
+                    else if (currentPreset == 3) config.render_scale = 0.5000f;
+                    else if (currentPreset == 4) config.render_scale = 0.3333f;
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+
+                if (ImGui::SliderFloat("Render Scale", &config.render_scale, 0.25f, 1.0f, "%.3fx")) {
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::Checkbox("Enable Sharpening", &config.upscaler_sharpening)) {
+                    settingsChanged = true;
+                }
+                if (config.upscaler_sharpening) {
+                    if (ImGui::SliderFloat("Sharpness", &config.upscaler_sharpness, 0.0f, 1.0f, "%.2f")) {
+                        settingsChanged = true;
+                    }
+                }
+                ImGui::Unindent();
             }
 
             if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
@@ -1576,24 +1590,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 7. Interactive Actions & Telemetry Export
+        // 7. Interactive Actions
         ImGui::Separator();
         if (ImGui::Button("Reset Accumulation", ImVec2(160.0f, 30.0f))) {
             settingsChanged = true;
             if (actions) actions->resetAccumulation = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Export Telemetry (.json)", ImVec2(200.0f, 30.0f))) {
-            std::string path = ImageDumper::generateDefaultTelemetryPath();
-            if (actions) {
-                actions->exportTelemetry = true;
-                actions->exportTelemetryPath = path;
-            }
-            m_lastExportNotification = "Saved: " + path;
-            m_exportNotificationTimer = 4.0f;
-        }
-        if (m_exportNotificationTimer > 0.0f) {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", m_lastExportNotification.c_str());
         }
         renderMoreDataBelowIndicator("ControlPanel");
     }

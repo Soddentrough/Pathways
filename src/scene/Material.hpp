@@ -21,8 +21,20 @@ enum AlphaMode : uint32_t {
 enum MaterialFlags : uint32_t {
     MATERIAL_FLAG_NONE               = 0,
     MATERIAL_FLAG_PROCEDURAL_TERRAIN = (1u << 9),
-    MATERIAL_FLAG_PROCEDURAL_WATER   = (1u << 11)
+    MATERIAL_FLAG_PROCEDURAL_WATER   = (1u << 11),
+    MATERIAL_FLAG_PROCEDURAL_PUDDLE  = (1u << 12),
+    MATERIAL_FLAG_PROCEDURAL_HOLO    = (1u << 13)
 };
+
+inline constexpr uint32_t operator|(MaterialType a, MaterialFlags b) {
+    return static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
+}
+inline constexpr uint32_t operator|(MaterialFlags a, MaterialType b) {
+    return static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
+}
+inline constexpr uint32_t operator|(MaterialFlags a, MaterialFlags b) {
+    return static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
+}
 
 struct MaterialGPU {
     glm::vec4 albedo = glm::vec4(1.0f);        // 16 bytes (offset 0) - baseColorFactor (linear RGBA)

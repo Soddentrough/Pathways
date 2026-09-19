@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Input: Upscaled display-resolution linear HDR radiance
+layout(binding = 0, rgba16f) uniform readonly image2D uUpscaledInput;
+
+// Output: Sharpened display-resolution linear HDR radiance
+layout(binding = 1, rgba16f) uniform writeonly image2D uSharpenedOutput;
+
+layout(push_constant) uniform PushConstants {
+    uint displayWidth;
+    uint displayHeight;
+    float sharpness;       // [0.0 - 1.0]
+    uint enableSharpening; // 1 = enable RCAS, 0 = bypass / passthrough
+} pc;
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= int(pc.displayWidth) || pixelCoord.y >= int(pc.displayHeight)) {
+        return;
+    }
+
+    vec3 e = imageLoad(uUpscaledInput, pixelCoord).rgb;
+    if (pc.enableSharpening == 0u || pc.sharpness <= 1e-4) {
+        // Direct passthrough when sharpening is disabled
+        imageStore(uSharpenedOutput, pixelCoord, vec4(e, 1.0));
+        return;
+    }
+
+    ivec2 maxCoord = ivec2(int(pc.displayWidth) - 1, int(pc.displayHeight) - 1);
+
+    // 5-tap cross pattern
+    //     B
+    //   D E F
+    //     H
+    vec3 b = imageLoad(uUpscaledInput, clamp(pixelCoord + ivec2(0, -1), ivec2(0), maxCoord)).rgb;
+    vec3 d = imageLoad(uUpscaledInput, clamp(pixelCoord + ivec2(-1, 0), ivec2(0), maxCoord)).rgb;
+    vec3 f = imageLoad(uUpscaledInput, clamp(pixelCoord + ivec2(1, 0), ivec2(0), maxCoord)).rgb;
+    vec3 h = imageLoad(uUpscaledInput, clamp(pixelCoord + ivec2(0, 1), ivec2(0), maxCoord)).rgb;
+
+    float bL = luma(b);
+    float dL = luma(d);
+    float eL = luma(e);
+    float fL = luma(f);
+    float hL = luma(h);
+
+    // 1. Evaluate local neighborhood contrast
+    float minL = min(min(min(bL, dL), min(fL, hL)), eL);
+    float maxL = max(max(max(bL, dL), max(fL, hL)), eL);
+    float contrast = (maxL - minL) / max(maxL + minL, 1e-4);
+
+    // 2. High-frequency 4-neighbor laplacian delta
+    vec3 laplacian = (b + d + f + h) * 0.25 - e;
+
+    // 3. AMD FSR Noise detection: attenuate sharpening on high-contrast noise spikes
+    float nz = (bL + dL + fL + hL) * 0.25 - eL;
+    float rangeL = maxL - minL;
+    float noiseFactor = clamp(1.0 - abs(nz) / max(rangeL, 1e-4), 0.0, 1.0);
+
+    // 4. Adaptive sharpening factor
+    float factor = clamp(pc.sharpness * 0.30 * (1.0 - contrast * 0.5) * noiseFactor, 0.0, 0.20);
+    vec3 sharpened = e - factor * laplacian;
+
+    // 5. Bound strictly within local neighbors: eliminate ringing and peak overshoot
+    vec3 mn = min(min(min(b, d), min(f, h)), e);
+    vec3 mx = max(max(max(b, d), max(f, h)), e);
+    vec3 result = clamp(sharpened, mn, mx);
+
+    // Sanitize NaNs and infinities
+    if (isnan(result.r) || isnan(result.g) || isnan(result.b) ||
+        isinf(result.r) || isinf(result.g) || isinf(result.b)) {
+        result = e;
+    }
+
+    imageStore(uSharpenedOutput, pixelCoord, vec4(result, 1.0));
+}

@@ -13,8 +13,10 @@ UpwaysPipeline::UpwaysPipeline(
     VkDevice device,
     VkPhysicalDevice physicalDevice,
     VmaAllocator allocator,
-    uint32_t width,
-    uint32_t height,
+    uint32_t inputWidth,
+    uint32_t inputHeight,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
     const std::vector<char>& shaderSpv,
     const std::string& weightsPath,
     bool enableSuperRes,
@@ -22,17 +24,16 @@ UpwaysPipeline::UpwaysPipeline(
 ) : m_device(device),
     m_physDevice(physicalDevice),
     m_allocator(allocator),
-    m_inputWidth(width),
-    m_inputHeight(height),
+    m_inputWidth(inputWidth),
+    m_inputHeight(inputHeight),
+    m_outputWidth(outputWidth),
+    m_outputHeight(outputHeight),
     m_superRes(enableSuperRes),
     m_format(imageFormat)
 {
-    m_outputWidth = m_superRes ? (m_inputWidth * 2) : m_inputWidth;
-    m_outputHeight = m_superRes ? (m_inputHeight * 2) : m_inputHeight;
-
     Logger::info("UpwaysPipeline initializing: Input {}x{}, Output {}x{} (SuperRes: {}), Format: {}",
                  m_inputWidth, m_inputHeight, m_outputWidth, m_outputHeight,
-                 m_superRes ? "2.0x" : "1.0x (Native)", static_cast<int>(m_format));
+                 m_superRes ? "Enabled" : "1.0x (Native)", static_cast<int>(m_format));
 
     initBuffers(weightsPath);
     initImages();
@@ -70,11 +71,12 @@ void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
     if (!weightsPath.empty()) {
         candidates.push_back(weightsPath);
     }
+    candidates.push_back("/home/naoki/Development/Upways/checkpoints/neural_reconstruct_run/upways_weights.bin");
     candidates.push_back("data/models/upways_weights.bin");
     candidates.push_back("../data/models/upways_weights.bin");
     candidates.push_back("../../data/models/upways_weights.bin");
     candidates.push_back("../../../data/models/upways_weights.bin");
-    candidates.push_back("/home/naoki/Development/Pathways/data/models/upways_weights.bin");
+    candidates.push_back("/home/naoki/Development/Upways/checkpoints/upways3_multiscale_kpn/vulkan_export/upways_v3_weights.bin");
     candidates.push_back("/home/naoki/Development/Upways/checkpoints/run_multiscene_superres/vulkan_export/upways_weights.bin");
     candidates.push_back("upways_weights.bin");
 
@@ -134,7 +136,13 @@ void UpwaysPipeline::initImages() {
     );
 
     for (int i = 0; i < 2; ++i) {
-        m_historyImages[i] = std::make_unique<Image>(
+        m_diffHistoryImages[i] = std::make_unique<Image>(
+            m_device, m_allocator,
+            m_outputWidth, m_outputHeight,
+            m_format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+        m_specHistoryImages[i] = std::make_unique<Image>(
             m_device, m_allocator,
             m_outputWidth, m_outputHeight,
             m_format,
@@ -158,8 +166,15 @@ void UpwaysPipeline::transitionInitialLayouts(VkCommandBuffer cmd) {
     }
 
     for (int i = 0; i < 2; ++i) {
-        if (m_historyImages[i]) {
-            m_historyImages[i]->transitionLayout(
+        if (m_diffHistoryImages[i]) {
+            m_diffHistoryImages[i]->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
+        if (m_specHistoryImages[i]) {
+            m_specHistoryImages[i]->transitionLayout(
                 cmd, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
@@ -171,7 +186,7 @@ void UpwaysPipeline::transitionInitialLayouts(VkCommandBuffer cmd) {
 }
 
 void UpwaysPipeline::createDescriptorSetLayout() {
-    // 11 Bindings:
+    // 13 Bindings:
     // 0: uAccumImage
     // 1: uNormalDepthImage
     // 2: uMotionVectorImage
@@ -179,22 +194,24 @@ void UpwaysPipeline::createDescriptorSetLayout() {
     // 4: uSpecularMotionImage
     // 5: uDiffuseImage
     // 6: uSpecularImage
-    // 7: uHistoryImage (read)
-    // 8: uOutputImage (write)
-    // 9: uHistoryOutputImage (write)
-    // 10: uWeightBuffer
-    std::vector<VkDescriptorSetLayoutBinding> bindings(11);
-    for (uint32_t i = 0; i < 10; ++i) {
+    // 7: uDiffHistoryImage (read)
+    // 8: uSpecHistoryImage (read)
+    // 9: uOutputImage (write)
+    // 10: uDiffHistoryOutputImage (write)
+    // 11: uSpecHistoryOutputImage (write)
+    // 12: uWeightBuffer
+    std::vector<VkDescriptorSetLayoutBinding> bindings(13);
+    for (uint32_t i = 0; i < 12; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
-    bindings[10].binding = 10;
-    bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[10].descriptorCount = 1;
-    bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[12].binding = 12;
+    bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[12].descriptorCount = 1;
+    bindings[12].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -208,7 +225,7 @@ void UpwaysPipeline::createDescriptorSetLayout() {
 void UpwaysPipeline::allocateDescriptorSets() {
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 20; // 10 per set * 2
+    poolSizes[0].descriptorCount = 24; // 12 per set * 2
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     poolSizes[1].descriptorCount = 2;
 
@@ -241,7 +258,10 @@ void UpwaysPipeline::updateDescriptors(
     VkImageView diffuseImageView,
     VkImageView specularImageView
 ) {
-    if (accumImageView == VK_NULL_HANDLE || !m_outputImage || !m_historyImages[0] || !m_historyImages[1] || !m_weightBuffer) {
+    if (accumImageView == VK_NULL_HANDLE || !m_outputImage ||
+        !m_diffHistoryImages[0] || !m_diffHistoryImages[1] ||
+        !m_specHistoryImages[0] || !m_specHistoryImages[1] ||
+        !m_weightBuffer) {
         return;
     }
 
@@ -260,8 +280,10 @@ void UpwaysPipeline::updateDescriptors(
         int readSlot = pingPong;
         int writeSlot = 1 - pingPong;
 
-        VkDescriptorImageInfo histReadInfo{ VK_NULL_HANDLE, m_historyImages[readSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo histWriteInfo{ VK_NULL_HANDLE, m_historyImages[writeSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo diffHistReadInfo{ VK_NULL_HANDLE, m_diffHistoryImages[readSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo specHistReadInfo{ VK_NULL_HANDLE, m_specHistoryImages[readSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo diffHistWriteInfo{ VK_NULL_HANDLE, m_diffHistoryImages[writeSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo specHistWriteInfo{ VK_NULL_HANDLE, m_specHistoryImages[writeSlot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
         std::vector<VkWriteDescriptorSet> writes;
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr });
@@ -271,10 +293,12 @@ void UpwaysPipeline::updateDescriptors(
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histReadInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histWriteInfo, nullptr, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightBufInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffHistReadInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specHistReadInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffHistWriteInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specHistWriteInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSets[pingPong], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightBufInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -328,22 +352,31 @@ void UpwaysPipeline::createPipeline(const std::vector<char>& shaderSpv) {
     vkDestroyShaderModule(m_device, compModule, nullptr);
 }
 
-void UpwaysPipeline::resize(uint32_t width, uint32_t height) {
-    m_inputWidth = width;
-    m_inputHeight = height;
-    m_outputWidth = m_superRes ? (m_inputWidth * 2) : m_inputWidth;
-    m_outputHeight = m_superRes ? (m_inputHeight * 2) : m_inputHeight;
+void UpwaysPipeline::resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes) {
+    m_inputWidth = inputWidth;
+    m_inputHeight = inputHeight;
+    m_outputWidth = outputWidth;
+    m_outputHeight = outputHeight;
+    m_superRes = enableSuperRes;
 
     initImages();
     // Note: Descriptors are updated by the host Engine via updateDescriptors() with freshly created image views.
-    Logger::info("UpwaysPipeline resized: Input {}x{}, Output {}x{}", m_inputWidth, m_inputHeight, m_outputWidth, m_outputHeight);
+    Logger::info("UpwaysPipeline resized: Input {}x{}, Output {}x{} (SuperRes: {}), Format: {}",
+                 m_inputWidth, m_inputHeight, m_outputWidth, m_outputHeight,
+                 m_superRes ? "Enabled" : "1.0x (Native)", static_cast<int>(m_format));
 }
 
 void UpwaysPipeline::recordFrame(
     VkCommandBuffer cmd,
     uint32_t frameIndex,
     bool resetHistory,
-    bool cameraMoved
+    bool cameraMoved,
+    int32_t tileOffsetX,
+    int32_t tileOffsetY,
+    int32_t tileWidth,
+    int32_t tileHeight,
+    int32_t apronWidth,
+    uint32_t totalSamples
 ) {
     if (!m_pipeline || !m_outputImage) return;
 
@@ -365,14 +398,22 @@ void UpwaysPipeline::recordFrame(
     pc.invInputHeight = 1.0f / static_cast<float>(m_inputHeight);
     pc.invOutputWidth = 1.0f / static_cast<float>(m_outputWidth);
     pc.invOutputHeight = 1.0f / static_cast<float>(m_outputHeight);
+    pc.tileOffsetX = tileOffsetX;
+    pc.tileOffsetY = tileOffsetY;
+    pc.tileWidth = (tileWidth > 0) ? tileWidth : static_cast<int32_t>(m_outputWidth);
+    pc.tileHeight = (tileHeight > 0) ? tileHeight : static_cast<int32_t>(m_outputHeight);
+    pc.apronWidth = apronWidth;
+    pc.scaleFactorX = m_superRes ? (static_cast<float>(m_outputWidth) / static_cast<float>(m_inputWidth)) : 1.0f;
+    pc.scaleFactorY = m_superRes ? (static_cast<float>(m_outputHeight) / static_cast<float>(m_inputHeight)) : 1.0f;
     pc.frameIndex = frameIndex;
     pc.resetHistory = resetHistory ? 1u : 0u;
     pc.cameraMoved = cameraMoved ? 1u : 0u;
     pc.superResMode = m_superRes ? 1u : 0u;
-    pc.depthThreshold = 0.05f;
-    pc.normalThreshold = 0.70f;
     pc.blendAlpha = 0.08f;
-    pc.pad = 0;
+    pc.minTau = 0.08f;
+    pc.learnedDemod = 1u;
+    pc.totalSamples = std::max(totalSamples, 1u);
+    pc.invTotalSamples = 1.0f; // Input accumulation buffer is already normalized running average
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
@@ -382,7 +423,7 @@ void UpwaysPipeline::recordFrame(
     vkCmdDispatch(cmd, groupsX, 1, 1);
 
     // Memory barriers ensuring downstream compute (tonemapper) and subsequent history reads observe writes
-    VkImageMemoryBarrier2 postBarriers[2]{};
+    VkImageMemoryBarrier2 postBarriers[3]{};
     postBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     postBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     postBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -401,11 +442,21 @@ void UpwaysPipeline::recordFrame(
     postBarriers[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     postBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     postBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarriers[1].image = m_historyImages[outHistSlot]->getImage();
+    postBarriers[1].image = m_diffHistoryImages[outHistSlot]->getImage();
     postBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
+    postBarriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    postBarriers[2].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarriers[2].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarriers[2].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarriers[2].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    postBarriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBarriers[2].image = m_specHistoryImages[outHistSlot]->getImage();
+    postBarriers[2].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
     VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = 2;
+    dep.imageMemoryBarrierCount = 3;
     dep.pImageMemoryBarriers = postBarriers;
     vkCmdPipelineBarrier2(cmd, &dep);
 

@@ -37,8 +37,10 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     return VK_FALSE;
 }
 
-VulkanContext::VulkanContext(const Config& config, VkSurfaceKHR surface) {
-    Logger::info("Initializing Vulkan 1.4 Context...");
+VulkanContext::VulkanContext(const Config& config, VkSurfaceKHR surface, const std::string& contextRole)
+    : m_contextRole(contextRole)
+{
+    Logger::info("Initializing Vulkan 1.4 Context [{}]...", m_contextRole);
     createInstance(config);
     if (config.validation_layers) {
         setupDebugMessenger();
@@ -46,11 +48,11 @@ VulkanContext::VulkanContext(const Config& config, VkSurfaceKHR surface) {
     selectPhysicalDevice(config, surface);
     createLogicalDevice(config);
     initVMA();
-    Logger::info("Vulkan 1.4 Context successfully initialized on: {}", m_deviceName);
+    Logger::info("Vulkan 1.4 Context [{}] successfully initialized on: {}", m_contextRole, m_deviceName);
 }
 
 VulkanContext::~VulkanContext() {
-    Logger::info("Destroying Vulkan Context...");
+    Logger::info("Destroying Vulkan Context [{}]...", m_contextRole);
     if (m_allocator) {
         vmaDestroyAllocator(m_allocator);
     }
@@ -165,7 +167,7 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         throw std::runtime_error("No Vulkan physical devices found!");
     }
 
-    Logger::info("Enumerated {} physical Vulkan device(s):", devices.size());
+    Logger::info("[{}] Enumerated {} physical Vulkan device(s):", m_contextRole, devices.size());
     for (size_t i = 0; i < devices.size(); ++i) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);

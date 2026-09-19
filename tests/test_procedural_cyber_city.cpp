@@ -65,10 +65,10 @@ int main() {
         check_true(mat.roughness >= 0.0f && mat.roughness <= 1.0f, "Valid roughness");
         check_true(mat.metallic >= 0.0f && mat.metallic <= 1.0f, "Valid metallic");
 
-        if (mat.type == MATERIAL_METALLIC) hasMetallic = true;
-        if (mat.type == MATERIAL_DIELECTRIC) hasDielectric = true;
-        if (mat.type == MATERIAL_EMISSIVE) hasEmissive = true;
-        if (mat.type == MATERIAL_DIFFUSE) hasDiffuse = true;
+        if ((mat.type & 0xFFu) == MATERIAL_METALLIC) hasMetallic = true;
+        if ((mat.type & 0xFFu) == MATERIAL_DIELECTRIC) hasDielectric = true;
+        if ((mat.type & 0xFFu) == MATERIAL_EMISSIVE) hasEmissive = true;
+        if ((mat.type & 0xFFu) == MATERIAL_DIFFUSE) hasDiffuse = true;
         if (!materialUsed[m]) {
             std::cerr << "Material " << m << " was not used in any prototype triangle!" << std::endl;
         }

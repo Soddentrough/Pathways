@@ -161,6 +161,7 @@ layout(push_constant) uniform PushConstants {
     uint frameIndex;
     uint numOpaqueTriangles;
     uint captureMlData;
+    float indirectClamp;
 } pc;
 
 void main() {
@@ -208,10 +209,11 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
+            vec3 skyContrib = vec3(throughput) * skyColor;
             if (bounce > 0u) {
-                skyColor = min(skyColor, vec3(30.0));
+                skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
             }
-            accumRadiance += vec3(throughput) * skyColor;
+            accumRadiance += skyContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
@@ -349,6 +351,9 @@ void main() {
                     vec3 causticIrr = imageLoad(uCausticImage, pCoord).rgb;
                     if (dot(causticIrr, causticIrr) > 1e-8) {
                         vec3 causticRad = vec3(throughput) * (vec3(diffuseColor) * INV_PI) * causticIrr;
+                        if (bounce > 0u) {
+                            causticRad = clampIndirectRadiance(causticRad, pc.indirectClamp);
+                        }
                         accumRadiance += causticRad;
                         rawPixel |= CAUSTIC_APPLIED_BIT;
                         if (pc.captureMlData != 0u) {
@@ -432,7 +437,7 @@ void main() {
                         float factor = (NdotL / lightPdfEff) * misWeight;
                         vec3 directLightRadiance = clamp(lightEmission * factor, vec3(0.0), vec3(65500.0));
                         secDirectL = baseBrdf * f16vec3(directLightRadiance);
-                        f16vec3 unshadowed = throughput * secDirectL;
+                        f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, pc.indirectClamp);
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
@@ -595,10 +600,11 @@ void main() {
                         float risWeight = totalWeightSum / (float(M) * selectedTarget);
                         float factor = selectedNdotL * misWeight * risWeight;
                         vec3 directLightRadiance = clamp(selectedLightEmission * factor, vec3(0.0), vec3(65500.0));
-                        f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
-                        f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
-                        secDirectL = diffUnshadowed + specUnshadowed;
-                        f16vec3 unshadowed = secDirectL;
+                        secDirectL = (diffBrdf + specBrdf) * f16vec3(directLightRadiance);
+                        f16vec3 unshadowed = throughput * secDirectL;
+                        if (bounce > 0u) {
+                            unshadowed = clampIndirectRadiance(unshadowed, pc.indirectClamp);
+                        }
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             if (enableShadows) {
@@ -611,6 +617,12 @@ void main() {
                                         vec4 prev = imageLoad(uAccumImage, pixelCoord);
                                         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
                                         if (pc.captureMlData != 0u) {
+                                            f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
+                                            f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
+                                            if (bounce > 0u) {
+                                                diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
+                                                specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
+                                            }
                                             if (isSpecularPath) {
                                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
@@ -621,6 +633,8 @@ void main() {
                                                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), 0.0));
                                             }
                                         }
+                                    } else {
+                                        secDirectL = f16vec3(0.0);
                                     }
                                 } else {
                                     hasShadowRay = true;
@@ -670,12 +684,25 @@ void main() {
                 if (isTrain) {
                     uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
                     if (trainIdx < pc.maxQueueCapacity) {
+                        vec3 targetRad = vec3(secDirectL);
+#if !IS_SECONDARY_BOUNCE
+                        if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
+                            vec3 sOrigin = shadowCandidate.originDist.xyz;
+                            float sDist = shadowCandidate.originDist.w;
+                            vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
+                            bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
+                                                                 (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                            if (occluded) {
+                                targetRad = vec3(0.0);
+                            }
+                        }
+#endif
                         nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
                         nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
                         nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
                         nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
                         nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput), 0.0);
-                        nrcTrainRecords[trainIdx].targetRadiance = vec4(vec3(secDirectL), 0.0);
+                        nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad, 0.0);
                     }
                 } else {
                     uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);

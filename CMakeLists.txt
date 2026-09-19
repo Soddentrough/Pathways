@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.22.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.23.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -131,10 +131,7 @@ file(MAKE_DIRECTORY ${BIN_SPV_DIR})
 set(SHADER_FILES
     ${SHADER_DIR}/compute/tonemap_aces.comp
     ${SHADER_DIR}/compute/accum_merge.comp
-    ${SHADER_DIR}/compute/ffx_shadow_tileclassify.comp
-    ${SHADER_DIR}/compute/ffx_shadow_filter.comp
-    ${SHADER_DIR}/compute/temporal_accum.comp
-    ${SHADER_DIR}/compute/bmfr_regression.comp
+    ${SHADER_DIR}/compute/accum_running_avg.comp
     ${SHADER_DIR}/compute/wavefront_classify.comp
     ${SHADER_DIR}/compute/wavefront_intersect.comp
     ${SHADER_DIR}/compute/wavefront_shade.comp
@@ -145,7 +142,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_emissive.comp
     ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
-    ${SHADER_DIR}/compute/wavefront_raysort.comp
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
@@ -155,6 +151,10 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_persistent.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/upways_reconstruct.comp
+    ${SHADER_DIR}/compute/neural_reconstruct.comp
+    ${SHADER_DIR}/compute/fsr3_upscale.comp
+    ${SHADER_DIR}/compute/fsr3_rcas.comp
+    ${SHADER_DIR}/compute/fsr3_blend.comp
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
@@ -386,20 +386,7 @@ endif()
 add_test(NAME GuiScroll COMMAND test_gui_scroll)
 
 
-# FidelityFX Shadow Denoiser Unit Test Target
-add_executable(test_shadow_denoiser
-    tests/test_shadow_denoiser.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_shadow_denoiser PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-if(UNIX)
-    target_link_libraries(test_shadow_denoiser PRIVATE m)
-endif()
-add_test(NAME ShadowDenoiser COMMAND test_shadow_denoiser)
+
 
 # Temporal Anti-Aliasing (TAA) Unit Test Target
 add_executable(test_taa
@@ -498,6 +485,9 @@ target_include_directories(test_upways_pipeline PRIVATE
 )
 target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
+add_test(NAME VisualIntegrity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_visual_integrity.py)
+
+
 
 # DGC Multi-Slice Ring Buffer & Dedicated Compute Queue Unit Test Target
 add_executable(test_dgc_async_queue

@@ -76,42 +76,8 @@ void main() {
         return;
     }
 
-    // 2. 5x5 Cross-Bilateral Spatial Reconstruction completely out of on-chip LDS
-    vec3 accumIrr = vec3(0.0);
-    float totalWeight = 0.0;
-
-    const float sigmaDepth = max(centerDepth * 0.05, 0.02);
-    const float sigmaNorm = 16.0;
-    const float kernelWeights[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
-
-    [[unroll]] for (int dy = -2; dy <= 2; ++dy) {
-        float wy = kernelWeights[dy + 2];
-        int ty = smY + dy;
-
-        [[unroll]] for (int dx = -2; dx <= 2; ++dx) {
-            float wx = kernelWeights[dx + 2];
-            int tx = smX + dx;
-
-            vec3 tapRawIrr = s_rawIrr[ty][tx];
-            vec4 tapGbuf = s_normDepth[ty][tx];
-            vec3 tapNorm = tapGbuf.xyz;
-            float tapDepth = tapGbuf.w;
-
-            // Depth difference weight
-            float depthDiff = abs(centerDepth - tapDepth);
-            float wDepth = exp(-depthDiff / sigmaDepth);
-
-            // Normal cosine similarity weight
-            float normDot = max(0.0, dot(centerNorm, tapNorm));
-            float wNorm = pow(normDot, sigmaNorm);
-
-            float weight = (wx * wy) * wDepth * wNorm;
-            accumIrr += tapRawIrr * weight;
-            totalWeight += weight;
-        }
-    }
-
-    vec3 spatialFiltered = (totalWeight > 1e-4) ? (accumIrr / totalWeight) : centerRawIrr;
+    // Raw caustic irradiance without heuristic 5x5 cross-bilateral filter
+    vec3 spatialFiltered = centerRawIrr;
 
     // 2. Motion-Vector Guided Temporal Accumulation
     vec3 finalIrr = spatialFiltered;

@@ -74,13 +74,16 @@ void main() {
 
             vec3 normPos = clamp((q.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
 
-            // Multi-frequency spatial encoding (24 features, 0 VRAM memory stalls)
-            for (uint l = 0u; l < NRC_LEVELS; ++l) {
-                float freq = float(1 << l);
-                vec3 p = normPos * freq;
-                vec2 f = vec2(sin(p.x + p.y), cos(p.y + p.z));
-                s_layer0[tid * 64u + l * 2u + 0u] = float16_t(f.x);
-                s_layer0[tid * 64u + l * 2u + 1u] = float16_t(f.y);
+            // Independent multi-frequency sinusoidal spatial encoding (24 features: 3 axes x 4 octaves x 2 (sin/cos))
+            const float PI = 3.14159265359;
+            for (uint axis = 0u; axis < 3u; ++axis) {
+                float coord = normPos[axis];
+                for (uint l = 0u; l < 4u; ++l) {
+                    float freq = float(1 << l) * PI;
+                    uint baseIdx = axis * 8u + l * 2u;
+                    s_layer0[tid * 64u + baseIdx + 0u] = float16_t(sin(coord * freq));
+                    s_layer0[tid * 64u + baseIdx + 1u] = float16_t(cos(coord * freq));
+                }
             }
 
             // Normal (channels 24..26)
@@ -184,8 +187,12 @@ void main() {
 
     // 6. Write final predicted radiance to 32-bit fixed-point atomic buffer (CRIT-05)
     if (tid < 16u && s_valid[tid]) {
-        vec3 predRadiance = max(vec3(0.0), vec3(float(s_output[tid * 16u + 0u]), float(s_output[tid * 16u + 1u]), float(s_output[tid * 16u + 2u])));
-        vec3 radiance = s_throughput[tid] * predRadiance;
+        vec3 rawPred = vec3(float(s_output[tid * 16u + 0u]), float(s_output[tid * 16u + 1u]), float(s_output[tid * 16u + 2u]));
+        if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
+        if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
+        if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
+        vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(50.0));
+        vec3 radiance = clamp(s_throughput[tid] * predRadiance, vec3(0.0), vec3(50.0));
 
         if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
         if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;

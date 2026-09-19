@@ -150,6 +150,7 @@ layout(push_constant) uniform PushConstants {
     uint frameIndex;
     uint numOpaqueTriangles;
     uint captureMlData;
+    float indirectClamp;
 } pc;
 
 void main() {
@@ -197,7 +198,11 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            accumRadiance += throughput * skyColor;
+            vec3 skyContrib = throughput * skyColor;
+            if (bounce > 0u) {
+                skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
+            }
+            accumRadiance += skyContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
@@ -468,6 +473,11 @@ void main() {
                             vec3 specUnshadowed = throughput * selectedLightEmission * selectedSpecBrdf * factor;
                             secDirectL = diffUnshadowed + specUnshadowed;
                             vec3 unshadowed = secDirectL;
+                            if (bounce > 0u) {
+                                unshadowed = clampIndirectRadiance(unshadowed, pc.indirectClamp);
+                                diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
+                                specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
+                            }
 
                             if (any(greaterThan(unshadowed, vec3(1e-5)))) {
                                 if (enableShadows) {

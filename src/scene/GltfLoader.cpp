@@ -1029,8 +1029,15 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     }
 
     // If the glTF had neither punctual lights nor physical emissive mesh lights,
-    // add an overhead area light scaled to the model dimensions as fallback
+    // add a directional sun light matching the procedural sky dome and an overhead area light
     if (data.lights.empty()) {
+        glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
+        LightGPU sunLight{};
+        sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
+        sunLight.normal = glm::vec4(sunDir, 0.0f);
+        sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
+        data.lights.push_back(sunLight);
+
         float lightSide = maxDim * 0.6f;
         float lightY = maxBound.y + maxDim * 0.5f;
         LightGPU defaultLight{};
@@ -1041,6 +1048,7 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         float area = lightSide * lightSide;
         defaultLight.emission = glm::vec4(25.0f, 25.0f, 25.0f, area);
         data.lights.push_back(defaultLight);
+        Logger::info("GltfLoader: Scene had no lights; generated directional sun and overhead area light fallback");
     }
 
     Logger::info("GltfLoader generated SceneData: {} Triangles, {} Spheres, {} Materials, {} Lights",

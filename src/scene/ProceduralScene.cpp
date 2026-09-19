@@ -635,14 +635,13 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     mat3.type = MATERIAL_METALLIC;
     materials.push_back(mat3);
 
-    // 4: Wet Reflective Plaza Pavement (Diffuse + High Clearcoat)
+    // 4: Wet Reflective Plaza Pavement (Diffuse + Procedural Puddle Mask)
     MaterialGPU mat4{};
     mat4.albedo = glm::vec4(0.06f, 0.06f, 0.08f, 1.0f);
-    mat4.roughness = 0.16f;
-    mat4.metallic = 0.10f;
-    mat4.clearcoat = 0.98f;
-    mat4.clearcoatRoughness = 0.02f;
-    mat4.type = MATERIAL_DIFFUSE;
+    mat4.roughness = 0.35f;
+    mat4.metallic = 0.0f;
+    mat4.clearcoat = 0.0f;
+    mat4.type = MATERIAL_DIFFUSE | MATERIAL_FLAG_PROCEDURAL_PUDDLE;
     materials.push_back(mat4);
 
     // 5: Transmissive Structural Crown Glass (Dielectric Refraction)
@@ -799,14 +798,13 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     materials.push_back(mat19);
 
     // --- 20 to 29: Secondary Composites, Utilities & Fabrics ---
-    // 20: Carbon Fiber Weave (Metallic + Clearcoat)
+    // 20: Dark Asphalt Roadway Surface (Diffuse + Procedural Puddle Mask)
     MaterialGPU mat20{};
-    mat20.albedo = glm::vec4(0.12f, 0.12f, 0.13f, 1.0f);
-    mat20.roughness = 0.38f;
-    mat20.metallic = 0.40f;
-    mat20.clearcoat = 0.60f;
-    mat20.clearcoatRoughness = 0.10f;
-    mat20.type = MATERIAL_METALLIC;
+    mat20.albedo = glm::vec4(0.07f, 0.07f, 0.08f, 1.0f);
+    mat20.roughness = 0.55f;
+    mat20.metallic = 0.0f;
+    mat20.clearcoat = 0.0f;
+    mat20.type = MATERIAL_DIFFUSE | MATERIAL_FLAG_PROCEDURAL_PUDDLE;
     materials.push_back(mat20);
 
     // 21: Weathered Rusted Iron (Diffuse Rough)
@@ -889,24 +887,25 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
 
     // --- 30 to 47: 18 Spectral Emissive Neons, Lasers & Displays ---
     // 30: Neon Cyan 480nm
+    // 30: Neon Cyan 480nm (Holographic Billboard / Conduit)
     MaterialGPU mat30{};
     mat30.albedo = glm::vec4(0.1f, 0.8f, 1.0f, 1.0f);
     mat30.emissive = glm::vec4(2.0f, 32.0f, 42.0f, 1.0f);
-    mat30.type = MATERIAL_EMISSIVE;
+    mat30.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
     materials.push_back(mat30);
 
-    // 31: Neon Magenta 650nm
+    // 31: Neon Magenta 650nm (Holographic Billboard)
     MaterialGPU mat31{};
     mat31.albedo = glm::vec4(1.0f, 0.1f, 0.6f, 1.0f);
     mat31.emissive = glm::vec4(42.0f, 2.0f, 22.0f, 1.0f);
-    mat31.type = MATERIAL_EMISSIVE;
+    mat31.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
     materials.push_back(mat31);
 
-    // 32: Neon Blaze Orange 600nm
+    // 32: Neon Blaze Orange 600nm (Holographic Billboard)
     MaterialGPU mat32{};
     mat32.albedo = glm::vec4(1.0f, 0.4f, 0.05f, 1.0f);
     mat32.emissive = glm::vec4(45.0f, 15.0f, 1.5f, 1.0f);
-    mat32.type = MATERIAL_EMISSIVE;
+    mat32.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
     materials.push_back(mat32);
 
     // 33: Neon Acid Green 520nm
@@ -930,11 +929,11 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     mat35.type = MATERIAL_EMISSIVE;
     materials.push_back(mat35);
 
-    // 36: Deep Violet Holo-Display 405nm
+    // 36: Deep Violet Holo-Display 405nm (Holographic Billboard)
     MaterialGPU mat36{};
     mat36.albedo = glm::vec4(0.7f, 0.1f, 1.0f, 1.0f);
     mat36.emissive = glm::vec4(25.0f, 2.0f, 45.0f, 1.0f);
-    mat36.type = MATERIAL_EMISSIVE;
+    mat36.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
     materials.push_back(mat36);
 
     // 37: Deep Cobalt Blue 450nm
@@ -948,7 +947,7 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     MaterialGPU mat38{};
     mat38.albedo = glm::vec4(1.0f, 0.2f, 0.7f, 1.0f);
     mat38.emissive = glm::vec4(48.0f, 8.0f, 32.0f, 1.0f);
-    mat38.type = MATERIAL_EMISSIVE;
+    mat38.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
     materials.push_back(mat38);
 
     // 39: Mint Phosphor Luminescence
@@ -2060,7 +2059,7 @@ SceneData ProceduralScene::createCyberCityScene() {
             blasMax[b] = glm::max(blasMax[b], glm::max(v0, glm::max(v1, v2)));
 
             if (tri.materialId < scene.materials.size() &&
-                scene.materials[tri.materialId].type == MATERIAL_DIELECTRIC) {
+                (scene.materials[tri.materialId].type & 0xFFu) == MATERIAL_DIELECTRIC) {
                 blasHasDielectric[b] = true;
                 blasDMin[b] = glm::min(blasDMin[b], glm::min(v0, glm::min(v1, v2)));
                 blasDMax[b] = glm::max(blasDMax[b], glm::max(v0, glm::max(v1, v2)));
@@ -2113,8 +2112,8 @@ SceneData ProceduralScene::createCyberCityScene() {
     }
 
     scene.hasCamera = true;
-    scene.cameraPosition = glm::vec3(0.0f, 32.0f, 60.0f);
-    scene.cameraTarget = glm::vec3(0.0f, 25.0f, -40.0f);
+    scene.cameraPosition = glm::vec3(-7.0f, 28.0f, 42.0f);
+    scene.cameraTarget = glm::vec3(6.0f, 22.0f, -30.0f);
     scene.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
     scene.cameraFov = 62.0f;
     scene.focalDistance = glm::length(scene.cameraPosition - scene.cameraTarget);

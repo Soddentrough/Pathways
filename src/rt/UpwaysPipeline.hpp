@@ -22,14 +22,22 @@ struct UpwaysPushConstants {
     float invInputHeight;
     float invOutputWidth;
     float invOutputHeight;
+    int32_t tileOffsetX;
+    int32_t tileOffsetY;
+    int32_t tileWidth;
+    int32_t tileHeight;
+    int32_t apronWidth;
+    float scaleFactorX;
+    float scaleFactorY;
     uint32_t frameIndex;
     uint32_t resetHistory;
     uint32_t cameraMoved;
-    uint32_t superResMode;      // 0 = 1:1 Denoising, 1 = 2x Super-Resolution
-    float depthThreshold;
-    float normalThreshold;
+    uint32_t superResMode;
     float blendAlpha;
-    uint32_t pad;
+    float minTau;
+    uint32_t learnedDemod;
+    float invTotalSamples;
+    uint32_t totalSamples;
 };
 
 class UpwaysPipeline {
@@ -38,8 +46,10 @@ public:
         VkDevice device,
         VkPhysicalDevice physicalDevice,
         VmaAllocator allocator,
-        uint32_t width,
-        uint32_t height,
+        uint32_t inputWidth,
+        uint32_t inputHeight,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
         const std::vector<char>& shaderSpv,
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
@@ -50,7 +60,7 @@ public:
     UpwaysPipeline(const UpwaysPipeline&) = delete;
     UpwaysPipeline& operator=(const UpwaysPipeline&) = delete;
 
-    void resize(uint32_t width, uint32_t height);
+    void resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes);
     void updateDescriptors(
         VkImageView accumImageView,
         VkImageView normalDepthImageView,
@@ -65,7 +75,13 @@ public:
         VkCommandBuffer cmd,
         uint32_t frameIndex,
         bool resetHistory,
-        bool cameraMoved
+        bool cameraMoved,
+        int32_t tileOffsetX = 0,
+        int32_t tileOffsetY = 0,
+        int32_t tileWidth = 0,
+        int32_t tileHeight = 0,
+        int32_t apronWidth = 0,
+        uint32_t totalSamples = 1
     );
 
     void transitionInitialLayouts(VkCommandBuffer cmd);
@@ -101,7 +117,8 @@ private:
 
     std::unique_ptr<Buffer> m_weightBuffer;
     std::unique_ptr<Image> m_outputImage;
-    std::unique_ptr<Image> m_historyImages[2];
+    std::unique_ptr<Image> m_diffHistoryImages[2];
+    std::unique_ptr<Image> m_specHistoryImages[2];
 
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_descLayout = VK_NULL_HANDLE;

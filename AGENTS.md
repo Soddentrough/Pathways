@@ -75,7 +75,7 @@ Always calibrate verification depth strictly to the nature and scope of the modi
 
 3. **Tier 2: Core Rendering Pipelines, Shaders, Synchronization & Multi-GPU**:
    - **Action**: Run the full headless regression suite (`./scripts/run_headless_tests.sh`) and image quality verification (`python3 tests/test_image_quality.py`).
-   - Use only when shader algorithms, memory barriers, DGC dispatch queues, or multi-GPU transport paths are modified, or when explicitly requested by the user.
+   - **Timing**: The Headless Regression Test Suite must **NEVER** be run as an intermediate or early test (e.g., as the second test). During iteration, use only fast, targeted test commands, single-frame dumps, and visual comparisons to verify functionality. The full headless regression suite should **ONLY** be carried out at the very end of the task once all functional, visual, and performance issues have been fully resolved.
 
 ## Command-Line Option & CLI Guidelines
 - **Binary / Mutually Exclusive Options Rule**: When an option represents a mutually exclusive binary condition, there must be only **ONE** option, which is to negate the default state.

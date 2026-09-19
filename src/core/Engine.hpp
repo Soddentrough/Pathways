@@ -16,6 +16,7 @@
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/NRCManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
+#include "rt/Fsr3Upscaler.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
 #include "core/QualityGovernor.hpp"
@@ -62,6 +63,7 @@ public:
     QualityGovernor* getGovernor() const { return m_governor.get(); }
     NRCManager* getNrcManager() const { return m_nrcManager.get(); }
     UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
+    Fsr3Upscaler* getFsr3Upscaler() const { return m_fsr3Upscaler.get(); }
 
 private:
     void initVulkan();
@@ -134,6 +136,7 @@ private:
     std::vector<std::unique_ptr<Texture>> m_sceneTextures;
 
     // Render Targets
+    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_frameImages;
     std::unique_ptr<Image> m_accumImage;
     std::unique_ptr<Image> m_outputImage;
 
@@ -190,33 +193,22 @@ private:
     void updateSceneDescriptors();
     void updateWavefrontSceneDescriptors();
 
+    // Running Average Accumulation Pipeline (FP16 Frame -> FP32 Persistent History)
+    VkDescriptorSetLayout m_accumRunningAvgDescLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_accumRunningAvgDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout m_accumRunningAvgPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_accumRunningAvgPipeline = VK_NULL_HANDLE;
+    void createAccumRunningAvgPipeline();
+    void updateAccumRunningAvgDescriptors();
+
+    // G-Buffer Resources (used by ray tracer, direct lighting, and FSR / Upways)
     std::unique_ptr<Image> m_directLightImage;
     std::unique_ptr<Image> m_normalDepthImage;
     std::unique_ptr<Image> m_prevNormalDepthImage;
-    std::unique_ptr<Image> m_shadowFilterPingImage;
-    std::unique_ptr<Image> m_momentsImages[2];
-    std::unique_ptr<Image> m_depthImages[2];
-    std::unique_ptr<Buffer> m_tileMetaDataBuffer;
-
-    VkDescriptorSetLayout m_shadowClassifyDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_shadowFilterDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_shadowClassifyDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_shadowFilterDescSet = VK_NULL_HANDLE;
-    uint32_t m_shadowPingPongIndex = 0;
-    VkPipelineLayout m_shadowClassifyPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_shadowFilterPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_shadowClassifyPipeline = VK_NULL_HANDLE;
-    VkPipeline m_shadowFilterPipeline = VK_NULL_HANDLE;
-
-    void createShadowDenoiserPipelines();
-    void createShadowDenoiserResources();
-    void destroyShadowDenoiserResources();
-    void destroyShadowDenoiserPipelines();
-    void updateShadowDenoiserDescriptors();
-    double m_lastShadowDenoiserTimeMs = 0.0;
-
     // Screen-Space Motion Vectors (used by ray tracer and temporal reconstruction passes)
     std::unique_ptr<Image> m_motionVectorImage;
+    void createGBufferResources();
+    void destroyGBufferResources();
 
     // ML Training Data Capture Targets (Upways neural denoiser & continuous upscaler)
     std::unique_ptr<Image> m_mlAlbedoRoughnessImage;
@@ -226,40 +218,12 @@ private:
     void runTrainingDataCapture();
     void captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp);
 
-    // Temporal Radiance Accumulation & wRLS Outlier Rejection
-    std::array<std::unique_ptr<Image>, 2> m_temporalHistory;
-    uint32_t m_temporalPingPong = 0;
     bool m_temporalResetRequested = true;
-    VkDescriptorSetLayout m_temporalAccumDescSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_temporalAccumDescPool = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_temporalAccumDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_temporalAccumPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_temporalAccumPipeline = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_tonemapTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    void createTemporalAccumPipelines();
-    void createTemporalAccumResources();
-    void destroyTemporalAccumResources();
-    void destroyTemporalAccumPipelines();
-    void updateTemporalAccumDescriptors();
-    uint32_t dispatchTemporalAccum(VkCommandBuffer cmd, bool resetHistory);
-
-    // Blockwise Multi-Order Feature Regression (BMFR)
-    std::unique_ptr<Image> m_bmfrOutputImage;
-    VkDescriptorSetLayout m_bmfrDescSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_bmfrDescPool = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_bmfrDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_bmfrRawDescSet = VK_NULL_HANDLE;
-    VkDescriptorSet m_tonemapBmfrDescSet = VK_NULL_HANDLE;
-    VkPipelineLayout m_bmfrPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_bmfrPipeline = VK_NULL_HANDLE;
-
-    void createBmfrPipelines();
-    void createBmfrResources();
-    void destroyBmfrResources();
-    void destroyBmfrPipelines();
-    void updateBmfrDescriptors();
-    bool dispatchBmfr(VkCommandBuffer cmd, uint32_t temporalSlot);
+    // Post-processing descriptor pool (for upscalers / tonemapping sets)
+    VkDescriptorPool m_postProcessDescPool = VK_NULL_HANDLE;
+    void createPostProcessDescPool();
+    void destroyPostProcessDescPool();
 
     // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
     std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
@@ -271,6 +235,25 @@ private:
     void destroyUpwaysPipelines();
     void updateUpwaysDescriptors();
     bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory);
+
+    // AMD FidelityFX Super Resolution 3.1
+    std::unique_ptr<Fsr3Upscaler> m_fsr3Upscaler;
+    std::unique_ptr<Image> m_secAccumImage;
+    VkDescriptorSet m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+
+    // FSR 3.1 Multi-GPU SampleBlend 4K resolve
+    VkDescriptorSetLayout m_fsr3BlendDescLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_fsr3BlendPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_fsr3BlendPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool m_fsr3BlendDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet m_fsr3BlendDescSet = VK_NULL_HANDLE;
+
+    void createFsr3Pipelines();
+    void createFsr3Resources();
+    void destroyFsr3Resources();
+    void destroyFsr3Pipelines();
+    void updateFsr3Descriptors();
+    bool dispatchFsr3(VkCommandBuffer cmd, bool resetHistory);
 
     // Real-Time Caustics (Photon Injection + Atomic Splatting + Bilateral Filter)
     std::unique_ptr<Buffer> m_causticPhotonBuffer;
@@ -314,12 +297,19 @@ private:
     std::chrono::steady_clock::time_point m_sceneLoadingStartTime;
     bool m_pendingMgpuModeChange = false;
     MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
+    bool m_pendingMgpuUpscaleModeChange = false;
+    MgpuUpscaleMode m_newMgpuUpscaleMode = MgpuUpscaleMode::PostMerge;
     bool m_pendingAccumFormatChange = false;
     AccumFormat m_newAccumFormat = AccumFormat::RGBA16_SFLOAT;
     bool m_pendingDoubleBufferChange = false;
     bool m_newDoubleBuffer = true;
     bool m_pendingTileSizeChange = false;
     uint32_t m_newTileSize = 64;
+
+    // Active configuration tracking for descriptor / resource resynchronization
+    float m_lastRenderScale = 1.0f;
+    UpscalerMode m_lastUpscalerMode = UpscalerMode::None;
+    uint32_t m_lastTileSize = 64;
 
     // Available scenes and dynamic selection
     std::vector<SceneEntry> m_availableScenes;

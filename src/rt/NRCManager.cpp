@@ -391,6 +391,7 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
 
 void NRCManager::resize(uint32_t width, uint32_t height) {
     if (m_width == width && m_height == height) return;
+    Logger::info("NRCManager resized: updating cache resolution to {}x{}", width, height);
     m_width = width;
     m_height = height;
     initBuffers();

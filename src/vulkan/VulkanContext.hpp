@@ -66,8 +66,10 @@ struct PciLinkInfo {
 
 class VulkanContext {
 public:
-    VulkanContext(const Config& config, VkSurfaceKHR surface = VK_NULL_HANDLE);
+    VulkanContext(const Config& config, VkSurfaceKHR surface = VK_NULL_HANDLE, const std::string& contextRole = "Primary GPU");
     ~VulkanContext();
+
+    const std::string& getContextRole() const { return m_contextRole; }
 
     VkInstance getInstance() const { return m_instance; }
     VkPhysicalDevice getPhysicalDevice() const { return m_physicalDevice; }
@@ -170,6 +172,7 @@ private:
     PFN_vkReleaseFullScreenExclusiveModeEXT pfnVkReleaseFullScreenExclusiveModeEXT = nullptr;
 #endif
     PciLinkInfo m_pciLinkInfo;
+    std::string m_contextRole = "Primary GPU";
 
     static uint32_t s_validationErrors;
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(

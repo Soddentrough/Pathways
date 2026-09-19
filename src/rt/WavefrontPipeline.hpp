@@ -12,6 +12,8 @@
 
 namespace pathways {
 
+class Image;
+
 struct WavefrontSceneData {
     uint32_t numTriangles = 0;
     uint32_t numSpheres = 0;
@@ -40,6 +42,7 @@ struct WavefrontSceneData {
     uint32_t fullWidth = 0;               // Full unclipped frame resolution width
     uint32_t fullHeight = 0;              // Full unclipped frame resolution height
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
+    float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
 };
 
 class WavefrontPipeline {
@@ -49,7 +52,6 @@ public:
 
     WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                       uint32_t width, uint32_t height,
-                      uint32_t tileSize,
                       const std::vector<char>& classifyCode,
                       const std::vector<char>& intersectCode,
                       const std::vector<char>& shadeCode,
@@ -60,7 +62,6 @@ public:
                       const std::vector<char>& shadeComplexCode = {},
                       const std::vector<char>& shadeEmissiveCode = {},
                       const std::vector<char>& shadePassthroughCode = {},
-                      const std::vector<char>& raySortCode = {},
                       bool supportsExecutionSet = false,
                       const std::vector<char>& shadeDiffuseSecCode = {},
                       const std::vector<char>& shadeComplexSecCode = {},
@@ -95,9 +96,7 @@ public:
                                 VkDeviceSize instanceSize = 0,
                                 VkImageView causticImageView = VK_NULL_HANDLE);
 
-    void resize(uint32_t width, uint32_t height, uint32_t tileSize = 0);
-    void setTileSize(uint32_t tileSize);
-    uint32_t getTileSize() const { return m_tileSize; }
+    void resize(uint32_t width, uint32_t height);
 
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,
@@ -158,7 +157,6 @@ private:
                          const std::vector<char>& shadeComplexCode,
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadePassthroughCode,
-                         const std::vector<char>& raySortCode,
                          const std::vector<char>& shadeDiffuseSecCode = {},
                          const std::vector<char>& shadeComplexSecCode = {});
 
@@ -169,7 +167,6 @@ private:
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
-    uint32_t m_tileSize = 256;
     uint32_t m_maxCapacity = 0;
     uint32_t m_sortMode = 0;
     uint32_t m_secondarySortMode = 0;
@@ -183,7 +180,7 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueB; // 32B RayState
     std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 32B RayHit
     std::array<std::unique_ptr<Buffer>, 2> m_materialIndexQueue; // 4B index * 6 archetypes (Index-Based Material Queues)
-    std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Secondary Ray Index Queue)
+    std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Directional DGC Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_shadowQueue;    // 32B PackedShadowRay
     std::array<std::unique_ptr<Buffer>, 2> m_queueCounters;
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;   // Double-buffered per in-flight frame slot
@@ -209,7 +206,6 @@ private:
     VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
-    VkPipeline m_raySortPipeline = VK_NULL_HANDLE;
 
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
@@ -219,6 +215,8 @@ private:
     std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
 
     std::unique_ptr<DGCManager> m_dgcManager;
+    std::unique_ptr<Image> m_dummyStorageImage;
+    bool m_dummyImageTransitioned = false;
 };
 
 } // namespace pathways

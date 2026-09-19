@@ -15,6 +15,11 @@ enum class MultiGpuMode {
     Auto                 // Adaptive: SampleParallel if SPP > 1, else CheckerboardTile
 };
 
+enum class MgpuUpscaleMode {
+    PostMerge,   // Final Frame Upscaling: Checkerboard 64x64 tiles merged on GPU0, then upscaled to 4K (Max FPS, 0 seams) [Default for Tile mode]
+    SampleBlend  // Merge Upscaled Frames: Dual full passes independently upscaled to 4K, then averaged on GPU0 (Max Quality, 2x SPP denoising) [Default for Sample mode]
+};
+
 enum class AccumFormat {
     RGBA16_SFLOAT, // 64-bit Half Float HDR (Industry standard for real-time graphics, 50% VRAM/PCIe footprint) [Default]
     RGBA32_SFLOAT  // 128-bit Full Float HDR
@@ -27,22 +32,25 @@ enum class PipelineType {
 
 enum class WavefrontSortMode {
     None,      // Monolithic shade kernel, no material partitioning
-    Archetype, // Technique A & B: Multi-queue wave-ballot partitioning with DGC Execution Sets
-    BDA,       // Technique C: Buffer Device Address queue pointers
-    Dual       // Technique D: 2D Spatial-Morton + Material Dual-Binning
+    Archetype, // Multi-queue wave-ballot partitioning with DGC Execution Sets
+    Dual       // 3D Spatial-Morton intra-wave sort + Archetype dual-binning (Default)
 };
 
 enum class SecondarySortMode {
-    None,           // Standard unsorted secondary rays
-    DirectionalDGC, // Option 1: On-Chip Directional Multi-Queue Binning via DGC & subgroup ballots
-    SpatialIndex    // Option 2: 4-Byte Index-Only Spatial-Morton Reordering
+    None,           // Standard unsorted secondary rays (Default)
+    DirectionalDGC  // Option 1: On-Chip Directional Multi-Queue Binning via DGC & subgroup ballots
 };
 
 enum class DenoiserMode {
     None,     // Raw stochastic path traced output (unfiltered progressive)
-    Temporal, // Motion-vector guided Temporal Radiance Accumulation [Default]
-    BMFR,     // Blockwise Multi-Order Feature Regression [Experimental]
     Upways    // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+};
+
+enum class UpscalerMode {
+    None,   // Native resolution or direct linear blit
+    FSR3,   // AMD FidelityFX Super Resolution 3.1 (Temporal Accumulation)
+    Upways, // Pathways Native Neural Combined Denoiser & Super-Resolution (Wave32 WMMA)
+    FSR1    // AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)
 };
 
 struct Config {
@@ -52,6 +60,7 @@ struct Config {
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
     float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
+    float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -65,6 +74,7 @@ struct Config {
 
     // Dynamic Quality Governor & Target Frame Rate Limiter
     uint32_t target_fps = 0;          // 0 = uncapped [Default]
+    float target_frame_time_ms = 8.3f; // Target frame time budget in milliseconds [Default: 8.3 ms]
     bool adaptive_spp = false;        // Enable 3-axis dynamic sample rate governor [Default: false]
     uint32_t min_spp = 1;             // Minimum SPP floor [Default: 1]
     uint32_t max_spp = 16;            // Maximum SPP ceiling [Default: 16]
@@ -86,32 +96,17 @@ struct Config {
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
-    bool enable_shadow_denoiser = false;
-    float shadow_denoiser_depth_sigma = 0.02f;
-    float shadow_denoiser_normal_power = 16.0f;
-    bool enable_taa = false;              // Temporal Anti-Aliasing [Deprecated, default: disabled]
     // Denoiser Defaults & Rationale:
-    // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None, enable_temporal_accum = false).
-    // Changing this default to DenoiserMode::Temporal (or enable_temporal_accum = true) causes a severe
-    // "Star Wars hyperspace jump" radial streak artifact during interactive camera translation/zoom:
-    // 1. At 1 SPP, incoming radiance is discrete, high-contrast stochastic Monte Carlo noise.
-    // 2. Camera forward/backward motion creates an outward/inward radial optical flow vector field.
-    // 3. Temporal accumulation (EMA alpha = 0.25, 75% history retention) persists noise grains across ~15 frames
-    //    (0.75^15 ~= 0.013), dragging each grain along the radial motion vectors by 50-100 pixels.
-    // 4. Hundreds of thousands of grains tracing radial lines simultaneously produce needle-like streaks
-    //    (radial-to-tangential gradient ratio R = <|grad_theta|> / <|grad_r|> increases from 0.999 to >1.075).
-    // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise (R = 0.999)
+    // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None).
+    // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise
     // with zero motion trails during interactive navigation, and seamless progressive convergence (up to 2048 spp)
-    // when stationary. Temporal accumulation should remain opt-in (--temporal-accum / --tra) or paired with
-    // spatial regression filtering (BMFR / Upways).
+    // when stationary. Real-time reconstruction is provided via Upways or FSR 3.1.
     DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
-    bool enable_temporal_accum = false;   // Motion-vector guided temporal accumulation [Default: disabled, opt-in via --temporal-accum / --denoiser temporal]
-    bool enable_bmfr = false;             // Blockwise Multi-Order Feature Regression [Default: disabled, opt-in via --bmfr]
-    float temporal_clamping_gamma = 1.25f;// Neighborhood variance clamp box multiplier
-    float temporal_outlier_h = 0.75f;     // wRLS outlier rejection bandwidth
-    float temporal_max_history = 32.0f;   // Maximum temporal history sample accumulation limit
     bool upways_superres = false;         // Upways 2x Continuous Super-Resolution (e.g. 1080p -> 4K)
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
+    UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
+    bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]
+    float upscaler_sharpness = 0.0f;                 // RCAS contrast-adaptive sharpness [0.0 - 1.0] (default: 0.0)
     bool enable_indirect_light = true;
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
     uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)
@@ -124,21 +119,20 @@ struct Config {
     // Caustics & Forward Photon Injection (Vulkan 1.4 hardware rayQueryEXT)
     bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]
     uint32_t caustic_photons = 1048576;   // Number of caustic photons traced per frame (default: 1048576 = 1024x1024)
-    bool enable_sppm = false;             // Stochastic Progressive Photon Mapping for offline reference convergence [Default: false, opt-in via --sppm]
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
+    MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge; // Multi-GPU upscaling topology: PostMerge (Final Frame) or SampleBlend (Merged Frames)
     enum class MgpuTransferMode {
         Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory, high performance default)
         P2P,      // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR)
         Staging   // CPU memcpy staging (Fallback)
     };
     MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::Host;
-    AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Industry standard for real-time HDR)
+    AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Preserve FP16 bandwidth and performance)
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     uint32_t tile_size = 64;
-    uint32_t wavefront_tile_size = 0; // Wavefront cache-resident tile size (0 = full frame monolithic, 256 = 256x256, 512 = 512x256, default: 0)
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
@@ -152,6 +146,7 @@ struct Config {
 
     std::string scene_path = "";
     std::string hdri_path = "";
+    bool custom_hdri = false; // User explicitly provided --hdri on CLI (do not auto-override during scene changes)
     std::string dump_frame_path = "";
     std::string dump_ui_path = "";
     std::string dump_hdr_path = "";

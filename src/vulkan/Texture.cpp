@@ -463,4 +463,42 @@ std::unique_ptr<Texture> Texture::loadFromFile(
     }
 }
 
+std::unique_ptr<Texture> Texture::createSceneEnvironmentMap(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    const std::string& hdriPath, const std::string& scenePath,
+    const std::string& domeLightHdriPath
+) {
+    std::unique_ptr<Texture> envMap = nullptr;
+
+    // 1. Explicit user-provided or scene-associated HDRI path
+    if (!hdriPath.empty() && hdriPath != "night" && hdriPath != "night-sky") {
+        envMap = Texture::loadFromFile(device, allocator, queue, pool, hdriPath);
+    }
+
+    // 2. USD DomeLight HDRI
+    if (!envMap && !domeLightHdriPath.empty()) {
+        envMap = Texture::loadFromFile(device, allocator, queue, pool, domeLightHdriPath);
+        if (envMap) {
+            Logger::info("Loaded USD DomeLight HDRI from UsdLuxDomeLight schema: {}", domeLightHdriPath);
+        }
+    }
+
+    // 3. Procedural Sky Dome selection based on scene type
+    if (!envMap) {
+        bool isCyber = (hdriPath == "night" || hdriPath == "night-sky" ||
+                        scenePath == "cyber-city" || scenePath == "procedural:cyber-city" ||
+                        scenePath == "procedural:cyber_city" || scenePath == "cyber_city" ||
+                        scenePath == "Procedural Cyber City");
+        if (isCyber) {
+            envMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
+            Logger::info("Initialized procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
+        } else {
+            envMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
+            Logger::info("Initialized procedural Day HDRI sky dome (512x256, 32-bit Float).");
+        }
+    }
+
+    return envMap;
+}
+
 } // namespace pathways

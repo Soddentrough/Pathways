@@ -9,6 +9,7 @@
 #include "rt/AccelerationStructure.hpp"
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
+#include "rt/Fsr3Upscaler.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -79,28 +80,16 @@ struct GpuDeviceNode {
     std::unique_ptr<RTPipeline> rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> wavefrontPipeline;
 
-    // Secondary FidelityFX Shadow Denoiser Resources & Pipelines
+    // G-Buffer Resources (used by ray tracer, direct lighting, and FSR / Upways)
     std::unique_ptr<Image> directLightImage;
     std::unique_ptr<Image> normalDepthImage;
-    std::unique_ptr<Image> shadowFilterPingImage;
-    std::unique_ptr<Image> momentsImages[2];
-    std::unique_ptr<Image> depthImages[2];
-    std::unique_ptr<Buffer> tileMetaDataBuffer;
-
-    VkDescriptorSetLayout shadowClassifyDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout shadowFilterDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet shadowClassifyDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet shadowFilterDescSet = VK_NULL_HANDLE;
-    uint32_t shadowPingPongIndex = 0;
-
-    VkPipelineLayout shadowClassifyPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout shadowFilterPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline shadowClassifyPipeline = VK_NULL_HANDLE;
-    VkPipeline shadowFilterPipeline = VK_NULL_HANDLE;
 
     // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
     std::unique_ptr<Image> motionVectorImage;
     std::unique_ptr<Image> causticImage;
+
+    // Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
+    std::unique_ptr<Fsr3Upscaler> upscaler;
 
     ~GpuDeviceNode();
 };
@@ -117,14 +106,14 @@ public:
     MultiGpuMode getMode() const { return m_mode; }
     void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
     void setFormat(AccumFormat format) { m_config.accum_format = format; }
-    void setConfig(const Config& config) { m_config = config; }
+    void setConfig(const Config& config);
     double getSecondaryGpuTimeMs() const;
     double getSecondaryTransferTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
     VulkanContext* getSecondaryContext() const { return m_devices.empty() ? nullptr : m_devices[0]->context.get(); }
     AccelerationStructureManager* getSecondaryAsManager() const { return m_devices.empty() ? nullptr : m_devices[0]->asManager.get(); }
     void resize(uint32_t width, uint32_t height);
-    bool loadScene(const SceneData& scene);
+    bool loadScene(const SceneData& scene, const std::string& scenePath = "");
 
     // Launch secondary GPU raytracing asynchronously via persistent dedicated worker thread
     void launchSecondaryWork(const CameraUniform& cameraUniform,
@@ -141,7 +130,19 @@ public:
                              void* dstHostPtr = nullptr,
                              size_t transferBytes = 0,
                              uint32_t totalCompositeSpp = 0,
-                             uint32_t numOpaqueTriangles = 0);
+                             uint32_t numOpaqueTriangles = 0,
+                             bool enableUpscaler = false,
+                             uint32_t renderW = 0,
+                             uint32_t renderH = 0,
+                             uint32_t displayW = 0,
+                             uint32_t displayH = 0,
+                             glm::vec2 jitter = glm::vec2(0.0f),
+                             bool resetUpscaler = false,
+                             bool cameraMoved = false,
+                             uint32_t frameIndex = 0,
+                             bool enableSharpening = false,
+                             float sharpness = 0.0f,
+                             uint32_t totalSamples = 1u);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
@@ -211,6 +212,19 @@ private:
         size_t transferBytes = 0;
         uint32_t totalCompositeSpp = 0;
         uint32_t numOpaqueTriangles = 0;
+        bool enableUpscaler = false;
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
+        uint32_t displayWidth = 0;
+        uint32_t displayHeight = 0;
+        bool resetUpscalerHistory = false;
+        bool cameraMoved = false;
+        uint32_t frameIndex = 0;
+        float jitterX = 0.0f;
+        float jitterY = 0.0f;
+        bool enableSharpening = false;
+        float sharpness = 0.0f;
+        uint32_t totalSamples = 1u;
         bool valid = false;
     };
 
@@ -218,7 +232,6 @@ private:
     void executeSecondaryWork(const SecondaryWorkPacket& packet);
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
-    void updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode);
     void updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode);
 
     bool initSharedP2PBuffer(VkDeviceSize bufferSize);

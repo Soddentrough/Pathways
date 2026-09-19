@@ -63,6 +63,22 @@ int main() {
         Config cMotion = Config::parse(2, const_cast<char**>(argvMotion));
         check_true(cMotion.camera_motion, "--camera-motion sets camera_motion = true");
 
+        // Test --mgpu tile (Final Frame Upscaling / PostMerge)
+        const char* argvTile[] = { "pathways", "--mgpu", "tile", "--upscaler", "fsr3" };
+        Config cTile = Config::parse(5, const_cast<char**>(argvTile));
+        check_true(cTile.mgpu_mode == MultiGpuMode::CheckerboardTile,
+                   "--mgpu tile sets CheckerboardTile mode");
+        check_true(cTile.mgpu_upscale_mode == MgpuUpscaleMode::PostMerge,
+                   "--mgpu tile sets MgpuUpscaleMode::PostMerge");
+
+        // Test --mgpu sample (Merge Upscaled Frames / SampleBlend)
+        const char* argvSample[] = { "pathways", "--mgpu", "sample", "--upscaler", "fsr3" };
+        Config cSample = Config::parse(5, const_cast<char**>(argvSample));
+        check_true(cSample.mgpu_mode == MultiGpuMode::SampleParallel,
+                   "--mgpu sample sets SampleParallel mode");
+        check_true(cSample.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend,
+                   "--mgpu sample sets MgpuUpscaleMode::SampleBlend");
+
         std::cout << "  -> CLI config parsing passed successfully." << std::endl;
     }
 

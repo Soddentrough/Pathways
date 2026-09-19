@@ -86,6 +86,7 @@ struct FrameStats {
     std::string pipeline_type_str = "rtp";
     uint32_t width = 0;
     uint32_t height = 0;
+    std::string upscaler_mode_str = "None";
     float render_scale = 1.0f;
     uint32_t spp = 0;
     uint32_t max_bounces = 0;
@@ -139,7 +140,8 @@ struct FrameStats {
     double avg_presentation_fps = 0.0;
     double rays_per_second = 0.0;
     uint32_t validation_errors = 0;
-    bool target_achieved = false; // true if avg_frame_time_ms < 8.0
+    double target_frame_time_ms = 8.3;
+    bool target_achieved = false; // true if avg_frame_time_ms < target_frame_time_ms
     bool accumulation_complete = false;
     uint32_t max_accum_frames = 2048;
 
@@ -211,6 +213,7 @@ struct FrameStats {
         double secondary_gpu_time_ms = 0.0;
         double tonemap_time_ms = 0.0;
         double gigarays_per_second = 0.0;
+        double target_frame_time_ms = 8.3;
         bool target_achieved = false;
         double blas_build_time_ms = 0.0;
         double blas_size_kb = 0.0;

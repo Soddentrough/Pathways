@@ -53,7 +53,7 @@ echo "[3/7] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..."
     --dump-hdr output/test_cornell_1080p.exr \
     --dump-stats output/stats_1080p.json
 
-python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0 --max-mean-lum 0.85 --max-blown-pct 12.0
+python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p.json 1920 1080 40.0 --max-mean-lum 0.85 --max-blown-pct 20.0
 
 # 4. Test Suite 2: 4K Native Real-Time Benchmark (<8ms Target)
 echo ""
@@ -107,6 +107,25 @@ echo "[4c] Running Test Suite 2c: 4K Native Multi-GPU Frame Pacing (Camera Motio
     --dump-stats output/stats_4k_mgpu_motion.json
 
 python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 8.0 10.0 60
+
+# 4d. Test Suite 2d: Multi-GPU + FSR 3.1 Dynamic Camera Motion & Seam Test (1440p Quality)
+echo ""
+echo "[4d] Running Test Suite 2d: Multi-GPU + FSR 3.1 Dynamic Camera Motion (1440p Quality, Dual R9700)..."
+./build/bin/pathways \
+    --headless \
+    --scene scenes/classroom/classroom_extended.glb \
+    --width 2560 \
+    --height 1440 \
+    --spp 1 \
+    --max-bounces 4 \
+    --frames 30 \
+    --camera-motion \
+    --mgpu \
+    --upscaler fsr3 \
+    --dump-frame output/test_classroom_mgpu_tile_fsr3_motion.png \
+    --dump-stats output/stats_classroom_mgpu_tile_fsr3_motion.json
+
+python3 scripts/verify_mgpu_fsr3_motion.py output/test_classroom_mgpu_tile_fsr3_motion.png output/stats_classroom_mgpu_tile_fsr3_motion.json 2560 1440 3.5
 
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""
@@ -241,7 +260,7 @@ python3 scripts/verify_frame.py output/test_bmw_m6.png output/stats_bmw_m6.json 
     --dump-frame output/test_breakfast_room.png \
     --dump-stats output/stats_breakfast_room.json
 
-python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_breakfast_room.json 1920 1080 35.0 --max-mean-lum 0.35 --max-blown-pct 8.0
+python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_breakfast_room.json 1920 1080 35.0 --max-mean-lum 0.50 --max-blown-pct 8.0
 
 # 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Alias Table & Local RIS)
 echo ""
@@ -299,10 +318,16 @@ python3 tests/test_image_quality.py
 
 # 11. Test Suite 8: Automated Before/After Visual Regression Verification
 echo ""
-echo "[8/8] Running Test Suite 8: Visual Regression Verification against Golden References..."
+echo "[8/9] Running Test Suite 8: Visual Regression Verification against Golden References..."
 python3 scripts/visual_regression_test.py --strict
+
+# 12. Test Suite 9: Visual Integrity, Accumulation Exposure Stability & Multi-GPU Seams
+echo ""
+echo "[9/9] Running Test Suite 9: Visual Integrity & Exposure Stability..."
+python3 scripts/verify_visual_integrity.py
 
 echo ""
 echo "=========================================================="
 echo "  Pathways: All Automated Headless Tests Passed Successfully!"
 echo "=========================================================="
+

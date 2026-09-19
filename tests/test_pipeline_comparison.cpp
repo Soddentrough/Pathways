@@ -49,7 +49,7 @@ int main() {
         Config c2 = Config::parse(3, const_cast<char**>(argv2));
         check_true(c2.pipeline_type == PipelineType::Wavefront, "--pipeline wavefront sets Wavefront");
 
-        // Wavefront sort modes: none, archetype, bda, dual
+        // Wavefront sort modes: none, archetype, dual
         const char* argvSortNone[] = { "pathways", "--pipeline", "wavefront", "--wavefront-sort", "none" };
         Config cSortNone = Config::parse(5, const_cast<char**>(argvSortNone));
         check_true(cSortNone.wavefront_sort_mode == WavefrontSortMode::None, "Sort mode None parsed correctly");
@@ -58,15 +58,53 @@ int main() {
         Config cSortArch = Config::parse(5, const_cast<char**>(argvSortArch));
         check_true(cSortArch.wavefront_sort_mode == WavefrontSortMode::Archetype, "Sort mode Archetype parsed correctly");
 
-        const char* argvSortBda[] = { "pathways", "--pipeline", "wavefront", "--wavefront-sort", "bda" };
-        Config cSortBda = Config::parse(5, const_cast<char**>(argvSortBda));
-        check_true(cSortBda.wavefront_sort_mode == WavefrontSortMode::BDA, "Sort mode BDA parsed correctly");
-
         const char* argvSortDual[] = { "pathways", "--pipeline", "wavefront", "--wavefront-sort", "dual" };
         Config cSortDual = Config::parse(5, const_cast<char**>(argvSortDual));
         check_true(cSortDual.wavefront_sort_mode == WavefrontSortMode::Dual, "Sort mode Dual parsed correctly");
 
-        std::cout << "  -> Pipeline CLI flags and sort modes successfully verified." << std::endl;
+        // Indirect / secondary bounce radiance clamping
+        check_true(cfgDef.indirect_clamp == 35.0f, "Default indirect clamp is 35.0 cd/m2");
+
+        const char* argvClamp1[] = { "pathways", "--indirect-clamp", "50.0" };
+        Config cClamp1 = Config::parse(3, const_cast<char**>(argvClamp1));
+        assert_near(cClamp1.indirect_clamp, 50.0f, 0.001f, "--indirect-clamp sets custom ceiling");
+
+        const char* argvClamp2[] = { "pathways", "--indirect-clamp=75.5" };
+        Config cClamp2 = Config::parse(2, const_cast<char**>(argvClamp2));
+        assert_near(cClamp2.indirect_clamp, 75.5f, 0.001f, "--indirect-clamp=val sets custom ceiling");
+
+        const char* argvClamp3[] = { "pathways", "--sec-clamp", "20.0" };
+        Config cClamp3 = Config::parse(3, const_cast<char**>(argvClamp3));
+        assert_near(cClamp3.indirect_clamp, 20.0f, 0.001f, "--sec-clamp sets custom ceiling");
+
+        const char* argvClampZero1[] = { "pathways", "--indirect-clamp", "0" };
+        Config cClampZero1 = Config::parse(3, const_cast<char**>(argvClampZero1));
+        assert_near(cClampZero1.indirect_clamp, 0.0f, 0.001f, "--indirect-clamp 0 disables clamping");
+
+        const char* argvClampZero2[] = { "pathways", "--indirect-clamp=0.0" };
+        Config cClampZero2 = Config::parse(2, const_cast<char**>(argvClampZero2));
+        assert_near(cClampZero2.indirect_clamp, 0.0f, 0.001f, "--indirect-clamp=0.0 disables clamping");
+
+        const char* argvClampZero3[] = { "pathways", "--sec-clamp", "0" };
+        Config cClampZero3 = Config::parse(3, const_cast<char**>(argvClampZero3));
+        assert_near(cClampZero3.indirect_clamp, 0.0f, 0.001f, "--sec-clamp 0 disables clamping");
+
+        // Target frame time budget
+        assert_near(cfgDef.target_frame_time_ms, 8.3f, 0.001f, "Default target frame time is 8.3 ms");
+
+        const char* argvBudget1[] = { "pathways", "--target-frame-time", "16.6" };
+        Config cBudget1 = Config::parse(3, const_cast<char**>(argvBudget1));
+        assert_near(cBudget1.target_frame_time_ms, 16.6f, 0.001f, "--target-frame-time sets custom budget");
+
+        const char* argvBudget2[] = { "pathways", "--frame-budget=6.9" };
+        Config cBudget2 = Config::parse(2, const_cast<char**>(argvBudget2));
+        assert_near(cBudget2.target_frame_time_ms, 6.9f, 0.001f, "--frame-budget=val sets custom budget");
+
+        const char* argvFps1[] = { "pathways", "--target-fps", "60" };
+        Config cFps1 = Config::parse(3, const_cast<char**>(argvFps1));
+        assert_near(cFps1.target_frame_time_ms, 16.6667f, 0.01f, "--target-fps auto-derives frame budget");
+
+        std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, and frame budget successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

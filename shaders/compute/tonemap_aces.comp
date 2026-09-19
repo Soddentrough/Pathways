@@ -133,10 +133,6 @@ void main() {
         // normalizedL = (scRGB * 80.0) / 10000.0 = scRGB / 125.0
         vec3 normalizedL = rec2020Linear / 125.0;
         finalColor = LinearToST2084(normalizedL);
-
-        // High-frequency triangular dither (scaled for 10-bit quantization: 1024 discrete code levels)
-        float dither = (fract(sin(dot(vec2(pixelCoord), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 1023.0;
-        finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
     } else {
         // --- SDR Fallback (sRGB ~2.2 Gamma, [0.0, 1.0]) ---
         vec3 mappedColor = linearColor;
@@ -148,10 +144,6 @@ void main() {
         }
         // Gamma correction (sRGB ~2.2)
         finalColor = pow(clamp(mappedColor, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
-
-        // High-frequency triangular dither (scaled for 10-bit / 8-bit backbuffer quantization)
-        float dither = (fract(sin(dot(vec2(pixelCoord), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 1023.0;
-        finalColor = clamp(finalColor + vec3(dither), 0.0, 1.0);
     }
 
     // Multi-GPU Load Split Visualization Overlay

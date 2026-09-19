@@ -119,10 +119,6 @@ void main() {
         if (inRange) {
             rayIdx = secondaryIndices[pc.octantBin * pc.maxQueueCapacity + idx];
         }
-    } else if (pc.secondarySortMode == 2u) {
-        if (inRange) {
-            rayIdx = secondaryIndices[idx];
-        }
     }
 
     RayGeometry geom;

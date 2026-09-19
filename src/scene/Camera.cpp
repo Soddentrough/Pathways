@@ -399,4 +399,11 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     return ubo;
 }
 
+void Camera::advanceFrame() {
+    glm::mat4 view = getViewMatrix();
+    glm::mat4 unjitteredProj = getProjectionMatrix();
+    m_prevViewProj = unjitteredProj * view;
+    m_hasPrevViewProj = true;
+}
+
 } // namespace pathways

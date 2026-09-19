@@ -370,24 +370,10 @@ GpuDeviceNode::~GpuDeviceNode() {
     materialBuffer.reset();
     lightBuffer.reset();
     lightTreeBuffer.reset();
-
-    if (shadowClassifyPipeline) vkDestroyPipeline(device, shadowClassifyPipeline, nullptr);
-    if (shadowFilterPipeline) vkDestroyPipeline(device, shadowFilterPipeline, nullptr);
-    if (shadowClassifyPipelineLayout) vkDestroyPipelineLayout(device, shadowClassifyPipelineLayout, nullptr);
-    if (shadowFilterPipelineLayout) vkDestroyPipelineLayout(device, shadowFilterPipelineLayout, nullptr);
-    if (shadowClassifyDescLayout) vkDestroyDescriptorSetLayout(device, shadowClassifyDescLayout, nullptr);
-    if (shadowFilterDescLayout) vkDestroyDescriptorSetLayout(device, shadowFilterDescLayout, nullptr);
-
     directLightImage.reset();
     normalDepthImage.reset();
-    shadowFilterPingImage.reset();
-    momentsImages[0].reset();
-    momentsImages[1].reset();
-    depthImages[0].reset();
-    depthImages[1].reset();
-    tileMetaDataBuffer.reset();
-
     motionVectorImage.reset();
+    upscaler.reset();
 }
 
 MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryContext, const SceneData& scene)
@@ -925,7 +911,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     auto secNode = std::make_unique<GpuDeviceNode>();
     secNode->deviceIndex = 1;
-    secNode->context = std::make_unique<VulkanContext>(secConfig);
+    secNode->context = std::make_unique<VulkanContext>(secConfig, VK_NULL_HANDLE, "Secondary GPU / Peer Compute");
     secNode->deviceName = secNode->context->getDeviceName();
     secNode->timestampPeriod = secNode->context->getDeviceProperties().limits.timestampPeriod;
 
@@ -1071,19 +1057,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->dummyNormal = Texture::createDummyNormal(secDevice, secAlloc, secQueue, secPool);
     secNode->blueNoiseTexture = Texture::createBlueNoise64(secDevice, secAlloc, secQueue, secPool);
 
-    if (!config.hdri_path.empty() && std::filesystem::exists(config.hdri_path)) {
-        secNode->environmentMap = Texture::loadFromFile(secDevice, secAlloc, secQueue, secPool, config.hdri_path);
-    }
-    if (!secNode->environmentMap) {
-        bool isCyber = (config.scene_path == "cyber-city" || config.scene_path == "procedural:cyber-city" ||
-                        config.scene_path == "procedural:cyber_city" || config.scene_path == "cyber_city" ||
-                        config.scene_path == "Procedural Cyber City" || config.hdri_path == "night" || config.hdri_path == "night-sky");
-        if (isCyber) {
-            secNode->environmentMap = Texture::createProceduralNightHdrSky(secDevice, secAlloc, secQueue, secPool);
-        } else {
-            secNode->environmentMap = Texture::createProceduralHdrSky(secDevice, secAlloc, secQueue, secPool);
-        }
-    }
+    secNode->environmentMap = Texture::createSceneEnvironmentMap(
+        secDevice, secAlloc, secQueue, secPool,
+        config.hdri_path, config.scene_path, scene.domeLightHdriPath
+    );
 
     secNode->sceneTextures.clear();
     for (const auto& texData : scene.textures) {
@@ -1149,39 +1126,18 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descAllocInfo.pSetLayouts = descLayouts.data();
     vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
 
-    // Allocate secondary FidelityFX Shadow Denoiser images & buffers
+    // Allocate secondary G-Buffer & scratch images
     secNode->directLightImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
     secNode->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-    secNode->shadowFilterPingImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
-        VK_FORMAT_R16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-    for (int i = 0; i < 2; ++i) {
-        secNode->momentsImages[i] = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
-            VK_FORMAT_R16G16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-        secNode->depthImages[i] = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
-            VK_FORMAT_R16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    }
-
-    uint32_t tilesX = (config.width + 7) / 8;
-    uint32_t tilesY = (config.height + 7) / 8;
-    VkDeviceSize tileBufferSize = static_cast<VkDeviceSize>(tilesX * tilesY) * sizeof(uint32_t);
-    secNode->tileMetaDataBuffer = std::make_unique<Buffer>(secAlloc, tileBufferSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     secNode->causticImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1239,90 +1195,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
 
-    // Secondary FidelityFX Shadow Denoiser Descriptor Layouts & Pipelines
-    std::vector<VkDescriptorSetLayoutBinding> classifyBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-    VkDescriptorSetLayoutCreateInfo classifyLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    classifyLayoutInfo.bindingCount = static_cast<uint32_t>(classifyBindings.size());
-    classifyLayoutInfo.pBindings = classifyBindings.data();
-    vkCreateDescriptorSetLayout(secDevice, &classifyLayoutInfo, nullptr, &secNode->shadowClassifyDescLayout);
-
-    std::vector<VkDescriptorSetLayoutBinding> filterBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
-    };
-    VkDescriptorSetLayoutCreateInfo filterLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    filterLayoutInfo.bindingCount = static_cast<uint32_t>(filterBindings.size());
-    filterLayoutInfo.pBindings = filterBindings.data();
-    vkCreateDescriptorSetLayout(secDevice, &filterLayoutInfo, nullptr, &secNode->shadowFilterDescLayout);
-
-    std::array<VkDescriptorSetLayout, 2> classifyLayouts = { secNode->shadowClassifyDescLayout, secNode->shadowClassifyDescLayout };
-    VkDescriptorSetAllocateInfo classifyAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    classifyAllocInfo.descriptorPool = secNode->descriptorPool;
-    classifyAllocInfo.descriptorSetCount = 2;
-    classifyAllocInfo.pSetLayouts = classifyLayouts.data();
-    vkAllocateDescriptorSets(secDevice, &classifyAllocInfo, secNode->shadowClassifyDescSets);
-
-    VkDescriptorSetAllocateInfo filterAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    filterAllocInfo.descriptorPool = secNode->descriptorPool;
-    filterAllocInfo.descriptorSetCount = 1;
-    filterAllocInfo.pSetLayouts = &secNode->shadowFilterDescLayout;
-    vkAllocateDescriptorSets(secDevice, &filterAllocInfo, &secNode->shadowFilterDescSet);
-
-    VkPushConstantRange classifyPcRange{};
-    classifyPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    classifyPcRange.offset = 0;
-    classifyPcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(float) * 16 + sizeof(uint32_t) * 4;
-
-    VkPipelineLayoutCreateInfo classifyPlInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    classifyPlInfo.setLayoutCount = 1;
-    classifyPlInfo.pSetLayouts = &secNode->shadowClassifyDescLayout;
-    classifyPlInfo.pushConstantRangeCount = 1;
-    classifyPlInfo.pPushConstantRanges = &classifyPcRange;
-    vkCreatePipelineLayout(secDevice, &classifyPlInfo, nullptr, &secNode->shadowClassifyPipelineLayout);
-
-    VkPushConstantRange filterPcRange{};
-    filterPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    filterPcRange.offset = 0;
-    filterPcRange.size = sizeof(int32_t) * 2 + sizeof(float) * 2 + sizeof(int32_t) + sizeof(float) * 2 + sizeof(uint32_t) * 3;
-
-    VkPipelineLayoutCreateInfo filterPlInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    filterPlInfo.setLayoutCount = 1;
-    filterPlInfo.pSetLayouts = &secNode->shadowFilterDescLayout;
-    filterPlInfo.pushConstantRangeCount = 1;
-    filterPlInfo.pPushConstantRanges = &filterPcRange;
-    vkCreatePipelineLayout(secDevice, &filterPlInfo, nullptr, &secNode->shadowFilterPipelineLayout);
-
-    auto classifyCode = loadShaderSPIRV("ffx_shadow_tileclassify.comp.spv");
-    VkShaderModule classifyShaderModule = createShaderModule(secDevice, classifyCode);
-    VkComputePipelineCreateInfo classifyPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    classifyPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, classifyShaderModule, "main", nullptr };
-    classifyPipeInfo.layout = secNode->shadowClassifyPipelineLayout;
-    vkCreateComputePipelines(secDevice, VK_NULL_HANDLE, 1, &classifyPipeInfo, nullptr, &secNode->shadowClassifyPipeline);
-    vkDestroyShaderModule(secDevice, classifyShaderModule, nullptr);
-
-    auto filterCode = loadShaderSPIRV("ffx_shadow_filter.comp.spv");
-    VkShaderModule filterShaderModule = createShaderModule(secDevice, filterCode);
-    VkComputePipelineCreateInfo filterPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    filterPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, filterShaderModule, "main", nullptr };
-    filterPipeInfo.layout = secNode->shadowFilterPipelineLayout;
-    vkCreateComputePipelines(secDevice, VK_NULL_HANDLE, 1, &filterPipeInfo, nullptr, &secNode->shadowFilterPipeline);
-    vkDestroyShaderModule(secDevice, filterShaderModule, nullptr);
-
-    updateSecondaryShadowDenoiserDescriptors(secNode.get());
-    Logger::info("Secondary GPU: FidelityFX Shadow Denoiser pipelines and resources created successfully.");
-
     // 6. Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) on Secondary GPU
     VkPushConstantRange rtpPushConstant{};
     rtpPushConstant.stageFlags = rtStages;
@@ -1363,17 +1235,15 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeComplexCode = loadShaderSPIRV("wavefront_shade_complex.comp.spv");
             auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
             auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
-            auto wfRaySortCode = loadShaderSPIRV("wavefront_raysort.comp.spv");
             auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,
                 config.width, config.height,
-                config.wavefront_tile_size,
                 wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
                 wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
-                wfShadeEmissiveCode, wfShadePassthroughCode, wfRaySortCode,
+                wfShadeEmissiveCode, wfShadePassthroughCode,
                 secNode->context->hasDgcExecutionSet(),
                 wfShadeDiffuseSecCode, wfShadeComplexSecCode,
                 config.dgc_preprocess
@@ -1383,6 +1253,37 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         } catch (const std::exception& e) {
             Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}. Falling back to RTP.", e.what());
             secNode->wavefrontPipeline.reset();
+        }
+    }
+
+    // 7b. Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
+    if (config.upscaler_mode == UpscalerMode::FSR3) {
+        try {
+            auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
+            auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
+            uint32_t renderW = (config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(config.width * config.render_scale) :
+                config.width;
+            uint32_t renderH = (config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(config.height * config.render_scale) :
+                config.height;
+            secNode->upscaler = std::make_unique<Fsr3Upscaler>(
+                secDevice,
+                secNode->context->getPhysicalDevice(),
+                secAlloc,
+                renderW,
+                renderH,
+                config.width,
+                config.height,
+                upscaleCode,
+                rcasCode,
+                accumFormat,
+                "[GPU 1 Secondary Peer]"
+            );
+            Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized successfully [GPU 1 Secondary Peer].");
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler: {}", e.what());
+            secNode->upscaler.reset();
         }
     }
 
@@ -1424,23 +1325,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
-    secNode->shadowFilterPingImage->transitionLayout(
-        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-    for (int i = 0; i < 2; ++i) {
-        secNode->momentsImages[i]->transitionLayout(
-            secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-        secNode->depthImages[i]->transitionLayout(
-            secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
 
     VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -1462,8 +1346,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     m_devices.push_back(std::move(secNode));
     m_active = true;
 
-    // Initialize zero-copy shared external memory host buffer across primary and secondary GPUs
-    uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+    // Initialize zero-copy shared external memory host buffer across primary and secondary GPUs (24 bytes/pixel: Radiance + MV + Normal/Depth)
+    uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(config.width) * config.height * bytesPerPixel;
     initSharedHostBuffer(bufferSize);
 
@@ -1475,54 +1359,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
         );
     }
-}
-
-void MultiGpuManager::updateSecondaryShadowDenoiserDescriptors(GpuDeviceNode* secNode) {
-    if (!secNode || secNode->shadowClassifyDescSets[0] == VK_NULL_HANDLE || secNode->shadowClassifyDescSets[1] == VK_NULL_HANDLE ||
-        secNode->shadowFilterDescSet == VK_NULL_HANDLE ||
-        !secNode->directLightImage || !secNode->normalDepthImage || !secNode->tileMetaDataBuffer) return;
-    VkDevice device = secNode->context->getDevice();
-
-    VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo pingInfo{ VK_NULL_HANDLE, secNode->shadowFilterPingImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo accumInfo{ VK_NULL_HANDLE, secNode->accumTarget->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo tileBufInfo{ secNode->tileMetaDataBuffer->getBuffer(), 0, secNode->tileMetaDataBuffer->getSize() };
-
-    VkDescriptorImageInfo momentsInfo0{ VK_NULL_HANDLE, secNode->momentsImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo momentsInfo1{ VK_NULL_HANDLE, secNode->momentsImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo depthInfo0{ VK_NULL_HANDLE, secNode->depthImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo depthInfo1{ VK_NULL_HANDLE, secNode->depthImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    std::vector<VkWriteDescriptorSet> writes = {
-        // Set 0: prev = [0], curr = [1]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[0], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-
-        // Set 1: prev = [1], curr = [0]
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo1, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &momentsInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo0, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowClassifyDescSets[1], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-
-        // Filter descriptor writes
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileBufInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &pingInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->shadowFilterDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumInfo, nullptr, nullptr }
-    };
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
@@ -1624,7 +1460,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     // 2. Update Camera UBO for this slot
     CameraUniform uboSecCopy = packet.cameraUniform;
     uint32_t secSppLoop = packet.cameraUniform.spp;
-    if (packet.totalCompositeSpp > 0) {
+    if (m_config.pipeline_type == PipelineType::Wavefront && packet.totalCompositeSpp > 0u) {
         uboSecCopy.spp = packet.totalCompositeSpp;
     }
     node->cameraUBOs[slot]->copyFrom(&uboSecCopy, sizeof(CameraUniform));
@@ -1651,7 +1487,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         packet.accumulateHistory,
         fracBits,
         packet.totalCompositeSpp,
-        packet.numOpaqueTriangles, 0
+        packet.numOpaqueTriangles, std::bit_cast<uint32_t>(m_config.indirect_clamp)
     };
 
     uint32_t dispatchWidth = packet.tileWidth;
@@ -1664,7 +1500,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
     } else {
         if (packet.tileOffsetX == 1u || packet.tileOffsetX == 2u) {
-            dispatchWidth = (packet.tileWidth + 1) / 2;
+            uint32_t tileSize = (packet.tileOffsetY == 0u) ? 64u : packet.tileOffsetY;
+            uint32_t numTilesX = (packet.tileWidth + tileSize - 1u) / tileSize;
+            uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+            dispatchWidth = maxTilesPerGpuX * tileSize;
             dispatchHeight = packet.tileHeight;
         }
     }
@@ -1712,6 +1551,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
+        wfSceneData.indirectClamp = m_config.indirect_clamp;
         wfSceneData.tileOffsetX = packet.tileOffsetX;
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
@@ -1727,136 +1567,169 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         vkCmdPushConstants(cmd, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
 
         node->rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
-
-    if ((packet.cameraUniform.flags & (1 << 20)) && node->shadowClassifyPipeline && node->shadowFilterPipeline) {
-        VkMemoryBarrier2 rtToClassifyBarrier{};
-        rtToClassifyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        rtToClassifyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-        rtToClassifyBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        rtToClassifyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        rtToClassifyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo classifyDep{};
-        classifyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        classifyDep.memoryBarrierCount = 1;
-        classifyDep.pMemoryBarriers = &rtToClassifyBarrier;
-        vkCmdPipelineBarrier2(cmd, &classifyDep);
-
-        // 1. FidelityFX Shadow Denoiser Tile Classification Pass
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->shadowClassifyPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->shadowClassifyPipelineLayout, 0, 1, &node->shadowClassifyDescSets[node->shadowPingPongIndex], 0, nullptr);
-
-        struct ClassifyPushConstants {
-            int32_t imageDim[2];
-            float invImageDim[2];
-            glm::mat4 prevViewProj;
-            uint32_t frameIndex;
-            float depthDisocclusionThreshold;
-            uint32_t tileOffsetX;
-            uint32_t tileOffsetY;
-        } classifyPC;
-        classifyPC.imageDim[0] = static_cast<int32_t>(packet.tileWidth);
-        classifyPC.imageDim[1] = static_cast<int32_t>(packet.tileHeight);
-        classifyPC.invImageDim[0] = 1.0f / static_cast<float>(packet.tileWidth);
-        classifyPC.invImageDim[1] = 1.0f / static_cast<float>(packet.tileHeight);
-        classifyPC.prevViewProj = packet.cameraUniform.prevViewProj * (packet.cameraUniform.viewInverse * packet.cameraUniform.projInverse);
-        classifyPC.frameIndex = packet.cameraUniform.frameIndex;
-        classifyPC.depthDisocclusionThreshold = m_config.shadow_denoiser_depth_sigma;
-        classifyPC.tileOffsetX = packet.tileOffsetX;
-        classifyPC.tileOffsetY = packet.tileOffsetY;
-
-        vkCmdPushConstants(cmd, node->shadowClassifyPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), &classifyPC);
-        vkCmdDispatch(cmd, (packet.tileWidth + 7) / 8, (packet.tileHeight + 7) / 8, 1);
-
-        VkMemoryBarrier2 classifyToFilterBarrier{};
-        classifyToFilterBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        classifyToFilterBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        classifyToFilterBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        classifyToFilterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        classifyToFilterBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-
-        VkDependencyInfo filterDep{};
-        filterDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        filterDep.memoryBarrierCount = 1;
-        filterDep.pMemoryBarriers = &classifyToFilterBarrier;
-        vkCmdPipelineBarrier2(cmd, &filterDep);
-
-        // 2. FidelityFX Shadow Denoiser Cross-Bilateral Filter & Direct-Light Resolve Pass
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->shadowFilterPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, node->shadowFilterPipelineLayout, 0, 1, &node->shadowFilterDescSet, 0, nullptr);
-
-        struct FilterPushConstants {
-            int32_t imageDim[2];
-            float invImageDim[2];
-            int32_t passIndex;
-            float depthSigma;
-            float normalPower;
-            uint32_t tileOffsetX;
-            uint32_t tileOffsetY;
-            uint32_t tileSize;
-        } filterPC;
-        filterPC.imageDim[0] = static_cast<int32_t>(packet.tileWidth);
-        filterPC.imageDim[1] = static_cast<int32_t>(packet.tileHeight);
-        filterPC.invImageDim[0] = 1.0f / static_cast<float>(packet.tileWidth);
-        filterPC.invImageDim[1] = 1.0f / static_cast<float>(packet.tileHeight);
-        filterPC.passIndex = 0;
-        filterPC.depthSigma = m_config.shadow_denoiser_depth_sigma;
-        filterPC.normalPower = m_config.shadow_denoiser_normal_power;
-        filterPC.tileOffsetX = packet.tileOffsetX;
-        filterPC.tileOffsetY = packet.tileOffsetY;
-        filterPC.tileSize = m_config.tile_size;
-
-        vkCmdPushConstants(cmd, node->shadowFilterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(filterPC), &filterPC);
-        vkCmdDispatch(cmd, (packet.tileWidth + 7) / 8, (packet.tileHeight + 7) / 8, 1);
-
-        node->shadowPingPongIndex = 1 - node->shadowPingPongIndex;
-    }
     }
 
 
 
-    // Timestamp 1: RT End
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
+    if (packet.enableUpscaler && node->upscaler) {
+        // Timestamp 1: RT End
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
 
-    // Transition accumTarget to TRANSFER_SRC_OPTIMAL
-    node->accumTarget->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-    );
+        if (node->upscaler->getRenderWidth() != packet.renderWidth ||
+            node->upscaler->getRenderHeight() != packet.renderHeight ||
+            node->upscaler->getDisplayWidth() != packet.displayWidth ||
+            node->upscaler->getDisplayHeight() != packet.displayHeight) {
+            node->upscaler->resize(packet.renderWidth, packet.renderHeight, packet.displayWidth, packet.displayHeight);
+        }
 
-    // Timestamp 2: Copy Start
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
+        UpscalerDispatchDesc descSec{};
+        descSec.cmd = cmd;
+        descSec.colorIn = node->accumTarget->getImageView();
+        descSec.depthIn = node->normalDepthImage ? node->normalDepthImage->getImageView() : VK_NULL_HANDLE;
+        descSec.motionVectorsIn = node->motionVectorImage ? node->motionVectorImage->getImageView() : VK_NULL_HANDLE;
+        descSec.colorOut = node->upscaler->getOutputImage()->getImageView();
+        descSec.renderWidth = packet.renderWidth;
+        descSec.renderHeight = packet.renderHeight;
+        descSec.displayWidth = packet.displayWidth;
+        descSec.displayHeight = packet.displayHeight;
+        descSec.jitterX = packet.jitterX;
+        descSec.jitterY = packet.jitterY;
+        descSec.enableSharpening = packet.enableSharpening;
+        descSec.sharpness = packet.sharpness;
+        descSec.resetHistory = packet.resetUpscalerHistory;
+        descSec.cameraMoved = packet.cameraMoved;
+        descSec.frameIndex = packet.frameIndex;
+        descSec.totalSamples = packet.totalSamples;
+        descSec.inputIsNormalized = false;
 
-    VkBufferImageCopy copyRegion{};
-    copyRegion.bufferOffset = 0;
-    copyRegion.bufferRowLength = 0;
-    copyRegion.bufferImageHeight = 0;
-    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copyRegion.imageSubresource.mipLevel = 0;
-    copyRegion.imageSubresource.baseArrayLayer = 0;
-    copyRegion.imageSubresource.layerCount = 1;
-    copyRegion.imageOffset = { 0, 0, 0 };
-    copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
+        node->upscaler->recordUpscale(descSec);
 
-    uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
-    VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
-        ? m_p2pBufferSecondary[sharedSlot]
-        : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
+        // Transition upscaler output to TRANSFER_SRC_OPTIMAL
+        node->upscaler->getOutputImage()->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+        );
 
-    vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           targetBuffer, 1, &copyRegion);
+        // Timestamp 2: Copy Start
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
 
-    // Timestamp 3: Copy End
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageOffset = { 0, 0, 0 };
+        copyRegion.imageExtent = { packet.displayWidth, packet.displayHeight, 1 };
 
-    node->accumTarget->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
+        uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
+        VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
+            ? m_p2pBufferSecondary[sharedSlot]
+            : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
+
+        vkCmdCopyImageToBuffer(cmd, node->upscaler->getOutputImage()->getImage(),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               targetBuffer, 1, &copyRegion);
+
+        // Timestamp 3: Copy End
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
+
+        node->upscaler->getOutputImage()->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    } else {
+        // Timestamp 1: RT End
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
+
+        // Transition accumTarget to TRANSFER_SRC_OPTIMAL
+        node->accumTarget->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+        );
+
+        // Timestamp 2: Copy Start
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageOffset = { 0, 0, 0 };
+        copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
+
+        uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
+        VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
+            ? m_p2pBufferSecondary[sharedSlot]
+            : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
+
+        vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               targetBuffer, 1, &copyRegion);
+
+        if (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage) {
+            uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 : 16;
+            VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
+            VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
+            VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+
+            // Copy Motion Vectors
+            node->motionVectorImage->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+            );
+            VkBufferImageCopy copyMv = copyRegion;
+            copyMv.bufferOffset = radOffsetAligned;
+            vkCmdCopyImageToBuffer(cmd, node->motionVectorImage->getImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   targetBuffer, 1, &copyMv);
+            node->motionVectorImage->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+
+            // Copy Normal & Depth
+            node->normalDepthImage->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+            );
+            VkBufferImageCopy copyNd = copyRegion;
+            copyNd.bufferOffset = mvOffsetAligned;
+            vkCmdCopyImageToBuffer(cmd, node->normalDepthImage->getImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   targetBuffer, 1, &copyNd);
+            node->normalDepthImage->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
+
+        // Timestamp 3: Copy End
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
+
+        node->accumTarget->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
 
     vkEndCommandBuffer(cmd);
 
@@ -1908,7 +1781,19 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          void* dstHostPtr,
                                          size_t transferBytes,
                                          uint32_t totalCompositeSpp,
-                                         uint32_t numOpaqueTriangles) {
+                                         uint32_t numOpaqueTriangles,
+                                         bool enableUpscaler,
+                                         uint32_t renderW,
+                                         uint32_t renderH,
+                                         uint32_t displayW,
+                                         uint32_t displayH,
+                                         glm::vec2 jitter,
+                                         bool resetUpscaler,
+                                         bool cameraMoved,
+                                         uint32_t frameIndex,
+                                         bool enableSharpening,
+                                         float sharpness,
+                                         uint32_t totalSamples) {
     if (!m_active || m_devices.empty()) return;
 
     {
@@ -1934,6 +1819,19 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.transferBytes = transferBytes;
         m_pendingWork.totalCompositeSpp = totalCompositeSpp;
         m_pendingWork.numOpaqueTriangles = numOpaqueTriangles;
+        m_pendingWork.enableUpscaler = enableUpscaler;
+        m_pendingWork.renderWidth = renderW;
+        m_pendingWork.renderHeight = renderH;
+        m_pendingWork.displayWidth = displayW;
+        m_pendingWork.displayHeight = displayH;
+        m_pendingWork.jitterX = jitter.x;
+        m_pendingWork.jitterY = jitter.y;
+        m_pendingWork.resetUpscalerHistory = resetUpscaler;
+        m_pendingWork.cameraMoved = cameraMoved;
+        m_pendingWork.frameIndex = frameIndex;
+        m_pendingWork.enableSharpening = enableSharpening;
+        m_pendingWork.sharpness = sharpness;
+        m_pendingWork.totalSamples = totalSamples;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
         m_waitingSlot = slot;
@@ -2042,7 +1940,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         VmaAllocator secAlloc = node->context->getAllocator();
         vkDeviceWaitIdle(secDevice);
 
-        uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+        uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
         VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
         uint32_t secWidth = width;
         node->accumTarget = std::make_unique<Image>(
@@ -2051,40 +1949,18 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
         );
 
-        // Recreate secondary FidelityFX Shadow Denoiser resources
+        // Recreate secondary G-Buffer resources
         node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
         node->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
             VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-        node->shadowFilterPingImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
-            VK_FORMAT_R16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-        for (int i = 0; i < 2; ++i) {
-            node->momentsImages[i] = std::make_unique<Image>(secDevice, secAlloc, width, height,
-                VK_FORMAT_R16G16_SFLOAT,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
-            node->depthImages[i] = std::make_unique<Image>(secDevice, secAlloc, width, height,
-                VK_FORMAT_R16_SFLOAT,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        }
-        node->shadowPingPongIndex = 0;
-
-        uint32_t tilesX = (width + 7) / 8;
-        uint32_t tilesY = (height + 7) / 8;
-        VkDeviceSize tileBufferSize = static_cast<VkDeviceSize>(tilesX * tilesY) * sizeof(uint32_t);
-        node->tileMetaDataBuffer = std::make_unique<Buffer>(secAlloc, tileBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
         node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
             VK_FORMAT_R16G16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
         node->causticImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
             VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -2116,26 +1992,6 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
-        node->shadowFilterPingImage->transitionLayout(
-            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-        for (int i = 0; i < 2; ++i) {
-            node->momentsImages[i]->transitionLayout(
-                node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
-            node->depthImages[i]->transitionLayout(
-                node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
-        }
 
         node->motionVectorImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -2205,10 +2061,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 node->exportedFd[slot] = -1;
             }
         }
-        updateSecondaryShadowDenoiserDescriptors(node.get());
         if (node->wavefrontPipeline) {
-            node->wavefrontPipeline->resize(width, height, m_config.wavefront_tile_size);
+            node->wavefrontPipeline->resize(width, height);
             updateSecondaryWavefrontDescriptors(node.get());
+        }
+        if (node->upscaler) {
+            uint32_t renderW = (m_config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(width * m_config.render_scale) : width;
+            uint32_t renderH = (m_config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(height * m_config.render_scale) : height;
+            node->upscaler->resize(renderW, renderH, width, height);
         }
         m_slotSubmitted = { false, false };
         m_workSubmitted = false;
@@ -2217,7 +2079,50 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
     Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);
 }
 
-bool MultiGpuManager::loadScene(const SceneData& scene) {
+void MultiGpuManager::setConfig(const Config& config) {
+    bool upscalerChanged = (config.upscaler_mode != m_config.upscaler_mode) ||
+                           (config.render_scale != m_config.render_scale);
+    m_config = config;
+    if (upscalerChanged && !m_devices.empty()) {
+        GpuDeviceNode* secNode = m_devices[0].get();
+        if (config.upscaler_mode == UpscalerMode::FSR3) {
+            uint32_t renderW = (config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(config.width * config.render_scale) :
+                config.width;
+            uint32_t renderH = (config.render_scale < 1.0f) ?
+                static_cast<uint32_t>(config.height * config.render_scale) :
+                config.height;
+            if (!secNode->upscaler) {
+                try {
+                    auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
+                    auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
+                    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+                    secNode->upscaler = std::make_unique<Fsr3Upscaler>(
+                        secNode->context->getDevice(),
+                        secNode->context->getPhysicalDevice(),
+                        secNode->context->getAllocator(),
+                        renderW, renderH, config.width, config.height,
+                        upscaleCode, rcasCode, accumFormat,
+                        "[GPU 1 Secondary Peer]"
+                    );
+                    Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
+                } catch (const std::exception& e) {
+                    Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler on setConfig: {}", e.what());
+                    secNode->upscaler.reset();
+                }
+            } else {
+                secNode->upscaler->resize(renderW, renderH, config.width, config.height);
+            }
+        } else {
+            secNode->upscaler.reset();
+        }
+    }
+}
+
+bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scenePath) {
+    if (!scenePath.empty()) {
+        m_config.scene_path = scenePath;
+    }
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
     if (m_devices.empty()) return false;
@@ -2308,18 +2213,11 @@ bool MultiGpuManager::loadScene(const SceneData& scene) {
         }
     }
 
-    // 3b. Adapt procedural HDRI sky dome to scene type on secondary GPU
-    if (m_config.hdri_path.empty() || m_config.hdri_path == "night" || m_config.hdri_path == "night-sky") {
-        bool isCyber = (m_config.hdri_path == "night" || m_config.hdri_path == "night-sky" ||
-                        m_config.scene_path == "cyber-city" || m_config.scene_path == "procedural:cyber-city" ||
-                        m_config.scene_path == "procedural:cyber_city" || m_config.scene_path == "cyber_city" ||
-                        m_config.scene_path == "Procedural Cyber City");
-        if (isCyber) {
-            secNode->environmentMap = Texture::createProceduralNightHdrSky(secDevice, secAlloc, secQueue, secPool);
-        } else {
-            secNode->environmentMap = Texture::createProceduralHdrSky(secDevice, secAlloc, secQueue, secPool);
-        }
-    }
+    // 3b. Unified HDRI sky dome synchronization on secondary GPU
+    secNode->environmentMap = Texture::createSceneEnvironmentMap(
+        secDevice, secAlloc, secQueue, secPool,
+        m_config.hdri_path, m_config.scene_path, scene.domeLightHdriPath
+    );
 
     // 4. Update secondary descriptors
     VkDescriptorImageInfo accumImageInfo{};

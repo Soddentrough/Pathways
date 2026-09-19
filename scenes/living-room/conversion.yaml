@@ -7,13 +7,13 @@ scene:
 outputs:
   core: "scenes/living-room/gltf/living_room_core.gltf"
   extended: "scenes/living-room/gltf/living_room_extended.gltf"
-  extended_extensions: ["KHR_materials_specular", "KHR_materials_clearcoat", "KHR_materials_transmission", "KHR_materials_ior"]
+  extended_extensions: ["KHR_materials_specular", "KHR_materials_clearcoat", "KHR_materials_transmission", "KHR_materials_ior", "KHR_lights_punctual"]
 summary:
   meshes: 65
   triangles: 143163
   materials: 19
   textures: 5
-  lights: 1
+  lights: 3
   generated_flat_normal_meshes: 16
 render:
   integrator: "path"
@@ -117,9 +117,25 @@ material_mappings:
     alpha_gltf: "white background baked into baseColorTexture alpha"
 light_mappings:
   -
-    pbrt: "infinite"
-    gltf: "metadata_only"
-    source: "textures/Sky 19.pfm"
-    pbrt_transform: [-1.0, 0.0, 8.74228e-08, 0.0, -8.74228e-08, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    name: "Sun"
+    pbrt: "infinite (sun lobe)"
+    gltf: "KHR_lights_punctual directional"
+    dir_to_light: [-0.65, 0.50, 0.55]
+    color: [1.0, 0.96, 0.90]
+    intensity: 14.0
+  -
+    name: "SkyFill"
+    pbrt: "infinite (sky dome)"
+    gltf: "KHR_lights_punctual directional"
+    dir_to_light: [-0.30, 0.80, 0.50]
+    color: [0.70, 0.82, 1.0]
+    intensity: 4.0
+  -
+    name: "SashWindowFill"
+    pbrt: "infinite (sash window aperture fill)"
+    gltf: "KHR_lights_punctual directional"
+    dir_to_light: [-0.85, 0.35, 0.35]
+    color: [0.95, 0.92, 0.85]
+    intensity: 5.0
 approximations: ["coateddiffuse_clearcoat", "dielectric_transmission_ior", "conductor_metallic"]
-losses: ["render_integrator", "render_sampler", "pixel_filter", "film_output", "infinite_environment_light", "diffusetransmission_transmittance"]
+losses: ["render_integrator", "render_sampler", "pixel_filter", "film_output", "diffusetransmission_transmittance"]

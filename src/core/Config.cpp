@@ -135,7 +135,6 @@ void Config::printUsage(const char* progName) {
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
-              << "  --render-scale <float>  Internal rendering scale (default: 1.0)\n"
               << "  --no-hdr                Disable HDR display auto-negotiation (force SDR sRGB)\n"
               << "  --hdr-peak <float>      Display peak luminance in nits (default: 1000.0)\n"
               << "  --hdr-white <float>     Reference paper white luminance in nits (default: 200.0)\n\n"
@@ -146,8 +145,11 @@ void Config::printUsage(const char* progName) {
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
-              << "  --temporal-accum, --tra Enable motion-vector guided temporal accumulation [default: disabled]\n"
-              << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'temporal' (Temporal Accumulation), 'bmfr', 'upways' (Wave32 WMMA), or 'upways_sr' (2x Super-Resolution)\n"
+              << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'upways' (Wave32 WMMA)\n"
+              << "  --upscaler <mode>       Upscaler mode: 'none' (1:1 native [default]), 'fsr3' (AMD FSR 3.1), 'upways' (Combined Denoiser/SR), 'fsr1' (Spatial EASU+RCAS)\n"
+              << "  --upscaler-sharpening   Enable additional RCAS sharpening pass [default: disabled]\n"
+              << "  --upscaler-sharpness <f> RCAS contrast-adaptive sharpness factor [0.0 - 1.0] (default: 0.0)\n"
+              << "  --render-scale <float>  Continuous internal render scale factor (e.g. 0.6667 for 1.5x, 0.5 for 2.0x)\n"
               << "  --upways                Enable Upways Neural Denoising with Wave32 WMMA\n"
               << "  --upways-sr             Enable Upways Continuous Super-Resolution (2.0x upscaling)\n"
               << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin)\n"
@@ -156,10 +158,10 @@ void Config::printUsage(const char* progName) {
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
-              << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
-              << "  --sppm                  Enable Stochastic Progressive Photon Mapping for offline reference convergence\n\n"
+              << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
+              << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
               << "  --adaptive-spp          Enable dynamic 3-axis sample rate governor to track target FPS\n"
               << "  --min-spp <int>         Minimum dynamic SPP floor (default: 1)\n"
               << "  --max-spp <int>         Maximum dynamic SPP ceiling (default: 16)\n"
@@ -173,15 +175,14 @@ void Config::printUsage(const char* progName) {
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
               << "Wavefront Architecture:\n"
-              << "  --wavefront-tile <int>  Wavefront cache-resident tile size (0 = full frame, 256 = 256x256, default: 0)\n"
-              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', 'archetype' (A & B), or 'bda' (C)\n"
-              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], 'directional' (Option 1 DGC), or 'spatial' (Option 2 Morton)\n"
+              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', or 'archetype' (A & B)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], or 'directional' (Option 1 DGC)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
+              << "  --indirect-clamp <float> Maximum indirect / secondary bounce radiance luminance (default: 35.0, 0 = disabled)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
-              << "  --no-async-preprocess   Disable dedicated async compute queue DGC preprocessing\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
@@ -203,7 +204,6 @@ void Config::printUsage(const char* progName) {
               << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
               << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
               << "  --capture-channels <int> Number of channels: 16, 19, or 20 (default: 20 PTTD v2)\n"
-              << "  --capture-normals       Include surface normals (20ch PTTD v2 stream [default: on])\n"
               << "  --no-capture-normals    Legacy 16-channel export without surface normals\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
@@ -214,6 +214,7 @@ Config Config::parse(int argc, char* argv[]) {
     Config cfg;
 
     bool fullscreen_explicit = false;
+    bool frame_time_explicit = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -285,6 +286,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.scene_path = argv[++i];
         } else if (arg == "--hdri" && i + 1 < argc) {
             cfg.hdri_path = argv[++i];
+            cfg.custom_hdri = true;
         } else if (arg == "--dump-frame" && i + 1 < argc) {
             cfg.dump_frame_path = argv[++i];
         } else if (arg == "--dump-8bit" || arg == "--png-8bit") {
@@ -304,18 +306,34 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--capture-channels" && i + 1 < argc) {
             cfg.capture_channels = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.capture_normals = (cfg.capture_channels >= 19);
-        } else if (arg == "--capture-normals") {
-            cfg.capture_normals = true;
-            if (cfg.capture_channels < 19) {
-                cfg.capture_channels = 20;
-            }
         } else if (arg == "--no-capture-normals") {
             cfg.capture_normals = false;
             cfg.capture_channels = 16;
         } else if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--mgpu") {
-            cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string mode = argv[++i];
+                if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
+                else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
+                    Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
+                    cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                    cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+                }
+                else if (mode == "tile" || mode == "split" || mode == "checkerboard") {
+                    cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                    cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+                }
+                else if (mode == "sample" || mode == "sample_parallel") {
+                    cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+                    cfg.mgpu_upscale_mode = MgpuUpscaleMode::SampleBlend;
+                }
+                else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
+                else cfg.mgpu_mode = MultiGpuMode::Off;
+            } else {
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+            }
         } else if (arg.starts_with("--mgpu=")) {
             std::string mode = arg.substr(7);
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
@@ -323,8 +341,14 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
                 cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             }
-            else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
-            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "tile" || mode == "split" || mode == "checkerboard") {
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+            }
+            else if (mode == "sample" || mode == "sample_parallel") {
+                cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::SampleBlend;
+            }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-mode" && i + 1 < argc) {
@@ -334,8 +358,14 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
                 cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             }
-            else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
-            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "tile" || mode == "split" || mode == "checkerboard") {
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+            }
+            else if (mode == "sample" || mode == "sample_parallel") {
+                cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::SampleBlend;
+            }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg.starts_with("--mgpu-mode=")) {
@@ -345,8 +375,14 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::info("Interleaved scanline mode deprecated; defaulting to CheckerboardTile.");
                 cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
             }
-            else if (mode == "tile" || mode == "split" || mode == "checkerboard") cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
-            else if (mode == "sample" || mode == "sample_parallel") cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+            else if (mode == "tile" || mode == "split" || mode == "checkerboard") {
+                cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
+            }
+            else if (mode == "sample" || mode == "sample_parallel") {
+                cfg.mgpu_mode = MultiGpuMode::SampleParallel;
+                cfg.mgpu_upscale_mode = MgpuUpscaleMode::SampleBlend;
+            }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
         } else if (arg == "--mgpu-transfer" && i + 1 < argc) {
@@ -367,96 +403,98 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
-        } else if (arg == "--shadow-denoiser" || arg == "--denoise-shadows") {
-            Logger::info("FidelityFX Shadow Denoiser option is deprecated and has been removed from the active pipeline.");
-        } else if (arg == "--taa" || arg == "--no-taa") {
-            Logger::info("TAA option is deprecated and has been removed from the active pipeline.");
-        } else if (arg == "--taa-alpha" && i + 1 < argc) {
-            ++i;
-        } else if (arg == "--taa-gamma" && i + 1 < argc) {
-            ++i;
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "upways") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.upways_superres = false;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
-            } else if (mode == "bmfr") {
-                cfg.enable_bmfr = true;
-                cfg.enable_temporal_accum = true;
-                cfg.denoiser_mode = DenoiserMode::BMFR;
-            } else if (mode == "temporal" || mode == "tra") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = true;
-                cfg.denoiser_mode = DenoiserMode::Temporal;
             } else if (mode == "none" || mode == "off") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             if (mode == "upways") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.upways_superres = false;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
-            } else if (mode == "bmfr") {
-                cfg.enable_bmfr = true;
-                cfg.enable_temporal_accum = true;
-                cfg.denoiser_mode = DenoiserMode::BMFR;
-            } else if (mode == "temporal" || mode == "tra") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = true;
-                cfg.denoiser_mode = DenoiserMode::Temporal;
             } else if (mode == "none" || mode == "off") {
-                cfg.enable_bmfr = false;
-                cfg.enable_temporal_accum = false;
                 cfg.denoiser_mode = DenoiserMode::None;
             }
         } else if (arg == "--upways") {
-            cfg.enable_bmfr = false;
-            cfg.enable_temporal_accum = false;
             cfg.upways_superres = false;
             cfg.denoiser_mode = DenoiserMode::Upways;
         } else if (arg == "--upways-sr" || arg == "--upways-superres") {
-            cfg.enable_bmfr = false;
-            cfg.enable_temporal_accum = false;
             cfg.upways_superres = true;
             cfg.denoiser_mode = DenoiserMode::Upways;
+            cfg.upscaler_mode = UpscalerMode::Upways;
+            if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f;
+        } else if (arg == "--upscaler" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
+                cfg.upscaler_mode = UpscalerMode::FSR3;
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f; // Default to 1.5x Quality mode
+            } else if (mode == "upways" || mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.upscaler_mode = UpscalerMode::Upways;
+                cfg.upways_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Upways; // Combined denoiser & upscaler
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f; // Default to 2.0x Super-Resolution
+            } else if (mode == "fsr1" || mode == "cas" || mode == "spatial") {
+                cfg.upscaler_mode = UpscalerMode::FSR1;
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+            } else if (mode == "none" || mode == "off") {
+                cfg.upscaler_mode = UpscalerMode::None;
+                cfg.upways_superres = false;
+            }
+        } else if (arg.starts_with("--upscaler=")) {
+            std::string mode = arg.substr(arg.find('=') + 1);
+            if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
+                cfg.upscaler_mode = UpscalerMode::FSR3;
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+            } else if (mode == "upways" || mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.upscaler_mode = UpscalerMode::Upways;
+                cfg.upways_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Upways;
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f;
+            } else if (mode == "fsr1" || mode == "cas" || mode == "spatial") {
+                cfg.upscaler_mode = UpscalerMode::FSR1;
+                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+            } else if (mode == "none" || mode == "off") {
+                cfg.upscaler_mode = UpscalerMode::None;
+                cfg.upways_superres = false;
+            }
+        } else if ((arg == "--upscaler-preset" || arg == "--upscaler-quality") && i + 1 < argc) {
+            std::string preset = argv[++i];
+            if (preset == "native") {
+                cfg.render_scale = 1.0f;
+            } else if (preset == "quality" || preset == "q") {
+                cfg.render_scale = 0.6667f; // 1.5x (e.g. 1440p -> 4K)
+            } else if (preset == "balanced" || preset == "bal") {
+                cfg.render_scale = 0.5882f; // ~1.7x
+            } else if (preset == "performance" || preset == "perf" || preset == "p") {
+                cfg.render_scale = 0.5000f; // 2.0x (e.g. 1080p -> 4K)
+            } else if (preset == "ultra-performance" || preset == "ultra_performance" || preset == "ultra_perf") {
+                cfg.render_scale = 0.3333f; // 3.0x (e.g. 720p -> 4K)
+            }
+        } else if (arg == "--upscaler-sharpening") {
+            cfg.upscaler_sharpening = true;
+            if (cfg.upscaler_sharpness <= 0.0f) {
+                cfg.upscaler_sharpness = 0.5f;
+            }
+        } else if (arg == "--upscaler-sharpness" && i + 1 < argc) {
+            cfg.upscaler_sharpness = std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
+            cfg.upscaler_sharpening = (cfg.upscaler_sharpness > 0.0f);
+        } else if (arg.starts_with("--upscaler-sharpness=")) {
+            cfg.upscaler_sharpness = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.0f, 1.0f);
+            cfg.upscaler_sharpening = (cfg.upscaler_sharpness > 0.0f);
         } else if (arg == "--upways-weights" && i + 1 < argc) {
             cfg.upways_weights_path = argv[++i];
         } else if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
-        } else if (arg == "--bmfr") {
-            cfg.enable_bmfr = true;
-            cfg.enable_temporal_accum = true;
-            cfg.denoiser_mode = DenoiserMode::BMFR;
-        } else if (arg == "--temporal-accum" || arg == "--tra") {
-            // Explicit opt-in for temporal radiance accumulation. Default remains Pure Monte Carlo
-            // to avoid radial hyperspace motion trails under 1-SPP interactive camera translation.
-            cfg.enable_temporal_accum = true;
-            if (cfg.denoiser_mode == DenoiserMode::None) {
-                cfg.denoiser_mode = DenoiserMode::Temporal;
-            }
-        } else if (arg == "--no-temporal-accum" || arg == "--no-tra") {
-            cfg.enable_temporal_accum = false;
-            if (cfg.denoiser_mode == DenoiserMode::Temporal) {
-                cfg.denoiser_mode = DenoiserMode::None;
-            }
-        } else if (arg == "--atrous" || arg.starts_with("--atrous")) {
-            Logger::warn("A-Trous Wavelet denoiser has been removed. Use --bmfr or --temporal-accum to configure denoising.");
         } else if (arg == "--light-tree") {
             cfg.enable_light_tree = true;
         } else if (arg == "--nrc") {
@@ -475,9 +513,6 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--caustic-photons=")) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--sppm") {
-            cfg.enable_caustics = true;
-            cfg.enable_sppm = true;
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {
@@ -486,31 +521,23 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::warn("Invalid tile size {} specified. Must be 16, 32, 64, or 128. Defaulting to 64.", sz);
                 cfg.tile_size = 64;
             }
-        } else if ((arg == "--wavefront-tile" || arg == "--wf-tile" || arg == "--wavefront-tile-size") && i + 1 < argc) {
-            cfg.wavefront_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--wavefront-tile=") || arg.starts_with("--wf-tile=") || arg.starts_with("--wavefront-tile-size=")) {
-            cfg.wavefront_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if ((arg == "--wavefront-sort" || arg == "--wf-sort" || arg == "--material-sort") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
-            else if (s == "bda" || s == "c") cfg.wavefront_sort_mode = WavefrontSortMode::BDA;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
         } else if (arg.starts_with("--wavefront-sort=") || arg.starts_with("--wf-sort=") || arg.starts_with("--material-sort=")) {
             std::string s = arg.substr(arg.find('=') + 1);
             if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
-            else if (s == "bda" || s == "c") cfg.wavefront_sort_mode = WavefrontSortMode::BDA;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
         } else if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
-            else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if (arg.starts_with("--sec-sort=") || arg.starts_with("--secondary-sort=") || arg.starts_with("-ss=")) {
             std::string s = arg.substr(arg.find('=') + 1);
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
-            else if (s == "spatial" || s == "morton" || s == "index" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::SpatialIndex;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
             cfg.streamline_secondary_shading = false;
@@ -520,6 +547,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_secondary_distance = std::stof(argv[++i]);
         } else if (arg.starts_with("--sec-max-dist=") || arg.starts_with("--secondary-max-distance=")) {
             cfg.max_secondary_distance = std::stof(arg.substr(arg.find('=') + 1));
+        } else if ((arg == "--indirect-clamp" || arg == "--sec-clamp") && i + 1 < argc) {
+            cfg.indirect_clamp = std::max(0.0f, std::stof(argv[++i]));
+        } else if (arg.starts_with("--indirect-clamp=") || arg.starts_with("--sec-clamp=")) {
+            cfg.indirect_clamp = std::max(0.0f, std::stof(arg.substr(arg.find('=') + 1)));
         } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
@@ -719,13 +750,23 @@ Config Config::parse(int argc, char* argv[]) {
         } else if (arg == "--target-fps" && i + 1 < argc) {
             cfg.target_fps = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.adaptive_spp = (cfg.target_fps > 0);
+            if (!frame_time_explicit && cfg.target_fps > 0) {
+                cfg.target_frame_time_ms = 1000.0f / static_cast<float>(cfg.target_fps);
+            }
         } else if (arg.starts_with("--target-fps=")) {
             cfg.target_fps = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
             cfg.adaptive_spp = (cfg.target_fps > 0);
+            if (!frame_time_explicit && cfg.target_fps > 0) {
+                cfg.target_frame_time_ms = 1000.0f / static_cast<float>(cfg.target_fps);
+            }
+        } else if ((arg == "--target-frame-time" || arg == "--frame-budget") && i + 1 < argc) {
+            cfg.target_frame_time_ms = std::stof(argv[++i]);
+            frame_time_explicit = true;
+        } else if (arg.starts_with("--target-frame-time=") || arg.starts_with("--frame-budget=")) {
+            cfg.target_frame_time_ms = std::stof(arg.substr(arg.find('=') + 1));
+            frame_time_explicit = true;
         } else if (arg == "--adaptive-spp") {
             cfg.adaptive_spp = true;
-        } else if (arg == "--no-adaptive-spp") {
-            cfg.adaptive_spp = false;
         } else if (arg == "--min-spp" && i + 1 < argc) {
             cfg.min_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--max-spp" && i + 1 < argc) {
@@ -736,8 +777,6 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-accumulation" || arg == "--realtime") {
             cfg.progressive_accumulation = false;
-        } else if (arg == "--accumulation") {
-            cfg.progressive_accumulation = true;
         } else if ((arg == "--accum-cutoff" || arg == "--max-accum-frames" || arg == "--accum-limit") && i + 1 < argc) {
             cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") || arg.starts_with("--accum-limit=")) {
@@ -745,8 +784,6 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(arg.substr(eq + 1)));
         } else if (arg == "--no-indirect" || arg == "--direct-only") {
             cfg.enable_indirect_light = false;
-        } else if (arg == "--indirect") {
-            cfg.enable_indirect_light = true;
         } else if (arg == "--no-hdr") {
             cfg.enable_hdr = false;
         } else if (arg == "--hdr-peak" && i + 1 < argc) {

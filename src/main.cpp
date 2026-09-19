@@ -20,8 +20,9 @@ int main(int argc, char* argv[]) {
             pathways::Logger::info("  Target Resolution: Auto (Native Display) | SPP: {} | Max Bounces: {}",
                                    config.spp, config.max_bounces);
         }
-        pathways::Logger::info("  Mode: {} | Target Frame Budget: <8.0 ms",
-                               config.headless ? "Headless Testing & Verification" : "Interactive Real-Time Viewport");
+        pathways::Logger::info("  Mode: {} | Target Frame Budget: <{:.1f} ms",
+                               config.headless ? "Headless Testing & Verification" : "Interactive Real-Time Viewport",
+                               config.target_frame_time_ms);
         pathways::Logger::info("==========================================================");
 
         if (config.test_scene_switching) {

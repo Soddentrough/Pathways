@@ -37,7 +37,7 @@ int main() {
 
     // 1. Verify UpwaysPushConstants layout & size alignment
     std::cout << "[TEST 1] UpwaysPushConstants Struct Layout & Alignment..." << std::endl;
-    check_true(sizeof(UpwaysPushConstants) == 64, "UpwaysPushConstants must be exactly 64 bytes");
+    check_true(sizeof(UpwaysPushConstants) == 96, "UpwaysPushConstants must be exactly 96 bytes");
     check_true(offsetof(UpwaysPushConstants, inputWidth) == 0, "inputWidth must be at byte 0");
     check_true(offsetof(UpwaysPushConstants, inputHeight) == 4, "inputHeight must be at byte 4");
     check_true(offsetof(UpwaysPushConstants, outputWidth) == 8, "outputWidth must be at byte 8");
@@ -46,15 +46,24 @@ int main() {
     check_true(offsetof(UpwaysPushConstants, invInputHeight) == 20, "invInputHeight must be at byte 20");
     check_true(offsetof(UpwaysPushConstants, invOutputWidth) == 24, "invOutputWidth must be at byte 24");
     check_true(offsetof(UpwaysPushConstants, invOutputHeight) == 28, "invOutputHeight must be at byte 28");
-    check_true(offsetof(UpwaysPushConstants, frameIndex) == 32, "frameIndex must be at byte 32");
-    check_true(offsetof(UpwaysPushConstants, resetHistory) == 36, "resetHistory must be at byte 36");
-    check_true(offsetof(UpwaysPushConstants, cameraMoved) == 40, "cameraMoved must be at byte 40");
-    check_true(offsetof(UpwaysPushConstants, superResMode) == 44, "superResMode must be at byte 44");
-    check_true(offsetof(UpwaysPushConstants, depthThreshold) == 48, "depthThreshold must be at byte 48");
-    check_true(offsetof(UpwaysPushConstants, normalThreshold) == 52, "normalThreshold must be at byte 52");
-    check_true(offsetof(UpwaysPushConstants, blendAlpha) == 56, "blendAlpha must be at byte 56");
-    check_true(offsetof(UpwaysPushConstants, pad) == 60, "pad must be at byte 60");
-    std::cout << "  -> UpwaysPushConstants layout verified (64B push constant aligned)." << std::endl;
+    check_true(offsetof(UpwaysPushConstants, tileOffsetX) == 32, "tileOffsetX must be at byte 32");
+    check_true(offsetof(UpwaysPushConstants, tileOffsetY) == 36, "tileOffsetY must be at byte 36");
+    check_true(offsetof(UpwaysPushConstants, tileWidth) == 40, "tileWidth must be at byte 40");
+    check_true(offsetof(UpwaysPushConstants, tileHeight) == 44, "tileHeight must be at byte 44");
+    check_true(offsetof(UpwaysPushConstants, apronWidth) == 48, "apronWidth must be at byte 48");
+    check_true(offsetof(UpwaysPushConstants, scaleFactorX) == 52, "scaleFactorX must be at byte 52");
+    check_true(offsetof(UpwaysPushConstants, scaleFactorY) == 56, "scaleFactorY must be at byte 56");
+    check_true(offsetof(UpwaysPushConstants, frameIndex) == 60, "frameIndex must be at byte 60");
+    check_true(offsetof(UpwaysPushConstants, resetHistory) == 64, "resetHistory must be at byte 64");
+    check_true(offsetof(UpwaysPushConstants, cameraMoved) == 68, "cameraMoved must be at byte 68");
+    check_true(offsetof(UpwaysPushConstants, superResMode) == 72, "superResMode must be at byte 72");
+    check_true(offsetof(UpwaysPushConstants, blendAlpha) == 76, "blendAlpha must be at byte 76");
+    check_true(offsetof(UpwaysPushConstants, minTau) == 80, "minTau must be at byte 80");
+    check_true(offsetof(UpwaysPushConstants, learnedDemod) == 84, "learnedDemod must be at byte 84");
+    check_true(offsetof(UpwaysPushConstants, invTotalSamples) == 88, "invTotalSamples must be at byte 88");
+    check_true(offsetof(UpwaysPushConstants, totalSamples) == 92, "totalSamples must be at byte 92");
+    std::cout << "  -> UpwaysPushConstants layout verified (96B push constant aligned)." << std::endl;
+
 
     // 2. Verify Invertible Log Transform Invariants
     std::cout << "[TEST 2] Invertible Log Compression & Decompression Math..." << std::endl;
@@ -85,27 +94,25 @@ int main() {
 
     // 4. Verify Cooperative Matrix WMMA Weights Topology
     std::cout << "[TEST 4] Wave32 WMMA Cooperative Matrix Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 524792, "TOTAL_WEIGHT_BUFFER_SIZE must be 524792 bytes");
-    check_true(upways::LAYER_ENC0_PROJ.inChannels == 16, "enc0_proj input channels must be 16");
-    check_true(upways::LAYER_ENC0_PROJ.outChannels == 32, "enc0_proj output channels must be 32");
-    check_true(upways::LAYER_ENC0_RES_CONV1.outChannels == 32, "enc0_res_conv1 output channels must be 32");
-    check_true(upways::LAYER_DOWNSAMPLE_1.outChannels == 64, "downsample_1 output channels must be 64");
-    check_true(upways::LAYER_ENC1_RES_CONV1.outChannels == 64, "enc1_res_conv1 output channels must be 64");
-    check_true(upways::LAYER_CONV_GRU_CONV_RZ.outChannels == 128, "conv_gru_conv_rz output channels must be 128");
-    check_true(upways::LAYER_CONV_GRU_CONV_H.outChannels == 64, "conv_gru_conv_h output channels must be 64");
-    check_true(upways::LAYER_DEC1_RES_CONV1.outChannels == 64, "dec1_res_conv1 output channels must be 64");
-    check_true(upways::LAYER_UPSAMPLE_1.outChannels == 32, "upsample_1 output channels must be 32");
-    check_true(upways::LAYER_SKIP_BLEND.outChannels == 32, "skip_blend output channels must be 32");
-    check_true(upways::LAYER_DEC0_RES_CONV1.outChannels == 32, "dec0_res_conv1 output channels must be 32");
-    check_true(upways::LAYER_UPSCALER_UP_CONV.outChannels == 128, "upscaler_up_conv output channels must be 128");
-    check_true(upways::LAYER_UPSCALER_REFINE_4.outChannels == 6, "upscaler_refine_4 output channels must be 6");
-    check_true(upways::LAYER_UPSCALER_NATIVE_CONV_2.outChannels == 6, "upscaler_native_conv_2 output channels must be 6");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 22944, "TOTAL_WEIGHT_BUFFER_SIZE must be 22944 bytes");
+    check_true(upways::LAYER_FC1.outChannels == 64, "fc1 output channels must be 64");
+    check_true(upways::LAYER_FC1.inChannels == 32, "fc1 input channels must be 32");
+    check_true(upways::LAYER_FC2.outChannels == 64, "fc2 output channels must be 64");
+    check_true(upways::LAYER_FC2.inChannels == 64, "fc2 input channels must be 64");
+    check_true(upways::LAYER_FC3.outChannels == 64, "fc3 output channels must be 64");
+    check_true(upways::LAYER_FC3.inChannels == 64, "fc3 input channels must be 64");
+    check_true(upways::LAYER_FC4.outChannels == 16, "fc4 output channels must be 16");
+    check_true(upways::LAYER_FC4.inChannels == 64, "fc4 input channels must be 64");
 
-    // Verify all channel counts are aligned to 16 for Wave32 WMMA (except final 6-channel output)
-    check_true(upways::LAYER_ENC0_PROJ.inChannels % 16 == 0, "enc0_proj inChannels must be multiple of 16");
-    check_true(upways::LAYER_ENC0_PROJ.outChannels % 16 == 0, "enc0_proj outChannels must be multiple of 16");
-    check_true(upways::LAYER_ENC1_RES_CONV1.outChannels % 16 == 0, "enc1_res_conv1 outChannels must be multiple of 16");
-    check_true(upways::LAYER_CONV_GRU_CONV_RZ.outChannels % 16 == 0, "conv_gru outChannels must be multiple of 16");
+    // Verify all channel counts are aligned to 16 for Wave32 WMMA
+    check_true(upways::LAYER_FC1.inChannels % 16 == 0, "fc1 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC1.outChannels % 16 == 0, "fc1 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.inChannels % 16 == 0, "fc2 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.outChannels % 16 == 0, "fc2 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC3.inChannels % 16 == 0, "fc3 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC3.outChannels % 16 == 0, "fc3 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC4.inChannels % 16 == 0, "fc4 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC4.outChannels % 16 == 0, "fc4 outChannels must be multiple of 16");
     std::cout << "  -> Wave32 WMMA 16x16 cooperative matrix alignment verified across all network layers." << std::endl;
 
     // 5. Verify Exported Weights File Existence and Size
@@ -116,6 +123,8 @@ int main() {
         "../../data/models/upways_weights.bin",
         "../../../data/models/upways_weights.bin",
         "/home/naoki/Development/Pathways/data/models/upways_weights.bin",
+        "/home/naoki/Development/Upways/checkpoints/neural_reconstruct_run/upways_weights.bin",
+        "/home/naoki/Development/Upways/checkpoints/upways3_multiscale_kpn/vulkan_export/upways_v3_weights.bin",
         "/home/naoki/Development/Upways/checkpoints/run_multiscene_superres/vulkan_export/upways_weights.bin"
     };
     std::string foundPath;

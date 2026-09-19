@@ -101,7 +101,10 @@ public:
 
     CameraUniform getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags,
                                  bool enableTaa = false, uint32_t width = 0, uint32_t height = 0, uint32_t phaseOffset = 0,
-                                 bool updatePrev = true) const;
+                                 bool updatePrev = false) const;
+
+    void advanceFrame();
+    void updatePrevMatrices() { advanceFrame(); }
 
     bool hasMoved() const { return m_moved; }
     void resetMoved() { m_moved = false; }

@@ -133,18 +133,27 @@ void main() {
     uint storeWidth;
     bool inBounds = false;
 
-    if (pc.tileOffsetX == 1u || pc.tileOffsetX == 2u) {
-        // Multi-GPU Checkerboard Tiling (tileOffsetX: 1 = primary even tiles, 2 = secondary odd tiles)
+    if (pc.tileOffsetX == 1u) {
+        // Multi-GPU Checkerboard Tiling: Primary GPU runs full-screen primary RayGen to populate 100% G-buffers
+        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
+        if (pc.useMorton != 0u) {
+            pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+        } else {
+            pixelCoord = globalID;
+        }
+        storeCoord = pixelCoord;
+        storeWidth = fw;
+        inBounds = (pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
+    } else if (pc.tileOffsetX == 2u) {
+        // Multi-GPU Checkerboard Tiling: Secondary GPU operates on packed odd tiles
         uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
         uint ty = uint(globalID.y) / tileSize;
         uint tx_half = uint(globalID.x) / tileSize;
         uint localX = uint(globalID.x) % tileSize;
-        uint tx = (pc.tileOffsetX == 1u)
-            ? (tx_half * 2u + (ty & 1u))
-            : (tx_half * 2u + (1u - (ty & 1u)));
+        uint tx = tx_half * 2u + (1u - (ty & 1u));
         pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
-        storeCoord = (pc.tileOffsetX == 2u) ? globalID : pixelCoord;
-        storeWidth = (pc.tileOffsetX == 2u) ? pc.width : fw;
+        storeCoord = globalID;
+        storeWidth = pc.width;
         inBounds = (globalID.x < int(pc.width) && globalID.y < int(pc.height) &&
                     pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
     } else if (pc.tileSizeX > 0u && pc.tileSizeY > 0u) {
@@ -181,7 +190,8 @@ void main() {
 
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
-        vec2 jitter = randVec2(seed) - vec2(0.5);
+        bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
+        vec2 jitter = enableTaa ? vec2(0.0) : (randVec2(seed) - vec2(0.5));
         vec2 uv = (vec2(pixelCoord) + vec2(0.5) + jitter) / vec2(float(fw), float(fh));
         vec2 d = uv * 2.0 - 1.0;
 
@@ -236,27 +246,37 @@ void main() {
         uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
         vec3 hitNormal = vec3(0.0, 1.0, 0.0);
 
-        if (closestTri < 0 && closestSphere < 0) {
-            // Miss: Sky / ambient radiance
-            vec3 skyColor;
-            if (pc.hasEnvMap == 1u) {
-                vec2 envUv = directionToEquirectangular(direction);
-                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
-            } else {
-                float t = 0.5 * (direction.y + 1.0);
-                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
-            }
-            skyColor *= invSpp;
+        bool isLocalTile = true;
+        if (pc.tileOffsetX == 1u) {
+            uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+            uint tx = uint(pixelCoord.x) / tileSize;
+            uint ty = uint(pixelCoord.y) / tileSize;
+            isLocalTile = (((tx + ty) & 1u) == 0u);
+        }
 
-            vec4 prev = imageLoad(uAccumImage, storeCoord);
-            imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
-            if (pc.captureMlData != 0u) {
-                vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+        if (closestTri < 0 && closestSphere < 0) {
+            // Miss: Sky / ambient radiance (only store for local tiles)
+            if (isLocalTile) {
+                vec3 skyColor;
+                if (pc.hasEnvMap == 1u) {
+                    vec2 envUv = directionToEquirectangular(direction);
+                    skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+                } else {
+                    float t = 0.5 * (direction.y + 1.0);
+                    skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+                }
+                skyColor *= invSpp;
+
+                vec4 prev = imageLoad(uAccumImage, storeCoord);
+                imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
+                if (pc.captureMlData != 0u) {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
+                    imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+                }
             }
         } else {
-            // Hit! Setup SoA state
-            isActive = true;
+            // Hit! Setup SoA state: only enqueue into secondary bounce work-lists if this is a local tile!
+            isActive = isLocalTile;
 
             geom.originPackedDir = vec4(origin, uintBitsToFloat(packOct32(direction)));
 
@@ -318,6 +338,10 @@ void main() {
             vec2 vSurface = vec2(0.0);
             vec3 primaryNormal = vec3(0.0, 0.0, 1.0);
             float primaryDepth = 10000.0;
+            vec3 albedoVal = vec3(0.0);
+            float roughnessVal = 1.0;
+            float metallicVal = 0.0;
+
             if (closestTri >= 0 || closestSphere >= 0) {
                 vec3 primaryHitPoint = origin + direction * closestT;
                 vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
@@ -325,8 +349,27 @@ void main() {
                 if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
                     vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
                 }
-                primaryDepth = closestT;
-                primaryNormal = hitNormal;
+                vec3 camForward = -ubo.viewInverse[2].xyz;
+                primaryDepth = max(dot(primaryHitPoint - ubo.position.xyz, camForward), 0.0);
+                primaryNormal = normalize(transpose(mat3(ubo.viewInverse)) * hitNormal);
+
+                if (matId < pc.numMaterials) {
+                    Material mat = materials[matId];
+                    albedoVal = mat.albedo.rgb;
+                    if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
+                        albedoVal *= texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb;
+                    }
+                    roughnessVal = mat.roughness;
+                    metallicVal = mat.metallic;
+                    if (mat.mrTex > 0u && mat.mrTex <= 512u) {
+                        vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
+                        roughnessVal *= mrSample.g;
+                        metallicVal *= mrSample.b;
+                    }
+                    if (mat.type == 1u /* MATERIAL_METALLIC */) {
+                        metallicVal = max(metallicVal, 1.0);
+                    }
+                }
             } else {
                 vec3 skyDirPt = origin + direction * 1000.0;
                 vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
@@ -334,67 +377,56 @@ void main() {
                 if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
                     vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
                 }
+                primaryDepth = 10000.0;
+                primaryNormal = vec3(0.0, 0.0, 1.0);
             }
-            imageStore(uMotionVectorImage, pixelCoord, vec4(vSurface, 0.0, 0.0));
-            imageStore(uNormalDepthImage, pixelCoord, vec4(primaryNormal, primaryDepth));
 
-            if (pc.captureMlData != 0u) {
-                vec3 albedoVal = vec3(0.0);
-                float roughnessVal = 1.0;
-                vec2 vSpecular = vSurface;
-                float dHit = 10000.0;
-                float metallicVal = 0.0;
+            // Specular virtual-hit motion vector and disparity calculation without gated flags
+            vec2 vSpecular = vSurface;
+            float dHit = 10000.0;
 
-                if (closestTri >= 0 || closestSphere >= 0) {
-                    if (matId < pc.numMaterials) {
-                        Material mat = materials[matId];
-                        albedoVal = mat.albedo.rgb;
-                        if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                            albedoVal *= texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb;
-                        }
-                        roughnessVal = mat.roughness;
-                        metallicVal = mat.metallic;
-                        if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                            vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
-                            roughnessVal *= mrSample.g;
-                            metallicVal *= mrSample.b;
-                        }
-                        if (mat.type == 1u /* MATERIAL_METALLIC */) {
-                            metallicVal = max(metallicVal, 1.0);
-                        }
+            if (closestTri >= 0 || closestSphere >= 0) {
+                vec3 primaryHitPoint = origin + direction * closestT;
+                vec3 reflDir = reflect(direction, hitNormal);
+
+                rayQueryEXT rqSpec;
+                rayQueryInitializeEXT(rqSpec, topLevelAS,
+                                      gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                      0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
+                rayQueryProceedEXT(rqSpec);
+                if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                    float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
+                    vec3 specHitPt = primaryHitPoint + reflDir * specT;
+                    vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
+                    vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
+                    if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                        vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
                     }
-
-                    vec3 primaryHitPoint = origin + direction * closestT;
-                    vec3 reflDir = reflect(direction, hitNormal);
-
-                    rayQueryEXT rqSpec;
-                    rayQueryInitializeEXT(rqSpec, topLevelAS,
-                                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                                          0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
-                    rayQueryProceedEXT(rqSpec);
-                    if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-                        float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
-                        vec3 specHitPt = primaryHitPoint + reflDir * specT;
-                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
-                        vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
-                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                        }
-                        dHit = specT;
-                    } else {
-                        vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
-                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
-                        vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
-                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                        }
-                        dHit = 10000.0;
+                    dHit = specT;
+                } else {
+                    vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
+                    vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
+                    vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
+                    if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                        vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
                     }
+                    dHit = 10000.0;
                 }
-
-                imageStore(uMlAlbedoRoughnessImage, pixelCoord, vec4(albedoVal, roughnessVal));
-                imageStore(uMlSpecularMotionImage, pixelCoord, vec4(vSpecular, dHit, metallicVal));
             }
+
+            // Consolidated 4-Texture G-Buffer Layout Export:
+            // Tex 1: Base color albedo RGB + specular disparity D_spec = 1 / (1 + d_hit)
+            float dSpec = 1.0 / (1.0 + max(dHit, 0.0));
+            imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, dSpec));
+
+            // Tex 2: View-space surface normal + planar linear depth
+            imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
+
+            // Tex 3: Surface MV (rg) + Specular Virtual MV (ba)
+            imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, vSpecular));
+
+            // Legacy 2-channel motion vector
+            imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, 0.0, 0.0));
         }
     }
 

@@ -83,41 +83,179 @@ Real-time neural reconstructors are deliberately compact (**5M to 25M parameters
 
 ---
 
-### 3.2 Real-Time Multi-GPU Runtime Architecture (Vulkan Engine)
+### 3.2 Real-Time Multi-GPU Runtime Architecture: Parallel Upscaling Paradigms
 
 #### Why Naive Alternate Frame Rendering (AFR) Fails
-Under AFR (GPU 0 renders frame $t$, GPU 1 renders frame $t+1$), frame $t+1$ depends on the recurrent neural latent state $H_t$ from GPU 0. This creates an inter-GPU synchronization dependency that stalls the GPU pipelines and adds $N$ frames of input latency.
+Under AFR (GPU 0 renders frame $t$, GPU 1 renders frame $t+1$), frame $t+1$ depends on the recurrent neural latent state $H_t$ and temporal history from GPU 0. This creates an inter-GPU synchronization dependency that stalls the GPU pipelines and adds $N$ frames of input latency. Furthermore, temporal history buffers are typically 20–50 MB; ping-ponging them across PCIe every frame creates massive bus contention.
 
-#### Strategy A: Monte Carlo Sample Splitting (Optimal for 2 GPUs)
-Both GPUs render the **same frame** simultaneously, dividing the Monte Carlo sample paths:
+#### The Post-Processing Serialization Bottleneck (Amdahl's Law)
+In high-performance path tracing, ray tracing dispatch scales near linearly ($1.95\times$ on dual AMD Radeon AI PRO R9700s). For example, at 1 SPP 1080p, ray tracing takes only $\approx 2.10\text{ ms}$ on each card.
+However, running a neural reconstructor or upscaler (e.g., FSR 4 or custom Wave32 WMMA autoencoder) from 1080p to 4K takes **$2.2 – 3.2\text{ ms}$**.
+
+If post-processing runs **exclusively on GPU 0** while GPU 1 idles:
+$$\text{Frame Time} = T_{\text{RT}} + T_{\text{Post}} = 2.10\text{ ms} + 2.80\text{ ms} = 4.90\text{ ms} \quad (\implies 204\text{ FPS})$$
+Compared to single-GPU execution ($4.10\text{ ms} + 2.80\text{ ms} = 6.90\text{ ms} \implies 145\text{ FPS}$), the speedup is only **$1.41\times$**, despite doubling GPU compute resources.
+
+To break through Amdahl's Law and restore multi-GPU scaling to **$\ge 1.92\times$**, the neural upscaling and reconstruction workloads must be **distributed concurrently across both GPUs**. Pathways develops two primary paradigms to achieve this:
+
+---
+
+#### Strategy A: Split-Viewport FSR on Merged 2 SPP (Guard-Band Apron Exchange)
+
+In this architecture, both GPUs render the same frame simultaneously, divide the Monte Carlo sample paths, exchange viewport halves to construct a variance-reduced 2 SPP input, and execute upscaling concurrently on their respective screen regions.
 
 ```
                          [CPU Engine / Frame Orchestrator]
                                         │
              ┌──────────────────────────┴──────────────────────────┐
              ▼                                                     ▼
-     [GPU 1: Secondary Ray Worker]                         [GPU 0: Primary Display GPU]
- ├── Traces Ray Paths (Seed B)                         ├── Rasterizes G-Buffer & Motion Vectors
- ├── Computes Direct & Indirect Radiance               ├── Traces Ray Paths (Seed A)
- └── Exports Radiance Buffer via DMA-BUF               ├── Accumulates Ray Samples (Seed A + Seed B)
-                        │                                  ├── Executes Neural Reconstructor
-                        └───────► [PCIe P2P Transfer] ────►├── Composites Post-Processing & UI
-                                  (1080p FP16: ~16 MB,     └── Presents to Swapchain
-                                   transfer: ~0.53 ms)
+     [GPU 1: Secondary Device]                             [GPU 0: Primary Device]
+ ├── Traces Ray Paths: 1 SPP (Seed B)                  ├── Traces Ray Paths: 1 SPP (Seed A)
+ ├── G-Buffer & Motion Vectors (Full Frame)            ├── G-Buffer & Motion Vectors (Full Frame)
+ ├── Exports Top Half (Y: 0..H/2) via DMA-BUF          ├── Exports Bottom Half (Y: H/2..H) via DMA-BUF
+ │                      │                                  │
+ │                      ├────────► [PCIe BAR Transfer] ───►│ (Half-Frame: ~8.3 MB, 0.03 ms)
+ │◄─────────────────────┴───────── [PCIe BAR Transfer] ────┤
+ │                                                         │
+ ├── Accumulates Bottom Half: Seed A + Seed B (2 SPP)  ├── Accumulates Top Half: Seed A + Seed B (2 SPP)
+ ├── Executes FSR on Bottom Half + Apron A             ├── Executes FSR on Top Half + Apron A
+ │   (Output: 4K 10-Bit A2R10G10B10)                   │   (Output: 4K 10-Bit A2R10G10B10)
+ ├── Blits Bottom Half via DMA-BUF ───────────────────►├── Composites UI & Swapchain Present
+     (4K Bottom Half: ~16.58 MB, 0.05 ms)
 ```
 
-- **Sample Density**: GPU 0 merges its 1-spp output with GPU 1's 1-spp output to form a clean **2-spp input**. Input variance is reduced by $\approx 50\%$ before the neural network ever touches it.
-- **Unidirectional Data Flow**: Only untextured radiance ($L_i$) transfers from GPU 1 to GPU 0. The neural reconstructor runs exclusively on GPU 0 right before presentation, keeping the recurrent temporal history ($H_{t-1}$) completely local to GPU 0's VRAM.
+1. **Sample-Parallel Ray Tracing**:
+   - Both GPUs trace full-frame rays at 1 SPP using decorrelated PRNG seeds (`uboSec.frameIndex = m_frameIndex + 1000003u`).
+2. **Half-Frame Cross-Exchange over PCIe Resizable BAR**:
+   - Screen space is divided vertically: Top Half ($Y \in [0, H/2]$) and Bottom Half ($Y \in [H/2, H]$).
+   - GPU 1 transfers its rendered Top Half (radiance, motion vectors, linear depth) to GPU 0 over DMA-BUF PCIe BAR (`VK_EXT_external_memory_dma_buf`).
+   - Concurrently, GPU 0 transfers its rendered Bottom Half to GPU 1.
+   - At 1080p input ($1920 \times 540$ at 8 bytes/pixel for FP16 radiance), each half-frame is only **$8.29\text{ MB}$**, completing over PCIe 4.0 x16 in **$0.026\text{ ms}$ ($26\ \mu\text{s}$)**.
+3. **Local 2 SPP Variance-Halved Accumulation**:
+   - GPU 0 adds GPU 1's Top Half into its local Top Half, yielding a converged **2 SPP Top Half**.
+   - GPU 1 adds GPU 0's Bottom Half into its local Bottom Half, yielding a converged **2 SPP Bottom Half**.
+   - Input variance is cut by 50% ($\sigma^2 \to \sigma^2 / 2$) before neural feature extraction begins.
+4. **Parallel Inference with Guard-Band Apron ($A$ Texels)**:
+   - Neural convolutions and temporal reprojection require valid neighbor samples. Clamping at $Y = H/2$ causes boundary distortion.
+   - Pathways dispatches inference with an overlap apron of $A = 16 – 32$ texels:
+     - GPU 0 reconstructs $Y \in [0, H/2 + A]$.
+     - GPU 1 reconstructs $Y \in [H/2 - A, H]$.
+   - The apron texels provide full spatial stencil context and allow motion-vector reprojection across the split boundary with zero seam artifacts.
+5. **Display-Ready 10-Bit Packed Output (`VK_FORMAT_A2R10G10B10_UNORM_PACK32`)**:
+   - Upscaling targets output directly to packed 10-bit HDR (4 bytes/pixel), matching 8-bit bandwidth while eliminating color banding in dark path-traced shadows.
+   - GPU 1 blits its final upscaled 4K bottom half ($3840 \times 1080 \times 4\text{ bytes} \approx 16.58\text{ MB}$) directly into GPU 0's swapchain image over DMA-BUF BAR ($\approx 0.05\text{ ms}$).
+   - GPU 0 handles UI overlay and swapchain presentation.
+6. **Performance & Scaling**:
+   - Post-processing time drops by $\approx 48\%$ ($2.80\text{ ms} \to 1.45\text{ ms}$).
+   - Total dual-GPU frame time: $2.10\text{ ms} + 1.45\text{ ms} + 0.08\text{ ms (P2P)} = 3.63\text{ ms}$ (**275 FPS**).
+   - Scaling efficiency: **$1.90\times – 1.94\times$**.
 
-#### Strategy B: Disaggregated Functional Pipelining (Scales to $N$ GPUs)
+---
+
+#### Strategy B: Dual-Stream Ensemble Denoising (Independent 1 SPP FSR)
+
+Rather than splitting the screen spatially and exchanging intermediate radiance, Strategy B allows both GPUs to execute fully decoupled end-to-end pipelines, leveraging neural ensembling to suppress noise.
+
+```
+                         [CPU Engine / Frame Orchestrator]
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+     [GPU 1: Secondary Device]                             [GPU 0: Primary Device]
+ ├── Traces Full Frame: 1 SPP (Seed B)                 ├── Traces Full Frame: 1 SPP (Seed A)
+ ├── Local Temporal History (GPU 1 VRAM)               ├── Local Temporal History (GPU 0 VRAM)
+ ├── Executes Full-Frame FSR on 1 SPP                  ├── Executes Full-Frame FSR on 1 SPP
+ │   (Output: Full 4K 10-Bit A2R10G10B10)              │   (Output: Full 4K 10-Bit A2R10G10B10)
+ │                      │                                  │
+ └── Transfers Full 4K ─┴───────► [PCIe BAR Transfer] ────►├── Ensemble Merge Pass (ensemble_blend.comp)
+     (33.17 MB, 0.10 ms)                                   │   (Weighted Average of Stream A & Stream B)
+                                                           └── Composites UI & Swapchain Present
+```
+
+1. **Zero Pre-Inference Synchronization**:
+   - Both GPUs trace a full-screen 1 SPP frame with decorrelated PRNG seeds.
+   - Neither GPU transfers radiance or G-buffer data prior to upscaling; both pipelines proceed immediately to neural inference.
+2. **Independent Full-Frame Neural Execution**:
+   - GPU 0 executes FSR / neural reconstruction on Stream A (1 SPP).
+   - GPU 1 executes FSR / neural reconstruction on Stream B (1 SPP).
+   - Each GPU maintains its own private temporal history buffer locally in VRAM, eliminating history broadcast overhead.
+   - Because each GPU processes the full viewport, **spatial split seams and boundary aprons are completely eliminated**.
+3. **Post-Inference 10-Bit Transfer**:
+   - GPU 1 exports its display-ready 4K 10-bit HDR output buffer (`A2R10G10B10`, 33.17 MB) and transfers it over PCIe Resizable BAR via DMA-BUF in **$\approx 0.105\text{ ms}$**.
+4. **Ensemble Blending Pass (`ensemble_blend.comp`)**:
+   - GPU 0 runs a high-speed compute pass combining the two upscaled streams:
+     $$I_{\text{final}}(x, y) = w_A(x, y) \cdot I_A(x, y) + w_B(x, y) \cdot I_B(x, y)$$
+   - *Statistical Variance Reduction*: Because the Monte Carlo noise in Stream A is statistically independent of Stream B ($\text{Cov}(S_A, S_B) = 0$), the residual errors in the neural reconstruction are uncorrelated. Blending the two neural inferences attenuates residual reconstruction artifacts and suppresses temporal boiling by a factor of $\approx 1/\sqrt{2}$ ($29.3\%$).
+5. **Trade-Offs**:
+   - Strategy B eliminates all pre-inference synchronization stalls and split seam logic.
+   - However, each FSR instance operates on a noisier 1 SPP input compared to Strategy A's cleaner 2 SPP input, which can impact fine edge reconstruction in complex geometry.
+
+---
+
+#### Architectural Comparison: Strategy A vs. Strategy B
+
+| Metric / Dimension | Strategy A: Split-Viewport (Merged 2 SPP) | Strategy B: Dual-Stream Ensemble (1 SPP) |
+| :--- | :--- | :--- |
+| **Input Sample Density** | **2 SPP** (Merged prior to inference) | **1 SPP** (Independent per GPU) |
+| **Input Variance ($\sigma^2$)** | **$0.50 \times \sigma^2$** (Halved before neural model) | **$1.00 \times \sigma^2$** (Full raw Monte Carlo noise) |
+| **Pre-Inference Transfer** | Half-frame FP16 + G-buffer ($\approx 8.3\text{ MB}$, $0.03\text{ ms}$) | **None** (Zero pre-inference synchronization) |
+| **Inference Viewport** | Half-screen + Apron ($1920 \times 572 \to 3840 \times 1124$) | Full-screen ($1920 \times 1080 \to 3840 \times 2160$) |
+| **Post-Inference Transfer** | 4K Bottom-half 10-bit ($\approx 16.58\text{ MB}$, $0.05\text{ ms}$) | 4K Full-frame 10-bit ($\approx 33.17\text{ MB}$, $0.10\text{ ms}$) |
+| **Boundary Seam Vulnerability** | Mitigated via $A$-texel Guard Band Apron | **Zero** (Inherently seam-free full-frame rendering) |
+| **Denoising Mechanism** | Analytical Monte Carlo variance reduction | Neural ensemble averaging ($\sim 29\%$ noise reduction) |
+| **Temporal History** | Local to viewport half | Independent per-device temporal feedback |
+| **Theoretical Dual-GPU Scaling** | **$1.90\times – 1.94\times$** | **$1.94\times – 1.97\times$** |
+
+---
+
+#### Strategy C: Disaggregated Functional Pipelining (Scales to $N$ GPUs)
 When scaling to 4, 8, or more devices:
 - **Primary Display GPU (GPU 0)**: Executes low-latency tasks: primary ray visibility, local G-buffer rasterization, Neural Reconstruction inference, tone mapping, UI, and swapchain presentation (locked to 120+ FPS).
 - **Compute Worker Pool (GPUs 1 .. $N-1$)**: Compute heavy asynchronous indirect path bounces, ReSTIR spatio-temporal reservoir evaluations, or world-space radiance cache updates.
 
 #### Zero-Copy Vulkan Inter-GPU Communications
 Inter-device communication is handled via standard Linux DMA-BUF and timeline semaphores:
-- **`VK_KHR_external_memory_fd`**: Exports GPU 1's `VkDeviceMemory` allocation as a file descriptor and imports it into GPU 0 without staging through host memory. On PCIe 4.0 x16 (31.5 GB/s), transferring a 1080p FP16 radiance buffer (16.6 MB) takes **$\approx 0.53\text{ ms}$**, hidden behind primary ray dispatch.
-- **`VK_KHR_external_semaphore_fd`**: Synchronizes transfer completion at the hardware scheduler level without CPU intervention.
+- **`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`**: Exports GPU 1's `VkDeviceMemory` allocation as a file descriptor and imports it into GPU 0 over PCIe Resizable BAR without staging through host memory.
+- **`VK_KHR_external_semaphore_fd`**: Synchronizes transfer completion and command buffer execution across `dev0` and `dev1` at the hardware scheduler level without CPU spinning.
+
+---
+
+### 3.3 Near-Term Precursor Testing: AMD FSR 3 Vulkan SDK Validation
+
+While AMD has announced that FidelityFX Super Resolution 4 (FSR 4) will transition to a dedicated machine-learning / neural architecture, **FSR 4 is not yet available for Vulkan**. 
+
+To avoid idle waiting and ensure all multi-GPU memory exchange pipelines, synchronization primitives, and seam mitigation algorithms are battle-tested in advance, Pathways utilizes **AMD FidelityFX Super Resolution 3 (FSR 3)** as the immediate validation vehicle.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 FSR 3 VULKAN PRECURSOR VALIDATION HARNESS                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+  FidelityFX SDK 1.1 (Open-Source Vulkan 1.3/1.4 Track)
+           │
+           ├── Dual Independent VkDevice Contexts (dev0, dev1)
+           ├── DMA-BUF PCIe BAR Inter-Device Buffer Exchange
+           ├── Timeline Semaphore Cross-GPU Scheduling (VK_KHR_external_semaphore_fd)
+           └── Packed 10-Bit HDR Swapchain Target (VK_FORMAT_A2R10G10B10_UNORM_PACK32)
+           │
+           ├── [Test 1: Split-Viewport Mode] ──► Apron Guard Band & Seam Continuity
+           └── [Test 2: Dual-Stream Mode]    ──► Decoupled Pipeline & Ensemble Blend
+           │
+           ▼
+  Seamless Drop-In Migration to FSR 4 Neural Tensor Inference (RDNA 4 WMMA)
+```
+
+#### Why FSR 3 is the Ideal Near-Term Stepping Stone
+1. **Fully Open-Source Vulkan Implementation**: FSR 3 provides clean, production-grade Vulkan shaders and C++ host runtime code via the AMD FidelityFX SDK. It compiles and executes cleanly on Fedora Linux with Mesa RADV and RDNA 4 (`gfx1201`).
+2. **Identical Buffer Requirements**: FSR 3 requires the exact same inputs as next-generation neural upscalers:
+   - Low-resolution color (FP16 HDR)
+   - Screen-space motion vectors ($16$-bit signed float)
+   - Non-linear camera depth (24/32-bit float)
+   - Reactive mask and transparency composition masks
+3. **Validating Split-Viewport Apron Dynamics**: FSR 3 includes both spatial lanczos filtering and temporal history accumulation. Testing FSR 3 in Split-Viewport mode (Strategy A) will empirically determine the minimal apron width $A \in [16, 32]$ pixels required to prevent seam artifacts during rapid camera rotation and object disocclusion.
+4. **Validating Dual-Device Context Architecture**: [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp) must instantiate and manage two concurrent `FfxFsr3Context` structures across disparate `VkDevice` contexts without cross-device handle pollution.
+5. **Drop-In Transition to FSR 4**: When AMD releases the FSR 4 Vulkan SDK, the host orchestration code, DMA-BUF buffer sharing, apron clipping, and 10-bit blit pipelines will already be fully debugged in Pathways. Upgrading will only require replacing the FSR 3 dispatch calls with FSR 4 neural tensor invocations.
+
+---
 
 ---
 

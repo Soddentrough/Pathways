@@ -308,6 +308,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << "  \"engine_settings\": {\n"
         << std::format("    \"pipeline_type\": \"{}\",\n", stats.pipeline_type_str)
         << std::format("    \"resolution\": [{}, {}],\n", stats.width, stats.height)
+        << std::format("    \"upscaler_mode\": \"{}\",\n", stats.upscaler_mode_str)
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)
         << std::format("    \"max_bounces\": {},\n", stats.max_bounces)
@@ -365,6 +366,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"min_frame_time_ms\": {:.3f},\n", stats.min_frame_time_ms)
         << std::format("    \"max_frame_time_ms\": {:.3f},\n", stats.max_frame_time_ms)
         << std::format("    \"avg_fps\": {:.1f},\n", stats.avg_fps)
+        << std::format("    \"target_frame_time_ms\": {:.2f},\n", stats.target_frame_time_ms)
+        << std::format("    \"target_achieved\": {},\n", stats.target_achieved ? "true" : "false")
         << std::format("    \"target_achieved_sub_8ms\": {},\n", stats.target_achieved ? "true" : "false")
         << std::format("    \"rays_per_second\": {:.2e},\n", stats.rays_per_second)
         << std::format("    \"gigarays_per_second\": {:.3f},\n", stats.rays_per_second * 1e-9)
@@ -443,6 +446,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
              << std::format("        \"secondary_gpu_time_ms\": {:.3f},\n", c.secondary_gpu_time_ms)
              << std::format("        \"tonemap_time_ms\": {:.3f},\n", c.tonemap_time_ms)
              << std::format("        \"gigarays_per_second\": {:.3f},\n", c.gigarays_per_second)
+             << std::format("        \"target_frame_time_ms\": {:.2f},\n", c.target_frame_time_ms)
+             << std::format("        \"target_achieved\": {},\n", c.target_achieved ? "true" : "false")
              << std::format("        \"target_achieved_sub_8ms\": {},\n", c.target_achieved ? "true" : "false")
              << "        \"acceleration_structures\": {\n"
              << std::format("          \"blas_build_time_ms\": {:.3f},\n", c.blas_build_time_ms)

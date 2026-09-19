@@ -58,6 +58,26 @@ TEST_CONFIGS = [
         "diff_path": f"{OUTPUT_DIR}/diff_classroom_4k_motion.png"
     },
     {
+        "id": "classroom_1440p_mgpu_fsr3_motion",
+        "name": "Classroom 1440p Multi-GPU FSR 3.1 (Camera Motion)",
+        "scene": "scenes/classroom/classroom_extended.glb",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "scenes/classroom/classroom_extended.glb",
+            "--width", "2560", "--height", "1440",
+            "--spp", "1", "--max-bounces", "4",
+            "--frames", "30",
+            "--camera-motion",
+            "--mgpu",
+            "--upscaler", "fsr3",
+            "--dump-frame", f"{OUTPUT_DIR}/test_classroom_mgpu_tile_fsr3_motion.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_classroom_mgpu_tile_fsr3_motion.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_classroom_mgpu_tile_fsr3_motion.png",
+        "ref_path": f"{REF_DIR}/classroom_1440p_mgpu_fsr3_motion.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_classroom_1440p_mgpu_fsr3_motion.png"
+    },
+    {
         "id": "living_room_1080p_static",
         "name": "Living Room 1080p (Converged Static Accumulation)",
         "scene": "scenes/living-room/living_room_extended.glb",

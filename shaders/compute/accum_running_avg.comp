@@ -1,0 +1,50 @@
+#version 450
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly uniform image2D uCurrentFrame;  // Per-frame FP16 radiance
+layout(binding = 1) uniform image2D uHistoryAccum;           // Persistent FP32 history buffer
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint sampleCount; // Current accumulated frame count N (>= 1)
+    float invSpp;     // 1.0 / activeSpp
+} pc;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= int(pc.width) || pixelCoord.y >= int(pc.height)) {
+        return;
+    }
+
+    vec4 frameVal = imageLoad(uCurrentFrame, pixelCoord);
+    vec3 frameColor = frameVal.rgb * pc.invSpp;
+
+    // Sanitize current frame against NaN and Inf
+    if (isnan(frameColor.r) || isnan(frameColor.g) || isnan(frameColor.b) ||
+        isinf(frameColor.r) || isinf(frameColor.g) || isinf(frameColor.b)) {
+        frameColor = vec3(0.0);
+    }
+    frameColor = max(frameColor, vec3(0.0));
+
+    if (pc.sampleCount <= 1u) {
+        // First frame or accumulation reset: initialize history directly
+        imageStore(uHistoryAccum, pixelCoord, vec4(frameColor, 1.0));
+    } else {
+        // Progressive Welford running average accumulation:
+        // x_bar_N = mix(x_bar_{N-1}, x_N, 1.0 / N)
+        vec4 histVal = imageLoad(uHistoryAccum, pixelCoord);
+        vec3 history = histVal.rgb;
+        if (isnan(history.r) || isnan(history.g) || isnan(history.b) ||
+            isinf(history.r) || isinf(history.g) || isinf(history.b)) {
+            history = vec3(0.0);
+        }
+        history = max(history, vec3(0.0));
+
+        float alpha = 1.0 / float(pc.sampleCount);
+        vec3 newAvg = mix(history, frameColor, alpha);
+        imageStore(uHistoryAccum, pixelCoord, vec4(newAvg, 1.0));
+    }
+}

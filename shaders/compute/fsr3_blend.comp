@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Destination image (Primary GPU 4K upscaled radiance, read-write)
+layout(binding = 0, rgba16f) uniform image2D uDstImage;
+
+// Source image (Secondary GPU 4K upscaled radiance, read-only)
+layout(binding = 1, rgba16f) readonly uniform image2D uSrcImage;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float weightDst;
+    float weightSrc;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) {
+        return;
+    }
+
+    vec4 dstVal = imageLoad(uDstImage, coord);
+    vec4 srcVal = imageLoad(uSrcImage, coord);
+
+    // Weighted sample blend in linear radiance space
+    vec3 blended = pc.weightDst * dstVal.rgb + pc.weightSrc * srcVal.rgb;
+
+    imageStore(uDstImage, coord, vec4(blended, dstVal.a));
+}

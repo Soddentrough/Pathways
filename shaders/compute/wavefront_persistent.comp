@@ -170,11 +170,8 @@ vec3 randVec3(inout uint seed) {
 }
 
 vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
-    if (dot(val, val) < 1e-12) return accum;
-    uvec3 bits = floatBitsToUint(max(accum, vec3(1e-4)));
-    vec3 ulp = uintBitsToFloat((bits & 0x7F800000u) - (10u << 23));
-    vec3 dither = (randVec3(seed) - vec3(0.5)) * ulp;
-    return max(vec3(0.0), accum + val + dither);
+    if (isnan(val.r) || isnan(val.g) || isnan(val.b) || isinf(val.r) || isinf(val.g) || isinf(val.b)) return accum;
+    return accum + max(val, vec3(0.0));
 }
 
 // Ray structure

@@ -62,6 +62,12 @@ public:
         const std::string& filepath
     );
 
+    static std::unique_ptr<Texture> createSceneEnvironmentMap(
+        VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+        const std::string& hdriPath, const std::string& scenePath,
+        const std::string& domeLightHdriPath = ""
+    );
+
 private:
     void release();
 

@@ -155,7 +155,7 @@ layout(push_constant) uniform PushConstants {
     float fractionalSpp;
     uint totalCompositeSpp;
     uint numOpaqueTriangles;
-    uint pad2;
+    float indirectClamp;
 } pc;
 
 // RNG
@@ -524,14 +524,16 @@ void main() {
                 int currentPx = int(prd.pad % pc.tileWidth);
                 int currentPy = int(prd.pad / pc.tileWidth);
                 ivec2 baseCoord = ivec2(currentPx, currentPy);
-                imageStore(uNormalDepthImage, baseCoord, vec4(geomNormal, length(hitPoint - ubo.position.xyz)));
+                vec3 viewGeomNormal = normalize(transpose(mat3(ubo.viewInverse)) * geomNormal);
+                vec3 camForward = -ubo.viewInverse[2].xyz;
+                float planarDepth = max(dot(hitPoint - ubo.position.xyz, camForward), 0.0);
+                imageStore(uNormalDepthImage, baseCoord, vec4(viewGeomNormal, planarDepth));
             }
             vec3 specOut = accumRadiance * transmittance;
-            if (!isPrimary) {
-                const float MAX_INDIRECT_LUMINANCE = 35.0;
+            if (!isPrimary && pc.indirectClamp > 0.0) {
                 float eLum = dot(specOut, vec3(0.2126, 0.7152, 0.0722));
-                if (eLum > MAX_INDIRECT_LUMINANCE) {
-                    specOut *= (MAX_INDIRECT_LUMINANCE / eLum);
+                if (eLum > pc.indirectClamp) {
+                    specOut *= (pc.indirectClamp / eLum);
                 }
             }
             prd.diffuseRadiance = vec3(0.0);
@@ -601,7 +603,9 @@ void main() {
 
     // 2. Direct Lighting (Analytical Lights with Uniform NEE and MIS)
     bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
-    float hitDepth = length(hitPoint - ubo.position.xyz);
+    vec3 camForward = -ubo.viewInverse[2].xyz;
+    float hitDepth = max(dot(hitPoint - ubo.position.xyz, camForward), 0.0);
+    vec3 viewNormal = normalize(transpose(mat3(ubo.viewInverse)) * hitNormal);
 
     if (enableDirect && pc.numLights > 0u && mat.type != 3u && transmission < 0.1 && mat.type != 2u) {
         // Standard Uniform Light Picking NEE with MIS
@@ -688,7 +692,7 @@ void main() {
                     ivec2 baseCoord = ivec2(currentPx, currentPy);
                     float rawShadow = inShadow ? 0.0 : 1.0;
                     imageStore(uDirectLightImage, baseCoord, vec4(directUnshadowed, rawShadow));
-                    imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+                    imageStore(uNormalDepthImage, baseCoord, vec4(viewNormal, hitDepth));
                 } else {
                     accumRadiance += directUnshadowed;
                     accumDiffuse += directDiffuse;
@@ -748,7 +752,7 @@ void main() {
                 int currentPx = int(prd.pad % pc.tileWidth);
                 int currentPy = int(prd.pad / pc.tileWidth);
                 ivec2 baseCoord = ivec2(currentPx, currentPy);
-                imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+                imageStore(uNormalDepthImage, baseCoord, vec4(viewNormal, hitDepth));
             }
             prd.diffuseRadiance = vec3(0.0);
             prd.specularRadiance = accumRadiance;
@@ -823,7 +827,7 @@ void main() {
         int currentPx = int(prd.pad % pc.tileWidth);
         int currentPy = int(prd.pad / pc.tileWidth);
         ivec2 baseCoord = ivec2(currentPx, currentPy);
-        imageStore(uNormalDepthImage, baseCoord, vec4(hitNormal, hitDepth));
+        imageStore(uNormalDepthImage, baseCoord, vec4(viewNormal, hitDepth));
         prd.packedAlbedoRG = packHalf2x16(baseColor.rg);
         prd.packedAlbedoB_Roughness = packHalf2x16(vec2(baseColor.b, roughness));
     } else {
@@ -831,15 +835,14 @@ void main() {
         prd.packedAlbedoB_Roughness = 0u;
     }
 
-    if (!isPrimary) {
-        const float MAX_INDIRECT_LUMINANCE = 35.0;
+    if (!isPrimary && pc.indirectClamp > 0.0) {
         float dLum = dot(accumDiffuse, vec3(0.2126, 0.7152, 0.0722));
-        if (dLum > MAX_INDIRECT_LUMINANCE) {
-            accumDiffuse *= (MAX_INDIRECT_LUMINANCE / dLum);
+        if (dLum > pc.indirectClamp) {
+            accumDiffuse *= (pc.indirectClamp / dLum);
         }
         float sLum = dot(accumSpecular, vec3(0.2126, 0.7152, 0.0722));
-        if (sLum > MAX_INDIRECT_LUMINANCE) {
-            accumSpecular *= (MAX_INDIRECT_LUMINANCE / sLum);
+        if (sLum > pc.indirectClamp) {
+            accumSpecular *= (pc.indirectClamp / sLum);
         }
     }
 
