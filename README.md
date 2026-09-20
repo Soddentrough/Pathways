@@ -56,7 +56,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 | **Geometry & Instances** | 134,995 Triangles (135K) • 1 Instance |
 | **Acceleration Structures** | BLAS: 6.22 MB • TLAS: 0.50 KB |
 | **BSDF Material Models** | Pure Dielectric Fresnel ($n = 1.5$), Volumetric Absorption ($\beta_{\text{abs}}$), Snell's Law Refraction, Ground Caustics |
-| **RDNA 4 Single-GPU (4K Native)** | **5.72 ms (174.8 FPS)** (Wavefront DGC) / **6.58 ms** • **5.04 – 6.82 GigaRays/s** |
+| **RDNA 4 Single-GPU (4K Native)** | **5.72 ms (174.8 FPS)** • **5.04 GigaRays/s** |
 | **RDNA 4 Dual-GPU (4K Checkerboard)** | **3.83 ms (261.1 FPS)** • **8.66 GigaRays/s** (**1.72x Scaling**) |
 | **Wavefront Specialization** | Specialized dielectric microkernel runs at **< 40 VGPRs** with **100% Wave32 hardware occupancy** |
 
