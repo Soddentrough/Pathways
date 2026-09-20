@@ -17,7 +17,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ### 1. Classic Cornell Box
 ![Classic Cornell Box](docs/images/cornell_box.png)
 
-*The quintessential physical light transport testbed, evaluating diffuse inter-reflection (color bleeding across opposing walls), soft shadow penumbras, Fresnel specular reflections, and focused dielectric caustic pooling beneath the refractive glass sphere.*
+*The quintessential physical light transport testbed, evaluating diffuse inter-reflection (color bleeding across opposing walls), soft shadow penumbras, Fresnel specular reflections, and refractive light transport through the glass sphere.*
 
 | Scene Metric / Telemetry | Measurement & Specification |
 | :--- | :--- |
@@ -39,7 +39,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 | :--- | :--- |
 | **Geometry & Instances** | 269,538 Triangles (270K) • 1 Instance |
 | **Acceleration Structures** | BLAS: 12.13 MB • TLAS: 0.50 KB |
-| **BSDF Material Models** | Multi-bounce glTF PBR, anisotropic wood grain, micro-roughness ceramics, specular porcelain, Venetian blind occlusion |
+| **BSDF Material Models** | glTF 2.0 PBR Metallic-Roughness, KHR_materials_clearcoat, KHR_materials_specular, directional sunlight shadow penumbras |
 | **RDNA 4 Single-GPU (4K Native)** | **17.12 ms (58.4 FPS)** • **1.94 GigaRays/s** |
 | **RDNA 4 Dual-GPU (4K Checkerboard)** | **8.85 ms (113.0 FPS)** • **1.93x Scaling** |
 | **1080p Single-GPU Baseline** | **4.15 ms (241.0 FPS)** (1 SPP) • 128 SPP progressive accumulation preview |
@@ -49,13 +49,13 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ### 3. Dragon (Dielectric Attenuation & Dispersion)
 ![Stanford Dragon Dielectric Attenuation](docs/images/dragon.png)
 
-*High-curvature Stanford Dragon evaluating physically-based dielectric transmission with Snell's law refraction, volumetric Beer-Lambert absorption (attenuation distance & extinction coefficients), spectral dispersion, and caustic ground highlights over a high-contrast backdrop.*
+*High-curvature Stanford Dragon evaluating physically-based dielectric transmission with Snell's law refraction ($n = 1.75$), volumetric Beer-Lambert absorption ($\beta_{\text{abs}}$ with 0.155 m attenuation distance), and chromatic spectral dispersion across high-frequency surface detail against a checkered cloth backdrop.*
 
 | Scene Metric / Telemetry | Measurement & Specification |
 | :--- | :--- |
 | **Geometry & Instances** | 134,995 Triangles (135K) • 1 Instance |
 | **Acceleration Structures** | BLAS: 6.22 MB • TLAS: 0.50 KB |
-| **BSDF Material Models** | Pure Dielectric Fresnel ($n = 1.5$), Volumetric Absorption ($\beta_{\text{abs}}$), Snell's Law Refraction, Ground Caustics |
+| **BSDF Material Models** | Pure Dielectric Fresnel ($n = 1.75$), Volumetric Absorption ($\beta_{\text{abs}}$), Snell's Law Refraction, Chromatic Dispersion ($2.04$) |
 | **RDNA 4 Single-GPU (4K Native)** | **5.72 ms (174.8 FPS)** • **5.04 GigaRays/s** |
 | **RDNA 4 Dual-GPU (4K Checkerboard)** | **3.83 ms (261.1 FPS)** • **8.66 GigaRays/s** (**1.72x Scaling**) |
 | **Wavefront Specialization** | Specialized dielectric microkernel runs at **< 40 VGPRs** with **100% Wave32 hardware occupancy** |
@@ -65,11 +65,11 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ### 4. Point Instance City (OpenUSD Stage)
 ![Point Instanced City](docs/images/point_instance_city.png)
 
-*Massive urban environment loaded via OpenUSD `UsdGeomPointInstancer`, stress-testing hardware Top-Level Acceleration Structure (TLAS) traversal across 40,000 instanced buildings and structures over undulating terrain with prototype BLAS deduplication.*
+*Massive urban environment loaded via OpenUSD `UsdGeomPointInstancer`, stress-testing hardware Top-Level Acceleration Structure (TLAS) traversal across 40,000 instanced buildings and structures (~49 million expanded triangles) over undulating terrain with prototype BLAS deduplication.*
 
 | Scene Metric / Telemetry | Measurement & Specification |
 | :--- | :--- |
-| **Geometry & Instances** | 27,456 Prototype Triangles • **40,001 Hardware Instances** |
+| **Geometry & Instances** | 27,456 Prototype Triangles • **40,001 Hardware Instances** • **~49.2M Total Triangles** (49,177,624 expanded) |
 | **Acceleration Structures** | BLAS: 1.18 MB (Deduplicated Prototype) • **TLAS: 13.01 MB** |
 | **BSDF Material Models** | Modular multi-colored building facades, painted architectural trim, clay tile roofing, terrain ground plane |
 | **RDNA 4 Single-GPU (4K Native)** | **9.19 ms (108.8 FPS)** • **3.61 GigaRays/s** |
