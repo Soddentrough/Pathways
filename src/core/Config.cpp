@@ -176,6 +176,7 @@ void Config::printUsage(const char* progName) {
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
               << "Wavefront Architecture:\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', or 'archetype' (A & B)\n"
+              << "  --use-morton            Enable 2D Morton Z-curve mapping for wavefront classification (default: disabled / linear raster)\n"
               << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], or 'directional' (Option 1 DGC)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
@@ -531,6 +532,8 @@ Config Config::parse(int argc, char* argv[]) {
             if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
+        } else if (arg == "--use-morton" || arg == "--morton") {
+            cfg.use_morton = true;
         } else if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;

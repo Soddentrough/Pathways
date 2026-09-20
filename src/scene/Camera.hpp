@@ -46,6 +46,8 @@ public:
     void setAspect(float aspect);
     void setFov(float fov);
     float getFov() const { return m_fov; }
+    float getAspect() const { return m_aspect; }
+    void setPose(const glm::vec3& position, float yaw, float pitch);
     void lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f));
     void update(float deltaTime);
 

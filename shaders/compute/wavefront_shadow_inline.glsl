@@ -53,7 +53,7 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                                    cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
                         float calpha = mat.albedo.a;
                         if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                            calpha *= texture(sceneTextures[mat.albedoTex - 1u], cuv).a;
+                            calpha *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, cuv).a;
                         }
                         float cutoff = (mat.alphaMode == 1u) ? mat.alphaCutoff : 0.5;
                         if (calpha < cutoff) {

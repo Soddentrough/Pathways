@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
 
@@ -225,7 +226,7 @@ void main() {
 
             // Tangent frame & Normal mapping: load tangents only when normal texture is active
             if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
-                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
 
@@ -238,7 +239,7 @@ void main() {
             // 1. Sample glTF 2.0 Material Textures & Factors
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
+                baseColor *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv);
             }
 
             // Alpha masking & stochastic alpha blending
@@ -253,7 +254,7 @@ void main() {
                 // Emissive radiance evaluation
                 vec3 emissive = mat.emissive.rgb;
                 if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                    emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
+                    emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
                 }
                 if (length(emissive) > 1e-3) {
                     accumRadiance += throughput * emissive;
@@ -266,7 +267,7 @@ void main() {
                     float roughness = mat.roughness;
                     float metallic = mat.metallic;
                     if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                        vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
+                        vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
                         roughness *= mrSample.g; // Green = roughness
                         metallic *= mrSample.b;  // Blue = metallic
                     }
@@ -276,14 +277,14 @@ void main() {
 
                     float transmission = mat.transmission;
                     if (mat.transmissionTex > 0u && mat.transmissionTex <= 512u) {
-                        transmission *= texture(sceneTextures[mat.transmissionTex - 1u], hitUv).r;
+                        transmission *= SAMPLE_SCENE_TEXTURE(mat.transmissionTex, hitUv).r;
                     }
 
                     float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
                     float f0Dielectric = pow((iorVal - 1.0) / (iorVal + 1.0), 2.0);
                     float specFactor = mat.specularFactor;
                     if (mat.specularTex > 0u && mat.specularTex <= 512u) {
-                        specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
+                        specFactor *= SAMPLE_SCENE_TEXTURE(mat.specularTex, hitUv).a;
                     }
                     vec3 dielectricF0 = vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
                     vec3 F0 = mix(dielectricF0, baseColor.rgb, metallic);
@@ -293,13 +294,13 @@ void main() {
                     // Clearcoat properties
                     float clearcoat = mat.clearcoat;
                     if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
-                        clearcoat *= texture(sceneTextures[mat.clearcoatTex - 1u], hitUv).r;
+                        clearcoat *= SAMPLE_SCENE_TEXTURE(mat.clearcoatTex, hitUv).r;
                     }
                     float clearcoatRoughness = mat.clearcoatRoughness;
                     if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 512u) {
-                        clearcoatRoughness *= texture(sceneTextures[mat.clearcoatRoughnessTex - 1u], hitUv).g;
+                        clearcoatRoughness *= SAMPLE_SCENE_TEXTURE(mat.clearcoatRoughnessTex, hitUv).g;
                     }
-                    clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
+                    clearcoatRoughness = clamp(clearcoatRoughness, 0.04, 1.0);
                     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
                     vec3 clearcoatNormal = hitNormal;
@@ -307,7 +308,7 @@ void main() {
                         vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
                         vec3 cTan = normalize(cross(up, hitNormal));
                         vec3 cBitan = cross(hitNormal, cTan);
-                        vec3 cNormMap = texture(sceneTextures[mat.clearcoatNormalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                        vec3 cNormMap = SAMPLE_SCENE_TEXTURE(mat.clearcoatNormalTex, hitUv).rgb * 2.0 - 1.0;
                         clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
                     }
 
@@ -325,7 +326,8 @@ void main() {
                     bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
                     bool enableShadows = (ubo.flags & (1 << 4)) != 0;
 
-                    float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
+                    float Fc_V = fresnelSchlick(clamp(dot(V, clearcoatNormal), 0.0, 1.0), 1.5) * clearcoat;
+                    float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? clamp(Fc_V, 0.04, 0.95) : 0.0;
                     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
                     // 2. Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
@@ -597,56 +599,45 @@ void main() {
                             if (xi < clearcoatProb) {
                                 // Clearcoat specular lobe: GGX microfacet sampling with clearcoatNormal
                                 sampledSpecularLobe = true;
-                                vec3 Hc = sampleGGX(clearcoatNormal, clearcoatAlpha, seed);
-                                vec3 L = reflect(-V, Hc);
-                                float NcDotL = dot(clearcoatNormal, L);
-
-                                if (NcDotL > 0.0) {
+                                vec3 T_cc, B_cc;
+                                buildOrthonormalBasis(clearcoatNormal, T_cc, B_cc);
+                                vec3 V_local = vec3(dot(V, T_cc), dot(V, B_cc), dot(V, clearcoatNormal));
+                                if (V_local.z > 0.0) {
+                                    vec3 H_local = sampleVNDF_GGX(V_local, clearcoatAlpha, clearcoatAlpha, seed);
+                                    vec3 Hc = normalize(T_cc * H_local.x + B_cc * H_local.y + clearcoatNormal * H_local.z);
+                                    vec3 L = reflect(-V, Hc);
+                                    float NcDotL = clamp(dot(clearcoatNormal, L), 0.001, 1.0);
                                     float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
-                                    float NcDotH = clamp(dot(clearcoatNormal, Hc), 0.001, 1.0);
                                     float VDotHc = clamp(dot(V, Hc), 0.0, 1.0);
-
-                                    float VisC = visibilitySmithGGXCorrelated(NcDotL, NcDotV, clearcoatAlpha);
                                     float Fc = fresnelSchlick(VDotHc, 1.5) * clearcoat;
-
-                                    vec3 specWeight = vec3((4.0 * VisC * Fc * NcDotL * VDotHc) / max(NcDotH * clearcoatProb, 1e-4));
-                                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
+                                    float g2_over_g1 = ratioSmithG2OverG1(NcDotV, NcDotL, clearcoatAlpha);
+                                    float specWeight = g2_over_g1 * (Fc / max(clearcoatProb, 1e-4));
+                                    throughput *= clamp(vec3(specWeight), vec3(0.0), vec3(10.0));
                                     nextDirection = L;
                                 } else {
-                                    // Fallback to diffuse normalized by clearcoat sample probability
-                                    sampledSpecularLobe = false;
-                                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                    vec3 H_diff = normalize(V + nextDirection);
-                                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                                    throughput *= (vec3(1.0) - F_diff) * diffuseColor / max(clearcoatProb, 1e-4);
+                                    pathTerminated = true;
                                 }
                             } else if (xi < clearcoatProb + baseSpecProb) {
-                                // Base Specular lobe: GGX microfacet sampling
+                                // Base Specular lobe: GGX VNDF sampling
                                 sampledSpecularLobe = true;
-                                vec3 H = sampleGGX(hitNormal, alphaRoughness, seed);
-                                vec3 L = reflect(-V, H);
-                                float NdotL = dot(hitNormal, L);
-
-                                if (NdotL > 0.0) {
+                                vec3 T_spec, B_spec;
+                                buildOrthonormalBasis(hitNormal, T_spec, B_spec);
+                                vec3 V_local = vec3(dot(V, T_spec), dot(V, B_spec), dot(V, hitNormal));
+                                if (V_local.z > 0.0) {
+                                    vec3 H_local = sampleVNDF_GGX(V_local, alphaRoughness, alphaRoughness, seed);
+                                    vec3 H = normalize(T_spec * H_local.x + B_spec * H_local.y + hitNormal * H_local.z);
+                                    vec3 L = reflect(-V, H);
+                                    float NdotL = clamp(dot(hitNormal, L), 0.001, 1.0);
                                     float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
                                     float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                                    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
                                     vec3 F = fresnelSchlickVec(VdotH, F0);
                                     float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
-
-                                    vec3 specWeight = (4.0 * Vis * F * NdotL * VdotH * (1.0 - Fc)) / max(NdotH * baseSpecProb, 1e-4);
-                                    throughput *= clamp(specWeight, vec3(0.0), vec3(10.0));
+                                    float g2_over_g1 = ratioSmithG2OverG1(NdotV, NdotL, alphaRoughness);
+                                    float specWeight = g2_over_g1 * ((1.0 - Fc) / max(baseSpecProb, 1e-4));
+                                    throughput *= F * clamp(vec3(specWeight), vec3(0.0), vec3(10.0));
                                     nextDirection = L;
                                 } else {
-                                    // Fallback to diffuse normalized by baseSpecProb sample probability
-                                    sampledSpecularLobe = false;
-                                    nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                                    vec3 H_diff = normalize(V + nextDirection);
-                                    vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                                    float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                                    throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(baseSpecProb, 1e-4);
+                                    pathTerminated = true;
                                 }
                             } else {
                                 // Diffuse lobe: Cosine-weighted hemisphere sampling

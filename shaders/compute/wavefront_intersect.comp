@@ -281,8 +281,9 @@ void main() {
 
             if (matchCount > 0u) {
                 uint laneSlot = subgroupBallotExclusiveBitCount(matBallot);
+                uint leader = subgroupBallotFindLSB(matBallot);
                 uint waveQueueBase = 0u;
-                if (subgroupElect()) {
+                if (gl_SubgroupInvocationID == leader) {
                     if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
                     else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
                     else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.conductorCount, matchCount);
@@ -290,7 +291,7 @@ void main() {
                     else if (k == 4u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
                     else if (k == 5u) waveQueueBase = atomicAdd(queueCounters.alphamaskCount, matchCount);
                 }
-                waveQueueBase = subgroupBroadcastFirst(waveQueueBase);
+                waveQueueBase = subgroupBroadcast(waveQueueBase, leader);
 
                 if (isMatch) {
                     uint targetIdx = k * pc.maxQueueCapacity + (waveQueueBase + laneSlot);
@@ -311,12 +312,12 @@ void main() {
             uint b = pc.currentBounce;
             uint nextB = b + 1u;
             if (pc.sortMode > 0u && nextB < pc.maxBounces) {
-                uint diffCnt = queueCounters.diffuseCount;
-                uint dielCnt = queueCounters.dielectricCount;
-                uint condCnt = queueCounters.conductorCount;
-                uint compCnt = queueCounters.complexCount;
-                uint emisCnt = queueCounters.emissiveCount;
-                uint passCnt = queueCounters.alphamaskCount;
+                uint diffCnt = atomicExchange(queueCounters.diffuseCount, 0u);
+                uint dielCnt = atomicExchange(queueCounters.dielectricCount, 0u);
+                uint condCnt = atomicExchange(queueCounters.conductorCount, 0u);
+                uint compCnt = atomicExchange(queueCounters.complexCount, 0u);
+                uint emisCnt = atomicExchange(queueCounters.emissiveCount, 0u);
+                uint passCnt = atomicExchange(queueCounters.alphamaskCount, 0u);
 
                 queueCounters.currentMaterialCounts[0] = diffCnt;
                 queueCounters.currentMaterialCounts[1] = dielCnt;
@@ -407,13 +408,6 @@ void main() {
                         dgcStream.commands[nextB * 16u + c].x = 0u;
                     }
                 }
-
-                queueCounters.diffuseCount = 0u;
-                queueCounters.dielectricCount = 0u;
-                queueCounters.conductorCount = 0u;
-                queueCounters.complexCount = 0u;
-                queueCounters.emissiveCount = 0u;
-                queueCounters.alphamaskCount = 0u;
             }
 
             queueCounters.currentShadowCount = 0u;

@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
 
@@ -215,7 +216,7 @@ void main() {
 
             Material mat = materials[matId];
             if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
-                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
 
@@ -227,7 +228,7 @@ void main() {
 
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
+                baseColor *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv);
             }
 
             bool isCutout = (mat.alphaMode == 1u && baseColor.a < mat.alphaCutoff) ||

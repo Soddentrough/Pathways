@@ -576,7 +576,7 @@ void main() {
     if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 512u) {
         clearcoatRoughness *= texture(sceneTextures[nonuniformEXT(mat.clearcoatRoughnessTex - 1u)], hitUv).g;
     }
-    clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
+    clearcoatRoughness = clamp(clearcoatRoughness, 0.04, 1.0);
     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
     vec3 clearcoatNormal = geomNormal;
     if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
@@ -598,7 +598,8 @@ void main() {
         clearcoatNormal = normalize(cTbn * cNormMap);
     }
 
-    float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? (clearcoat * 0.25) : 0.0;
+    float Fc_V = fresnelSchlick(clamp(dot(V, clearcoatNormal), 0.0, 1.0), 1.5) * clearcoat;
+    float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? clamp(Fc_V, 0.04, 0.95) : 0.0;
     float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
     // 2. Direct Lighting (Analytical Lights with Uniform NEE and MIS)

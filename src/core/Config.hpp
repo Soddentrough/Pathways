@@ -56,6 +56,7 @@ enum class UpscalerMode {
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
+    bool use_morton = false; // 2D Morton Z-curve mapping for wavefront classification (default: false / linear raster)
     SecondarySortMode secondary_sort_mode = SecondarySortMode::None; // Secondary ray BVH traversal coherency mode
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]

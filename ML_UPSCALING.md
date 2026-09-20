@@ -252,7 +252,7 @@ To avoid idle waiting and ensure all multi-GPU memory exchange pipelines, synchr
    - Non-linear camera depth (24/32-bit float)
    - Reactive mask and transparency composition masks
 3. **Validating Split-Viewport Apron Dynamics**: FSR 3 includes both spatial lanczos filtering and temporal history accumulation. Testing FSR 3 in Split-Viewport mode (Strategy A) will empirically determine the minimal apron width $A \in [16, 32]$ pixels required to prevent seam artifacts during rapid camera rotation and object disocclusion.
-4. **Validating Dual-Device Context Architecture**: [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp) must instantiate and manage two concurrent `FfxFsr3Context` structures across disparate `VkDevice` contexts without cross-device handle pollution.
+4. **Validating Dual-Device Context Architecture**: [`MultiGpuManager`](src/mgpu/MultiGpuManager.cpp) must instantiate and manage two concurrent `FfxFsr3Context` structures across disparate `VkDevice` contexts without cross-device handle pollution.
 5. **Drop-In Transition to FSR 4**: When AMD releases the FSR 4 Vulkan SDK, the host orchestration code, DMA-BUF buffer sharing, apron clipping, and 10-bit blit pipelines will already be fully debugged in Pathways. Upgrading will only require replacing the FSR 3 dispatch calls with FSR 4 neural tensor invocations.
 
 ---

@@ -511,14 +511,19 @@ struct PTTDHeader {
     uint32_t frame_index = 0;
     uint32_t spp = 1;
     uint64_t payload_byte_size = 0;
-    char padding[24] = {0};
+    float fov_deg = 45.0f;
+    float aspect_ratio = 16.0f / 9.0f;
+    float cam_pos[3] = {0.0f, 0.0f, 0.0f};
+    char padding[4] = {0};
 };
 #pragma pack(pop)
 static_assert(sizeof(PTTDHeader) == 64, "PTTDHeader must be exactly 64 bytes");
 
 bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t height,
                            uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,
-                           const void* payloadData, size_t payloadBytes) {
+                           const void* payloadData, size_t payloadBytes,
+                           float fovDeg, float aspectRatio,
+                           const float camPos[3]) {
     if (!payloadData || width == 0 || height == 0 || channels == 0 || payloadBytes == 0) {
         Logger::error("Invalid tensor payload passed to savePTTD");
         return false;
@@ -538,6 +543,13 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
     header.frame_index = frameIndex;
     header.spp = spp;
     header.payload_byte_size = payloadBytes;
+    header.fov_deg = fovDeg;
+    header.aspect_ratio = aspectRatio;
+    if (camPos) {
+        header.cam_pos[0] = camPos[0];
+        header.cam_pos[1] = camPos[1];
+        header.cam_pos[2] = camPos[2];
+    }
 
     std::ofstream out(filepath, std::ios::binary);
     if (!out.is_open()) {

@@ -1539,7 +1539,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.envMapIntensity = packet.envMapIntensity;
         wfSceneData.useHardwareRT = packet.useHardwareRT;
         wfSceneData.frameIndex = packet.cameraUniform.frameIndex;
-        wfSceneData.useMorton = 1u;
+        wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = packet.accumulateHistory;
         wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
         wfSceneData.numOpaqueTriangles = packet.numOpaqueTriangles;

@@ -8,6 +8,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
@@ -235,7 +236,7 @@ void main() {
             Material mat = materials[matId];
 #if !IS_SECONDARY_BOUNCE
             if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
-                vec3 normalMap = texture(sceneTextures[mat.normalTex - 1u], hitUv).rgb * 2.0 - 1.0;
+                vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
 
@@ -292,12 +293,12 @@ void main() {
                 vec3 gradProj = gradBump - dot(gradBump, hitNormal) * hitNormal;
                 hitNormal = normalize(hitNormal - gradProj * (0.12 * (1.0 - puddleMask)));
             } else if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                baseColor *= texture(sceneTextures[mat.albedoTex - 1u], hitUv);
+                baseColor *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv);
             }
 
             vec3 emissive = mat.emissive.rgb;
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
+                emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             }
             if ((mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {
                 float time = float(ubo.frameIndex) * 0.01666667;
@@ -321,13 +322,13 @@ void main() {
 
             float diffTrans = clamp(mat.diffuseTransmission, 0.0, 1.0);
             if (mat.diffuseTransmissionTex > 0u && mat.diffuseTransmissionTex <= 512u) {
-                diffTrans *= texture(sceneTextures[mat.diffuseTransmissionTex - 1u], hitUv).r;
+                diffTrans *= SAMPLE_SCENE_TEXTURE(mat.diffuseTransmissionTex, hitUv).r;
             }
             diffTrans = clamp(diffTrans, 0.0, 1.0);
 
             float roughness = (isTerrain || isPuddle) ? procRoughness : mat.roughness;
             if (!isTerrain && !isPuddle && mat.mrTex > 0u && mat.mrTex <= 512u) {
-                roughness *= texture(sceneTextures[mat.mrTex - 1u], hitUv).g;
+                roughness *= SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv).g;
             }
             roughness = clamp(roughness, 0.02, 1.0);
             float alphaRoughness = roughness * roughness;
@@ -339,7 +340,7 @@ void main() {
 #else
             float specFactor = mat.specularFactor;
             if (mat.specularTex > 0u && mat.specularTex <= 512u) {
-                specFactor *= texture(sceneTextures[mat.specularTex - 1u], hitUv).a;
+                specFactor *= SAMPLE_SCENE_TEXTURE(mat.specularTex, hitUv).a;
             }
             f16vec3 F0 = f16vec3(clamp(f0Dielectric * specFactor, 0.0, 1.0));
 #endif

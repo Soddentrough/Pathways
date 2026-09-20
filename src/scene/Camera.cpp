@@ -160,6 +160,14 @@ void Camera::update(float deltaTime) {
     }
 }
 
+void Camera::setPose(const glm::vec3& position, float yaw, float pitch) {
+    m_position = position;
+    m_yaw = yaw;
+    m_pitch = std::clamp(pitch, -89.0f, 89.0f);
+    updateVectors();
+    m_moved = true;
+}
+
 void Camera::lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up) {
     m_position = position;
     m_worldUp = up;

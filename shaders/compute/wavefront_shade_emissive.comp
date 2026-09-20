@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
@@ -198,7 +199,7 @@ void main() {
             Material mat = materials[matId];
             vec3 emissive = mat.emissive.rgb;
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                emissive *= texture(sceneTextures[mat.emissiveTex - 1u], hitUv).rgb;
+                emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             }
 
             if ((mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {

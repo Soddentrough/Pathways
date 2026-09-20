@@ -7,8 +7,11 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "nrc_common.glsl"
+
+#define SAMPLE_SCENE_TEXTURE(texId, uv) textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), 0.0)
 
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
@@ -537,6 +540,43 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
     vec3 bitangent = cross(N, tangent);
 
     return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
+}
+
+// Orthonormal basis construction (Duff et al. 2017)
+void buildOrthonormalBasis(vec3 n, out vec3 b1, out vec3 b2) {
+    float signVal = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (signVal + n.z);
+    float b = n.x * n.y * a;
+    b1 = vec3(1.0 + signVal * n.x * n.x * a, signVal * b, -signVal * n.x);
+    b2 = vec3(b, signVal + n.y * n.y * a, -n.y);
+}
+
+// Visible Normal Distribution Function (VNDF) Sampling (Dupuy & Heitz 2023)
+vec3 sampleVNDF_GGX(vec3 V_local, float alpha_x, float alpha_y, inout uint seed) {
+    vec2 u = randVec2(seed);
+    vec3 Vh = normalize(vec3(alpha_x * V_local.x, alpha_y * V_local.y, V_local.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 1e-7 ? vec3(-Vh.y, Vh.x, 0.0) / sqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+    float r = sqrt(u.x);
+    float phi = TWO_PI * u.y;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    return normalize(vec3(alpha_x * Nh.x, alpha_y * Nh.y, max(0.0, Nh.z)));
+}
+
+// Height-correlated Smith G2 / G1 ratio for exact VNDF Monte Carlo estimator weighting
+float ratioSmithG2OverG1(float NdotV, float NdotL, float alpha) {
+    float a2 = max(alpha * alpha, 1e-6);
+    float sqV = sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float sqL = sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    float G1_V_denom = NdotV + sqV;
+    float num = NdotL * G1_V_denom;
+    float den = NdotL * sqV + NdotV * sqL;
+    return clamp(num / max(den, 1e-6), 0.0, 1.0);
 }
 
 // Anisotropic GGX Normal Distribution Function D

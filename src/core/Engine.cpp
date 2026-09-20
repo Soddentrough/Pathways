@@ -4546,7 +4546,7 @@ void Engine::renderFrame() {
             wfSceneData.envMapIntensity = envIntensity;
             wfSceneData.useHardwareRT = useHwRT;
             wfSceneData.frameIndex = m_frameIndex;
-            wfSceneData.useMorton = 1u;
+            wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
             wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
             wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
             wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
@@ -4931,7 +4931,7 @@ void Engine::renderFrame() {
                 wfSceneData.envMapIntensity = envIntensity;
                 wfSceneData.useHardwareRT = useHwRT;
                 wfSceneData.frameIndex = m_frameIndex;
-                wfSceneData.useMorton = 1u;
+                wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
                 wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
                 wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
                 wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
@@ -6692,9 +6692,12 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     };
 
+    Image* targetAccumImg = m_frameImages[0].get();
+    bool isTargetFp16 = targetAccumImg && (targetAccumImg->getFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
+
     if (isReference) {
         // --- GROUND TRUTH REFERENCE CAPTURE PASS ---
-        // 1. Clear accumImage to zero before progressive accumulation
+        // 1. Clear targetAccumImg (m_frameImages[0]) to zero before progressive accumulation
         {
             VkCommandBuffer cmd = m_commandBuffers[0];
             vkResetCommandBuffer(cmd, 0);
@@ -6702,7 +6705,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
-            clearImage(cmd, m_accumImage.get());
+            clearImage(cmd, targetAccumImg);
             vkEndCommandBuffer(cmd);
 
             VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -6727,7 +6730,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.hasEnvMap = m_environmentMap ? 1u : 0u;
         wfSceneData.envMapIntensity = 1.0f;
         wfSceneData.useHardwareRT = 1u;
-        wfSceneData.useMorton = 1u;
+        wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 1u;
         wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
         wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
@@ -6773,9 +6776,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             currentSppOffset += batchSpp;
         }
 
-        // 3. Read back accumImage and write PTTD reference file
-        bool isFp16 = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT);
-        VkDeviceSize accumPixelBytes = isFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+        // 3. Read back targetAccumImg (m_frameImages[0]) and write PTTD reference file
+        VkDeviceSize accumPixelBytes = isTargetFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
         VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width) * height * accumPixelBytes;
 
         Buffer stagingAccum(allocator, stagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -6789,7 +6791,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            m_accumImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
@@ -6798,9 +6800,9 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             copyRegion.imageSubresource.layerCount = 1;
             copyRegion.imageExtent = { width, height, 1 };
 
-            vkCmdCopyImageToBuffer(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingAccum.getBuffer(), 1, &copyRegion);
+            vkCmdCopyImageToBuffer(cmd, targetAccumImg->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingAccum.getBuffer(), 1, &copyRegion);
 
-            m_accumImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+            targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
@@ -6819,7 +6821,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         std::vector<uint16_t> refPayload(static_cast<size_t>(width) * height * 4);
         uint16_t sppFp16 = glm::detail::toFloat16(static_cast<float>(spp));
 
-        if (isFp16) {
+        if (isTargetFp16) {
             const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
             for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
                 refPayload[p * 4 + 0] = src[p * 4 + 0];
@@ -6839,14 +6841,20 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             stagingAccum.unmap();
         }
 
+        glm::vec3 camPos = m_camera ? m_camera->getPosition() : glm::vec3(0.0f);
+        float fov = m_camera ? m_camera->getFov() : 45.0f;
+        float aspect = m_camera ? m_camera->getAspect() : (static_cast<float>(width) / height);
+        float camPosArr[3] = { camPos.x, camPos.y, camPos.z };
+
         std::string refPath = std::format("{}/frame_{:05d}_reference.bin", m_config.capture_training_data_dir, frameIdx);
         ImageDumper::savePTTD(refPath, width, height, 4, 0 /* Float16 */,
-                              frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t));
+                              frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t),
+                              fov, aspect, camPosArr);
         Logger::info("  -> Saved reference: {} (4 channels, {} SPP)", refPath, spp);
 
     } else {
         // --- 1-SPP NOISY INPUT + ML FEATURE EXTRACTION PASS ---
-        // 1. Clear accum and ML images to zero
+        // 1. Clear targetAccumImg and ML images to zero
         VkCommandBuffer cmd = m_commandBuffers[0];
         vkResetCommandBuffer(cmd, 0);
 
@@ -6854,7 +6862,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        clearImage(cmd, m_accumImage.get());
+        clearImage(cmd, targetAccumImg);
         clearImage(cmd, m_mlDiffuseImage.get());
         clearImage(cmd, m_mlSpecularImage.get());
         clearImage(cmd, m_mlAlbedoRoughnessImage.get());
@@ -6877,7 +6885,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.envMapIntensity = 1.0f;
         wfSceneData.useHardwareRT = 1u;
         wfSceneData.frameIndex = frameIdx;
-        wfSceneData.useMorton = 1u;
+        wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 0u;
         wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
         wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
@@ -7012,11 +7020,203 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         }
         stagingInput.unmap();
 
+        glm::vec3 camPos = m_camera ? m_camera->getPosition() : glm::vec3(0.0f);
+        float fov = m_camera ? m_camera->getFov() : 45.0f;
+        float aspect = m_camera ? m_camera->getAspect() : (static_cast<float>(width) / height);
+        float camPosArr[3] = { camPos.x, camPos.y, camPos.z };
+
         std::string inpPath = std::format("{}/frame_{:05d}_input.bin", m_config.capture_training_data_dir, frameIdx);
         ImageDumper::savePTTD(inpPath, width, height, outChannels, 0 /* Float16 */,
-                              frameIdx, 1, inputPayload.data(), inputPayload.size() * sizeof(uint16_t));
+                              frameIdx, 1, inputPayload.data(), inputPayload.size() * sizeof(uint16_t),
+                              fov, aspect, camPosArr);
         Logger::info("  -> Saved input    : {} ({} channels, 1 SPP)", inpPath, outChannels);
     }
+}
+
+void Engine::updateGamingChoreography(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName) {
+    if (!camera) return;
+
+    if (!m_choreoInitialized) {
+        m_choreoInitialPos = camera->getPosition();
+        m_choreoInitialYaw = camera->getYaw();
+        m_choreoInitialPitch = camera->getPitch();
+        m_choreoInitialFov = camera->getFov();
+        m_choreoInitialized = true;
+        Logger::info("[Gaming Choreography] Initialized baseline camera at pos=({:.2f}, {:.2f}, {:.2f}), yaw={:.1f}°, pitch={:.1f}°, fov={:.1f}° for {}",
+                     m_choreoInitialPos.x, m_choreoInitialPos.y, m_choreoInitialPos.z,
+                     m_choreoInitialYaw, m_choreoInitialPitch, m_choreoInitialFov, sceneName);
+    }
+
+    if (totalFrames <= 1) return;
+
+    // Basis vectors in local coordinate system
+    float radYaw = glm::radians(m_choreoInitialYaw);
+    float radPitch = glm::radians(m_choreoInitialPitch);
+    glm::vec3 forward0(
+        std::cos(radYaw) * std::cos(radPitch),
+        std::sin(radPitch),
+        std::sin(radYaw) * std::cos(radPitch)
+    );
+    forward0 = glm::normalize(forward0);
+
+    glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    glm::vec3 right0 = glm::normalize(glm::cross(forward0, worldUp));
+    glm::vec3 groundForward0 = glm::normalize(glm::cross(worldUp, right0));
+
+    glm::vec3 pos = m_choreoInitialPos;
+    float yaw = m_choreoInitialYaw;
+    float pitch = m_choreoInitialPitch;
+    float fov = m_choreoInitialFov;
+
+    constexpr float PI = 3.14159265358979323846f;
+
+    // Normalize frame progress across 240 frames
+    float normalizedFrame = (static_cast<float>(frameIdx) / static_cast<float>(totalFrames)) * 240.0f;
+
+    // Landmark positions for phase continuity
+    const float walkDist = 0.22f;
+    const float sprintDist = 0.38f;
+    const float jumpForwardDist = 0.15f;
+    const float crawlDist = 0.08f;
+
+    glm::vec3 pEndPhase1 = m_choreoInitialPos + groundForward0 * walkDist;
+    glm::vec3 pEndPhase2 = pEndPhase1 + groundForward0 * sprintDist;
+    glm::vec3 pEndPhase3 = pEndPhase2 + groundForward0 * jumpForwardDist;
+    glm::vec3 pEndPhase5 = pEndPhase3 + groundForward0 * crawlDist;
+
+    if (normalizedFrame < 40.0f) {
+        // --- PHASE 1 (Frames 0..39): Stationary warmup (0..9) -> Walking acceleration (10..39) ---
+        if (normalizedFrame >= 10.0f) {
+            float u = (normalizedFrame - 10.0f) / 30.0f; // 0..1
+            float easeU = u * u; // gentle acceleration
+            float d = walkDist * easeU;
+            float bob = 0.015f * std::sin(2.0f * PI * (normalizedFrame - 10.0f) / 12.0f) * u;
+            float glance = 1.0f * std::sin(2.0f * PI * (normalizedFrame - 10.0f) / 24.0f) * u;
+
+            pos = m_choreoInitialPos + groundForward0 * d + worldUp * bob;
+            yaw = m_choreoInitialYaw + glance;
+        }
+    } else if (normalizedFrame < 90.0f) {
+        // --- PHASE 2 (Frames 40..89): Sprint & Lateral Strafe + Sprint FOV (+5 deg) ---
+        float u = (normalizedFrame - 40.0f) / 50.0f; // 0..1
+        float d = sprintDist * u;
+        float strafe = 0.16f * std::sin(2.0f * PI * u * 1.5f);
+        float bob = 0.025f * std::sin(2.0f * PI * (normalizedFrame - 40.0f) / 8.0f);
+        float dynamicFov = 5.0f * std::sin(PI * u);
+        float counterYaw = -1.8f * std::sin(2.0f * PI * u * 1.5f);
+
+        pos = pEndPhase1 + groundForward0 * d + right0 * strafe + worldUp * bob;
+        yaw = m_choreoInitialYaw + counterYaw;
+        fov = m_choreoInitialFov + dynamicFov;
+    } else if (normalizedFrame < 130.0f) {
+        // --- PHASE 3 (Frames 90..129): Vertical Jump & Landing Shock ---
+        float fInPhase = normalizedFrame - 90.0f;
+        float forwardProgress = (fInPhase / 40.0f) * jumpForwardDist;
+        glm::vec3 baseP = pEndPhase2 + groundForward0 * forwardProgress;
+
+        if (fInPhase < 24.0f) {
+            // Parabolic Jump Ascent & Descent
+            float tau = fInPhase / 24.0f; // 0..1
+            float jumpHeight = 4.0f * 0.28f * tau * (1.0f - tau);
+            float apexFloorLook = -4.0f * std::sin(PI * tau);
+
+            pos = baseP + worldUp * jumpHeight;
+            pitch = m_choreoInitialPitch + apexFloorLook;
+        } else {
+            // Landing Shock (Damped Spring Squish Oscillation)
+            float tL = fInPhase - 24.0f;
+            float decay = std::exp(-0.25f * tL);
+            float squishY = -0.045f * decay * std::cos(2.0f * PI * tL / 5.0f);
+            float chinNod = 3.5f * decay * std::sin(2.0f * PI * tL / 4.5f);
+
+            pos = baseP + worldUp * squishY;
+            pitch = m_choreoInitialPitch + chinNod;
+        }
+    } else if (normalizedFrame < 170.0f) {
+        // --- PHASE 4 (Frames 130..169): Rapid Twitch Mouse Flick (+55 deg in 4 frames) & Snap Return ---
+        pos = pEndPhase3;
+        float fInPhase = normalizedFrame - 130.0f;
+
+        float flickYaw = 0.0f;
+        if (fInPhase < 4.0f) {
+            // Pre-flick stationary pause
+            flickYaw = 0.0f;
+        } else if (fInPhase < 8.0f) {
+            // 4-frame high-velocity flick (+13.75 deg / frame)
+            float t = (fInPhase - 4.0f) / 4.0f;
+            flickYaw = 55.0f * (t * t * (3.0f - 2.0f * t)); // smooth cubic flick
+        } else if (fInPhase < 18.0f) {
+            // Snap pause with micro-tremor
+            float snapT = fInPhase - 8.0f;
+            float microSway = 0.6f * std::sin(2.0f * PI * snapT / 5.0f);
+            flickYaw = 55.0f + microSway;
+        } else if (fInPhase < 22.0f) {
+            // 4-frame rapid return flick back to 0 deg
+            float t = (fInPhase - 18.0f) / 4.0f;
+            float s = t * t * (3.0f - 2.0f * t);
+            flickYaw = 55.0f * (1.0f - s);
+        } else {
+            // Stabilization
+            flickYaw = 0.0f;
+        }
+
+        yaw = m_choreoInitialYaw + flickYaw;
+    } else if (normalizedFrame < 210.0f) {
+        // --- PHASE 5 (Frames 170..209): Aim Down Sights (ADS) Dynamic Zoom (45 -> 24 deg) & Tactical Crawl ---
+        float fInPhase = normalizedFrame - 170.0f;
+        float targetFov = 24.0f;
+
+        if (fInPhase < 10.0f) {
+            // Smooth ADS Zoom In
+            float s = fInPhase / 10.0f;
+            s = s * s * (3.0f - 2.0f * s);
+            fov = m_choreoInitialFov - (m_choreoInitialFov - targetFov) * s;
+            pos = pEndPhase3;
+        } else if (fInPhase < 28.0f) {
+            // Full ADS hold + tactical crawl + breathing sway
+            fov = targetFov;
+            float crawlT = (fInPhase - 10.0f) / 18.0f;
+            float crawlProgress = crawlDist * crawlT;
+            float breathYaw = 0.25f * std::sin(2.0f * PI * (fInPhase - 10.0f) / 14.0f);
+            float breathPitch = 0.20f * std::cos(2.0f * PI * (fInPhase - 10.0f) / 14.0f);
+
+            pos = pEndPhase3 + groundForward0 * crawlProgress;
+            yaw = m_choreoInitialYaw + breathYaw;
+            pitch = m_choreoInitialPitch + breathPitch;
+        } else if (fInPhase < 38.0f) {
+            // Smooth ADS Zoom Out
+            float s = (fInPhase - 28.0f) / 10.0f;
+            s = s * s * (3.0f - 2.0f * s);
+            fov = targetFov + (m_choreoInitialFov - targetFov) * s;
+            pos = pEndPhase5;
+        } else {
+            fov = m_choreoInitialFov;
+            pos = pEndPhase5;
+        }
+    } else {
+        // --- PHASE 6 (Frames 210..239): Arc-Strafe / Turntable Orbit (Non-uniform parallax flow) ---
+        float fInPhase = normalizedFrame - 210.0f;
+        float u = fInPhase / 29.0f; // 0..1
+        float orbitR = 1.6f;
+        glm::vec3 focalPoint = pEndPhase5 + groundForward0 * orbitR + worldUp * 0.05f;
+
+        float maxAngleDeg = 16.0f;
+        float curAngleDeg = maxAngleDeg * std::sin((PI * 0.5f) * u); // smooth ease-out arc
+        float curAngleRad = glm::radians(curAngleDeg);
+
+        // Orbit around focal point in horizontal plane
+        glm::vec3 rel = -groundForward0 * std::cos(curAngleRad) + right0 * std::sin(curAngleRad);
+        pos = focalPoint + rel * orbitR;
+
+        // Camera gaze tracks focal point
+        glm::vec3 lookDir = glm::normalize(focalPoint - pos);
+        yaw = glm::degrees(std::atan2(lookDir.z, lookDir.x));
+        pitch = glm::degrees(std::asin(std::clamp(lookDir.y, -0.999f, 0.999f)));
+        fov = m_choreoInitialFov;
+    }
+
+    camera->setPose(pos, yaw, pitch);
+    camera->setFov(fov);
 }
 
 void Engine::runTrainingDataCapture() {
@@ -7032,7 +7232,8 @@ void Engine::runTrainingDataCapture() {
 
     std::filesystem::create_directories(m_config.capture_training_data_dir);
 
-    // Warm up camera
+    // Warm up camera & reset choreography state
+    m_choreoInitialized = false;
     if (m_camera) {
         m_camera->resetMoved();
     }
@@ -7040,16 +7241,16 @@ void Engine::runTrainingDataCapture() {
     for (uint32_t f = 0; f < m_config.capture_frames; ++f) {
         Logger::info("--- Capturing Training Frame [{}/{}] ---", f + 1, m_config.capture_frames);
 
+        // Update 6-DOF procedural choreography for frame f
+        if (m_camera) {
+            updateGamingChoreography(m_camera.get(), f, m_config.capture_frames, m_config.scene_path);
+        }
+
         // 1. Render 1-SPP Noisy Input Frame FIRST (evaluates true inter-frame motion vectors from f-1 to f)
         captureTrainingFrame(f, /*isReference=*/false, 1);
 
         // 2. Render Ground Truth Reference Frame SECOND (same camera pose)
         captureTrainingFrame(f, /*isReference=*/true, m_config.capture_reference_spp);
-
-        // 3. Move camera for next frame if multi-frame sequence
-        if (m_camera) {
-            m_camera->processMouseMovement(2.0f, 0.0f);
-        }
     }
 
     Logger::info("========================================================================================");

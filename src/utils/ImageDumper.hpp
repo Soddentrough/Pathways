@@ -252,7 +252,9 @@ public:
     static bool saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels);
     static bool savePTTD(const std::string& filepath, uint32_t width, uint32_t height,
                          uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,
-                         const void* payloadData, size_t payloadBytes);
+                         const void* payloadData, size_t payloadBytes,
+                         float fovDeg = 45.0f, float aspectRatio = 16.0f / 9.0f,
+                         const float camPos[3] = nullptr);
     static bool saveStatsJSON(const std::string& filepath, const FrameStats& stats);
     static std::string generateDefaultTelemetryPath();
 };

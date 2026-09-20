@@ -547,7 +547,7 @@ Three scenes in particular demonstrated sub-80% scaling efficiency: **`Kitchen E
     - Primary bottleneck identified: fixed host memory round-trip latency (`parallelMemcpy` over PCIe host-visible staging).
     - Tonemap & Merge pass latency reduced from ~0.50 ms down to **0.090 – 0.135 ms** across all native 4K scenes (3840x2160).
     - Host memory double-hops completely eliminated.
-    - Verified via automated unit test [`tests/test_p2p_direct_bar.cpp`](file:///home/naoki/Development/Pathways/tests/test_p2p_direct_bar.cpp).
+    - Verified via automated unit test [`tests/test_p2p_direct_bar.cpp`](tests/test_p2p_direct_bar.cpp).
 
 - [x] **3. Architectural Evaluation of Spatial Partitioning vs. Checkerboard Tiling (Post-Mortem):**
   - **Hypothesis**: Scaling limitations in *Kitchen Extended*, *Dragon Attenuation*, and *Bistro Interior* were initially hypothesized to stem from spatial ray variance in screen space.

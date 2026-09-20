@@ -217,6 +217,13 @@ private:
     std::unique_ptr<Image> m_mlSpecularImage;
     void runTrainingDataCapture();
     void captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp);
+    void updateGamingChoreography(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName);
+
+    bool m_choreoInitialized = false;
+    glm::vec3 m_choreoInitialPos{0.0f};
+    float m_choreoInitialYaw = 0.0f;
+    float m_choreoInitialPitch = 0.0f;
+    float m_choreoInitialFov = 45.0f;
 
     bool m_temporalResetRequested = true;
 

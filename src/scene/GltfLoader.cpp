@@ -1038,17 +1038,7 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
         data.lights.push_back(sunLight);
 
-        float lightSide = maxDim * 0.6f;
-        float lightY = maxBound.y + maxDim * 0.5f;
-        LightGPU defaultLight{};
-        defaultLight.position = glm::vec4(center.x - lightSide * 0.5f, lightY, center.z - lightSide * 0.5f, LIGHT_AREA_QUAD);
-        defaultLight.u = glm::vec4(lightSide, 0.0f, 0.0f, 0.0f);
-        defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
-        defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
-        float area = lightSide * lightSide;
-        defaultLight.emission = glm::vec4(25.0f, 25.0f, 25.0f, area);
-        data.lights.push_back(defaultLight);
-        Logger::info("GltfLoader: Scene had no lights; generated directional sun and overhead area light fallback");
+        Logger::info("GltfLoader: Scene had no lights; generated directional sun fallback matching procedural sky");
     }
 
     Logger::info("GltfLoader generated SceneData: {} Triangles, {} Spheres, {} Materials, {} Lights",

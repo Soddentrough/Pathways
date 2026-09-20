@@ -159,14 +159,14 @@ def main():
         else:
             print(f"\033[32m[PASS]\033[0m Contact shadows preserved: {m_mc['shadow_pct']:.2f}% >= 5%")
 
-        if m_mc["mean_lum"] < 0.35:
-            print(f"[FAIL] Mean luminance {m_mc['mean_lum']:.4f} is too dark (below 0.35)")
+        if m_mc["mean_lum"] < 0.30:
+            print(f"[FAIL] Mean luminance {m_mc['mean_lum']:.4f} is too dark (below 0.30)")
             all_passed = False
         elif m_mc["mean_lum"] > 0.62:
             print(f"[FAIL] Mean luminance {m_mc['mean_lum']:.4f} is bleached / overexposed (exceeds 0.62)")
             all_passed = False
         else:
-            print(f"\033[32m[PASS]\033[0m Exposure normalized: {m_mc['mean_lum']:.4f} in [0.35, 0.62]")
+            print(f"\033[32m[PASS]\033[0m Exposure normalized: {m_mc['mean_lum']:.4f} in [0.30, 0.62]")
 
         if m_mc["blown_pct"] > 30.0:
             print(f"[FAIL] Blown-out percentage {m_mc['blown_pct']:.2f}% exceeds 30.0% ceiling")

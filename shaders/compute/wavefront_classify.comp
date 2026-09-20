@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
 
@@ -357,12 +358,12 @@ void main() {
                     Material mat = materials[matId];
                     albedoVal = mat.albedo.rgb;
                     if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                        albedoVal *= texture(sceneTextures[mat.albedoTex - 1u], hitUv).rgb;
+                        albedoVal *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv).rgb;
                     }
                     roughnessVal = mat.roughness;
                     metallicVal = mat.metallic;
                     if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                        vec4 mrSample = texture(sceneTextures[mat.mrTex - 1u], hitUv);
+                        vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
                         roughnessVal *= mrSample.g;
                         metallicVal *= mrSample.b;
                     }
@@ -436,10 +437,13 @@ void main() {
     uint waveActiveCount = subgroupBallotBitCount(ballot);
 
     uint waveGlobalOffset = 0u;
-    if (subgroupElect()) {
-        waveGlobalOffset = atomicAdd(queueCounters.activeRayCount, waveActiveCount);
+    if (waveActiveCount > 0u) {
+        uint leader = subgroupBallotFindLSB(ballot);
+        if (gl_SubgroupInvocationID == leader) {
+            waveGlobalOffset = atomicAdd(queueCounters.activeRayCount, waveActiveCount);
+        }
+        waveGlobalOffset = subgroupShuffle(waveGlobalOffset, leader);
     }
-    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
 
     uint rayIdx = 0u;
     if (isActive) {
@@ -460,8 +464,9 @@ void main() {
 
             if (matchCount > 0u) {
                 uint matLaneSlot = subgroupBallotExclusiveBitCount(matBallot);
+                uint leader = subgroupBallotFindLSB(matBallot);
                 uint waveQueueBase = 0u;
-                if (subgroupElect()) {
+                if (gl_SubgroupInvocationID == leader) {
                     if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
                     else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
                     else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.conductorCount, matchCount);
@@ -469,7 +474,7 @@ void main() {
                     else if (k == 4u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
                     else if (k == 5u) waveQueueBase = atomicAdd(queueCounters.alphamaskCount, matchCount);
                 }
-                waveQueueBase = subgroupBroadcastFirst(waveQueueBase);
+                waveQueueBase = subgroupShuffle(waveQueueBase, leader);
 
                 if (isMatch) {
                     uint slot = waveQueueBase + matLaneSlot;
@@ -488,12 +493,12 @@ void main() {
         uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
         if (retired == totalWgs - 1u) {
             if (pc.sortMode > 0u) {
-                uint diffCnt = queueCounters.diffuseCount;
-                uint dielCnt = queueCounters.dielectricCount;
-                uint condCnt = queueCounters.conductorCount;
-                uint compCnt = queueCounters.complexCount;
-                uint emisCnt = queueCounters.emissiveCount;
-                uint passCnt = queueCounters.alphamaskCount;
+                uint diffCnt = atomicExchange(queueCounters.diffuseCount, 0u);
+                uint dielCnt = atomicExchange(queueCounters.dielectricCount, 0u);
+                uint condCnt = atomicExchange(queueCounters.conductorCount, 0u);
+                uint compCnt = atomicExchange(queueCounters.complexCount, 0u);
+                uint emisCnt = atomicExchange(queueCounters.emissiveCount, 0u);
+                uint passCnt = atomicExchange(queueCounters.alphamaskCount, 0u);
 
                 queueCounters.currentMaterialCounts[0] = diffCnt;
                 queueCounters.currentMaterialCounts[1] = dielCnt;
@@ -581,15 +586,8 @@ void main() {
                         dgcStream.commands[c].x = 0u;
                     }
                 }
-
-                queueCounters.diffuseCount = 0u;
-                queueCounters.dielectricCount = 0u;
-                queueCounters.conductorCount = 0u;
-                queueCounters.complexCount = 0u;
-                queueCounters.emissiveCount = 0u;
-                queueCounters.alphamaskCount = 0u;
             } else {
-                uint activeCount = queueCounters.activeRayCount;
+                uint activeCount = atomicAdd(queueCounters.activeRayCount, 0u);
                 uint shadeGroups = (activeCount + 31u) / 32u;
                 indirect.commands[0].x = shadeGroups;
                 indirect.commands[0].y = 1u;

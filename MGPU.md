@@ -6,7 +6,7 @@ Pathways implements a high-performance, real-time multi-GPU path tracing backend
 
 ### 1.1 The Core Design: Unlinked Multi-GPU via DMA-BUF Direct BAR
 Unlike legacy game implementations that relied on monolithic Vulkan device groups (`VK_KHR_device_group`) and proprietary driver SLI/CrossFire profiles, Pathways operates on **Unlinked Heterogeneous Multi-GPU**:
-- **Dual Independent Logical Devices:** [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp) instantiates two standalone `VkDevice` contexts ([`dev0` and `dev1`](file:///home/naoki/Development/Pathways/tests/test_p2p_direct_bar.cpp#L57-L59)).
+- **Dual Independent Logical Devices:** [`MultiGpuManager`](src/mgpu/MultiGpuManager.cpp) instantiates two standalone `VkDevice` contexts ([`dev0` and `dev1`](tests/test_p2p_direct_bar.cpp#L57-L59)).
 - **Zero-Copy PCIe P2P Transfer:** Secondary GPU accumulation targets are exported via `VK_EXT_external_memory_dma_buf` and mapped directly into the primary GPU's memory space over PCIe Resizable BAR (`P2P_Direct_BAR`).
 - **Hardware-Level Signaling:** Synchronization between command streams is orchestrated with zero CPU spinning via `VK_KHR_external_semaphore_fd`.
 - **Latency & Throughput:** At 4K native ($3840 \times 2160$), transferring the secondary GPU's compacted FP16 buffer takes only **0.090 – 0.135 ms** across PCIe 4.0/5.0.
@@ -15,14 +15,14 @@ Unlike legacy game implementations that relied on monolithic Vulkan device group
 Pathways dynamically bifurcates its workload across two distinct strategies:
 1. **`MultiGpuMode::SampleParallel` (Multi-Sample Rendering, $\ge 2$ SPP):**
    - Each GPU traces full-screen rays at $N / 2$ SPP with decorrelated PRNG seeds (`uboSec.frameIndex = m_frameIndex + 1000003u`).
-   - Results are combined via an additive FP16 accumulator compute pass ([`accum_merge.comp`](file:///home/naoki/Development/Pathways/shaders/compute/accum_merge.comp#L61-L80)).
+   - Results are combined via an additive FP16 accumulator compute pass ([`accum_merge.comp`](shaders/compute/accum_merge.comp#L61-L80)).
    - **Characteristics:** Zero spatial artifacts, 100% seam-free, perfectly compatible with screen-space denoisers, but inherently inapplicable to 1-SPP real-time rendering.
 2. **`MultiGpuMode::CheckerboardTile` (Single-Sample Rendering, 1 SPP):**
    - Screen space is divided into a 2D checkerboard grid of $64 \times 64$ tiles (2,040 tiles at 4K).
    - Tile $(X, Y)$ parity: $P = (X + Y) \pmod 2$.
      - **GPU 0 (Primary):** Traces Parity 0 ("white" tiles).
      - **GPU 1 (Secondary):** Traces Parity 1 ("black" tiles).
-   - **Compacted Dispatch Grid:** Both GPUs dispatch a compacted grid of dimensions $(W/2, H)$. In [`raytrace.rgen:116-127`](file:///home/naoki/Development/Pathways/shaders/rt/raytrace.rgen#L116-L127), thread coordinates are mathematically unpacked into interleaved screen space with **zero wave divergence** on RDNA 4 Wave32.
+   - **Compacted Dispatch Grid:** Both GPUs dispatch a compacted grid of dimensions $(W/2, H)$. In [`raytrace.rgen:116-127`](shaders/rt/raytrace.rgen#L116-L127), thread coordinates are mathematically unpacked into interleaved screen space with **zero wave divergence** on RDNA 4 Wave32.
    - **Compacted Storage & PCIe Optimization:** GPU 1 stores directly into its native $(W/2, H)$ buffer (`storeCoord = launchID`), cutting PCIe memory traffic in half (33 MB vs 66 MB at 4K FP16).
    - **Scaling Efficiency:** Achieves **97.0% to 99.3% efficiency** on geometry-heavy scenes (*Bistro Interior* 4.08 ms $\to$ 2.10 ms; *Pontiac GTO* 11.56 ms $\to$ 5.82 ms).
 
@@ -53,10 +53,10 @@ While the core hardware transfer and raygen dispatch pipelines are exceptionally
 
 ### Area 1: Cross-Tile Spatial Denoising & The Asymmetric Clamping Defect
 
-#### The Defect in [`ffx_shadow_filter.comp`](file:///home/naoki/Development/Pathways/shaders/compute/ffx_shadow_filter.comp)
+#### The Defect in [`ffx_shadow_filter.comp`](shaders/compute/ffx_shadow_filter.comp)
 When running in checkerboard mode, spatial cross-bilateral filters (e.g., the FidelityFX shadow denoiser's 9-tap À-Trous filter) require neighboring pixel samples (normal, depth, visibility). Because adjacent tiles belong to the other GPU, sampling across tile boundaries directly reads uninitialized or stale memory on that device.
 
-In [`ffx_shadow_filter.comp:108-125`](file:///home/naoki/Development/Pathways/shaders/compute/ffx_shadow_filter.comp#L108-L125), clamping logic was introduced to constrain taps within the local tile:
+In [`ffx_shadow_filter.comp:108-125`](shaders/compute/ffx_shadow_filter.comp#L108-L125), clamping logic was introduced to constrain taps within the local tile:
 ```glsl
 // Checkerboard tile border clamping bounds
 int minTileX = 0;
@@ -85,7 +85,7 @@ for (int dy = -1; dy <= 1; ++dy) {
 Instead of clamping within local tiles or pushing all denoising onto GPU 0:
 1. **Apron Dispatch:** Each GPU renders its assigned $64 \times 64$ tiles expanded by an $A$-pixel border apron (e.g., $A = 8$ or $16$ pixels, matching the denoiser kernel radius $\text{stepSize} \times 2$).
 2. **Compact Edge Blit:** Before running spatial filtering, exchange only the narrow border bands via DMA-BUF P2P, or let each GPU evaluate rays on its tile plus apron, filtering seamlessly across the boundary, and clipping away the apron during the merge pass.
-3. **Alternative: Post-Merge Denoising on Unified Geometry:** Move spatial filtering to GPU 0 immediately *after* [`accum_merge.comp`](file:///home/naoki/Development/Pathways/shaders/compute/accum_merge.comp), transferring the packed G-buffer alongside radiance.
+3. **Alternative: Post-Merge Denoising on Unified Geometry:** Move spatial filtering to GPU 0 immediately *after* [`accum_merge.comp`](shaders/compute/accum_merge.comp), transferring the packed G-buffer alongside radiance.
 
 ---
 
@@ -132,7 +132,7 @@ As ray tracing execution drops to $\sim 2.10\text{ ms}$ on dual R9700s, post-pro
 
 #### The Problem
 Because path-traced diffuse and glossy rays bounce unpredictably across the entire 3D scene, secondary rays originating in a GPU 0 tile can strike objects anywhere in the world.
-- Currently, [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp#L940-L1050) creates a **complete duplicate** of all BLAS, TLAS, vertex/index buffers, materials, textures, and light trees in GPU 1's VRAM.
+- Currently, [`MultiGpuManager`](src/mgpu/MultiGpuManager.cpp#L940-L1050) creates a **complete duplicate** of all BLAS, TLAS, vertex/index buffers, materials, textures, and light trees in GPU 1's VRAM.
 - Although the dual Radeon AI PRO R9700 setup provides $2 \times 32\text{GB} = 64\text{GB}$ of total VRAM, the maximum scene capacity remains hard-capped at **32GB**.
 
 #### Proposed Improvement: Unified Virtual Asset Paging via PCIe BAR
@@ -157,7 +157,7 @@ While $64 \times 64$ checkerboard tiling provides excellent statistical load bal
 1. **Feedback-Driven Tile Sizes:**
    Instead of a static $64 \times 64$ grid, support dynamic tile sizes ($32 \times 32$ or $16 \times 16$) in scenes with high spatial bounce variance. Smaller tile sizes increase spatial mixing, further smoothing out localized hotspots.
 2. **Dynamic Work Stealing / Ray Queue Rebalancing:**
-   In the Wavefront pipeline ([`wavefront_intersect.comp`](file:///home/naoki/Development/Pathways/shaders/compute/wavefront_intersect.comp)), after Bounce 2:
+   In the Wavefront pipeline ([`wavefront_intersect.comp`](shaders/compute/wavefront_intersect.comp)), after Bounce 2:
    - If GPU 0 has 2,000,000 active rays remaining and GPU 1 has only 400,000, GPU 0 can export a contiguous ray queue chunk over DMA-BUF BAR for GPU 1 to process, bringing wave occupancy back to parity.
 
 ---
@@ -188,12 +188,12 @@ To achieve the **lowest performance overhead and most linear scaling** while per
 
 ### 3.1 Architectural Principles
 1. **Primary Hit via Compacted Checkerboard ($W/2 \times H$):**
-   - Retain Pathways' existing, battle-tested compacted dispatch grid in [`raytrace.rgen`](file:///home/naoki/Development/Pathways/shaders/rt/raytrace.rgen).
+   - Retain Pathways' existing, battle-tested compacted dispatch grid in [`raytrace.rgen`](shaders/rt/raytrace.rgen).
    - GPU 0 traces Parity 0 ("white" tiles); GPU 1 traces Parity 1 ("black" tiles).
    - Guarantees 100% SIMD lane occupancy on RDNA 4 Wave32 and cuts primary ray traversal overhead by exactly 50%.
 2. **Infinite Indirect Bounces via Local NRC Inference:**
    - Rather than executing 4–8 divergent ray bounces across scene BVHs (which chokes GDDR6 memory bandwidth and induces ray divergence), rays terminate at Bounce 1 or 2 and query a small, local Multi-Layer Perceptron (MLP).
-   - On the dual Radeon AI PRO R9700s, this MLP is evaluated in pure FP16 via hardware WMMA (Wave Matrix Multiply Accumulate) tensor instructions ([`compute/nrc_evaluate.comp`](file:///home/naoki/Development/Pathways/shaders/compute/nrc_evaluate.comp)), resolving global illumination in $\sim 0.3\text{ ms}$.
+   - On the dual Radeon AI PRO R9700s, this MLP is evaluated in pure FP16 via hardware WMMA (Wave Matrix Multiply Accumulate) tensor instructions ([`compute/nrc_evaluate.comp`](shaders/compute/nrc_evaluate.comp)), resolving global illumination in $\sim 0.3\text{ ms}$.
 3. **Data-Parallel Temporal Synchronization (Gradient AllReduce):**
    - The temporal history of the scene's radiance field is parameterised in the **weights $\theta \in \mathbb{R}^D$ of the network**, not in a 2D pixel buffer.
    - During training passes (5–10% of rays), each GPU calculates local weight gradients ($\nabla_\theta \mathcal{L}_0$ and $\nabla_\theta \mathcal{L}_1$).
@@ -215,7 +215,7 @@ To achieve the **lowest performance overhead and most linear scaling** while per
    - Implement an isolated standalone test (`tests/test_p2p_allreduce.cpp`) allocating a 100 KB shared DMA-BUF buffer between `dev0` and `dev1`.
    - Measure round-trip latency of cross-device gradient accumulation using `VK_KHR_external_semaphore_fd`. Target: $\le 10\ \mu\text{s}$.
 2. **Phase 2: Multi-GPU NRC Pipeline Integration:**
-   - Extend [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp) to dispatch [`nrc_evaluate.comp`](file:///home/naoki/Development/Pathways/shaders/compute/nrc_evaluate.comp) and [`nrc_train.comp`](file:///home/naoki/Development/Pathways/shaders/compute/nrc_train.comp) concurrently on both `GpuDeviceNode` instances.
+   - Extend [`MultiGpuManager`](src/mgpu/MultiGpuManager.cpp) to dispatch [`nrc_evaluate.comp`](shaders/compute/nrc_evaluate.comp) and [`nrc_train.comp`](shaders/compute/nrc_train.comp) concurrently on both `GpuDeviceNode` instances.
    - Remap training ray samples using the compacted checkerboard coord unpack.
 3. **Phase 3: Scaling & Quality Verification:**
    - Benchmark against standard 4-bounce brute-force path tracing across *Living Room*, *Kitchen Extended*, and *Bistro Interior*.
@@ -232,7 +232,7 @@ With AMD transitioning FidelityFX Super Resolution 4 (FSR 4) to a dedicated mach
 
 #### The Dual-GPU Execution Model
 Rather than serializing FSR 4 on GPU 0 after the merge (which induces the Amdahl's Law penalty capping scaling at $\sim 1.8\times$), the engine will distribute inference across both devices:
-1. **Per-Device FSR 4 Contexts:** Instantiate standalone FSR 4 contexts on both `GpuDeviceNode` instances in [`MultiGpuManager`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp).
+1. **Per-Device FSR 4 Contexts:** Instantiate standalone FSR 4 contexts on both `GpuDeviceNode` instances in [`MultiGpuManager`](src/mgpu/MultiGpuManager.cpp).
 2. **Pre-Transfer Neural Upscaling & Denoising:**
    - Both GPUs run FSR 4 in parallel on their respective half-grids / tiles.
    - Use the shared motion vector field ($16.58\text{ MB}$, $0.05\text{ ms}$) and linear depth for boundary advection padding to prevent seam artifacts between tiles.
@@ -255,14 +255,14 @@ Rather than serializing FSR 4 on GPU 0 after the merge (which induces the Amdahl
 
 | Tier | Task | Impact | Complexity | Target Files |
 | :---: | :--- | :---: | :---: | :--- |
-| **Tier 1** | **Fix Spatial Filter $Y$-Clamp Bug**<br>Clamp `tapCoord.y` to local tile bounds in `ffx_shadow_filter.comp`. | High (Eliminates seam noise) | Low | [`ffx_shadow_filter.comp`](file:///home/naoki/Development/Pathways/shaders/compute/ffx_shadow_filter.comp) |
-| **Tier 1** | **RGBA8 / A2R10G10B10 Transfer Mode**<br>Move tonemapping / 10-bit conversion to secondary GPU pre-transfer, cutting PCIe traffic from 33MB to 16.5MB. | Medium (50% bandwidth cut) | Medium | [`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp)<br>[`accum_merge.comp`](file:///home/naoki/Development/Pathways/shaders/compute/accum_merge.comp) |
-| **Tier 2** | **Merge-First Denoising Architecture**<br>Move spatial À-Trous and BMFR passes post-merge on GPU 0 to eradicate all tile boundary seams. | High (Flawless penumbras) | Medium | [`Engine.cpp`](file:///home/naoki/Development/Pathways/src/core/Engine.cpp) |
-| **Tier 2** | **Full History Buffer Broadcast for TAA**<br>Broadcast previous frame history to GPU 1 over DMA-BUF to enable motion-vector reprojection in checkerboard mode. | High (Enables real-time TAA) | Medium | [`Engine.cpp`](file:///home/naoki/Development/Pathways/src/core/Engine.cpp)<br>[`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp) |
-| **Tier 3** | **Parametric NRC + Compacted Checkerboard Integration**<br>Implement data-parallel gradient AllReduce for Neural Radiance Caching across dual GPUs. | **Transformative (Near-linear scaling, 3 µs sync, zero seams)** | High | [`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp)<br>[`nrc_evaluate.comp`](file:///home/naoki/Development/Pathways/shaders/compute/nrc_evaluate.comp)<br>[`nrc_train.comp`](file:///home/naoki/Development/Pathways/shaders/compute/nrc_train.comp) |
-| **Tier 3** | **Shared Motion Vector Advection Padding**<br>Share the compacted 16MB velocity field to enable flow-guided boundary extrapolation for neural denoisers. | Very High (Seamless neural denoising) | High | [`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp)<br>[`accum_merge.comp`](file:///home/naoki/Development/Pathways/shaders/compute/accum_merge.comp) |
-| **Tier 3** | **Parallel Dual-GPU FSR 4 Integration (Upon Vulkan SDK Release)**<br>Execute FSR 4 neural upscaling and reconstruction concurrently on both GPUs with 10-bit `A2R10G10B10` output to restore $\ge 1.95\times$ scaling. | **Transformative (Enables 128–256 SPP 4K real-time at $\ge 1.95\times$ scaling)** | High | [`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp)<br>[`Engine.cpp`](file:///home/naoki/Development/Pathways/src/core/Engine.cpp) |
-| **Tier 4** | **VRAM Texture Virtualization via P2P BAR**<br>Pool the 64GB VRAM across both GPUs by storing non-overlapping texture sets in each card's physical memory. | High (Enables >32GB scenes) | High | [`MultiGpuManager.cpp`](file:///home/naoki/Development/Pathways/src/mgpu/MultiGpuManager.cpp)<br>[`Texture.cpp`](file:///home/naoki/Development/Pathways/src/vulkan/Texture.cpp) |
+| **Tier 1** | **Fix Spatial Filter $Y$-Clamp Bug**<br>Clamp `tapCoord.y` to local tile bounds in `ffx_shadow_filter.comp`. | High (Eliminates seam noise) | Low | [`ffx_shadow_filter.comp`](shaders/compute/ffx_shadow_filter.comp) |
+| **Tier 1** | **RGBA8 / A2R10G10B10 Transfer Mode**<br>Move tonemapping / 10-bit conversion to secondary GPU pre-transfer, cutting PCIe traffic from 33MB to 16.5MB. | Medium (50% bandwidth cut) | Medium | [`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp)<br>[`accum_merge.comp`](shaders/compute/accum_merge.comp) |
+| **Tier 2** | **Merge-First Denoising Architecture**<br>Move spatial À-Trous and BMFR passes post-merge on GPU 0 to eradicate all tile boundary seams. | High (Flawless penumbras) | Medium | [`Engine.cpp`](src/core/Engine.cpp) |
+| **Tier 2** | **Full History Buffer Broadcast for TAA**<br>Broadcast previous frame history to GPU 1 over DMA-BUF to enable motion-vector reprojection in checkerboard mode. | High (Enables real-time TAA) | Medium | [`Engine.cpp`](src/core/Engine.cpp)<br>[`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp) |
+| **Tier 3** | **Parametric NRC + Compacted Checkerboard Integration**<br>Implement data-parallel gradient AllReduce for Neural Radiance Caching across dual GPUs. | **Transformative (Near-linear scaling, 3 µs sync, zero seams)** | High | [`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp)<br>[`nrc_evaluate.comp`](shaders/compute/nrc_evaluate.comp)<br>[`nrc_train.comp`](shaders/compute/nrc_train.comp) |
+| **Tier 3** | **Shared Motion Vector Advection Padding**<br>Share the compacted 16MB velocity field to enable flow-guided boundary extrapolation for neural denoisers. | Very High (Seamless neural denoising) | High | [`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp)<br>[`accum_merge.comp`](shaders/compute/accum_merge.comp) |
+| **Tier 3** | **Parallel Dual-GPU FSR 4 Integration (Upon Vulkan SDK Release)**<br>Execute FSR 4 neural upscaling and reconstruction concurrently on both GPUs with 10-bit `A2R10G10B10` output to restore $\ge 1.95\times$ scaling. | **Transformative (Enables 128–256 SPP 4K real-time at $\ge 1.95\times$ scaling)** | High | [`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp)<br>[`Engine.cpp`](src/core/Engine.cpp) |
+| **Tier 4** | **VRAM Texture Virtualization via P2P BAR**<br>Pool the 64GB VRAM across both GPUs by storing non-overlapping texture sets in each card's physical memory. | High (Enables >32GB scenes) | High | [`MultiGpuManager.cpp`](src/mgpu/MultiGpuManager.cpp)<br>[`Texture.cpp`](src/vulkan/Texture.cpp) |
 
 ---
 
