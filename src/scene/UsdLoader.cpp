@@ -1668,28 +1668,60 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                          data.cameraTarget.x, data.cameraTarget.y, data.cameraTarget.z, finalDist);
         }
 
-        if (data.lights.empty() && !hasDomeLight) {
-            if (maxDim > 50.0f) {
-                // Large outdoor scene: generate physical directional sun light matching procedural sky
-                glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
-                LightGPU sunLight{};
-                sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
-                sunLight.normal = glm::vec4(sunDir, 0.0f);
-                sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
-                data.lights.push_back(sunLight);
-                Logger::info("UsdLoader: Outdoor scene extent ({:.1f} m); added directional sun light matching sky dome", maxDim);
-            } else {
-                float lightSide = maxDim * 0.8f;
-                float lightY = bMax.y + maxDim * 0.6f;
-                LightGPU defaultLight{};
-                defaultLight.position = glm::vec4(center.x - lightSide * 0.5f, lightY, center.z - lightSide * 0.5f, LIGHT_AREA_QUAD);
-                defaultLight.u = glm::vec4(lightSide, 0.0f, 0.0f, 0.0f);
-                defaultLight.v = glm::vec4(0.0f, 0.0f, lightSide, 0.0f);
-                defaultLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
-                float area = lightSide * lightSide;
-                defaultLight.emission = glm::vec4(15.0f, 15.0f, 15.0f, area);
-                data.lights.push_back(defaultLight);
+        // Scan baked world-space triangles for emissive materials
+        // and convert them to physical area lights for direct MIS sampling
+        std::vector<LightGPU> emissiveMeshLights;
+        for (const auto& tri : data.triangles) {
+            if (tri.materialId < data.materials.size()) {
+                const auto& mat = data.materials[tri.materialId];
+                glm::vec3 em = glm::vec3(mat.emissive);
+                float emPower = glm::length(em);
+                bool isExplicitLight = (mat.type == MATERIAL_EMISSIVE) || (emPower >= 2.0f && mat.albedoTex == 0 && mat.mrTex == 0);
+                if (isExplicitLight) {
+                    glm::vec3 p0 = glm::vec3(tri.v0.position);
+                    glm::vec3 p1 = glm::vec3(tri.v1.position);
+                    glm::vec3 p2 = glm::vec3(tri.v2.position);
+                    glm::vec3 u = p1 - p0;
+                    glm::vec3 v = p2 - p0;
+                    glm::vec3 n = glm::cross(u, v);
+                    float lenN = glm::length(n);
+                    if (lenN > 1e-6f) {
+                        float triArea = 0.5f * lenN;
+                        LightGPU light{};
+                        light.position = glm::vec4(p0, LIGHT_AREA_QUAD);
+                        light.u = glm::vec4(u, 0.0f);
+                        light.v = glm::vec4(v, 0.0f);
+                        light.normal = glm::vec4(n / lenN, 0.0f);
+                        light.emission = glm::vec4(em, triArea);
+                        emissiveMeshLights.push_back(light);
+                    }
+                }
             }
+        }
+
+        if (!emissiveMeshLights.empty()) {
+            Logger::info("UsdLoader: Extracted {} physical emissive mesh lights from scene geometry", emissiveMeshLights.size());
+            if (emissiveMeshLights.size() > 64) {
+                std::sort(emissiveMeshLights.begin(), emissiveMeshLights.end(), [](const LightGPU& a, const LightGPU& b) {
+                    float fluxA = (a.emission.r + a.emission.g + a.emission.b) * a.emission.w;
+                    float fluxB = (b.emission.r + b.emission.g + b.emission.b) * b.emission.w;
+                    return fluxA > fluxB;
+                });
+                emissiveMeshLights.resize(64);
+            }
+            for (const auto& l : emissiveMeshLights) {
+                data.lights.push_back(l);
+            }
+        }
+
+        if (data.lights.empty() && !hasDomeLight) {
+            glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
+            LightGPU sunLight{};
+            sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
+            sunLight.normal = glm::vec4(sunDir, 0.0f);
+            sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
+            data.lights.push_back(sunLight);
+            Logger::info("UsdLoader: Scene had no lights; added directional sun light matching sky dome");
         }
 
         MeshRange range{};
