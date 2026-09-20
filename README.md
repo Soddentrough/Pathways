@@ -1,6 +1,6 @@
 # Pathways
 
-Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4**. Clean sheet design to use **Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Binning, **Wavefront Path Tracing**, and high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**. 
+Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4** (Version **1.23.0**). Clean sheet design featuring **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
 
 > **Design Philosophy**: No megakernel — only efficient, GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and modern real-time rendering principles. Pathways uses strictly standard Vulkan 1.4, KHR, and EXT specifications with **no proprietary extensions**.
 
@@ -10,12 +10,82 @@ Pathways is a high-performance, real-time path tracing and renderer engine built
 
 ---
 
+## Real-Time Scene Showcase
+
+Pathways delivers high-throughput real-time path tracing across diverse geometric complexities, BSDF archetypes, and instancing loads. The following scene examples demonstrate real-world rendering quality and hardware throughput on **AMD RDNA 4 (`gfx1201`)** architecture at native **4K UHD (3840×2160)**, 1 SPP, 4 Bounces with FP16 HDR accumulation.
+
+### 1. Classic Cornell Box
+![Classic Cornell Box](docs/images/cornell_box.png)
+
+*The quintessential physical light transport testbed, evaluating diffuse inter-reflection (color bleeding across opposing walls), soft shadow penumbras, Fresnel specular reflections, and focused dielectric caustic pooling beneath the refractive glass sphere.*
+
+| Scene Metric / Telemetry | Measurement & Specification |
+| :--- | :--- |
+| **Geometry & Instances** | 2,048 Triangles • 1 Instance |
+| **Acceleration Structures** | BLAS: 89.1 KB • TLAS: 0.50 KB |
+| **BSDF Material Models** | Lambertian Diffuse (walls & box), Conductor GGX (chrome sphere), Dielectric Glass (refractive sphere) |
+| **RDNA 4 Single-GPU (4K Native)** | **7.36 ms (135.9 FPS)** • **4.47 GigaRays/s** |
+| **RDNA 4 Dual-GPU (4K Checkerboard)** | **3.87 ms (258.1 FPS)** • **8.56 GigaRays/s** (**1.90x Scaling**) |
+| **1080p Single-GPU Baseline** | **3.71 ms (269.4 FPS)** (1 SPP) • Interactive 128 SPP convergence in < 0.5s |
+
+---
+
+### 2. Breakfast Table
+![Breakfast Table](docs/images/breakfast_table.png)
+
+*Complex architectural interior illuminated by direct sunlight streaming through micro-slatted Venetian window blinds, challenging light transport with high-frequency shadow penumbras across porcelain, ceramics, wood, and metal tableware with multi-bounce global illumination.*
+
+| Scene Metric / Telemetry | Measurement & Specification |
+| :--- | :--- |
+| **Geometry & Instances** | 269,538 Triangles (270K) • 1 Instance |
+| **Acceleration Structures** | BLAS: 12.13 MB • TLAS: 0.50 KB |
+| **BSDF Material Models** | Multi-bounce glTF PBR, anisotropic wood grain, micro-roughness ceramics, specular porcelain, Venetian blind occlusion |
+| **RDNA 4 Single-GPU (4K Native)** | **17.12 ms (58.4 FPS)** • **1.94 GigaRays/s** |
+| **RDNA 4 Dual-GPU (4K Checkerboard)** | **8.85 ms (113.0 FPS)** • **1.93x Scaling** |
+| **1080p Single-GPU Baseline** | **4.15 ms (241.0 FPS)** (1 SPP) • 128 SPP progressive accumulation preview |
+
+---
+
+### 3. Dragon (Dielectric Attenuation & Dispersion)
+![Stanford Dragon Dielectric Attenuation](docs/images/dragon.png)
+
+*High-curvature Stanford Dragon evaluating physically-based dielectric transmission with Snell's law refraction, volumetric Beer-Lambert absorption (attenuation distance & extinction coefficients), spectral dispersion, and caustic ground highlights over a high-contrast backdrop.*
+
+| Scene Metric / Telemetry | Measurement & Specification |
+| :--- | :--- |
+| **Geometry & Instances** | 134,995 Triangles (135K) • 1 Instance |
+| **Acceleration Structures** | BLAS: 6.22 MB • TLAS: 0.50 KB |
+| **BSDF Material Models** | Pure Dielectric Fresnel ($n = 1.5$), Volumetric Absorption ($\beta_{\text{abs}}$), Snell's Law Refraction, Ground Caustics |
+| **RDNA 4 Single-GPU (4K Native)** | **5.72 ms (174.8 FPS)** (Wavefront DGC) / **6.58 ms** • **5.04 – 6.82 GigaRays/s** |
+| **RDNA 4 Dual-GPU (4K Checkerboard)** | **3.83 ms (261.1 FPS)** • **8.66 GigaRays/s** (**1.72x Scaling**) |
+| **Wavefront Specialization** | Specialized dielectric microkernel runs at **< 40 VGPRs** with **100% Wave32 hardware occupancy** |
+
+---
+
+### 4. Point Instance City (OpenUSD Stage)
+![Point Instanced City](docs/images/point_instance_city.png)
+
+*Massive urban environment loaded via OpenUSD `UsdGeomPointInstancer`, stress-testing hardware Top-Level Acceleration Structure (TLAS) traversal across 40,000 instanced buildings and structures over undulating terrain with prototype BLAS deduplication.*
+
+| Scene Metric / Telemetry | Measurement & Specification |
+| :--- | :--- |
+| **Geometry & Instances** | 27,456 Prototype Triangles • **40,001 Hardware Instances** |
+| **Acceleration Structures** | BLAS: 1.18 MB (Deduplicated Prototype) • **TLAS: 13.01 MB** |
+| **BSDF Material Models** | Modular multi-colored building facades, painted architectural trim, clay tile roofing, terrain ground plane |
+| **RDNA 4 Single-GPU (4K Native)** | **9.19 ms (108.8 FPS)** • **3.61 GigaRays/s** |
+| **RDNA 4 Dual-GPU (4K Checkerboard)** | **4.82 ms (207.5 FPS)** • **1.91x Scaling** |
+| **Hardware TLAS Build** | **1.97 ms** real-time dynamic TLAS generation for 40,001 instances |
+
+---
+
 ## Key Capabilities & Architecture
 
 ### 1. Wavefront Path Tracing & Autonomous DGC
 - **Wavefront Architecture**: Decomposes ray tracing into decoupled compute stages (Ray Classification, Ray Intersection, Material Shading, Shadow Queries, Accumulation Resolve), eliminating execution divergence.
-- **GPU-Autonomous Material Sorting via DGC**: Uses `vkCmdExecuteGeneratedCommandsEXT` to dynamically group rays by BSDF archetype (diffuse, dielectric, conductor, complex) and dispatch specialized compute kernels directly on the device with zero CPU intervention.
+- **GPU-Autonomous Material Sorting via DGC**: Uses `vkCmdExecuteGeneratedCommandsEXT` to dynamically group rays by BSDF archetype (diffuse, dielectric, conductor, complex) and dispatch specialized compute microkernels directly on the device with zero CPU intervention.
+- **3D Spatial-Morton + Material Dual-Binning (Default)**: Clusters rays by 16-bit composite keys combining material archetype with quantized 3D Morton spatial cells, achieving instruction coherence while preserving L0/L1 texture and geometry cache locality.
 - **Producer-Side Binning & Directional DGC Queuing**: Partitions secondary rays directly at emission time across 8 directional octant bins using Wave32 ballot leader-election loops, eliminating post-hoc sort passes and scattered gather memory fetches during downstream BVH traversal.
+- **Secondary Ray Clamping & Streamlining**: Scene-scale invariant distance clamping and radiance luminance clamping (`--indirect-clamp`, default 35.0) to eliminate specular/caustic fireflies and boost secondary bounce throughput.
 - **Buffer Device Address (BDA) Ray Queuing**: Lock-free, atomic queue allocation using 64-bit device addresses for high-throughput ray staging.
 - **Hardware Ray Tracing**: Full support for dedicated hardware BVH traversal via `VK_KHR_ray_tracing_pipeline` (RTP) and inline `VK_KHR_ray_query`.
 
@@ -26,32 +96,33 @@ Pathways is a high-performance, real-time path tracing and renderer engine built
   - `p2p`: Direct Linux DMA-BUF export/import (`VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd`). Ideal on hardware architectures with coherent inter-GPU links (e.g., Infinity Fabric bridges); on discrete PCIe slots, direct shader reads across PCIe BAR encounter non-posted read latency.
   - `staging`: Dedicated asynchronous transfer queues with CPU staging buffers.
 - **Fine-Grained 2D Checkerboard Tiling**: Dynamically distributes screen space across $64\times 64$ alternating tiles (2,040 tiles at 4K) for balanced spatial and shading workload division across dual GPUs.
+- **Multi-GPU Upscaling Topologies**: Supports PostMerge upscaling (checkerboard tiles merged on primary GPU, then upscaled to 4K) and SampleBlend (independent dual-GPU full passes upscaled and blended).
 - **Sample Parallelism**: Temporal sample division mode for multi-SPP scenarios.
 - **Cross-Platform Fallback**: Automatic detection and transparent fallback to double-buffered shared host memory for platforms without DMA-BUF (such as Windows).
 
-
-### 3. Pure Path-Traced Lighting & Physical Materials
-- **glTF 2.0 PBR & Extensions**: Physically-based materials with metallic-roughness, normal mapping, emissive meshes, and advanced Khronos extensions:
+### 3. Lighting, Physical Materials & Scene Formats
+- **OpenUSD & glTF 2.0 Ingestion**: Full support for OpenUSD stages (`.usd`, `.usdc`, `.usda`) with high-density point instancing (`UsdGeomPointInstancer`) and prototype BLAS deduplication, as well as glTF 2.0 PBR models with Khronos physical extensions:
   - `KHR_materials_transmission` (specular & diffuse transmission with Snell's law refraction)
   - `KHR_materials_clearcoat` (secondary reflective coats with independent roughness)
   - `KHR_materials_ior` (Fresnel index of refraction)
   - `KHR_materials_volume` (volumetric Beer-Lambert absorption, attenuation color, and distance)
   - Alpha MASK and BLEND transparency modes
-- **Multiple Importance Sampling (MIS)**: Veach balance heuristic combining Next-Event Estimation (direct light sampling) with BSDF importance sampling across diffuse, dielectric, and conductor microkernels.
-- **Pure Monte Carlo Convergence**: Unbiased physical ray tracing with progressive sample accumulation and Russian roulette path termination. (Screen-space filters such as ReSTIR DI, FidelityFX Shadow Denoiser, À-Trous wavelet, and TAA are disabled in favor of true physical Monte Carlo convergence and dynamic SPP regulation).
-- **Physical Sky & HDR Environment Maps**: Procedural physical sky dome and pre-filtered high-dynamic-range EXR/HDR image-based lighting.
-- **ACES Tonemapping**: High-quality filmic tone curve mapping linear HDR radiance into sRGB display space via compute shader.
+- **Real-Time Forward Ray-Traced Caustics (`--caustics`)**: Forward photon injection using Vulkan 1.4 hardware `rayQueryEXT` for crisp real-time refractive caustics.
+- **Hierarchical 3D Light Tree (`--light-tree`)**: Spatial octree importance sampling for scenes with dozens or hundreds of analytical and emissive light sources.
+- **AMD FidelityFX Super Resolution (FSR 3.1) & Upways Neural Denoising**: High-performance temporal super-resolution (`--upscaler fsr3`) with Robust Contrast Adaptive Sharpening (RCAS), and native Upways Neural Reconstruction (`--denoiser upways`) accelerated by Wave32 WMMA (`VK_KHR_cooperative_matrix`).
+- **Welford Running Average Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`) eliminating numeric overflow and preventing highlight blowout up to 2048 SPP.
+- **HDR Display Output & ACES Tonemapping**: Auto-negotiates scRGB Linear and HDR10 PQ (ST 2084) via `VK_EXT_hdr_metadata`, paired with compute-based filmic ACES tonemapping for standard SDR displays.
 
 ### 4. Dynamic Quality Regulation & Telemetry
-- **Dynamic Quality Governor**: Closed-loop frame-time budget regulation targeting user-defined FPS (e.g., 60, 90, 120 FPS), dynamically scaling SPP and bounce depth to guarantee smooth interactive framerates.
-- **Dear ImGui HUD & Controls**: Interactive in-engine UI overlay featuring collapsible controls, live GPU frame time histograms, camera controls, and real-time pipeline toggles.
-- **Telemetry & Benchmarking**: Headless automated benchmark suite (`--headless`) exporting comprehensive JSON telemetry breakdowns (MAE, RMSE, PSNR, bounce-by-bounce ray counts, and queue footprints).
+- **Dynamic Quality Governor**: Closed-loop frame-time budget regulation targeting user-defined FPS (e.g., 60, 90, 120 FPS via `--target-fps` or `--target-frame-time`), dynamically scaling SPP and bounce depth to guarantee smooth interactive framerates.
+- **Dear ImGui HUD & Controls**: Interactive in-engine UI overlay featuring collapsible controls, live GPU frame time histograms, camera controls, upscaler settings, and real-time pipeline toggles.
+- **Telemetry & Benchmarking**: Headless automated benchmark suite (`--headless`) exporting comprehensive JSON telemetry breakdowns (MAE, RMSE, PSNR, bounce-by-bounce ray counts, acceleration structure memory footprints, and queue statistics).
 
 ---
 
 ## Deliverables & Interactive Controls
 
-Load any glTF 2.0 or procedural scene and fly through it in real time with high-fidelity global illumination, reflections, refractions, and contact shadows.
+Load any OpenUSD stage (`.usd`, `.usdc`, `.usda`), glTF 2.0 model (`.glb`, `.gltf`), or procedural scene and explore in real time with high-fidelity physical global illumination, reflections, refractions, and contact shadows.
 
 | Control | Action |
 | :--- | :--- |
@@ -61,9 +132,12 @@ Load any glTF 2.0 or procedural scene and fly through it in real time with high-
 | **E / Q** or **Space / C** | Fly up / fly down |
 | **Shift** (hold) | Sprint speed multiplier (3.0x) |
 | **Alt** (hold) | Precision crawl speed multiplier (0.25x) |
+| **Ctrl** (hold) + **Mouse Move** | Orbit camera around targeted surface point |
 | **Mouse Wheel** | Adjust fly camera movement speed |
 | **F** | Focus and center camera on target object |
 | **F11** | Toggle Fullscreen |
+| **ESC** | Return to UI mode from FPS camera navigation (or exit if in UI) |
+| **Gamepad** | Dual-analog flight navigation (Left Stick: Fly/Strafe, Right Stick: Look, RT/LT: Sprint/Crawl, A/B: Up/Down) |
 | **Alt+F4 / Close** | Exit Pathways |
 
 ---
@@ -74,6 +148,7 @@ Load any glTF 2.0 or procedural scene and fly through it in real time with high-
 - **Windowing & Input**: SDL3 (v3.1+)
 - **Compression**: zlib / zlib-ng
 - **Math**: GLM (header-only, bundled in `third_party/glm`)
+- **OpenUSD** (Optional): Pixar OpenUSD (`pxr`) library for `.usd`/`.usdc`/`.usda` stage ingestion
 - **GPU**: AMD Radeon RDNA4 / RDNA3 (or any modern GPU with Vulkan 1.4, ray queries, and DGC support)
 
 ### Hardware & Extension Support Note
@@ -124,14 +199,17 @@ ctest --test-dir build --output-on-failure
 
 #### 4. Launch Pathways
 ```bash
-# Launch interactive Cornell Box
+# Launch interactive Cornell Box (default: fullscreen, 4K/native, dual-binning wavefront)
 ./build/bin/pathways
 
-# Launch custom glTF scene with Multi-GPU enabled
-./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --mgpu --spp 1
+# Launch OpenUSD scene with Multi-GPU load balancing enabled
+./build/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
 
-# Launch Wavefront path tracer with Autonomous DGC material sorting
-./build/bin/pathways --pipeline wavefront --wavefront-sort archetype --res 1440p
+# Launch glTF scene with AMD FSR 3.1 Super-Resolution
+./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --upscaler fsr3 --upscaler-preset quality
+
+# Launch in windowed mode with target frame pacing at 1440p
+./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
 ```
 
 ---
@@ -163,43 +241,51 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 
 | Flag | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `--scene` | `<path>` | Path to glTF 2.0 file (`.glb` / `.gltf`) | Cornell Box |
-| `--pipeline` | `wavefront` \| `rtp` | Pipeline architecture: Wavefront DGC or KHR RTP | `wavefront` |
-| `--res`, `-r` | `1080` \| `1440` \| `4k` \| `WxH` | Viewport resolution preset or dimensions | Display native |
+| `--scene` | `<path>` | Path to glTF 2.0 (`.glb`/`.gltf`) or OpenUSD (`.usd`/`.usdc`/`.usda`) stage | Procedural Cornell Box |
+| `--pipeline` | `wavefront` \| `rtp` | Path tracing architecture: Wavefront Work Lists & DGC or KHR RTP | `wavefront` |
+| `--res`, `-r` | `1080` \| `1440` \| `4k` \| `5k` \| `8k` \| `dualup` \| `square` \| `WxH` | Viewport resolution preset or custom dimensions | Display native (3840×2160 headless) |
+| `--width`, `--height` | `<int>` | Explicit viewport dimensions in pixels | Native display |
+| `--fullscreen` | *(flag)* | Launch in fullscreen mode | Fullscreen (default) |
+| `--windowed` | *(flag)* | Launch in windowed mode (`--no-fullscreen`) | Fullscreen |
 | `--spp` | `<int>` | Samples per pixel accumulated per frame | `1` |
-| `--max-bounces` | `<int>` | Maximum path depth / bounce limit | `4` |
+| `--max-bounces` | `<int>` | Maximum path depth / ray bounces (or `--bounces`) | `4` |
+| `--no-accumulation` | *(flag)* | Disable progressive static accumulation (evaluate real-time noise; `--realtime`) | Accumulation on |
+| `--indirect-clamp` | `<float>` | Secondary bounce radiance luminance clamp to eliminate fireflies (0 = disabled) | `35.0` |
+| `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or monolithic (`none`) | `dual` |
+| `--sec-sort` | `none` \| `directional` | Secondary ray coherency sort mode (Option 1 on-chip DGC octant binning) | `none` |
+| `--upscaler` | `none` \| `fsr3` \| `upways` \| `fsr1` | Super-resolution upscaler: AMD FSR 3.1, Upways Neural, or Spatial EASU+RCAS | `none` |
+| `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra-perf` | Super-resolution scale preset (1.5x, 1.7x, 2.0x, 3.0x) | `quality` |
+| `--upscaler-sharpening` | *(flag)* | Enable Robust Contrast Adaptive Sharpening (RCAS) pass | Disabled |
+| `--upscaler-sharpness` | `<float>` | RCAS contrast-adaptive sharpness factor `[0.0 - 1.0]` | `0.0` |
+| `--denoiser` | `none` \| `upways` | Denoising mode: Pure Monte Carlo (unbiased) or Upways Wave32 WMMA | `none` |
+| `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
+| `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
+| `--nrc` | *(flag)* | Enable Neural Radiance Caching with Wave32 WMMA | Disabled |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
-| `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU distribution strategy | `tile` |
-| `--mgpu-transfer` | `host` \| `p2p` \| `staging` | Inter-GPU transfer mechanism: zero-copy host pinned memory (default), direct DMA-BUF P2P BAR, or staging buffers | `host` |
+| `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
+| `--mgpu-transfer` | `host` \| `p2p` \| `staging` | Inter-GPU transfer mechanism: zero-copy host pinned memory (`host`), direct DMA-BUF P2P BAR (`p2p`), or staging | `host` |
 | `--tile-size` | `16` \| `32` \| `64` \| `128` | Checkerboard tile dimensions in pixels | `64` |
-| `--visualize-split` | *(flag)* | Show colored overlay indicating GPU assignment | Off |
-| `--wavefront-sort` | `none` \| `archetype` \| `bda` \| `dual` | Material sorting mode for DGC wavefront | `none` |
-| `--no-accumulation` | *(flag)* | Disable progressive accumulation (evaluate real-time per-frame noise) | Accumulation on |
-| `--warmup-frames` | `<int>` | Number of initial frames to discard from benchmark stats | `0` |
-| `--target-fps` | `<int>` | Quality Governor target FPS (`0` = uncapped) | `0` |
-| `--adaptive-spp` | *(flag)* | Enable dynamic 3-axis quality regulation | Disabled |
+| `--no-double-buffer` | *(flag)* | Disable double-buffering for inter-GPU shared host memory | Double-buffered |
+| `--visualize-split` | *(flag)* | Show colored overlay indicating GPU workload assignment | Off |
+| `--target-fps` | `<int>` | Target frame rate limit (0 = uncapped) | `0` |
+| `--target-frame-time` | `<float>` | Target frame time budget in ms (e.g. 8.3 ms for 120 FPS) | `8.3` |
+| `--adaptive-spp` | *(flag)* | Enable dynamic 3-axis quality governor to track target FPS | Disabled |
+| `--no-hdr` | *(flag)* | Disable HDR display auto-negotiation (force SDR sRGB) | HDR on |
 | `--headless` | *(flag)* | Run offscreen without opening a window | Disabled |
-| `--frames` | `<int>` | Total frame execution limit (`0` = run continuously) | `0` |
-| `--dump-frame` | `<path.png>` | Save tonemapped LDR frame to PNG on exit | None |
+| `--frames` | `<int>` | Total frame execution limit (0 = run continuously in GUI; 1 in headless) | `0` (GUI) / `1` (Headless) |
+| `--warmup-frames` | `<int>` | Number of initial frames to discard from benchmark stats | `0` |
+| `--benchmark` | *(flag)* | Enable per-frame latency logging and verification | Disabled |
+| `--dump-frame` | `<path.png>` | Save tonemapped frame to PNG on exit | None |
+| `--dump-8bit` | *(flag)* | Force 8-bit PNG dump instead of default 10/16-bit | 10/16-bit |
 | `--dump-hdr` | `<path.exr>` | Save linear radiance buffer to OpenEXR on exit | None |
 | `--dump-stats` | `<path.json>` | Export per-frame telemetry breakdown to JSON | None |
 | `--no-validation` | *(flag)* | Disable Vulkan validation layers | Validation on |
 
 ---
 
-## Performance Benchmarks & Tested Hardware
+## Multi-GPU Scaling & Architecture Benchmarks
 
-Pathways is continuously tested and profiled on modern high-end multi-GPU AMD hardware. Below are representative performance metrics and scaling benchmarks.
-
-### Reference Hardware Specifications
-- **Host CPU**: AMD Ryzen Threadripper 3970X (32 cores / 64 threads, 128 MB L3 cache)
-- **System Memory**: 64 GB DDR4 Quad-Channel
-- **Primary GPU (GPU 0)**: AMD Radeon AI PRO R9700 (32 GB GDDR6, 256-bit, PCIe 4.0 x16, RDNA 4 `gfx1201`)
-- **Secondary GPU (GPU 1)**: AMD Radeon AI PRO R9700 (32 GB GDDR6, 256-bit, PCIe 4.0 x8, RDNA 4 `gfx1201`)
-- **Interconnect**: Zero-Copy Host Memory (`VK_EXT_external_memory_host`) and DMA-BUF P2P over PCIe 4.0, synchronized via `VK_KHR_external_semaphore_fd`
-- **OS & Driver**: Fedora Linux 44 (Kernel 7.1), Mesa RADV 26.1.8, Vulkan 1.4.354
-
----
+Pathways is profiled and benchmarked on modern AMD RDNA 4 architecture (`gfx1201`) with multi-GPU scaling over high-throughput Zero-Copy Host Memory (`VK_EXT_external_memory_host`) and DMA-BUF P2P (`VK_EXT_external_memory_dma_buf`). Below are representative performance metrics and scaling benchmarks.
 
 ### Multi-GPU Scaling & Resolution Benchmarks
 
@@ -217,7 +303,7 @@ Pathways is continuously tested and profiled on modern high-end multi-GPU AMD ha
 
 ### 4K Architecture Comparison (Megakernel RTP vs. Wavefront DGC)
 
-Measured at native **3840x2160 (4K)**, 1 SPP, 4 Bounces, FP16 on primary Radeon AI PRO R9700:
+Measured at native **3840x2160 (4K)**, 1 SPP, 4 Bounces, FP16 on AMD RDNA 4 (`gfx1201`):
 
 | Scene | Scene Characteristics | Megakernel RTP (ms / FPS) | Wavefront Monolithic (ms / FPS) | Wavefront Sorted (ms / FPS) | Relative Speedup (WF / RTP) | Visual Parity (PSNR / MAE) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -300,18 +386,13 @@ RADV_DEBUG=syncshaders ./build/bin/pathways
 
 ---
 
-## Packages (Linux Reference)
+## Software Environment Baseline
 
-```
-glslc-2026.1-1.fc44.x86_64
-vulkan-loader-1.4.341.0-1.fc44.x86_64
-vulkan-headers-1.4.341.0-1.fc44.noarch
-vulkan-validation-layers-1.4.341.0-2.fc44.x86_64
-vulkan-loader-devel-1.4.341.0-1.fc44.x86_64
-vulkan-tools-1.4.341.0-1.fc44.x86_64
-vulkan-utility-libraries-devel-1.4.341.0-1.fc44.x86_64
-mesa-vulkan-drivers-26.1.8-1.fc44.x86_64
-```
+- **Vulkan Core**: Version 1.4+ (SDK >= 1.4.341)
+- **Shader Compiler**: `glslc` (Vulkan 1.4 target: `--target-env=vulkan1.4`)
+- **Driver**: Mesa RADV 26.1+ or modern Vulkan 1.4-compliant driver
+- **Windowing & Input**: SDL3 (v3.1+)
+- **C/C++ Compilers**: GCC 14+ / Clang 20+ / MSVC 2022+ (C++23 standard)
 
 ---
 
