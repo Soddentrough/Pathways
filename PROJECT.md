@@ -1,76 +1,66 @@
-# Project: Pathways Scanlands Architectural Capabilities & High-Density Point Instancing
+# Project: Pathways 4K Deep Profiling, Hardware Telemetry & Synchronization Optimization
 
 ## Architecture
-Pathways is a pure Vulkan 1.4 path tracer optimized for AMD RDNA 4 (`gfx1201`) dual-GPU and single-GPU execution.
-This project enhances the engine with:
-1. Wavefront microkernel material enhancements:
-   - Thin-walled two-sided diffuse transmission in `wavefront_shade_diffuse.comp`, `wavefront_shade_complex.comp`, and `MaterialGPU`.
-   - Tangent-space normal mapping parity in `wavefront_shade_dielectric.comp` matching `raytrace.rchit`.
-2. GPU Procedural Shading Architecture:
-   - GLSL continuous procedural noise library (`shaders/compute/procedural_noise.glsl`) featuring analytical gradient Simplex 3D, Voronoi 2D, and domain-rotated fBM.
-   - Direct procedural terrain and rock surface evaluation in `wavefront_shade_diffuse.comp`.
-   - Directional wave normal evaluation in `wavefront_shade_dielectric.comp` coupled to native Beer-Lambert depth absorption.
-3. High-Density Asset Ingestion & OpenUSD Point Instancing:
-   - Conversion pipeline (`scripts/convert_scanlands_to_usd.py`) for `scenes/Scanlands.blend` authoring `UsdGeomPointInstancer` with 8 deduplicated BLAS prototypes (187,490 foliage elements).
-   - Ingestion support in `src/scene/UsdLoader.cpp` translating point instancers directly into `VkAccelerationStructureInstanceKHR` TLAS instances.
-   - Scalability parameters: `--instance-density` and `--cull-distance`.
-   - Alpha mask mode support for foliage cards.
-4. Single-GPU Performance & Physical Fidelity Benchmarking:
-   - Profile on AMD Radeon AI PRO R9700 (32GB GDDR6, `gfx1201`).
-   - Strict VRAM limit < 24.0 GB via `/opt/rocm/core-10.0/bin/amd-smi metric --mem-usage`.
-   - 1080p / 1440p / 4K benchmarks, 1–3 bounces, density scaling.
-   - Visual verification against Blender Cycles reference.
+Pathways is a real-time Vulkan 1.4 path tracer optimized for Dual AMD Radeon AI PRO R9700 (`gfx1201`, RDNA 4) GPUs and Mesa RADV.
+This project executes comprehensive 4K performance characterization, deep hardware profiling, and targeted synchronization/shader optimizations across 5 milestones:
+1. **4K Multi-Scene Benchmark Matrix & Telemetry Automation**: Native 3840x2160 benchmarking across all 15 scenes in Single-GPU Monolithic, Single-GPU DGC Sorting, Dual-GPU Tile Parallelism, and Dual-GPU Sample Parallelism, with AMD-SMI power and clock metrics.
+2. **ACO Compiler Diagnostics & Shader Register Optimization**: Full register utilization audit (SGPR, VGPR, scratch spills, Wave32/64 occupancy, instruction mix) via Mesa ACO (`RADV_DEBUG=shaderstats,nocache`) and AMD RGA, with targeted register pressure optimization for spilling kernels.
+3. **Hardware Cache Telemetry & DGC Autonomous Execution Validation**: Collection of L0/L1/L2 cache hit/miss rates, memory stalls, and bandwidth via Mesa RADV trace controls (`RADV_THREAD_TRACE_CACHE_COUNTERS=1`), coupled with formal verification of GPU-autonomous `VK_EXT_device_generated_commands` execution without CPU intervention or silent fallbacks.
+4. **Pipeline Barrier & Synchronization Overhead Optimization**: Audit and refactoring of pipeline barriers and synchronization primitives across wavefront bounces and cross-GPU transfers (DMA-BUF / zero-copy host memory) to eliminate redundant pipeline flushes and over-broad stage masks.
+5. **Final Regression Verification & Comprehensive Optimization Report**: Full execution of `./scripts/run_headless_tests.sh` and `python3 tests/test_image_quality.py`, culminating in the authoritative `output/deep_profile/comprehensive_perf_report.md`.
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| F1 | Dielectric Normal Mapping Parity | Unpack tangents and evaluate normal maps in `wavefront_shade_dielectric.comp` | M1 | Survey 1 |
-| F2 | Thin-Walled Diffuse Transmission | Two-sided diffuse transmission BSDF and NEE in diffuse/complex microkernels | M1 | Survey 1 |
-| F3 | MaterialGPU Transmission Fields | Add diffuse transmission factor/texture to `MaterialGPU` and `Material` struct | M1 | Survey 1 |
-| F4 | GLSL Procedural Noise Library | Implement `simplex3D_grad`, `hash33`, `voronoi2D`, `fbm3D_grad` in GLSL | M2 | Survey 2 |
-| F5 | Procedural Terrain Shading | GPU procedural terrain/rock evaluation in `wavefront_shade_diffuse.comp` | M2 | Survey 2 |
-| F6 | Procedural Water Waves & Beer-Lambert | Directional Gerstner wave normals coupled with Beer-Lambert depth absorption | M2 | Survey 2 |
-| F7 | Procedural Material Flags | Encode procedural material tags in `MaterialGPU::type` bits 8–31 | M2 | Survey 2 |
-| F8 | Scanlands USD Conversion Pipeline | Two-stage hybrid script extracting 8 BLAS prototypes and 187k point instances | M3 | Survey 3 |
-| F9 | UsdGeomPointInstancer Loader Support | Ingest USD point instancers as native TLAS instances in `UsdLoader.cpp` | M3 | Survey 3 |
-| F10 | Foliage Alpha Mask Parity | Support `ALPHA_MODE_MASK` for foliage cards in `UsdLoader.cpp` | M3 | Survey 3 |
-| F11 | Configurable Density & Culling | CLI options `--instance-density` and `--cull-distance` | M3 | Survey 3 |
-| F12 | Single-GPU Benchmarking & Profiling | Profile on AMD R9700 (VRAM < 24 GB, 1080p/1440p, 1–3 bounces, density tiers) | M4 | Survey 3 |
-| F13 | Physical Fidelity Verification | Validate backlit foliage, water caustics, and terrain against Cycles via frame dump | M4 | Survey 1/2 |
+| F1 | 15-Scene Asset & Config Catalog Integration | Integrate all 15 showcase scenes into `scripts/deep_profile_scenes.py` including Cyber City and Kitchen USD | M1 | Survey 1 |
+| F2 | Native 4K 4-Mode Execution Matrix | Support Monolithic, DGC sort, Dual-GPU Tile, and Dual-GPU Sample modes at 4K in benchmark runner | M1 | Survey 1 |
+| F3 | AMD-SMI Power & Clock Telemetry | Harvest GPU socket power (W), core clocks (MHz), and temperatures from `/opt/rocm/core-10.0/bin/amd-smi` into JSON | M1 | Survey 1 |
+| F4 | Automated Shader Statistics Extractor | Script/tool to automate Mesa ACO (`RADV_DEBUG=shaderstats,nocache`) and RGA shader inspection | M2 | Survey 2 |
+| F5 | Shader Compiler Register Table | Generate comprehensive table of SGPR/VGPR counts, scratch allocation, occupancy, and instruction mix | M2 | Survey 2 |
+| F6 | Shader Register Pressure Remediation | Optimize shader logic in spilling kernels (`nrc_train.comp`, `fsr3_upscale.comp`) to fit register budgets | M2 | Survey 2 |
+| F7 | DGC Autonomous Execution Validation | Verify `vkCmdExecuteGeneratedCommandsEXT` executes without CPU intervention or fallbacks, verifying ring buffer safety | M3 | Survey 3 |
+| F8 | Hardware Cache Telemetry Collection | Collect and tabulate L0/L1/L2 hit/miss ratios, memory stalls, and bandwidth using Mesa RADV SQTT/cache counters | M3 | Survey 3 |
+| F9 | Engine Redundant Memory Barrier Pruning | Remove redundant post-raytracing `memBarrier` in `src/core/Engine.cpp` | M4 | Survey 3 |
+| F10 | Multi-GPU Barrier Stage Mask Tightening | Tighten over-broad `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` in `MultiGpuManager.cpp` to compute/RT stages | M4 | Survey 3 |
+| F11 | Cross-GPU Barrier Batching & Semaphore Optimization | Batch image layout transitions and tighten secondary semaphore signal stages | M4 | Survey 3 |
+| F12 | Full Regression & Image Quality Validation | Validate engine with `./scripts/run_headless_tests.sh` and `python3 tests/test_image_quality.py` | M5 | Survey 1/2/3 |
+| F13 | Comprehensive 4K Optimization Report | Authoritative report at `output/deep_profile/comprehensive_perf_report.md` | M5 | Survey 1/2/3 |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | Thin-Walled Transmission & Dielectric Normal Parity | F1, F2, F3 | none | DONE |
-| M2 | GPU Procedural Shading Architecture | F4, F5, F6, F7 | M1 | DONE |
-| M3 | Asset Ingestion & Point Instancing Pipeline | F8, F9, F10, F11 | none | DONE |
-| M4 | Single-GPU Performance & Fidelity Benchmarking | F12, F13 | M1, M2, M3 | DONE |
-| E2E | E2E Testing Suite Track | Comprehensive multi-tier test suite across F1–F13 | none | DONE |
+| M1 | 4K Multi-Scene Benchmark Matrix & Automated Profiling | F1, F2, F3 | none | DONE |
+| M2 | ACO Compiler Shader Statistics & Register Optimization | F4, F5, F6 | none | DONE |
+| M3 | Hardware Cache Telemetry & DGC Autonomous Validation | F7, F8 | M1 | DONE |
+| M4 | Pipeline Barrier & Synchronization Overhead Optimization | F9, F10, F11 | M1 | DONE |
+| M5 | Final Regression Testing & Comprehensive Report | F12, F13 | M1, M2, M3, M4 | DONE |
 
 ## Interface Contracts
-### Material Definition ↔ Shaders
-- `MaterialGPU`: std430 208-byte layout.
-- Diffuse transmission: `float diffuseTransmission` at offset 192, `uint diffuseTransmissionTex` at offset 196, `vec2 diffuseTransPad` at offset 200.
-- Procedural flags: `uint type` bitmask:
-  - bits 0–7: base type (`0=DIFFUSE`, `1=METALLIC`, `2=DIELECTRIC`, `3=EMISSIVE`)
-  - bit 9: `MATERIAL_FLAG_PROCEDURAL_TERRAIN (1u << 9)`
-  - bit 11: `MATERIAL_FLAG_PROCEDURAL_WATER (1u << 11)`
+### Benchmark Runner ↔ Engine CLI
+- Execution binary: `./build/bin/pathways`
+- Headless invocation: `--headless --width 3840 --height 2160 --warmup-frames 15 --frames 45 --dump-stats <json_path>`
+- Mode 1 (Monolithic): `--wavefront-sort none --mgpu-mode off`
+- Mode 2 (DGC Sort): `--wavefront-sort archetype --mgpu-mode off`
+- Mode 3 (Dual-GPU Tile): `--mgpu-mode tile --tile-size 64 --wavefront-sort archetype`
+- Mode 4 (Dual-GPU Sample): `--mgpu-mode sample --wavefront-sort archetype`
+- Telemetry output: JSON containing timestamp metrics (`primary_gpu_time_ms`, `secondary_gpu_time_ms`, `tonemap_and_merge_time_ms`, `avg_frame_time_ms`, `avg_fps`, `gigarays_per_second`), plus `amd_smi` power and clock readings.
 
-### OpenUSD Ingestion ↔ Engine TLAS
-- Point instancer positions, quaternions, and prototype indices map directly to `VkAccelerationStructureInstanceKHR`.
-- Prototypes loaded once as BLAS; instancer populates instance transforms referencing prototype BLAS acceleration structures.
-- Density downsampling uses deterministic hash: `hash(instanceId) < density * 0xFFFFFFFF`.
-- Distance culling: `length(instancePos - cameraPos) <= cullDistance`.
+### Shader Compilation ↔ Profiling Pipeline
+- Mesa ACO statistics: `RADV_DEBUG=shaderstats,nocache` redirected to log.
+- AMD RGA binary: `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/rga -s compute -c gfx1201 --isa <path.isa> --analysis <path.csv> <shader.spv>`.
+- Core invariant: Traversal and shading microkernels must maintain 0 scratch memory spills.
+
+### Pipeline Barriers ↔ Cross-GPU Synchronization
+- Pre-PCIe transfer barrier: `srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR`, `srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT`.
+- Secondary completion semaphore: signal stage `VK_PIPELINE_STAGE_2_TRANSFER_BIT`.
+- Post-raytracing barrier in `Engine.cpp`: Guarded to avoid redundant execution when `WavefrontPipeline::recordFrame` already emitted `finalBarrier`.
 
 ## Code Layout
-- `src/scene/Material.hpp`: `MaterialGPU` struct definition (208 bytes) and flag constants.
-- `shaders/compute/wavefront_common.glsl`: `struct Material` and archetype classification.
-- `shaders/compute/raytrace_comp.comp`, `shaders/compute/wavefront_persistent.comp`: 208-byte std430 `struct Material`.
-- `shaders/compute/wavefront_shade_dielectric.comp`: Tangent unpacking, normal map perturbation, colinear tangent guard, procedural waves.
-- `shaders/compute/wavefront_shade_diffuse.comp`: Two-sided diffuse transmission, procedural terrain shading.
-- `shaders/compute/wavefront_shade_complex.comp`: Two-sided diffuse transmission for complex materials.
-- `shaders/compute/procedural_noise.glsl`: GLSL noise primitives (`simplex3D_grad`, `voronoi2D`, `fbm3D_grad`, `evaluateWaterWaves`).
-- `scripts/convert_scanlands_to_usd.py`: Python/bpy/pxr hybrid asset conversion script with atmospheric occlusion mesh pruning.
-- `src/scene/UsdLoader.cpp`: OpenUSD `UsdGeomPointInstancer` parsing, alpha mask setup, foliage diffuse transmission wiring, dome light HDRI ingestion.
-- `src/core/Config.hpp`, `src/core/Engine.cpp`: CLI arguments, culling/density parameters, environment map binding.
-- `tests/e2e/test_scanlands_capabilities.py`: 145 genuine automated multi-tier tests.
+- `scripts/deep_profile_scenes.py`: Automated 4K multi-scene benchmark runner.
+- `scripts/extract_shader_stats.py`: Automated Mesa ACO and AMD RGA compiler statistics extraction and tabulator.
+- `src/core/Engine.cpp`: Main engine loop, frame recording, barrier synchronization.
+- `src/mgpu/MultiGpuManager.cpp`: Multi-GPU tile and sample orchestration, cross-GPU image transitions, and semaphores.
+- `src/rt/WavefrontPipeline.cpp`: Wavefront path tracing dispatch, barrier management, and DGC execution.
+- `src/rt/DGCManager.cpp`: DGC indirect commands layouts, preprocessing ring buffer allocation and recording.
+- `shaders/compute/`: Microkernel shaders (`wavefront_*.comp`, `nrc_*.comp`, `fsr3_*.comp`).
+- `output/deep_profile/`: Destination for benchmark JSONs, shader statistics tables, RGP traces, and final report.

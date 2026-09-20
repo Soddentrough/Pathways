@@ -1043,7 +1043,7 @@ static void addWindowGrid(std::vector<TriangleGPU>& triangles,
                           glm::vec3 origin, glm::vec3 uAxis, glm::vec3 vAxis,
                           int rows, int cols, float spanU, float spanV,
                           uint32_t mullionMat, uint32_t glassMat, uint32_t emissiveMat,
-                          uint32_t seed) {
+                          uint32_t seed, uint32_t sillMat = 3, uint32_t accentMat = 30) {
     float stepU = spanU / static_cast<float>(cols);
     float stepV = spanV / static_cast<float>(rows);
     glm::vec3 normal = glm::normalize(glm::cross(uAxis, vAxis));
@@ -1054,6 +1054,10 @@ static void addWindowGrid(std::vector<TriangleGPU>& triangles,
                                  + vAxis * ((static_cast<float>(r) + 0.5f) * stepV);
             // Window mullion frame
             addBox(triangles, p, glm::vec3(stepU * 0.94f, stepV * 0.94f, 0.12f), 0.0f, mullionMat);
+
+            // Recessed window sill (adds micro-facet depth)
+            glm::vec3 pSill = p + normal * 0.02f - vAxis * (stepV * 0.42f);
+            addBox(triangles, pSill, glm::vec3(stepU * 0.88f, 0.04f, 0.08f), 0.0f, sillMat);
 
             // Recessed pane
             uint32_t pSeed = (seed + static_cast<uint32_t>(r * 19 + c * 31)) % 100u;
@@ -1067,6 +1071,12 @@ static void addWindowGrid(std::vector<TriangleGPU>& triangles,
                     pGlass + halfU + halfV,
                     pGlass - halfU + halfV,
                     normal, paneMat);
+
+            // Micro LED indicator / architectural accent strip on select windows
+            if (pSeed > 78u) {
+                glm::vec3 pLed = p + normal * 0.05f + vAxis * (stepV * 0.40f);
+                addBox(triangles, pLed, glm::vec3(stepU * 0.70f, 0.02f, 0.02f), 0.0f, accentMat);
+            }
         }
     }
 }
@@ -1074,7 +1084,7 @@ static void addWindowGrid(std::vector<TriangleGPU>& triangles,
 static void addDiagridLattice(std::vector<TriangleGPU>& triangles,
                               glm::vec3 origin, glm::vec3 uAxis, glm::vec3 vAxis,
                               int segments, float spanU, float spanV,
-                              uint32_t trussMat) {
+                              uint32_t trussMat, uint32_t nodeMat = 2) {
     float stepU = spanU / static_cast<float>(segments);
     for (int s = 0; s < segments; ++s) {
         glm::vec3 b0 = origin + uAxis * (static_cast<float>(s) * stepU);
@@ -1083,6 +1093,9 @@ static void addDiagridLattice(std::vector<TriangleGPU>& triangles,
         glm::vec3 t1 = b1 + vAxis * spanV;
         addBox(triangles, (b0 + t1) * 0.5f, glm::vec3(stepU * 0.10f, spanV * 1.02f, 0.14f), 45.0f, trussMat);
         addBox(triangles, (b1 + t0) * 0.5f, glm::vec3(stepU * 0.10f, spanV * 1.02f, 0.14f), -45.0f, trussMat);
+        // Gusset / connection nodes
+        addBox(triangles, (b0 + b1) * 0.5f, glm::vec3(stepU * 0.16f, 0.12f, 0.16f), 0.0f, nodeMat);
+        addBox(triangles, (t0 + t1) * 0.5f, glm::vec3(stepU * 0.16f, 0.12f, 0.16f), 0.0f, nodeMat);
     }
 }
 
@@ -1122,16 +1135,27 @@ SceneData ProceduralScene::createCyberCityScene() {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
         // Foundation core block (Mat 0: Foundation Concrete)
         addBox(scene.triangles, glm::vec3(0.0f, 4.0f, 0.0f), glm::vec3(12.0f, 7.6f, 12.0f), 0.0f, 0);
-        // Basalt plinth base step (Mat 20: Rough Basalt Curb)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.2f, 0.0f), glm::vec3(13.6f, 0.4f, 13.6f), 0.0f, 20);
+        // Basalt plinth base step (Mat 8: Basalt / Rough Granite Foundation Blocks)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.2f, 0.0f), glm::vec3(13.6f, 0.4f, 13.6f), 0.0f, 8);
+        // Secondary stepped plinth with anti-slip brass nosing (Mat 3: Brushed Brass)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(13.0f, 0.1f, 13.0f), 0.0f, 3);
         // 4 heavy corner columns (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(-5.2f, 4.0f, -5.2f), glm::vec3(2.0f, 8.0f, 2.0f), 0.0f, 1);
         addBox(scene.triangles, glm::vec3( 5.2f, 4.0f, -5.2f), glm::vec3(2.0f, 8.0f, 2.0f), 0.0f, 1);
         addBox(scene.triangles, glm::vec3(-5.2f, 4.0f,  5.2f), glm::vec3(2.0f, 8.0f, 2.0f), 0.0f, 1);
         addBox(scene.triangles, glm::vec3( 5.2f, 4.0f,  5.2f), glm::vec3(2.0f, 8.0f, 2.0f), 0.0f, 1);
+        // Corner column decorative fluting (Mat 2: Titanium Chrome)
+        for (float sx : {-5.2f, 5.2f}) {
+            for (float sz : {-5.2f, 5.2f}) {
+                addBox(scene.triangles, glm::vec3(sx + (sx > 0.0f ? 1.05f : -1.05f), 4.0f, sz), glm::vec3(0.1f, 7.8f, 1.6f), 0.0f, 2);
+                addBox(scene.triangles, glm::vec3(sx, 4.0f, sz + (sz > 0.0f ? 1.05f : -1.05f)), glm::vec3(1.6f, 7.8f, 0.1f), 0.0f, 2);
+            }
+        }
         // Diagrid corner trusses (Mat 27: Galvanized Steel)
         addDiagridLattice(scene.triangles, glm::vec3(-5.8f, 0.4f, 5.8f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 2.0f, 7.2f, 27);
         addDiagridLattice(scene.triangles, glm::vec3( 3.8f, 0.4f, 5.8f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 2.0f, 7.2f, 27);
+        addDiagridLattice(scene.triangles, glm::vec3(-5.8f, 0.4f, -5.8f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 2.0f, 7.2f, 27);
+        addDiagridLattice(scene.triangles, glm::vec3( 3.8f, 0.4f, -5.8f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 2.0f, 7.2f, 27);
         // Entrance portals on all 4 facades (Mat 3: Brushed Brass, Mat 29: Polished Jade trim)
         addBox(scene.triangles, glm::vec3( 0.0f, 2.7f,  6.1f), glm::vec3(4.5f, 4.6f, 0.4f), 0.0f, 3);
         addBox(scene.triangles, glm::vec3( 0.0f, 2.7f, -6.1f), glm::vec3(4.5f, 4.6f, 0.4f), 0.0f, 3);
@@ -1141,12 +1165,22 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3( 0.0f, 4.8f, -6.15f), glm::vec3(4.8f, 0.3f, 0.2f), 0.0f, 29);
         addBox(scene.triangles, glm::vec3( 6.15f, 4.8f,  0.0f), glm::vec3(0.2f, 0.3f, 4.8f), 0.0f, 29);
         addBox(scene.triangles, glm::vec3(-6.15f, 4.8f,  0.0f), glm::vec3(0.2f, 0.3f, 4.8f), 0.0f, 29);
-        // Lower facade window grids: 4 facades x (3 rows x 4 cols = 12 windows)
-        // (Mat 1: Steel framing, Mat 7: Smoked Obsidian glass, Mat 41: Warm Sodium interior glow)
-        addWindowGrid(scene.triangles, glm::vec3(-4.6f, 1.2f,  6.08f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 4, 9.2f, 4.8f, 1, 7, 41, 101);
-        addWindowGrid(scene.triangles, glm::vec3(-4.6f, 1.2f, -6.08f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 4, 9.2f, 4.8f, 1, 7, 41, 103);
-        addWindowGrid(scene.triangles, glm::vec3( 6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 4, 9.2f, 4.8f, 1, 7, 41, 107);
-        addWindowGrid(scene.triangles, glm::vec3(-6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 3, 4, 9.2f, 4.8f, 1, 7, 41, 109);
+        // Cantilevered glass entrance canopies (Mat 6: Cyan Canopy Glass, Mat 2: Titanium frame)
+        addBox(scene.triangles, glm::vec3( 0.0f, 4.95f,  6.8f), glm::vec3(4.6f, 0.08f, 1.4f), 0.0f, 6);
+        addBox(scene.triangles, glm::vec3( 0.0f, 4.95f, -6.8f), glm::vec3(4.6f, 0.08f, 1.4f), 0.0f, 6);
+        addBox(scene.triangles, glm::vec3( 6.8f, 4.95f,  0.0f), glm::vec3(1.4f, 0.08f, 4.6f), 0.0f, 6);
+        addBox(scene.triangles, glm::vec3(-6.8f, 4.95f,  0.0f), glm::vec3(1.4f, 0.08f, 4.6f), 0.0f, 6);
+        // Revolving entrance door cylinders with Crown Glass (Mat 5: Dielectric Crown Glass)
+        addCylinder(scene.triangles, glm::vec3( 0.0f, 1.8f,  6.0f), 1.2f, 2.8f, 5, 12);
+        addCylinder(scene.triangles, glm::vec3( 0.0f, 1.8f, -6.0f), 1.2f, 2.8f, 5, 12);
+        addCylinder(scene.triangles, glm::vec3( 6.0f, 1.8f,  0.0f), 1.2f, 2.8f, 5, 12);
+        addCylinder(scene.triangles, glm::vec3(-6.0f, 1.8f,  0.0f), 1.2f, 2.8f, 5, 12);
+        // Lower facade window grids: 4 facades x (4 rows x 5 cols = 20 windows per facade)
+        // (Mat 1: Steel framing, Mat 7: Smoked Obsidian glass, Mat 41: Warm Sodium interior glow, Mat 18: Rose gold sill, Mat 35: Gold accent)
+        addWindowGrid(scene.triangles, glm::vec3(-4.6f, 1.2f,  6.08f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 101, 18, 35);
+        addWindowGrid(scene.triangles, glm::vec3(-4.6f, 1.2f, -6.08f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 103, 18, 35);
+        addWindowGrid(scene.triangles, glm::vec3( 6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 107, 18, 35);
+        addWindowGrid(scene.triangles, glm::vec3(-6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 109, 18, 35);
         // Emissive entrance beacon strips (Mat 30: Neon Cyan 480nm, Mat 35: Electric Gold)
         addBox(scene.triangles, glm::vec3( 0.0f, 2.36f,  6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 30);
         addBox(scene.triangles, glm::vec3( 0.0f, 2.36f, -6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 30);
@@ -1172,15 +1206,23 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3( 0.0f, 3.0f, -5.2f), glm::vec3(0.8f, 6.0f, 0.6f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3( 5.2f, 3.0f,  0.0f), glm::vec3(0.6f, 6.0f, 0.8f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(-5.2f, 3.0f,  0.0f), glm::vec3(0.6f, 6.0f, 0.8f), 0.0f, 2);
+        // Horizontal aerodynamic wing strakes (Mat 18: Rose Gold)
+        addBox(scene.triangles, glm::vec3( 0.0f, 3.0f,  5.5f), glm::vec3(4.0f, 0.12f, 0.4f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3( 0.0f, 3.0f, -5.5f), glm::vec3(4.0f, 0.12f, 0.4f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3( 5.5f, 3.0f,  0.0f), glm::vec3(0.4f, 0.12f, 4.0f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3(-5.5f, 3.0f,  0.0f), glm::vec3(0.4f, 0.12f, 4.0f), 0.0f, 18);
         // Vertical neon circuit conduits (Mat 35: Electric Gold)
         addBox(scene.triangles, glm::vec3(-4.95f, 3.0f, -4.95f), glm::vec3(0.2f, 6.0f, 0.2f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3( 4.95f, 3.0f,  4.95f), glm::vec3(0.2f, 6.0f, 0.2f), 0.0f, 35);
-        // Dense Curtain Wall Window Grids on 4 facades (5 rows x 4 cols = 20 windows per facade)
-        // (Mat 16: Anisotropic Platinum mullions, Mat 12: Iridescent Coated Glass, Mat 30: Neon Cyan office glow)
-        addWindowGrid(scene.triangles, glm::vec3(-4.5f, 0.5f,  4.98f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 9.0f, 5.0f, 16, 12, 30, 201);
-        addWindowGrid(scene.triangles, glm::vec3(-4.5f, 0.5f, -4.98f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 9.0f, 5.0f, 16, 12, 30, 203);
-        addWindowGrid(scene.triangles, glm::vec3( 4.98f, 0.5f, -4.5f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 9.0f, 5.0f, 16, 12, 30, 205);
-        addWindowGrid(scene.triangles, glm::vec3(-4.98f, 0.5f, -4.5f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 9.0f, 5.0f, 16, 12, 30, 207);
+        // External copper conduit raceways (Mat 10: Copper Conduits)
+        addBox(scene.triangles, glm::vec3( 4.95f, 3.0f, -4.95f), glm::vec3(0.15f, 6.0f, 0.15f), 0.0f, 10);
+        addBox(scene.triangles, glm::vec3(-4.95f, 3.0f,  4.95f), glm::vec3(0.15f, 6.0f, 0.15f), 0.0f, 10);
+        // Dense Curtain Wall Window Grids on 4 facades (6 rows x 6 cols = 36 windows per facade)
+        // (Mat 17: Anisotropic Platinum mullions, Mat 16: Iridescent Coated Glass, Mat 30: Neon Cyan office glow, Mat 18: Rose Gold sill, Mat 31: Magenta accent)
+        addWindowGrid(scene.triangles, glm::vec3(-4.5f, 0.5f,  4.98f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 9.0f, 5.0f, 17, 16, 30, 201, 18, 31);
+        addWindowGrid(scene.triangles, glm::vec3(-4.5f, 0.5f, -4.98f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 9.0f, 5.0f, 17, 16, 30, 203, 18, 31);
+        addWindowGrid(scene.triangles, glm::vec3( 4.98f, 0.5f, -4.5f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 9.0f, 5.0f, 17, 16, 30, 205, 18, 31);
+        addWindowGrid(scene.triangles, glm::vec3(-4.98f, 0.5f, -4.5f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 9.0f, 5.0f, 17, 16, 30, 207, 18, 31);
         recordBlasPrototype("Tower Mid Module A", tStart);
     }
 
@@ -1190,31 +1232,41 @@ SceneData ProceduralScene::createCyberCityScene() {
         // Cantilever terrace slab (Mat 21: High-Gloss Ceramic, Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 0.5f, 0.0f), glm::vec3(11.8f, 1.0f, 11.8f), 0.0f, 21);
         addBox(scene.triangles, glm::vec3(0.0f, 0.05f, 0.0f), glm::vec3(11.9f, 0.1f, 11.9f), 0.0f, 1);
-        // Recessed core (Mat 13: Anodized Gunmetal Aluminum)
-        addBox(scene.triangles, glm::vec3(0.0f, 3.5f, 0.0f), glm::vec3(8.8f, 5.0f, 8.8f), 0.0f, 13);
+        // Recessed core (Mat 19: Gunmetal Alloy Armor)
+        addBox(scene.triangles, glm::vec3(0.0f, 3.5f, 0.0f), glm::vec3(8.8f, 5.0f, 8.8f), 0.0f, 19);
         // 4 Terrace structural pillars (Mat 2: Titanium Chrome)
         addBox(scene.triangles, glm::vec3(-5.2f, 3.0f, -5.2f), glm::vec3(0.8f, 5.0f, 0.8f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3( 5.2f, 3.0f, -5.2f), glm::vec3(0.8f, 5.0f, 0.8f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(-5.2f, 3.0f,  5.2f), glm::vec3(0.8f, 5.0f, 0.8f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3( 5.2f, 3.0f,  5.2f), glm::vec3(0.8f, 5.0f, 0.8f), 0.0f, 2);
-        // Balustrade glass railings (Mat 6: Cyan Glass) & Rose Gold trim (Mat 15)
+        // Balustrade glass railings (Mat 6: Cyan Glass) & Rose Gold trim (Mat 18)
         addBox(scene.triangles, glm::vec3( 0.0f, 1.6f,  5.85f), glm::vec3(11.4f, 1.2f, 0.08f), 0.0f, 6);
         addBox(scene.triangles, glm::vec3( 0.0f, 1.6f, -5.85f), glm::vec3(11.4f, 1.2f, 0.08f), 0.0f, 6);
         addBox(scene.triangles, glm::vec3( 5.85f, 1.6f,  0.0f), glm::vec3(0.08f, 1.2f, 11.4f), 0.0f, 6);
         addBox(scene.triangles, glm::vec3(-5.85f, 1.6f,  0.0f), glm::vec3(0.08f, 1.2f, 11.4f), 0.0f, 6);
-        addBox(scene.triangles, glm::vec3( 0.0f, 2.22f,  5.85f), glm::vec3(11.5f, 0.06f, 0.12f), 0.0f, 15);
-        addBox(scene.triangles, glm::vec3( 0.0f, 2.22f, -5.85f), glm::vec3(11.5f, 0.06f, 0.12f), 0.0f, 15);
-        addBox(scene.triangles, glm::vec3( 5.85f, 2.22f,  0.0f), glm::vec3(0.12f, 0.06f, 11.5f), 0.0f, 15);
-        addBox(scene.triangles, glm::vec3(-5.85f, 2.22f,  0.0f), glm::vec3(0.12f, 0.06f, 11.5f), 0.0f, 15);
-        // Frosted Amber privacy screens (Mat 8)
-        addBox(scene.triangles, glm::vec3(-4.0f, 2.8f,  4.6f), glm::vec3(1.8f, 3.2f, 0.06f), 0.0f, 8);
-        addBox(scene.triangles, glm::vec3( 4.0f, 2.8f, -4.6f), glm::vec3(1.8f, 3.2f, 0.06f), 0.0f, 8);
+        addBox(scene.triangles, glm::vec3( 0.0f, 2.22f,  5.85f), glm::vec3(11.5f, 0.06f, 0.12f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3( 0.0f, 2.22f, -5.85f), glm::vec3(11.5f, 0.06f, 0.12f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3( 5.85f, 2.22f,  0.0f), glm::vec3(0.12f, 0.06f, 11.5f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3(-5.85f, 2.22f,  0.0f), glm::vec3(0.12f, 0.06f, 11.5f), 0.0f, 18);
+        // Planter boxes with Jade trim (Mat 29) and White Ceramic (Mat 9)
+        addBox(scene.triangles, glm::vec3(-3.8f, 1.3f,  5.0f), glm::vec3(2.2f, 0.6f, 0.8f), 0.0f, 9);
+        addBox(scene.triangles, glm::vec3(-3.8f, 1.65f, 5.0f), glm::vec3(2.3f, 0.1f, 0.9f), 0.0f, 29);
+        addBox(scene.triangles, glm::vec3( 3.8f, 1.3f, -5.0f), glm::vec3(2.2f, 0.6f, 0.8f), 0.0f, 9);
+        addBox(scene.triangles, glm::vec3( 3.8f, 1.65f, -5.0f), glm::vec3(2.3f, 0.1f, 0.9f), 0.0f, 29);
+        // Corner Dispersive Diamond Prism sculptures (Mat 15: Dispersive Diamond) and Emerald Crystal finials (Mat 13: Emerald)
+        addSphere(scene.triangles, glm::vec3(-5.4f, 2.6f, -5.4f), 0.35f, 15, 14, 14);
+        addSphere(scene.triangles, glm::vec3( 5.4f, 2.6f,  5.4f), 0.35f, 15, 14, 14);
+        addSphere(scene.triangles, glm::vec3(-5.4f, 2.6f,  5.4f), 0.35f, 13, 14, 14);
+        addSphere(scene.triangles, glm::vec3( 5.4f, 2.6f, -5.4f), 0.35f, 13, 14, 14);
+        // Frosted Amber privacy screens (Mat 12: Frosted Amber Glass)
+        addBox(scene.triangles, glm::vec3(-4.0f, 2.8f,  4.6f), glm::vec3(1.8f, 3.2f, 0.06f), 0.0f, 12);
+        addBox(scene.triangles, glm::vec3( 4.0f, 2.8f, -4.6f), glm::vec3(1.8f, 3.2f, 0.06f), 0.0f, 12);
         // Diagrid Exoskeleton Trusses on East & West facades (Mat 27: Galvanized Steel)
         addDiagridLattice(scene.triangles, glm::vec3(-4.2f, 1.0f,  4.5f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 8.4f, 4.8f, 27);
         addDiagridLattice(scene.triangles, glm::vec3(-4.2f, 1.0f, -4.5f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 8.4f, 4.8f, 27);
-        // Window grids on North & South recessed core (5 rows x 4 cols)
-        addWindowGrid(scene.triangles, glm::vec3( 4.45f, 1.2f, -4.0f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.0f, 4.5f, 1, 6, 31, 301);
-        addWindowGrid(scene.triangles, glm::vec3(-4.45f, 1.2f, -4.0f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.0f, 4.5f, 1, 6, 32, 303);
+        // Window grids on North & South recessed core (6 rows x 6 cols)
+        addWindowGrid(scene.triangles, glm::vec3( 4.45f, 1.2f, -4.0f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.0f, 4.5f, 1, 6, 31, 301, 10, 38);
+        addWindowGrid(scene.triangles, glm::vec3(-4.45f, 1.2f, -4.0f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.0f, 4.5f, 1, 6, 32, 303, 10, 38);
         // Neon perimeter rim strips (Mat 31: Magenta, Mat 32: Orange)
         addBox(scene.triangles, glm::vec3(0.0f, 0.8f,  5.95f), glm::vec3(11.6f, 0.2f, 0.1f), 0.0f, 31);
         addBox(scene.triangles, glm::vec3(0.0f, 0.8f, -5.95f), glm::vec3(11.6f, 0.2f, 0.1f), 0.0f, 32);
@@ -1224,7 +1276,7 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 3: Tower Mid Module C (High-Tech Industrial Core)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Heavy carbon fiber sheathing core (Mat 19: Carbon Fiber Polymer)
+        // Heavy carbon fiber sheathing core (Mat 19: Gunmetal Alloy Armor)
         addBox(scene.triangles, glm::vec3(0.0f, 3.0f, 0.0f), glm::vec3(10.2f, 5.8f, 10.2f), 0.0f, 19);
         // Floor collar (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 0.2f, 0.0f), glm::vec3(10.8f, 0.4f, 10.8f), 0.0f, 1);
@@ -1233,19 +1285,21 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3( 0.0f, 4.5f, -5.18f), glm::vec3(7.2f, 1.8f, 0.12f), 0.0f, 28);
         addBox(scene.triangles, glm::vec3( 5.18f, 4.5f,  0.0f), glm::vec3(0.12f, 1.8f, 7.2f), 0.0f, 28);
         addBox(scene.triangles, glm::vec3(-5.18f, 4.5f,  0.0f), glm::vec3(0.12f, 1.8f, 7.2f), 0.0f, 28);
-        // High-voltage copper busbars (Mat 14: Polished Copper)
-        addBox(scene.triangles, glm::vec3(-4.8f, 3.0f,  5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 14);
-        addBox(scene.triangles, glm::vec3( 4.8f, 3.0f,  5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 14);
-        addBox(scene.triangles, glm::vec3(-4.8f, 3.0f, -5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 14);
-        addBox(scene.triangles, glm::vec3( 4.8f, 3.0f, -5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 14);
-        // Server window banks (5 rows x 4 cols): Mat 17 (Chromium), Mat 7 (Obsidian), Mat 33 (Acid Green status)
-        addWindowGrid(scene.triangles, glm::vec3(-4.2f, 0.8f,  5.15f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.4f, 3.2f, 17, 7, 33, 401);
-        addWindowGrid(scene.triangles, glm::vec3(-4.2f, 0.8f, -5.15f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.4f, 3.2f, 17, 7, 33, 403);
-        addWindowGrid(scene.triangles, glm::vec3( 5.15f, 0.8f, -4.2f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.4f, 3.2f, 17, 7, 33, 405);
-        addWindowGrid(scene.triangles, glm::vec3(-5.15f, 0.8f, -4.2f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 5, 4, 8.4f, 3.2f, 17, 7, 33, 407);
-        // Crimson strobe safety beacon (Mat 44)
-        addBox(scene.triangles, glm::vec3(5.15f, 5.6f, 5.15f), glm::vec3(0.3f, 0.3f, 0.3f), 0.0f, 44);
+        // High-voltage copper busbars (Mat 10: Copper Conduits)
+        addBox(scene.triangles, glm::vec3(-4.8f, 3.0f,  5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 10);
+        addBox(scene.triangles, glm::vec3( 4.8f, 3.0f,  5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 10);
+        addBox(scene.triangles, glm::vec3(-4.8f, 3.0f, -5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 10);
+        addBox(scene.triangles, glm::vec3( 4.8f, 3.0f, -5.22f), glm::vec3(0.25f, 5.8f, 0.15f), 0.0f, 10);
+        // Server window banks (6 rows x 6 cols): Mat 17 (Chromium), Mat 11 (Smoked Obsidian), Mat 33 (Acid Green status), Mat 2 (Titanium sill), Mat 45 (Turquoise accent)
+        addWindowGrid(scene.triangles, glm::vec3(-4.2f, 0.8f,  5.15f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.4f, 3.2f, 17, 11, 33, 401, 2, 45);
+        addWindowGrid(scene.triangles, glm::vec3(-4.2f, 0.8f, -5.15f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.4f, 3.2f, 17, 11, 33, 403, 2, 45);
+        addWindowGrid(scene.triangles, glm::vec3( 5.15f, 0.8f, -4.2f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.4f, 3.2f, 17, 11, 33, 405, 2, 45);
+        addWindowGrid(scene.triangles, glm::vec3(-5.15f, 0.8f, -4.2f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 6, 6, 8.4f, 3.2f, 17, 11, 33, 407, 2, 45);
+        // Crimson strobe safety beacon (Mat 44) & UV Blacklight glow node (Mat 40)
+        addBox(scene.triangles, glm::vec3( 5.15f, 5.6f,  5.15f), glm::vec3(0.3f, 0.3f, 0.3f), 0.0f, 44);
         addBox(scene.triangles, glm::vec3(-5.15f, 5.6f, -5.15f), glm::vec3(0.3f, 0.3f, 0.3f), 0.0f, 44);
+        addSphere(scene.triangles, glm::vec3( 5.15f, 0.4f, -5.15f), 0.25f, 40, 10, 10);
+        addSphere(scene.triangles, glm::vec3(-5.15f, 0.4f,  5.15f), 0.25f, 40, 10, 10);
         recordBlasPrototype("Tower Mid Module C", tStart);
     }
 
@@ -1254,29 +1308,40 @@ SceneData ProceduralScene::createCyberCityScene() {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
         // Penthouse roof base (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(9.6f, 2.0f, 9.6f), 0.0f, 1);
-        // Angular pyramid frustum (Mat 16: Anisotropic Brushed Platinum)
-        addFrustum(scene.triangles, glm::vec3(0.0f, 3.0f, 0.0f), glm::vec2(9.6f), glm::vec2(5.4f), 2.0f, 16);
-        // Mezzanine deck (Mat 3: Brushed Brass)
+        // Angular pyramid frustum (Mat 17: Anisotropic Brushed Platinum)
+        addFrustum(scene.triangles, glm::vec3(0.0f, 3.0f, 0.0f), glm::vec2(9.6f), glm::vec2(5.4f), 2.0f, 17);
+        // Mezzanine deck (Mat 3: Brushed Brass, Mat 18: Rose gold border)
         addBox(scene.triangles, glm::vec3(0.0f, 4.2f, 0.0f), glm::vec3(5.6f, 0.4f, 5.6f), 0.0f, 3);
-        // Geodesic observation sphere (Mat 11: High-Dispersion Optical Diamond Glass)
-        addSphere(scene.triangles, glm::vec3(0.0f, 6.2f, 0.0f), 2.4f, 11, 28, 28);
-        // Emerald crystal finials (Mat 9: Emerald Crystal)
-        addSphere(scene.triangles, glm::vec3(-2.2f, 4.6f, -2.2f), 0.4f, 9, 14, 14);
-        addSphere(scene.triangles, glm::vec3( 2.2f, 4.6f, -2.2f), 0.4f, 9, 14, 14);
-        addSphere(scene.triangles, glm::vec3(-2.2f, 4.6f,  2.2f), 0.4f, 9, 14, 14);
-        addSphere(scene.triangles, glm::vec3( 2.2f, 4.6f,  2.2f), 0.4f, 9, 14, 14);
-        // Interior pedestal (Mat 2: Titanium Chrome)
+        addBox(scene.triangles, glm::vec3(0.0f, 4.42f, 0.0f), glm::vec3(5.8f, 0.08f, 5.8f), 0.0f, 18);
+        // Geodesic observation dome (Mat 15: Dispersive Diamond Prism, IOR 2.42, dispersion 0.08)
+        addSphere(scene.triangles, glm::vec3(0.0f, 6.2f, 0.0f), 2.4f, 15, 28, 28);
+        // Iridescent observation ring deck (Mat 16: Iridescent AR Coating)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 4.45f, 0.0f), 2.8f, 0.10f, 16, 24);
+        // Emerald crystal finials (Mat 13: Emerald Crystal Spire)
+        addSphere(scene.triangles, glm::vec3(-2.2f, 4.6f, -2.2f), 0.4f, 13, 14, 14);
+        addSphere(scene.triangles, glm::vec3( 2.2f, 4.6f, -2.2f), 0.4f, 13, 14, 14);
+        addSphere(scene.triangles, glm::vec3(-2.2f, 4.6f,  2.2f), 0.4f, 13, 14, 14);
+        addSphere(scene.triangles, glm::vec3( 2.2f, 4.6f,  2.2f), 0.4f, 13, 14, 14);
+        // Interior core pedestal (Mat 2: Titanium Chrome)
         addBox(scene.triangles, glm::vec3(0.0f, 5.2f, 0.0f), glm::vec3(0.8f, 1.0f, 0.8f), 0.0f, 2);
-        // Antenna mast (Mat 2: Titanium Chrome)
+        // High-altitude antenna mast (Mat 2: Titanium Chrome)
         addCylinder(scene.triangles, glm::vec3(0.0f, 12.0f, 0.0f), 0.18f, 7.8f, 2, 16);
-        // Cross arms (Mat 1: Carbon Steel)
+        // Structural cross arms (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 11.0f, 0.0f), glm::vec3(2.4f, 0.15f, 0.15f), 0.0f, 1);
         addBox(scene.triangles, glm::vec3(0.0f, 13.5f, 0.0f), glm::vec3(1.6f, 0.15f, 0.15f), 0.0f, 1);
+        // Dipole antenna arrays on cross arms (Mat 10: Copper Conduits)
+        for (float dx : {-1.0f, 1.0f}) {
+            addCylinder(scene.triangles, glm::vec3(dx, 11.0f, 0.0f), 0.03f, 1.2f, 10, 8);
+            addCylinder(scene.triangles, glm::vec3(dx * 0.7f, 13.5f, 0.0f), 0.03f, 0.8f, 10, 8);
+        }
+        // Satellite communications dishes (Mat 19: Gunmetal Alloy, Mat 3: Brass feed)
+        addCylinder(scene.triangles, glm::vec3(0.8f, 8.5f, 0.8f), 0.6f, 0.2f, 19, 14);
+        addBox(scene.triangles, glm::vec3(0.8f, 8.5f, 1.0f), glm::vec3(0.08f, 0.08f, 0.25f), 0.0f, 3);
         // Xenon floodlight fixtures (Mat 42: Xenon White)
         addBox(scene.triangles, glm::vec3( 1.1f, 10.9f, 0.0f), glm::vec3(0.2f, 0.2f, 0.2f), 0.0f, 42);
         addBox(scene.triangles, glm::vec3(-1.1f, 10.9f, 0.0f), glm::vec3(0.2f, 0.2f, 0.2f), 0.0f, 42);
-        // Ruby laser dielectric focusing core (Mat 10: Ruby Laser Crystal)
-        addSphere(scene.triangles, glm::vec3(0.0f, 16.0f, 0.0f), 0.35f, 10, 14, 14);
+        // Ruby laser dielectric focusing core (Mat 14: Ruby Laser Optical Glass)
+        addSphere(scene.triangles, glm::vec3(0.0f, 16.0f, 0.0f), 0.35f, 14, 14, 14);
         // Ruby laser beacon tip (Mat 34: Ruby Laser Warning Beacon)
         addBox(scene.triangles, glm::vec3(0.0f, 16.4f, 0.0f), glm::vec3(0.3f, 0.3f, 0.3f), 0.0f, 34);
         recordBlasPrototype("Tower Crown & Spire", tStart);
@@ -1285,19 +1350,28 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 5: Rooftop HVAC & Industrial Machinery Pod
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Corten steel mounting skid (Mat 18: Aged Rusted Corten Steel)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(8.0f, 0.8f, 6.0f), 0.0f, 18);
+        // Corten steel mounting skid (Mat 21: Weathered Rusted Iron)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(8.0f, 0.8f, 6.0f), 0.0f, 21);
         // Dual large chiller cylinders (Mat 1: Carbon Steel)
         addCylinder(scene.triangles, glm::vec3(-2.2f, 2.2f, 0.0f), 1.4f, 3.2f, 1, 16);
         addCylinder(scene.triangles, glm::vec3( 2.2f, 2.2f, 0.0f), 1.4f, 3.2f, 1, 16);
+        // 8 Radial fan blades per chiller (Mat 2: Titanium Chrome)
+        for (int b = 0; b < 8; ++b) {
+            float angle = static_cast<float>(b) * 45.0f;
+            addBox(scene.triangles, glm::vec3(-2.2f, 3.75f, 0.0f), glm::vec3(0.1f, 0.05f, 2.2f), angle, 2);
+            addBox(scene.triangles, glm::vec3( 2.2f, 3.75f, 0.0f), glm::vec3(0.1f, 0.05f, 2.2f), angle, 2);
+        }
         // Perforated ventilation exhaust intakes (Mat 28: Perforated Mesh)
         addBox(scene.triangles, glm::vec3(-2.2f, 3.9f, 0.0f), glm::vec3(2.4f, 0.3f, 2.4f), 0.0f, 28);
         addBox(scene.triangles, glm::vec3( 2.2f, 3.9f, 0.0f), glm::vec3(2.4f, 0.3f, 2.4f), 0.0f, 28);
-        // Polished copper pipe manifolds (Mat 14: Polished Copper)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 2.0f, -1.8f), 0.25f, 5.2f, 14, 12);
-        addCylinder(scene.triangles, glm::vec3(0.0f, 2.6f, -1.8f), 0.25f, 5.2f, 14, 12);
-        // Gunmetal ductwork housing (Mat 13: Anodized Gunmetal)
-        addBox(scene.triangles, glm::vec3(0.0f, 1.8f, 1.8f), glm::vec3(3.2f, 2.2f, 1.8f), 0.0f, 13);
+        // Polished copper pipe manifolds (Mat 10: Copper Conduits & Busbars)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 2.0f, -1.8f), 0.25f, 5.2f, 10, 12);
+        addCylinder(scene.triangles, glm::vec3(0.0f, 2.6f, -1.8f), 0.25f, 5.2f, 10, 12);
+        // Emergency pressure relief valve wheels (Mat 24: High-Gloss Yellow Hazard)
+        addCylinder(scene.triangles, glm::vec3(-1.0f, 2.9f, -1.8f), 0.3f, 0.08f, 24, 12);
+        addCylinder(scene.triangles, glm::vec3( 1.0f, 2.9f, -1.8f), 0.3f, 0.08f, 24, 12);
+        // Gunmetal ductwork housing (Mat 19: Gunmetal Alloy Armor)
+        addBox(scene.triangles, glm::vec3(0.0f, 1.8f, 1.8f), glm::vec3(3.2f, 2.2f, 1.8f), 0.0f, 19);
         // Amber hazard flasher (Mat 43: Amber Hazard)
         addBox(scene.triangles, glm::vec3(-3.6f, 1.0f, -2.6f), glm::vec3(0.3f, 0.4f, 0.3f), 0.0f, 43);
         addBox(scene.triangles, glm::vec3( 3.6f, 1.0f,  2.6f), glm::vec3(0.3f, 0.4f, 0.3f), 0.0f, 43);
@@ -1315,9 +1389,9 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(0.0f, 0.12f,  1.75f), glm::vec3(15.2f, 0.25f, 0.25f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(0.0f, 3.08f, -1.75f), glm::vec3(15.2f, 0.25f, 0.25f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(0.0f, 3.08f,  1.75f), glm::vec3(15.2f, 0.25f, 0.25f), 0.0f, 2);
-        // Diagrid truss sides along both flanks (Mat 27: Galvanized Steel)
-        addDiagridLattice(scene.triangles, glm::vec3(-7.2f, 0.2f,  1.74f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 8, 14.4f, 2.8f, 27);
-        addDiagridLattice(scene.triangles, glm::vec3(-7.2f, 0.2f, -1.74f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 8, 14.4f, 2.8f, 27);
+        // Diagrid truss sides along both flanks with gusset nodes (Mat 27: Galvanized Steel, Mat 3: Brass node)
+        addDiagridLattice(scene.triangles, glm::vec3(-7.2f, 0.2f,  1.74f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 8, 14.4f, 2.8f, 27, 3);
+        addDiagridLattice(scene.triangles, glm::vec3(-7.2f, 0.2f, -1.74f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 8, 14.4f, 2.8f, 27, 3);
         // Floor and ceiling structural crown glass (Mat 5: Transmissive Crown Glass)
         addBox(scene.triangles, glm::vec3(0.0f, 0.20f, 0.0f), glm::vec3(15.0f, 0.08f, 3.2f), 0.0f, 5);
         addBox(scene.triangles, glm::vec3(0.0f, 3.00f, 0.0f), glm::vec3(15.0f, 0.08f, 3.2f), 0.0f, 5);
@@ -1326,9 +1400,17 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(0.0f, 1.60f, -1.70f), glm::vec3(15.0f, 2.6f, 0.08f), 0.0f, 6);
         // Interior walkway lounge carpet (Mat 23: Velvet Sheen)
         addBox(scene.triangles, glm::vec3(0.0f, 0.25f, 0.0f), glm::vec3(14.8f, 0.02f, 1.8f), 0.0f, 23);
+        // Interior rose gold handrails (Mat 18: Rose Gold Filigree)
+        addBox(scene.triangles, glm::vec3(0.0f, 1.05f, -1.55f), glm::vec3(14.8f, 0.06f, 0.06f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3(0.0f, 1.05f,  1.55f), glm::vec3(14.8f, 0.06f, 0.06f), 0.0f, 18);
         // Interior neon guide strips (Mat 30: Neon Cyan)
         addBox(scene.triangles, glm::vec3(0.0f, 0.26f, -0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 30);
         addBox(scene.triangles, glm::vec3(0.0f, 0.26f,  0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 30);
+        // Ceiling recessed xenon troffer lights (Mat 42: Xenon White)
+        for (int i = -3; i <= 3; ++i) {
+            float xpos = static_cast<float>(i) * 2.0f;
+            addBox(scene.triangles, glm::vec3(xpos, 2.95f, 0.0f), glm::vec3(1.2f, 0.04f, 0.6f), 0.0f, 42);
+        }
         // Under-bridge electric turquoise display glow strip (Mat 45: Electric Turquoise)
         addBox(scene.triangles, glm::vec3(0.0f, -0.05f, 0.0f), glm::vec3(15.0f, 0.10f, 0.40f), 0.0f, 45);
         recordBlasPrototype("Glass Skybridge", tStart);
@@ -1339,16 +1421,17 @@ SceneData ProceduralScene::createCyberCityScene() {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
         // Structural mast (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 4.0f, 0.0f), glm::vec3(1.6f, 8.0f, 1.6f), 0.0f, 1);
-        // Diagrid lattice bracing (Mat 27: Galvanized Steel)
-        addDiagridLattice(scene.triangles, glm::vec3(-0.9f, 0.0f, 0.9f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 2, 1.8f, 7.8f, 27);
+        // Diagrid lattice bracing (Mat 27: Galvanized Steel, Mat 3: Brass node)
+        addDiagridLattice(scene.triangles, glm::vec3(-0.9f, 0.0f, 0.9f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 2, 1.8f, 7.8f, 27, 3);
         // Flange platforms (Mat 2: Titanium Chrome)
         addBox(scene.triangles, glm::vec3(0.0f, 3.0f, 0.0f), glm::vec3(2.4f, 0.2f, 2.4f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(0.0f, 6.0f, 0.0f), glm::vec3(2.0f, 0.2f, 2.0f), 0.0f, 2);
-        // Microwave receiver dishes (Mat 17: Dark Black Chromium)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 6.5f, 1.0f), 0.9f, 0.3f, 17, 16);
-        addCylinder(scene.triangles, glm::vec3(1.0f, 4.5f, 0.0f), 0.7f, 0.3f, 17, 16);
-        // Gold plated transceivers (Mat 3: Brushed Brass)
-        addBox(scene.triangles, glm::vec3(0.0f, 6.5f, 1.3f), glm::vec3(0.18f, 0.18f, 0.4f), 0.0f, 3);
+        // Microwave receiver dishes (Mat 19: Gunmetal Alloy Armor)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 6.5f, 1.0f), 0.9f, 0.3f, 19, 16);
+        addCylinder(scene.triangles, glm::vec3(1.0f, 4.5f, 0.0f), 0.7f, 0.3f, 19, 16);
+        // Gold plated transceivers (Mat 18: Rose Gold Filigree)
+        addBox(scene.triangles, glm::vec3(0.0f, 6.5f, 1.3f), glm::vec3(0.18f, 0.18f, 0.4f), 0.0f, 18);
+        addBox(scene.triangles, glm::vec3(1.3f, 4.5f, 0.0f), glm::vec3(0.4f, 0.18f, 0.18f), 0.0f, 18);
         // Ultraviolet blacklight holo-relay node (Mat 40: Ultraviolet Blacklight Glow)
         addSphere(scene.triangles, glm::vec3(0.0f, 7.5f, 0.0f), 0.45f, 40, 14, 14);
         // Top strobe beacon (Mat 44: Crimson Strobe)
@@ -1361,19 +1444,25 @@ SceneData ProceduralScene::createCyberCityScene() {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
         // Foundation concrete support girder (Mat 0: Foundation Concrete)
         addBox(scene.triangles, glm::vec3(0.0f, 0.3f, 0.0f), glm::vec3(16.0f, 0.6f, 4.8f), 0.0f, 0);
-        // High-traction rubber guideway bed (Mat 24: Rubber Guideway Bed)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.62f, 0.0f), glm::vec3(16.0f, 0.06f, 4.6f), 0.0f, 24);
-        // Porous asphalt apron shoulders (Mat 25: Sound-Absorbing Porous Asphalt)
+        // High-traction rubber guideway bed (Mat 22: Rubber Transit Dampers)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.62f, 0.0f), glm::vec3(16.0f, 0.06f, 4.6f), 0.0f, 22);
+        // Matte black stealth shoulders (Mat 25: Matte Black Stealth Paneling)
         addBox(scene.triangles, glm::vec3(0.0f, 0.64f, -2.0f), glm::vec3(16.0f, 0.04f, 0.6f), 0.0f, 25);
         addBox(scene.triangles, glm::vec3(0.0f, 0.64f,  2.0f), glm::vec3(16.0f, 0.04f, 0.6f), 0.0f, 25);
         // Dual electromagnetic levitation rails (Mat 35: Electric Gold Emissive Conduit)
         addBox(scene.triangles, glm::vec3(0.0f, 0.72f, -1.1f), glm::vec3(16.0f, 0.12f, 0.4f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3(0.0f, 0.72f,  1.1f), glm::vec3(16.0f, 0.12f, 0.4f), 0.0f, 35);
-        // Center copper power rail (Mat 14: Polished Copper)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.68f, 0.0f), glm::vec3(16.0f, 0.08f, 0.3f), 0.0f, 14);
+        // Center copper power rail (Mat 10: Copper Conduits & Busbars)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.68f, 0.0f), glm::vec3(16.0f, 0.08f, 0.3f), 0.0f, 10);
         // Titanium aerodynamic crash barriers (Mat 2: Titanium Chrome)
         addBox(scene.triangles, glm::vec3(0.0f, 0.95f, -2.35f), glm::vec3(16.0f, 0.8f, 0.2f), 0.0f, 2);
         addBox(scene.triangles, glm::vec3(0.0f, 0.95f,  2.35f), glm::vec3(16.0f, 0.8f, 0.2f), 0.0f, 2);
+        // High-gloss yellow hazard stripes on crash barriers (Mat 24: High-Gloss Yellow Hazard)
+        for (int i = -3; i <= 3; ++i) {
+            float xpos = static_cast<float>(i) * 2.2f;
+            addBox(scene.triangles, glm::vec3(xpos, 0.95f, -2.24f), glm::vec3(0.8f, 0.3f, 0.03f), 0.0f, 24);
+            addBox(scene.triangles, glm::vec3(xpos, 0.95f,  2.24f), glm::vec3(0.8f, 0.3f, 0.03f), 0.0f, 24);
+        }
         // Electric turquoise guideway edge markers (Mat 45: Electric Turquoise)
         addBox(scene.triangles, glm::vec3(0.0f, 0.98f, -2.22f), glm::vec3(16.0f, 0.08f, 0.06f), 0.0f, 45);
         addBox(scene.triangles, glm::vec3(0.0f, 0.98f,  2.22f), glm::vec3(16.0f, 0.08f, 0.06f), 0.0f, 45);
@@ -1385,23 +1474,34 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 9: Autonomous Aerodynamic Sky Cab (CYBER_BLAS_SKY_CAB)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // Carbon fiber composite chassis (Mat 19: Carbon Fiber Polymer)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(4.2f, 0.7f, 2.0f), 0.0f, 19);
-        // Titanium aerodynamic canards and winglets (Mat 2: Titanium Chrome)
+        // Stealth composite chassis (Mat 25: Matte Black Stealth Paneling)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(4.2f, 0.7f, 2.0f), 0.0f, 25);
+        // Titanium aerodynamic canards and delta winglets (Mat 2: Titanium Chrome)
         addBox(scene.triangles, glm::vec3(-0.4f, 0.38f, 0.0f), glm::vec3(2.4f, 0.12f, 3.4f), 0.0f, 2);
-        // Smoked obsidian glass teardrop cockpit canopy (Mat 7: Smoked Obsidian Glass)
-        addSphere(scene.triangles, glm::vec3(0.6f, 0.85f, 0.0f), 0.82f, 7, 20, 20);
-        // Gunmetal VTOL thruster nacelles (Mat 13: Anodized Gunmetal)
-        addCylinder(scene.triangles, glm::vec3(-1.8f, 0.45f, -1.1f), 0.38f, 0.8f, 13, 14);
-        addCylinder(scene.triangles, glm::vec3(-1.8f, 0.45f,  1.1f), 0.38f, 0.8f, 13, 14);
-        // Cyan plasma thruster rings (Mat 30: Neon Cyan)
+        // Smoked obsidian glass teardrop cockpit canopy (Mat 11: Smoked Obsidian Glass)
+        addSphere(scene.triangles, glm::vec3(0.6f, 0.85f, 0.0f), 0.82f, 11, 20, 20);
+        // Interior HUD cockpit display (Mat 45: Electric Turquoise Display)
+        addBox(scene.triangles, glm::vec3(0.7f, 0.72f, 0.0f), glm::vec3(0.15f, 0.15f, 0.35f), 0.0f, 45);
+        // Gunmetal VTOL thruster nacelles (Mat 19: Gunmetal Alloy Armor)
+        addCylinder(scene.triangles, glm::vec3(-1.8f, 0.45f, -1.1f), 0.38f, 0.8f, 19, 14);
+        addCylinder(scene.triangles, glm::vec3(-1.8f, 0.45f,  1.1f), 0.38f, 0.8f, 19, 14);
+        // Platinum stator vanes inside thrusters (Mat 17: Anisotropic Brushed Platinum)
+        for (int v = 0; v < 4; ++v) {
+            float vAngle = static_cast<float>(v) * 45.0f;
+            addBox(scene.triangles, glm::vec3(-1.8f, 0.45f, -1.1f), glm::vec3(0.04f, 0.65f, 0.65f), vAngle, 17);
+            addBox(scene.triangles, glm::vec3(-1.8f, 0.45f,  1.1f), glm::vec3(0.04f, 0.65f, 0.65f), vAngle, 17);
+        }
+        // Cyan plasma thruster exhaust rings (Mat 30: Neon Cyan)
         addBox(scene.triangles, glm::vec3(-2.22f, 0.45f, -1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 30);
         addBox(scene.triangles, glm::vec3(-2.22f, 0.45f,  1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 30);
         // Ice blue forward transit headlights (Mat 47: Ice Blue Transit Headlight)
         addBox(scene.triangles, glm::vec3(2.05f, 0.38f, -0.65f), glm::vec3(0.18f, 0.18f, 0.25f), 0.0f, 47);
         addBox(scene.triangles, glm::vec3(2.05f, 0.38f,  0.65f), glm::vec3(0.18f, 0.18f, 0.25f), 0.0f, 47);
-        // Ruby laser tail safety beacons (Mat 34: Ruby Laser Beacon)
-        addBox(scene.triangles, glm::vec3(-2.05f, 0.55f, 0.0f), glm::vec3(0.15f, 0.25f, 0.6f), 0.0f, 34);
+        // Port & Starboard navigation strobes (Mat 34 Red Port, Mat 33 Green Starboard)
+        addBox(scene.triangles, glm::vec3(-0.4f, 0.45f, -1.72f), glm::vec3(0.12f, 0.12f, 0.12f), 0.0f, 34);
+        addBox(scene.triangles, glm::vec3(-0.4f, 0.45f,  1.72f), glm::vec3(0.12f, 0.12f, 0.12f), 0.0f, 33);
+        // Tail strobe beacon (Mat 42: Xenon White)
+        addBox(scene.triangles, glm::vec3(-2.05f, 0.55f, 0.0f), glm::vec3(0.15f, 0.25f, 0.6f), 0.0f, 42);
         recordBlasPrototype("Sky Cab", tStart);
     }
 
@@ -1497,8 +1597,13 @@ SceneData ProceduralScene::createCyberCityScene() {
         }
         // Central inverter housing (Mat 1: Carbon Steel)
         addBox(scene.triangles, glm::vec3(0.0f, 0.4f, 0.0f), glm::vec3(1.4f, 0.8f, 1.0f), 0.0f, 1);
-        // Mint phosphor status indicator lights (Mat 39: Mint Phosphor Luminescence)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.6f, 0.52f), glm::vec3(0.6f, 0.12f, 0.04f), 0.0f, 39);
+        // Copper heatsink fins on inverter (Mat 10: Copper Conduits)
+        for (float hx = -0.5f; hx <= 0.5f; hx += 0.25f) {
+            addBox(scene.triangles, glm::vec3(hx, 0.85f, 0.0f), glm::vec3(0.04f, 0.15f, 0.8f), 0.0f, 10);
+        }
+        // Mint phosphor and amber status indicator lights (Mat 39: Mint Phosphor, Mat 43: Amber Hazard)
+        addBox(scene.triangles, glm::vec3(-0.3f, 0.6f, 0.52f), glm::vec3(0.25f, 0.12f, 0.04f), 0.0f, 39);
+        addBox(scene.triangles, glm::vec3( 0.3f, 0.6f, 0.52f), glm::vec3(0.25f, 0.12f, 0.04f), 0.0f, 43);
         recordBlasPrototype("Solar Roof", tStart);
     }
 
@@ -1509,24 +1614,29 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(0.0f, -0.35f, 0.0f), glm::vec3(16.2f, 0.7f, 16.2f), 0.0f, 0);
         // Wet reflective plaza pavement surface (Mat 4: Wet Reflective Pavement)
         addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(16.0f, 0.04f, 16.0f), 0.0f, 4);
-        // Rough basalt curb borders (Mat 20: Rough Basalt)
-        addBox(scene.triangles, glm::vec3( 7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 20);
-        addBox(scene.triangles, glm::vec3(-7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 20);
-        addBox(scene.triangles, glm::vec3(0.0f, 0.08f,  7.9f), glm::vec3(16.0f, 0.16f, 0.2f), 0.0f, 20);
-        addBox(scene.triangles, glm::vec3(0.0f, 0.08f, -7.9f), glm::vec3(16.0f, 0.16f, 0.2f), 0.0f, 20);
-        // Glazed ceramic planter boxes (Mat 21: White Ceramic) with Jade trim (Mat 29)
-        addBox(scene.triangles, glm::vec3(-4.5f, 0.4f, -4.5f), glm::vec3(2.4f, 0.8f, 2.4f), 0.0f, 21);
+        // Rough basalt curb borders (Mat 8: Basalt Foundation)
+        addBox(scene.triangles, glm::vec3( 7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 8);
+        addBox(scene.triangles, glm::vec3(-7.9f, 0.08f, 0.0f), glm::vec3(0.2f, 0.16f, 16.0f), 0.0f, 8);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.08f,  7.9f), glm::vec3(16.0f, 0.16f, 0.2f), 0.0f, 8);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.08f, -7.9f), glm::vec3(16.0f, 0.16f, 0.2f), 0.0f, 8);
+        // Glazed ceramic planter boxes (Mat 9: White Ceramic Cladding) with Jade trim (Mat 29)
+        addBox(scene.triangles, glm::vec3(-4.5f, 0.4f, -4.5f), glm::vec3(2.4f, 0.8f, 2.4f), 0.0f, 9);
         addBox(scene.triangles, glm::vec3(-4.5f, 0.82f, -4.5f), glm::vec3(2.5f, 0.08f, 2.5f), 0.0f, 29);
-        addBox(scene.triangles, glm::vec3( 4.5f, 0.4f,  4.5f), glm::vec3(2.4f, 0.8f, 2.4f), 0.0f, 21);
+        addBox(scene.triangles, glm::vec3( 4.5f, 0.4f,  4.5f), glm::vec3(2.4f, 0.8f, 2.4f), 0.0f, 9);
         addBox(scene.triangles, glm::vec3( 4.5f, 0.82f,  4.5f), glm::vec3(2.5f, 0.08f, 2.5f), 0.0f, 29);
+        // Ornamental crystal art sculptures inside planters (Mat 13: Emerald, Mat 14: Ruby)
+        addSphere(scene.triangles, glm::vec3(-4.5f, 1.15f, -4.5f), 0.35f, 13, 12, 12);
+        addSphere(scene.triangles, glm::vec3( 4.5f, 1.15f,  4.5f), 0.35f, 14, 12, 12);
         // Recessed ground luminescent and pedestrian guidance strips
         // (Mat 30: Neon Cyan 480nm, Mat 35: Electric Gold)
         addBox(scene.triangles, glm::vec3(0.0f, 0.03f, 0.0f), glm::vec3(15.6f, 0.02f, 0.25f), 0.0f, 30);
         addBox(scene.triangles, glm::vec3(0.0f, 0.03f, -4.5f), glm::vec3(0.25f, 0.02f, 7.0f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3(0.0f, 0.03f,  4.5f), glm::vec3(0.25f, 0.02f, 7.0f), 0.0f, 35);
-        // Titanium streetlight poles (Mat 2: Titanium Chrome)
+        // Titanium streetlight poles (Mat 2: Titanium Chrome) with Yellow hazard base collars (Mat 24)
         addCylinder(scene.triangles, glm::vec3( 6.8f, 2.5f,  6.8f), 0.08f, 5.0f, 2, 10);
         addCylinder(scene.triangles, glm::vec3(-6.8f, 2.5f, -6.8f), 0.08f, 5.0f, 2, 10);
+        addCylinder(scene.triangles, glm::vec3( 6.8f, 0.3f,  6.8f), 0.16f, 0.6f, 24, 10);
+        addCylinder(scene.triangles, glm::vec3(-6.8f, 0.3f, -6.8f), 0.16f, 0.6f, 24, 10);
         // Streetlight lamp fixtures (Mat 41: Warm Sodium Vapor Streetlight)
         addBox(scene.triangles, glm::vec3( 6.5f, 4.9f,  6.5f), glm::vec3(0.6f, 0.15f, 0.35f), 0.0f, 41);
         addBox(scene.triangles, glm::vec3(-6.5f, 4.9f, -6.5f), glm::vec3(0.6f, 0.15f, 0.35f), 0.0f, 41);
@@ -1553,13 +1663,17 @@ SceneData ProceduralScene::createCyberCityScene() {
             addBox(scene.triangles, glm::vec3( 2.6f, 0.045f, zCenter), glm::vec3(0.14f, 0.01f, 2.2f), 0.0f, 42);
         }
 
-        // Solid white outer road shoulder stripes (Mat 21: White Ceramic)
-        addBox(scene.triangles, glm::vec3(-4.85f, 0.045f, 0.0f), glm::vec3(0.15f, 0.01f, 15.9f), 0.0f, 21);
-        addBox(scene.triangles, glm::vec3( 4.85f, 0.045f, 0.0f), glm::vec3(0.15f, 0.01f, 15.9f), 0.0f, 21);
+        // Solid white outer road shoulder stripes (Mat 9: White Ceramic Cladding)
+        addBox(scene.triangles, glm::vec3(-4.85f, 0.045f, 0.0f), glm::vec3(0.15f, 0.01f, 15.9f), 0.0f, 9);
+        addBox(scene.triangles, glm::vec3( 4.85f, 0.045f, 0.0f), glm::vec3(0.15f, 0.01f, 15.9f), 0.0f, 9);
 
-        // Raised basalt curbs (Mat 20: Rough Basalt)
-        addBox(scene.triangles, glm::vec3(-5.15f, 0.10f, 0.0f), glm::vec3(0.35f, 0.20f, 16.0f), 0.0f, 20);
-        addBox(scene.triangles, glm::vec3( 5.15f, 0.10f, 0.0f), glm::vec3(0.35f, 0.20f, 16.0f), 0.0f, 20);
+        // Raised basalt curbs (Mat 8: Basalt Foundation)
+        addBox(scene.triangles, glm::vec3(-5.15f, 0.10f, 0.0f), glm::vec3(0.35f, 0.20f, 16.0f), 0.0f, 8);
+        addBox(scene.triangles, glm::vec3( 5.15f, 0.10f, 0.0f), glm::vec3(0.35f, 0.20f, 16.0f), 0.0f, 8);
+
+        // Recessed drainage utility grates along gutter (Mat 28: Perforated Mesh)
+        addBox(scene.triangles, glm::vec3(-4.70f, 0.038f, 0.0f), glm::vec3(0.16f, 0.01f, 15.8f), 0.0f, 28);
+        addBox(scene.triangles, glm::vec3( 4.70f, 0.038f, 0.0f), glm::vec3(0.16f, 0.01f, 15.8f), 0.0f, 28);
 
         // Pedestrian sidewalk pavement (Mat 4: Wet Reflective Pavement)
         addBox(scene.triangles, glm::vec3(-6.65f, 0.08f, 0.0f), glm::vec3(2.65f, 0.16f, 16.0f), 0.0f, 4);
@@ -1593,28 +1707,29 @@ SceneData ProceduralScene::createCyberCityScene() {
         // Asphalt crossing area (Mat 20)
         addBox(scene.triangles, glm::vec3(0.0f, 0.02f, 0.0f), glm::vec3(16.0f, 0.04f, 16.0f), 0.0f, 20);
 
-        // Zebra pedestrian crosswalks (Mat 21: White Ceramic) on all 4 directions
+        // Zebra pedestrian crosswalks (Mat 9: White Ceramic Cladding) on all 4 directions
         for (int s = -4; s <= 4; ++s) {
             float xPos = static_cast<float>(s) * 1.0f;
-            addBox(scene.triangles, glm::vec3(xPos, 0.045f,  6.0f), glm::vec3(0.45f, 0.01f, 2.0f), 0.0f, 21);
-            addBox(scene.triangles, glm::vec3(xPos, 0.045f, -6.0f), glm::vec3(0.45f, 0.01f, 2.0f), 0.0f, 21);
+            addBox(scene.triangles, glm::vec3(xPos, 0.045f,  6.0f), glm::vec3(0.45f, 0.01f, 2.0f), 0.0f, 9);
+            addBox(scene.triangles, glm::vec3(xPos, 0.045f, -6.0f), glm::vec3(0.45f, 0.01f, 2.0f), 0.0f, 9);
         }
         for (int s = -4; s <= 4; ++s) {
             float zPos = static_cast<float>(s) * 1.0f;
-            addBox(scene.triangles, glm::vec3( 6.0f, 0.045f, zPos), glm::vec3(2.0f, 0.01f, 0.45f), 0.0f, 21);
-            addBox(scene.triangles, glm::vec3(-6.0f, 0.045f, zPos), glm::vec3(2.0f, 0.01f, 0.45f), 0.0f, 21);
+            addBox(scene.triangles, glm::vec3( 6.0f, 0.045f, zPos), glm::vec3(2.0f, 0.01f, 0.45f), 0.0f, 9);
+            addBox(scene.triangles, glm::vec3(-6.0f, 0.045f, zPos), glm::vec3(2.0f, 0.01f, 0.45f), 0.0f, 9);
         }
 
-        // Corner sidewalks with wet pavement (Mat 4) and basalt curbs (Mat 20)
+        // Corner sidewalks with wet pavement (Mat 4) and basalt curbs (Mat 8)
         for (float sx : {-1.0f, 1.0f}) {
             for (float sz : {-1.0f, 1.0f}) {
                 glm::vec3 cPos(sx * 6.5f, 0.08f, sz * 6.5f);
                 addBox(scene.triangles, cPos, glm::vec3(2.6f, 0.16f, 2.6f), 0.0f, 4);
-                addBox(scene.triangles, cPos + glm::vec3(-sx * 1.35f, 0.02f, 0.0f), glm::vec3(0.2f, 0.20f, 2.8f), 0.0f, 20);
-                addBox(scene.triangles, cPos + glm::vec3(0.0f, 0.02f, -sz * 1.35f), glm::vec3(2.8f, 0.20f, 0.2f), 0.0f, 20);
-                // Corner illuminated safety bollard (Mat 2 + Mat 43 amber)
+                addBox(scene.triangles, cPos + glm::vec3(-sx * 1.35f, 0.02f, 0.0f), glm::vec3(0.2f, 0.20f, 2.8f), 0.0f, 8);
+                addBox(scene.triangles, cPos + glm::vec3(0.0f, 0.02f, -sz * 1.35f), glm::vec3(2.8f, 0.20f, 0.2f), 0.0f, 8);
+                // Corner illuminated safety bollard (Mat 2 Titanium + Mat 43 Amber + Mat 30 Cyan)
                 addCylinder(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 0.5f, -sz * 0.8f), 0.10f, 1.0f, 2, 8);
                 addBox(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 1.05f, -sz * 0.8f), glm::vec3(0.22f, 0.12f, 0.22f), 0.0f, 43);
+                addBox(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 0.55f, -sz * 0.8f), glm::vec3(0.22f, 0.06f, 0.22f), 0.0f, 30);
             }
         }
 
@@ -1651,10 +1766,11 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(0.0f, 0.022f, 0.0f), glm::vec3(31.6f, 0.015f, 0.15f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3(0.0f, 0.022f, 0.0f), glm::vec3(0.15f, 0.015f, 31.6f), 0.0f, 30);
 
-        // 4 boundary perimeter beacon pylons (Mat 2 + Mat 34 Ruby Laser Warning)
+        // 4 boundary perimeter beacon pylons (Mat 2 Titanium + Mat 40 Blacklight ring + Mat 34 Ruby Laser)
         for (float bx : {-14.5f, 14.5f}) {
             for (float bz : {-14.5f, 14.5f}) {
                 addCylinder(scene.triangles, glm::vec3(bx, 0.6f, bz), 0.12f, 1.2f, 2, 8);
+                addCylinder(scene.triangles, glm::vec3(bx, 0.15f, bz), 0.22f, 0.1f, 40, 8);
                 addBox(scene.triangles, glm::vec3(bx, 1.25f, bz), glm::vec3(0.28f, 0.18f, 0.28f), 0.0f, 34);
             }
         }
@@ -1823,13 +1939,13 @@ SceneData ProceduralScene::createCyberCityScene() {
             uint32_t seed = (gx * 37u + gz * 61u + 17u) % 100u;
             uint32_t numMids;
             if (gx == 5 || gx == 6) {
-                numMids = 16u + (seed % 9u); // Super-tall central avenue towers: 16 to 24 mids
+                numMids = 24u + (seed % 11u); // Super-tall central avenue towers: 24 to 34 mids (152m - 212m)
             } else if (gx == 4 || gx == 7) {
-                numMids = 12u + (seed % 7u); // Inner high-rise towers: 12 to 18 mids
+                numMids = 18u + (seed % 9u);  // Inner high-rise towers: 18 to 26 mids (116m - 164m)
             } else if (gx == 3 || gx == 8) {
-                numMids = 10u + (seed % 5u); // Mid-district towers: 10 to 14 mids
+                numMids = 14u + (seed % 7u);  // Mid-district towers: 14 to 20 mids (92m - 128m)
             } else {
-                numMids = 8u + (seed % 5u);  // Outer district towers: 8 to 12 mids
+                numMids = 10u + (seed % 7u);  // Outer district towers: 10 to 16 mids (68m - 104m)
             }
 
             // Tower Base Block
@@ -1859,7 +1975,7 @@ SceneData ProceduralScene::createCyberCityScene() {
                 addInstance(midProto, mMid);
 
                 // Periodic communication relay gantries mounted on mid setbacks
-                if (m % 3 == 2 && ((gx + gz + m) % 4 == 0)) {
+                if (m % 3 == 2 && ((gx + gz + m) % 3 == 0)) {
                     glm::mat4 mGantry = glm::translate(glm::mat4(1.0f), glm::vec3(posX + 4.8f, y + 1.0f, posZ + 4.8f));
                     addInstance(CYBER_BLAS_COMM_GANTRY, mGantry);
                 }
@@ -1885,9 +2001,9 @@ SceneData ProceduralScene::createCyberCityScene() {
             }
 
             // Holographic Billboards on tower facades
-            for (float by = 16.0f; by < crownY - 6.0f; by += 14.0f) {
+            for (float by = 16.0f; by < crownY - 6.0f; by += 12.0f) {
                 uint32_t bbSeed = static_cast<uint32_t>(gx * 19 + gz * 31 + static_cast<int>(by)) % 10u;
-                if (bbSeed > 6u) continue;
+                if (bbSeed > 4u) continue;
 
                 uint32_t bbProto = CYBER_BLAS_BILLBOARD_CYAN;
                 glm::vec3 bbLocalCorner(-3.8f, -2.05f, 0.12f);
@@ -1936,10 +2052,10 @@ SceneData ProceduralScene::createCyberCityScene() {
     }
 
     // 2c. Multi-Tier Skybridges (CYBER_BLAS_SKYBRIDGE)
-    // Central Avenue Skybridges (Connecting gx = 5 and gx = 6, 28m span)
+    // Central Avenue Skybridges (Connecting gx = 5 and gx = 6, 28m span) across 6 tiers
     for (uint32_t gz = 0; gz < 12; ++gz) {
         float posZ = -99.0f + static_cast<float>(gz) * 18.0f;
-        for (float by : { 24.0f, 44.0f, 64.0f, 84.0f }) {
+        for (float by : { 24.0f, 44.0f, 64.0f, 84.0f, 104.0f, 124.0f }) {
             glm::mat4 mBridge = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, by, posZ)) *
                                 glm::scale(glm::mat4(1.0f), glm::vec3(28.0f / 16.0f, 1.0f, 1.0f));
             addInstance(CYBER_BLAS_SKYBRIDGE, mBridge);
@@ -1949,7 +2065,7 @@ SceneData ProceduralScene::createCyberCityScene() {
         }
     }
 
-    // Inter-Tower Skybridges along X
+    // Inter-Tower Skybridges along X across multiple vertical elevations
     for (uint32_t gx = 0; gx < 11; ++gx) {
         if (gx == 5) continue; // Avenue gap
         float posX1 = (gx <= 5) ? (-14.0f - static_cast<float>(5 - gx) * 18.0f) : (+14.0f + static_cast<float>(gx - 6) * 18.0f);
@@ -1959,17 +2075,18 @@ SceneData ProceduralScene::createCyberCityScene() {
         for (uint32_t gz = 0; gz < 12; ++gz) {
             float posZ = -99.0f + static_cast<float>(gz) * 18.0f;
             if ((gx + gz) % 2 == 0) {
-                float by = 28.0f + static_cast<float>((gx * 7 + gz * 11) % 4) * 16.0f;
-                glm::mat4 mBridge = glm::translate(glm::mat4(1.0f), glm::vec3(midX, by, posZ)) *
-                                    glm::scale(glm::mat4(1.0f), glm::vec3(18.0f / 16.0f, 1.0f, 1.0f));
-                addInstance(CYBER_BLAS_SKYBRIDGE, mBridge);
-                addBillboardLight(mBridge, glm::vec3(-32.0f / 9.0f, -0.11f, -0.2f), glm::vec3(64.0f / 9.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 0.4f),
-                                  glm::vec3(2.0f, 28.0f, 36.0f), 1.0f);
+                for (float by : { 28.0f, 60.0f }) {
+                    glm::mat4 mBridge = glm::translate(glm::mat4(1.0f), glm::vec3(midX, by, posZ)) *
+                                        glm::scale(glm::mat4(1.0f), glm::vec3(18.0f / 16.0f, 1.0f, 1.0f));
+                    addInstance(CYBER_BLAS_SKYBRIDGE, mBridge);
+                    addBillboardLight(mBridge, glm::vec3(-32.0f / 9.0f, -0.11f, -0.2f), glm::vec3(64.0f / 9.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 0.4f),
+                                      glm::vec3(2.0f, 28.0f, 36.0f), 1.0f);
+                }
             }
         }
     }
 
-    // Inter-Tower Skybridges along Z
+    // Inter-Tower Skybridges along Z across multiple vertical elevations
     for (uint32_t gx = 0; gx < 12; ++gx) {
         float posX = (gx <= 5) ? (-14.0f - static_cast<float>(5 - gx) * 18.0f) : (+14.0f + static_cast<float>(gx - 6) * 18.0f);
         for (uint32_t gz = 0; gz < 11; ++gz) {
@@ -1977,19 +2094,20 @@ SceneData ProceduralScene::createCyberCityScene() {
             float posZ2 = -99.0f + static_cast<float>(gz + 1) * 18.0f;
             float midZ = (posZ1 + posZ2) * 0.5f;
             if ((gx * 3 + gz) % 3 == 0) {
-                float by = 34.0f + static_cast<float>((gx * 5 + gz * 13) % 4) * 16.0f;
-                glm::mat4 mBridge = glm::translate(glm::mat4(1.0f), glm::vec3(posX, by, midZ)) *
-                                    glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)) *
-                                    glm::scale(glm::mat4(1.0f), glm::vec3(18.0f / 16.0f, 1.0f, 1.0f));
-                addInstance(CYBER_BLAS_SKYBRIDGE, mBridge);
-                addBillboardLight(mBridge, glm::vec3(-32.0f / 9.0f, -0.11f, -0.2f), glm::vec3(64.0f / 9.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 0.4f),
-                                  glm::vec3(2.0f, 28.0f, 36.0f), 1.0f);
+                for (float by : { 34.0f, 66.0f }) {
+                    glm::mat4 mBridge = glm::translate(glm::mat4(1.0f), glm::vec3(posX, by, midZ)) *
+                                        glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f)) *
+                                        glm::scale(glm::mat4(1.0f), glm::vec3(18.0f / 16.0f, 1.0f, 1.0f));
+                    addInstance(CYBER_BLAS_SKYBRIDGE, mBridge);
+                    addBillboardLight(mBridge, glm::vec3(-32.0f / 9.0f, -0.11f, -0.2f), glm::vec3(64.0f / 9.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 0.4f),
+                                      glm::vec3(2.0f, 28.0f, 36.0f), 1.0f);
+                }
             }
         }
     }
 
     // 2d. Elevated Maglev Transit Guideways (CYBER_BLAS_TRANSIT_GUIDEWAY)
-    // Avenue Guideways North-South
+    // Avenue Guideways North-South (Low, Mid, and Express High)
     for (float hx : { -5.0f, 5.0f }) {
         for (int sz = -6; sz <= 6; ++sz) {
             float pz = static_cast<float>(sz) * 16.0f;
@@ -1997,24 +2115,32 @@ SceneData ProceduralScene::createCyberCityScene() {
                                   glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
             addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrackLow);
 
-            glm::mat4 mTrackHigh = glm::translate(glm::mat4(1.0f), glm::vec3(hx, 17.0f, pz)) *
+            glm::mat4 mTrackMid = glm::translate(glm::mat4(1.0f), glm::vec3(hx, 17.0f, pz)) *
+                                  glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrackMid);
+
+            glm::mat4 mTrackHigh = glm::translate(glm::mat4(1.0f), glm::vec3(hx, 24.0f, pz)) *
                                    glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
             addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrackHigh);
         }
     }
-    // Cross-Avenue Guideways East-West
+    // Cross-Avenue Guideways East-West (Two altitude tiers)
     for (float cz : { -54.0f, -18.0f, 18.0f, 54.0f }) {
         for (int sx = -6; sx <= 6; ++sx) {
             float px = static_cast<float>(sx) * 16.0f;
-            glm::mat4 mTrack = glm::translate(glm::mat4(1.0f), glm::vec3(px, 13.5f, cz));
-            addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrack);
+            glm::mat4 mTrackLow = glm::translate(glm::mat4(1.0f), glm::vec3(px, 13.5f, cz));
+            addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrackLow);
+
+            glm::mat4 mTrackHigh = glm::translate(glm::mat4(1.0f), glm::vec3(px, 20.5f, cz));
+            addInstance(CYBER_BLAS_TRANSIT_GUIDEWAY, mTrackHigh);
         }
     }
 
-    // 2e. Autonomous Sky Cabs in 3D Flight Corridors (CYBER_BLAS_SKY_CAB)
-    for (int i = 0; i < 150; ++i) {
-        float f = static_cast<float>(i) / 150.0f;
-        float y = 14.0f + std::fmod(f * 76.0f, 72.0f);
+    // 2e. Autonomous Sky Cabs in 3D Flight Corridors (CYBER_BLAS_SKY_CAB) - 700 vehicles
+    // Corridor 1: Avenue North-South Low (175 vehicles)
+    for (int i = 0; i < 175; ++i) {
+        float f = static_cast<float>(i) / 175.0f;
+        float y = 14.0f + std::fmod(f * 48.0f, 44.0f);
         float z = -105.0f + f * 210.0f;
         float x = (i % 2 == 0) ? -2.4f : 2.4f;
         float rot = (i % 2 == 0) ? 90.0f : -90.0f;
@@ -2023,11 +2149,36 @@ SceneData ProceduralScene::createCyberCityScene() {
                              glm::rotate(glm::mat4(1.0f), glm::radians(rot), glm::vec3(0.0f, 1.0f, 0.0f));
         addInstance(CYBER_BLAS_SKY_CAB, mVehicle);
     }
-    for (int i = 0; i < 150; ++i) {
-        float f = static_cast<float>(i) / 150.0f;
-        float y = 18.0f + std::fmod(f * 65.0f, 60.0f);
+    // Corridor 2: Avenue North-South High (175 vehicles)
+    for (int i = 0; i < 175; ++i) {
+        float f = static_cast<float>(i) / 175.0f;
+        float y = 62.0f + std::fmod(f * 56.0f, 52.0f);
+        float z = -105.0f + f * 210.0f;
+        float x = (i % 2 == 0) ? -3.2f : 3.2f;
+        float rot = (i % 2 == 0) ? 90.0f : -90.0f;
+
+        glm::mat4 mVehicle = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, z)) *
+                             glm::rotate(glm::mat4(1.0f), glm::radians(rot), glm::vec3(0.0f, 1.0f, 0.0f));
+        addInstance(CYBER_BLAS_SKY_CAB, mVehicle);
+    }
+    // Corridor 3: Cross-City East-West Low (175 vehicles)
+    for (int i = 0; i < 175; ++i) {
+        float f = static_cast<float>(i) / 175.0f;
+        float y = 18.0f + std::fmod(f * 40.0f, 36.0f);
         float x = -105.0f + f * 210.0f;
         float z = (i % 2 == 0) ? -45.0f : 45.0f;
+        float rot = (i % 2 == 0) ? 0.0f : 180.0f;
+
+        glm::mat4 mVehicle = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, z)) *
+                             glm::rotate(glm::mat4(1.0f), glm::radians(rot), glm::vec3(0.0f, 1.0f, 0.0f));
+        addInstance(CYBER_BLAS_SKY_CAB, mVehicle);
+    }
+    // Corridor 4: Cross-City East-West High (175 vehicles)
+    for (int i = 0; i < 175; ++i) {
+        float f = static_cast<float>(i) / 175.0f;
+        float y = 70.0f + std::fmod(f * 48.0f, 44.0f);
+        float x = -105.0f + f * 210.0f;
+        float z = (i % 2 == 0) ? -18.0f : 18.0f;
         float rot = (i % 2 == 0) ? 0.0f : 180.0f;
 
         glm::mat4 mVehicle = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, z)) *

@@ -196,9 +196,9 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     cyberCity.label = "Procedural Cyber City";
     cyberCity.filepath = "procedural:cyber-city";
     cyberCity.group = "Procedural";
-    cyberCity.triangleCount = 11700; // 19 modular BLAS prototypes
-    cyberCity.instancedTriangleCount = 3800000; // Over 3.8M instanced triangles
-    cyberCity.instanceCount = 4000; // Hardware TLAS instances
+    cyberCity.triangleCount = 26552; // 19 modular BLAS prototypes
+    cyberCity.instancedTriangleCount = 13587182; // Over 13.5M instanced triangles
+    cyberCity.instanceCount = 5521; // Hardware TLAS instances
     cyberCity.materialCount = 48;
     cyberCity.fileSizeBytes = 0;
     entries.push_back(cyberCity);

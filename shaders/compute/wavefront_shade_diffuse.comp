@@ -440,10 +440,32 @@ void main() {
 
                     if (length(unshadowed) > float16_t(1e-5)) {
                         if (enableShadows) {
-                            hasShadowRay = true;
                             vec3 shadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
-                            shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
-                            shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                            bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                            if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                bool occluded = traceShadowRayInline(shadowOrigin, lightDir, lightDist,
+                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                if (!occluded) {
+                                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                    if (pc.captureMlData != 0u) {
+                                        if (isSpecularPath) {
+                                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
+                                        } else {
+                                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
+                                        }
+                                    }
+                                } else {
+                                    secDirectL = f16vec3(0.0);
+                                }
+                            } else {
+                                hasShadowRay = true;
+                                shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
+                                shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                            }
                         } else {
                             accumRadiance += vec3(unshadowed);
                         }

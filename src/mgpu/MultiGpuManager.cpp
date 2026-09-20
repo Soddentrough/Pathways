@@ -1607,7 +1607,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         // Transition upscaler output to TRANSFER_SRC_OPTIMAL
         node->upscaler->getOutputImage()->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
 
@@ -1646,12 +1646,44 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         // Timestamp 1: RT End
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
 
-        // Transition accumTarget to TRANSFER_SRC_OPTIMAL
-        node->accumTarget->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-        );
+        bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage);
+
+        // Batched transition of images to TRANSFER_SRC_OPTIMAL
+        std::vector<VkImageMemoryBarrier2> toTransferBarriers;
+        toTransferBarriers.reserve(copyExtraImages ? 3 : 1);
+
+        VkImageSubresourceRange colorRange{};
+        colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorRange.baseMipLevel = 0;
+        colorRange.levelCount = 1;
+        colorRange.baseArrayLayer = 0;
+        colorRange.layerCount = 1;
+
+        auto makeToTransferBarrier = [&](VkImage img) {
+            VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = colorRange;
+            return b;
+        };
+
+        toTransferBarriers.push_back(makeToTransferBarrier(node->accumTarget->getImage()));
+        if (copyExtraImages) {
+            toTransferBarriers.push_back(makeToTransferBarrier(node->motionVectorImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->normalDepthImage->getImage()));
+        }
+
+        VkDependencyInfo toTransferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toTransferDep.imageMemoryBarrierCount = static_cast<uint32_t>(toTransferBarriers.size());
+        toTransferDep.pImageMemoryBarriers = toTransferBarriers.data();
+        vkCmdPipelineBarrier2(cmd, &toTransferDep);
 
         // Timestamp 2: Copy Start
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
@@ -1676,7 +1708,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                targetBuffer, 1, &copyRegion);
 
-        if (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage) {
+        if (copyExtraImages) {
             uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 : 16;
             VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
             VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
@@ -1684,51 +1716,52 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
             // Copy Motion Vectors
-            node->motionVectorImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-            );
             VkBufferImageCopy copyMv = copyRegion;
             copyMv.bufferOffset = radOffsetAligned;
             vkCmdCopyImageToBuffer(cmd, node->motionVectorImage->getImage(),
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    targetBuffer, 1, &copyMv);
-            node->motionVectorImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
 
             // Copy Normal & Depth
-            node->normalDepthImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-            );
             VkBufferImageCopy copyNd = copyRegion;
             copyNd.bufferOffset = mvOffsetAligned;
             vkCmdCopyImageToBuffer(cmd, node->normalDepthImage->getImage(),
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    targetBuffer, 1, &copyNd);
-            node->normalDepthImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
         }
 
         // Timestamp 3: Copy End
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
 
-        node->accumTarget->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
+        // Batched transition of images back to GENERAL
+        std::vector<VkImageMemoryBarrier2> toGeneralBarriers;
+        toGeneralBarriers.reserve(copyExtraImages ? 3 : 1);
+
+        auto makeToGeneralBarrier = [&](VkImage img) {
+            VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = colorRange;
+            return b;
+        };
+
+        toGeneralBarriers.push_back(makeToGeneralBarrier(node->accumTarget->getImage()));
+        if (copyExtraImages) {
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->motionVectorImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->normalDepthImage->getImage()));
+        }
+
+        VkDependencyInfo toGeneralDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toGeneralDep.imageMemoryBarrierCount = static_cast<uint32_t>(toGeneralBarriers.size());
+        toGeneralDep.pImageMemoryBarriers = toGeneralBarriers.data();
+        vkCmdPipelineBarrier2(cmd, &toGeneralDep);
     }
 
     vkEndCommandBuffer(cmd);
@@ -1740,7 +1773,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     VkSemaphoreSubmitInfo sigInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     if (m_useCrossGpuSync) {
         sigInfo.semaphore = node->secSemaphores[slot];
-        sigInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        sigInfo.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
     }
 
     VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };

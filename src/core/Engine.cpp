@@ -2670,7 +2670,7 @@ bool Engine::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory) {
         // 2. Copy secondary transferred 4K radiance buffer (upscaled on GPU 1) into m_secAccumImage
         m_secAccumImage->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
         );
 
@@ -4464,17 +4464,25 @@ void Engine::renderFrame() {
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        // Frame-start pipeline barrier to synchronize compute and transfer writes across frames
-        VkMemoryBarrier2 frameStartBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        frameStartBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT;
-        frameStartBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        frameStartBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        frameStartBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        // Refined frame-start barrier: target exact read/write hazards on m_accumImage across frames
+        if (m_config.progressive_accumulation && !accumReset && m_accumImage) {
+            VkImageMemoryBarrier2 accumStartBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            accumStartBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            accumStartBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            accumStartBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            accumStartBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            accumStartBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            accumStartBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            accumStartBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            accumStartBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            accumStartBarrier.image = m_accumImage->getImage();
+            accumStartBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        VkDependencyInfo frameStartDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        frameStartDep.memoryBarrierCount = 1;
-        frameStartDep.pMemoryBarriers = &frameStartBarrier;
-        vkCmdPipelineBarrier2(cmd, &frameStartDep);
+            VkDependencyInfo frameStartDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            frameStartDep.imageMemoryBarrierCount = 1;
+            frameStartDep.pImageMemoryBarriers = &accumStartBarrier;
+            vkCmdPipelineBarrier2(cmd, &frameStartDep);
+        }
 
         uint32_t qBase = m_currentFrame * 4;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
@@ -4486,8 +4494,8 @@ void Engine::renderFrame() {
             m_tlasNeedsGpuUpdate = false;
         }
 
+        bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
         if (!skipRayTracing) {
-            bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
             if (useWavefront) {
                 if (m_config.enable_nrc && m_nrcManager) {
                     m_nrcManager->resetCounters(cmd);
@@ -4613,18 +4621,22 @@ void Engine::renderFrame() {
 
         } // end if (!accumReachedCutoff)
 
-        VkMemoryBarrier2 memBarrier{};
-        memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT;
-        memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        // Redundant post-RT barrier eliminated for wavefront mode: WavefrontPipeline::recordFrame
+        // already terminates with a fully-scoped finalBarrier. Only emit for legacy RTP pipeline.
+        if (!useWavefront) {
+            VkMemoryBarrier2 memBarrier{};
+            memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT;
+            memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
-        VkDependencyInfo depInfo{};
-        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        depInfo.memoryBarrierCount = 1;
-        depInfo.pMemoryBarriers = &memBarrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
+            VkDependencyInfo depInfo{};
+            depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            depInfo.memoryBarrierCount = 1;
+            depInfo.pMemoryBarriers = &memBarrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+        }
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
@@ -4750,7 +4762,8 @@ void Engine::renderFrame() {
             uint32_t numTilesX = (mgpuBaseW + tileSize - 1u) / tileSize;
             uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
             secDispatchWidth = maxTilesPerGpuX * tileSize;
-            primDispatchWidth = (m_config.pipeline_type == PipelineType::Wavefront) ? mgpuBaseW : secDispatchWidth;
+            bool needFullScreenPrimGbuffer = (m_config.upscaler_mode == UpscalerMode::FSR3 || m_config.denoiser_mode == DenoiserMode::Upways);
+            primDispatchWidth = (needFullScreenPrimGbuffer && m_config.pipeline_type == PipelineType::Wavefront) ? mgpuBaseW : secDispatchWidth;
             dispatchWidth = primDispatchWidth;
             dispatchHeight = mgpuBaseH;
             secAccumHistory = 0u; // Secondary renders 1-frame delta; accum_running_avg accumulates merged frame
@@ -4996,7 +5009,7 @@ void Engine::renderFrame() {
 
         VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
         signalInfo.semaphore = m_rtCompleteSemaphores[m_currentFrame];
-        signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        signalInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
         VkSubmitInfo2 rtSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
         rtSubmit.commandBufferInfoCount = 1;

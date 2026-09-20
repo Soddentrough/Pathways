@@ -93,7 +93,7 @@ struct Config {
     bool custom_hdr_peak = false;        // Set to true when --hdr-peak is passed explicitly on CLI
     bool enable_refraction = true;
     bool enable_shadows = true;
-    bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation for bounce 0 (hardware rayQueryEXT)
+    bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation via hardware rayQueryEXT (Default: true)
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)

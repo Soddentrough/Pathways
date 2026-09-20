@@ -135,16 +135,30 @@ void main() {
     bool inBounds = false;
 
     if (pc.tileOffsetX == 1u) {
-        // Multi-GPU Checkerboard Tiling: Primary GPU runs full-screen primary RayGen to populate 100% G-buffers
-        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
-        if (pc.useMorton != 0u) {
-            pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+        if (pc.width < fw) {
+            // Multi-GPU Checkerboard Tiling: Half-screen packed even tiles (Primary GPU traces strictly 50% rays)
+            uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+            uint ty = uint(globalID.y) / tileSize;
+            uint tx_half = uint(globalID.x) / tileSize;
+            uint localX = uint(globalID.x) % tileSize;
+            uint tx = tx_half * 2u + (ty & 1u);
+            pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
+            storeCoord = pixelCoord;
+            storeWidth = fw;
+            inBounds = (globalID.x < int(pc.width) && globalID.y < int(pc.height) &&
+                        pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
         } else {
-            pixelCoord = globalID;
+            // Multi-GPU Checkerboard Tiling: Full-screen primary RayGen to populate 100% G-buffers for FSR3/ML
+            uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
+            if (pc.useMorton != 0u) {
+                pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+            } else {
+                pixelCoord = globalID;
+            }
+            storeCoord = pixelCoord;
+            storeWidth = fw;
+            inBounds = (pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
         }
-        storeCoord = pixelCoord;
-        storeWidth = fw;
-        inBounds = (pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
     } else if (pc.tileOffsetX == 2u) {
         // Multi-GPU Checkerboard Tiling: Secondary GPU operates on packed odd tiles
         uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
@@ -249,10 +263,12 @@ void main() {
 
         bool isLocalTile = true;
         if (pc.tileOffsetX == 1u) {
-            uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
-            uint tx = uint(pixelCoord.x) / tileSize;
-            uint ty = uint(pixelCoord.y) / tileSize;
-            isLocalTile = (((tx + ty) & 1u) == 0u);
+            if (pc.width >= fw) {
+                uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
+                uint tx = uint(pixelCoord.x) / tileSize;
+                uint ty = uint(pixelCoord.y) / tileSize;
+                isLocalTile = (((tx + ty) & 1u) == 0u);
+            }
         }
 
         if (closestTri < 0 && closestSphere < 0) {
@@ -382,52 +398,50 @@ void main() {
                 primaryNormal = vec3(0.0, 0.0, 1.0);
             }
 
-            // Specular virtual-hit motion vector and disparity calculation without gated flags
-            vec2 vSpecular = vSurface;
-            float dHit = 10000.0;
-
-            if (closestTri >= 0 || closestSphere >= 0) {
-                vec3 primaryHitPoint = origin + direction * closestT;
-                vec3 reflDir = reflect(direction, hitNormal);
-
-                rayQueryEXT rqSpec;
-                rayQueryInitializeEXT(rqSpec, topLevelAS,
-                                      gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                                      0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
-                rayQueryProceedEXT(rqSpec);
-                if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-                    float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
-                    vec3 specHitPt = primaryHitPoint + reflDir * specT;
-                    vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
-                    vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
-                    if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                        vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                    }
-                    dHit = specT;
-                } else {
-                    vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
-                    vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
-                    vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
-                    if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                        vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                    }
-                    dHit = 10000.0;
-                }
-            }
-
-            // Consolidated 4-Texture G-Buffer Layout Export:
-            // Tex 1: Base color albedo RGB + specular disparity D_spec = 1 / (1 + d_hit)
-            float dSpec = 1.0 / (1.0 + max(dHit, 0.0));
-            imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, dSpec));
-
-            // Tex 2: View-space surface normal + planar linear depth
+            // Standard G-Buffer Export (surface motion vectors, normal, depth)
             imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
-
-            // Tex 3: Surface MV (rg) + Specular Virtual MV (ba)
-            imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, vSpecular));
-
-            // Legacy 2-channel motion vector
             imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, 0.0, 0.0));
+
+            // Extended ML / FSR 3.1 Specular Virtual Motion & Disparity
+            // Strictly gated to active ML upscaling or capture passes (pc.captureMlData != 0)
+            // to avoid tracing a redundant secondary hardware ray query across all primary pixels.
+            if (pc.captureMlData != 0u) {
+                vec2 vSpecular = vSurface;
+                float dHit = 10000.0;
+
+                if (closestTri >= 0 || closestSphere >= 0) {
+                    vec3 primaryHitPoint = origin + direction * closestT;
+                    vec3 reflDir = reflect(direction, hitNormal);
+
+                    rayQueryEXT rqSpec;
+                    rayQueryInitializeEXT(rqSpec, topLevelAS,
+                                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                          0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
+                    rayQueryProceedEXT(rqSpec);
+                    if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                        float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
+                        vec3 specHitPt = primaryHitPoint + reflDir * specT;
+                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
+                        vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
+                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
+                        }
+                        dHit = specT;
+                    } else {
+                        vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
+                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
+                        vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
+                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
+                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
+                        }
+                        dHit = 10000.0;
+                    }
+                }
+
+                float dSpec = 1.0 / (1.0 + max(dHit, 0.0));
+                imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, dSpec));
+                imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, vSpecular));
+            }
         }
     }
 

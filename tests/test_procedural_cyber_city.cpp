@@ -34,7 +34,7 @@ int main() {
     // 2. BLAS Prototypes
     check_true(scene.blasRanges.size() == 19, "Expected exactly 19 BLAS prototypes");
     check_true(scene.meshRanges.size() == 19, "Expected exactly 19 MeshRange records");
-    check_true(scene.triangles.size() >= 8000, "Expected >= 8000 prototype triangles");
+    check_true(scene.triangles.size() >= 25000, "Expected >= 25000 prototype triangles");
     std::cout << "[PASS] Verified " << scene.blasRanges.size() << " BLAS ranges and "
               << scene.triangles.size() << " prototype triangles." << std::endl;
 
@@ -82,7 +82,7 @@ int main() {
     std::cout << "[PASS] Verified all 48 materials are actively used across all physical shading classes." << std::endl;
 
     // 4. Hardware TLAS Instances
-    check_true(scene.instances.size() >= 3500, "Instances count must be >= 3500");
+    check_true(scene.instances.size() >= 5000, "Instances count must be >= 5000");
     check_true(scene.instanceData.size() == scene.instances.size(), "instanceData size matches instances");
 
     uint64_t totalInstancedTriangles = 0;
@@ -93,12 +93,12 @@ int main() {
         instanceCounts[scene.instances[i].blasIndex]++;
         totalInstancedTriangles += scene.blasRanges[scene.instances[i].blasIndex].triangleCount;
     }
-    check_true(totalInstancedTriangles >= 3000000ULL, "Total instanced triangles must be >= 3,000,000 (millions)");
+    check_true(totalInstancedTriangles >= 12000000ULL, "Total instanced triangles must be >= 12,000,000 (millions)");
     std::cout << "[PASS] Verified " << scene.instances.size() << " TLAS hardware instances ("
               << totalInstancedTriangles << " total instanced triangles)." << std::endl;
 
     // 5. Physical Light Sources & Sampling Structures
-    check_true(scene.lights.size() >= 1500, "Light source count must be >= 1500");
+    check_true(scene.lights.size() >= 1800, "Light source count must be >= 1800");
     std::cout << "[PASS] Active physical light count: " << scene.lights.size() << " (>= 1500)." << std::endl;
 
     for (size_t l = 0; l < scene.lights.size(); ++l) {

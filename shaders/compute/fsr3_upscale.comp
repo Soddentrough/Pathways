@@ -94,14 +94,29 @@ void main() {
     vec2 frac = srcPos - vec2(baseCoord);
     ivec2 maxCoord = ivec2(int(pc.renderWidth) - 1, int(pc.renderHeight) - 1);
 
-    // 1. Load 4x4 input neighborhood taps and G-buffer normal/depth into local registers
-    vec3 tapRgb[4][4];
-    vec4 tapNormDepth[4][4];
-    float tapLuma[4][4];
+    // 1. Direct 4x4 Lanczos-2 accumulation and Karis-space statistics
+    // Streaming tap reads directly from image cache eliminates 784-byte scratch allocations.
+    vec3 sumColor = vec3(0.0);
+    float sumW = 0.0;
+    vec3 m1_ycocg = vec3(0.0);
+    vec3 m2_ycocg = vec3(0.0);
+    vec3 boxMin = vec3(1e9);
+    vec3 boxMax = vec3(-1e9);
+    float centerDepth = 0.0;
+    vec3 centerTapRgb = vec3(0.0);
+    vec3 centerNorm = vec3(0.0);
+
+    int startX = (frac.x < 0.5) ? 0 : 1;
+    int startY = (frac.y < 0.5) ? 0 : 1;
+
     for (int ky = 0; ky < 4; ++ky) {
         int sy = clamp(baseCoord.y + (ky - 1), 0, maxCoord.y);
+        float wy = lanczos2(float(ky - 1) - frac.y);
         for (int kx = 0; kx < 4; ++kx) {
             int sx = clamp(baseCoord.x + (kx - 1), 0, maxCoord.x);
+            float wx = lanczos2(float(kx - 1) - frac.x);
+            float w = wx * wy;
+
             ivec2 c = ivec2(sx, sy);
             float sampleScale = (pc.isInputNormalized == 1u) ? 1.0 : pc.invTotalSamples;
             vec3 sRgb = imageLoad(uRenderColor, c).rgb * sampleScale;
@@ -109,128 +124,17 @@ void main() {
             if (isnan(sRgb.r) || isinf(sRgb.r) || isnan(sRgb.g) || isinf(sRgb.g) || isnan(sRgb.b) || isinf(sRgb.b)) {
                 sRgb = vec3(0.0);
             }
-            tapRgb[ky][kx] = sRgb;
-            tapLuma[ky][kx] = luma(sRgb);
-            tapNormDepth[ky][kx] = imageLoad(uNormalDepth, c);
-        }
-    }
 
-    // 2. Monte Carlo Firefly Suppression Across All 16 Taps:
-    // Any isolated firefly in the 4x4 neighborhood must be suppressed before Lanczos-2 accumulation,
-    // otherwise it splats across multiple 4K display pixels or rings negatively.
-    for (int ky = 0; ky < 4; ++ky) {
-        for (int kx = 0; kx < 4; ++kx) {
-            float cLuma = tapLuma[ky][kx];
-            float sumNbrLuma = 0.0;
-            float sumNbrLumaSq = 0.0;
-            float count = 0.0;
-            int minY = max(0, ky - 1);
-            int maxY = min(3, ky + 1);
-            int minX = max(0, kx - 1);
-            int maxX = min(3, kx + 1);
-            for (int ny = minY; ny <= maxY; ++ny) {
-                for (int nx = minX; nx <= maxX; ++nx) {
-                    if (ny == ky && nx == kx) continue;
-                    float nL = tapLuma[ny][nx];
-                    sumNbrLuma += nL;
-                    sumNbrLumaSq += nL * nL;
-                    count += 1.0;
-                }
-            }
-            float mu = sumNbrLuma / count;
-            float sigma = sqrt(max(sumNbrLumaSq / count - mu * mu, 0.0));
-            float cap = mu + 1.5 * sigma;
-            if (cLuma > cap && cLuma > 1e-4) {
-                tapRgb[ky][kx] *= (cap / cLuma);
-                tapLuma[ky][kx] = cap;
-            }
-        }
-    }
-
-    // 2b. Geometry-Guided Spatial Bilateral Pre-Filter (Dynamic Motion / 1-SPP):
-    // Slashes 1-SPP Monte Carlo stochastic variance across diffuse surfaces prior to Lanczos-2 & history accumulation,
-    // eliminating horizontal noise streaking while preserving razor-sharp geometric edges and silhouettes.
-    // Filtering is performed in Karis tonemapped space to prevent isolated indirect fireflies from polluting neighbors.
-    if (pc.cameraMoved != 0u || pc.invTotalSamples >= 0.99) {
-        vec3 filteredRgb[4][4];
-        for (int ky = 0; ky < 4; ++ky) {
-            for (int kx = 0; kx < 4; ++kx) {
-                vec3 n0 = tapNormDepth[ky][kx].xyz;
-                float z0 = tapNormDepth[ky][kx].w;
-                vec3 c0 = tapRgb[ky][kx];
-
-                // Sky or invalid depth: retain original color
-                if (z0 <= 0.0 || z0 >= 5000.0) {
-                    filteredRgb[ky][kx] = c0;
-                    continue;
-                }
-
-                int kx1 = clamp(kx + 1, 0, 3);
-                int kx0 = clamp(kx - 1, 0, 3);
-                float gradX = (tapNormDepth[ky][kx1].w - tapNormDepth[ky][kx0].w) / max(float(kx1 - kx0), 1.0);
-
-                int ky1 = clamp(ky + 1, 0, 3);
-                int ky0 = clamp(ky - 1, 0, 3);
-                float gradY = (tapNormDepth[ky1][kx].w - tapNormDepth[ky0][kx].w) / max(float(ky1 - ky0), 1.0);
-
-                vec3 sumKaris = tonemapKaris(c0);
-                float sumW = 1.0;
-
-                int minY = max(0, ky - 1);
-                int maxY = min(3, ky + 1);
-                int minX = max(0, kx - 1);
-                int maxX = min(3, kx + 1);
-
-                for (int ny = minY; ny <= maxY; ++ny) {
-                    for (int nx = minX; nx <= maxX; ++nx) {
-                        if (ny == ky && nx == kx) continue;
-                        vec3 n_tap = tapNormDepth[ny][nx].xyz;
-                        float z_tap = tapNormDepth[ny][nx].w;
-                        if (z_tap <= 0.0 || z_tap >= 5000.0) continue;
-
-                        float z_pred = z0 + float(nx - kx) * gradX + float(ny - ky) * gradY;
-                        float depthDiff = min(abs(z_tap - z0), abs(z_tap - z_pred));
-                        float depthWeight = exp(-depthDiff / (0.10 * z0 + 1e-4));
-                        float normDot = max(0.0, dot(n0, n_tap));
-                        float normWeight = pow(normDot, 4.0);
-                        float w = depthWeight * normWeight;
-
-                        sumKaris += tonemapKaris(tapRgb[ny][nx]) * w;
-                        sumW += w;
-                    }
-                }
-                filteredRgb[ky][kx] = invTonemapKaris(sumKaris / sumW);
-            }
-        }
-        for (int ky = 0; ky < 4; ++ky) {
-            for (int kx = 0; kx < 4; ++kx) {
-                tapRgb[ky][kx] = filteredRgb[ky][kx];
-                tapLuma[ky][kx] = luma(filteredRgb[ky][kx]);
-            }
-        }
-    }
-
-    // 3. 4x4 Lanczos-2 accumulation in Karis tonemapped space & YCoCg statistics
-    vec3 sumColor = vec3(0.0);
-    float sumW = 0.0;
-    vec3 m1_ycocg = vec3(0.0);
-    vec3 m2_ycocg = vec3(0.0);
-    vec3 boxMin = vec3(1e9);
-    vec3 boxMax = vec3(-1e9);
-
-    int startX = (frac.x < 0.5) ? 0 : 1;
-    int startY = (frac.y < 0.5) ? 0 : 1;
-
-    for (int ky = 0; ky < 4; ++ky) {
-        float wy = lanczos2(float(ky - 1) - frac.y);
-        for (int kx = 0; kx < 4; ++kx) {
-            float wx = lanczos2(float(kx - 1) - frac.x);
-            float w = wx * wy;
-
-            vec3 sRgb = tapRgb[ky][kx];
             vec3 sKaris = tonemapKaris(sRgb);
             sumColor += sKaris * w;
             sumW += w;
+
+            if (ky == 1 && kx == 1) {
+                centerTapRgb = sRgb;
+                vec4 nd = imageLoad(uNormalDepth, c);
+                centerNorm = nd.xyz;
+                centerDepth = nd.w;
+            }
 
             // 2x2 local neighborhood for strict deringing bounds
             if (ky >= 1 && ky <= 2 && kx >= 1 && kx <= 2) {
@@ -250,7 +154,7 @@ void main() {
     currentUpsampled = clamp(currentUpsampled, boxMin, boxMax);
     vec3 currentUpsampledLinear = invTonemapKaris(currentUpsampled);
 
-    // 4. Depth-Based Motion Vector Dilation (3x3 Nearest-Depth Filter)
+    // 2. Depth-Based Motion Vector Dilation (3x3 Nearest-Depth Filter)
     float minDepth = 1e9;
     ivec2 bestMvCoord = baseCoord;
     for (int dy = -1; dy <= 1; ++dy) {
@@ -290,8 +194,7 @@ void main() {
     }
 
     vec3 historyColor = currentUpsampled;
-    float pixelDepth = tapNormDepth[1][1].w;
-    float currentDepth = (pixelDepth < 5000.0 && pixelDepth > 1e-3) ? pixelDepth : ((minDepth < 1e8) ? minDepth : 10000.0);
+    float currentDepth = (centerDepth < 5000.0 && centerDepth > 1e-3) ? centerDepth : ((minDepth < 1e8) ? minDepth : 10000.0);
 
     if (validHistory) {
         vec2 prevPx = prevUV * vec2(float(pc.displayWidth), float(pc.displayHeight)) - vec2(0.5);
@@ -335,7 +238,7 @@ void main() {
         }
     }
 
-    // 5. Velocity-Adaptive Variance Clamping in YCoCg Space
+    // 3. Velocity-Adaptive Variance Clamping in YCoCg Space
     if (validHistory) {
         vec3 mu = m1_ycocg * (1.0 / 9.0);
         vec3 sigma = sqrt(max(m2_ycocg * (1.0 / 9.0) - mu * mu, vec3(0.0)));
@@ -352,7 +255,7 @@ void main() {
         historyColor = YCoCgToRGB(histYCoCg);
     }
 
-    // 6. Velocity-Adaptive Temporal Blending (AMD FSR 3 Accumulation Model)
+    // 4. Velocity-Adaptive Temporal Blending (AMD FSR 3 Accumulation Model)
     vec3 finalRgb;
     if (pc.cameraMoved == 0u && (pc.invTotalSamples < 0.99 || pc.isInputNormalized == 1u)) {
         // Stationary convergence: unbiased progressive Monte Carlo pass-through
@@ -360,9 +263,6 @@ void main() {
     } else {
         // Dynamic camera motion or 1-SPP real-time navigation:
         // Scale alpha smoothly with velocity:
-        // Base alpha: ~0.06 - 0.08 (92-94% history retention for strong static denoising)
-        // Moving pixel: alpha scales smoothly between baseAlpha and conservative ceiling (0.10 - 0.14),
-        // preserving N_eff >= 7-16 frames on reprojectible surfaces instead of collapsing to noisy 1-SPP grains.
         float baseAlpha = clamp(1.0 - pc.temporalWeight, 0.08, 0.12);
         float motionFactor = smoothstep(0.5, 10.0, speed);
         float maxMotionAlpha = mix(0.20, 0.25, smoothstep(10.0, 25.0, speed));
@@ -372,38 +272,23 @@ void main() {
             // Feature F8: Disocclusion Spatial Pre-Filtering
             // True geometric disocclusion: apply 3x3 bilateral filter to incoming sample
             // to suppress raw Monte Carlo noise before output.
-            int cY = (frac.y < 0.5) ? 1 : 2;
-            int cX = (frac.x < 0.5) ? 1 : 2;
-            vec3 centerNorm = tapNormDepth[cY][cX].xyz;
-            float centerDepth = tapNormDepth[cY][cX].w;
-
             if (centerDepth > 0.0 && centerDepth < 5000.0) {
-                int cx1 = clamp(cX + 1, 0, 3);
-                int cx0 = clamp(cX - 1, 0, 3);
-                float gradX = (tapNormDepth[cY][cx1].w - tapNormDepth[cY][cx0].w) / max(float(cx1 - cx0), 1.0);
-
-                int cy1 = clamp(cY + 1, 0, 3);
-                int cy0 = clamp(cY - 1, 0, 3);
-                float gradY = (tapNormDepth[cy1][cX].w - tapNormDepth[cy0][cX].w) / max(float(cy1 - cy0), 1.0);
-
                 vec3 filterSum = vec3(0.0);
                 float filterWeightSum = 0.0;
                 for (int dy = -1; dy <= 1; ++dy) {
                     for (int dx = -1; dx <= 1; ++dx) {
-                        int ky = clamp(cY + dy, 0, 3);
-                        int kx = clamp(cX + dx, 0, 3);
-                        vec3 tapN = tapNormDepth[ky][kx].xyz;
-                        float tapD = tapNormDepth[ky][kx].w;
-                        if (tapD <= 0.0 || tapD >= 5000.0) continue;
+                        ivec2 tc = clamp(baseCoord + ivec2(dx, dy), ivec2(0), maxCoord);
+                        vec4 tapND = imageLoad(uNormalDepth, tc);
+                        if (tapND.w <= 0.0 || tapND.w >= 5000.0) continue;
 
-                        float predD = centerDepth + float(kx - cX) * gradX + float(ky - cY) * gradY;
-                        float dDiff = min(abs(tapD - centerDepth), abs(tapD - predD));
+                        float dDiff = abs(tapND.w - centerDepth);
                         float wD = exp(-dDiff / (0.10 * centerDepth + 1e-4));
-                        float wN = pow(max(0.0, dot(centerNorm, tapN)), 4.0);
+                        float wN = pow(max(0.0, dot(centerNorm, tapND.xyz)), 4.0);
                         float wDist = (dx == 0 && dy == 0) ? 1.0 : ((dx == 0 || dy == 0) ? 0.707 : 0.5);
                         float w = wD * wN * wDist;
 
-                        filterSum += tonemapKaris(tapRgb[ky][kx]) * w;
+                        vec3 tapC = imageLoad(uRenderColor, tc).rgb * ((pc.isInputNormalized == 1u) ? 1.0 : pc.invTotalSamples);
+                        filterSum += tonemapKaris(max(tapC, vec3(0.0))) * w;
                         filterWeightSum += w;
                     }
                 }
@@ -421,7 +306,7 @@ void main() {
     finalRgb = max(finalRgb, vec3(0.0));
     if (isnan(finalRgb.r) || isnan(finalRgb.g) || isnan(finalRgb.b) ||
         isinf(finalRgb.r) || isinf(finalRgb.g) || isinf(finalRgb.b)) {
-        finalRgb = max(tapRgb[1][1], vec3(0.0));
+        finalRgb = max(centerTapRgb, vec3(0.0));
     }
 
     imageStore(uHistoryOutput, pixelCoord, vec4(finalRgb, currentDepth));
