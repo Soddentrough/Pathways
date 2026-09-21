@@ -157,7 +157,7 @@ Pathways is designed for modern desktop workstations and gaming PCs with hardwar
 
 | Extension / Feature | Spec Date | Desktop Coverage (Win + Linux) | Mobile Coverage (Android) | Global Coverage (All Devices) | Role & Status in Pathways |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Enables GPU-autonomous material binning and kernel dispatch directly on the device with zero CPU intervention. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). Fallback via monolithic compute is supported (`--pipeline wavefront --wavefront-sort none`). |
+| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Powers Pathways' primary pure DGC engine with 100% device-generated commands for ray generation, material sorting, and compute microkernel dispatches directly on the device with zero CPU intervention. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). |
 | **`VK_KHR_acceleration_structure`** | Nov 20, 2020 | **~52.9%** | **~26.6%** | **~34.1%** | **BVH Management**: Required for building and querying hardware Top-Level (TLAS) and Bottom-Level (BLAS) ray tracing acceleration structures. |
 | **`VK_KHR_ray_tracing_pipeline`** | Nov 20, 2020 | **~51.3%** | **~7.6%** | **~21.8%** | **Hardware RTP**: Powers the dedicated hardware ray tracing pipeline (`--pipeline rtp` megakernel mode). |
 | **`VK_EXT_external_memory_host`** | Jan 17, 2018 | **~84.9%** | **~6.5%** | **~36.1%** | **Multi-GPU Zero-Copy**: Enables secondary GPU to stream rendered HDR tiles directly into pinned host RAM at PCIe line rate (~25 GB/s), eliminating peer PCIe BAR read stalls. |
@@ -251,7 +251,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--max-bounces` | `<int>` | Maximum path depth / ray bounces (or `--bounces`) | `4` |
 | `--no-accumulation` | *(flag)* | Disable progressive static accumulation (evaluate real-time noise; `--realtime`) | Accumulation on |
 | `--indirect-clamp` | `<float>` | Secondary bounce radiance luminance clamp to eliminate fireflies (0 = disabled) | `35.0` |
-| `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or monolithic (`none`) | `dual` |
+| `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `dual` |
 | `--sec-sort` | `none` \| `directional` | Secondary ray coherency sort mode (Option 1 on-chip DGC octant binning) | `none` |
 | `--upscaler` | `none` \| `fsr3` \| `upways` \| `fsr1` | Super-resolution upscaler: AMD FSR 3.1, Upways Neural, or Spatial EASU+RCAS | `none` |
 | `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra-perf` | Super-resolution scale preset (1.5x, 1.7x, 2.0x, 3.0x) | `quality` |
@@ -305,24 +305,24 @@ Pathways is profiled and benchmarked on modern AMD RDNA 4 architecture (`gfx1201
 
 Measured at native **3840×2160 (4K UHD)**, 1 SPP, 4 Bounces, FP16 HDR Accumulation on AMD RDNA 4 (`gfx1201`) under Mesa RADV ACO:
 
-| Scene | Scene Characteristics | Megakernel RTP (ms / FPS) | Wavefront Monolithic (ms / FPS) | Wavefront DGC (ms / FPS) | Relative Speedup (DGC vs RTP) | Visual Parity (PSNR / MAE) |
+| Scene | Scene Characteristics | Legacy Megakernel RTP (ms / FPS) | Pure Wavefront DGC (ms / FPS) | DGC Speedup vs. RTP | Frame Latency Delta | Visual Parity (PSNR / MAE) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Cornell Caustic** | Specular focusing & dielectric caustics | 7.47 ms (133.9 FPS) | 9.18 ms (108.9 FPS) | **3.74 ms (267.1 FPS)** | **2.00x** (2.45x vs Mono) | **29.80 dB** [PASS] |
-| **Dragon Attenuation** | High geometry, volumetric Beer-Lambert absorption | 8.07 ms (123.9 FPS) | 8.12 ms (123.2 FPS) | **4.16 ms (240.6 FPS)** | **1.94x** (1.95x vs Mono) | **33.76 dB** / 0.0083 [PASS] |
-| **Dragon Dispersion** | Dense mesh, chromatic dispersion, Fresnel transmission | 7.47 ms (133.9 FPS) | 7.47 ms (133.9 FPS) | **3.97 ms (251.6 FPS)** | **1.88x** (Wavefront Wins) | **34.10 dB** [PASS] |
-| **Classroom** | Dense architectural occlusion, multi-bounce GI | 12.53 ms (79.8 FPS) | 12.51 ms (79.9 FPS) | **9.97 ms (100.3 FPS)** | **1.26x** (Wavefront Wins) | **24.50 dB** [PASS] |
-| **Living Room Extended** | Complex architectural interior, divergent materials | 10.05 ms (99.6 FPS) | 10.50 ms (95.2 FPS) | **8.96 ms (111.5 FPS)** | **1.12x** (Wavefront Wins) | **29.25 dB** [PASS] |
-| **Cyber City** | 13.58M instanced triangles, 5,521 TLAS instances | 20.65 ms (48.4 FPS) | 17.54 ms (57.0 FPS) | **12.34 ms (81.0 FPS)** | **1.67x** (-8.31 ms vs RTP) | **31.20 dB** [PASS] |
-| **Bistro Interior** | Production scale (>1.3M triangles, 74 materials) | 30.19 ms (33.1 FPS) | 26.18 ms (38.2 FPS) | **23.67 ms (42.3 FPS)** | **1.28x** (-6.52 ms vs RTP) | **30.50 dB** [PASS] |
-| **Coffee Maker Extended** | Multi-material stress (OpenUSD, glossy conductors) | 6.98 ms (143.2 FPS) | 9.77 ms (102.4 FPS) | **8.43 ms (118.6 FPS)** | **1.16x vs Mono** | **23.29 dB** [PASS] |
-| **Cornell Box** | Low triangle count, baseline diffuse inter-reflection | **7.09 ms (141.1 FPS)** | 8.34 ms (119.9 FPS) | **8.01 ms (124.8 FPS)** | 0.89x (Fixed Barrier Floor) | **24.25 dB** [PASS] |
+| **Cornell Caustic** | Specular focusing & dielectric caustics | 7.47 ms (133.9 FPS) | **3.74 ms (267.1 FPS)** | **2.00x** (100% Faster) | **-3.73 ms** | **29.80 dB** [PASS] |
+| **Dragon Attenuation** | High geometry, volumetric Beer-Lambert absorption | 8.07 ms (123.9 FPS) | **4.16 ms (240.6 FPS)** | **1.94x** (94% Faster) | **-3.91 ms** | **33.76 dB** / 0.0083 [PASS] |
+| **Dragon Dispersion** | Dense mesh, chromatic dispersion, Fresnel transmission | 7.47 ms (133.9 FPS) | **3.97 ms (251.6 FPS)** | **1.88x** (88% Faster) | **-3.50 ms** | **34.10 dB** [PASS] |
+| **Cyber City** | 13.58M instanced triangles, 5,521 TLAS instances | 20.65 ms (48.4 FPS) | **12.34 ms (81.0 FPS)** | **1.67x** (67% Faster) | **-8.31 ms** | **31.20 dB** [PASS] |
+| **Bistro Interior** | Production scale (>1.3M triangles, 74 materials) | 30.19 ms (33.1 FPS) | **23.67 ms (42.3 FPS)** | **1.28x** (28% Faster) | **-6.52 ms** | **30.50 dB** [PASS] |
+| **Classroom** | Dense architectural occlusion, multi-bounce GI | 12.53 ms (79.8 FPS) | **9.97 ms (100.3 FPS)** | **1.26x** (26% Faster) | **-2.56 ms** | **24.50 dB** [PASS] |
+| **Living Room Extended** | Complex architectural interior, divergent materials | 10.05 ms (99.6 FPS) | **8.96 ms (111.5 FPS)** | **1.12x** (12% Faster) | **-1.09 ms** | **29.25 dB** [PASS] |
+| **Coffee Maker Extended** | Multi-material stress (OpenUSD, glossy conductors) | 6.98 ms (143.2 FPS) | **8.43 ms (118.6 FPS)** | 0.83x (Fixed Barrier Floor) | +1.45 ms | **23.29 dB** [PASS] |
+| **Cornell Box** | Low triangle count, baseline diffuse inter-reflection | **7.09 ms (141.1 FPS)** | **8.01 ms (124.8 FPS)** | 0.89x (Fixed Barrier Floor) | +0.92 ms | **24.25 dB** [PASS] |
 
 > **Takeaway & Microarchitectural Analysis**:
-> 1. **Zero Scratch Spilling & 100% Peak Occupancy**: Monolithic Megakernel RTP (`VK_KHR_ray_tracing_pipeline`) suffers from severe register pressure (**120–144 VGPRs**, 108 SGPRs), restricting wave occupancy to 10–12 subgroups/SIMD (25–37% occupancy ceiling) and spilling a **19.5 KB scratch memory frame per wave** for Continuation Passing Style (CPS) recursion. In contrast, Wavefront DGC decomposes shading into decoupled Wave32 microkernels consuming **< 40 VGPRs**, achieving **100% peak hardware occupancy (32 subgroups/SIMD)** with **0 bytes of scratch memory spilling** across all 31 compute microkernels.
-> 2. **Stream Compaction & Material Coherence**: In complex scenes with heavy transmission, caustics, and architectural occlusion (e.g. *Cornell Caustic*, *Dragon*, *Classroom*), ray lifetimes diverge wildly. The Megakernel serializes execution across heterogeneous materials and holds SIMD waves hostage while dead lanes idle. Wavefront DGC actively compacts queues via hardware Wave32 subgroup ballot leader election, achieving **1.2x to 2.45x higher ray throughput** by executing only homogeneous microkernels on active paths.
+> 1. **Zero Scratch Spilling & 100% Peak Occupancy**: The legacy Megakernel RTP fallback (`VK_KHR_ray_tracing_pipeline`) suffers from severe register pressure (**120–144 VGPRs**, 108 SGPRs), restricting wave occupancy to 10–12 subgroups/SIMD (25–37% occupancy ceiling) and spilling a **19.5 KB scratch memory frame per wave** for Continuation Passing Style (CPS) recursion. In contrast, Pure Wavefront DGC decomposes shading into decoupled Wave32 microkernels consuming **< 40 VGPRs**, achieving **100% peak hardware occupancy (32 subgroups/SIMD)** with **0 bytes of scratch memory spilling** across all 31 compute microkernels.
+> 2. **Stream Compaction & Material Coherence**: In complex scenes with heavy transmission, caustics, and architectural occlusion (e.g. *Cornell Caustic*, *Dragon*, *Classroom*, *Cyber City*), ray lifetimes diverge wildly. The monolithic RTP megakernel serializes execution across heterogeneous materials and holds SIMD waves hostage while dead lanes idle. Pure Wavefront DGC actively compacts queues via hardware Wave32 subgroup ballot leader election, achieving **up to 2.00x higher ray throughput** by executing only homogeneous microkernels on active paths.
 > 3. **Inline Hardware Ray Queries for Secondary Shadows**: Pathways eliminates secondary shadow queue VRAM round-trips by evaluating secondary visibility directly on-chip via inline hardware ray queries (`traceShadowRayInline`) inside registers with 0 bytes scratch spill, reserving DGC queue batching strictly for primary dispatches.
-> 4. **Technique D Dual Sorting (Morton 3D + Material Archetype)**: Secondary rays are sorted across both BSDF archetype and 3D Morton spatial codes, preserving L0/L1 texture and BVH cache locality across bounces.
-> 5. **Fixed Pipeline Barrier Floor**: Wavefront requires decoupled dispatch stages (Classify, Intersect, Shade) separated by Vulkan execution barriers and indirect DGC parameter writes, introducing an irreducible fixed overhead of ~0.45 ms. In trivial diffuse scenes without material divergence (e.g., baseline Cornell Box), this barrier floor gives Megakernel RTP a slight edge (~0.9 ms); in realistic production workloads, Wavefront DGC dominates.
+> 4. **Technique D Dual Sorting (Morton 3D + Material Archetype)**: Secondary rays are sorted across both BSDF archetype and 3D Morton spatial codes via 100% GPU-autonomous DGC execution, preserving L0/L1 texture and BVH cache locality across bounces.
+> 5. **Fixed Pipeline Barrier Floor**: Pure Wavefront DGC requires decoupled dispatch stages (Classify, Intersect, Shade) separated by Vulkan execution barriers and indirect DGC parameter writes, introducing an irreducible fixed overhead of ~0.45 ms. In trivial diffuse scenes without material divergence (e.g., baseline Cornell Box), this barrier floor gives the legacy RTP megakernel a slight edge (~0.9 ms); in realistic production workloads with complex geometry and materials, Pure Wavefront DGC decisively wins.
 
 ---
 
