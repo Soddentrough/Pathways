@@ -32,8 +32,8 @@ int main() {
     std::cout << "[PASS] ProceduralScene::createCyberCityScene() completed successfully." << std::endl;
 
     // 2. BLAS Prototypes
-    check_true(scene.blasRanges.size() == 19, "Expected exactly 19 BLAS prototypes");
-    check_true(scene.meshRanges.size() == 19, "Expected exactly 19 MeshRange records");
+    check_true(scene.blasRanges.size() == 20, "Expected exactly 20 BLAS prototypes");
+    check_true(scene.meshRanges.size() == 20, "Expected exactly 20 MeshRange records");
     check_true(scene.triangles.size() >= 25000, "Expected >= 25000 prototype triangles");
     std::cout << "[PASS] Verified " << scene.blasRanges.size() << " BLAS ranges and "
               << scene.triangles.size() << " prototype triangles." << std::endl;

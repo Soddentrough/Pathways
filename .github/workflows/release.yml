@@ -34,6 +34,9 @@ jobs:
             glslc \
             SDL3-devel \
             zlib-ng-compat-devel \
+            pkgconf-pkg-config \
+            ffmpeg-free-devel \
+            python3 \
             tar \
             gzip
 

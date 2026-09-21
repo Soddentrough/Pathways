@@ -194,46 +194,29 @@ void main() {
                 }
             }
         } else {
-            if (dot(rayDir, hitNormal) > 0.0) hitNormal = -hitNormal;
+            vec3 hitPoint = origin + rayDir * hitT;
+            bool frontFace = dot(rayDir, hitNormal) < 0.0;
+            if (!frontFace) hitNormal = -hitNormal;
 
             Material mat = materials[matId];
             vec3 emissive = mat.emissive.rgb;
 
             if ((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+                // Upright 3D Voxel Hologram Shading:
+                vec3 vidSample = SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
+
+                // Animated subtle holographic scanlines
                 float time = float(pc.frameIndex) * 0.01666667;
-                // 1. Chromatic aberration: horizontal displacement of R and B channels
-                float chrom = 0.007 * (1.0 + 0.35 * sin(time * 3.5));
-                vec2 uvR = hitUv + vec2(chrom, 0.0);
-                vec2 uvG = hitUv;
-                vec2 uvB = hitUv - vec2(chrom, 0.0);
+                float scanline = sin(hitPoint.y * 48.0 - time * 6.0) * 0.5 + 0.5;
 
-                // 2. High-frequency digital glitch jitter
-                vec3 dummyG;
-                float glitch = simplex3D_grad(vec3(floor(hitUv.y * 18.0), time * 8.0, 0.0), dummyG);
-                if (glitch > 0.70) {
-                    float shift = (glitch - 0.70) * 0.08 * sin(time * 50.0);
-                    uvR.x += shift;
-                    uvG.x += shift;
-                    uvB.x += shift;
-                }
+                // Subtle Fresnel edge rim glow on 3D voxel bevels
+                float fres = pow(1.0 - abs(dot(hitNormal, -rayDir)), 3.0);
+                vec3 rimColor = vec3(0.15, 0.75, 1.0) * (fres * 0.30);
 
-                // Sample RGB with chromatic dispersion
-                vec3 holoVideo = vec3(
-                    SAMPLE_SCENE_TEXTURE(mat.emissiveTex, uvR).r,
-                    SAMPLE_SCENE_TEXTURE(mat.emissiveTex, uvG).g,
-                    SAMPLE_SCENE_TEXTURE(mat.emissiveTex, uvB).b
-                );
+                // Preserve true video colors and sharp facial features with scanline modulation
+                vec3 holoColor = vidSample * (0.92 + 0.16 * scanline);
 
-                // 3. Scanline CRT / diffraction raster & beam sweep
-                float scanline = sin(hitUv.y * 360.0) * 0.22 + 0.78;
-                float vStripe = sin(hitUv.x * 640.0) * 0.08 + 0.92;
-                float beamSweep = exp(-abs(fract(time * 0.4) - hitUv.y) * 18.0) * 0.35;
-
-                // 4. Hologram edge fresnel glow (grazing angles shine brighter)
-                float edgeGlow = pow(1.0 - abs(dot(hitNormal, -rayDir)), 2.5);
-                vec3 holoTint = vec3(0.80, 0.95, 1.15);
-
-                emissive = (holoVideo * scanline * vStripe + vec3(beamSweep) + edgeGlow * 0.35 * holoTint) * mat.emissive.rgb * holoTint;
+                emissive = holoColor + rimColor;
             } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u && (mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) == 0u) {
                 // Flat 2D plane with emission (lower level billboards)
                 emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;

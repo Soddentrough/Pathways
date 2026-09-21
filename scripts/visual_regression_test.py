@@ -190,6 +190,40 @@ TEST_CONFIGS = [
         "render_path": f"{OUTPUT_DIR}/test_breakfast_room.png",
         "ref_path": f"{REF_DIR}/breakfast_room.png",
         "diff_path": f"{OUTPUT_DIR}/diff_breakfast_room.png"
+    },
+    {
+        "id": "cyber_city_4k",
+        "name": "Cyber City 4K (Dual GPU Real-Time Path Tracing)",
+        "scene": "Procedural Cyber City",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "cyber-city",
+            "--width", "3840", "--height", "2160",
+            "--frames", "60",
+            "--benchmark", "--mgpu",
+            "--dump-frame", f"{OUTPUT_DIR}/test_cyber_city_4k.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_cyber_city_4k.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_cyber_city_4k.png",
+        "ref_path": f"{REF_DIR}/cyber_city_4k.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_cyber_city_4k.png"
+    },
+    {
+        "id": "cyber_city_terrace",
+        "name": "Cyber City 1080p (Terrace 3D Voxel Hologram & Android)",
+        "scene": "Procedural Cyber City",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "cyber-city",
+            "--camera", "-6.8,29.0,36.5,2.0,25.0,-40.0,62.0",
+            "--width", "1920", "--height", "1080",
+            "--frames", "195",
+            "--dump-frame", f"{OUTPUT_DIR}/test_cyber_city_terrace.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_cyber_city_terrace.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_cyber_city_terrace.png",
+        "ref_path": f"{REF_DIR}/cyber_city_terrace.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_cyber_city_terrace.png"
     }
 ]
 

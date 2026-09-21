@@ -311,6 +311,39 @@ if [ -f "scenes/BuickRiviera/BuickRiviera.usdc" ]; then
     python3 scripts/verify_frame.py output/test_buick_usd.png output/stats_buick_usd.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 15.0
 fi
 
+# 9e. Test Suite 6g: Procedural Cyber-City Megastructure & Multi-GPU 4K Real-Time Benchmark
+echo ""
+echo "[6g] Running Test Suite 6g: Procedural Cyber-City Multi-GPU 4K Real-Time Benchmark..."
+./build/bin/pathways \
+    --headless \
+    --scene cyber-city \
+    --width 3840 \
+    --height 2160 \
+    --frames 60 \
+    --benchmark \
+    --mgpu \
+    --dump-frame output/test_cyber_city_4k.png \
+    --dump-stats output/stats_cyber_city_4k.json
+
+python3 scripts/verify_frame.py output/test_cyber_city_4k.png output/stats_cyber_city_4k.json 3840 2160 10.0 --max-mean-lum 0.85 --max-blown-pct 25.0
+
+# 9f. Test Suite 6h: Procedural Cyber-City Dynamic Multi-Frame Video Hologram E2E Verification
+echo ""
+echo "[6h] Running Test Suite 6h: Cyber-City Dynamic Multi-Frame Video Hologram Playback & Terrace View..."
+./build/bin/pathways \
+    --headless \
+    --scene cyber-city \
+    --camera -6.8,29.0,36.5,2.0,25.0,-40.0,62.0 \
+    --width 1920 \
+    --height 1080 \
+    --frames 195 \
+    --dump-frame output/test_cyber_city_terrace.png \
+    --dump-stats output/stats_cyber_city_terrace.json
+
+python3 scripts/verify_frame.py output/test_cyber_city_terrace.png output/stats_cyber_city_terrace.json 1920 1080 6.0
+
+python3 tests/e2e/test_cyber_city_video_playback.py
+
 # 10. Test Suite 7: Image Quality, Shadow Retention & Camera Motion Stability
 echo ""
 echo "[7/8] Running Test Suite 7: Image Quality, Shadow Retention & Motion Stability..."

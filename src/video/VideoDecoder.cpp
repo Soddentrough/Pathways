@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#ifdef PATHWAYS_HAS_FFMPEG
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -12,8 +13,11 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/avutil.h>
 }
+#endif
 
 namespace pathways {
+
+#ifdef PATHWAYS_HAS_FFMPEG
 
 VideoDecoder::VideoDecoder() {
 }
@@ -303,5 +307,26 @@ bool VideoDecoder::update(double dtSeconds) {
 
     return false;
 }
+
+#else
+
+VideoDecoder::VideoDecoder() {}
+VideoDecoder::~VideoDecoder() {}
+VideoDecoder::VideoDecoder(VideoDecoder&& other) noexcept = default;
+VideoDecoder& VideoDecoder::operator=(VideoDecoder&& other) noexcept = default;
+
+void VideoDecoder::release() {}
+void VideoDecoder::close() {}
+
+bool VideoDecoder::open(const std::string& filepath) {
+    Logger::info("VideoDecoder: Built without FFmpeg support. Video playback disabled for '{}'", filepath);
+    return false;
+}
+
+void VideoDecoder::rewind() {}
+bool VideoDecoder::decodeNextFrame() { return false; }
+bool VideoDecoder::update(double) { return false; }
+
+#endif
 
 } // namespace pathways

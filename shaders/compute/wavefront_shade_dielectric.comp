@@ -198,6 +198,10 @@ void main() {
             vec3 hitPoint = origin + hitT * rayDir;
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             hitNormal = frontFace ? hitNormal : -hitNormal;
+            vec2 effHitUv = hitUv;
+            if (!frontFace) {
+                effHitUv.x = 1.0 - effHitUv.x;
+            }
 
             Material mat = materials[matId];
             bool isWater = ((mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (mat.normalTex == 0xFFFFFF03u);

@@ -87,8 +87,14 @@ find_package(Vulkan REQUIRED)
 find_package(SDL3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
+endif()
+
+if(FFMPEG_FOUND)
+    add_compile_definitions(PATHWAYS_HAS_FFMPEG)
+endif()
 
 message(STATUS "Vulkan Include Dir: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "Vulkan Libraries: ${Vulkan_LIBRARIES}")
@@ -241,8 +247,11 @@ target_link_libraries(pathways
     SDL3::SDL3
     Threads::Threads
     ZLIB::ZLIB
-    PkgConfig::FFMPEG
 )
+
+if(FFMPEG_FOUND)
+    target_link_libraries(pathways PRIVATE PkgConfig::FFMPEG)
+endif()
 
 if(WIN32)
     target_link_libraries(pathways PRIVATE dxgi)

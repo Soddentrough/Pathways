@@ -1,4 +1,5 @@
 #include "scene/ProceduralScene.hpp"
+#include <fstream>
 #include <cmath>
 #include <algorithm>
 #include <glm/gtc/matrix_transform.hpp>
@@ -78,6 +79,91 @@ static void addBox(std::vector<TriangleGPU>& triangles,
     addQuad(triangles, p[0], p[4], p[7], p[3], rot(glm::vec3(-1, 0, 0)), matId);
     // Right
     addQuad(triangles, p[5], p[1], p[2], p[6], rot(glm::vec3(1, 0, 0)), matId);
+}
+
+static void addVoxelBox(std::vector<TriangleGPU>& triangles,
+                        glm::vec3 center, glm::vec3 size, uint32_t matId,
+                        glm::vec2 uvMin, glm::vec2 uvMax) {
+    glm::vec3 h = size * 0.5f;
+    float x0 = center.x - h.x;
+    float x1 = center.x + h.x;
+    float y0 = center.y - h.y;
+    float y1 = center.y + h.y;
+    float z0 = center.z - h.z;
+    float z1 = center.z + h.z;
+
+    // 1. Front Face (+Z normal) - facing front (+Z)
+    // p0: bottom-left, p1: bottom-right, p2: top-right, p3: top-left
+    addQuad(triangles,
+            glm::vec3(x0, y0, z1),
+            glm::vec3(x1, y0, z1),
+            glm::vec3(x1, y1, z1),
+            glm::vec3(x0, y1, z1),
+            glm::vec3(0.0f, 0.0f, 1.0f), matId,
+            glm::vec2(uvMin.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMin.y),
+            glm::vec2(uvMin.x, uvMin.y));
+
+    // 2. Back Face (-Z normal) - facing back (-Z)
+    addQuad(triangles,
+            glm::vec3(x1, y0, z0),
+            glm::vec3(x0, y0, z0),
+            glm::vec3(x0, y1, z0),
+            glm::vec3(x1, y1, z0),
+            glm::vec3(0.0f, 0.0f, -1.0f), matId,
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMin.x, uvMax.y),
+            glm::vec2(uvMin.x, uvMin.y),
+            glm::vec2(uvMax.x, uvMin.y));
+
+    // 3. Right Face (+X normal)
+    addQuad(triangles,
+            glm::vec3(x1, y0, z1),
+            glm::vec3(x1, y0, z0),
+            glm::vec3(x1, y1, z0),
+            glm::vec3(x1, y1, z1),
+            glm::vec3(1.0f, 0.0f, 0.0f), matId,
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMin.y),
+            glm::vec2(uvMax.x, uvMin.y));
+
+    // 4. Left Face (-X normal)
+    addQuad(triangles,
+            glm::vec3(x0, y0, z0),
+            glm::vec3(x0, y0, z1),
+            glm::vec3(x0, y1, z1),
+            glm::vec3(x0, y1, z0),
+            glm::vec3(-1.0f, 0.0f, 0.0f), matId,
+            glm::vec2(uvMin.x, uvMax.y),
+            glm::vec2(uvMin.x, uvMax.y),
+            glm::vec2(uvMin.x, uvMin.y),
+            glm::vec2(uvMin.x, uvMin.y));
+
+    // 5. Top Face (+Y normal)
+    addQuad(triangles,
+            glm::vec3(x0, y1, z1),
+            glm::vec3(x1, y1, z1),
+            glm::vec3(x1, y1, z0),
+            glm::vec3(x0, y1, z0),
+            glm::vec3(0.0f, 1.0f, 0.0f), matId,
+            glm::vec2(uvMin.x, uvMin.y),
+            glm::vec2(uvMax.x, uvMin.y),
+            glm::vec2(uvMax.x, uvMin.y),
+            glm::vec2(uvMin.x, uvMin.y));
+
+    // 6. Bottom Face (-Y normal)
+    addQuad(triangles,
+            glm::vec3(x0, y0, z0),
+            glm::vec3(x1, y0, z0),
+            glm::vec3(x1, y0, z1),
+            glm::vec3(x0, y0, z1),
+            glm::vec3(0.0f, -1.0f, 0.0f), matId,
+            glm::vec2(uvMin.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMax.x, uvMax.y),
+            glm::vec2(uvMin.x, uvMax.y));
 }
 
 static void addSphere(std::vector<TriangleGPU>& triangles,
@@ -933,11 +1019,15 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     mat35.type = MATERIAL_EMISSIVE;
     materials.push_back(mat35);
 
-    // 36: Rooftop Holographic Video Projection Display (Holographic Video Shader)
+    // 36: Rooftop Holographic Video Projection Display (Thin-Walled Translucent Holographic Shader)
     MaterialGPU mat36{};
-    mat36.albedo = glm::vec4(0.7f, 0.1f, 1.0f, 1.0f);
-    mat36.emissive = glm::vec4(1.8f, 1.2f, 2.5f, 1.0f);
+    mat36.albedo = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    mat36.emissive = glm::vec4(1.0f, 1.1f, 1.3f, 1.0f);
     mat36.emissiveTex = 1;
+    mat36.ior = 1.0f;
+    mat36.transmission = 0.0f;
+    mat36.thickness = 0.0f;
+    mat36.roughness = 0.0f;
     mat36.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_HOLO_VIDEO;
     materials.push_back(mat36);
 
@@ -1041,7 +1131,8 @@ enum CyberBlasType : uint32_t {
     CYBER_BLAS_ROAD_AVENUE = 16,
     CYBER_BLAS_ROAD_INTERSECTION = 17,
     CYBER_BLAS_PERIMETER_GROUND = 18,
-    CYBER_BLAS_COUNT = 19
+    CYBER_BLAS_HOLO_PROJECTOR = 19,
+    CYBER_BLAS_COUNT = 20
 };
 
 static void addWindowGrid(std::vector<TriangleGPU>& triangles,
@@ -1108,20 +1199,41 @@ SceneData ProceduralScene::createCyberCityScene() {
     SceneData scene;
     scene.materials = createCyberCityMaterials();
 
-    // Ingest initial video texture placeholder buffer (640x360 RGBA) for Billboard Video Display
+    // Ingest video billboard & hologram texture (640x360 RGBA)
     {
         TextureData videoTex;
         videoTex.width = 640;
         videoTex.height = 360;
         videoTex.isSrgb = false;
+
         videoTex.pixels.resize(640 * 360 * 4);
-        for (uint32_t py = 0; py < 360; ++py) {
-            for (uint32_t px = 0; px < 640; ++px) {
-                size_t idx = (py * 640 + px) * 4;
-                videoTex.pixels[idx + 0] = static_cast<uint8_t>(px * 255 / 640);
-                videoTex.pixels[idx + 1] = static_cast<uint8_t>(200);
-                videoTex.pixels[idx + 2] = static_cast<uint8_t>(py * 255 / 360);
-                videoTex.pixels[idx + 3] = 255;
+
+        bool loaded = false;
+        const std::vector<std::string> candidates = {
+            "scenes/cyber_city/cyber_city_frame_0.raw",
+            "../scenes/cyber_city/cyber_city_frame_0.raw",
+            "../../scenes/cyber_city/cyber_city_frame_0.raw"
+        };
+        for (const auto& path : candidates) {
+            std::ifstream file(path, std::ios::binary);
+            if (file) {
+                file.read(reinterpret_cast<char*>(videoTex.pixels.data()), videoTex.pixels.size());
+                if (file.gcount() == static_cast<std::streamsize>(videoTex.pixels.size())) {
+                    loaded = true;
+                    break;
+                }
+            }
+        }
+
+        if (!loaded) {
+            for (uint32_t py = 0; py < 360; ++py) {
+                for (uint32_t px = 0; px < 640; ++px) {
+                    size_t idx = (py * 640 + px) * 4;
+                    videoTex.pixels[idx + 0] = static_cast<uint8_t>(px * 255 / 640);
+                    videoTex.pixels[idx + 1] = static_cast<uint8_t>(200);
+                    videoTex.pixels[idx + 2] = static_cast<uint8_t>(py * 255 / 360);
+                    videoTex.pixels[idx + 3] = 255;
+                }
             }
         }
         scene.textures.push_back(std::move(videoTex));
@@ -1802,6 +1914,84 @@ SceneData ProceduralScene::createCyberCityScene() {
         recordBlasPrototype("Perimeter Ground", tStart);
     }
 
+    // Prototype 19: 3D Voxel Hologram Projector (CYBER_BLAS_HOLO_PROJECTOR)
+    {
+        uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
+        // 1. Heavy gunmetal base skid (Mat 19: Gunmetal Alloy Armor)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.2f, 0.0f), glm::vec3(5.6f, 0.4f, 5.6f), 0.0f, 19);
+        // 2. Stepped titanium collar (Mat 2: Titanium Chrome)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.45f, 0.0f), glm::vec3(4.6f, 0.15f, 4.6f), 0.0f, 2);
+        // 3. Circular receiver plate & glowing turquoise concentric neon border ring (Mat 17 Brushed Platinum, Mat 45 Electric Turquoise)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.55f, 0.0f), 2.2f, 0.08f, 17, 24);
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.60f, 0.0f), 2.0f, 0.03f, 45, 24);
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.64f, 0.0f), 1.8f, 0.04f, 19, 24);
+        // 4. Central optical projector lens / concave dish (Mat 30: Cyan Emitter)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.70f, 0.0f), 1.68f, 0.04f, 30, 24);
+
+        // 5. Overhead Projector Gantry Rig & Housing (sdProjector from reference shader)
+        for (float fx : {-1.85f, 1.85f}) {
+            for (float fz : {-1.85f, 1.85f}) {
+                // Vertical gunmetal base post
+                addBox(scene.triangles, glm::vec3(fx, 0.95f, fz), glm::vec3(0.24f, 0.80f, 0.24f), 0.0f, 19);
+                // Glowing turquoise collar ring
+                addBox(scene.triangles, glm::vec3(fx, 1.38f, fz), glm::vec3(0.30f, 0.06f, 0.30f), 0.0f, 45);
+                // Angled titanium upper truss strut reaching to overhead collar (fx*0.28, 4.25, fz*0.28)
+                glm::vec3 pBot(fx, 1.40f, fz);
+                glm::vec3 pTop(fx * 0.28f, 4.25f, fz * 0.28f);
+                glm::vec3 pMid = (pBot + pTop) * 0.5f;
+                addBox(scene.triangles, pMid, glm::vec3(0.12f, 2.90f, 0.12f), (fx * fz > 0.0f ? 28.0f : -28.0f), 2);
+                // Collimation guide laser filament connecting overhead lens to corner post
+                addBox(scene.triangles, (glm::vec3(0.0f, 4.10f, 0.0f) + pBot) * 0.5f, glm::vec3(0.02f, 2.80f, 0.02f), (fx * fz > 0.0f ? 26.0f : -26.0f), 45);
+            }
+        }
+        // Overhead projector mount gantry ring (Mat 2 Titanium)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 4.25f, 0.0f), 0.90f, 0.08f, 2, 24);
+        // Projector main housing body (sdProjector body box, Mat 19 Gunmetal)
+        addBox(scene.triangles, glm::vec3(0.0f, 4.45f, 0.0f), glm::vec3(0.80f, 0.32f, 0.80f), 0.0f, 19);
+        // Projector optical snout (sdProjector snout box, Mat 2 Titanium)
+        addBox(scene.triangles, glm::vec3(0.0f, 4.25f, 0.0f), glm::vec3(0.46f, 0.14f, 0.46f), 0.0f, 2);
+        // Downward-pointing emitter lens (sdProjector spherical lens, Mat 30 Cyan Emitter)
+        addSphere(scene.triangles, glm::vec3(0.0f, 4.10f, 0.0f), 0.24f, 30, 16, 16);
+        // Concentric neon emitter focus ring around lens (Mat 45 Electric Turquoise)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 4.14f, 0.0f), 0.36f, 0.03f, 45, 24);
+
+        // 6. Upright 3D Voxel Hologram Display: Full 16:9 Widescreen Matrix (32x18 = 576 voxels)
+        // Full video coverage (u in [0,1], v in [0,1]) - zero missing content across entire video timeline!
+        const uint32_t NX = 32;
+        const uint32_t NY = 18;
+        const float W = 3.20f;
+        const float H = 1.80f;
+        const float yBase = 0.95f;
+        const float dx = W / static_cast<float>(NX);
+        const float dy = H / static_cast<float>(NY);
+        const float boxW = dx * 0.88f; // tactile seam gap (12% margin)
+        const float boxH = dy * 0.88f; // tactile seam gap (12% margin)
+        const float zThick = 0.05f;    // 5cm physical 3D box thickness
+
+        for (uint32_t iy = 0; iy < NY; ++iy) {
+            float normY = (static_cast<float>(iy) + 0.5f) / static_cast<float>(NY);
+            float cy = yBase + normY * H;
+            float v0 = 1.0f - static_cast<float>(iy + 1) / static_cast<float>(NY);
+            float v1 = 1.0f - static_cast<float>(iy) / static_cast<float>(NY);
+
+            for (uint32_t ix = 0; ix < NX; ++ix) {
+                float normX = (static_cast<float>(ix) + 0.5f) / static_cast<float>(NX);
+                float cx = -W * 0.5f + normX * W;
+                float u0 = static_cast<float>(ix) / static_cast<float>(NX);
+                float u1 = static_cast<float>(ix + 1) / static_cast<float>(NX);
+
+                // Gentle cylindrical concave curvature facing the terrace viewer
+                float xRel = cx / (W * 0.5f);
+                float cz = -0.15f * (1.0f - xRel * xRel);
+
+                glm::vec3 center(cx, cy, cz);
+                glm::vec3 size(boxW, boxH, zThick);
+                addVoxelBox(scene.triangles, center, size, 36, glm::vec2(u0, v0), glm::vec2(u1, v1));
+            }
+        }
+        recordBlasPrototype("Hologram Projector", tStart);
+    }
+
     // =========================================================================
     // 2. Hardware TLAS Instancing & Physical Light Sources
     // =========================================================================
@@ -2003,6 +2193,20 @@ SceneData ProceduralScene::createCyberCityScene() {
                     glm::mat4 mGantry = glm::translate(glm::mat4(1.0f), glm::vec3(posX + 4.8f, y + 1.0f, posZ + 4.8f));
                     addInstance(CYBER_BLAS_COMM_GANTRY, mGantry);
                 }
+
+                // Camera-facing terrace holographic projectors on Mid B setbacks
+                if (gx == 5 && gz == 7 && m == 3) {
+                    glm::mat4 mTerraceHolo = glm::translate(glm::mat4(1.0f), glm::vec3(-6.4f, y + 1.2f, 30.5f)) *
+                                             glm::rotate(glm::mat4(1.0f), glm::radians(15.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                    addInstance(CYBER_BLAS_HOLO_PROJECTOR, mTerraceHolo);
+                    addBillboardLight(mTerraceHolo, glm::vec3(-1.6f, 1.85f, 0.0f), glm::vec3(3.2f, 0.0f, 0.0f), glm::vec3(0.0f, 1.8f, 0.0f), glm::vec3(0.5f, 1.5f, 3.0f), 0.5f);
+                }
+                if (gx == 6 && gz == 7 && m == 3) {
+                    glm::mat4 mTerraceHolo = glm::translate(glm::mat4(1.0f), glm::vec3(6.4f, y + 1.2f, 30.5f)) *
+                                             glm::rotate(glm::mat4(1.0f), glm::radians(-15.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                    addInstance(CYBER_BLAS_HOLO_PROJECTOR, mTerraceHolo);
+                    addBillboardLight(mTerraceHolo, glm::vec3(-1.6f, 1.85f, 0.0f), glm::vec3(3.2f, 0.0f, 0.0f), glm::vec3(0.0f, 1.8f, 0.0f), glm::vec3(0.5f, 1.5f, 3.0f), 0.5f);
+                }
             }
 
             // Tower Crown & Spire
@@ -2096,6 +2300,13 @@ SceneData ProceduralScene::createCyberCityScene() {
             // Light quad sits beneath bottom face at y = -0.11f
             addBillboardLight(mBridge, glm::vec3(-14.0f / 1.75f, -0.11f, -0.2f), glm::vec3(28.0f / 1.75f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 0.4f),
                               glm::vec3(2.0f, 28.0f, 36.0f), 1.0f);
+
+            // On tier 1 (by == 24.0f) of the camera foreground skybridge (gz == 7, posZ == 27.0f), mount central holographic projection display
+            if (gz == 7 && std::abs(by - 24.0f) < 1.0f) {
+                glm::mat4 mHoloBridge = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, by + 3.20f, posZ));
+                addInstance(CYBER_BLAS_HOLO_PROJECTOR, mHoloBridge);
+                addBillboardLight(mHoloBridge, glm::vec3(-1.6f, 1.85f, 0.0f), glm::vec3(3.2f, 0.0f, 0.0f), glm::vec3(0.0f, 1.8f, 0.0f), glm::vec3(0.5f, 1.5f, 3.0f), 0.5f);
+            }
         }
     }
 

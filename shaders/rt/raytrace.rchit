@@ -416,6 +416,10 @@ void main() {
     bool frontFace = dot(gl_WorldRayDirectionEXT, normal) < 0.0;
     vec3 geomNormal = frontFace ? normal : -normal;
     vec3 hitNormal = geomNormal;
+    vec2 effHitUv = hitUv;
+    if (!frontFace) {
+        effHitUv.x = 1.0 - effHitUv.x;
+    }
 
     Material mat = materials[tri.materialId];
 
@@ -477,17 +481,21 @@ void main() {
 
     vec3 emissive = mat.emissive.rgb;
     if ((mat.type & (1u << 14)) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+        // Upright 3D Voxel Hologram Shading:
+        vec3 vidSample = texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
+
+        // Animated subtle holographic scanlines
         float time = float(ubo.frameIndex) * 0.01666667;
-        float chrom = 0.007 * (1.0 + 0.35 * sin(time * 3.5));
-        vec3 holoVideo = vec3(
-            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv + vec2(chrom, 0.0)).r,
-            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).g,
-            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv - vec2(chrom, 0.0)).b
-        );
-        float scanline = sin(hitUv.y * 360.0) * 0.22 + 0.78;
-        float edgeGlow = pow(1.0 - abs(dot(hitNormal, -gl_WorldRayDirectionEXT)), 2.5);
-        vec3 holoTint = vec3(0.80, 0.95, 1.15);
-        emissive = (holoVideo * scanline + edgeGlow * 0.35 * holoTint) * mat.emissive.rgb * holoTint;
+        float scanline = sin(hitPoint.y * 48.0 - time * 6.0) * 0.5 + 0.5;
+
+        // Subtle Fresnel edge rim glow on 3D voxel bevels
+        float fres = pow(1.0 - abs(dot(hitNormal, -gl_WorldRayDirectionEXT)), 3.0);
+        vec3 rimColor = vec3(0.15, 0.75, 1.0) * (fres * 0.30);
+
+        // Preserve true video colors and sharp facial features with scanline modulation
+        vec3 holoColor = vidSample * (0.92 + 0.16 * scanline);
+
+        emissive = holoColor + rimColor;
     } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
         emissive *= texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
     }
@@ -738,19 +746,20 @@ void main() {
     bool sampleSpecular = false;
 
     if (transmission > 0.01 || mat.type == 2u) {
+        vec3 unitDir = normalize(gl_WorldRayDirectionEXT);
+        vec3 throughputMod = baseColor.rgb;
+
         if (!enableRefraction) {
             nextDirection = sampleCosineHemisphere(hitNormal, prd.seed);
             throughputFactor = baseColor.rgb;
         } else {
             float refractionRatio = frontFace ? (1.0 / iorVal) : iorVal;
-            vec3 unitDir = normalize(gl_WorldRayDirectionEXT);
             float cosTheta = min(dot(-unitDir, hitNormal), 1.0);
             float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
 
             bool cannotRefract = refractionRatio * sinTheta > 1.0;
             float reflectProb = fresnelDielectric(cosTheta, refractionRatio);
 
-            vec3 throughputMod;
             if (cannotRefract || reflectProb > randFloat(prd.seed)) {
                 // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                 nextDirection = reflect(unitDir, hitNormal);
