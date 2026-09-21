@@ -76,3 +76,7 @@ __pycache__/
 # Agent workspace artifacts
 .agents/
 ORIGINAL_REQUEST.md
+
+# Internal documentation, ideas, and scratch files
+docs/idea_*
+docs/scratch_*
