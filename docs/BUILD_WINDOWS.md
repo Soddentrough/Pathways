@@ -34,7 +34,7 @@ Pathways includes a modern, high-performance build system designed for Windows 1
 A PowerShell orchestrator (`build.ps1`) and batch wrapper (`build.bat`) are provided for single-command workflows:
 
 ### Quick Launch (Interactive GUI)
-Double click [`run.bat`](file:///c:/Users/naoki/Development/Pathways/run.bat) or run from any terminal:
+Double click [`run.bat`](../run.bat) or run from any terminal:
 ```powershell
 .\run.ps1
 ```

@@ -1,6 +1,6 @@
 # Pathways
 
-Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4** (Version **1.23.0**). Clean sheet design featuring **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
+Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4** (Version **1.24.0**). Clean sheet design featuring **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
 
 > **Design Philosophy**: No megakernel — only efficient, GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and modern real-time rendering principles. Pathways uses strictly standard Vulkan 1.4, KHR, and EXT specifications with **no proprietary extensions**.
 
@@ -79,6 +79,8 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ---
 
 ## Key Capabilities & Architecture
+
+> For complete mathematical formulations, pipeline stages, buffer layouts, and microkernel specifications, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### 1. Wavefront Path Tracing & Autonomous DGC
 - **Wavefront Architecture**: Decomposes ray tracing into decoupled compute stages (Ray Classification, Ray Intersection, Material Shading, Shadow Queries, Accumulation Resolve), eliminating execution divergence.
@@ -211,6 +213,8 @@ ctest --test-dir build --output-on-failure
 # Launch in windowed mode with target frame pacing at 1440p
 ./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
 ```
+
+For complete Linux toolchain configuration, CMake presets, and multi-GPU setup, see [BUILD_LINUX.md](docs/BUILD_LINUX.md).
 
 ---
 
@@ -409,6 +413,19 @@ RADV_DEBUG=syncshaders ./build/bin/pathways
 ## Thanks
 
 Additional thanks to **MrMPFR**.
+
+---
+
+## Documentation Suite
+
+Pathways maintains an extensive documentation directory in [`docs/`](docs/):
+- **[Documentation Hub](docs/README.md)**: Central landing page and directory catalog.
+- **[Engine Architecture Specification](docs/ARCHITECTURE.md)**: In-depth technical specification for pure DGC wavefront path tracing, multi-GPU scaling, and super-resolution.
+- **[Linux Build Guide](docs/BUILD_LINUX.md)**: Compilation, toolchain presets, driver configuration, and test execution for Fedora, Ubuntu, and Arch.
+- **[Windows 11 Build Guide](docs/BUILD_WINDOWS.md)**: MSYS2 UCRT64 toolchain, PowerShell automation, and CPack packaging.
+- **[Vulkan API Call Audit](docs/VULKAN_API_AUDIT.md)**: Specification tracking and multi-platform Vulkan Hardware Database comparison.
+- **[Material Shader Review](docs/reports/material_shader_review.md)**: In-depth physical BSDF and microarchitectural audit.
+- **[Scanlands Benchmark Report](docs/reports/scanlands_benchmark_report.md)**: Extreme point-instancing (359M triangles) single-GPU benchmark report.
 
 ---
 
