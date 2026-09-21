@@ -43,6 +43,7 @@ struct WavefrontSceneData {
     uint32_t fullHeight = 0;              // Full unclipped frame resolution height
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
     float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
+    bool inlineShadows = true;            // Inline shadow rays via hardware ray queries (bypasses separate shadow microkernel)
 };
 
 class WavefrontPipeline {
@@ -94,7 +95,8 @@ public:
                                 VkImageView mlSpecularImageView = VK_NULL_HANDLE,
                                 VkBuffer instanceBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize instanceSize = 0,
-                                VkImageView causticImageView = VK_NULL_HANDLE);
+                                VkImageView causticImageView = VK_NULL_HANDLE,
+                                VkBuffer restirReservoirBuffer = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height);
 
@@ -137,6 +139,10 @@ public:
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
     DGCManager* getDGCManager() const { return m_dgcManager.get(); }
     bool supportsExecutionSet() const { return m_supportsExecutionSet; }
+
+    Buffer* getRayGeomQueue(uint32_t slot) const { return m_rayGeomQueueA[slot].get(); }
+    Buffer* getRayHitQueue(uint32_t slot) const { return m_rayHitQueue[slot].get(); }
+    Buffer* getPixelToRayQueue(uint32_t slot) const { return m_pixelToRayQueue[slot].get(); }
 
     using PostClassifyCallback = std::function<void(VkCommandBuffer cmd, uint32_t frameSlot)>;
     void setPostClassifyCallback(PostClassifyCallback cb) { m_postClassifyCallback = std::move(cb); }
@@ -185,6 +191,7 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_queueCounters;
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;   // Double-buffered per in-flight frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_dgcStream;
+    std::array<std::unique_ptr<Buffer>, 2> m_pixelToRayQueue; // 4B pixel-to-ray mapping for ReSTIR DI
 
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

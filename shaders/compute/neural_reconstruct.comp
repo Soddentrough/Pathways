@@ -16,7 +16,7 @@ const uint TILE_M = 16u;
 // Descriptors: Consolidated 4-Texture G-Buffer Inputs & History State
 // =========================================================================
 // Tex 0: Invertible log composite radiance RGB + surface roughness alpha
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uAccumImage;
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D uAccumImage;
 
 // Tex 2: View-space surface normal XYZ + planar linear view depth
 layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uNormalDepthImage;
@@ -45,6 +45,25 @@ layout(set = 0, binding = 11, rgba16f) writeonly uniform image2D uSpecHistoryOut
 layout(std430, set = 0, binding = 12) readonly buffer WeightBuffer {
     float16_t weights[];
 };
+
+struct UnifiedReservoirPT {
+    uint lightIndex_M;
+    float wSum;
+    uint flags_uv_age;
+    float targetPdf;
+    float secondaryHitDist;
+    uint secondaryHitNormal;
+    uint secondaryRadianceRG;
+    uint secondaryRadianceB_flags;
+};
+
+// Unified ReSTIR PT Reservoir Buffer (Binding 13)
+layout(std430, set = 0, binding = 13) readonly buffer ReservoirBuffer {
+    UnifiedReservoirPT uReservoirs[];
+};
+
+// Reconstruct Confidence Output Map (Binding 14)
+layout(set = 0, binding = 14, r16f) writeonly uniform image2D uConfidenceOutputImage;
 
 // 96-byte Push Constants struct (24 fields x 4 bytes)
 layout(push_constant) uniform UpwaysPushConstants {
@@ -229,12 +248,12 @@ void main() {
             vec4 histSurf = sampleDiffHistoryBilinear(prevUvSurf, maxHistCoord);
             vec4 histSpec = sampleSpecHistoryBilinear(prevUvSpec, maxHistCoord);
 
-            // Plane-aware Disocclusion Confidence
+            // Plane-aware Disocclusion Confidence with deterministic geometric rejection (10% depth delta)
             float prevDepth = histSurf.w;
             bool historyPresent = (prevDepth > 0.0) && (pc.frameIndex > 0u) && (pc.resetHistory == 0u);
-            float depthDelta = (viewDepth > 0.0 && prevDepth > 0.0) ? (abs(viewDepth - prevDepth) / max(viewDepth, prevDepth)) : 1.0;
+            float depthDelta = (viewDepth > 0.0 && prevDepth > 0.0) ? (abs(viewDepth - prevDepth) / max(viewDepth, 1e-3)) : 1.0;
             bool surfValid = (prevUvSurf.x >= 0.0 && prevUvSurf.x <= 1.0 && prevUvSurf.y >= 0.0 && prevUvSurf.y <= 1.0);
-            float confidence = (surfValid && historyPresent) ? (1.0 - smoothstep(0.02, 0.18, depthDelta)) : 0.0;
+            float confidence = (surfValid && historyPresent && depthDelta <= 0.10) ? (1.0 - smoothstep(0.02, 0.10, depthDelta)) : 0.0;
 
             s_albedo[tid] = baseAlbedo;
             s_currentDepth[tid] = viewDepth;
@@ -246,6 +265,16 @@ void main() {
 
             // Sample density conditioning
             float sNorm = upwaysComputeSnorm(float(pc.totalSamples));
+
+            // Read Unified ReSTIR PT Reservoir for primary hit pixel
+            uint resIdx = uint(inCoord.y * pc.inputWidth + inCoord.x);
+            UnifiedReservoirPT res = uReservoirs[resIdx];
+            uint resM = (res.lightIndex_M >> 16u) & 0xFFFFu;
+            float resNormM = clamp(float(resM) / 64.0, 0.0, 1.0);
+            float p_hat = max(res.targetPdf, 1e-6);
+            float resW = clamp(res.wSum / (max(float(resM), 1.0) * p_hat), 0.0, 4.0) * 0.25;
+            uint resPathLen = (res.flags_uv_age >> 9u) & 3u;
+            float resIsGI = (resPathLen >= 2u) ? 1.0 : 0.0;
 
             // Assemble 32-channel continuous input features for Wave32 WMMA Head
             s_in_features[tid * 32u + 0u]  = float16_t(logRadiance.r);
@@ -278,9 +307,9 @@ void main() {
             s_in_features[tid * 32u + 24u] = float16_t(logDiff.r);
             s_in_features[tid * 32u + 25u] = float16_t(logDiff.g);
             s_in_features[tid * 32u + 26u] = float16_t(logDiff.b);
-            s_in_features[tid * 32u + 27u] = float16_t(0.04);
-            s_in_features[tid * 32u + 28u] = float16_t(0.04);
-            s_in_features[tid * 32u + 29u] = float16_t(0.04);
+            s_in_features[tid * 32u + 27u] = float16_t(resNormM);
+            s_in_features[tid * 32u + 28u] = float16_t(resW);
+            s_in_features[tid * 32u + 29u] = float16_t(resIsGI);
             s_in_features[tid * 32u + 30u] = float16_t(fract(inCoordF.x)); // Continuous subpixel phase X
             s_in_features[tid * 32u + 31u] = float16_t(fract(inCoordF.y)); // Continuous subpixel phase Y
         } else {
@@ -456,9 +485,9 @@ void main() {
             vec3 blendedLogDiff = mix(histSurf, logRadiance, effectiveAlpha);
             vec3 blendedLogSpec = mix(histSpec, logRadiance, effectiveAlpha);
 
-            // Bounded residual correction: prevents runaway or negative clamping
-            vec3 cleanLogDiff = clamp(blendedLogDiff + clamp(deltaDiff * 0.25, vec3(-0.5), vec3(0.5)), vec3(0.0), vec3(3.8));
-            vec3 cleanLogSpec = clamp(blendedLogSpec + clamp(deltaSpec * 0.25, vec3(-0.5), vec3(0.5)), vec3(0.0), vec3(3.8));
+            // Bounded residual correction: prevents runaway or negative clamping (tight +/- 0.15 bound)
+            vec3 cleanLogDiff = clamp(blendedLogDiff + clamp(deltaDiff * 0.15, vec3(-0.15), vec3(0.15)), vec3(0.0), vec3(3.8));
+            vec3 cleanLogSpec = clamp(blendedLogSpec + clamp(deltaSpec * 0.15, vec3(-0.15), vec3(0.15)), vec3(0.0), vec3(3.8));
 
             // Clamped Inverse Log Decompression (y <= 3.8)
             vec3 cleanDiff = upwaysInverseLogTransform(cleanLogDiff);
@@ -485,6 +514,10 @@ void main() {
             // Write temporal history state
             imageStore(uDiffHistoryOutputImage, outCoord, vec4(cleanLogDiff, s_currentDepth[tid]));
             imageStore(uSpecHistoryOutputImage, outCoord, vec4(cleanLogSpec, s_specDisparity[tid]));
+
+            // Write reconstructed confidence map for ReSTIR closed-loop feedback gating
+            float predConfidence = clamp(1.0 / (1.0 + exp(-float(s_fc4_out[tid * 16u + 9u]))), 0.0, 1.0);
+            imageStore(uConfidenceOutputImage, outCoord, vec4(predConfidence, 0.0, 0.0, 0.0));
         }
     }
 }

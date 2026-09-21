@@ -29,6 +29,13 @@ public:
     uint32_t getWidth() const { return m_image ? m_image->getWidth() : 0; }
     uint32_t getHeight() const { return m_image ? m_image->getHeight() : 0; }
 
+    void updatePixelsAsync(
+        VkCommandBuffer cmd,
+        Buffer& stagingBuffer,
+        const void* pixels,
+        size_t dataSize
+    );
+
     static std::unique_ptr<Texture> createFromPixels(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
         uint32_t width, uint32_t height, VkFormat format, const void* pixels, size_t dataSize,

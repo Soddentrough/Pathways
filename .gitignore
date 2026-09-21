@@ -55,6 +55,8 @@ scenes/*/
 !scenes/Kitchen_set/**
 !scenes/BuickRiviera/
 !scenes/BuickRiviera/**
+!scenes/cyber_city/
+!scenes/cyber_city/**
 
 # Inside shipped scene subdirectories, exclude duplicate core models, temporary backups, and reference PNG renders
 scenes/*/*_core.glb

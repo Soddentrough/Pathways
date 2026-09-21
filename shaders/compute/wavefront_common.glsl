@@ -285,6 +285,7 @@ struct RayState {
 #define MATERIAL_FLAG_PROCEDURAL_WATER   (1u << 11)
 #define MATERIAL_FLAG_PROCEDURAL_PUDDLE  (1u << 12)
 #define MATERIAL_FLAG_PROCEDURAL_HOLO    (1u << 13)
+#define MATERIAL_FLAG_HOLO_VIDEO         (1u << 14)
 
 uint getMaterialArchetype(Material mat) {
     // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures

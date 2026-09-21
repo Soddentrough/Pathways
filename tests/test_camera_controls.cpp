@@ -134,6 +134,32 @@ int main() {
     cam.setAdaptiveFov(false);
     cam.setFov(50.0f);
     cam.adaptFovForAspect(1280.0f / 2160.0f);
+    assert_near(cam.getFov(), 50.0f, 0.01f, "Manual FOV preserved when adaptive FOV disabled");
+    std::cout << "[PASS] Manual FOV preservation verified when adaptive mode disabled." << std::endl;
+
+    // 10b. Hor+ Aspect Ratio Transition & Authored FOV Preservation (16:9 Window -> 21:9 Fullscreen)
+    cam.setAdaptiveFov(true);
+    cam.setDefaultFraming(glm::vec3(0.0f, 32.0f, 60.0f), glm::vec3(0.0f, 25.0f, -40.0f), 62.0f);
+    assert_near(cam.getFov(), 62.0f, 0.01f, "Authored FOV set to 62 deg");
+
+    // 16:9 4K Window (3840x2160, aspect = 1.7778)
+    cam.setAspect(3840.0f / 2160.0f);
+    assert_near(cam.getFov(), 62.0f, 0.01f, "16:9 landscape retains authored 62 deg vertical FOV (no zoom-in)");
+
+    // Resize/Fullscreen transition to 21:9 Ultrawide (3440x1440, aspect = 2.3889)
+    cam.setAspect(3440.0f / 1440.0f);
+    assert_near(cam.getFov(), 62.0f, 0.01f, "21:9 ultrawide preserves 62 deg vertical FOV (Hor+ expansion, no zoom-in)");
+
+    // Transition back to 16:9
+    cam.setAspect(1920.0f / 1080.0f);
+    assert_near(cam.getFov(), 62.0f, 0.01f, "Transition back to 16:9 preserves 62 deg vertical FOV");
+
+    // Reset to default restores authored 62 deg
+    cam.processKeyboard('W', 1.0f);
+    cam.resetToDefault();
+    assert_near(cam.getFov(), 62.0f, 0.01f, "Reset to default restores authored 62 deg framing");
+    std::cout << "[PASS] 16:9 to 21:9 Hor+ scaling & authored FOV zoom-in prevention verified." << std::endl;
+
     // 11. Scale-Adaptive Camera Speeds (Half-Distance Traversal Time Law)
     // Small scene (e.g. coffee maker, radius 0.25m, target dist 0.85m)
     cam.setSceneScale(0.25f, 0.85f);

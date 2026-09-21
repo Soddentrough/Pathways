@@ -22,7 +22,7 @@ Camera::Camera(glm::vec3 position, glm::vec3 target, float fov, float aspect)
 
 void Camera::setAspect(float aspect) {
     if (std::abs(m_aspect - aspect) > 0.001f) {
-        if (m_adaptiveFov) {
+        if (m_adaptiveFov && (aspect < 1.05f || m_aspect < 1.05f)) {
             adaptFovForAspect(aspect);
         } else {
             m_aspect = aspect;
@@ -32,6 +32,7 @@ void Camera::setAspect(float aspect) {
 }
 
 void Camera::adaptFovForAspect(float aspect) {
+    float prevAspect = m_aspect;
     m_aspect = aspect;
     if (m_adaptiveFov) {
         if (aspect < 1.05f) {
@@ -44,7 +45,13 @@ void Camera::adaptFovForAspect(float aspect) {
             float adaptedFovY = glm::degrees(halfFovYRad) * 2.0f;
             m_fov = std::clamp(adaptedFovY, 45.0f, 90.0f);
         } else {
-            m_fov = m_defaultFov;
+            // In landscape mode (16:9, 16:10, 21:9, 32:9), preserve authored vertical FOV.
+            // Under standard Hor+ perspective projection, horizontal FOV expands proportionally
+            // with aspect ratio (tan(halfFovX) = aspect * tan(halfFovY)), avoiding clipping or unwanted zoom.
+            // Only restore default baseline FOV if returning from portrait mode.
+            if (prevAspect < 1.05f && m_defaultFov > 0.0f) {
+                m_fov = m_defaultFov;
+            }
         }
     }
     m_moved = true;
@@ -53,6 +60,7 @@ void Camera::adaptFovForAspect(float aspect) {
 void Camera::setFov(float fov) {
     if (std::abs(m_fov - fov) > 0.01f) {
         m_fov = fov;
+        m_defaultFov = fov;
         m_moved = true;
     }
 }

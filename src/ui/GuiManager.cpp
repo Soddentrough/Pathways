@@ -636,13 +636,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         double pct = (c.pipeline_stages.primary_rays > 0)
                             ? (100.0 * static_cast<double>(b.rays_left) / c.pipeline_stages.primary_rays)
                             : 0.0;
+                        std::string shadowStr = (b.shadow_ms > 0.0005f) ? std::format("Shadow: {:.2f} ms", b.shadow_ms) : "Shadow: Inline";
                         if (b.intersect_ms > 0.0001) {
-                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | Intersect: %.2f ms | %s rays left (%.1f%%)",
-                                                b.bounce, b.shade_ms, b.shadow_ms, b.intersect_ms,
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | %s | Intersect: %.2f ms | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, shadowStr.c_str(), b.intersect_ms,
                                                 formatRayCount(b.rays_left).c_str(), pct);
                         } else {
-                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | Shadow: %.2f ms | %s rays left (%.1f%%)",
-                                                b.bounce, b.shade_ms, b.shadow_ms,
+                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | %s | %s rays left (%.1f%%)",
+                                                b.bounce, b.shade_ms, shadowStr.c_str(),
                                                 formatRayCount(b.rays_left).c_str(), pct);
                         }
                     }
@@ -1470,6 +1471,29 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Percentage of rays that continue tracing to provide real-time training samples.");
+                }
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("ReSTIR Direct Illumination (gfx1201 Ultra-Lean):");
+            if (ImGui::Checkbox("Enable ReSTIR DI", &config.enable_restir_di)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spatio-temporal reservoir resampling for direct illumination with 16B reservoirs and LDS-cached spatial reuse. Opt-in via --restir-di.");
+            }
+            if (config.enable_restir_di) {
+                ImGui::Indent();
+                int mCap = static_cast<int>(config.restir_di_m_cap);
+                if (ImGui::SliderInt("Temporal M-Cap", &mCap, 1, 100)) {
+                    config.restir_di_m_cap = static_cast<uint32_t>(mCap);
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Maximum temporal history sample count M cap to prevent lag and bias.");
                 }
                 ImGui::Unindent();
             }

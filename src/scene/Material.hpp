@@ -23,7 +23,8 @@ enum MaterialFlags : uint32_t {
     MATERIAL_FLAG_PROCEDURAL_TERRAIN = (1u << 9),
     MATERIAL_FLAG_PROCEDURAL_WATER   = (1u << 11),
     MATERIAL_FLAG_PROCEDURAL_PUDDLE  = (1u << 12),
-    MATERIAL_FLAG_PROCEDURAL_HOLO    = (1u << 13)
+    MATERIAL_FLAG_PROCEDURAL_HOLO    = (1u << 13),
+    MATERIAL_FLAG_HOLO_VIDEO         = (1u << 14)
 };
 
 inline constexpr uint32_t operator|(MaterialType a, MaterialFlags b) {

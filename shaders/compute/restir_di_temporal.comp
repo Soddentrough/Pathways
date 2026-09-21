@@ -1,0 +1,212 @@
+#version 460
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "wavefront_common.glsl"
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 1) readonly buffer PrevReservoirBuffer {
+    UnifiedReservoirPT inPrevReservoirs[];
+};
+
+layout(std430, binding = 2) readonly buffer InRayGeomQueue {
+    RayGeometry inGeoms[];
+};
+
+layout(std430, binding = 3) readonly buffer InRayHitQueue {
+    RayHit inHits[];
+};
+
+layout(std430, binding = 4) readonly buffer LightsBuffer {
+    Light lights[];
+};
+
+layout(std430, binding = 5) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(binding = 6) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
+} ubo;
+
+layout(binding = 7, rg16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 8, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 9, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
+
+layout(std430, binding = 10) readonly buffer LightTreeBuffer {
+    LightTreeNode lightNodes[];
+};
+
+layout(std430, binding = 11) writeonly buffer TemporalOutBuffer {
+    UnifiedReservoirPT outTemporalReservoirs[];
+};
+
+layout(std430, binding = 13) readonly buffer PixelToRayBuffer {
+    uint pixelToRay[];
+};
+
+layout(push_constant) uniform ReSTIRPushConstants {
+    uint width;
+    uint height;
+    uint numLights;
+    uint frameIndex;
+    uint mCap;
+    uint numTriangles;
+    uint hasLightTree;
+    uint passIndex;
+} pc;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) return;
+
+    uint pixelIdx = pixelCoord.y * pc.width + pixelCoord.x;
+    uint seed = pixelIdx ^ (pc.frameIndex * 1973u + 7u);
+
+    UnifiedReservoirPT emptyRes;
+    emptyRes.lightIndex_M = 0u;
+    emptyRes.wSum = 0.0;
+    emptyRes.flags_uv_age = 0u; // invalid
+    emptyRes.targetPdf = 0.0;
+    emptyRes.secondaryHitDist = 0.0;
+    emptyRes.secondaryHitNormal = 0u;
+    emptyRes.secondaryRadianceRG = 0u;
+    emptyRes.secondaryRadianceB_flags = 0u;
+
+    uint rayIdx = pixelToRay[pixelIdx];
+    if (rayIdx == 0xFFFFFFFFu || pc.numLights == 0u) {
+        outTemporalReservoirs[pixelIdx] = emptyRes;
+        return;
+    }
+
+    RayGeometry geom = inGeoms[rayIdx];
+    RayHit hit = inHits[rayIdx];
+    uint hitType = floatBitsToUint(hit.hitData1.w);
+    float hitT = hit.hitData0.x;
+
+    // Inactive ray, sky miss, or invalid hit
+    if (hitType == 2u || hitT <= 0.0) {
+        outTemporalReservoirs[pixelIdx] = emptyRes;
+        return;
+    }
+
+    uint matId = floatBitsToUint(hit.hitData0.y);
+    Material mat = materials[matId];
+
+    // Pure dielectric (glass, water) has no direct diffuse/specular NEE lighting
+    if ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.001) {
+        outTemporalReservoirs[pixelIdx] = emptyRes;
+        return;
+    }
+
+    vec3 origin = geom.originPackedDir.xyz;
+    vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
+    vec3 hitPoint = origin + dir * hitT;
+    vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
+    f16vec3 diffuseAlbedo = f16vec3(mat.albedo.rgb);
+
+    // --- PHASE 1: Generate Fresh Candidates (Fused Candidate Generation) ---
+    UnifiedReservoirPT rCurr;
+    rCurr.lightIndex_M = 0u;
+    rCurr.wSum = 0.0;
+    rCurr.flags_uv_age = 0u;
+    rCurr.targetPdf = 0.0;
+    rCurr.secondaryHitDist = 0.0;
+    rCurr.secondaryHitNormal = 0u;
+    rCurr.secondaryRadianceRG = 0u;
+    rCurr.secondaryRadianceB_flags = 0u;
+
+    const uint NUM_CANDIDATES = 4u;
+    for (uint c = 0u; c < NUM_CANDIDATES; ++c) {
+        uint lightIdx = 0u;
+        float selectPdf = 1.0;
+        if (pc.hasLightTree != 0u && pc.numLights > 1u) {
+            SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, selectPdf);
+        } else {
+            SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, selectPdf);
+        }
+
+        Light light = lights[lightIdx];
+        vec2 luv = randVec2(seed);
+        float p_hat = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, luv);
+        float weight = (p_hat > 0.0 && selectPdf > 0.0) ? (p_hat / selectPdf) : 0.0;
+        updateReservoirDI(rCurr, lightIdx, weight, p_hat, luv, seed);
+    }
+
+    // --- PHASE 2: Temporal Reprojection & Reuse ---
+    vec2 mv = imageLoad(uMotionVectorImage, pixelCoord).xy;
+    vec2 pixelDisp = mv * vec2(float(pc.width), float(pc.height));
+    vec2 prevPixelFloat = vec2(pixelCoord) + pixelDisp;
+    ivec2 prevCoord = ivec2(round(prevPixelFloat));
+
+    if (prevCoord.x >= 0 && prevCoord.x < int(pc.width) &&
+        prevCoord.y >= 0 && prevCoord.y < int(pc.height) &&
+        pc.frameIndex > 0u)
+    {
+        vec4 currNormDepth = imageLoad(uNormalDepthImage, pixelCoord);
+        vec3 currNormal = currNormDepth.xyz;
+        float currDepth = currNormDepth.w;
+
+        vec4 prevNormDepth = imageLoad(uPrevNormalDepthImage, prevCoord);
+        vec3 prevNormal = prevNormDepth.xyz;
+        float prevDepth = prevNormDepth.w;
+
+        // Velocity-adaptive bilateral edge stopping:
+        float normalDot = dot(currNormal, prevNormal);
+        float depthDiff = abs(currDepth - prevDepth) / max(currDepth, 1e-3);
+        float mvSpeed = length(pixelDisp);
+        float depthTolerance = 0.05 + min(0.05 * mvSpeed, 0.15);
+
+        // Denoiser-Aware Decorrelation: 10% of pixels skip temporal accumulation to inject fresh unbiased variance for Upways
+        bool isDecorrelationPixel = (randFloat(seed) < 0.10);
+
+        if (normalDot >= 0.75 && depthDiff <= depthTolerance && !isDecorrelationPixel) {
+            uint prevIdx = uint(prevCoord.y * int(pc.width) + prevCoord.x);
+            UnifiedReservoirPT rPrev = inPrevReservoirs[prevIdx];
+            if (isValidReservoir(rPrev.flags_uv_age) && rPrev.targetPdf > 0.0) {
+                // Clamp temporal M to avoid lag and history saturation
+                uint prevM = min(getM(rPrev.lightIndex_M), pc.mCap);
+                rPrev.lightIndex_M = packLightM(getLightIndex(rPrev.lightIndex_M), prevM);
+
+                // Increment age and preserve flags
+                uint prevAge = min(getAge(rPrev.flags_uv_age) + 1u, 255u);
+                uint prevPathLen = getPathLength(rPrev.flags_uv_age);
+                uint prevLobe = (rPrev.flags_uv_age >> 11u) & 1u;
+                uint high16 = (rPrev.flags_uv_age >> 16u) & 0xFFFFu;
+                rPrev.flags_uv_age = (prevAge & 0xFFu) | (1u << 8u) | ((prevPathLen & 3u) << 9u) | ((prevLobe & 1u) << 11u) | (high16 << 16u);
+
+                if (prevPathLen == 1u /* DI */) {
+                    uint prevLightIdx = getLightIndex(rPrev.lightIndex_M);
+                    if (prevLightIdx < pc.numLights) {
+                        Light prevLight = lights[prevLightIdx];
+                        vec2 prevUV = unpackUV(rPrev.flags_uv_age);
+                        float p_hat_prev_at_curr = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, prevLight, prevUV);
+                        combineReservoirsDI(rCurr, rPrev, p_hat_prev_at_curr, seed);
+                    }
+                } else if (prevPathLen >= 2u /* GI */) {
+                    vec3 secDir = unpackOct16(high16);
+                    vec3 secNormal = unpackOct32(rPrev.secondaryHitNormal);
+                    vec3 secRadiance = vec3(unpackRadianceRG(rPrev.secondaryRadianceRG), float(unpackRadianceB(rPrev.secondaryRadianceB_flags)));
+                    vec3 secHitPoint = hitPoint + secDir * rPrev.secondaryHitDist;
+                    float p_hat_prev_at_curr = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
+                    combineReservoirsDI(rCurr, rPrev, p_hat_prev_at_curr, seed);
+                }
+            }
+        }
+    }
+
+    outTemporalReservoirs[pixelIdx] = rCurr;
+}

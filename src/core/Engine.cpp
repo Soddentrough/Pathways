@@ -5,7 +5,9 @@
 #include "scene/GltfLoader.hpp"
 #include "scene/UsdLoader.hpp"
 #include "scene/LightTree.hpp"
+#include "video/VideoDecoder.hpp"
 #include <glm/detail/type_half.hpp>
+#include <glm/gtc/packing.hpp>
 
 #include <fstream>
 #include <filesystem>
@@ -202,7 +204,7 @@ Engine::Engine(const Config& config) : m_config(config) {
         45.0f,
         aspect
     );
-    m_camera->adaptFovForAspect(aspect);
+    m_camera->setAspect(aspect);
 
     initVulkan();
     initScene();
@@ -305,6 +307,7 @@ Engine::~Engine() {
     destroyFsr3Pipelines();
     destroyCausticsResources();
     destroyCausticsPipelines();
+    destroyReSTIRResources();
     m_motionVectorImage.reset();
     m_mlAlbedoRoughnessImage.reset();
     m_mlSpecularMotionImage.reset();
@@ -1001,6 +1004,7 @@ void Engine::initScene() {
                 options.instanceDensity = m_config.instance_density;
                 options.cullDistance = m_config.cull_distance;
                 options.cameraPosOverride = m_config.camera_pos;
+                options.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
                 m_sceneData = UsdLoader::loadSceneData(resolvedScene, options);
             } else {
                 m_sceneData = GltfLoader::loadSceneData(resolvedScene);
@@ -1208,6 +1212,7 @@ void Engine::initScene() {
         }
     }
     Logger::info("Scene textures loaded: {} texture(s).", m_sceneTextures.size());
+    initVideoBillboardDecoder(m_config.scene_path);
 }
 
 void Engine::requestSceneChange(const std::string& filepath) {
@@ -1245,6 +1250,7 @@ void Engine::requestSceneChange(const std::string& filepath) {
     usdOptions.instanceDensity = m_config.instance_density;
     usdOptions.cullDistance = m_config.cull_distance;
     usdOptions.cameraPosOverride = m_config.camera_pos;
+    usdOptions.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
 
     m_sceneLoadingFuture = std::async(std::launch::async, [filepath, usdOptions]() -> SceneData {
         if (filepath.empty() || filepath == "__procedural_cornell_box__") {
@@ -1502,6 +1508,8 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_sceneData.triangles.clear();
     m_sceneData.triangles.shrink_to_fit();
 
+    initVideoBillboardDecoder(filepath);
+
     Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
     return true;
 }
@@ -1524,6 +1532,7 @@ bool Engine::loadScene(const std::string& filepath) {
             options.instanceDensity = m_config.instance_density;
             options.cullDistance = m_config.cull_distance;
             options.cameraPosOverride = m_config.camera_pos;
+            options.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
             newScene = UsdLoader::loadSceneData(filepath, options);
         } else {
             Logger::info("Loading glTF scene '{}'...", filepath);
@@ -1824,6 +1833,9 @@ void Engine::initPipelines() {
         Logger::warn("NRCManager initialization failed: {}", e.what());
     }
 
+    // 6d. Ultra-Lean ReSTIR DI Subsystem
+    createReSTIRResources();
+
     // 7. ACES Tonemapping Compute Pipeline (Wave32 execution mode on RDNA4)
     VkPushConstantRange tonemapPushConstant{};
     tonemapPushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1946,10 +1958,38 @@ void Engine::initPipelines() {
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                 dispatchCausticSplatAndFilter(cmd, frameSlot);
             }
+            if (m_config.enable_restir_di && m_restirManager && m_numLights > 0) {
+                uint32_t rw = m_config.width;
+                uint32_t rh = m_config.height;
+                Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(frameSlot);
+                Buffer* rayHit = m_wavefrontPipeline->getRayHitQueue(frameSlot);
+                Buffer* pixelToRay = m_wavefrontPipeline->getPixelToRayQueue(frameSlot);
+                Buffer* camUBO = m_cameraUBOs[frameSlot].get();
+                Buffer* lightsBuf = m_lightBuffer.get();
+                Buffer* matsBuf = m_materialBuffer.get();
+                Buffer* ltBuf = m_lightTreeBuffer.get();
+                VkImageView mvView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
+                VkImageView ndView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
+                VkImageView prevNdView = m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : ndView;
+
+                VkImageView confView = (m_upwaysPipeline && m_upwaysPipeline->getConfidenceImage())
+                    ? m_upwaysPipeline->getConfidenceImage()->getImageView()
+                    : VK_NULL_HANDLE;
+
+                m_restirManager->recordFrame(cmd, frameSlot, rw, rh,
+                                             m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), m_config.enable_light_tree,
+                                             m_frameIndex, m_config.restir_di_m_cap,
+                                             rayGeom, rayHit, pixelToRay,
+                                             lightsBuf, matsBuf,
+                                             camUBO, ltBuf,
+                                             mvView, ndView, prevNdView,
+                                             confView);
+            }
         });
     }
 
     updateAllImageDescriptors();
+    updateSceneDescriptors();
 }
 
 void Engine::updateAllImageDescriptors() {
@@ -2351,6 +2391,17 @@ void Engine::updateUpwaysDescriptors() {
     VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_accumImage->getImageView();
     VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : m_accumImage->getImageView();
 
+    VkBuffer restirBuffer0 = VK_NULL_HANDLE;
+    VkBuffer restirBuffer1 = VK_NULL_HANDLE;
+    if (m_restirManager && m_config.enable_restir_di) {
+        Buffer* sBuf0 = m_restirManager->getSpatialReservoirBuffer(0);
+        Buffer* sBuf1 = m_restirManager->getSpatialReservoirBuffer(1);
+        if (sBuf0) restirBuffer0 = sBuf0->getBuffer();
+        if (sBuf1) restirBuffer1 = sBuf1->getBuffer();
+    }
+
+    VkImageView confView = m_upwaysPipeline->getConfidenceImage() ? m_upwaysPipeline->getConfidenceImage()->getImageView() : VK_NULL_HANDLE;
+
     m_upwaysPipeline->updateDescriptors(
         m_accumImage->getImageView(),
         normDepthView,
@@ -2358,7 +2409,10 @@ void Engine::updateUpwaysDescriptors() {
         albedoView,
         specMotionView,
         diffView,
-        specView
+        specView,
+        restirBuffer0,
+        confView,
+        restirBuffer1
     );
 
     if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage()) {
@@ -3056,6 +3110,27 @@ void Engine::destroyCausticsResources() {
     m_prevCausticImage.reset();
 }
 
+void Engine::createReSTIRResources() {
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    try {
+        auto temporalCode  = loadShaderSPIRV("restir_di_temporal.comp.spv");
+        auto spatialCode   = loadShaderSPIRV("restir_di_spatial.comp.spv");
+        m_restirManager = std::make_unique<ReSTIRManager>(
+            device, allocator,
+            m_config.width, m_config.height,
+            temporalCode, spatialCode
+        );
+        Logger::info("Ultra-Lean ReSTIR DI Subsystem (16B Reservoirs, Fused Temporal & LDS Spatial Reuse) initialized successfully.");
+    } catch (const std::exception& e) {
+        Logger::warn("ReSTIRManager initialization failed: {}", e.what());
+    }
+}
+
+void Engine::destroyReSTIRResources() {
+    m_restirManager.reset();
+}
+
 void Engine::updateCausticsDescriptors() {
     VkDevice device = m_context->getDevice();
     if (!m_causticDescPool || !m_causticPhotonBuffer || !m_causticAtomicBuffer ||
@@ -3410,6 +3485,7 @@ void Engine::updateWavefrontSceneDescriptors() {
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         if (!m_cameraUBOs[slot] || !m_frameImages[slot]) continue;
+        VkBuffer restirReservoirBuf = m_restirManager ? m_restirManager->getSpatialReservoirBuffer(slot)->getBuffer() : VK_NULL_HANDLE;
         m_wavefrontPipeline->updateSceneDescriptors(
             slot,
             m_frameImages[slot]->getImageView(),
@@ -3434,7 +3510,8 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE,
             m_instanceBuffer ? m_instanceBuffer->getBuffer() : VK_NULL_HANDLE,
             m_instanceBuffer ? m_instanceBuffer->getSize() : 0,
-            m_filteredCausticImage ? m_filteredCausticImage->getImageView() : VK_NULL_HANDLE
+            m_filteredCausticImage ? m_filteredCausticImage->getImageView() : VK_NULL_HANDLE,
+            restirReservoirBuf
         );
     }
 
@@ -4313,6 +4390,15 @@ void Engine::renderFrame() {
         }
     }
 
+    // Advance video billboard decoder if active
+    if (m_videoDecoder && m_videoDecoder->isOpen()) {
+        float dt = 1.0f / 24.0f;
+        if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
+            dt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
+        }
+        m_videoDecoder->update(dt);
+    }
+
     // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
     bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
@@ -4370,6 +4456,7 @@ void Engine::renderFrame() {
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree)     flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
+    if (m_config.enable_restir_di && m_numLights > 0) flags |= (1 << 9);
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
     }
@@ -4494,6 +4581,9 @@ void Engine::renderFrame() {
             m_tlasNeedsGpuUpdate = false;
         }
 
+        // Update animated video billboard texture if a new frame is ready
+        updateVideoBillboards(cmd);
+
         bool useWavefront = (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline);
         if (!skipRayTracing) {
             if (useWavefront) {
@@ -4568,6 +4658,7 @@ void Engine::renderFrame() {
             wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
+            wfSceneData.inlineShadows = m_config.inline_primary_shadows;
             wfSceneData.fullWidth = renderW;
             wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
                                         m_config.upscaler_mode == UpscalerMode::Upways ||
@@ -4587,6 +4678,60 @@ void Engine::renderFrame() {
                 m_nrcManager->recordTraining(cmd, m_frameIndex,
                                              m_sceneData.boundsMin, m_sceneData.boundsMax,
                                              1e-3f, 1024);
+            }
+
+            if (m_config.enable_restir_di && m_normalDepthImage && m_prevNormalDepthImage) {
+                VkImageCopy copyRegion{};
+                copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                copyRegion.extent = { renderW, renderH, 1 };
+
+                VkImageMemoryBarrier2 imgBarriers[2]{};
+                imgBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                imgBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                imgBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                imgBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                imgBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                imgBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imgBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imgBarriers[0].image = m_normalDepthImage->getImage();
+                imgBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+                imgBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                imgBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                imgBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                imgBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                imgBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                imgBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imgBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imgBarriers[1].image = m_prevNormalDepthImage->getImage();
+                imgBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+                VkDependencyInfo copyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                copyDep.imageMemoryBarrierCount = 2;
+                copyDep.pImageMemoryBarriers = imgBarriers;
+                vkCmdPipelineBarrier2(cmd, &copyDep);
+
+                vkCmdCopyImage(cmd,
+                               m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                               m_prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                               1, &copyRegion);
+
+                VkImageMemoryBarrier2 postBarrier{};
+                postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                postBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                postBarrier.image = m_prevNormalDepthImage->getImage();
+                postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+                VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                postDep.imageMemoryBarrierCount = 1;
+                postDep.pImageMemoryBarriers = &postBarrier;
+                vkCmdPipelineBarrier2(cmd, &postDep);
             }
         } else {
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
@@ -4654,7 +4799,7 @@ void Engine::renderFrame() {
             avgPC.width = renderW;
             avgPC.height = renderH;
             avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
-            avgPC.invSpp = (activeSpp > 0) ? (1.0f / static_cast<float>(activeSpp)) : 1.0f;
+            avgPC.invSpp = 1.0f;
 
             vkCmdPushConstants(cmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
             vkCmdDispatch(cmd, (renderW + 15) / 16, (renderH + 15) / 16, 1);
@@ -4867,6 +5012,9 @@ void Engine::renderFrame() {
             m_tlasNeedsGpuUpdate = false;
         }
 
+        // Update animated video billboard texture if a new frame is ready
+        updateVideoBillboards(cmd);
+
         uint32_t fracSppBits = std::bit_cast<uint32_t>(activeFractionalSpp);
         uint32_t rtPushConstants[16] = {
             m_numTriangles, m_numSpheres, m_numMaterials, m_numLights,
@@ -4963,6 +5111,7 @@ void Engine::renderFrame() {
                 wfSceneData.enableDistanceClamping = m_config.distance_clamping;
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
                 wfSceneData.indirectClamp = m_config.indirect_clamp;
+                wfSceneData.inlineShadows = m_config.inline_primary_shadows;
                 wfSceneData.tileOffsetX = tileOffsetX_prim;
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
                 wfSceneData.fullWidth = mgpuBaseW;
@@ -5079,8 +5228,7 @@ void Engine::renderFrame() {
             avgPC.width = mgpuBaseW;
             avgPC.height = mgpuBaseH;
             avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
-            uint32_t totalSpp = (activeMode == MultiGpuMode::SampleParallel) ? (primSpp + secSpp) : activeSpp;
-            avgPC.invSpp = (totalSpp > 0) ? (1.0f / static_cast<float>(totalSpp)) : 1.0f;
+            avgPC.invSpp = 1.0f;
 
             vkCmdPushConstants(activeCmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
             vkCmdDispatch(activeCmd, (mgpuBaseW + 15) / 16, (mgpuBaseH + 15) / 16, 1);
@@ -6436,6 +6584,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_nrcManager->resize(m_config.width, m_config.height);
     }
 
+    if (m_restirManager) {
+        m_restirManager->resize(m_config.width, m_config.height);
+    }
+
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->resize(m_config.width, m_config.height);
     }
@@ -6448,10 +6600,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_uiDumpBuffer.reset();
     }
 
-    // 7. Adapt Camera aspect ratio & FOV
+    // 7. Adapt Camera aspect ratio
     if (m_camera) {
         float aspect = static_cast<float>(m_config.width) / static_cast<float>(m_config.height);
-        m_camera->adaptFovForAspect(aspect);
+        m_camera->setAspect(aspect);
     }
 
     // 9. Invalidate accumulation
@@ -6624,7 +6776,8 @@ void Engine::printExecutionSummary() const {
         }
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
-            Logger::info("    Pipeline Stages:");
+            bool inlineShadowsActive = m_config.inline_primary_shadows;
+            Logger::info("    Pipeline Stages{}:", inlineShadowsActive ? " (Inline Hardware Shadows Active)" : "");
             uint64_t primaryRays = tally.getAvgPrimaryRays();
             auto bounces = tally.getAvgBounces();
             if (primaryRays == 0 && !bounces.empty() && bounces[0].activeCount > 0) {
@@ -6638,13 +6791,15 @@ void Engine::printExecutionSummary() const {
             }
             for (const auto& b : bounces) {
                 double pct = (primaryRays > 0) ? (100.0 * static_cast<double>(b.nextCount) / primaryRays) : 0.0;
+                std::string shadowStr = (b.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms", b.shadowMs)
+                                      : (inlineShadowsActive ? "Shadow: Inline" : "Shadow: 0.000 ms");
                 if (b.intersectMs > 0.0001) {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, b.shadowMs, b.intersectMs, b.totalMs,
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, shadowStr, b.intersectMs, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 } else {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | Shadow: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, b.shadowMs, b.totalMs,
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, shadowStr, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 }
             }
@@ -6689,6 +6844,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree)      flags |= (1 << 7);
+    if (m_config.enable_restir_di && m_numLights > 0) flags |= (1 << 9);
 
     VkClearColorValue clearZero{};
     clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;
@@ -6755,15 +6911,16 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
         wfSceneData.indirectClamp = m_config.indirect_clamp;
+        wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 0;
 
         while (remainingSpp > 0) {
             uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
             wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
 
-            // ubo with spp = 1 so samples accumulate full unscaled radiance; do not clobber m_prevViewProj
+            // ubo with spp = 1 so samples accumulate full unscaled radiance; enable subpixel jitter for ground truth convergence
             CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, m_config.max_bounces, flags,
-                                                         false, width, height, 0, /*updatePrev=*/false);
+                                                         true, width, height, 0, /*updatePrev=*/false);
             m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
             VkCommandBuffer cmd = m_commandBuffers[0];
@@ -6910,11 +7067,37 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
         wfSceneData.indirectClamp = m_config.indirect_clamp;
+        wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 1;
 
         m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_config.max_bounces, wfSceneData);
 
-        // 4. Staging copy for 6 ML images
+        if (m_config.capture_channels >= 23 && m_restirManager && m_numLights > 0) {
+            Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(0);
+            Buffer* rayHit = m_wavefrontPipeline->getRayHitQueue(0);
+            Buffer* pixelToRay = m_wavefrontPipeline->getPixelToRayQueue(0);
+            Buffer* camUBO = m_cameraUBOs[0].get();
+            Buffer* lightsBuf = m_lightBuffer.get();
+            Buffer* matsBuf = m_materialBuffer.get();
+            Buffer* ltBuf = m_lightTreeBuffer.get();
+            VkImageView mvView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView ndView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView prevNdView = m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : ndView;
+            VkImageView confView = (m_upwaysPipeline && m_upwaysPipeline->getConfidenceImage())
+                ? m_upwaysPipeline->getConfidenceImage()->getImageView()
+                : VK_NULL_HANDLE;
+
+            m_restirManager->recordFrame(cmd, 0, width, height,
+                                         m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), m_config.enable_light_tree,
+                                         frameIdx, m_config.restir_di_m_cap,
+                                         rayGeom, rayHit, pixelToRay,
+                                         lightsBuf, matsBuf,
+                                         camUBO, ltBuf,
+                                         mvView, ndView, prevNdView,
+                                         confView);
+        }
+
+        // 4. Staging copy for 6 ML images (and ReSTIR reservoir buffer if capture_channels >= 23)
         VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
         VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
         VkDeviceSize rg16Size   = numPixels * 2 * sizeof(uint16_t);
@@ -6926,6 +7109,19 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         VkDeviceSize offsetSM   = offsetND   + rgba16Size;
         VkDeviceSize offsetMV   = offsetSM   + rgba16Size;
         VkDeviceSize totalInputStagingSize = offsetMV + rg16Size;
+
+        uint32_t outChannels = m_config.capture_channels;
+        VkDeviceSize offsetRes = 0;
+        VkDeviceSize resSize = 0;
+        Buffer* resBuffer = nullptr;
+        if (outChannels >= 23 && m_restirManager) {
+            resBuffer = m_restirManager->getSpatialReservoirBuffer(0);
+            if (resBuffer) {
+                offsetRes = totalInputStagingSize;
+                resSize = numPixels * sizeof(UnifiedReservoirPT);
+                totalInputStagingSize += resSize;
+            }
+        }
 
         Buffer stagingInput(allocator, totalInputStagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
@@ -6958,6 +7154,36 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         copyImgToBuffer(m_mlSpecularMotionImage.get(), offsetSM);
         copyImgToBuffer(m_motionVectorImage.get(), offsetMV);
 
+        if (resBuffer) {
+            VkBufferMemoryBarrier2 bufBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+            bufBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            bufBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            bufBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            bufBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            bufBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufBarrier.buffer = resBuffer->getBuffer();
+            bufBarrier.offset = 0;
+            bufBarrier.size = resSize;
+
+            VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            depInfo.bufferMemoryBarrierCount = 1;
+            depInfo.pBufferMemoryBarriers = &bufBarrier;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+
+            VkBufferCopy copyRegion{};
+            copyRegion.srcOffset = 0;
+            copyRegion.dstOffset = offsetRes;
+            copyRegion.size = resSize;
+            vkCmdCopyBuffer(cmd, resBuffer->getBuffer(), stagingInput.getBuffer(), 1, &copyRegion);
+
+            bufBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            bufBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            bufBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            bufBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+        }
+
         vkEndCommandBuffer(cmd);
 
         VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -6976,8 +7202,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         const uint16_t* ndPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetND);
         const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
+        const UnifiedReservoirPT* resPixels = resBuffer ? reinterpret_cast<const UnifiedReservoirPT*>(basePtr + offsetRes) : nullptr;
 
-        uint32_t outChannels = m_config.capture_channels;
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
 
         for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
@@ -7007,6 +7233,26 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
                 inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1];   // normal Y
                 inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2];   // normal Z
                 inputPayload[p * outChannels + 19] = smPixels[p * 4 + 2];   // specular hit distance
+
+                if (outChannels >= 23) {
+                    if (resPixels) {
+                        const auto& res = resPixels[p];
+                        uint32_t M = (res.lightIndex_M >> 16) & 0xFFFFu;
+                        float res_m = std::clamp(static_cast<float>(M) / 64.0f, 0.0f, 1.0f);
+                        float pHat = std::max(res.targetPdf, 1e-4f);
+                        float res_w = std::clamp(res.wSum / (std::max(static_cast<float>(M), 1.0f) * pHat), 0.0f, 4.0f) * 0.25f;
+                        uint32_t pathLen = (res.flags_uv_age >> 9) & 0x3u;
+                        float res_is_gi = (pathLen >= 2u) ? 1.0f : 0.0f;
+
+                        inputPayload[p * outChannels + 20] = glm::packHalf1x16(res_m);
+                        inputPayload[p * outChannels + 21] = glm::packHalf1x16(res_w);
+                        inputPayload[p * outChannels + 22] = glm::packHalf1x16(res_is_gi);
+                    } else {
+                        inputPayload[p * outChannels + 20] = glm::packHalf1x16(0.04f);
+                        inputPayload[p * outChannels + 21] = glm::packHalf1x16(0.04f);
+                        inputPayload[p * outChannels + 22] = glm::packHalf1x16(0.0f);
+                    }
+                }
             } else {
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
                 inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
@@ -7239,7 +7485,7 @@ void Engine::runTrainingDataCapture() {
     Logger::info("  Frames to Capture: {}", m_config.capture_frames);
     Logger::info("  Reference SPP    : {}", m_config.capture_reference_spp);
     Logger::info("  Capture Channels : {} (PTTD v{})", m_config.capture_channels,
-                 m_config.capture_channels == 20 ? 2 : 1);
+                 m_config.capture_channels >= 23 ? 3 : (m_config.capture_channels == 20 ? 2 : 1));
     Logger::info("  Capture Normals  : {}", m_config.capture_normals ? "YES" : "NO");
     Logger::info("========================================================================================");
 
@@ -7315,6 +7561,112 @@ void Engine::run() {
     }
 
     dumpOutputFiles();
+}
+
+void Engine::initVideoBillboardDecoder(const std::string& scenePath) {
+    bool isCyberCity = (scenePath == "cyber-city" || scenePath == "cyber_city" ||
+                        scenePath == "procedural:cyber-city" || scenePath == "procedural:cyber_city" ||
+                        scenePath == "Procedural Cyber City");
+    if (!isCyberCity) {
+        for (const auto& mat : m_sceneData.materials) {
+            if ((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0) {
+                isCyberCity = true;
+                break;
+            }
+        }
+    }
+
+    if (!isCyberCity) {
+        m_videoDecoder.reset();
+        for (auto& sb : m_videoStagingBuffers) {
+            sb.reset();
+        }
+        return;
+    }
+
+    std::filesystem::path exeDir;
+#ifdef _WIN32
+    char exePathBuf[MAX_PATH] = {0};
+    if (GetModuleFileNameA(NULL, exePathBuf, MAX_PATH)) {
+        exeDir = std::filesystem::path(exePathBuf).parent_path();
+    }
+#elif defined(__linux__) || defined(__unix__)
+    std::error_code ec;
+    auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && !p.empty()) {
+        exeDir = p.parent_path();
+    } else {
+        p = std::filesystem::canonical("/proc/self/exe", ec);
+        if (!ec) exeDir = p.parent_path();
+    }
+#endif
+
+    std::vector<std::filesystem::path> candidates = {
+        "scenes/cyber_city/cyber_city_ad_1.mp4",
+        "scenes/cyber_city_ad_1.mp4",
+        "../scenes/cyber_city/cyber_city_ad_1.mp4",
+        "../../scenes/cyber_city/cyber_city_ad_1.mp4",
+    };
+    if (!exeDir.empty()) {
+        candidates.push_back(exeDir / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+        candidates.push_back(exeDir / ".." / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+        candidates.push_back(exeDir / ".." / ".." / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+    }
+
+    std::filesystem::path foundPath;
+    for (const auto& c : candidates) {
+        std::error_code err;
+        if (std::filesystem::exists(c, err)) {
+            foundPath = c;
+            break;
+        }
+    }
+
+    if (foundPath.empty()) {
+        Logger::warn("Engine: Video billboard file 'cyber_city_ad_1.mp4' not found in candidate paths.");
+        return;
+    }
+
+    m_videoDecoder = std::make_unique<VideoDecoder>();
+    if (!m_videoDecoder->open(foundPath.string())) {
+        Logger::error("Engine: Failed to open video billboard stream from '{}'", foundPath.string());
+        m_videoDecoder.reset();
+        return;
+    }
+
+    // Allocate per-frame-in-flight staging buffers for lock-free asynchronous GPU uploads
+    VmaAllocator allocator = m_context->getAllocator();
+    size_t rgbaSize = m_videoDecoder->getRgbaSize();
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_videoStagingBuffers[i] = std::make_unique<Buffer>(
+            allocator, rgbaSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+    }
+
+    Logger::info("Engine: Video billboard initialized ({}x{} @ {:.2f} fps) using '{}'",
+                 m_videoDecoder->getWidth(), m_videoDecoder->getHeight(), m_videoDecoder->getFps(), foundPath.string());
+}
+
+void Engine::updateVideoBillboards(VkCommandBuffer cmd) {
+    if (!m_videoDecoder || !m_videoDecoder->isOpen()) {
+        return;
+    }
+    if (m_sceneTextures.empty() || !m_sceneTextures[0]) {
+        return;
+    }
+    if (!m_videoDecoder->hasNewFrame()) {
+        return;
+    }
+
+    const uint8_t* pixels = m_videoDecoder->getRgbaPixels();
+    size_t size = m_videoDecoder->getRgbaSize();
+    if (pixels && size > 0 && m_videoStagingBuffers[m_currentFrame]) {
+        m_sceneTextures[0]->updatePixelsAsync(cmd, *m_videoStagingBuffers[m_currentFrame], pixels, size);
+        m_videoDecoder->clearNewFrameFlag();
+    }
 }
 
 } // namespace pathways

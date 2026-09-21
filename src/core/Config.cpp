@@ -158,7 +158,9 @@ void Config::printUsage(const char* progName) {
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
-              << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n\n"
+              << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
+              << "  --restir-pt, --restir-di Enable ReSTIR PT Enhanced (Unified Path Reservoir Resampling) [default: disabled]\n"
+              << "  --restir-m-cap <int>    Temporal history M-cap for ReSTIR (default: 30)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -514,6 +516,12 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--caustic-photons=")) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--restir-pt" || arg == "--restir-di" || arg == "--restir") {
+            cfg.enable_restir_di = true;
+        } else if (arg == "--restir-m-cap" && i + 1 < argc) {
+            cfg.restir_di_m_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--restir-m-cap=")) {
+            cfg.restir_di_m_cap = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {

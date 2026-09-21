@@ -101,6 +101,10 @@ layout(std430, binding = 18) writeonly buffer MaterialIndexQueue {
     uint materialIndices[];
 };
 
+layout(std430, binding = 33) writeonly buffer PixelToRayBuffer {
+    uint pixelToRay[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
     uint numSpheres;
@@ -202,6 +206,7 @@ void main() {
     RayState state;
     vec2 hitUv = vec2(0.0);
     uint matId = 0u;
+    uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
 
     if (inBounds) {
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
@@ -258,7 +263,7 @@ void main() {
         }
 
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
-        uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
+        pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
         vec3 hitNormal = vec3(0.0, 1.0, 0.0);
 
         bool isLocalTile = true;
@@ -439,8 +444,10 @@ void main() {
                 }
 
                 float dSpec = 1.0 / (1.0 + max(dHit, 0.0));
-                imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, dSpec));
-                imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, vSpecular));
+                imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, roughnessVal));
+                imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSpecular, dSpec, 0.0));
+                vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
+                imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, metallicVal));
             }
         }
     }
@@ -467,6 +474,10 @@ void main() {
             outHits[rayIdx]  = hit;
             outStates[rayIdx] = state;
         }
+    }
+
+    if (inBounds && pc.sppSampleIndex == 0u) {
+        pixelToRay[pixelIndex] = (isActive && rayIdx < pc.maxQueueCapacity) ? rayIdx : 0xFFFFFFFFu;
     }
 
     if (pc.sortMode > 0u) {

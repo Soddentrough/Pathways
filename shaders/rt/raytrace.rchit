@@ -476,7 +476,19 @@ void main() {
     }
 
     vec3 emissive = mat.emissive.rgb;
-    if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+    if ((mat.type & (1u << 14)) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+        float time = float(ubo.frameIndex) * 0.01666667;
+        float chrom = 0.007 * (1.0 + 0.35 * sin(time * 3.5));
+        vec3 holoVideo = vec3(
+            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv + vec2(chrom, 0.0)).r,
+            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).g,
+            texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv - vec2(chrom, 0.0)).b
+        );
+        float scanline = sin(hitUv.y * 360.0) * 0.22 + 0.78;
+        float edgeGlow = pow(1.0 - abs(dot(hitNormal, -gl_WorldRayDirectionEXT)), 2.5);
+        vec3 holoTint = vec3(0.80, 0.95, 1.15);
+        emissive = (holoVideo * scanline + edgeGlow * 0.35 * holoTint) * mat.emissive.rgb * holoTint;
+    } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
         emissive *= texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
     }
 

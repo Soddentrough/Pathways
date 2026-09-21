@@ -1611,7 +1611,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
             data.cameraFov = 45.0f;
             float fovRad = glm::radians(data.cameraFov);
             float tanHalfFovV = std::tan(fovRad * 0.5f);
-            float aspect = 16.0f / 9.0f;
+            float aspect = (options.viewportAspect > 0.01f) ? options.viewportAspect : (16.0f / 9.0f);
             float tanHalfFovH = tanHalfFovV * aspect;
 
             // Compute viewing direction: elevated 3/4 vantage

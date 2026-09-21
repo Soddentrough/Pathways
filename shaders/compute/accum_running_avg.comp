@@ -28,9 +28,10 @@ void main() {
         frameColor = vec3(0.0);
     }
     frameColor = max(frameColor, vec3(0.0));
+    bool isDynamicVideo = (frameVal.a > 0.5);
 
-    if (pc.sampleCount <= 1u) {
-        // First frame or accumulation reset: initialize history directly
+    if (pc.sampleCount <= 1u || isDynamicVideo) {
+        // First frame, accumulation reset, or dynamic video billboard: initialize/overwrite history directly
         imageStore(uHistoryAccum, pixelCoord, vec4(frameColor, 1.0));
     } else {
         // Progressive Welford running average accumulation:

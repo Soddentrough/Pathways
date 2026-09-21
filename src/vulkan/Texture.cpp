@@ -67,6 +67,49 @@ VkDescriptorImageInfo Texture::getDescriptorInfo() const {
     return info;
 }
 
+void Texture::updatePixelsAsync(
+    VkCommandBuffer cmd,
+    Buffer& stagingBuffer,
+    const void* pixels,
+    size_t dataSize
+) {
+    if (!pixels || dataSize == 0 || !m_image) return;
+
+    stagingBuffer.copyFrom(pixels, dataSize);
+
+    uint32_t width = m_image->getWidth();
+    uint32_t height = m_image->getHeight();
+
+    // Transition image: SHADER_READ_ONLY_OPTIMAL -> TRANSFER_DST_OPTIMAL
+    m_image->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+    );
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {width, height, 1};
+
+    vkCmdCopyBufferToImage(cmd, stagingBuffer.getBuffer(), m_image->getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Transition image: TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
+    m_image->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+    );
+}
+
 std::unique_ptr<Texture> Texture::createFromPixels(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
     uint32_t width, uint32_t height, VkFormat format, const void* pixels, size_t dataSize,

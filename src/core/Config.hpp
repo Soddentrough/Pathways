@@ -121,6 +121,10 @@ struct Config {
     bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]
     uint32_t caustic_photons = 1048576;   // Number of caustic photons traced per frame (default: 1048576 = 1024x1024)
 
+    // ReSTIR Direct Illumination (Spatio-Temporal Reservoir Resampling)
+    bool enable_restir_di = false;        // Spatio-temporal reservoir resampling for direct illumination [Default: false, opt-in via --restir-di]
+    uint32_t restir_di_m_cap = 30;        // Temporal history M-cap for ReSTIR DI (default: 30)
+
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
     MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge; // Multi-GPU upscaling topology: PostMerge (Final Frame) or SampleBlend (Merged Frames)
@@ -157,9 +161,9 @@ struct Config {
     // ML Neural Reconstruction Dataset Capture (Upways PTTD)
     std::string capture_training_data_dir = "";
     uint32_t capture_frames = 0;
-    uint32_t capture_reference_spp = 1;
+    uint32_t capture_reference_spp = 256;
     bool capture_normals = true;
-    uint32_t capture_channels = 20; // 16, 19, or 20 (PTTD v2 default)
+    uint32_t capture_channels = 20; // 16, 19, 20, or 23 (PTTD v3 default)
 
     // Asset Ingestion & Point Instancing (Scanlands)
     float instance_density = 1.0f; // Scale factor for point instancing (0.0 to 1.0, default: 1.0)

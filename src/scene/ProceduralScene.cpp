@@ -7,32 +7,36 @@ namespace pathways {
 
 static void addQuad(std::vector<TriangleGPU>& triangles,
                     glm::vec3 p0, glm::vec3 p1, glm::vec3 p2, glm::vec3 p3,
-                    glm::vec3 normal, uint32_t matId) {
+                    glm::vec3 normal, uint32_t matId,
+                    glm::vec2 uv0 = glm::vec2(0.0f, 1.0f),
+                    glm::vec2 uv1 = glm::vec2(1.0f, 1.0f),
+                    glm::vec2 uv2 = glm::vec2(1.0f, 0.0f),
+                    glm::vec2 uv3 = glm::vec2(0.0f, 0.0f)) {
     glm::vec3 up = std::abs(normal.z) < 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
     glm::vec3 tanDir = glm::normalize(glm::cross(up, normal));
     glm::vec4 tangentVec = glm::vec4(tanDir, 1.0f);
 
     TriangleGPU t1{};
-    t1.v0.position = glm::vec4(p0, 0.0f);
-    t1.v0.normal = glm::vec4(normal, 0.0f);
+    t1.v0.position = glm::vec4(p0, uv0.x);
+    t1.v0.normal = glm::vec4(normal, uv0.y);
     t1.v0.tangent = tangentVec;
-    t1.v1.position = glm::vec4(p1, 1.0f);
-    t1.v1.normal = glm::vec4(normal, 0.0f);
+    t1.v1.position = glm::vec4(p1, uv1.x);
+    t1.v1.normal = glm::vec4(normal, uv1.y);
     t1.v1.tangent = tangentVec;
-    t1.v2.position = glm::vec4(p2, 1.0f);
-    t1.v2.normal = glm::vec4(normal, 1.0f);
+    t1.v2.position = glm::vec4(p2, uv2.x);
+    t1.v2.normal = glm::vec4(normal, uv2.y);
     t1.v2.tangent = tangentVec;
     t1.materialId = matId;
 
     TriangleGPU t2{};
-    t2.v0.position = glm::vec4(p0, 0.0f);
-    t2.v0.normal = glm::vec4(normal, 0.0f);
+    t2.v0.position = glm::vec4(p0, uv0.x);
+    t2.v0.normal = glm::vec4(normal, uv0.y);
     t2.v0.tangent = tangentVec;
-    t2.v1.position = glm::vec4(p2, 1.0f);
-    t2.v1.normal = glm::vec4(normal, 1.0f);
+    t2.v1.position = glm::vec4(p2, uv2.x);
+    t2.v1.normal = glm::vec4(normal, uv2.y);
     t2.v1.tangent = tangentVec;
-    t2.v2.position = glm::vec4(p3, 0.0f);
-    t2.v2.normal = glm::vec4(normal, 1.0f);
+    t2.v2.position = glm::vec4(p3, uv3.x);
+    t2.v2.normal = glm::vec4(normal, uv3.y);
     t2.v2.tangent = tangentVec;
     t2.materialId = matId;
 
@@ -886,12 +890,12 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     materials.push_back(mat29);
 
     // --- 30 to 47: 18 Spectral Emissive Neons, Lasers & Displays ---
-    // 30: Neon Cyan 480nm
-    // 30: Neon Cyan 480nm (Holographic Billboard / Conduit)
+    // 30: Lower-Level Billboard Video Display (Flat 2D Emission)
     MaterialGPU mat30{};
-    mat30.albedo = glm::vec4(0.1f, 0.8f, 1.0f, 1.0f);
-    mat30.emissive = glm::vec4(2.0f, 32.0f, 42.0f, 1.0f);
-    mat30.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
+    mat30.albedo = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+    mat30.emissive = glm::vec4(1.2f, 1.2f, 1.2f, 1.0f);
+    mat30.emissiveTex = 1;
+    mat30.type = MATERIAL_EMISSIVE;
     materials.push_back(mat30);
 
     // 31: Neon Magenta 650nm (Holographic Billboard)
@@ -929,11 +933,12 @@ static std::vector<MaterialGPU> createCyberCityMaterials() {
     mat35.type = MATERIAL_EMISSIVE;
     materials.push_back(mat35);
 
-    // 36: Deep Violet Holo-Display 405nm (Holographic Billboard)
+    // 36: Rooftop Holographic Video Projection Display (Holographic Video Shader)
     MaterialGPU mat36{};
     mat36.albedo = glm::vec4(0.7f, 0.1f, 1.0f, 1.0f);
-    mat36.emissive = glm::vec4(25.0f, 2.0f, 45.0f, 1.0f);
-    mat36.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_PROCEDURAL_HOLO;
+    mat36.emissive = glm::vec4(1.8f, 1.2f, 2.5f, 1.0f);
+    mat36.emissiveTex = 1;
+    mat36.type = MATERIAL_EMISSIVE | MATERIAL_FLAG_HOLO_VIDEO;
     materials.push_back(mat36);
 
     // 37: Deep Cobalt Blue 450nm
@@ -1103,6 +1108,25 @@ SceneData ProceduralScene::createCyberCityScene() {
     SceneData scene;
     scene.materials = createCyberCityMaterials();
 
+    // Ingest initial video texture placeholder buffer (640x360 RGBA) for Billboard Video Display
+    {
+        TextureData videoTex;
+        videoTex.width = 640;
+        videoTex.height = 360;
+        videoTex.isSrgb = false;
+        videoTex.pixels.resize(640 * 360 * 4);
+        for (uint32_t py = 0; py < 360; ++py) {
+            for (uint32_t px = 0; px < 640; ++px) {
+                size_t idx = (py * 640 + px) * 4;
+                videoTex.pixels[idx + 0] = static_cast<uint8_t>(px * 255 / 640);
+                videoTex.pixels[idx + 1] = static_cast<uint8_t>(200);
+                videoTex.pixels[idx + 2] = static_cast<uint8_t>(py * 255 / 360);
+                videoTex.pixels[idx + 3] = 255;
+            }
+        }
+        scene.textures.push_back(std::move(videoTex));
+    }
+
     auto recordBlasPrototype = [&](const std::string& name, uint32_t startTri) {
         uint32_t triCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
         BlasGeometryRange range{};
@@ -1181,11 +1205,11 @@ SceneData ProceduralScene::createCyberCityScene() {
         addWindowGrid(scene.triangles, glm::vec3(-4.6f, 1.2f, -6.08f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 103, 18, 35);
         addWindowGrid(scene.triangles, glm::vec3( 6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 107, 18, 35);
         addWindowGrid(scene.triangles, glm::vec3(-6.08f, 1.2f, -4.6f), glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 5, 9.2f, 4.8f, 1, 7, 41, 109, 18, 35);
-        // Emissive entrance beacon strips (Mat 30: Neon Cyan 480nm, Mat 35: Electric Gold)
-        addBox(scene.triangles, glm::vec3( 0.0f, 2.36f,  6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3( 0.0f, 2.36f, -6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3( 6.25f, 2.36f,  0.0f), glm::vec3(0.12f, 3.88f, 3.2f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3(-6.25f, 2.36f,  0.0f), glm::vec3(0.12f, 3.88f, 3.2f), 0.0f, 30);
+        // Emissive entrance beacon strips (Mat 45: Electric Turquoise 490nm, Mat 35: Electric Gold)
+        addBox(scene.triangles, glm::vec3( 0.0f, 2.36f,  6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3( 0.0f, 2.36f, -6.25f), glm::vec3(3.2f, 3.88f, 0.12f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3( 6.25f, 2.36f,  0.0f), glm::vec3(0.12f, 3.88f, 3.2f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3(-6.25f, 2.36f,  0.0f), glm::vec3(0.12f, 3.88f, 3.2f), 0.0f, 45);
         addBox(scene.triangles, glm::vec3( 0.0f, 0.42f,  6.25f), glm::vec3(3.4f, 0.10f, 0.12f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3( 0.0f, 0.42f, -6.25f), glm::vec3(3.4f, 0.10f, 0.12f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3( 6.25f, 0.42f,  0.0f), glm::vec3(0.12f, 0.10f, 3.4f), 0.0f, 35);
@@ -1403,9 +1427,9 @@ SceneData ProceduralScene::createCyberCityScene() {
         // Interior rose gold handrails (Mat 18: Rose Gold Filigree)
         addBox(scene.triangles, glm::vec3(0.0f, 1.05f, -1.55f), glm::vec3(14.8f, 0.06f, 0.06f), 0.0f, 18);
         addBox(scene.triangles, glm::vec3(0.0f, 1.05f,  1.55f), glm::vec3(14.8f, 0.06f, 0.06f), 0.0f, 18);
-        // Interior neon guide strips (Mat 30: Neon Cyan)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.26f, -0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3(0.0f, 0.26f,  0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 30);
+        // Interior neon guide strips (Mat 45: Electric Turquoise)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.26f, -0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.26f,  0.9f), glm::vec3(14.8f, 0.04f, 0.15f), 0.0f, 45);
         // Ceiling recessed xenon troffer lights (Mat 42: Xenon White)
         for (int i = -3; i <= 3; ++i) {
             float xpos = static_cast<float>(i) * 2.0f;
@@ -1491,9 +1515,9 @@ SceneData ProceduralScene::createCyberCityScene() {
             addBox(scene.triangles, glm::vec3(-1.8f, 0.45f, -1.1f), glm::vec3(0.04f, 0.65f, 0.65f), vAngle, 17);
             addBox(scene.triangles, glm::vec3(-1.8f, 0.45f,  1.1f), glm::vec3(0.04f, 0.65f, 0.65f), vAngle, 17);
         }
-        // Cyan plasma thruster exhaust rings (Mat 30: Neon Cyan)
-        addBox(scene.triangles, glm::vec3(-2.22f, 0.45f, -1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3(-2.22f, 0.45f,  1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 30);
+        // Cyan plasma thruster exhaust rings (Mat 45: Electric Turquoise)
+        addBox(scene.triangles, glm::vec3(-2.22f, 0.45f, -1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3(-2.22f, 0.45f,  1.1f), glm::vec3(0.08f, 0.42f, 0.42f), 0.0f, 45);
         // Ice blue forward transit headlights (Mat 47: Ice Blue Transit Headlight)
         addBox(scene.triangles, glm::vec3(2.05f, 0.38f, -0.65f), glm::vec3(0.18f, 0.18f, 0.25f), 0.0f, 47);
         addBox(scene.triangles, glm::vec3(2.05f, 0.38f,  0.65f), glm::vec3(0.18f, 0.18f, 0.25f), 0.0f, 47);
@@ -1513,8 +1537,8 @@ SceneData ProceduralScene::createCyberCityScene() {
         addDiagridLattice(scene.triangles, glm::vec3(-3.8f, -2.0f, -0.24f), glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), 4, 7.6f, 4.0f, 27);
         // Gold border bezel (Mat 3: Brushed Brass)
         addBox(scene.triangles, glm::vec3(0.0f, 0.0f, 0.02f), glm::vec3(8.3f, 4.8f, 0.15f), 0.0f, 3);
-        // Violet secondary accent border (Mat 36: Deep Violet)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.0f, 0.08f), glm::vec3(7.9f, 4.4f, 0.06f), 0.0f, 36);
+        // Violet secondary accent border (Mat 37: Deep Cobalt)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.0f, 0.08f), glm::vec3(7.9f, 4.4f, 0.06f), 0.0f, 37);
         // Primary emissive quad (Mat 30: Neon Cyan 480nm)
         addQuad(scene.triangles,
                 glm::vec3(-3.8f, -2.05f, 0.12f),
@@ -1628,8 +1652,8 @@ SceneData ProceduralScene::createCyberCityScene() {
         addSphere(scene.triangles, glm::vec3(-4.5f, 1.15f, -4.5f), 0.35f, 13, 12, 12);
         addSphere(scene.triangles, glm::vec3( 4.5f, 1.15f,  4.5f), 0.35f, 14, 12, 12);
         // Recessed ground luminescent and pedestrian guidance strips
-        // (Mat 30: Neon Cyan 480nm, Mat 35: Electric Gold)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.03f, 0.0f), glm::vec3(15.6f, 0.02f, 0.25f), 0.0f, 30);
+        // (Mat 45: Electric Turquoise 490nm, Mat 35: Electric Gold)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.03f, 0.0f), glm::vec3(15.6f, 0.02f, 0.25f), 0.0f, 45);
         addBox(scene.triangles, glm::vec3(0.0f, 0.03f, -4.5f), glm::vec3(0.25f, 0.02f, 7.0f), 0.0f, 35);
         addBox(scene.triangles, glm::vec3(0.0f, 0.03f,  4.5f), glm::vec3(0.25f, 0.02f, 7.0f), 0.0f, 35);
         // Titanium streetlight poles (Mat 2: Titanium Chrome) with Yellow hazard base collars (Mat 24)
@@ -1679,9 +1703,9 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(-6.65f, 0.08f, 0.0f), glm::vec3(2.65f, 0.16f, 16.0f), 0.0f, 4);
         addBox(scene.triangles, glm::vec3( 6.65f, 0.08f, 0.0f), glm::vec3(2.65f, 0.16f, 16.0f), 0.0f, 4);
 
-        // Recessed neon pedestrian guidance strips (Mat 30: Neon Cyan 480nm)
-        addBox(scene.triangles, glm::vec3(-6.65f, 0.165f, 0.0f), glm::vec3(0.18f, 0.01f, 15.8f), 0.0f, 30);
-        addBox(scene.triangles, glm::vec3( 6.65f, 0.165f, 0.0f), glm::vec3(0.18f, 0.01f, 15.8f), 0.0f, 30);
+        // Recessed neon pedestrian guidance strips (Mat 45: Electric Turquoise 490nm)
+        addBox(scene.triangles, glm::vec3(-6.65f, 0.165f, 0.0f), glm::vec3(0.18f, 0.01f, 15.8f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3( 6.65f, 0.165f, 0.0f), glm::vec3(0.18f, 0.01f, 15.8f), 0.0f, 45);
 
         // Streetlight titanium masts on both sidewalks (Mat 2: Titanium Chrome)
         addCylinder(scene.triangles, glm::vec3(-7.2f, 3.2f, 0.0f), 0.09f, 6.4f, 2, 10);
@@ -1726,10 +1750,10 @@ SceneData ProceduralScene::createCyberCityScene() {
                 addBox(scene.triangles, cPos, glm::vec3(2.6f, 0.16f, 2.6f), 0.0f, 4);
                 addBox(scene.triangles, cPos + glm::vec3(-sx * 1.35f, 0.02f, 0.0f), glm::vec3(0.2f, 0.20f, 2.8f), 0.0f, 8);
                 addBox(scene.triangles, cPos + glm::vec3(0.0f, 0.02f, -sz * 1.35f), glm::vec3(2.8f, 0.20f, 0.2f), 0.0f, 8);
-                // Corner illuminated safety bollard (Mat 2 Titanium + Mat 43 Amber + Mat 30 Cyan)
+                // Corner illuminated safety bollard (Mat 2 Titanium + Mat 43 Amber + Mat 45 Cyan)
                 addCylinder(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 0.5f, -sz * 0.8f), 0.10f, 1.0f, 2, 8);
                 addBox(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 1.05f, -sz * 0.8f), glm::vec3(0.22f, 0.12f, 0.22f), 0.0f, 43);
-                addBox(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 0.55f, -sz * 0.8f), glm::vec3(0.22f, 0.06f, 0.22f), 0.0f, 30);
+                addBox(scene.triangles, cPos + glm::vec3(-sx * 0.8f, 0.55f, -sz * 0.8f), glm::vec3(0.22f, 0.06f, 0.22f), 0.0f, 45);
             }
         }
 
@@ -1762,9 +1786,9 @@ SceneData ProceduralScene::createCyberCityScene() {
         addBox(scene.triangles, glm::vec3(-10.0f, 0.025f, 0.0f), glm::vec3(1.2f, 0.02f, 30.0f), 0.0f, 28);
         addBox(scene.triangles, glm::vec3( 10.0f, 0.025f, 0.0f), glm::vec3(1.2f, 0.02f, 30.0f), 0.0f, 28);
 
-        // Industrial expansion joints (Mat 35: Electric Gold / Mat 30: Neon Cyan)
+        // Industrial expansion joints (Mat 35: Electric Gold / Mat 45: Electric Turquoise)
         addBox(scene.triangles, glm::vec3(0.0f, 0.022f, 0.0f), glm::vec3(31.6f, 0.015f, 0.15f), 0.0f, 35);
-        addBox(scene.triangles, glm::vec3(0.0f, 0.022f, 0.0f), glm::vec3(0.15f, 0.015f, 31.6f), 0.0f, 30);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.022f, 0.0f), glm::vec3(0.15f, 0.015f, 31.6f), 0.0f, 45);
 
         // 4 boundary perimeter beacon pylons (Mat 2 Titanium + Mat 40 Blacklight ring + Mat 34 Ruby Laser)
         for (float bx : {-14.5f, 14.5f}) {
@@ -2000,35 +2024,45 @@ SceneData ProceduralScene::createCyberCityScene() {
                 addInstance(CYBER_BLAS_ROOFTOP_HVAC, mRoof);
             }
 
-            // Holographic Billboards on tower facades
+            // Rooftop Holographic Video Projection Displays (CYBER_BLAS_BILLBOARD_VIOLET - Mat 36)
+            if ((gx * 3 + gz * 5) % 2 == 0) {
+                glm::mat4 mRoofHolo = glm::translate(glm::mat4(1.0f), glm::vec3(posX, crownY + 3.8f, posZ));
+                addInstance(CYBER_BLAS_BILLBOARD_VIOLET, mRoofHolo);
+                addBillboardLight(mRoofHolo, glm::vec3(-2.5f, -2.5f, 0.12f), glm::vec3(5.0f, 0.0f, 0.0f), glm::vec3(0.0f, 5.0f, 0.0f), glm::vec3(20.0f, 2.0f, 35.0f), 1.2f);
+            }
+
+            // Billboards on tower facades
             for (float by = 16.0f; by < crownY - 6.0f; by += 12.0f) {
                 uint32_t bbSeed = static_cast<uint32_t>(gx * 19 + gz * 31 + static_cast<int>(by)) % 10u;
                 if (bbSeed > 4u) continue;
 
+                // Lower level billboards (by <= 28.0f) play video as flat 2D emission (CYBER_BLAS_BILLBOARD_CYAN - Mat 30)
                 uint32_t bbProto = CYBER_BLAS_BILLBOARD_CYAN;
                 glm::vec3 bbLocalCorner(-3.8f, -2.05f, 0.12f);
                 glm::vec3 bbLocalU(7.6f, 0.0f, 0.0f);
                 glm::vec3 bbLocalV(0.0f, 4.1f, 0.0f);
-                glm::vec3 bbColor(2.0f, 28.0f, 36.0f);
+                glm::vec3 bbColor(1.5f, 2.5f, 3.5f);
 
-                if (bbSeed % 4 == 1) {
-                    bbProto = CYBER_BLAS_BILLBOARD_MAGENTA;
-                    bbLocalCorner = glm::vec3(-2.05f, -3.8f, 0.12f);
-                    bbLocalU = glm::vec3(4.1f, 0.0f, 0.0f);
-                    bbLocalV = glm::vec3(0.0f, 7.6f, 0.0f);
-                    bbColor = glm::vec3(35.0f, 2.0f, 18.0f);
-                } else if (bbSeed % 4 == 2) {
-                    bbProto = CYBER_BLAS_BILLBOARD_ORANGE;
-                    bbLocalCorner = glm::vec3(-3.3f, -1.45f, 0.12f);
-                    bbLocalU = glm::vec3(6.6f, 0.0f, 0.0f);
-                    bbLocalV = glm::vec3(0.0f, 2.9f, 0.0f);
-                    bbColor = glm::vec3(36.0f, 12.0f, 1.5f);
-                } else if (bbSeed % 4 == 3) {
-                    bbProto = CYBER_BLAS_BILLBOARD_VIOLET;
-                    bbLocalCorner = glm::vec3(-2.5f, -2.5f, 0.12f);
-                    bbLocalU = glm::vec3(5.0f, 0.0f, 0.0f);
-                    bbLocalV = glm::vec3(0.0f, 5.0f, 0.0f);
-                    bbColor = glm::vec3(20.0f, 2.0f, 35.0f);
+                if (by > 28.0f) {
+                    if (bbSeed % 3 == 0) {
+                        bbProto = CYBER_BLAS_BILLBOARD_VIOLET;
+                        bbLocalCorner = glm::vec3(-2.5f, -2.5f, 0.12f);
+                        bbLocalU = glm::vec3(5.0f, 0.0f, 0.0f);
+                        bbLocalV = glm::vec3(0.0f, 5.0f, 0.0f);
+                        bbColor = glm::vec3(20.0f, 2.0f, 35.0f);
+                    } else if (bbSeed % 3 == 1) {
+                        bbProto = CYBER_BLAS_BILLBOARD_MAGENTA;
+                        bbLocalCorner = glm::vec3(-2.05f, -3.8f, 0.12f);
+                        bbLocalU = glm::vec3(4.1f, 0.0f, 0.0f);
+                        bbLocalV = glm::vec3(0.0f, 7.6f, 0.0f);
+                        bbColor = glm::vec3(35.0f, 2.0f, 18.0f);
+                    } else {
+                        bbProto = CYBER_BLAS_BILLBOARD_ORANGE;
+                        bbLocalCorner = glm::vec3(-3.3f, -1.45f, 0.12f);
+                        bbLocalU = glm::vec3(6.6f, 0.0f, 0.0f);
+                        bbLocalV = glm::vec3(0.0f, 2.9f, 0.0f);
+                        bbColor = glm::vec3(36.0f, 12.0f, 1.5f);
+                    }
                 }
 
                 glm::mat4 mBillboard(1.0f);

@@ -13,6 +13,7 @@ struct UsdLoadOptions {
     float instanceDensity = 1.0f; // Scale factor for point instancing (0.0 to 1.0, default: 1.0)
     float cullDistance = 0.0f;    // Max distance in meters from camera to cull instances (0 = disabled)
     std::optional<glm::vec3> cameraPosOverride;
+    float viewportAspect = 16.0f / 9.0f; // Viewport aspect ratio for fallback camera frustum fitting
 };
 
 class UsdLoader {

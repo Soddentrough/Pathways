@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Pathways VERSION 1.23.0 LANGUAGES C CXX)
+project(Pathways VERSION 1.24.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,10 +87,13 @@ find_package(Vulkan REQUIRED)
 find_package(SDL3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libavutil)
 
 message(STATUS "Vulkan Include Dir: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "Vulkan Libraries: ${Vulkan_LIBRARIES}")
 message(STATUS "SDL3 Include Dir: ${SDL3_INCLUDE_DIRS}")
+message(STATUS "FFmpeg Found: ${FFMPEG_FOUND}")
 
 # Third-party include directories (marked as SYSTEM to avoid external warnings)
 set(THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -158,6 +161,8 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
+    ${SHADER_DIR}/compute/restir_di_temporal.comp
+    ${SHADER_DIR}/compute/restir_di_spatial.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -174,7 +179,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl
+            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl ${SHADER_DIR}/compute/restir_common.glsl
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})
@@ -236,6 +241,7 @@ target_link_libraries(pathways
     SDL3::SDL3
     Threads::Threads
     ZLIB::ZLIB
+    PkgConfig::FFMPEG
 )
 
 if(WIN32)

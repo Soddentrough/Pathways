@@ -86,6 +86,8 @@ public:
         m_defaultPosition = position;
         m_defaultTarget = target;
         m_defaultFov = fov;
+        m_fov = fov;
+        m_moved = true;
     }
 
     void adaptFovForAspect(float aspect);

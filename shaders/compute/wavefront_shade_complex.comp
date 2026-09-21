@@ -137,6 +137,12 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
     LightTreeNode lightNodes[];
 };
 
+#include "restir_common.glsl"
+
+layout(std430, binding = 32) readonly buffer ReSTIRReservoirsBuffer {
+    ReservoirDI restirReservoirs[];
+};
+
 #include "wavefront_shadow_inline.glsl"
 
 layout(push_constant) uniform PushConstants {
@@ -474,7 +480,7 @@ void main() {
                 }
             }
 #else
-            // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
+            // Direct Lighting (Stochastic NEE with ReSTIR DI and Alias Table)
             f16vec3 secDirectL = f16vec3(0.0);
             if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
                 bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
@@ -491,82 +497,177 @@ void main() {
                 float selectedTarget = 0.0;
                 float totalWeightSum = 0.0;
                 bool hasCandidate = false;
+                bool usedRestir = false;
 
                 // Fast proxy luminance weight for RIS candidate selection (Packed FP16):
                 f16vec3 proxyLumWeight = max(diffuseColor + F0, f16vec3(0.04)) * f16vec3(0.2126, 0.7152, 0.0722);
 
-                for (uint c = 0u; c < M; ++c) {
-                    uint lightIdx = 0u;
-                    float lightSelectPdf = 1.0;
-                    if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
-                        SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
-                    } else {
-                        SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
-                    }
+                bool enableRestirDI = ((ubo.flags & (1 << 9)) != 0 && pc.currentBounce == 0u);
+                if (enableRestirDI) {
+                    ReservoirDI res = restirReservoirs[pixelIndex];
+                    if (isValidReservoir(res.age_flags) && res.wSum > 0.0) {
+                        uint pLen = getPathLength(res.flags_uv_age);
+                        if (pLen <= 1u) {
+                            uint lightIdx = getLightIndex(res.lightIndex_M);
+                            if (lightIdx < pc.numLights) {
+                                Light light = lights[lightIdx];
+                                vec3 lightPoint;
+                                vec3 lightDir;
+                                float lightDist = 0.0;
+                                float lightPdf = 1.0;
+                                vec3 lightEmission = light.emission.rgb;
+                                bool validLightSample = false;
 
-                    Light light = lights[lightIdx];
-                    vec3 lightPoint;
-                    vec3 lightDir;
-                    float lightDist = 0.0;
-                    float lightPdf = 1.0;
-                    vec3 lightEmission = light.emission.rgb;
-                    bool validLightSample = false;
+                                if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                                    vec2 luv = unpackUV(res.age_flags);
+                                    lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                                    vec3 toLight = lightPoint - hitPoint;
+                                    lightDist = length(toLight);
+                                    lightDir = toLight / max(lightDist, 1e-4);
 
-                    if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                        vec2 luv = randVec2(seed);
-                        lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                        vec3 toLight = lightPoint - hitPoint;
-                        lightDist = length(toLight);
-                        lightDir = toLight / max(lightDist, 1e-4);
+                                    float cosLight = dot(-lightDir, light.normal.xyz);
+                                    if (cosLight > 0.0) {
+                                        float area = max(light.emission.w, 1e-4);
+                                        lightPdf = (lightDist * lightDist) / (area * cosLight);
+                                        validLightSample = true;
+                                    }
+                                } else if (uint(light.position.w) == 1u /* SPOT */) {
+                                    vec3 toLight = light.position.xyz - hitPoint;
+                                    lightDist = length(toLight);
+                                    lightDir = toLight / max(lightDist, 1e-4);
 
-                        float cosLight = dot(-lightDir, light.normal.xyz);
-                        if (cosLight > 0.0) {
-                            float area = light.emission.w;
-                            lightPdf = (lightDist * lightDist) / (area * cosLight);
-                            validLightSample = true;
+                                    float cosSpot = dot(-lightDir, light.normal.xyz);
+                                    float innerCos = light.u.w;
+                                    float outerCos = light.v.w;
+                                    if (cosSpot >= outerCos) {
+                                        float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                                        lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                                        lightPdf = 1.0;
+                                        validLightSample = true;
+                                    }
+                                } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                                    lightDir = normalize(light.normal.xyz);
+                                    lightDist = 10000.0;
+                                    lightPdf = 1.0;
+                                    validLightSample = true;
+                                }
+
+                                float rawNdotL = dot(hitNormal, lightDir);
+                                bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
+                                float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
+                                if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
+                                    selectedLightIdx = lightIdx;
+                                    selectedLightDir = lightDir;
+                                    selectedLightDist = lightDist;
+                                    selectedLightEmission = lightEmission;
+                                    selectedLightPdf = lightPdf;
+                                    selectedLightSelectPdf = 1.0;
+                                    selectedNdotL = NdotL;
+                                    selectedIsTrans = isTrans;
+                                    selectedTarget = 1.0;
+                                    totalWeightSum = res.wSum;
+                                    hasCandidate = true;
+                                    usedRestir = true;
+                                }
+                            }
+                        } else if (pLen >= 2u) {
+                            vec3 secDir = unpackOct16((res.flags_uv_age >> 16u) & 0xFFFFu);
+                            float rawNdotL = dot(hitNormal, secDir);
+                            bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
+                            float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
+                            if (NdotL > 0.0 && (rawNdotL > 0.0 || isTrans) && res.secondaryHitDist > 1e-4) {
+                                vec3 secRadiance = vec3(unpackRadianceRG(res.secondaryRadianceRG), float(unpackRadianceB(res.secondaryRadianceB_flags)));
+                                selectedLightIdx = 0u;
+                                selectedLightDir = secDir;
+                                selectedLightDist = res.secondaryHitDist;
+                                selectedLightEmission = secRadiance;
+                                selectedLightPdf = 1.0;
+                                selectedLightSelectPdf = 1.0;
+                                selectedNdotL = NdotL;
+                                selectedIsTrans = isTrans;
+                                selectedTarget = 1.0;
+                                totalWeightSum = res.wSum;
+                                hasCandidate = true;
+                                usedRestir = true;
+                            }
                         }
-                    } else if (uint(light.position.w) == 1u /* SPOT */) {
-                        vec3 toLight = light.position.xyz - hitPoint;
-                        lightDist = length(toLight);
-                        lightDir = toLight / max(lightDist, 1e-4);
+                    }
+                }
 
-                        float cosSpot = dot(-lightDir, light.normal.xyz);
-                        float innerCos = light.u.w;
-                        float outerCos = light.v.w;
-                        if (cosSpot >= outerCos) {
-                            float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                            lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                if (!hasCandidate) {
+                    for (uint c = 0u; c < M; ++c) {
+                        uint lightIdx = 0u;
+                        float lightSelectPdf = 1.0;
+                        if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
+                            SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
+                        } else {
+                            SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
+                        }
+
+                        Light light = lights[lightIdx];
+                        vec3 lightPoint;
+                        vec3 lightDir;
+                        float lightDist = 0.0;
+                        float lightPdf = 1.0;
+                        vec3 lightEmission = light.emission.rgb;
+                        bool validLightSample = false;
+
+                        if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                            vec2 luv = randVec2(seed);
+                            lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                            vec3 toLight = lightPoint - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+
+                            float cosLight = dot(-lightDir, light.normal.xyz);
+                            if (cosLight > 0.0) {
+                                float area = light.emission.w;
+                                lightPdf = (lightDist * lightDist) / (area * cosLight);
+                                validLightSample = true;
+                            }
+                        } else if (uint(light.position.w) == 1u /* SPOT */) {
+                            vec3 toLight = light.position.xyz - hitPoint;
+                            lightDist = length(toLight);
+                            lightDir = toLight / max(lightDist, 1e-4);
+
+                            float cosSpot = dot(-lightDir, light.normal.xyz);
+                            float innerCos = light.u.w;
+                            float outerCos = light.v.w;
+                            if (cosSpot >= outerCos) {
+                                float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                                lightPdf = 1.0;
+                                validLightSample = true;
+                            }
+                        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                            lightDir = normalize(light.normal.xyz);
+                            lightDist = 10000.0;
                             lightPdf = 1.0;
                             validLightSample = true;
                         }
-                    } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
-                        lightDir = normalize(light.normal.xyz);
-                        lightDist = 10000.0;
-                        lightPdf = 1.0;
-                        validLightSample = true;
-                    }
 
-                    float rawNdotL = dot(hitNormal, lightDir);
-                    bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
-                    float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
-                    if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
-                        float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
-                        float target = max(dot(lightEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
-                        float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
-                        float weight = target / sourcePdf;
+                        float rawNdotL = dot(hitNormal, lightDir);
+                        bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
+                        float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
+                        if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
+                            float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
+                            float target = max(dot(lightEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
+                            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
+                            float weight = target / sourcePdf;
 
-                        totalWeightSum += weight;
-                        if (randFloat(seed) * totalWeightSum < weight) {
-                            selectedLightIdx = lightIdx;
-                            selectedLightDir = lightDir;
-                            selectedLightDist = lightDist;
-                            selectedLightEmission = lightEmission;
-                            selectedLightPdf = lightPdf;
-                            selectedLightSelectPdf = lightSelectPdf;
-                            selectedNdotL = NdotL;
-                            selectedIsTrans = isTrans;
-                            selectedTarget = target;
-                            hasCandidate = true;
+                            totalWeightSum += weight;
+                            if (randFloat(seed) * totalWeightSum < weight) {
+                                selectedLightIdx = lightIdx;
+                                selectedLightDir = lightDir;
+                                selectedLightDist = lightDist;
+                                selectedLightEmission = lightEmission;
+                                selectedLightPdf = lightPdf;
+                                selectedLightSelectPdf = lightSelectPdf;
+                                selectedNdotL = NdotL;
+                                selectedIsTrans = isTrans;
+                                selectedTarget = target;
+                                hasCandidate = true;
+                            }
                         }
                     }
                 }
@@ -593,7 +694,7 @@ void main() {
 
                         float misWeight = 1.0;
                         Light selLight = lights[selectedLightIdx];
-                        if (uint(selLight.position.w) == 0u) {
+                        if (uint(selLight.position.w) == 0u && !usedRestir) {
                             float lightPdfEff = selectedLightPdf * selectedLightSelectPdf;
                             misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                         }
@@ -619,8 +720,10 @@ void main() {
                             specBrdf = specBrdf * (float16_t(1.0) - maxSheen) + sheenBrdf;
                         }
 
-                        float risWeight = totalWeightSum / (float(M) * selectedTarget);
-                        float factor = selectedNdotL * misWeight * risWeight;
+                        float risWeight = totalWeightSum / (float(usedRestir ? 1u : M) * selectedTarget);
+                        uint pLen = usedRestir ? getPathLength(restirReservoirs[pixelIndex].flags_uv_age) : 1u;
+                        float geomFactor = (usedRestir && pLen <= 1u && uint(selLight.position.w) == 0u) ? (1.0 / max(selectedLightPdf, 1e-6)) : 1.0;
+                        float factor = selectedNdotL * geomFactor * misWeight * risWeight;
                         vec3 directLightRadiance = clamp(selectedLightEmission * factor, vec3(0.0), vec3(65500.0));
                         secDirectL = (diffBrdf + specBrdf) * f16vec3(directLightRadiance);
                         f16vec3 unshadowed = throughput * secDirectL;

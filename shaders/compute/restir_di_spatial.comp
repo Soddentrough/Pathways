@@ -1,0 +1,216 @@
+#version 460
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#include "wavefront_common.glsl"
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 2) readonly buffer InRayGeomQueue {
+    RayGeometry inGeoms[];
+};
+
+layout(std430, binding = 3) readonly buffer InRayHitQueue {
+    RayHit inHits[];
+};
+
+layout(std430, binding = 4) readonly buffer LightsBuffer {
+    Light lights[];
+};
+
+layout(std430, binding = 5) readonly buffer MaterialsBuffer {
+    Material materials[];
+};
+
+layout(binding = 6) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
+} ubo;
+
+layout(binding = 8, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 14, r16f) uniform readonly image2D uConfidenceImage;
+
+layout(std430, binding = 11) readonly buffer InTemporalBuffer {
+    UnifiedReservoirPT inTemporalReservoirs[];
+};
+
+layout(std430, binding = 12) writeonly buffer OutSpatialBuffer {
+    UnifiedReservoirPT outSpatialReservoirs[];
+};
+
+layout(std430, binding = 13) readonly buffer PixelToRayBuffer {
+    uint pixelToRay[];
+};
+
+layout(push_constant) uniform ReSTIRPushConstants {
+    uint width;
+    uint height;
+    uint numLights;
+    uint frameIndex;
+    uint mCap;
+    uint numTriangles;
+    uint hasLightTree;
+    uint passIndex;
+} pc;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) return;
+
+    uint pixelIdx = pixelCoord.y * pc.width + pixelCoord.x;
+    uint seed = pixelIdx ^ (pc.frameIndex * 314159265u + 13u);
+
+    UnifiedReservoirPT rCenter = inTemporalReservoirs[pixelIdx];
+    vec4 centerNormDepth = imageLoad(uNormalDepthImage, pixelCoord);
+    vec3 centerNormal = centerNormDepth.xyz;
+    float centerDepth = centerNormDepth.w;
+
+    if (centerDepth <= 0.0 || pc.numLights == 0u) {
+        outSpatialReservoirs[pixelIdx] = rCenter;
+        return;
+    }
+
+    uint rayIdx = pixelToRay[pixelIdx];
+    if (rayIdx == 0xFFFFFFFFu) {
+        outSpatialReservoirs[pixelIdx] = rCenter;
+        return;
+    }
+
+    RayGeometry geom = inGeoms[rayIdx];
+    RayHit hit = inHits[rayIdx];
+    uint hitType = floatBitsToUint(hit.hitData1.w);
+    float hitT = hit.hitData0.x;
+
+    if (hitType == 2u || hitT <= 0.0) {
+        outSpatialReservoirs[pixelIdx] = rCenter;
+        return;
+    }
+
+    uint matId = floatBitsToUint(hit.hitData0.y);
+    Material mat = materials[matId];
+    if ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.001) {
+        outSpatialReservoirs[pixelIdx] = rCenter;
+        return;
+    }
+
+    vec3 origin = geom.originPackedDir.xyz;
+    vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
+    vec3 hitPoint = origin + dir * hitT;
+    vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
+    f16vec3 diffuseAlbedo = f16vec3(mat.albedo.rgb);
+    float roughness = mat.roughness;
+
+    // --- RING 0: Reciprocal / Paired Neighbor Reuse (ReSTIR PT Enhanced 2026) ---
+    // Horizontal pair within local 2x1 grid: partner is lane ^ 1
+    uint partnerLane = gl_SubgroupInvocationID ^ 1u;
+    ivec2 partnerOffset = ((gl_SubgroupInvocationID & 1u) == 0u) ? ivec2(1, 0) : ivec2(-1, 0);
+    ivec2 partnerCoord = clamp(pixelCoord + partnerOffset, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+    uint partnerPixelIdx = uint(partnerCoord.y * int(pc.width) + partnerCoord.x);
+
+    UnifiedReservoirPT rPartner = inTemporalReservoirs[partnerPixelIdx];
+    if (isValidReservoir(rPartner.flags_uv_age)) {
+        vec4 partnerNormDepth = imageLoad(uNormalDepthImage, partnerCoord);
+        vec3 partnerNorm = partnerNormDepth.xyz;
+        float partnerDepth = partnerNormDepth.w;
+
+        float pNormDot = dot(centerNormal, partnerNorm);
+        float pDepthDiff = abs(centerDepth - partnerDepth) / max(centerDepth, 1e-3);
+
+        if (pNormDot >= 0.80 && pDepthDiff <= 0.10) {
+            uint partnerPathLen = getPathLength(rPartner.flags_uv_age);
+            if (partnerPathLen == 1u /* DI */) {
+                uint pLightIdx = getLightIndex(rPartner.lightIndex_M);
+                if (pLightIdx < pc.numLights) {
+                    Light light = lights[pLightIdx];
+                    vec2 pUV = unpackUV(rPartner.flags_uv_age);
+                    float p_hat_partner = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, pUV);
+                    combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
+                }
+            } else if (partnerPathLen >= 2u /* GI */) {
+                vec3 secDir = unpackOct16((rPartner.flags_uv_age >> 16u) & 0xFFFFu);
+                vec3 secNormal = unpackOct32(rPartner.secondaryHitNormal);
+                vec3 secRadiance = vec3(unpackRadianceRG(rPartner.secondaryRadianceRG), float(unpackRadianceB(rPartner.secondaryRadianceB_flags)));
+                vec3 partnerHitPoint = hitPoint + partnerOffset.x * ubo.viewInverse[0].xyz * 0.05; // estimated partner primary hit
+                vec3 secHitPoint = partnerHitPoint + secDir * rPartner.secondaryHitDist;
+
+                if (validateReconnectionFootprint(hitPoint, hitNormal, roughness, partnerHitPoint, partnerNorm, roughness, secHitPoint)) {
+                    float p_hat_partner = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
+                    combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
+                }
+            }
+        }
+    }
+
+    // --- RINGS 1..3: Multi-Scale Concentric Ring Spatial Sampling with Compatibility Guidance ---
+    // Ring 1: Medium local neighbor (radius 2.5..8.0 px)
+    // Ring 2: Wide surface neighbor (radius 8.0..16.0 px)
+    // Ring 3: Far diffusion neighbor (radius 16.0..24.0 px)
+    // Confidence gating: when Upways neural reconstruction confidence is high (> 0.95), skip outer rings
+    // to prevent over-blurring and retain contact shadows.
+    float reconstructConfidence = imageLoad(uConfidenceImage, pixelCoord).r;
+    int maxRings = (reconstructConfidence > 0.95) ? 1 : 3;
+
+    const float RING_MIN[3] = float[](2.5,  8.0, 16.0);
+    const float RING_MAX[3] = float[](8.0, 16.0, 24.0);
+
+    for (int i = 0; i < maxRings; ++i) {
+        float angle = randFloat(seed) * 6.2831853;
+        float radius = RING_MIN[i] + randFloat(seed) * (RING_MAX[i] - RING_MIN[i]);
+        ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+        ivec2 nCoord = clamp(pixelCoord + offset, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+
+        uint nPixelIdx = uint(nCoord.y * int(pc.width) + nCoord.x);
+        UnifiedReservoirPT rNeighbor = inTemporalReservoirs[nPixelIdx];
+        if (!isValidReservoir(rNeighbor.flags_uv_age)) continue;
+
+        vec4 nNormDepth = imageLoad(uNormalDepthImage, nCoord);
+        vec3 nNormal = nNormDepth.xyz;
+        float nDepth = nNormDepth.w;
+
+        // Compatibility Guidance (HPG 2026): bilateral edge-stopping
+        float normDot = dot(centerNormal, nNormal);
+        float depthDiff = abs(centerDepth - nDepth) / max(centerDepth, 1e-3);
+        if (normDot < 0.80 || depthDiff > 0.10) continue;
+
+        uint nPathLen = getPathLength(rNeighbor.flags_uv_age);
+        if (nPathLen == 1u /* DI */) {
+            uint neighborLightIdx = getLightIndex(rNeighbor.lightIndex_M);
+            if (neighborLightIdx >= pc.numLights) continue;
+
+            Light light = lights[neighborLightIdx];
+            vec2 nLuv = unpackUV(rNeighbor.flags_uv_age);
+            float p_hat_at_center = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, nLuv);
+            combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
+        } else if (nPathLen >= 2u /* GI */) {
+            vec3 secDir = unpackOct16((rNeighbor.flags_uv_age >> 16u) & 0xFFFFu);
+            vec3 secNormal = unpackOct32(rNeighbor.secondaryHitNormal);
+            vec3 secRadiance = vec3(unpackRadianceRG(rNeighbor.secondaryRadianceRG), float(unpackRadianceB(rNeighbor.secondaryRadianceB_flags)));
+            vec3 nHitPoint = hitPoint + dir * (nDepth - centerDepth);
+            vec3 secHitPoint = nHitPoint + secDir * rNeighbor.secondaryHitDist;
+
+            if (validateReconnectionFootprint(hitPoint, hitNormal, roughness, nHitPoint, nNormal, roughness, secHitPoint)) {
+                float p_hat_at_center = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
+                combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
+            }
+        }
+    }
+
+    // Compute final unbiased Monte Carlo evaluation weight W = wSum / (M * p_hat)
+    float W = computeUnbiasedWeightDI(rCenter);
+    rCenter.wSum = W;
+
+    outSpatialReservoirs[pixelIdx] = rCenter;
+}

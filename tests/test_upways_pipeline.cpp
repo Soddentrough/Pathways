@@ -94,25 +94,25 @@ int main() {
 
     // 4. Verify Cooperative Matrix WMMA Weights Topology
     std::cout << "[TEST 4] Wave32 WMMA Cooperative Matrix Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 2121536, "TOTAL_WEIGHT_BUFFER_SIZE must be 2121536 bytes");
-    check_true(upways::LAYER_GUIDE_BRANCH_PROJ.outChannels == 16, "guide_branch_proj output channels must be 16");
-    check_true(upways::LAYER_GUIDE_BRANCH_PROJ.inChannels == 16, "guide_branch_proj input channels must be 16");
-    check_true(upways::LAYER_DOWN1.outChannels == 80, "down1 output channels must be 80");
-    check_true(upways::LAYER_DOWN1.inChannels == 48, "down1 input channels must be 48");
-    check_true(upways::LAYER_DOWN2.outChannels == 112, "down2 output channels must be 112");
-    check_true(upways::LAYER_DOWN2.inChannels == 80, "down2 input channels must be 80");
-    check_true(upways::LAYER_OUT_HEAD_2.outChannels == 16, "out_head_2 output channels must be 16");
-    check_true(upways::LAYER_OUT_HEAD_2.inChannels == 48, "out_head_2 input channels must be 48");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 22944, "TOTAL_WEIGHT_BUFFER_SIZE must be 22944 bytes");
+    check_true(upways::LAYER_FC1.outChannels == 64, "fc1 output channels must be 64");
+    check_true(upways::LAYER_FC1.inChannels == 32, "fc1 input channels must be 32");
+    check_true(upways::LAYER_FC2.outChannels == 64, "fc2 output channels must be 64");
+    check_true(upways::LAYER_FC2.inChannels == 64, "fc2 input channels must be 64");
+    check_true(upways::LAYER_FC3.outChannels == 64, "fc3 output channels must be 64");
+    check_true(upways::LAYER_FC3.inChannels == 64, "fc3 input channels must be 64");
+    check_true(upways::LAYER_FC4.outChannels == 16, "fc4 output channels must be 16");
+    check_true(upways::LAYER_FC4.inChannels == 64, "fc4 input channels must be 64");
 
     // Verify channel counts are aligned to 16 for Wave32 WMMA
-    check_true(upways::LAYER_GUIDE_BRANCH_PROJ.inChannels % 16 == 0, "guide_branch_proj inChannels must be multiple of 16");
-    check_true(upways::LAYER_GUIDE_BRANCH_PROJ.outChannels % 16 == 0, "guide_branch_proj outChannels must be multiple of 16");
-    check_true(upways::LAYER_DOWN1.inChannels % 16 == 0, "down1 inChannels must be multiple of 16");
-    check_true(upways::LAYER_DOWN1.outChannels % 16 == 0, "down1 outChannels must be multiple of 16");
-    check_true(upways::LAYER_DOWN2.inChannels % 16 == 0, "down2 inChannels must be multiple of 16");
-    check_true(upways::LAYER_DOWN2.outChannels % 16 == 0, "down2 outChannels must be multiple of 16");
-    check_true(upways::LAYER_OUT_HEAD_2.inChannels % 16 == 0, "out_head_2 inChannels must be multiple of 16");
-    check_true(upways::LAYER_OUT_HEAD_2.outChannels % 16 == 0, "out_head_2 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC1.inChannels % 16 == 0, "fc1 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC1.outChannels % 16 == 0, "fc1 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.inChannels % 16 == 0, "fc2 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.outChannels % 16 == 0, "fc2 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC3.inChannels % 16 == 0, "fc3 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC3.outChannels % 16 == 0, "fc3 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC4.inChannels % 16 == 0, "fc4 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC4.outChannels % 16 == 0, "fc4 outChannels must be multiple of 16");
     std::cout << "  -> Wave32 WMMA 16x16 cooperative matrix alignment verified across all network layers." << std::endl;
 
     // 5. Verify Exported Weights File Existence and Size

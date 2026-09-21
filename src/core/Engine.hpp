@@ -15,6 +15,7 @@
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/NRCManager.hpp"
+#include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
 #include "vulkan/Texture.hpp"
@@ -32,6 +33,8 @@
 #include <future>
 
 namespace pathways {
+
+class VideoDecoder;
 
 class Engine {
 public:
@@ -294,6 +297,11 @@ private:
     void dispatchCausticSplatAndFilter(VkCommandBuffer cmd, uint32_t frameSlot);
     void dispatchCaustics(VkCommandBuffer cmd, uint32_t frameSlot);
 
+    // ReSTIR DI Subsystem
+    std::unique_ptr<ReSTIRManager> m_restirManager;
+    void createReSTIRResources();
+    void destroyReSTIRResources();
+
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";
@@ -391,6 +399,12 @@ private:
     float m_gamepadRightTrigger = 0.0f;
     bool m_gamepadBtnA = false;
     bool m_gamepadBtnB = false;
+
+    // Video billboard decoder & dynamic staging buffers
+    std::unique_ptr<VideoDecoder> m_videoDecoder;
+    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_videoStagingBuffers;
+    void initVideoBillboardDecoder(const std::string& scenePath);
+    void updateVideoBillboards(VkCommandBuffer cmd);
 };
 
 } // namespace pathways

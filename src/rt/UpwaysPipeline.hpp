@@ -68,7 +68,10 @@ public:
         VkImageView albedoRoughnessImageView,
         VkImageView specularMotionImageView,
         VkImageView diffuseImageView,
-        VkImageView specularImageView
+        VkImageView specularImageView,
+        VkBuffer restirReservoirBuffer = VK_NULL_HANDLE,
+        VkImageView confidenceOutputImageView = VK_NULL_HANDLE,
+        VkBuffer restirReservoirBuffer1 = VK_NULL_HANDLE
     );
 
     void recordFrame(
@@ -87,6 +90,7 @@ public:
     void transitionInitialLayouts(VkCommandBuffer cmd);
 
     Image* getOutputImage() const { return m_outputImage.get(); }
+    Image* getConfidenceImage() const { return m_confidenceImage.get(); }
     uint32_t getInputWidth() const { return m_inputWidth; }
     uint32_t getInputHeight() const { return m_inputHeight; }
     uint32_t getOutputWidth() const { return m_outputWidth; }
@@ -116,7 +120,9 @@ private:
     uint32_t m_pingPongIndex = 0;
 
     std::unique_ptr<Buffer> m_weightBuffer;
+    std::unique_ptr<Buffer> m_dummyReservoirBuffer;
     std::unique_ptr<Image> m_outputImage;
+    std::unique_ptr<Image> m_confidenceImage;
     std::unique_ptr<Image> m_diffHistoryImages[2];
     std::unique_ptr<Image> m_specHistoryImages[2];
 
