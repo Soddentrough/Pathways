@@ -312,8 +312,8 @@ Measured at native **3840×2160 (4K UHD)**, 1 SPP, 4 Bounces, FP16 HDR Accumulat
 | **Dragon Dispersion** | Dense mesh, chromatic dispersion, Fresnel transmission | 7.47 ms (133.9 FPS) | 7.47 ms (133.9 FPS) | **3.97 ms (251.6 FPS)** | **1.88x** (Wavefront Wins) | **34.10 dB** [PASS] |
 | **Classroom** | Dense architectural occlusion, multi-bounce GI | 12.53 ms (79.8 FPS) | 12.51 ms (79.9 FPS) | **9.97 ms (100.3 FPS)** | **1.26x** (Wavefront Wins) | **24.50 dB** [PASS] |
 | **Living Room Extended** | Complex architectural interior, divergent materials | 10.05 ms (99.6 FPS) | 10.50 ms (95.2 FPS) | **8.96 ms (111.5 FPS)** | **1.12x** (Wavefront Wins) | **29.25 dB** [PASS] |
-| **Cyber City** | 13.58M instanced triangles, 5,521 TLAS instances | — | 17.54 ms (57.0 FPS) | **12.34 ms (81.0 FPS)** | **1.42x** (-5.20 ms) | **31.20 dB** [PASS] |
-| **Bistro Interior** | Production scale (>1.3M triangles, 74 materials) | — | 26.18 ms (38.2 FPS) | **23.67 ms (42.3 FPS)** | **1.11x** (-2.51 ms) | **30.50 dB** [PASS] |
+| **Cyber City** | 13.58M instanced triangles, 5,521 TLAS instances | 20.65 ms (48.4 FPS) | 17.54 ms (57.0 FPS) | **12.34 ms (81.0 FPS)** | **1.67x** (-8.31 ms vs RTP) | **31.20 dB** [PASS] |
+| **Bistro Interior** | Production scale (>1.3M triangles, 74 materials) | 30.19 ms (33.1 FPS) | 26.18 ms (38.2 FPS) | **23.67 ms (42.3 FPS)** | **1.28x** (-6.52 ms vs RTP) | **30.50 dB** [PASS] |
 | **Coffee Maker Extended** | Multi-material stress (OpenUSD, glossy conductors) | 6.98 ms (143.2 FPS) | 9.77 ms (102.4 FPS) | **8.43 ms (118.6 FPS)** | **1.16x vs Mono** | **23.29 dB** [PASS] |
 | **Cornell Box** | Low triangle count, baseline diffuse inter-reflection | **7.09 ms (141.1 FPS)** | 8.34 ms (119.9 FPS) | **8.01 ms (124.8 FPS)** | 0.89x (Fixed Barrier Floor) | **24.25 dB** [PASS] |
 
