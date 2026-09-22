@@ -1249,7 +1249,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 config.dgc_preprocess
             );
             updateSecondaryWavefrontDescriptors(secNode.get());
-            Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
+            Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
         } catch (const std::exception& e) {
             Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}. Falling back to RTP.", e.what());
             secNode->wavefrontPipeline.reset();

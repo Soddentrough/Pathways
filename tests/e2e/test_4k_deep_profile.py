@@ -520,7 +520,7 @@ class Test4KDeepProfileSuite:
         validate_frame_image(png_path, 3840, 2160)
 
     def test_tier2_extreme_geometry_bistro_interior(self):
-        """Tier 2: Stress-test massive exterior/interior real-world asset (Bistro Interior: 1.3M+ tris, 74 mats)."""
+        """Tier 2: Stress-test large exterior/interior real-world asset (Bistro Interior: 1.3M+ tris, 74 mats)."""
         bistro_path = os.path.join(PROJECT_ROOT, "scenes", "bistro", "bistro_interior.glb")
         if not os.path.exists(bistro_path):
             return
@@ -663,7 +663,7 @@ class Test4KDeepProfileSuite:
         ], timeout_sec=30)
         assert code == 0
 
-        assert "Secondary GPU: Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully" in stdout
+        assert "Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully" in stdout
         assert "Secondary GPU Node fully initialized" in stdout
 
     # --------------------------------------------------------------------------
@@ -805,7 +805,7 @@ def run_standalone_suite(selected_tier=None, output_dir=DEFAULT_OUTPUT_DIR):
         ("F07-T01", "Single vs Dual Tile Image Consistency", suite.test_tier2_single_vs_dual_gpu_consistency_tile),
         ("F07-T02", "Single vs Dual Sample Image Consistency", suite.test_tier2_single_vs_dual_gpu_consistency_sample),
         ("F08-T01", "Procedural Cyber City Extreme Load", suite.test_tier2_extreme_geometry_cyber_city),
-        ("F09-T01", "Bistro Interior Massive Mesh (1.3M Tris)", suite.test_tier2_extreme_geometry_bistro_interior),
+        ("F09-T01", "Bistro Interior Large-Scale Mesh (1.3M Tris)", suite.test_tier2_extreme_geometry_bistro_interior),
         ("F10-T01", "Bounce Depth Boundary (1 vs 8 Bounces)", suite.test_tier2_bounce_depth_boundary),
     ]
 

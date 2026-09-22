@@ -1,5 +1,5 @@
 # Pathways Engine Architecture Specification
-## Pure Vulkan 1.4 Real-Time Path Tracing with Autonomous Device-Generated Commands, Wavefront Microkernels, and Multi-GPU Scaling
+## Vulkan 1.4 Real-Time Path Tracing with Autonomous Device-Generated Commands, Wavefront Microkernels, and Multi-GPU Scaling
 
 - **Engine Baseline**: Vulkan Core 1.4 (1.4.341+)
 - **Primary Hardware Targets**: AMD RDNA 4 (`gfx1201` / Radeon AI PRO R9700) and RDNA 3 architectures
@@ -9,14 +9,14 @@
 
 ## 1. Architectural Philosophy & Engine Foundations
 
-Real-time path tracing at 4K (3840×2160) within an interactive 8.33 ms (120 FPS) or 16.66 ms (60 FPS) frame budget demands extreme architectural discipline. Traditional real-time renderers deploy **monolithic megakernels** that package ray generation, BVH traversal, material evaluation, light sampling, and secondary ray recursion into a single execution unit.
+Real-time path tracing at 4K (3840×2160) within an interactive 8.33 ms (120 FPS) or 16.66 ms (60 FPS) frame budget requires structured pipeline design and register management. Traditional real-time renderers deploy **monolithic megakernels** that package ray generation, BVH traversal, material evaluation, light sampling, and secondary ray recursion into a single execution unit.
 
-While conceptually straightforward, monolithic ray tracing pipelines suffer from catastrophic hardware inefficiencies on modern wide SIMD architectures:
+While conceptually straightforward, monolithic ray tracing pipelines encounter several hardware bottlenecks on modern wide SIMD architectures:
 1. **Intra-Wave Branch & Path-Length Divergence**: SIMD execution units serialize across divergent execution paths when adjacent lanes evaluate differing materials or terminate at differing path lengths.
 2. **Vector General-Purpose Register (VGPR) Bloat**: Monolithic shaders must preserve registers and samplers for all supported BSDFs simultaneously, demanding 72–128+ VGPRs per thread and capping hardware wave occupancy to 25%–50%.
-3. **Cache Locality Thrashing**: Adjacent threads access disparate textures, material buffers, and BVH nodes, destroying L0/L1 vector cache hit rates.
+3. **Cache Locality Thrashing**: Adjacent threads access disparate textures, material buffers, and BVH nodes, degrading L0/L1 vector cache hit rates.
 
-Pathways discards the monolithic megakernel paradigm in favor of a **GPU-Autonomous Wavefront Architecture** driven by standard Vulkan 1.4 **Device Generated Commands (`VK_EXT_device_generated_commands`)**.
+Pathways replaces the monolithic megakernel approach with a **GPU-driven Wavefront Architecture** using standard Vulkan 1.4 **Device Generated Commands (`VK_EXT_device_generated_commands`)**.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -61,14 +61,14 @@ Pathways decomposes light transport into decoupled, specialized compute microker
    - Inspects surface intersection records produced by BVH traversal.
    - Evaluates surface material archetype (Diffuse, Dielectric, Conductor, Complex, Emissive, Passthrough).
    - Computes 16-bit composite sorting keys combining material archetype and quantized 3D Morton spatial codes.
-   - Atomically stages rays into dedicated Structure-of-Arrays (SoA) work-list queues via 64-bit Buffer Device Addresses (BDA).
+   - Atomically stages rays into dedicated Structure-of-Arrays (SoA) ray queues via 64-bit Buffer Device Addresses (BDA).
 2. **GPU-Autonomous Command Synthesis**:
    - The classifier kernel synthesizes indirect dispatch commands directly into a device command buffer.
    - Updates `VkIndirectExecutionSetEXT` pipeline tokens on the device with zero CPU intervention.
 3. **Autonomous Microkernel Execution (`vkCmdExecuteGeneratedCommandsEXT`)**:
    - Dispatches only the exact wave counts needed for each material queue.
    - Vector register pressure is tailored to each physical lobe:
-     - `shade_diffuse.comp`: Pure Lambertian diffuse reflection + shadow query. Operates at **24 VGPRs** with **100% Wave32 hardware occupancy**.
+     - `shade_diffuse.comp`: Lambertian diffuse reflection + shadow query. Operates at **24 VGPRs** with **100% Wave32 hardware occupancy**.
      - `shade_dielectric.comp`: Snell's law refraction, Total Internal Reflection (TIR), and volumetric Beer-Lambert absorption. Operates at **40 VGPRs** with **100% occupancy**.
      - `shade_conductor.comp`: Anisotropic GGX specular microfacets with Fresnel-Conductor physics. Operates at **48 VGPRs** with **100% occupancy**.
      - `shade_complex.comp`: Layered clearcoat, transmission, and sheen BSDFs. Operates at **64 VGPRs** with **50% occupancy**.
@@ -123,7 +123,7 @@ Pathways provides unlinked multi-GPU scaling across dual discrete GPUs (e.g. 2x 
        ▼  CP DMA High-Speed Posted Writes (~25 GB/s PCIe Bus Line Rate)
   [ Pinned Host RAM ] ──► VK_EXT_external_memory_host
        │
-       ▼  Zero CPU Intervention / Zero PCIe Bus Contention
+       ▼  GPU-Autonomous DMA / Pinned Host Buffering
   [ Primary GPU (GPU 0) ]
        │
        ▼  Direct Import & Tile Composite (<0.12 ms)
@@ -132,19 +132,19 @@ Pathways provides unlinked multi-GPU scaling across dual discrete GPUs (e.g. 2x 
 
 ### 4.1 Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`)
 - **Default Mode (`--mgpu-transfer host`)**: Secondary GPU streams completed $64\times 64$ checkerboard tiles into pinned host memory via CP DMA posted writes at PCIe 4.0/5.0 bus line rate (~25 GB/s, latency <0.5 ms).
-- **Direct Primary Import**: Primary GPU imports the host pointer and composites alternate tiles in ~0.12 ms without PCIe bus contention, ensuring consistent 250+ FPS camera motion.
+- **Direct Primary Import**: Primary GPU imports the host pointer and composites alternate tiles in ~0.12 ms without PCIe bus contention, maintaining consistent frame pacing.
 
 ### 4.2 Linux DMA-BUF Direct P2P (`--mgpu-transfer p2p`)
 - Uses `VK_EXT_external_memory_dma_buf` and `VK_KHR_external_semaphore_fd` for direct cross-device memory sharing on hardware with coherent inter-GPU links (e.g. Infinity Fabric).
 
 ### 4.3 Fine-Grained 2D Checkerboard Tiling
-Screen space is subdivided into $64\times 64$ alternating tiles (2,040 tiles at 4K). Dual GPUs execute perfectly balanced spatial and shading workloads, scaling framerates by **$1.72\times$ to $1.93\times$** over single-GPU performance.
+Screen space is subdivided into $64\times 64$ alternating tiles (2,040 tiles at 4K). Dual GPUs execute balanced spatial and shading workloads across alternating tiles, scaling framerates by **$1.72\times$ to $1.93\times$** over single-GPU performance.
 
 ---
 
 ## 5. Super-Resolution & Neural Reconstruction
 
-Pathways integrates two state-of-the-art super-resolution paradigms:
+Pathways provides two super-resolution options:
 
 ### 5.1 AMD FidelityFX Super Resolution 3.1 (FSR 3.1)
 - Integrated via modular `Fsr3Upscaler` compute pipeline (`shaders/compute/fsr3_*.comp`).
@@ -161,7 +161,7 @@ Pathways integrates two state-of-the-art super-resolution paradigms:
 
 Pathways implements ReSTIR Direct Illumination (`src/rt/ReSTIRManager.cpp`) to handle many-light environments:
 - **Temporal Reservoir Reuse**: Projects light candidate reservoirs across consecutive frames via motion vectors, evaluating temporal visibility confidence.
-- **Spatial Reservoir Reuse**: Exchanges light candidates across neighboring pixels within a spatial radius, suppressing direct lighting variance by orders of magnitude with a single shadow ray evaluation.
+- **Spatial Reservoir Reuse**: Exchanges light candidates across neighboring pixels within a spatial radius, significantly reducing direct lighting variance with a single shadow ray evaluation.
 
 ---
 

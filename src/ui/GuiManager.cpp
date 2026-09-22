@@ -533,7 +533,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("VK_KHR_acceleration_structure (BLAS + TLAS)");
             ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
             ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
-            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Work Lists & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
+            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Ray Queues & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
             if (config.pipeline_type == PipelineType::Wavefront) {
                 const char* wfSortStr = "Dual (Spatial-Morton + Material)";
                 if (config.wavefront_sort_mode == WavefrontSortMode::None) wfSortStr = "None (Monolithic)";
@@ -1117,7 +1117,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
             int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
-            if (ImGui::RadioButton("Wavefront Path Tracing (Work Lists & DGC)", &pipeType, 0)) {
+            if (ImGui::RadioButton("Wavefront Path Tracing (Ray Queues & DGC)", &pipeType, 0)) {
                 config.pipeline_type = PipelineType::Wavefront;
                 settingsChanged = true;
             }
@@ -1476,13 +1476,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("ReSTIR Direct Illumination (gfx1201 Ultra-Lean):");
-            if (ImGui::Checkbox("Enable ReSTIR DI", &config.enable_restir_di)) {
+            ImGui::TextDisabled("Direct Lighting & Importance Sampling:");
+            if (ImGui::Checkbox("Hierarchical Light Tree (3D BVH)", &config.enable_light_tree)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatio-temporal reservoir resampling for direct illumination with 16B reservoirs and LDS-cached spatial reuse. Opt-in via --restir-di.");
+                ImGui::SetTooltip("O(log N) hierarchical 3D BVH importance sampling for many-light scenes. Opt-in via --light-tree.");
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("ReSTIR Path Resampling (gfx1201 Ultra-Lean):");
+            if (ImGui::Checkbox("Enable ReSTIR PT", &config.enable_restir_di)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spatio-temporal path reservoir resampling (ReSTIR PT) with unified reservoirs and multi-scale spatial reuse. Opt-in via --restir-pt.");
             }
             if (config.enable_restir_di) {
                 ImGui::Indent();

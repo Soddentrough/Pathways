@@ -78,7 +78,7 @@ void main() {
     vec3 centerNormal = centerNormDepth.xyz;
     float centerDepth = centerNormDepth.w;
 
-    if (centerDepth <= 0.0 || pc.numLights == 0u) {
+    if (centerDepth <= 0.0) {
         outSpatialReservoirs[pixelIdx] = rCenter;
         return;
     }
@@ -208,9 +208,6 @@ void main() {
         }
     }
 
-    // Compute final unbiased Monte Carlo evaluation weight W = wSum / (M * p_hat)
-    float W = computeUnbiasedWeightDI(rCenter);
-    rCenter.wSum = W;
-
+    // Write completed spatial reservoir (wSum, M, and targetPdf are preserved for shading and next-frame temporal reuse)
     outSpatialReservoirs[pixelIdx] = rCenter;
 }

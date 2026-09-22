@@ -63,7 +63,7 @@ This report delivers an exhaustive, evidence-based physical, architectural, and 
 ### Key Empirical Findings
 - **Occupancy Disparity on RDNA 4 (`gfx1201`)**:
   - The monolithic wavefront kernel consumes **101 VGPRs** (104 allocated), restricting theoretical wave occupancy to **4 waves/SIMD (25.0%)**.
-  - Archetype microkernel splitting unlocks dramatic occupancy gains for specific lobes:
+  - Archetype microkernel splitting increases wave occupancy for specific lobes:
     - **Emissive**: Drops to **19 VGPRs**, reaching **16 waves/SIMD (100.0% occupancy)** (+300% gain).
     - **Dielectric (Glass/Transmission)**: Drops to **42 VGPRs**, reaching **10 waves/SIMD (62.5% occupancy)** (+150% gain).
     - **Secondary Diffuse**: Specialized compile-time dead-code elimination (`-DIS_SECONDARY_BOUNCE=1`) drops VGPRs from 85 to **52 VGPRs**, increasing occupancy from 31.2% to **56.2% (9 waves/SIMD)**.
@@ -119,7 +119,7 @@ The Pathways codebase incorporates three distinct path tracing paradigms:
    - Supports two execution modes:
      - **Monolithic Mode**: A single compute kernel (`wavefront_shade.comp`) processes all active ray hits regardless of material type.
      - **Specialized Archetype Microkernel Mode**: Ray hits are classified into 6 discrete material queues (`diffuse`, `dielectric`, `conductor`, `complex`, `emissive`, `passthrough`). Each archetype executes a specialized compute kernel with customized register budgets, SIMD width, and lobe math.
-   - Dispatches can be driven either via multi-dispatch indirect work-lists (`vkCmdDispatchIndirect`) or Device Generated Commands (`VK_EXT_device_generated_commands`) with `VkIndirectExecutionSetEXT`.
+   - Dispatches can be driven either via multi-dispatch indirect buffers (`vkCmdDispatchIndirect`) or Device Generated Commands (`VK_EXT_device_generated_commands`) with `VkIndirectExecutionSetEXT`.
 
 2. **Hardware Ray Tracing Pipeline (`VK_KHR_ray_tracing_pipeline`)**:
    - Implemented across `shaders/rt/raytrace.rgen`, `shaders/rt/raytrace.rchit`, `shaders/rt/raytrace.rmiss`, and `shaders/rt/shadow.rmiss`.
@@ -208,7 +208,7 @@ float distributionGGX(float NdotH, float alpha) {
     return a2 / (PI * d * d);
 }
 ```
-**Audit Assessment**: The clamping $\max(\alpha^2, 10^{-6})$ prevents catastrophic division by zero at $\alpha \to 0$. The formulation is mathematically exact and normalized: $\int_{\Omega} D(H) (N\cdot H) d\omega = 1$.
+**Audit Assessment**: The clamping $\max(\alpha^2, 10^{-6})$ prevents division by zero at $\alpha \to 0$. The formulation is mathematically exact and normalized: $\int_{\Omega} D(H) (N\cdot H) d\omega = 1$.
 
 #### Anisotropic GGX
 In `wavefront_common.glsl:517` and `wavefront_shade_conductor.comp:357`:
@@ -311,7 +311,7 @@ float visibilitySmithGGXCorrelated(float NdotL, float NdotV, float alpha) {
    `float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);`
    This is a physical approximation: microfacets elongated along the tangent direction exhibit asymmetric self-shadowing along the bitangent axis. The true anisotropic Smith correlated term requires:
    $$\Lambda(v) = \frac{\sqrt{1 + \frac{(\alpha_x (T\cdot v))^2 + (\alpha_y (B\cdot v))^2}{(N\cdot v)^2}} - 1}{2}$$
-   Using isotropic $G$ causes highlights at extreme grazing angles along the anisotropic axis to be slightly under-shadowed.
+   Using isotropic $G$ causes highlights at steep grazing angles along the anisotropic axis to be slightly under-shadowed.
 
 ---
 
@@ -589,7 +589,7 @@ $$f_r(V, L) = \frac{D(H) G_2(V, L) F(V, H)}{4 (N\cdot V) (N\cdot L)} = D(H) V(V,
 Consequently, the mathematically exact Monte Carlo throughput estimator weight for an indirect bounce sampled with discrete probability $p_{lobe}$ is:
 $$w = \frac{f_r(V, L) (N\cdot L)}{p(L) p_{lobe}} = \frac{\frac{D(H) G_2(V, L) F(V, H)}{4(N\cdot V)(N\cdot L)} (N\cdot L)}{\frac{D(H)(N\cdot H)}{4(V\cdot H)} p_{lobe}} = F(V, H) \frac{G_2(V, L)(V\cdot H)}{(N\cdot V)(N\cdot H) p_{lobe}} = \frac{4 V(V, L) F(V, H) (N\cdot L) (V\cdot H)}{(N\cdot H) p_{lobe}}$$
 In `wavefront_shade_complex.comp`, lines 663 and 673 omit $G_2(V, L)$ (or $V(V, L)$), $(N\cdot L)$, and the $(V\cdot H)/(N\cdot H)$ Jacobian ratio in their entirety, multiplying throughput simply by $F_c / p_{clearcoat}$ and $F_{spec} (1 - F_c) / p_{baseSpec}$.
-- **Physical Failure**: The shader treats rough microfacet surfaces as completely unshadowed specular mirrors. On rough surfaces ($\alpha > 0.2$), where $G_2(V, L)$ is significantly smaller than 1.0 (often $0.2 - 0.4$ at grazing angles), omitting masking-shadowing severely violates energy conservation, producing extreme, unphysical radiant energy blowout on rough complex materials.
+- **Physical Failure**: The shader treats rough microfacet surfaces as completely unshadowed specular mirrors. On rough surfaces ($\alpha > 0.2$), where $G_2(V, L)$ is significantly smaller than 1.0 (often $0.2 - 0.4$ at grazing angles), omitting masking-shadowing severely violates energy conservation, producing unphysical radiant energy blowout on rough complex materials.
 
 **Defect 2: Zero Horizon Rejection and Interior Ray Leakage**:
 Under standard GGX sampling at oblique viewing angles, sampled microfacets regularly reflect light below the geometric surface horizon ($N\cdot L \le 0$).
@@ -688,7 +688,7 @@ Because NEE already sampled that emissive light source on bounce $b-1$, accumula
 +-----------------------------+-----------------------------------------------------------------------------------------------+
 | Tier 2 glTF Extensions      | - Microkernels: Full support in wavefront_shade_complex.comp:550, conductor:248, diel:215     |
 | (Sheen, Aniso, Disp, Irid)  | - Monolithic / RT / RayQuery: Fields defined in struct Material but NEVER evaluated.          |
-|                             | - Visual Impact: Dramatic loss of detail on fabric, metal, and glass when leaving microkernel.|
+|                             | - Visual Impact: Loss of detail on fabric, metal, and glass when leaving microkernel.        |
 +-----------------------------+-----------------------------------------------------------------------------------------------+
 | Grazing Specular Reflection | - wavefront_shade.comp:626 & raytrace_comp.comp:817 fall back to diffuse dividing by diffProb.|
 |                             | - wavefront_shade_conductor.comp:437 kills the ray outright on N.L <= 0.                      |
@@ -934,9 +934,9 @@ uint getMaterialArchetype(Material mat) {
 In the current implementation, every transparent cutout pixel encountered consumes **one full bounce of the path tracer budget** and wastes 128 bytes of queue memory bandwidth (80B read + 48B write) merely to advance the ray origin by $\epsilon$.
 
 #### The Naive Inlining Proposal & Its Microarchitectural Pitfalls
-At first glance, inlining alpha testing into BVH traversal (`wavefront_intersect.comp`) using `rayQueryConfirmIntersectionEXT()` seems intuitive: non-opaque intersections could be rejected during traversal, eliminating the `MATERIAL_ARCHETYPE_ALPHAMASK` microkernel entirely. However, a rigorous microarchitectural audit on AMD RDNA 4 (`gfx1201`) reveals that inlining texture lookups into the ray traversal loop introduces catastrophic performance penalties:
+At first glance, inlining alpha testing into BVH traversal (`wavefront_intersect.comp`) using `rayQueryConfirmIntersectionEXT()` seems intuitive: non-opaque intersections could be rejected during traversal, eliminating the `MATERIAL_ARCHETYPE_ALPHAMASK` microkernel entirely. However, a rigorous microarchitectural audit on AMD RDNA 4 (`gfx1201`) reveals that inlining texture lookups into the ray traversal loop introduces severe performance penalties:
 
-1. **Destruction of Fixed-Function Hardware Ray Acceleration**:
+1. **Bypassing Fixed-Function Hardware Ray Acceleration**:
    - In `wavefront_intersect.comp:149`, BVH traversal is currently initialized with:
      ```glsl
      rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, EPSILON, direction, closestT);
@@ -1059,7 +1059,7 @@ In this standard path:
 3. The CPU never inspects workgroup counts, never waits on fences, and never re-records commands between bounces. The GPU command processor consumes the indirect arguments directly.
 
 #### Balanced Latency & Overhead Trade-Off: DGC vs. Multi-Dispatch Indirect for $N=4$
-While DGC (`VK_EXT_device_generated_commands`) is transformative for massive workloads (hundreds or thousands of indirect commands dynamically altering descriptors, push constants, and shaders), its latency profile for a small, static sequence count of **$N = 4$** warrants rigorous scrutiny:
+While DGC (`VK_EXT_device_generated_commands`) is effective for large command workloads (hundreds or thousands of indirect commands dynamically altering descriptors, push constants, and shaders), its latency profile for a small, static sequence count of **$N = 4$** warrants rigorous scrutiny:
 
 | Execution Dimension | Standard Multi-Dispatch Indirect (`vkCmdDispatchIndirect`) | DGC Execution Sets (`vkCmdExecuteGeneratedCommandsEXT`) |
 | :--- | :--- | :--- |

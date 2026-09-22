@@ -87,7 +87,7 @@ void main() {
     emptyRes.secondaryRadianceB_flags = 0u;
 
     uint rayIdx = pixelToRay[pixelIdx];
-    if (rayIdx == 0xFFFFFFFFu || pc.numLights == 0u) {
+    if (rayIdx == 0xFFFFFFFFu) {
         outTemporalReservoirs[pixelIdx] = emptyRes;
         return;
     }
@@ -129,7 +129,7 @@ void main() {
     rCurr.secondaryRadianceRG = 0u;
     rCurr.secondaryRadianceB_flags = 0u;
 
-    const uint NUM_CANDIDATES = 4u;
+    const uint NUM_CANDIDATES = (pc.numLights > 0u) ? 4u : 0u;
     for (uint c = 0u; c < NUM_CANDIDATES; ++c) {
         uint lightIdx = 0u;
         float selectPdf = 1.0;
@@ -149,37 +149,34 @@ void main() {
     // --- PHASE 2: Temporal Reprojection & Reuse ---
     vec2 mv = imageLoad(uMotionVectorImage, pixelCoord).xy;
     vec2 pixelDisp = mv * vec2(float(pc.width), float(pc.height));
-    vec2 prevPixelFloat = vec2(pixelCoord) + pixelDisp;
+    vec2 prevPixelFloat = vec2(pixelCoord) - pixelDisp;
     ivec2 prevCoord = ivec2(round(prevPixelFloat));
 
     if (prevCoord.x >= 0 && prevCoord.x < int(pc.width) &&
         prevCoord.y >= 0 && prevCoord.y < int(pc.height) &&
         pc.frameIndex > 0u)
     {
-        vec4 currNormDepth = imageLoad(uNormalDepthImage, pixelCoord);
-        vec3 currNormal = currNormDepth.xyz;
-        float currDepth = currNormDepth.w;
+        vec4 prevClip = ubo.prevViewProj * vec4(hitPoint, 1.0);
+        float expectedPrevDepth = prevClip.w;
 
         vec4 prevNormDepth = imageLoad(uPrevNormalDepthImage, prevCoord);
-        vec3 prevNormal = prevNormDepth.xyz;
         float prevDepth = prevNormDepth.w;
 
-        // Velocity-adaptive bilateral edge stopping:
-        float normalDot = dot(currNormal, prevNormal);
-        float depthDiff = abs(currDepth - prevDepth) / max(currDepth, 1e-3);
+        // Velocity-adaptive bilateral depth edge stopping based on true reprojected depth:
+        float depthDiff = abs(expectedPrevDepth - prevDepth) / max(expectedPrevDepth, 1e-3);
         float mvSpeed = length(pixelDisp);
-        float depthTolerance = 0.05 + min(0.05 * mvSpeed, 0.15);
+        float depthTolerance = 0.08 + min(0.05 * mvSpeed, 0.20);
 
-        // Denoiser-Aware Decorrelation: 10% of pixels skip temporal accumulation to inject fresh unbiased variance for Upways
-        bool isDecorrelationPixel = (randFloat(seed) < 0.10);
-
-        if (normalDot >= 0.75 && depthDiff <= depthTolerance && !isDecorrelationPixel) {
+        if (expectedPrevDepth > 0.0 && depthDiff <= depthTolerance) {
             uint prevIdx = uint(prevCoord.y * int(pc.width) + prevCoord.x);
             UnifiedReservoirPT rPrev = inPrevReservoirs[prevIdx];
             if (isValidReservoir(rPrev.flags_uv_age) && rPrev.targetPdf > 0.0) {
-                // Clamp temporal M to avoid lag and history saturation
-                uint prevM = min(getM(rPrev.lightIndex_M), pc.mCap);
-                rPrev.lightIndex_M = packLightM(getLightIndex(rPrev.lightIndex_M), prevM);
+                // Clamp temporal M to avoid lag and history saturation, scaling wSum to preserve unbiased mean (Bitterli et al. Eq. 6)
+                uint origM = getM(rPrev.lightIndex_M);
+                if (origM > pc.mCap && origM > 0u) {
+                    rPrev.wSum *= float(pc.mCap) / float(origM);
+                    rPrev.lightIndex_M = packLightM(getLightIndex(rPrev.lightIndex_M), pc.mCap);
+                }
 
                 // Increment age and preserve flags
                 uint prevAge = min(getAge(rPrev.flags_uv_age) + 1u, 255u);

@@ -405,7 +405,7 @@ int main() {
         camResponsiveness.update(0.016f);
         check_true(!camResponsiveness.hasMoved(), "Ceasing mouse movement must immediately trigger accumulation");
 
-        std::cout << "[PASS] Camera inertia damping & zero-latency accumulation responsiveness verified (< 50 ms)." << std::endl;
+        std::cout << "[PASS] Camera inertia damping & immediate accumulation responsiveness verified (< 50 ms)." << std::endl;
     }
 
     // 21. Analog Stick Proportional Deflection & Sub-Threshold Deadzone

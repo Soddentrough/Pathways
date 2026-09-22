@@ -55,14 +55,14 @@ TARGET_SCENES = [
     {
         "id": "bistro_interior",
         "name": "Bistro Interior",
-        "category": "Massive Architectural (>1.3M Triangles)",
+        "category": "Large-Scale Architectural (>1.3M Triangles)",
         "args": [
             "--scene", "scenes/bistro/bistro_interior.glb",
             "--camera-pos", "3.5,1.75,-6.2",
             "--camera-target", "9.5,1.65,0.5",
             "--camera-fov", "70"
         ],
-        "desc": "Massive geometry (1.32M tris), 74 materials, 207 textures, high occlusion."
+        "desc": "Complex geometry (1.32M tris), 74 materials, 207 textures, high occlusion."
     },
     {
         "id": "cyber_city",
@@ -655,7 +655,7 @@ def generate_dgc_validation_report(hw_info, output_path):
         "   - Workgroup dispatch dimensions (`groups = (count + 31u) / 32u`) are written directly to GPU memory addresses in `indirectArgs` (`commands[0..5]` and `dgcStream.commands[0..5]`).",
         "2. **Device Command Recording**:",
         "   - The host CPU records command buffer commands once per frame.",
-        "   - All subsequent dispatch counts, material classifications, shadow ray queues, and intersect worklists are resolved directly by the GPU command processor without round-trips to the host.",
+        "   - All subsequent dispatch counts, material classifications, shadow ray queues, and intersect ray queues are resolved directly by the GPU command processor without round-trips to the host.",
         "3. **Mesa RADV Parity & Fallback Verification**:",
         "   - Tested under both `--wavefront-sort archetype` (DGC enabled) and `--no-dgc-preprocess` (DGC implicit baseline).",
         "   - Zero Vulkan validation layer warnings; zero CPU fallback warnings in runtime execution logs.",

@@ -297,7 +297,7 @@ void main() {
                 }
             }
         } else {
-            // Hit! Setup SoA state: only enqueue into secondary bounce work-lists if this is a local tile!
+            // Hit! Setup SoA state: only enqueue into secondary bounce ray queues if this is a local tile!
             isActive = isLocalTile;
 
             geom.originPackedDir = vec4(origin, uintBitsToFloat(packOct32(direction)));

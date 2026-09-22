@@ -155,8 +155,30 @@ float evalUnshadowedTargetGI(vec3 hitPoint, vec3 hitNormal, f16vec3 diffuseAlbed
     float lum = dot(secRadiance, vec3(0.2126, 0.7152, 0.0722));
     if (lum <= 1e-6) return 0.0;
     float albedoWeight = max(float(dot(diffuseAlbedo, f16vec3(0.3333))), 0.01);
+
+    // Optical infinity / Sky dome has no 1/r^2 geometric distance decay
+    if (dist >= 5000.0) {
+        return lum * cosTheta0 * albedoWeight;
+    }
+
     float distSq = max(dist * dist, 1e-4);
     return (lum * cosTheta0 * cosTheta1 * albedoWeight) / distSq;
+}
+
+// Jacobian determinant for secondary path reconnection:
+// J = (||x1 - x_orig||^2 / ||x1 - x_new||^2) * (cos(theta1_new) / cos(theta1_orig))
+float evalGIJacobian(vec3 x_new, vec3 x_orig, vec3 x1, vec3 n1) {
+    vec3 to_orig = x1 - x_orig;
+    vec3 to_new = x1 - x_new;
+    float dSq_orig = dot(to_orig, to_orig);
+    float dSq_new = dot(to_new, to_new);
+    if (dSq_orig >= 2.5e7 || dSq_new >= 2.5e7) return 1.0;
+    float d_orig = sqrt(max(dSq_orig, 1e-4));
+    float d_new = sqrt(max(dSq_new, 1e-4));
+    float cos1_orig = abs(dot(n1, -to_orig / d_orig));
+    float cos1_new  = abs(dot(n1, -to_new / d_new));
+    float J = (dSq_orig / max(dSq_new, 1e-4)) * (cos1_new / max(cos1_orig, 1e-3));
+    return clamp(J, 0.05, 10.0);
 }
 
 // Footprint-based reconnection criterion (ReSTIR PT Enhanced 2026)
@@ -242,7 +264,8 @@ void combineReservoirsDI(inout UnifiedReservoirPT rA, in UnifiedReservoirPT rB, 
 float computeUnbiasedWeightDI(in UnifiedReservoirPT r) {
     uint M = getM(r.lightIndex_M);
     if (M == 0u || r.targetPdf <= 0.0 || !isValidReservoir(r.flags_uv_age)) return 0.0;
-    return r.wSum / (float(M) * r.targetPdf);
+    float W = r.wSum / (float(M) * r.targetPdf);
+    return clamp(W, 0.0, 10000.0);
 }
 
 #endif // RESTIR_COMMON_GLSL

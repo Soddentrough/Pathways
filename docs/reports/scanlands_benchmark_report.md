@@ -1,7 +1,7 @@
 # Pathways: Single-GPU Performance & Physical Fidelity Benchmark Report
 **Target System**: AMD Radeon AI PRO R9700 (32GB GDDR6, `gfx1201`, RDNA 4)  
 **Scene**: `scenes/Scanlands/Scanlands.usdc` (187,491 Instances, ~359M Instanced Triangles)  
-**Engine Baseline**: Pathways Pure Vulkan 1.4 Hybrid Path Tracer (v1.21.0)  
+**Engine Baseline**: Pathways Vulkan 1.4 Hybrid Path Tracer (v1.21.0)  
 **Date**: September 16, 2026  
 **Status**: COMPLETE / VERIFIED (100% Pass Rate)
 
@@ -13,7 +13,7 @@ This report documents the single-GPU performance profiling, memory utilization, 
 
 ### Key Highlights & Verification Status
 - **VRAM Constraint Adherence**: Strict requirement was peak VRAM $< 24.0\text{ GB}$. Pathways achieved **3.58 GB peak allocated VRAM at 1080p** (well within hardware limits), monitored continuously via `/opt/rocm/core-10.0/bin/amd-smi metric --mem-usage` and Vulkan memory budget telemetry. This represents ~11% of the single R9700's 32 GB capacity, verifying full single-GPU memory safety.
-- **Extreme High-Density Point Instancing**: Successfully ingested all **187,491 foliage instances** across 8 deduplicated BLAS prototypes into a 60.99 MB TLAS acceleration structure, evaluating **358,947,853 instanced triangles** without geometry flattening or buffer expansion.
+- **High-Density Point Instancing**: Successfully ingested all **187,491 foliage instances** across 8 deduplicated BLAS prototypes into a 60.99 MB TLAS acceleration structure, evaluating **358,947,853 instanced triangles** without geometry flattening or buffer expansion.
 - **Atmospheric Occlusion Remediation & Unoccluded Rendering**: Pruned the 3.4 km `separator` plane from `scripts/convert_scanlands_to_usd.py` and `scenes/Scanlands/Scanlands.usdc`, while adding defense-in-depth skip guards in `src/scene/UsdLoader.cpp`. The generated frame dump (`output/scanlands_benchmark_frame.png`) displays the full unoccluded island, coastal architecture, 187k foliage instances, water caustics, and terrain with high spatial variance ($\sigma^2 = 0.004487$).
 - **Foliage Thin-Walled Transmission**: Ingested `gpuMat.diffuseTransmission = 0.40f` for all foliage elements in `UsdLoader.cpp`, eliminating pitch-black canopies and reducing dark pixels from 67.5% down to 22.7%.
 - **Single-GPU Unoccluded Path Tracing Performance**:
@@ -243,6 +243,6 @@ The following benchmark outputs, telemetry captures, and visual assets are persi
 ## 9. Conclusion
 
 The single-GPU benchmarking and physical fidelity audit of Pathways running `Scanlands` confirms that:
-1. Pathways handles massive open-world scenes ($>350\text{M}$ instanced triangles, 187k instances) within a modest **3.50 GB to 7.34 GB VRAM budget**, well below the strict 24.0 GB limit.
-2. The wavefront path tracer achieves stellar framerates (**514 FPS at 1080p 3-bounce, 154 FPS at 4K 3-bounce**) on a single AMD Radeon AI PRO R9700 GPU (`gfx1201`).
-3. Material enhancements—thin-walled foliage transmission, dielectric normal mapping parity, procedural wave normal perturbation, and Beer-Lambert extinction—provide visual parity with offline production path tracers while running at hundreds of frames per second in real time.
+1. Pathways handles large open-world scenes ($>350\text{M}$ instanced triangles, 187k instances) within a modest **3.50 GB to 7.34 GB VRAM budget**, well below the strict 24.0 GB limit.
+2. The wavefront path tracer achieves high framerates (**514 FPS at 1080p 3-bounce, 154 FPS at 4K 3-bounce**) on a single AMD Radeon AI PRO R9700 GPU (`gfx1201`).
+3. Material enhancements—thin-walled foliage transmission, dielectric normal mapping parity, procedural wave normal perturbation, and Beer-Lambert extinction—reproduce offline path tracer lighting behaviors at real-time framerates.

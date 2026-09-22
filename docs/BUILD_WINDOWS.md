@@ -12,7 +12,7 @@ Pathways includes a modern, high-performance build system designed for Windows 1
    - `glslc.exe` is provided in `$env:VULKAN_SDK\Bin`.
 
 2. **MSYS2 UCRT64 Toolchain** (Native Universal C Runtime):
-   - Pathways leverages cutting-edge C++23 compilers linking against Microsoft Universal C Runtime (`ucrtbase.dll`).
+   - Pathways uses C++23 compilers (Clang 20 / GCC 15) linking against Microsoft Universal C Runtime (`ucrtbase.dll`).
    - Ensure the following packages are installed via pacman (`C:\msys64\usr\bin\pacman.exe`):
      ```bash
      pacman -S --noconfirm mingw-w64-ucrt-x86_64-clang \

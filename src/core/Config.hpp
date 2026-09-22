@@ -27,7 +27,7 @@ enum class AccumFormat {
 
 enum class PipelineType {
     RTP,       // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-    Wavefront  // Wavefront Path Tracing with Work Lists & DGC
+    Wavefront  // Wavefront Path Tracing with Ray Queues & DGC
 };
 
 enum class WavefrontSortMode {

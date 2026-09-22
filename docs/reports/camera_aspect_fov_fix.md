@@ -47,7 +47,7 @@ void Camera::adaptFovForAspect(float aspect) {
 When `setAspect(aspect)` was wired into `Engine::onResize()` and `Camera::getUniformData()`:
 1. `m_defaultFov` was initialized to $45.0^\circ$ at engine bootstrap.
 2. When scenes loaded custom authored cameras (e.g. Cyber City at $62.0^\circ$, Bistro at $60.0^\circ$, or wide glTF/USD cameras), `setFov(camFov)` set `m_fov` but never synchronized `m_defaultFov`.
-3. The moment window resizing, fullscreen toggling (F11), or swapchain recreation occurred, `aspect >= 1.05f` forcibly executed `m_fov = m_defaultFov;`, instantly crushing the active scene FOV down to $45.0^\circ$.
+3. The moment window resizing, fullscreen toggling (F11), or swapchain recreation occurred, `aspect >= 1.05f` forcibly executed `m_fov = m_defaultFov;`, reducing the active scene FOV down to $45.0^\circ$.
 4. Reducing vertical FOV from $62^\circ$ to $45^\circ$ magnifies the projected image by $\approx 1.45\times$, causing the scene to appear heavily zoomed in.
 
 ### B. Cornell Box Camera Position Discrepancy

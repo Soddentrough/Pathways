@@ -87,7 +87,7 @@ DEFAULT_SCENES = {
     "bistro": {
         "name": "Bistro Interior",
         "path": "scenes/bistro/bistro_interior.glb",
-        "desc": "Massive geometry (1.32M tris), 74 materials, interior restaurant dining & bar",
+        "desc": "Complex geometry (1.32M tris), 74 materials, interior restaurant dining & bar",
         "camera": {
             "pos": [3.5, 1.75, -6.2],
             "target": [9.5, 1.65, 0.5],

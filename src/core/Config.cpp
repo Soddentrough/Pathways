@@ -139,7 +139,7 @@ void Config::printUsage(const char* progName) {
               << "  --hdr-peak <float>      Display peak luminance in nits (default: 1000.0)\n"
               << "  --hdr-white <float>     Reference paper white luminance in nits (default: 200.0)\n\n"
               << "Rendering & Path Tracing:\n"
-              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Work Lists & DGC [default]) or 'rtp' (KHR RTP)\n"
+              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Ray Queues & DGC [default]) or 'rtp' (KHR RTP)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
@@ -500,6 +500,8 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
         } else if (arg == "--light-tree") {
             cfg.enable_light_tree = true;
+        } else if (arg == "--no-light-tree") {
+            cfg.enable_light_tree = false;
         } else if (arg == "--nrc") {
             cfg.enable_nrc = true;
         } else if (arg == "--nrc-bounce" && i + 1 < argc) {

@@ -209,17 +209,15 @@ void ReSTIRManager::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_
                                 VkImageView motionVectorView, VkImageView normalDepthView, VkImageView prevNormalDepthView,
                                 VkImageView reconstructConfidenceView)
 {
-    if (!m_initialized || width == 0 || height == 0 || numLights == 0) return;
+    if (!m_initialized || width == 0 || height == 0) return;
 
     if (width != m_width || height != m_height) {
         resize(width, height);
     }
 
-    uint32_t prevTemporalIdx = 1 - m_temporalIndex;
-    uint32_t currTemporalIdx = m_temporalIndex;
-
-    Buffer* prevTemporalBuf = m_temporalBuffers[prevTemporalIdx].get();
-    Buffer* currTemporalBuf = m_temporalBuffers[currTemporalIdx].get();
+    uint32_t prevSlot = 1 - frameSlot;
+    Buffer* prevTemporalBuf = m_spatialBuffers[prevSlot].get();
+    Buffer* currTemporalBuf = m_temporalBuffers[frameSlot].get();
     Buffer* spatialBuf      = m_spatialBuffers[frameSlot].get();
 
     if (!prevTemporalBuf || !currTemporalBuf || !spatialBuf) return;
@@ -290,6 +288,16 @@ void ReSTIRManager::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_
     uint32_t dispatchX = (width + 15) / 16;
     uint32_t dispatchY = (height + 15) / 16;
 
+    // Barrier: Ensure previous frame's spatial buffer (containing Bounce 1 updates) is visible
+    VkBufferMemoryBarrier2 prevBufBarrier = makeBufferBarrier2(
+        prevTemporalBuf->getBuffer(),
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    VkDependencyInfo prevDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    prevDep.bufferMemoryBarrierCount = 1;
+    prevDep.pBufferMemoryBarriers = &prevBufBarrier;
+    vkCmdPipelineBarrier2(cmd, &prevDep);
+
     // --- PASS 1: Fused Candidate Generation & Temporal Resampling ---
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &dset, 0, nullptr);
@@ -312,11 +320,11 @@ void ReSTIRManager::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, dispatchX, dispatchY, 1);
 
-    // Barrier: SpatialBuffer write -> Shading pass read
+    // Barrier: SpatialBuffer write -> Shading pass read & Bounce 1 write
     VkBufferMemoryBarrier2 s2shadeBarrier = makeBufferBarrier2(
         spatialBuf->getBuffer(),
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     VkDependencyInfo s2shadeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     s2shadeDep.bufferMemoryBarrierCount = 1;
     s2shadeDep.pBufferMemoryBarriers = &s2shadeBarrier;

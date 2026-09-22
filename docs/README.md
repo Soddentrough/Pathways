@@ -25,7 +25,7 @@ docs/
 ## 1. Architecture & Engineering Specifications
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**:
-  Comprehensive technical specification detailing Pathways' pure wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), AMD FSR 3.1 spatiotemporal super-resolution, ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
+  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), AMD FSR 3.1 spatiotemporal super-resolution, ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
 
 ---
 
@@ -50,7 +50,7 @@ docs/
 The [`reports/`](reports/) directory contains formal research reports and architectural audits:
 
 - **[reports/material_shader_review.md](reports/material_shader_review.md)**:
-  Exhaustive 1,400+ line mathematical and microarchitectural audit of Pathways BSDF formulations (microfacet normal distributions, Smith correlated masking-shadowing, dielectric transmission, Airy thin-film iridescence, and RDNA 4 VGPR occupancy optimization).
+  Comprehensive mathematical and microarchitectural audit of Pathways BSDF formulations (microfacet normal distributions, Smith correlated masking-shadowing, dielectric transmission, Airy thin-film iridescence, and RDNA 4 VGPR occupancy optimization).
 - **[reports/scanlands_benchmark_report.md](reports/scanlands_benchmark_report.md)**:
   Empirical single-GPU performance benchmark running the `Scanlands` OpenUSD production landscape asset (187,491 foliage instances, 358.9M instanced triangles) on an AMD Radeon AI PRO R9700. Covers VRAM safety, dynamic TLAS generation, and unoccluded frame pacing.
 
@@ -62,7 +62,7 @@ The [`images/`](images/) directory contains uncompressed native 4K reference ren
 - **[images/cornell_box.png](images/cornell_box.png)**: Classic Cornell Box diffuse inter-reflection and dielectric glass transmission.
 - **[images/breakfast_table.png](images/breakfast_table.png)**: 270K-triangle architectural interior with Venetian blind shadow penumbras.
 - **[images/dragon.png](images/dragon.png)**: High-curvature Stanford Dragon with volumetric Beer-Lambert absorption and chromatic dispersion.
-- **[images/point_instance_city.png](images/point_instance_city.png)**: Massive OpenUSD 40,000-instance urban environment (~49M triangles).
+- **[images/point_instance_city.png](images/point_instance_city.png)**: Large-scale OpenUSD 40,000-instance urban environment (~49M triangles).
 
 ---
 

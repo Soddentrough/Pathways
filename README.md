@@ -1,8 +1,8 @@
 # Pathways
 
-Pathways is a high-performance, real-time path tracing and renderer engine built from scratch on pure **Vulkan 1.4** (Version **1.24.0**). Clean sheet design featuring **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
+Pathways (v1.24.0) is a real-time path tracing engine built on **Vulkan 1.4**. The architecture features **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
 
-> **Design Philosophy**: No megakernel — only efficient, GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and modern real-time rendering principles. Pathways uses strictly standard Vulkan 1.4, KHR, and EXT specifications with **no proprietary extensions**.
+> **Design Philosophy**: Focusing on GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and standard Vulkan 1.4 core, KHR, and EXT specifications without vendor-proprietary extensions.
 
 - **API Baseline**: Vulkan 1.4 (1.4.341+)
 - **Primary Hardware Targets**: AMD RDNA4 (`gfx1201`) and RDNA3 architectures (and compatible Vulkan 1.4 hardware; functions on any compliant Vulkan 1.4 driver)
@@ -17,7 +17,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ### 1. Classic Cornell Box
 ![Classic Cornell Box](docs/images/cornell_box.png)
 
-*The quintessential physical light transport testbed, evaluating diffuse inter-reflection (color bleeding across opposing walls), soft shadow penumbras, Fresnel specular reflections, and refractive light transport through the glass sphere.*
+*A standard physical light transport test scene, evaluating diffuse inter-reflection (color bleeding across opposing walls), soft shadow penumbras, Fresnel specular reflections, and refractive light transport through the glass sphere.*
 
 | Scene Metric / Telemetry | Measurement & Specification |
 | :--- | :--- |
@@ -65,7 +65,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 ### 4. Point Instance City (OpenUSD Stage)
 ![Point Instanced City](docs/images/point_instance_city.png)
 
-*Massive urban environment loaded via OpenUSD `UsdGeomPointInstancer`, stress-testing hardware Top-Level Acceleration Structure (TLAS) traversal across 40,000 instanced buildings and structures (~49 million expanded triangles) over undulating terrain with prototype BLAS deduplication.*
+*Large-scale urban environment loaded via OpenUSD `UsdGeomPointInstancer`, stress-testing hardware Top-Level Acceleration Structure (TLAS) traversal across 40,001 instanced buildings and structures (~49 million expanded triangles) over undulating terrain with prototype BLAS deduplication.*
 
 | Scene Metric / Telemetry | Measurement & Specification |
 | :--- | :--- |
@@ -83,8 +83,8 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 > For complete mathematical formulations, pipeline stages, buffer layouts, and microkernel specifications, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### 1. Wavefront Path Tracing & Autonomous DGC
-- **Wavefront Architecture**: Decomposes ray tracing into decoupled compute stages (Ray Classification, Ray Intersection, Material Shading, Shadow Queries, Accumulation Resolve), eliminating execution divergence.
-- **GPU-Autonomous Material Sorting via DGC**: Uses `vkCmdExecuteGeneratedCommandsEXT` to dynamically group rays by BSDF archetype (diffuse, dielectric, conductor, complex) and dispatch specialized compute microkernels directly on the device with zero CPU intervention.
+- **Wavefront Architecture**: Decomposes ray tracing into decoupled compute stages (Ray Classification, Ray Intersection, Material Shading, Shadow Queries, Accumulation Resolve), reducing execution divergence across heterogeneous materials.
+- **GPU-Autonomous Material Sorting via DGC**: Uses `vkCmdExecuteGeneratedCommandsEXT` to dynamically group rays by BSDF archetype (diffuse, dielectric, conductor, complex) and dispatch specialized compute microkernels directly on the device without host CPU dispatch loops.
 - **3D Spatial-Morton + Material Dual-Binning (Default)**: Clusters rays by 16-bit composite keys combining material archetype with quantized 3D Morton spatial cells, achieving instruction coherence while preserving L0/L1 texture and geometry cache locality.
 - **Producer-Side Binning & Directional DGC Queuing**: Partitions secondary rays directly at emission time across 8 directional octant bins using Wave32 ballot leader-election loops, eliminating post-hoc sort passes and scattered gather memory fetches during downstream BVH traversal.
 - **Secondary Ray Clamping & Streamlining**: Scene-scale invariant distance clamping and radiance luminance clamping (`--indirect-clamp`, default 35.0) to eliminate specular/caustic fireflies and boost secondary bounce throughput.
@@ -92,7 +92,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 - **Hardware Ray Tracing**: Full support for dedicated hardware BVH traversal via `VK_KHR_ray_tracing_pipeline` (RTP) and inline `VK_KHR_ray_query`.
 
 ### 2. Real-Time Multi-GPU Scaling
-- **Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`)**: Secondary GPU streams tiled render buffers into pinned host memory via high-speed CP DMA posted writes at PCIe bus line rate (~25 GB/s, <0.5 ms). Primary GPU merges and resolves tiles in ~0.12 ms without PCIe bus contention, ensuring jitter-free, consistent 250+ FPS camera motion.
+- **Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`)**: Secondary GPU streams tiled render buffers into pinned host memory via high-speed CP DMA posted writes at PCIe bus line rate (~25 GB/s, <0.5 ms). Primary GPU merges and resolves tiles in ~0.12 ms without PCIe bus contention, maintaining consistent frame pacing.
 - **Configurable Inter-GPU Transfer Modes (`--mgpu-transfer`)**:
   - `host` (Default): Pinned zero-copy host memory. Highly recommended for discrete PCIe topologies without dedicated inter-GPU fabric bridges.
   - `p2p`: Direct Linux DMA-BUF export/import (`VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd`). Ideal on hardware architectures with coherent inter-GPU links (e.g., Infinity Fabric bridges); on discrete PCIe slots, direct shader reads across PCIe BAR encounter non-posted read latency.
@@ -139,7 +139,7 @@ Load any OpenUSD stage (`.usd`, `.usdc`, `.usda`), glTF 2.0 model (`.glb`, `.glt
 | **F** | Focus and center camera on target object |
 | **F11** | Toggle Fullscreen |
 | **ESC** | Return to UI mode from FPS camera navigation (or exit if in UI) |
-| **Gamepad** | Dual-analog flight navigation (Left Stick: Fly/Strafe, Right Stick: Look, RT/LT: Sprint/Crawl, A/B: Up/Down) : Untested, maybe broken |
+| **Gamepad** | Dual-analog flight navigation (Left Stick: Fly/Strafe, Right Stick: Look, RT/LT: Sprint/Crawl, A/B: Up/Down) : (Experimental; unverified) |
 | **Alt+F4 / ESC** | Exit Pathways |
 
 ---
@@ -151,7 +151,7 @@ Load any OpenUSD stage (`.usd`, `.usdc`, `.usda`), glTF 2.0 model (`.glb`, `.glt
 - **Compression**: zlib / zlib-ng
 - **Math**: GLM (header-only, bundled in `third_party/glm`)
 - **OpenUSD** (Optional): Pixar OpenUSD (`pxr`) library for `.usd`/`.usdc`/`.usda` stage ingestion
-- **GPU**: AMD Radeon RDNA4 / RDNA3 (or any modern GPU with Vulkan 1.4, ray queries, and DGC support - at least in theory)
+- **GPU**: AMD Radeon RDNA4 / RDNA3 (or any Vulkan 1.4 compliant GPU supporting ray query and DGC extensions)
 
 ### Hardware & Extension Support Note
 
@@ -159,14 +159,14 @@ Pathways is designed for modern desktop workstations and gaming PCs with hardwar
 
 | Extension / Feature | Spec Date | Desktop Coverage (Win + Linux) | Mobile Coverage (Android) | Global Coverage (All Devices) | Role & Status in Pathways |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Powers Pathways' primary pure DGC engine with 100% device-generated commands for ray generation, material sorting, and compute microkernel dispatches directly on the device with zero CPU intervention. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). |
+| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Enables GPU-autonomous indirect command generation and execution for material microkernel dispatches via `VK_EXT_device_generated_commands`, reducing host CPU dispatch overhead. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). |
 | **`VK_KHR_acceleration_structure`** | Nov 20, 2020 | **~52.9%** | **~26.6%** | **~34.1%** | **BVH Management**: Required for building and querying hardware Top-Level (TLAS) and Bottom-Level (BLAS) ray tracing acceleration structures. |
 | **`VK_KHR_ray_tracing_pipeline`** | Nov 20, 2020 | **~51.3%** | **~7.6%** | **~21.8%** | **Hardware RTP**: Powers the dedicated hardware ray tracing pipeline (`--pipeline rtp` megakernel mode). |
 | **`VK_EXT_external_memory_host`** | Jan 17, 2018 | **~84.9%** | **~6.5%** | **~36.1%** | **Multi-GPU Zero-Copy**: Enables secondary GPU to stream rendered HDR tiles directly into pinned host RAM at PCIe line rate (~25 GB/s), eliminating peer PCIe BAR read stalls. |
 | **Vulkan 1.4 Core** | Jan 15, 2025 | **~61.2%** | **~7.9%** | **~28.2%** | **Engine Baseline**: Core driver version requirement (72.6% on Linux Mesa, 53.2% on Windows). |
 
 > [!NOTE]
-> **Desktop vs. Global Metrics**: Over 61.7% of all devices recorded in the Vulkan Hardware Database are low-power Android mobile phones and embedded SoCs (1,467 out of 2,376 devices), which drastically pulls down global percentages for high-end rendering features. Among desktop PCs (976 reported Windows and Linux devices), hardware ray tracing and DGC achieve ~50–53% coverage across all recorded hardware generations, and approach ~100% on contemporary discrete gaming GPUs (AMD RDNA2+, NVIDIA RTX 20+). For a complete breakdown and call-site citations across the entire engine, see [VULKAN_API_AUDIT.md](docs/VULKAN_API_AUDIT.md) or run `python3 scripts/audit_vulkan_api.py --compare-platforms`.
+> **Desktop vs. Global Metrics**: Over 61.7% of all devices recorded in the Vulkan Hardware Database are low-power Android mobile phones and embedded SoCs (1,467 out of 2,376 devices), which pulls down global percentages for high-end rendering features. Among desktop PCs (976 reported Windows and Linux devices), hardware ray tracing and DGC achieve ~50–53% coverage across all recorded hardware generations, and approach ~100% on contemporary discrete gaming GPUs (AMD RDNA2+, NVIDIA RTX 20+). For a complete breakdown and call-site citations across the entire engine, see [VULKAN_API_AUDIT.md](docs/VULKAN_API_AUDIT.md) or run `python3 scripts/audit_vulkan_api.py --compare-platforms`.
 
 ---
 
@@ -246,7 +246,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | Flag | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `--scene` | `<path>` | Path to glTF 2.0 (`.glb`/`.gltf`) or OpenUSD (`.usd`/`.usdc`/`.usda`) stage | Procedural Cornell Box |
-| `--pipeline` | `wavefront` \| `rtp` | Path tracing architecture: Wavefront Work Lists & DGC or KHR RTP | `wavefront` |
+| `--pipeline` | `wavefront` \| `rtp` | Path tracing architecture: Wavefront Ray Queues & DGC or KHR RTP | `wavefront` |
 | `--res`, `-r` | `1080` \| `1440` \| `4k` \| `5k` \| `8k` \| `dualup` \| `square` \| `WxH` | Viewport resolution preset or custom dimensions | Display native (3840×2160 headless) |
 | `--width`, `--height` | `<int>` | Explicit viewport dimensions in pixels | Native display |
 | `--fullscreen` | *(flag)* | Launch in fullscreen mode | Fullscreen (default) |
@@ -295,11 +295,11 @@ Pathways is profiled and benchmarked on modern AMD RDNA 4 architecture (`gfx1201
 
 | Scene / Workload | Resolution & Settings | Single-GPU (ms / FPS) | Dual-GPU (ms / FPS) | Multi-GPU Mode | Speedup / Scaling | Throughput Gain |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Procedural Cornell Box** | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 7.35 ms (136.0 FPS) | **3.87 ms** (258.1 FPS) | Checkerboard ($64\times 64$) | **1.90x** (Smooth Camera Motion) | 8.56 GigaRays/s |
-| **Damaged Helmet (`.glb`)** | **1080p** (1920x1080), 16 SPP, 4 Bounces | 7.79 ms (128.5 FPS) | **3.41 ms** (293.0 FPS) | Sample Parallelism | **2.28x** (>100% Efficiency) | 1.88x ($3.86 \times 10^{10}$ rays/s) |
+| **Procedural Cornell Box** | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 7.35 ms (136.0 FPS) | **3.87 ms** (258.1 FPS) | Checkerboard ($64\times 64$) | **1.90x** | 8.56 GigaRays/s |
+| **Damaged Helmet (`.glb`)** | **1080p** (1920x1080), 16 SPP, 4 Bounces | 7.79 ms (128.5 FPS) | **3.41 ms** (293.0 FPS) | Sample Parallelism | **2.28x** (Super-linear scaling via cache partitioning) | 1.88x ($3.86 \times 10^{10}$ rays/s) |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **5.82 ms** (171.8 FPS) | Checkerboard ($64\times 64$) | **1.99x** (99.3% Efficiency) | 5.70 GigaRays/s |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **6.97 ms** (143.4 FPS) | Sample Parallelism | **1.66x** (83.0% Efficiency) | 4.76 GigaRays/s |
-| **Zero-Copy Host Compositing** | 4K HDR Tile Merge (63.3 MB) | — | **0.12 ms** (8.3 kHz) | Host DMA (`VK_EXT_external_memory_host`) | **Zero PCIe BAR Stalls** | Smooth 258 FPS Motion |
+| **Zero-Copy Host Compositing** | 4K HDR Tile Merge (63.3 MB) | — | **0.12 ms** (8.3 kHz) | Host DMA (`VK_EXT_external_memory_host`) | **Avoids non-posted PCIe BAR stalls** | 258 FPS throughput |
 
 > **Discrete PCIe vs. Coherent Fabric Note**: On dual discrete GPUs connected across standard PCIe slots, reading directly across peer PCIe BAR via compute shaders issues uncached, non-posted PCIe reads which incur high per-transaction latency (stalling GPU compute queues for up to 28 ms per frame under heavy traffic). Pathways solves this by defaulting to `VK_EXT_external_memory_host`, where the secondary GPU writes to pinned host memory via high-speed DMA posted writes at full bus line rate (~25 GB/s, <0.5 ms), allowing the primary GPU to composite in 0.12 ms without bus stalls. Direct P2P BAR remains selectable via `--mgpu-transfer p2p` for systems equipped with hardware-coherent interconnects.
 
@@ -309,7 +309,7 @@ Pathways is profiled and benchmarked on modern AMD RDNA 4 architecture (`gfx1201
 
 Measured at native **3840×2160 (4K UHD)**, 1 SPP, 4 Bounces, FP16 HDR Accumulation on AMD RDNA 4 (`gfx1201`) under Mesa RADV ACO:
 
-| Scene | Scene Characteristics | Legacy Megakernel RTP (ms / FPS) | Pure Wavefront DGC (ms / FPS) | DGC Speedup vs. RTP | Frame Latency Delta | Visual Parity (PSNR / MAE) |
+| Scene | Scene Characteristics | Megakernel RTP (ms / FPS) | Wavefront DGC (ms / FPS) | DGC Speedup vs. RTP | Frame Latency Delta | Visual Parity (PSNR / MAE) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Cornell Caustic** | Specular focusing & dielectric caustics | 7.47 ms (133.9 FPS) | **3.74 ms (267.1 FPS)** | **2.00x** (100% Faster) | **-3.73 ms** | **29.80 dB** [PASS] |
 | **Dragon Attenuation** | High geometry, volumetric Beer-Lambert absorption | 8.07 ms (123.9 FPS) | **4.16 ms (240.6 FPS)** | **1.94x** (94% Faster) | **-3.91 ms** | **33.76 dB** / 0.0083 [PASS] |
@@ -322,11 +322,11 @@ Measured at native **3840×2160 (4K UHD)**, 1 SPP, 4 Bounces, FP16 HDR Accumulat
 | **Cornell Box** | Low triangle count, baseline diffuse inter-reflection | **7.09 ms (141.1 FPS)** | **8.01 ms (124.8 FPS)** | 0.89x (Fixed Barrier Floor) | +0.92 ms | **24.25 dB** [PASS] |
 
 > **Takeaway & Microarchitectural Analysis**:
-> 1. **Zero Scratch Spilling & 100% Peak Occupancy**: The legacy Megakernel RTP fallback (`VK_KHR_ray_tracing_pipeline`) suffers from severe register pressure (**120–144 VGPRs**, 108 SGPRs), restricting wave occupancy to 10–12 subgroups/SIMD (25–37% occupancy ceiling) and spilling a **19.5 KB scratch memory frame per wave** for Continuation Passing Style (CPS) recursion. In contrast, Pure Wavefront DGC decomposes shading into decoupled Wave32 microkernels consuming **< 40 VGPRs**, achieving **100% peak hardware occupancy (32 subgroups/SIMD)** with **0 bytes of scratch memory spilling** across all 31 compute microkernels.
-> 2. **Stream Compaction & Material Coherence**: In complex scenes with heavy transmission, caustics, and architectural occlusion (e.g. *Cornell Caustic*, *Dragon*, *Classroom*, *Cyber City*), ray lifetimes diverge wildly. The monolithic RTP megakernel serializes execution across heterogeneous materials and holds SIMD waves hostage while dead lanes idle. Pure Wavefront DGC actively compacts queues via hardware Wave32 subgroup ballot leader election, achieving **up to 2.00x higher ray throughput** by executing only homogeneous microkernels on active paths.
+> 1. **Zero Scratch Spilling & 100% Peak Occupancy**: The monolithic RTP baseline (`VK_KHR_ray_tracing_pipeline`) requires high register allocation (**120–144 VGPRs**, 108 SGPRs), limiting wave occupancy to 10–12 subgroups/SIMD (25–37% occupancy ceiling) and allocating a **19.5 KB scratch memory frame per wave** for Continuation Passing Style (CPS) recursion. In contrast, Wavefront DGC decomposes shading into decoupled Wave32 microkernels consuming **< 40 VGPRs**, achieving **up to 100% peak hardware occupancy (32 subgroups/SIMD)** with **0 bytes of scratch memory spilling** across all 31 compute microkernels.
+> 2. **Stream Compaction & Material Coherence**: In complex scenes with heavy transmission, caustics, and architectural occlusion (e.g. *Cornell Caustic*, *Dragon*, *Classroom*, *Cyber City*), ray lifetimes and material evaluation diverge across paths. The monolithic RTP megakernel serializes execution across heterogeneous materials, causing inactive SIMD lanes to idle. Wavefront DGC compacts queues via hardware Wave32 subgroup ballot leader election, measuring **up to 2.00x higher ray throughput** by executing only homogeneous microkernels on active paths.
 > 3. **Inline Hardware Ray Queries for Secondary Shadows**: Pathways eliminates secondary shadow queue VRAM round-trips by evaluating secondary visibility directly on-chip via inline hardware ray queries (`traceShadowRayInline`) inside registers with 0 bytes scratch spill, reserving DGC queue batching strictly for primary dispatches.
-> 4. **Technique D Dual Sorting (Morton 3D + Material Archetype)**: Secondary rays are sorted across both BSDF archetype and 3D Morton spatial codes via 100% GPU-autonomous DGC execution, preserving L0/L1 texture and BVH cache locality across bounces.
-> 5. **Fixed Pipeline Barrier Floor**: Pure Wavefront DGC requires decoupled dispatch stages (Classify, Intersect, Shade) separated by Vulkan execution barriers and indirect DGC parameter writes, introducing an irreducible fixed overhead of ~0.45 ms. In trivial diffuse scenes without material divergence (e.g., baseline Cornell Box), this barrier floor gives the legacy RTP megakernel a slight edge (~0.9 ms); in realistic production workloads with complex geometry and materials, Pure Wavefront DGC decisively wins.
+> 4. **Technique D Dual Sorting (Morton 3D + Material Archetype)**: Secondary rays are sorted across both BSDF archetype and 3D Morton spatial codes via GPU-driven DGC execution, preserving L0/L1 texture and BVH cache locality across bounces.
+> 5. **Fixed Pipeline Barrier Floor**: Wavefront DGC requires decoupled dispatch stages (Classify, Intersect, Shade) separated by Vulkan execution barriers and indirect DGC parameter writes, introducing an irreducible fixed overhead of ~0.45 ms. In trivial diffuse scenes without material divergence (e.g., baseline Cornell Box), this barrier floor allows the RTP megakernel to execute ~0.9 ms faster; on workloads with divergent materials and high-curvature geometry, Wavefront DGC achieves lower overall frame time.
 
 ---
 
@@ -420,12 +420,12 @@ Additional thanks to **MrMPFR**.
 
 Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - **[Documentation Hub](docs/README.md)**: Central landing page and directory catalog.
-- **[Engine Architecture Specification](docs/ARCHITECTURE.md)**: In-depth technical specification for pure DGC wavefront path tracing, multi-GPU scaling, and super-resolution.
+- **[Engine Architecture Specification](docs/ARCHITECTURE.md)**: In-depth technical specification for DGC wavefront path tracing, multi-GPU scaling, and super-resolution.
 - **[Linux Build Guide](docs/BUILD_LINUX.md)**: Compilation, toolchain presets, driver configuration, and test execution for Fedora, Ubuntu, and Arch.
 - **[Windows 11 Build Guide](docs/BUILD_WINDOWS.md)**: MSYS2 UCRT64 toolchain, PowerShell automation, and CPack packaging.
 - **[Vulkan API Call Audit](docs/VULKAN_API_AUDIT.md)**: Specification tracking and multi-platform Vulkan Hardware Database comparison.
 - **[Material Shader Review](docs/reports/material_shader_review.md)**: In-depth physical BSDF and microarchitectural audit.
-- **[Scanlands Benchmark Report](docs/reports/scanlands_benchmark_report.md)**: Extreme point-instancing (359M triangles) single-GPU benchmark report.
+- **[Scanlands Benchmark Report](docs/reports/scanlands_benchmark_report.md)**: High-density point-instancing (359M triangles) single-GPU benchmark report.
 
 ---
 
@@ -435,7 +435,7 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - [vkdoc Device Generated Commands Guide](https://vkdoc.net/chapters/device-generated-commands)
 - [Vulkan Ray Tracing Overview](https://docs.vulkan.org/tutorial/latest/courses/18_Ray_tracing/00_Overview.html)
 - [Supergoodcode: Device Generated Commands](https://www.supergoodcode.com/device-generated-commands/)
-- [GPUOpen: RGP Work Graphs & DGC](https://gpuopen.com/learn/rgp-work-graphs/)
+- [GPUOpen: Radeon GPU Profiler (RGP)](https://gpuopen.com/rgp/)
 - [AMD RDNA4 Instruction Set Architecture (ISA)](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture)
 - [AMD RDNA Performance Guide](https://gpuopen.com/learn/rdna-performance-guide/)
 - [Improving Ray Tracing Performance with RRA](https://gpuopen.com/learn/improving-rt-perf-with-rra/)

@@ -1792,7 +1792,7 @@ void Engine::initPipelines() {
     );
     Logger::info("Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
 
-    // 6b. Wavefront Path Tracing Pipeline (Work Lists & DGC)
+    // 6b. Wavefront Path Tracing Pipeline (Ray Queues & DGC)
     auto wfClassifyCode = loadShaderSPIRV("wavefront_classify.comp.spv");
     auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
     auto wfShadeCode = loadShaderSPIRV("wavefront_shade.comp.spv");
@@ -1816,7 +1816,7 @@ void Engine::initPipelines() {
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
         true // enableDgcPreprocess
     );
-    Logger::info("Wavefront Path Tracing Pipeline (Work Lists & DGC) initialized successfully.");
+    Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 
     // 6c. Neural Radiance Caching (NRC) Manager (Wave32 WMMA)
     try {
@@ -1958,7 +1958,7 @@ void Engine::initPipelines() {
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                 dispatchCausticSplatAndFilter(cmd, frameSlot);
             }
-            if (m_config.enable_restir_di && m_restirManager && m_numLights > 0) {
+            if (m_config.enable_restir_di && m_restirManager) {
                 uint32_t rw = m_config.width;
                 uint32_t rh = m_config.height;
                 Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(frameSlot);
@@ -1976,8 +1976,9 @@ void Engine::initPipelines() {
                     ? m_upwaysPipeline->getConfidenceImage()->getImageView()
                     : VK_NULL_HANDLE;
 
+                bool hasLt = m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && ltBuf != nullptr);
                 m_restirManager->recordFrame(cmd, frameSlot, rw, rh,
-                                             m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), m_config.enable_light_tree,
+                                             m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), hasLt,
                                              m_frameIndex, m_config.restir_di_m_cap,
                                              rayGeom, rayHit, pixelToRay,
                                              lightsBuf, matsBuf,
@@ -3121,7 +3122,7 @@ void Engine::createReSTIRResources() {
             m_config.width, m_config.height,
             temporalCode, spatialCode
         );
-        Logger::info("Ultra-Lean ReSTIR DI Subsystem (16B Reservoirs, Fused Temporal & LDS Spatial Reuse) initialized successfully.");
+        Logger::info("Ultra-Lean ReSTIR PT Subsystem (32B Reservoirs, Fused Temporal & LDS Spatial Reuse) initialized successfully.");
     } catch (const std::exception& e) {
         Logger::warn("ReSTIRManager initialization failed: {}", e.what());
     }
@@ -4454,9 +4455,9 @@ void Engine::renderFrame() {
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree)     flags |= (1 << 7);
+    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
-    if (m_config.enable_restir_di && m_numLights > 0) flags |= (1 << 9);
+    if (m_config.enable_restir_di) flags |= (1 << 9);
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
     }
@@ -6843,8 +6844,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_config.enable_shadows)         flags |= (1 << 4);
     if (m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree)      flags |= (1 << 7);
-    if (m_config.enable_restir_di && m_numLights > 0) flags |= (1 << 9);
+    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
+    if (m_config.enable_restir_di) flags |= (1 << 9);
 
     VkClearColorValue clearZero{};
     clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;
@@ -7087,8 +7088,9 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
                 ? m_upwaysPipeline->getConfidenceImage()->getImageView()
                 : VK_NULL_HANDLE;
 
+            bool hasLt = m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && ltBuf != nullptr);
             m_restirManager->recordFrame(cmd, 0, width, height,
-                                         m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), m_config.enable_light_tree,
+                                         m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), hasLt,
                                          frameIdx, m_config.restir_di_m_cap,
                                          rayGeom, rayHit, pixelToRay,
                                          lightsBuf, matsBuf,

@@ -1,6 +1,6 @@
 # Building and Running Pathways on Linux
 
-Pathways is designed for Linux workstations and gaming systems targeting modern AMD RDNA 3 / RDNA 4 architectures (and any conformant Vulkan 1.4 hardware). It features GPU-autonomous Device-Generated Commands (DGC), pure wavefront path tracing microkernels, zero-copy multi-GPU scaling, OpenUSD stage ingestion, and AMD FSR 3.1 super-resolution.
+Pathways is designed for Linux workstations and gaming systems targeting modern AMD RDNA 3 / RDNA 4 architectures (and any conformant Vulkan 1.4 hardware). It features GPU-autonomous Device-Generated Commands (DGC), wavefront path tracing microkernels, zero-copy multi-GPU scaling, OpenUSD stage ingestion, and AMD FSR 3.1 super-resolution.
 
 ---
 
@@ -156,7 +156,7 @@ Pathways includes an automated testing and regression suite:
 # 2. CTest unit tests (16 unit tests covering cameras, descriptors, WMMA, and instancing)
 ctest --test-dir build --output-on-failure
 
-# 3. Scanlands extreme-scale end-to-end test suite
+# 3. Scanlands point-instancing end-to-end test suite
 ./scripts/run_scanlands_e2e_tests.sh
 
 # 4. Vulkan API specification auditor

@@ -19,6 +19,7 @@ layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 layout(binding = 31, rgba16f) uniform readonly image2D uCausticImage;
+layout(binding = 24, rgba16f) uniform readonly image2D uNormalDepthImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -140,7 +141,7 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 
 #include "restir_common.glsl"
 
-layout(std430, binding = 32) readonly buffer ReSTIRReservoirsBuffer {
+layout(std430, binding = 32) buffer ReSTIRReservoirsBuffer {
     ReservoirDI restirReservoirs[];
 };
 
@@ -225,6 +226,16 @@ void main() {
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), prev.a));
+
+            bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
+            if (enableRestir && bounce == 1u && length(skyColor) > 1e-3) {
+                vec3 n0 = imageLoad(uNormalDepthImage, pixelCoord).xyz;
+                vec3 fakeSkyPoint = origin + rayDir * 10000.0;
+                float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), fakeSkyPoint, -rayDir, skyColor);
+                if (p_hat > 0.0) {
+                    updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, 10000.0, -rayDir, skyColor, seed);
+                }
+            }
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -321,6 +332,15 @@ void main() {
             }
             if (length(emissive) > 1e-3) {
                 accumRadiance += vec3(throughput) * emissive;
+                bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
+                if (enableRestir && bounce == 1u && hitT > 1e-3) {
+                    ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                    vec3 n0 = imageLoad(uNormalDepthImage, pCoord).xyz;
+                    float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), hitPoint, hitNormal, emissive);
+                    if (p_hat > 0.0) {
+                        updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, hitT, hitNormal, emissive, seed);
+                    }
+                }
             }
 
             f16vec3 diffuseColor = f16vec3(baseColor.rgb);
@@ -561,7 +581,7 @@ void main() {
                                     selectedLightSelectPdf = 1.0;
                                     selectedNdotL = NdotL;
                                     selectedIsTrans = isTrans;
-                                    selectedTarget = 1.0;
+                                    selectedTarget = max(res.targetPdf, 1e-6);
                                     totalWeightSum = res.wSum;
                                     hasCandidate = true;
                                     usedRestir = true;
@@ -583,7 +603,7 @@ void main() {
                                 selectedLightSelectPdf = 1.0;
                                 selectedNdotL = NdotL;
                                 selectedIsTrans = isTrans;
-                                selectedTarget = 1.0;
+                                selectedTarget = max(res.targetPdf, 1e-6);
                                 totalWeightSum = res.wSum;
                                 hasCandidate = true;
                                 usedRestir = true;
@@ -698,7 +718,9 @@ void main() {
                             misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                         }
 
-                        float risWeight = totalWeightSum / (float(usedRestir ? 1u : M) * selectedTarget);
+                        uint restirM = usedRestir ? max(getM(restirReservoirs[pixelIndex].lightIndex_M), 1u) : M;
+                        float risWeight = totalWeightSum / (float(restirM) * max(selectedTarget, 1e-6));
+                        risWeight = clamp(risWeight, 0.0, 10000.0);
                         uint pLen = usedRestir ? getPathLength(restirReservoirs[pixelIndex].flags_uv_age) : 1u;
                         float geomFactor = (usedRestir && pLen <= 1u && uint(selLight.position.w) == 0u) ? (1.0 / max(selectedLightPdf, 1e-6)) : 1.0;
                         float factor = selectedNdotL * geomFactor * misWeight * risWeight;
@@ -738,6 +760,12 @@ void main() {
                                         }
                                     } else {
                                         secDirectL = f16vec3(0.0);
+                                        if (enableRestirDI) {
+                                            restirReservoirs[pixelIndex].wSum = 0.0;
+                                            restirReservoirs[pixelIndex].flags_uv_age = 0u;
+                                            restirReservoirs[pixelIndex].targetPdf = 0.0;
+                                            restirReservoirs[pixelIndex].lightIndex_M = 0u;
+                                        }
                                     }
                                 } else {
                                     hasShadowRay = true;
