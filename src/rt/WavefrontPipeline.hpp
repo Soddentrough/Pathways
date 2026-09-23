@@ -96,7 +96,11 @@ public:
                                 VkBuffer instanceBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize instanceSize = 0,
                                 VkImageView causticImageView = VK_NULL_HANDLE,
-                                VkBuffer restirReservoirBuffer = VK_NULL_HANDLE);
+                                VkBuffer restirReservoirBuffer = VK_NULL_HANDLE,
+                                VkBuffer materialArchetypeBuffer = VK_NULL_HANDLE,
+                                VkDeviceSize matArchetypeSize = 0,
+                                VkBuffer shadeMaterialBuffer = VK_NULL_HANDLE,
+                                VkDeviceSize shadeMaterialSize = 0);
 
     void resize(uint32_t width, uint32_t height);
 

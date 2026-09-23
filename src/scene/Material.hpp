@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include <glm/gtc/packing.hpp>
 #include <cstdint>
 
 namespace pathways {
@@ -86,5 +87,79 @@ struct MaterialGPU {
     glm::vec2 diffuseTransPad = glm::vec2(0.0f); // 8 bytes (offsets 200, 204) - padding for 16B std430 alignment
 };
 static_assert(sizeof(MaterialGPU) == 208, "MaterialGPU must be exactly 208 bytes (std430 aligned)");
+
+// Compact 64-byte cache-line aligned shading material (2 materials per 128B RDNA 4 cache line)
+struct alignas(16) ShadeMaterialGPU {
+    glm::vec4 albedo = glm::vec4(1.0f);        // 16 bytes: baseColorFactor (linear RGBA)
+    glm::vec4 emissive_spec = glm::vec4(0.0f); // 16 bytes: xyz: emissive (linear RGB), w: specularFactor
+    glm::vec4 pbrParams = glm::vec4(1.0f, 0.0f, 1.5f, 0.0f); // 16 bytes: x: roughness, y: metallic, z: ior, w: diffuseTransmission
+    glm::uvec4 tex_flags = glm::uvec4(0);      // 16 bytes: x: albedoTex | (normalTex << 16)
+                                               //           y: mrTex | (emissiveTex << 16)
+                                               //           z: diffTransTex | (specularTex << 16)
+                                               //           w: (type & 0xFFFF) | (packHalf16(normalScale) << 16)
+};
+static_assert(sizeof(ShadeMaterialGPU) == 64, "ShadeMaterialGPU must be exactly 64 bytes (std430 aligned)");
+
+inline ShadeMaterialGPU createShadeMaterial(const MaterialGPU& mat) {
+    ShadeMaterialGPU sm{};
+    sm.albedo = mat.albedo;
+    sm.emissive_spec = glm::vec4(glm::vec3(mat.emissive), mat.specularFactor);
+    sm.pbrParams = glm::vec4(mat.roughness, mat.metallic, mat.ior, mat.diffuseTransmission);
+
+    uint32_t alb = (mat.albedoTex <= 512u) ? mat.albedoTex : 0u;
+    uint32_t nrm = (mat.normalTex <= 512u) ? mat.normalTex : 0u;
+    uint32_t mr  = (mat.mrTex <= 512u) ? mat.mrTex : 0u;
+    uint32_t em  = (mat.emissiveTex <= 512u) ? mat.emissiveTex : 0u;
+    uint32_t dt  = (mat.diffuseTransmissionTex <= 512u) ? mat.diffuseTransmissionTex : 0u;
+    uint32_t sp  = (mat.specularTex <= 512u) ? mat.specularTex : 0u;
+    uint32_t tp  = mat.type & 0xFFFFu;
+    uint32_t nScaleHalf = glm::packHalf2x16(glm::vec2(mat.normalScale, 0.0f)) & 0xFFFFu;
+
+    sm.tex_flags.x = alb | (nrm << 16u);
+    sm.tex_flags.y = mr | (em << 16u);
+    sm.tex_flags.z = dt | (sp << 16u);
+    sm.tex_flags.w = tp | (nScaleHalf << 16u);
+    return sm;
+}
+
+enum MaterialArchetype : uint32_t {
+    MATERIAL_ARCHETYPE_DIFFUSE    = 0,
+    MATERIAL_ARCHETYPE_DIELECTRIC = 1,
+    MATERIAL_ARCHETYPE_CONDUCTOR  = 2,
+    MATERIAL_ARCHETYPE_COMPLEX    = 3,
+    MATERIAL_ARCHETYPE_EMISSIVE   = 4,
+    MATERIAL_ARCHETYPE_ALPHAMASK  = 5,
+    NUM_MATERIAL_ARCHETYPES       = 6
+};
+
+inline uint32_t computeMaterialArchetype(const MaterialGPU& mat) {
+    // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures
+    if (mat.alphaMode == ALPHA_MODE_MASK && mat.albedoTex > 0u) {
+        return MATERIAL_ARCHETYPE_ALPHAMASK;
+    }
+    // 2. Pure emissive mesh lights: pure emitters without scattering BSDF
+    if ((mat.type & 0xFFu) == MATERIAL_EMISSIVE ||
+        (glm::length(glm::vec3(mat.emissive)) > 0.1f && mat.albedoTex == 0u && glm::length(glm::vec3(mat.albedo)) < 0.05f && mat.metallic < 0.01f && mat.transmission < 0.01f)) {
+        return MATERIAL_ARCHETYPE_EMISSIVE;
+    }
+    // 3. Procedural wet pavement & puddle surfaces (evaluated in diffuse microkernel)
+    if ((mat.type & MATERIAL_FLAG_PROCEDURAL_PUDDLE) != 0u) {
+        return MATERIAL_ARCHETYPE_DIFFUSE;
+    }
+    // 4. Multi-layer complex PBR (Clearcoat on top of substrate, or Sheen)
+    if (mat.clearcoat > 0.001f || mat.clearcoatTex > 0u || glm::length(mat.sheenColor) > 0.001f || mat.sheenTex > 0u) {
+        return MATERIAL_ARCHETYPE_COMPLEX;
+    }
+    // 5. Pure dielectric transmission / refraction / glass / dispersion / procedural water
+    if (mat.transmission > 0.001f || (mat.type & 0xFFu) == MATERIAL_DIELECTRIC || (mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u || mat.dispersion > 0.001f) {
+        return MATERIAL_ARCHETYPE_DIELECTRIC;
+    }
+    // 6. Metallic conductors (GGX microfacet specular reflection, anisotropy, iridescence)
+    if ((mat.type & 0xFFu) == MATERIAL_METALLIC || mat.metallic > 0.5f || mat.anisotropyStrength > 0.001f || mat.iridescence > 0.001f) {
+        return MATERIAL_ARCHETYPE_CONDUCTOR;
+    }
+    // 7. Dielectric diffuse base + GGX specular dual-lobe PBR (plastics, wood, stone, cloth)
+    return MATERIAL_ARCHETYPE_DIFFUSE;
+}
 
 } // namespace pathways

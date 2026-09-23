@@ -169,9 +169,8 @@ void main() {
         vec3 hitPoint = rayOrigin + rayDir * hitT;
 
         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-        float u = bary.x, v = bary.y, w = 1.0 - u - v;
         Triangle tri = triangles[triIdx];
-        vec3 localNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+        vec3 localNormal = getTriangleNormal(tri, bary);
         vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
 
         bool isDielectric = (mat.type == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);

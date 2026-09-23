@@ -632,7 +632,7 @@ void Engine::uploadToDeviceBuffer(Buffer& dstBuffer, const void* srcData, VkDevi
 
 void Engine::uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount) {
     if (triangleCount == 0) {
-        uint32_t dummy[3] = { 0, 3, 6 };
+        uint32_t dummy[3] = { 0, 1, 2 };
         uploadToDeviceBuffer(dstBuffer, dummy, sizeof(dummy));
         return;
     }
@@ -666,9 +666,9 @@ void Engine::uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount) {
         uint32_t currentChunkTriangles = std::min(chunkTriangles, triangleCount - triOffset);
         for (uint32_t i = 0; i < currentChunkTriangles; ++i) {
             uint32_t k = triOffset + i;
-            mappedStaging[i * 3 + 0] = 10 * k + 0;
-            mappedStaging[i * 3 + 1] = 10 * k + 3;
-            mappedStaging[i * 3 + 2] = 10 * k + 6;
+            mappedStaging[i * 3 + 0] = 3 * k + 0;
+            mappedStaging[i * 3 + 1] = 3 * k + 1;
+            mappedStaging[i * 3 + 2] = 3 * k + 2;
         }
         VkDeviceSize currentBytes = currentChunkTriangles * 3 * sizeof(uint32_t);
         stagingBuffer.flush(0, currentBytes);
@@ -751,7 +751,7 @@ void Engine::createAccelerationStructures() {
     uploadToDeviceBuffer(*m_instanceBuffer, instanceUpload.data(), instanceBufferSize);
 
     // 2. Acceleration Structures
-    VkDeviceAddress vertexBaseAddr = m_triangleBuffer->getDeviceAddress(device);
+    VkDeviceAddress vertexBaseAddr = m_positionBuffer ? m_positionBuffer->getDeviceAddress(device) : 0;
     VkDeviceAddress indexBaseAddr = m_asIndexBuffer->getDeviceAddress(device);
 
     if (!m_sceneData.blasRanges.empty()) {
@@ -763,9 +763,9 @@ void Engine::createAccelerationStructures() {
                 ASGeometryInput geomOpaque{};
                 geomOpaque.vertexBufferAddress = vertexBaseAddr;
                 geomOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * 3 * sizeof(uint32_t);
-                geomOpaque.vertexCount = 10 * (range.firstTriangle + range.numOpaqueTriangles);
+                geomOpaque.vertexCount = 3 * (range.firstTriangle + range.numOpaqueTriangles);
                 geomOpaque.triangleCount = range.numOpaqueTriangles;
-                geomOpaque.vertexStride = 16;
+                geomOpaque.vertexStride = sizeof(glm::vec4);
                 geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
                 geomOpaque.isOpaque = true;
                 geoms.push_back(geomOpaque);
@@ -775,9 +775,9 @@ void Engine::createAccelerationStructures() {
                 ASGeometryInput geomNonOpaque{};
                 geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
                 geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * 3 * sizeof(uint32_t);
-                geomNonOpaque.vertexCount = 10 * (range.firstTriangle + range.triangleCount);
+                geomNonOpaque.vertexCount = 3 * (range.firstTriangle + range.triangleCount);
                 geomNonOpaque.triangleCount = numNonOpaque;
-                geomNonOpaque.vertexStride = 16;
+                geomNonOpaque.vertexStride = sizeof(glm::vec4);
                 geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
                 geomNonOpaque.isOpaque = false;
                 geoms.push_back(geomNonOpaque);
@@ -786,9 +786,9 @@ void Engine::createAccelerationStructures() {
                 ASGeometryInput dummyGeom{};
                 dummyGeom.vertexBufferAddress = vertexBaseAddr;
                 dummyGeom.indexBufferAddress = indexBaseAddr;
-                dummyGeom.vertexCount = 10;
+                dummyGeom.vertexCount = 3;
                 dummyGeom.triangleCount = 1;
-                dummyGeom.vertexStride = 16;
+                dummyGeom.vertexStride = sizeof(glm::vec4);
                 dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
@@ -823,9 +823,9 @@ void Engine::createAccelerationStructures() {
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
             geomOpaque.indexBufferAddress = indexBaseAddr;
-            geomOpaque.vertexCount = 10 * m_numOpaqueTriangles;
+            geomOpaque.vertexCount = 3 * m_numOpaqueTriangles;
             geomOpaque.triangleCount = m_numOpaqueTriangles;
-            geomOpaque.vertexStride = 16;
+            geomOpaque.vertexStride = sizeof(glm::vec4);
             geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomOpaque.isOpaque = true;
             geoms.push_back(geomOpaque);
@@ -836,9 +836,9 @@ void Engine::createAccelerationStructures() {
             ASGeometryInput geomNonOpaque{};
             geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
             geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(m_numOpaqueTriangles) * 3 * sizeof(uint32_t);
-            geomNonOpaque.vertexCount = 10 * numTriangles;
+            geomNonOpaque.vertexCount = 3 * numTriangles;
             geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = 16;
+            geomNonOpaque.vertexStride = sizeof(glm::vec4);
             geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomNonOpaque.isOpaque = false;
             geoms.push_back(geomNonOpaque);
@@ -848,9 +848,9 @@ void Engine::createAccelerationStructures() {
             ASGeometryInput dummyGeom{};
             dummyGeom.vertexBufferAddress = vertexBaseAddr;
             dummyGeom.indexBufferAddress = indexBaseAddr;
-            dummyGeom.vertexCount = 10;
+            dummyGeom.vertexCount = 3;
             dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = 16;
+            dummyGeom.vertexStride = sizeof(glm::vec4);
             dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
             dummyGeom.isOpaque = true;
             geoms.push_back(dummyGeom);
@@ -1104,17 +1104,55 @@ void Engine::initScene() {
         }
     }
 
-    // Triangle buffer (pure DEVICE_LOCAL VRAM with AS read-only bit & bounded staging upload)
-    VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * m_sceneData.triangles.size(), sizeof(TriangleGPU));
-    m_triangleBuffer = std::make_unique<Buffer>(
-        allocator, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+    // 1. Position buffer (pure DEVICE_LOCAL VRAM for BLAS building, 16-byte aligned)
+    size_t numTris = m_sceneData.triangles.size();
+    std::vector<glm::vec4> positions;
+    positions.reserve(numTris * 3);
+    std::vector<TriangleShadeGPU> shadeTriangles;
+    shadeTriangles.reserve(numTris);
+
+    for (const auto& tri : m_sceneData.triangles) {
+        positions.push_back(glm::vec4(glm::vec3(tri.v0.position), 1.0f));
+        positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
+        positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
+
+        TriangleShadeGPU s{};
+        s.normal0_u0 = glm::vec4(glm::vec3(tri.v0.normal), tri.v0.position.w);
+        s.normal1_u1 = glm::vec4(glm::vec3(tri.v1.normal), tri.v1.position.w);
+        s.normal2_u2 = glm::vec4(glm::vec3(tri.v2.normal), tri.v2.position.w);
+        s.tan0_v0    = glm::vec4(glm::vec3(tri.v0.tangent), tri.v0.normal.w);
+        s.tan1_v1    = glm::vec4(glm::vec3(tri.v1.tangent), tri.v1.normal.w);
+        s.tan2_v2    = glm::vec4(glm::vec3(tri.v2.tangent), tri.v2.normal.w);
+        s.tanSigns   = glm::vec4(tri.v0.tangent.w, tri.v1.tangent.w, tri.v2.tangent.w, 0.0f);
+        s.materialId = tri.materialId;
+        s.padding[0] = 0;
+        s.padding[1] = 0;
+        s.padding[2] = 0;
+        shadeTriangles.push_back(s);
+    }
+
+    VkDeviceSize posSize = std::max(sizeof(glm::vec4) * positions.size(), sizeof(glm::vec4) * 3);
+    m_positionBuffer = std::make_unique<Buffer>(
+        allocator, posSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
     );
-    if (!m_sceneData.triangles.empty()) {
-        uploadToDeviceBuffer(*m_triangleBuffer, m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
+    if (!positions.empty()) {
+        uploadToDeviceBuffer(*m_positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+    }
+
+    // 2. Triangle shading buffer (128-byte cache-line aligned for ray hit resolution)
+    VkDeviceSize triSize = std::max(sizeof(TriangleShadeGPU) * shadeTriangles.size(), sizeof(TriangleShadeGPU));
+    m_triangleBuffer = std::make_unique<Buffer>(
+        allocator, triSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    if (!shadeTriangles.empty()) {
+        uploadToDeviceBuffer(*m_triangleBuffer, shadeTriangles.data(), sizeof(TriangleShadeGPU) * shadeTriangles.size());
     }
 
     // Sphere buffer
@@ -1139,6 +1177,38 @@ void Engine::initScene() {
     );
     if (!m_sceneData.materials.empty()) {
         m_materialBuffer->copyFrom(m_sceneData.materials.data(), sizeof(MaterialGPU) * m_sceneData.materials.size());
+    }
+
+    // Material Archetype buffer (compact 4-byte lookup table for L0/L1 cache efficiency)
+    std::vector<uint32_t> matArchetypes(m_sceneData.materials.size());
+    for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
+        matArchetypes[i] = computeMaterialArchetype(m_sceneData.materials[i]);
+    }
+    VkDeviceSize archSize = std::max(sizeof(uint32_t) * matArchetypes.size(), sizeof(uint32_t));
+    m_materialArchetypeBuffer = std::make_unique<Buffer>(
+        allocator, archSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!matArchetypes.empty()) {
+        m_materialArchetypeBuffer->copyFrom(matArchetypes.data(), sizeof(uint32_t) * matArchetypes.size());
+    }
+
+    // Compact 64-byte Shading Material buffer (2 materials per 128B RDNA 4 vector cache line)
+    std::vector<ShadeMaterialGPU> shadeMaterials(m_sceneData.materials.size());
+    for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
+        shadeMaterials[i] = createShadeMaterial(m_sceneData.materials[i]);
+    }
+    VkDeviceSize shadeMatSize = std::max(sizeof(ShadeMaterialGPU) * shadeMaterials.size(), sizeof(ShadeMaterialGPU));
+    m_shadeMaterialBuffer = std::make_unique<Buffer>(
+        allocator, shadeMatSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!shadeMaterials.empty()) {
+        m_shadeMaterialBuffer->copyFrom(shadeMaterials.data(), sizeof(ShadeMaterialGPU) * shadeMaterials.size());
     }
 
     // Light buffer
@@ -1344,16 +1414,55 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     // Recreate primary buffers
     VmaAllocator allocator = m_context->getAllocator();
 
-    VkDeviceSize triSize = std::max(sizeof(TriangleGPU) * m_sceneData.triangles.size(), sizeof(TriangleGPU));
-    m_triangleBuffer = std::make_unique<Buffer>(
-        allocator, triSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+    // 1. Position buffer (pure DEVICE_LOCAL VRAM for BLAS building, 16-byte aligned)
+    size_t numTris = m_sceneData.triangles.size();
+    std::vector<glm::vec4> positions;
+    positions.reserve(numTris * 3);
+    std::vector<TriangleShadeGPU> shadeTriangles;
+    shadeTriangles.reserve(numTris);
+
+    for (const auto& tri : m_sceneData.triangles) {
+        positions.push_back(glm::vec4(glm::vec3(tri.v0.position), 1.0f));
+        positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
+        positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
+
+        TriangleShadeGPU s{};
+        s.normal0_u0 = glm::vec4(glm::vec3(tri.v0.normal), tri.v0.position.w);
+        s.normal1_u1 = glm::vec4(glm::vec3(tri.v1.normal), tri.v1.position.w);
+        s.normal2_u2 = glm::vec4(glm::vec3(tri.v2.normal), tri.v2.position.w);
+        s.tan0_v0    = glm::vec4(glm::vec3(tri.v0.tangent), tri.v0.normal.w);
+        s.tan1_v1    = glm::vec4(glm::vec3(tri.v1.tangent), tri.v1.normal.w);
+        s.tan2_v2    = glm::vec4(glm::vec3(tri.v2.tangent), tri.v2.normal.w);
+        s.tanSigns   = glm::vec4(tri.v0.tangent.w, tri.v1.tangent.w, tri.v2.tangent.w, 0.0f);
+        s.materialId = tri.materialId;
+        s.padding[0] = 0;
+        s.padding[1] = 0;
+        s.padding[2] = 0;
+        shadeTriangles.push_back(s);
+    }
+
+    VkDeviceSize posSize = std::max(sizeof(glm::vec4) * positions.size(), sizeof(glm::vec4) * 3);
+    m_positionBuffer = std::make_unique<Buffer>(
+        allocator, posSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
     );
-    if (!m_sceneData.triangles.empty()) {
-        uploadToDeviceBuffer(*m_triangleBuffer, m_sceneData.triangles.data(), sizeof(TriangleGPU) * m_sceneData.triangles.size());
+    if (!positions.empty()) {
+        uploadToDeviceBuffer(*m_positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+    }
+
+    // 2. Triangle shading buffer (128-byte cache-line aligned for ray hit resolution)
+    VkDeviceSize triSize = std::max(sizeof(TriangleShadeGPU) * shadeTriangles.size(), sizeof(TriangleShadeGPU));
+    m_triangleBuffer = std::make_unique<Buffer>(
+        allocator, triSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    if (!shadeTriangles.empty()) {
+        uploadToDeviceBuffer(*m_triangleBuffer, shadeTriangles.data(), sizeof(TriangleShadeGPU) * shadeTriangles.size());
     }
 
     VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * m_sceneData.spheres.size(), sizeof(SphereGPU));
@@ -1376,6 +1485,38 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     );
     if (!m_sceneData.materials.empty()) {
         m_materialBuffer->copyFrom(m_sceneData.materials.data(), sizeof(MaterialGPU) * m_sceneData.materials.size());
+    }
+
+    // Material Archetype buffer (compact 4-byte lookup table for L0/L1 cache efficiency)
+    std::vector<uint32_t> matArchetypes(m_sceneData.materials.size());
+    for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
+        matArchetypes[i] = computeMaterialArchetype(m_sceneData.materials[i]);
+    }
+    VkDeviceSize archSize = std::max(sizeof(uint32_t) * matArchetypes.size(), sizeof(uint32_t));
+    m_materialArchetypeBuffer = std::make_unique<Buffer>(
+        allocator, archSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!matArchetypes.empty()) {
+        m_materialArchetypeBuffer->copyFrom(matArchetypes.data(), sizeof(uint32_t) * matArchetypes.size());
+    }
+
+    // Compact 64-byte Shading Material buffer (2 materials per 128B RDNA 4 vector cache line)
+    std::vector<ShadeMaterialGPU> shadeMaterials(m_sceneData.materials.size());
+    for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
+        shadeMaterials[i] = createShadeMaterial(m_sceneData.materials[i]);
+    }
+    VkDeviceSize shadeMatSize = std::max(sizeof(ShadeMaterialGPU) * shadeMaterials.size(), sizeof(ShadeMaterialGPU));
+    m_shadeMaterialBuffer = std::make_unique<Buffer>(
+        allocator, shadeMatSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    if (!shadeMaterials.empty()) {
+        m_shadeMaterialBuffer->copyFrom(shadeMaterials.data(), sizeof(ShadeMaterialGPU) * shadeMaterials.size());
     }
 
     VkDeviceSize lightSize = std::max(sizeof(LightGPU) * m_sceneData.lights.size(), sizeof(LightGPU));
@@ -3512,7 +3653,11 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_instanceBuffer ? m_instanceBuffer->getBuffer() : VK_NULL_HANDLE,
             m_instanceBuffer ? m_instanceBuffer->getSize() : 0,
             m_filteredCausticImage ? m_filteredCausticImage->getImageView() : VK_NULL_HANDLE,
-            restirReservoirBuf
+            restirReservoirBuf,
+            m_materialArchetypeBuffer ? m_materialArchetypeBuffer->getBuffer() : VK_NULL_HANDLE,
+            m_materialArchetypeBuffer ? m_materialArchetypeBuffer->getSize() : 0,
+            m_shadeMaterialBuffer ? m_shadeMaterialBuffer->getBuffer() : VK_NULL_HANDLE,
+            m_shadeMaterialBuffer ? m_shadeMaterialBuffer->getSize() : 0
         );
     }
 

@@ -305,20 +305,13 @@ void main() {
             archetype = MATERIAL_ARCHETYPE_DIFFUSE;
 
             if (closestTri >= 0) {
-                float u = closestBary.x;
-                float v = closestBary.y;
-                float w = 1.0 - u - v;
                 Triangle tri = triangles[closestTri];
-                vec3 localNormal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
+                vec3 localNormal = getTriangleNormal(tri, closestBary);
                 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-                hitUv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
-                        u * vec2(tri.v1.position.w, tri.v1.normal.w) +
-                        v * vec2(tri.v2.position.w, tri.v2.normal.w);
-                vec4 geomTan = w * tri.v0.tangent + u * tri.v1.tangent + v * tri.v2.tangent;
-                float tanLen = length(geomTan.xyz);
-                vec3 tanDir = tanLen > 1e-4 ? (geomTan.xyz / tanLen) : vec3(1.0, 0.0, 0.0);
+                hitUv = getTriangleUV(tri, closestBary);
+                vec3 tanDir = getTriangleTangent(tri, closestBary);
                 tanDir = normalize(mat3(hitO2w) * tanDir);
-                float tanSign = tri.v0.tangent.w != 0.0 ? tri.v0.tangent.w : 1.0;
+                float tanSign = getTriangleTangentSign(tri);
 
                 matId = tri.materialId + hitInstMatOffset;
                 hit.hitData0 = vec4(closestT,
@@ -329,10 +322,7 @@ void main() {
                                    tanSign,
                                    uintBitsToFloat(uint(closestTri)),
                                    uintBitsToFloat(0u)); // 0: triangle
-                if (matId < pc.numMaterials) {
-                    Material mat = materials[matId];
-                    archetype = getMaterialArchetype(mat);
-                }
+                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
             } else {
                 hitNormal = closestSphereNorm;
                 matId = spheres[closestSphere].materialId;
@@ -344,10 +334,7 @@ void main() {
                                    1.0,
                                    uintBitsToFloat(uint(closestSphere)),
                                    uintBitsToFloat(1u)); // 1: sphere
-                if (matId < pc.numMaterials) {
-                    Material mat = materials[matId];
-                    archetype = getMaterialArchetype(mat);
-                }
+                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
             }
 
             bool isSpecular = (archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC);

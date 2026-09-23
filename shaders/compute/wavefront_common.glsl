@@ -18,19 +18,47 @@
 #define INV_PI 0.31830988618379067154
 #define EPSILON 0.0005
 
-struct Vertex {
-    vec4 position; // xyz: pos, w: u
-    vec4 normal;   // xyz: norm, w: v
-    vec4 tangent;  // xyz: tangent, w: sign
-};
-
+// 128-byte cache-line aligned shading triangle (Option 3 / RDNA 4 vector cache line)
 struct Triangle {
-    Vertex v0;
-    Vertex v1;
-    Vertex v2;
+    vec4 normal0_u0; // xyz: normal0, w: uv0.x
+    vec4 normal1_u1; // xyz: normal1, w: uv1.x
+    vec4 normal2_u2; // xyz: normal2, w: uv2.x
+    vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
+    vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
+    vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
+    vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: unused
     uint materialId;
     uint padding[3];
 };
+
+vec3 getTriangleNormal(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    return normalize(w * tri.normal0_u0.xyz + u * tri.normal1_u1.xyz + v * tri.normal2_u2.xyz);
+}
+
+vec2 getTriangleUV(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    return w * vec2(tri.normal0_u0.w, tri.tan0_v0.w) +
+           u * vec2(tri.normal1_u1.w, tri.tan1_v1.w) +
+           v * vec2(tri.normal2_u2.w, tri.tan2_v2.w);
+}
+
+vec3 getTriangleTangent(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    vec3 geomTan = w * tri.tan0_v0.xyz + u * tri.tan1_v1.xyz + v * tri.tan2_v2.xyz;
+    float len = length(geomTan);
+    return len > 1e-4 ? (geomTan / len) : vec3(1.0, 0.0, 0.0);
+}
+
+float getTriangleTangentSign(in Triangle tri) {
+    return tri.tanSigns.x != 0.0 ? tri.tanSigns.x : 1.0;
+}
 
 struct Sphere {
     vec4 centerRadius; // xyz: center, w: radius
@@ -47,6 +75,21 @@ struct InstanceGPU {
 
 layout(std430, binding = 30) readonly buffer InstancesBuffer {
     InstanceGPU instances[];
+};
+
+layout(std430, binding = 34) readonly buffer MaterialArchetypesBuffer {
+    uint materialArchetypes[];
+};
+
+struct ShadeMaterial {
+    vec4 albedo;
+    vec4 emissive_spec;
+    vec4 pbrParams;
+    uvec4 tex_flags;
+};
+
+layout(std430, binding = 35) readonly buffer ShadeMaterialsBuffer {
+    ShadeMaterial shadeMaterials[];
 };
 
 struct Material {
@@ -669,35 +712,7 @@ bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMa
     return true;
 }
 
-// Möller-Trumbore ray-triangle intersection
-bool intersectTriangle(vec3 origin, vec3 dir, Triangle tri, float tMin, float tMax, out float outT, out vec2 outBary) {
-    vec3 v0 = tri.v0.position.xyz;
-    vec3 v1 = tri.v1.position.xyz;
-    vec3 v2 = tri.v2.position.xyz;
 
-    vec3 edge1 = v1 - v0;
-    vec3 edge2 = v2 - v0;
-    vec3 pvec = cross(dir, edge2);
-    float det = dot(edge1, pvec);
-
-    if (abs(det) < 1e-7) return false;
-    float invDet = 1.0 / det;
-
-    vec3 tvec = origin - v0;
-    float u = dot(tvec, pvec) * invDet;
-    if (u < 0.0 || u > 1.0) return false;
-
-    vec3 qvec = cross(tvec, edge1);
-    float v = dot(dir, qvec) * invDet;
-    if (v < 0.0 || u + v > 1.0) return false;
-
-    float t = dot(edge2, qvec) * invDet;
-    if (t < tMin || t > tMax) return false;
-
-    outT = t;
-    outBary = vec2(u, v);
-    return true;
-}
 
 // Chromaticity-preserving luminance clamping for indirect / secondary bounces
 vec3 clampIndirectRadiance(vec3 rad, float maxLum) {

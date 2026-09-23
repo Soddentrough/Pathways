@@ -36,21 +36,20 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                     InstanceGPU inst = instances[instIdx];
                     uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
                     uint matId = triangles[triIdx].materialId + inst.materialOffset;
-                    Material mat = materials[matId];
-                    bool isDielectric = (mat.type == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
-                    if (mat.type == 3u /* Skip EMISSIVE */ || (!enableCaustics && isDielectric)) {
+                    uint arch = materialArchetypes[matId];
+                    if (arch == MATERIAL_ARCHETYPE_EMISSIVE || (!enableCaustics && arch == MATERIAL_ARCHETYPE_DIELECTRIC)) {
                         continue;
                     }
-                    if (enableCaustics && isDielectric && mat.thickness <= 0.001) {
-                        continue;
+                    if (enableCaustics && arch == MATERIAL_ARCHETYPE_DIELECTRIC) {
+                        if (materials[matId].thickness <= 0.001) {
+                            continue;
+                        }
                     }
-                    if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {
+                    if (arch == MATERIAL_ARCHETYPE_ALPHAMASK) {
+                        Material mat = materials[matId];
                         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rqAlpha, false);
-                        float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
                         Triangle ctri = triangles[triIdx];
-                        vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
-                                   cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
-                                   cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                        vec2 cuv = getTriangleUV(ctri, bary);
                         float calpha = mat.albedo.a;
                         if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                             calpha *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, cuv).a;

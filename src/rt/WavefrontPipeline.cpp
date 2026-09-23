@@ -133,7 +133,9 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // InstancesBuffer
         { 31, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uCausticImage
         { 32, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ReSTIRReservoirsBuffer
-        { 33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // PixelToRayBuffer
+        { 33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PixelToRayBuffer
+        { 34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // MaterialArchetypesBuffer
+        { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // ShadeMaterialsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -319,7 +321,11 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer instanceBuffer,
                                                 VkDeviceSize instanceSize,
                                                 VkImageView causticImageView,
-                                                VkBuffer restirReservoirBuffer) {
+                                                VkBuffer restirReservoirBuffer,
+                                                VkBuffer materialArchetypeBuffer,
+                                                VkDeviceSize matArchetypeSize,
+                                                VkBuffer shadeMaterialBuffer,
+                                                VkDeviceSize shadeMaterialSize) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -345,6 +351,14 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorBufferInfo sphereInfo{ sphereBuffer, 0, sphereSize };
     VkDescriptorBufferInfo matInfo{ matBuffer, 0, matSize };
     VkDescriptorBufferInfo lightInfo{ lightBuffer, 0, lightSize };
+
+    VkBuffer actualMatArchetype = (materialArchetypeBuffer != VK_NULL_HANDLE) ? materialArchetypeBuffer : matBuffer;
+    VkDeviceSize actualMatArchetypeSize = (materialArchetypeBuffer != VK_NULL_HANDLE && matArchetypeSize > 0) ? matArchetypeSize : matSize;
+    VkDescriptorBufferInfo matArchetypeInfo{ actualMatArchetype, 0, actualMatArchetypeSize };
+
+    VkBuffer actualShadeMat = (shadeMaterialBuffer != VK_NULL_HANDLE) ? shadeMaterialBuffer : matBuffer;
+    VkDeviceSize actualShadeMatSize = (shadeMaterialBuffer != VK_NULL_HANDLE && shadeMaterialSize > 0) ? shadeMaterialSize : matSize;
+    VkDescriptorBufferInfo shadeMatInfo{ actualShadeMat, 0, actualShadeMatSize };
 
     VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_queueCounters[frameSlot]->getBuffer();
     VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_queueCounters[frameSlot]->getBuffer();
@@ -412,6 +426,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 31, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 32, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &restirInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 34, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matArchetypeInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 35, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeMatInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }

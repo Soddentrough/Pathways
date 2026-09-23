@@ -25,20 +25,49 @@ struct HitPayload {
 layout(location = 0) rayPayloadInEXT HitPayload prd;
 hitAttributeEXT vec2 attribs;
 
-// Scene structures
-struct Vertex {
-    vec4 position; // xyz: pos, w: u
-    vec4 normal;   // xyz: norm, w: v
-    vec4 tangent;  // xyz: tangent, w: sign
-};
-
+// 128-byte cache-line aligned shading triangle (Option 3 / RDNA 4 vector cache line)
 struct Triangle {
-    Vertex v0;
-    Vertex v1;
-    Vertex v2;
+    vec4 normal0_u0; // xyz: normal0, w: uv0.x
+    vec4 normal1_u1; // xyz: normal1, w: uv1.x
+    vec4 normal2_u2; // xyz: normal2, w: uv2.x
+    vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
+    vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
+    vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
+    vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: unused
     uint materialId;
     uint padding[3];
 };
+
+vec3 getTriangleNormal(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    return normalize(w * tri.normal0_u0.xyz + u * tri.normal1_u1.xyz + v * tri.normal2_u2.xyz);
+}
+
+vec2 getTriangleUV(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    return w * vec2(tri.normal0_u0.w, tri.tan0_v0.w) +
+           u * vec2(tri.normal1_u1.w, tri.tan1_v1.w) +
+           v * vec2(tri.normal2_u2.w, tri.tan2_v2.w);
+}
+
+vec3 getTriangleTangent(in Triangle tri, in vec2 bary) {
+    float u = bary.x;
+    float v = bary.y;
+    float w = 1.0 - u - v;
+    vec3 geomTan = w * tri.tan0_v0.xyz + u * tri.tan1_v1.xyz + v * tri.tan2_v2.xyz;
+    float len = length(geomTan);
+    return len > 1e-4 ? (geomTan / len) : vec3(1.0, 0.0, 0.0);
+}
+
+float getTriangleTangentSign(in Triangle tri) {
+    return tri.tanSigns.x != 0.0 ? tri.tanSigns.x : 1.0;
+}
+
+
 
 struct Sphere {
     vec4 centerRadius; // xyz: center, w: radius
@@ -253,11 +282,8 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
             }
             if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {
                 vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                float cu = bary.x, cv = bary.y, cw = 1.0 - cu - cv;
                 Triangle ctri = triangles[triIdx];
-                vec2 cuv = cw * vec2(ctri.v0.position.w, ctri.v0.normal.w) +
-                           cu * vec2(ctri.v1.position.w, ctri.v1.normal.w) +
-                           cv * vec2(ctri.v2.position.w, ctri.v2.normal.w);
+                vec2 cuv = getTriangleUV(ctri, bary);
                 float calpha = mat.albedo.a;
                 if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                     calpha *= texture(sceneTextures[nonuniformEXT(mat.albedoTex - 1u)], cuv).a;
@@ -408,10 +434,8 @@ void main() {
     float w = 1.0 - u - v;
 
     vec3 hitPoint = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
-    vec3 normal = normalize(w * tri.v0.normal.xyz + u * tri.v1.normal.xyz + v * tri.v2.normal.xyz);
-    vec2 hitUv = w * vec2(tri.v0.position.w, tri.v0.normal.w) +
-                 u * vec2(tri.v1.position.w, tri.v1.normal.w) +
-                 v * vec2(tri.v2.position.w, tri.v2.normal.w);
+    vec3 normal = getTriangleNormal(tri, attribs);
+    vec2 hitUv = getTriangleUV(tri, attribs);
 
     bool frontFace = dot(gl_WorldRayDirectionEXT, normal) < 0.0;
     vec3 geomNormal = frontFace ? normal : -normal;
@@ -447,11 +471,8 @@ void main() {
 
     // Normal mapping
     if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-        vec4 tan0 = tri.v0.tangent;
-        vec4 tan1 = tri.v1.tangent;
-        vec4 tan2 = tri.v2.tangent;
-        vec3 geomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
-        float tanSign = tan0.w != 0.0 ? tan0.w : 1.0;
+        vec3 geomTan = getTriangleTangent(tri, attribs);
+        float tanSign = getTriangleTangentSign(tri);
 
         vec3 normalMap = texture(sceneTextures[nonuniformEXT(mat.normalTex - 1u)], hitUv).rgb * 2.0 - 1.0;
         normalMap.xy *= mat.normalScale;
@@ -600,11 +621,8 @@ void main() {
     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
     vec3 clearcoatNormal = geomNormal;
     if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
-        vec4 tan0 = tri.v0.tangent;
-        vec4 tan1 = tri.v1.tangent;
-        vec4 tan2 = tri.v2.tangent;
-        vec3 cGeomTan = normalize(w * tan0.xyz + u * tan1.xyz + v * tan2.xyz);
-        float cTanSign = tan0.w != 0.0 ? tan0.w : 1.0;
+        vec3 cGeomTan = getTriangleTangent(tri, attribs);
+        float cTanSign = getTriangleTangentSign(tri);
         if (length(cGeomTan) < 0.1) {
             vec3 up = abs(geomNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
             cGeomTan = normalize(cross(up, geomNormal));

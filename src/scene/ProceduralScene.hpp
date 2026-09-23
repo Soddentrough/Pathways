@@ -26,6 +26,20 @@ struct TriangleGPU {
 };
 static_assert(sizeof(TriangleGPU) == 160, "TriangleGPU must be exactly 160 bytes");
 
+// 128-byte cache-line aligned shading triangle struct (Option 3 / RDNA 4 vector cache line)
+struct alignas(16) TriangleShadeGPU {
+    glm::vec4 normal0_u0; // xyz: normal0, w: uv0.x
+    glm::vec4 normal1_u1; // xyz: normal1, w: uv1.x
+    glm::vec4 normal2_u2; // xyz: normal2, w: uv2.x
+    glm::vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
+    glm::vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
+    glm::vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
+    glm::vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: 0.0f
+    uint32_t materialId;
+    uint32_t padding[3];
+};
+static_assert(sizeof(TriangleShadeGPU) == 128, "TriangleShadeGPU must be exactly 128 bytes (1 L0 cache line)");
+
 struct SphereGPU {
     glm::vec4 centerRadius; // xyz: center, w: radius
     uint32_t materialId;

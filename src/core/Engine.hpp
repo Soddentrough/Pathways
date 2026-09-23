@@ -103,12 +103,15 @@ private:
     std::unique_ptr<Buffer> m_triangleBuffer;
     std::unique_ptr<Buffer> m_sphereBuffer;
     std::unique_ptr<Buffer> m_materialBuffer;
+    std::unique_ptr<Buffer> m_materialArchetypeBuffer;
+    std::unique_ptr<Buffer> m_shadeMaterialBuffer;
     std::unique_ptr<Buffer> m_lightBuffer;
     std::unique_ptr<Buffer> m_lightTreeBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
+    std::unique_ptr<Buffer> m_positionBuffer;
     std::unique_ptr<Buffer> m_asIndexBuffer;
     std::unique_ptr<Buffer> m_instanceBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;
