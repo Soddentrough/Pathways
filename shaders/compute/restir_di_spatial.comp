@@ -91,15 +91,18 @@ void main() {
 
     RayGeometry geom = inGeoms[rayIdx];
     RayHit hit = inHits[rayIdx];
-    uint hitType = floatBitsToUint(hit.hitData1.w);
-    float hitT = hit.hitData0.x;
+    float hitT;
+    uint matId, hitType;
+    vec3 hitNormal, geomTan;
+    vec2 hitUv;
+    float tanSign;
+    unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
 
     if (hitType == 2u || hitT <= 0.0) {
         outSpatialReservoirs[pixelIdx] = rCenter;
         return;
     }
 
-    uint matId = floatBitsToUint(hit.hitData0.y);
     Material mat = materials[matId];
     if ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.001) {
         outSpatialReservoirs[pixelIdx] = rCenter;
@@ -109,7 +112,6 @@ void main() {
     vec3 origin = geom.originPackedDir.xyz;
     vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
     vec3 hitPoint = origin + dir * hitT;
-    vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
     f16vec3 diffuseAlbedo = f16vec3(mat.albedo.rgb);
     float roughness = mat.roughness;
 

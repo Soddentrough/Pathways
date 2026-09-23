@@ -15,7 +15,8 @@ public:
                const std::vector<char>& rgenCode,
                const std::vector<char>& rmissCode,
                const std::vector<char>& shadowMissCode,
-               const std::vector<char>& rchitCode);
+               const std::vector<char>& rchitCode,
+               bool supportsSubgroupSizeControl = true);
     ~RTPipeline();
 
     RTPipeline(const RTPipeline&) = delete;
@@ -50,6 +51,7 @@ private:
     VkStridedDeviceAddressRegionKHR m_callableRegion{};
 
     bool m_supported = false;
+    bool m_supportsSubgroupSizeControl = true;
 
     PFN_vkCreateRayTracingPipelinesKHR pfn_vkCreateRayTracingPipelinesKHR = nullptr;
     PFN_vkGetRayTracingShaderGroupHandlesKHR pfn_vkGetRayTracingShaderGroupHandlesKHR = nullptr;

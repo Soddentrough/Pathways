@@ -27,6 +27,11 @@ int main() {
     std::cout << "==========================================================" << std::endl;
 
     Camera cam(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+    check_true(cam.isDynamicScaling(), "Distance-adaptive speed is enabled by default (isDynamicScaling)");
+    check_true(cam.isAdaptiveSpeed(), "Distance-adaptive speed is enabled by default (isAdaptiveSpeed)");
+
+    // Disable dynamic scaling for fixed-rate kinematics unit verification (tests 2-6)
+    cam.setDynamicScaling(false);
 
     // 1. Initial orientation
     assert_near(cam.getPosition().x, 0.0f, 0.001f, "Initial pos X");
@@ -185,6 +190,37 @@ int main() {
     cam.focusOnTarget(glm::vec3(0.0f, 0.0f, 0.0f), 2.0f);
     check_true(cam.hasMoved());
     std::cout << "[PASS] Focus on target shortcut verified." << std::endl;
+
+    // 11c. Distance-Adaptive Speed (Smooth Approach to Focus)
+    {
+        Camera camAdaptive(glm::vec3(0.0f, 1.0f, 4.0f), glm::vec3(0.0f, 1.0f, 0.0f), 45.0f, 16.0f / 9.0f);
+        check_true(camAdaptive.isDynamicScaling(), "Default Camera must have adaptive speed enabled");
+        // At focal distance (4.0m), distRatio = 1.0 -> distFactor = 1.0
+        float baseEffSpeed = camAdaptive.getEffectiveSpeed();
+        assert_near(baseEffSpeed, camAdaptive.getSpeed(), 0.01f, "Effective speed equals base speed at focal distance");
+
+        // Move closer to target (currentDist = 2.0m, half focal distance)
+        camAdaptive.setPose(glm::vec3(0.0f, 1.0f, 2.0f), -90.0f, 0.0f);
+        float closeEffSpeed = camAdaptive.getEffectiveSpeed();
+        assert_near(closeEffSpeed, baseEffSpeed * 0.5f, 0.01f, "Effective speed halves at half focal distance");
+
+        // Move further away (currentDist = 8.0m, double focal distance)
+        camAdaptive.setPose(glm::vec3(0.0f, 1.0f, 8.0f), -90.0f, 0.0f);
+        float farEffSpeed = camAdaptive.getEffectiveSpeed();
+        assert_near(farEffSpeed, baseEffSpeed * 2.0f, 0.01f, "Effective speed doubles at double focal distance");
+
+        // Clamping bounds: minimum distFactor is 0.15f, maximum is 5.0f
+        camAdaptive.setPose(glm::vec3(0.0f, 1.0f, 0.1f), -90.0f, 0.0f); // very close
+        assert_near(camAdaptive.getEffectiveSpeed(), baseEffSpeed * 0.15f, 0.01f, "Clamped to min dynamic speed factor (0.15x)");
+
+        camAdaptive.setPose(glm::vec3(0.0f, 1.0f, 100.0f), -90.0f, 0.0f); // very far
+        assert_near(camAdaptive.getEffectiveSpeed(), baseEffSpeed * 5.0f, 0.01f, "Clamped to max dynamic speed factor (5.0x)");
+
+        // Disabling adaptive speed restores constant speed
+        camAdaptive.setDynamicScaling(false);
+        assert_near(camAdaptive.getEffectiveSpeed(), camAdaptive.getSpeed(), 0.01f, "Effective speed remains constant when adaptive speed disabled");
+        std::cout << "[PASS] Distance-adaptive speed (smooth approach scaling & clamping) verified." << std::endl;
+    }
 
     // 12. Mouse wheel speed adjustment (multiplicative)
     float speedBeforeWheel = cam.getSpeed();
@@ -368,6 +404,16 @@ int main() {
         assert_near(testCam.getPosition().z, 3.75f, 0.001f, "testCam pos z");
         assert_near(testCam.getFov(), 60.0f, 0.001f, "testCam fov");
         std::cout << "[PASS] Camera view override application verified." << std::endl;
+
+        // 19e. Adaptive speed CLI configuration flag parsing
+        const char* argvAdaptiveOff[] = { "pathways", "--no-adaptive-speed" };
+        Config cfgAdaptiveOff = Config::parse(2, const_cast<char**>(argvAdaptiveOff));
+        check_true(!cfgAdaptiveOff.adaptive_speed, "Config parses --no-adaptive-speed");
+
+        const char* argvAdaptiveOn[] = { "pathways", "--adaptive-speed" };
+        Config cfgAdaptiveOn = Config::parse(2, const_cast<char**>(argvAdaptiveOn));
+        check_true(cfgAdaptiveOn.adaptive_speed, "Config parses --adaptive-speed");
+        std::cout << "[PASS] Adaptive speed CLI flag parsing verified." << std::endl;
     }
 
     // 20. Camera Inertia Damping & Accumulation Responsiveness (< 50 ms Latency)

@@ -63,9 +63,6 @@ public:
                        uint32_t maxSequenceCount = 1, bool isPreprocessed = true,
                        VkDeviceAddress sequenceCountAddress = 0);
 
-    // Standard indirect dispatch fallback (for when DGC execution is disabled or bypassed)
-    void recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0);
-
     // Material execution set support (Techniques A, B, C)
     bool isMaterialDGCSupported() const { return m_materialDGCSupported; }
     VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSet; }

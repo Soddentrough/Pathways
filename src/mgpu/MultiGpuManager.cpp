@@ -33,27 +33,7 @@ static inline void closeFileDescriptor(int fd) {
     }
 }
 
-static void parallelMemcpy(void* dst, const void* src, size_t size, size_t numThreads = 8) {
-    if (!dst || !src || size == 0 || dst == src) return;
-    if (size < 1024 * 512 || numThreads <= 1) {
-        std::memcpy(dst, src, size);
-        return;
-    }
-    const size_t chunkSize = size / numThreads;
-    std::vector<std::thread> workers;
-    workers.reserve(numThreads - 1);
-    for (size_t t = 1; t < numThreads; ++t) {
-        size_t offset = t * chunkSize;
-        size_t len = (t == numThreads - 1) ? (size - offset) : chunkSize;
-        workers.emplace_back([=]() {
-            std::memcpy(static_cast<char*>(dst) + offset, static_cast<const char*>(src) + offset, len);
-        });
-    }
-    std::memcpy(dst, src, chunkSize);
-    for (auto& w : workers) {
-        w.join();
-    }
-}
+
 
 static void uploadToDeviceBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize) {
     if (dataSize == 0 || !srcData) return;
@@ -364,7 +344,6 @@ GpuDeviceNode::~GpuDeviceNode() {
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
 
     accumTarget.reset();
-    p2pStagingBuffer.reset();
     triangleBuffer.reset();
     sphereBuffer.reset();
     materialBuffer.reset();
@@ -380,14 +359,22 @@ MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryCon
     : m_primaryContext(primaryContext), m_mode(config.mgpu_mode), m_config(config) {
 
     auto devices = VulkanContext::enumeratePhysicalDevices(primaryContext->getInstance());
-    if (devices.size() < 2) {
-        Logger::info("Multi-GPU: only {} physical Vulkan device(s) found. Multi-GPU unavailable.", devices.size());
+    std::vector<VkPhysicalDevice> hwDevices;
+    for (auto d : devices) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(d, &props);
+        if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            hwDevices.push_back(d);
+        }
+    }
+    if (hwDevices.size() < 2) {
+        Logger::info("Multi-GPU: only {} hardware GPU(s) found (ignoring CPU/software rasterizers). Multi-GPU unavailable.", hwDevices.size());
         m_mode = MultiGpuMode::Off;
         return;
     }
 
     Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs (Initial State: {})...",
-                 devices.size(), m_mode == MultiGpuMode::Off ? "Standby (Single-GPU)" : "Active");
+                 hwDevices.size(), m_mode == MultiGpuMode::Off ? "Standby (Single-GPU)" : "Active");
     initSecondaryDevice(config, scene);
 
     if (m_active) {
@@ -715,7 +702,7 @@ void MultiGpuManager::destroySharedHostBuffer() {
     }
     m_sharedBufferSize = 0;
     m_useZeroCopyHost = false;
-    m_transferMode = InterGpuTransferMode::CpuStaging;
+    m_transferMode = InterGpuTransferMode::ZeroCopy_HostMemory;
 }
 
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
@@ -731,14 +718,9 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     }
 
     // Option 2 (Default): High-Performance Zero-Copy Host Memory via VK_EXT_external_memory_host
-    if (m_config.mgpu_transfer_mode != Config::MgpuTransferMode::Staging &&
-        m_primaryContext && m_primaryContext->hasExternalMemoryHost() &&
-        !m_devices.empty() && m_devices[0]->context && m_devices[0]->context->hasExternalMemoryHost()) {
-    } else {
-        Logger::warn("P2P Direct BAR and external_memory_host unavailable. Falling back to CPU staging copy.");
-        m_useZeroCopyHost = false;
-        m_transferMode = InterGpuTransferMode::CpuStaging;
-        return;
+    if (!(m_primaryContext && m_primaryContext->hasExternalMemoryHost() &&
+          !m_devices.empty() && m_devices[0]->context && m_devices[0]->context->hasExternalMemoryHost())) {
+        throw std::runtime_error("Multi-GPU requires high-performance Zero-Copy Host Memory (VK_EXT_external_memory_host) or Direct P2P BAR. Slower CPU staging workarounds are not supported under Vulkan 1.4 baseline.");
     }
 
     VkDevice dev0 = m_primaryContext->getDevice();
@@ -896,21 +878,45 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
                      m_config.double_buffered_shared_mem ? "Double-Buffered" : "Single-Buffered (Double-Buffering Disabled)",
                      static_cast<double>(m_sharedBufferSize) / (1024.0 * 1024.0));
     } else {
-        Logger::warn("Failed to bind zero-copy host buffers on both GPUs. Falling back to CPU staging.");
         destroySharedHostBuffer();
-        m_useZeroCopyHost = false;
-        m_transferMode = InterGpuTransferMode::CpuStaging;
+        throw std::runtime_error("Failed to bind zero-copy host buffers on both GPUs. Slower CPU staging workarounds are not supported under Vulkan 1.4 baseline.");
     }
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
+#if defined(_WIN32)
+    Logger::warn("Multi-GPU requires hardware cross-GPU semaphore synchronization (VK_KHR_external_semaphore_win32), which is not yet supported on Windows. Multi-GPU disabled.");
+    m_mode = MultiGpuMode::Off;
+    return;
+#endif
+
+    auto devices = VulkanContext::enumeratePhysicalDevices(m_primaryContext->getInstance());
+    uint32_t secondaryGpuIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < devices.size(); ++i) {
+        if (devices[i] == m_primaryContext->getPhysicalDevice()) {
+            continue;
+        }
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+        if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            secondaryGpuIndex = i;
+            break;
+        }
+    }
+
+    if (secondaryGpuIndex == UINT32_MAX) {
+        Logger::info("Multi-GPU: No secondary hardware GPU found (ignoring CPU/software rasterizers). Multi-GPU unavailable.");
+        m_mode = MultiGpuMode::Off;
+        return;
+    }
+
     Config secConfig = config;
-    secConfig.gpu_index = 1; // Explicit secondary GPU
+    secConfig.gpu_index = secondaryGpuIndex; // Explicit secondary hardware GPU
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
 
     auto secNode = std::make_unique<GpuDeviceNode>();
-    secNode->deviceIndex = 1;
+    secNode->deviceIndex = secondaryGpuIndex;
     secNode->context = std::make_unique<VulkanContext>(secConfig, VK_NULL_HANDLE, "Secondary GPU / Peer Compute");
     secNode->deviceName = secNode->context->getDeviceName();
     secNode->timestampPeriod = secNode->context->getDeviceProperties().limits.timestampPeriod;
@@ -952,22 +958,25 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkDevice primDevice = m_primaryContext->getDevice();
     m_useCrossGpuSync = m_primaryContext->hasExternalSemaphoreFd() && secNode->context->hasExternalSemaphoreFd() &&
                         m_primaryContext->pfnImportSemaphoreFdKHR && secNode->context->pfnGetSemaphoreFdKHR;
-    if (m_useCrossGpuSync) {
-        for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
-            VkExportSemaphoreCreateInfo exportInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
-            exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-
-            VkSemaphoreCreateInfo secSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            secSemInfo.pNext = &exportInfo;
-            vkCreateSemaphore(secDevice, &secSemInfo, nullptr, &secNode->secSemaphores[i]);
-
-            VkSemaphoreCreateInfo primSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            vkCreateSemaphore(primDevice, &primSemInfo, nullptr, &secNode->primImportedSemaphores[i]);
-            secNode->exportedFd[i] = -1;
-            secNode->slotFdReady[i] = false;
-        }
-        Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd (zero-wait GPU-to-GPU pipelining).");
+    if (!m_useCrossGpuSync) {
+        Logger::error("Multi-GPU requires cross-GPU hardware semaphore synchronization (VK_KHR_external_semaphore_fd), which is not supported by the Vulkan devices on this system. Disabling Multi-GPU.");
+        m_mode = MultiGpuMode::Off;
+        return;
     }
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        VkExportSemaphoreCreateInfo exportInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+        exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+        VkSemaphoreCreateInfo secSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        secSemInfo.pNext = &exportInfo;
+        vkCreateSemaphore(secDevice, &secSemInfo, nullptr, &secNode->secSemaphores[i]);
+
+        VkSemaphoreCreateInfo primSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        vkCreateSemaphore(primDevice, &primSemInfo, nullptr, &secNode->primImportedSemaphores[i]);
+        secNode->exportedFd[i] = -1;
+        secNode->slotFdReady[i] = false;
+    }
+    Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd (zero-wait GPU-to-GPU pipelining).");
 
     // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
     uint32_t secWidth = config.width;
@@ -1218,7 +1227,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secDevice, secAlloc,
         secNode->context->getRayTracingPipelineProperties(),
         secNode->rtpPipelineLayout,
-        rgenCode, rmissCode, shadowMissCode, rchitCode
+        rgenCode, rmissCode, shadowMissCode, rchitCode,
+        secNode->context->hasRtSubgroupSizeControl()
     );
     Logger::info("Secondary GPU: Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) initialized.");
 
@@ -1246,7 +1256,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 wfShadeEmissiveCode, wfShadePassthroughCode,
                 secNode->context->hasDgcExecutionSet(),
                 wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-                config.dgc_preprocess
+                config.dgc_preprocess,
+                secNode->context->hasSubgroupSizeControl()
             );
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
@@ -1350,15 +1361,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(config.width) * config.height * bytesPerPixel;
     initSharedHostBuffer(bufferSize);
-
-    if (!m_useZeroCopyHost) {
-        m_devices[0]->p2pStagingBuffer = std::make_unique<Buffer>(
-            m_devices[0]->context->getAllocator(), bufferSize,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO,
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-        );
-    }
 }
 
 void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
@@ -1628,7 +1630,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
         VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
             ? m_p2pBufferSecondary[sharedSlot]
-            : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
+            : m_sharedBufferSecondary[sharedSlot];
 
         vkCmdCopyImageToBuffer(cmd, node->upscaler->getOutputImage()->getImage(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1702,7 +1704,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0;
         VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
             ? m_p2pBufferSecondary[sharedSlot]
-            : (m_useZeroCopyHost ? m_sharedBufferSecondary[sharedSlot] : node->p2pStagingBuffer->getBuffer());
+            : m_sharedBufferSecondary[sharedSlot];
 
         vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1887,54 +1889,27 @@ void MultiGpuManager::syncAndTransfer(uint32_t slot, void* dstHostPtr, size_t by
 
     uint32_t s = slot % GpuDeviceNode::NUM_IN_FLIGHT;
 
-    if (m_useCrossGpuSync) {
-        // Wait until worker thread has exported the semaphore FD for this slot
-        {
-            std::unique_lock<std::mutex> lock(m_workMutex);
-            m_submitCv.wait(lock, [this, s]() { return m_devices[0]->slotFdReady[s]; });
-        }
-        // Import FD into primary device semaphore on main thread (safe because frame N-2 fence signaled)
-        GpuDeviceNode* node = m_devices[0].get();
-        int fd = node->exportedFd[s];
-        if (fd >= 0) {
-            VkDevice primDev = m_primaryContext->getDevice();
-            VkImportSemaphoreFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
-            importInfo.semaphore = node->primImportedSemaphores[s];
-            importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
-            importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-            importInfo.fd = fd;
-            m_primaryContext->pfnImportSemaphoreFdKHR(primDev, &importInfo);
-            node->exportedFd[s] = -1;
-        }
-        return;
+    if (!m_useCrossGpuSync) {
+        throw std::runtime_error("MultiGpuManager::syncAndTransfer requires hardware cross-GPU semaphore synchronization under Vulkan 1.4 baseline.");
     }
 
-    // 1. Wait until the worker thread has submitted the command buffer for this slot
+    // Wait until worker thread has exported the semaphore FD for this slot
     {
         std::unique_lock<std::mutex> lock(m_workMutex);
-        m_submitCv.wait(lock, [this, s]() { return m_slotSubmitted[s]; });
+        m_submitCv.wait(lock, [this, s]() { return m_devices[0]->slotFdReady[s]; });
     }
-
+    // Import FD into primary device semaphore on main thread (safe because frame N-2 fence signaled)
     GpuDeviceNode* node = m_devices[0].get();
-    VkDevice device = node->context->getDevice();
-
-    // 2. Wait for secondary GPU completion of this slot
-    vkWaitForFences(device, 1, &node->renderFences[s], VK_TRUE, UINT64_MAX);
-
-    // 3. Read timestamp queries (0: Start RT, 1: End RT, 2: Start Copy, 3: End Copy)
-    uint64_t timestamps[4] = {0, 0, 0, 0};
-    vkGetQueryPoolResults(device, node->queryPools[s], 0, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-    if (timestamps[1] > timestamps[0]) {
-        node->lastFrameTimeMs = (timestamps[1] - timestamps[0]) * node->timestampPeriod * 1e-6;
-    }
-    if (timestamps[3] > timestamps[2]) {
-        node->lastTransferTimeMs = (timestamps[3] - timestamps[2]) * node->timestampPeriod * 1e-6;
-    }
-
-    // 4. Asynchronous PCIe transfer into host-mapped destination buffer (fallback only when zero-copy disabled)
-    if (!m_useZeroCopyHost && dstHostPtr != nullptr && byteSize > 0) {
-        void* srcPtr = node->p2pStagingBuffer->map();
-        parallelMemcpy(dstHostPtr, srcPtr, byteSize, 8);
+    int fd = node->exportedFd[s];
+    if (fd >= 0) {
+        VkDevice primDev = m_primaryContext->getDevice();
+        VkImportSemaphoreFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+        importInfo.semaphore = node->primImportedSemaphores[s];
+        importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+        importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        importInfo.fd = fd;
+        m_primaryContext->pfnImportSemaphoreFdKHR(primDev, &importInfo);
+        node->exportedFd[s] = -1;
     }
 }
 
@@ -2060,15 +2035,6 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         VkDeviceSize bufferSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
         initSharedHostBuffer(bufferSize);
-
-        if (!m_useZeroCopyHost) {
-            node->p2pStagingBuffer = std::make_unique<Buffer>(
-                secAlloc, bufferSize,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_AUTO,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-            );
-        }
 
         VkDescriptorImageInfo accumImageInfo{};
         accumImageInfo.imageView = node->accumTarget->getImageView();

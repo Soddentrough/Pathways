@@ -12,13 +12,10 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
 
     loadFunctionPointers();
     if (getenv("PATHWAYS_DISABLE_DGC")) {
-        m_supported = false;
-        Logger::info("DGC explicitly disabled via PATHWAYS_DISABLE_DGC environment variable. Using standard indirect dispatch.");
-        return;
+        throw std::runtime_error("DGC explicitly disabled via PATHWAYS_DISABLE_DGC, but slower fallback workarounds are not supported under Vulkan 1.4 baseline.");
     }
     if (!m_supported) {
-        Logger::warn("DGCManager: VK_EXT_device_generated_commands not available or entry points failed to load.");
-        return;
+        throw std::runtime_error("DGCManager: VK_EXT_device_generated_commands not available or entry points failed to load.");
     }
 
     if (getenv("PATHWAYS_DISABLE_DGC_PREPROCESS")) {
@@ -52,15 +49,13 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
     createInfo.pTokens = &token;
 
     VkResult res = pfn_vkCreateIndirectCommandsLayoutEXT(m_device, &createInfo, nullptr, &m_indirectLayout);
-    if (res == VK_SUCCESS) {
-        Logger::info("Created DGC indirect commands layout (Single Dispatch Token, stride: {} bytes, flags: 0x{:x}).",
-                     createInfo.indirectStride, createInfo.flags);
-    } else {
-        Logger::warn("Failed to create DGC indirect commands layout (code: {}). Falling back to standard indirect dispatch.", (int)res);
-        m_supported = false;
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create DGC indirect commands layout (code: " + std::to_string(res) + ")");
     }
+    Logger::info("Created DGC indirect commands layout (Single Dispatch Token, stride: {} bytes, flags: 0x{:x}).",
+                 createInfo.indirectStride, createInfo.flags);
 
-    if (m_supported && supportsExecutionSet) {
+    if (supportsExecutionSet) {
         VkIndirectCommandsExecutionSetTokenEXT execSetToken{};
         execSetToken.type = VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT;
         execSetToken.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -90,16 +85,12 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         if (matRes == VK_SUCCESS) {
             Logger::info("Created DGC Material indirect commands layout (ExecutionSet + Dispatch, stride: {} bytes).",
                          matCreateInfo.indirectStride);
-            m_materialDGCSupported = true;
         } else {
             Logger::warn("Note: DGC Material indirect commands layout not supported by driver (code: {}). Using multi-dispatch indirect.", (int)matRes);
             m_materialDGCSupported = false;
         }
     } else {
         m_materialDGCSupported = false;
-        if (!supportsExecutionSet && m_supported) {
-            Logger::info("DGC Execution Sets disabled. Using multi-dispatch indirect fallback.");
-        }
     }
 }
 
@@ -247,15 +238,13 @@ void DGCManager::recordPreprocessBarrier(VkCommandBuffer cmd, uint32_t sliceInde
 }
 
 void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer* argumentBuffer,
-                              VkDeviceSize argumentOffset, uint32_t sliceIndex,
-                              uint32_t maxSequenceCount, bool isPreprocessed,
-                              VkDeviceAddress sequenceCountAddress) {
+                               VkDeviceSize argumentOffset, uint32_t sliceIndex,
+                               uint32_t maxSequenceCount, bool isPreprocessed,
+                               VkDeviceAddress sequenceCountAddress) {
     if (!argumentBuffer || pipeline == VK_NULL_HANDLE) return;
 
     if (!m_supported || !m_indirectLayout) {
-        // Fallback: Dispatch indirect
-        vkCmdDispatchIndirect(cmd, argumentBuffer->getBuffer(), argumentOffset);
-        return;
+        throw std::runtime_error("DGCManager::recordExecute: DGC indirect commands layout is not available.");
     }
 
     ensurePreprocessBuffer(pipeline, maxSequenceCount);
@@ -284,11 +273,6 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
 
     bool executePreprocessed = m_explicitPreprocess && isPreprocessed;
     pfn_vkCmdExecuteGeneratedCommandsEXT(cmd, executePreprocessed ? VK_TRUE : VK_FALSE, &genInfo);
-}
-
-void DGCManager::recordIndirectDispatch(VkCommandBuffer cmd, Buffer* argumentBuffer, VkDeviceSize argumentOffset) {
-    if (!argumentBuffer) return;
-    vkCmdDispatchIndirect(cmd, argumentBuffer->getBuffer(), argumentOffset);
 }
 
 void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines) {
@@ -322,8 +306,7 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
         VkIndirectExecutionSetEXT execSet = VK_NULL_HANDLE;
         VkResult res = pfn_vkCreateIndirectExecutionSetEXT(m_device, &execSetCreateInfo, nullptr, &execSet);
         if (res != VK_SUCCESS || execSet == VK_NULL_HANDLE) {
-            Logger::warn("Failed to create {} VkIndirectExecutionSetEXT (code: {}).", name, (int)res);
-            return VK_NULL_HANDLE;
+            throw std::runtime_error(std::string("Failed to create ") + name + " VkIndirectExecutionSetEXT (code: " + std::to_string(res) + ")");
         }
 
         std::vector<VkWriteIndirectExecutionSetPipelineEXT> writes(pipes.size());
@@ -348,11 +331,6 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
     }
 
     m_materialExecutionSet = createExecSet(primaryPipelines, "primary material");
-    if (m_materialExecutionSet == VK_NULL_HANDLE) {
-        m_materialDGCSupported = false;
-        Logger::warn("Falling back to multi-dispatch indirect for materials.");
-        return;
-    }
 
     if (!secondaryPipelines.empty()) {
         m_materialExecutionSetSecondary = createExecSet(secondaryPipelines, "secondary material");
@@ -404,7 +382,7 @@ void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<Vk
     VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
 
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet || (m_explicitPreprocess && !isPreprocessed)) {
-        // Direct multi-dispatch indirect fallback (16 bytes stride per DispatchCommand)
+        // Direct multi-dispatch indirect (16 bytes stride per DispatchCommand)
         for (uint32_t k = 0; k < sequenceCount && k < pipelines.size(); ++k) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[k]);
             vkCmdDispatchIndirect(cmd, argumentBuffer->getBuffer(), argumentOffset + k * 16);

@@ -42,10 +42,11 @@ VulkanContext::VulkanContext(const Config& config, VkSurfaceKHR surface, const s
 {
     Logger::info("Initializing Vulkan 1.4 Context [{}]...", m_contextRole);
     createInstance(config);
-    if (config.validation_layers) {
+    if (m_validationLayersEnabled) {
         setupDebugMessenger();
     }
     selectPhysicalDevice(config, surface);
+    verifyPhysicalDeviceRequirements();
     createLogicalDevice(config);
     initVMA();
     Logger::info("Vulkan 1.4 Context [{}] successfully initialized on: {}", m_contextRole, m_deviceName);
@@ -79,6 +80,16 @@ std::vector<VkPhysicalDevice> VulkanContext::enumeratePhysicalDevices(VkInstance
 }
 
 void VulkanContext::createInstance(const Config& config) {
+    uint32_t instanceVersion = 0;
+    if (vkEnumerateInstanceVersion(&instanceVersion) != VK_SUCCESS ||
+        instanceVersion < PATHWAYS_MIN_VULKAN_API_VERSION) {
+        throw std::runtime_error(std::format(
+            "Vulkan 1.4.341+ loader is required. Found instance version: {}.{}.{} (Minimum required: 1.4.341).",
+            VK_API_VERSION_MAJOR(instanceVersion),
+            VK_API_VERSION_MINOR(instanceVersion),
+            VK_API_VERSION_PATCH(instanceVersion)));
+    }
+
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Pathways";
@@ -86,6 +97,33 @@ void VulkanContext::createInstance(const Config& config) {
     appInfo.pEngineName = "PathwaysEngine";
     appInfo.engineVersion = VK_MAKE_VERSION(PATHWAYS_VERSION_MAJOR, PATHWAYS_VERSION_MINOR, PATHWAYS_VERSION_PATCH);
     appInfo.apiVersion = VK_API_VERSION_1_4;
+
+    m_validationLayersEnabled = false;
+    std::vector<const char*> enabledLayers;
+    if (config.validation_layers) {
+        uint32_t layerCount = 0;
+        vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+        std::vector<VkLayerProperties> availableLayers(layerCount);
+        vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+
+        for (const char* layerName : g_validationLayers) {
+            bool found = false;
+            for (const auto& layerProperties : availableLayers) {
+                if (std::strcmp(layerName, layerProperties.layerName) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                enabledLayers.push_back(layerName);
+            } else {
+                Logger::warn("Validation layer '{}' requested, but not available on this system. Validation will be disabled.", layerName);
+            }
+        }
+        if (!enabledLayers.empty()) {
+            m_validationLayersEnabled = true;
+        }
+    }
 
     std::vector<const char*> instanceExtensions;
     if (!config.headless) {
@@ -100,7 +138,7 @@ void VulkanContext::createInstance(const Config& config) {
 #endif
         instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     }
-    if (config.validation_layers) {
+    if (m_validationLayersEnabled) {
         instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
 
@@ -131,13 +169,8 @@ void VulkanContext::createInstance(const Config& config) {
     createInfo.pApplicationInfo = &appInfo;
     createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();
-
-    if (config.validation_layers) {
-        createInfo.enabledLayerCount = static_cast<uint32_t>(g_validationLayers.size());
-        createInfo.ppEnabledLayerNames = g_validationLayers.data();
-    } else {
-        createInfo.enabledLayerCount = 0;
-    }
+    createInfo.enabledLayerCount = static_cast<uint32_t>(enabledLayers.size());
+    createInfo.ppEnabledLayerNames = enabledLayers.empty() ? nullptr : enabledLayers.data();
 
     VkResult res = vkCreateInstance(&createInfo, nullptr, &m_instance);
     if (res != VK_SUCCESS) {
@@ -188,6 +221,15 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     m_physicalDevice = devices[selectedIdx];
     vkGetPhysicalDeviceProperties(m_physicalDevice, &m_deviceProperties);
     m_deviceName = m_deviceProperties.deviceName;
+
+    if (m_deviceProperties.apiVersion < PATHWAYS_MIN_VULKAN_API_VERSION) {
+        throw std::runtime_error(std::format(
+            "Selected GPU '{}' does not meet the minimum Vulkan 1.4.341+ baseline requirement. Device reports {}.{}.{} (Minimum required: 1.4.341).",
+            m_deviceName,
+            VK_API_VERSION_MAJOR(m_deviceProperties.apiVersion),
+            VK_API_VERSION_MINOR(m_deviceProperties.apiVersion),
+            VK_API_VERSION_PATCH(m_deviceProperties.apiVersion)));
+    }
 
     std::string nameLower = m_deviceName;
     std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
@@ -325,12 +367,26 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extCount, availableExtensions.data());
 
     bool hasPciBusInfo = false;
+    bool hasAccStruct = false;
+    bool hasRtPipeline = false;
+    bool hasRayQuery = false;
+    bool hasDeferredOps = false;
+
     for (const auto& ext : availableExtensions) {
         if (std::strcmp(ext.extensionName, VK_EXT_DEVICE_GENERATED_COMMANDS_EXTENSION_NAME) == 0) {
             m_hasDGC = true;
         }
         if (std::strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) {
-            m_hasRayTracing = true;
+            hasAccStruct = true;
+        }
+        if (std::strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0) {
+            hasRtPipeline = true;
+        }
+        if (std::strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0) {
+            hasRayQuery = true;
+        }
+        if (std::strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0) {
+            hasDeferredOps = true;
         }
         if (std::strcmp(ext.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0) {
             hasPciBusInfo = true;
@@ -359,6 +415,7 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         }
 #endif
     }
+    m_hasRayTracing = hasAccStruct && hasRtPipeline && hasRayQuery && hasDeferredOps;
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
     VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps{};
@@ -400,11 +457,18 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
         m_hasSubgroupSizeControl = true;
     }
+    if (m_hasSubgroupSizeControl &&
+        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_RAYGEN_BIT_KHR) &&
+        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) &&
+        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MISS_BIT_KHR)) {
+        m_hasRtSubgroupSizeControl = true;
+    }
 
-    Logger::info("Device Capabilities -> DGC: {}, Hardware RT: {}, SubgroupSizeControl (Wave32): {}",
+    Logger::info("Device Capabilities -> DGC: {}, Hardware RT: {}, SubgroupSizeControl (Wave32 Compute: {}, RT: {})",
                  m_hasDGC ? "SUPPORTED" : "NOT FOUND",
                  m_hasRayTracing ? "SUPPORTED" : "NOT FOUND",
-                 m_hasSubgroupSizeControl ? "SUPPORTED" : "NOT FOUND");
+                 m_hasSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)",
+                 m_hasRtSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)");
     if (m_hasRayTracing) {
         Logger::info("RT Pipeline Properties -> HandleSize: {} B, BaseAlign: {} B, HandleAlign: {} B, MaxRecursion: {}",
                      m_rtPipelineProperties.shaderGroupHandleSize,
@@ -424,6 +488,98 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                      dgcProps.supportedIndirectCommandsShaderStages,
                      m_hasDgcExecutionSet ? "SUPPORTED" : "UNSUPPORTED");
     }
+}
+
+void VulkanContext::verifyPhysicalDeviceRequirements() {
+    // 1. Mandatory Extension Verification
+    std::vector<std::string> missingRequirements;
+    if (!m_hasRayTracing) {
+        missingRequirements.push_back("Hardware Ray Tracing (VK_KHR_acceleration_structure, VK_KHR_ray_tracing_pipeline, VK_KHR_ray_query, VK_KHR_deferred_host_operations)");
+    }
+    if (!m_hasDGC) {
+        missingRequirements.push_back("Device Generated Commands (VK_EXT_device_generated_commands)");
+    }
+
+    // 2. Hardware Features Pre-Validation via vkGetPhysicalDeviceFeatures2
+    VkPhysicalDeviceVulkan14Features feat14{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES };
+    VkPhysicalDeviceVulkan13Features feat13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceVulkan12Features feat12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceVulkan11Features feat11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR featRTP{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR featAS{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+    VkPhysicalDeviceRayQueryFeaturesKHR featRQ{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT featDGC{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
+
+    feat14.pNext = &feat13;
+    feat13.pNext = &feat12;
+    feat12.pNext = &feat11;
+    feat11.pNext = &featRTP;
+    featRTP.pNext = &featAS;
+    featAS.pNext = &featRQ;
+    featRQ.pNext = &featDGC;
+
+    VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    feat2.pNext = &feat14;
+
+    vkGetPhysicalDeviceFeatures2(m_physicalDevice, &feat2);
+
+    auto requireFeat = [&](VkBool32 supported, const char* name) {
+        if (!supported) missingRequirements.push_back(name);
+    };
+
+    // Vulkan 1.4 Core Features
+    requireFeat(feat14.shaderSubgroupRotate, "Vulkan 1.4: shaderSubgroupRotate");
+    requireFeat(feat14.shaderSubgroupRotateClustered, "Vulkan 1.4: shaderSubgroupRotateClustered");
+    requireFeat(feat14.shaderFloatControls2, "Vulkan 1.4: shaderFloatControls2");
+    requireFeat(feat14.shaderExpectAssume, "Vulkan 1.4: shaderExpectAssume");
+    requireFeat(feat14.dynamicRenderingLocalRead, "Vulkan 1.4: dynamicRenderingLocalRead");
+    requireFeat(feat14.maintenance5, "Vulkan 1.4: maintenance5");
+    requireFeat(feat14.maintenance6, "Vulkan 1.4: maintenance6");
+
+    // Vulkan 1.3 Core Features
+    requireFeat(feat13.dynamicRendering, "Vulkan 1.3: dynamicRendering");
+    requireFeat(feat13.synchronization2, "Vulkan 1.3: synchronization2");
+
+    // Vulkan 1.2 Core Features
+    requireFeat(feat12.bufferDeviceAddress, "Vulkan 1.2: bufferDeviceAddress");
+    requireFeat(feat12.descriptorIndexing, "Vulkan 1.2: descriptorIndexing");
+    requireFeat(feat12.runtimeDescriptorArray, "Vulkan 1.2: runtimeDescriptorArray");
+    requireFeat(feat12.descriptorBindingPartiallyBound, "Vulkan 1.2: descriptorBindingPartiallyBound");
+    requireFeat(feat12.descriptorBindingVariableDescriptorCount, "Vulkan 1.2: descriptorBindingVariableDescriptorCount");
+    requireFeat(feat12.shaderSampledImageArrayNonUniformIndexing, "Vulkan 1.2: shaderSampledImageArrayNonUniformIndexing");
+    requireFeat(feat12.scalarBlockLayout, "Vulkan 1.2: scalarBlockLayout");
+    requireFeat(feat12.timelineSemaphore, "Vulkan 1.2: timelineSemaphore");
+    requireFeat(feat12.vulkanMemoryModel, "Vulkan 1.2: vulkanMemoryModel");
+    requireFeat(feat12.vulkanMemoryModelDeviceScope, "Vulkan 1.2: vulkanMemoryModelDeviceScope");
+    requireFeat(feat12.shaderFloat16, "Vulkan 1.2: shaderFloat16");
+
+    // Vulkan 1.1 Core Features
+    requireFeat(feat11.storageBuffer16BitAccess, "Vulkan 1.1: storageBuffer16BitAccess");
+    requireFeat(feat11.uniformAndStorageBuffer16BitAccess, "Vulkan 1.1: uniformAndStorageBuffer16BitAccess");
+
+    // Vulkan 1.0 Core Features
+    requireFeat(feat2.features.samplerAnisotropy, "Vulkan 1.0: samplerAnisotropy");
+    requireFeat(feat2.features.shaderInt64, "Vulkan 1.0: shaderInt64");
+    requireFeat(feat2.features.shaderStorageImageWriteWithoutFormat, "Vulkan 1.0: shaderStorageImageWriteWithoutFormat");
+    requireFeat(feat2.features.shaderStorageImageReadWithoutFormat, "Vulkan 1.0: shaderStorageImageReadWithoutFormat");
+
+    // Hardware Ray Tracing Features
+    requireFeat(featAS.accelerationStructure, "Ray Tracing: accelerationStructure");
+    requireFeat(featRTP.rayTracingPipeline, "Ray Tracing: rayTracingPipeline");
+    requireFeat(featRQ.rayQuery, "Ray Tracing: rayQuery");
+
+    // DGC Features
+    requireFeat(featDGC.deviceGeneratedCommands, "DGC: deviceGeneratedCommands");
+    requireFeat(featDGC.dynamicGeneratedPipelineLayout, "DGC: dynamicGeneratedPipelineLayout");
+
+    if (!missingRequirements.empty()) {
+        std::string err = std::format("GPU '{}' lacks required Vulkan 1.4 baseline capability/feature(s):\n", m_deviceName);
+        for (const auto& item : missingRequirements) {
+            err += "  - " + item + "\n";
+        }
+        throw std::runtime_error(err);
+    }
+    Logger::info("[{}] Verified all Vulkan 1.4 (1.4.341+) baseline hardware features and extensions on '{}'.", m_contextRole, m_deviceName);
 }
 
 void VulkanContext::refreshPciLinkInfo() {

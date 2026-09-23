@@ -35,6 +35,12 @@ int main() {
     vkGetPhysicalDeviceProperties(gpus[1], &p1);
     std::cout << "GPU 0: " << p0.deviceName << std::endl;
     std::cout << "GPU 1: " << p1.deviceName << std::endl;
+    if (p0.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU || p1.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+        std::cout << "One or more devices is a CPU/software renderer (" << (p1.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? p1.deviceName : p0.deviceName)
+                  << "). Skipping cross-GPU sync test (requires dual hardware GPUs)." << std::endl;
+        vkDestroyInstance(instance, nullptr);
+        return 0;
+    }
 
     // Create Device 0 and Device 1 with external_semaphore_fd
     const char* exts[] = { "VK_KHR_external_semaphore_fd" };

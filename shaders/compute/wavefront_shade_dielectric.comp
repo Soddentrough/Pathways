@@ -156,20 +156,18 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData0.x;
-        uint matId = floatBitsToUint(hit.hitData0.y);
-        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
-        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
-        vec3 geomTan = unpackOct32(floatBitsToUint(hit.hitData1.x));
-        float tanSign = hit.hitData1.y;
-        uint primId = floatBitsToUint(hit.hitData1.z);
-        uint hitType = floatBitsToUint(hit.hitData1.w);
+        float hitT;
+        uint matId, hitType;
+        vec3 hitNormal, geomTan;
+        vec2 hitUv;
+        float tanSign;
+        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
 
-        vec3 throughput = state.throughputSeed.rgb;
-        uint seed = floatBitsToUint(state.throughputSeed.w);
-        vec3 accumRadiance = state.radiancePixel.rgb;
-        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
-        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
+        f16vec3 throughputHalf;
+        uint seed, pixelIndex;
+        bool isSpecularPath, causticApplied;
+        unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+        vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
 
         if (hitType == 2u) {
@@ -186,13 +184,12 @@ void main() {
             if (bounce > 0u) {
                 skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
             }
-            accumRadiance += skyContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
             }
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
@@ -241,7 +238,13 @@ void main() {
                 if (bounce > 0u) {
                     emissiveContrib = clampIndirectRadiance(emissiveContrib, pc.indirectClamp);
                 }
-                accumRadiance += emissiveContrib;
+                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                if (pc.captureMlData != 0u) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), 0.0));
+                }
             }
 
             bool pathTerminated = false;
@@ -343,20 +346,8 @@ void main() {
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                        uint nextPackedPixel = pixelIndex | SPECULAR_FLAG_BIT;
-                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPackedPixel));
+                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied);
                     }
-                }
-            }
-
-            if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
-                ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
-                if (pc.captureMlData != 0u) {
-                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
                 }
             }
         }

@@ -165,21 +165,18 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData0.x;
-        uint matId = floatBitsToUint(hit.hitData0.y);
-        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
-        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
-        vec3 geomTan = unpackOct32(floatBitsToUint(hit.hitData1.x));
-        float tanSign = hit.hitData1.y;
-        uint primId = floatBitsToUint(hit.hitData1.z);
-        uint hitType = floatBitsToUint(hit.hitData1.w);
+        float hitT;
+        uint matId, hitType;
+        vec3 hitNormal, geomTan;
+        vec2 hitUv;
+        float tanSign;
+        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
 
-        vec3 throughput = state.throughputSeed.rgb;
-        uint seed = floatBitsToUint(state.throughputSeed.w);
-        vec3 accumRadiance = state.radiancePixel.rgb;
-        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
-        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
-        bool isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
+        f16vec3 throughputHalf;
+        uint seed, pixelIndex;
+        bool isSpecularPath, causticApplied;
+        unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+        vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
 
         if (hitType == 2u) {
@@ -196,17 +193,16 @@ void main() {
             if (bounce > 0u) {
                 skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
             }
-            accumRadiance += skyContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
                 } else {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), 0.0));
                 }
             }
         } else {
@@ -238,8 +234,7 @@ void main() {
                 // Alpha cutout transparent passthrough: Ray advances through geometry unhindered
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(hitPoint + rayDir * EPSILON, uintBitsToFloat(packOct32(rayDir)));
-                nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(rawPixel));
+                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, isSpecularPath, causticApplied);
             } else {
                 // Opaque region of alpha-tested geometry: Evaluate diffuse lighting + bounce
                 vec3 diffuseColor = baseColor.rgb;
@@ -379,7 +374,9 @@ void main() {
                                     shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
                                 }
                             } else {
-                                accumRadiance += unshadowed;
+                                ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                vec4 prev = imageLoad(uAccumImage, pCoord);
+                                imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), prev.a));
                             }
                         }
                     }
@@ -413,24 +410,7 @@ void main() {
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState.throughputSeed = vec4(throughput, uintBitsToFloat(seed));
-                        uint nextPackedPixel = pixelIndex | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u);
-                        nextState.radiancePixel = vec4(accumRadiance, uintBitsToFloat(nextPackedPixel));
-                    }
-                }
-
-                if (pathTerminated && any(greaterThan(accumRadiance, vec3(1e-5)))) {
-                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), 0.0));
-                    if (pc.captureMlData != 0u) {
-                        if (isSpecularPath) {
-                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), 0.0));
-                        } else {
-                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), 0.0));
-                        }
+                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, isSpecularPath, causticApplied);
                     }
                 }
             }

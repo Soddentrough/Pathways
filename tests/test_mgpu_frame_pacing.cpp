@@ -52,11 +52,16 @@ int main() {
         check_true(cP2P.mgpu_transfer_mode == Config::MgpuTransferMode::P2P,
                    "--mgpu-transfer p2p sets MgpuTransferMode::P2P");
 
-        // Explicit --mgpu-transfer staging
-        const char* argvStaging[] = { "pathways", "--mgpu", "--mgpu-transfer", "staging" };
-        Config cStaging = Config::parse(4, const_cast<char**>(argvStaging));
-        check_true(cStaging.mgpu_transfer_mode == Config::MgpuTransferMode::Staging,
-                   "--mgpu-transfer staging sets MgpuTransferMode::Staging");
+        // Explicit --mgpu-transfer staging rejected under Vulkan 1.4 baseline
+        bool caughtStagingError = false;
+        try {
+            const char* argvStaging[] = { "pathways", "--mgpu", "--mgpu-transfer", "staging" };
+            Config::parse(4, const_cast<char**>(argvStaging));
+        } catch (const std::runtime_error&) {
+            caughtStagingError = true;
+        }
+        check_true(caughtStagingError,
+                   "--mgpu-transfer staging is explicitly rejected under Vulkan 1.4 baseline");
 
         // Test --camera-motion flag
         const char* argvMotion[] = { "pathways", "--camera-motion" };

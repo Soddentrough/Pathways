@@ -152,19 +152,19 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT = hit.hitData0.x;
-        uint matId = floatBitsToUint(hit.hitData0.y);
-        vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
-        vec2 hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.w));
-        uint primId = floatBitsToUint(hit.hitData1.z);
-        uint hitType = floatBitsToUint(hit.hitData1.w);
+        float hitT;
+        uint matId, hitType;
+        vec3 hitNormal, geomTan;
+        vec2 hitUv;
+        float tanSign;
+        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
 
-        vec3 throughput = state.throughputSeed.rgb;
-        uint seed = floatBitsToUint(state.throughputSeed.w);
-        vec3 accumRadiance = state.radiancePixel.rgb;
-        uint rawPixel = floatBitsToUint(state.radiancePixel.w);
-        uint pixelIndex = rawPixel & PIXEL_INDEX_MASK;
-        bool isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
+        f16vec3 throughputHalf;
+        uint seed, pixelIndex;
+        bool isSpecularPath, causticApplied;
+        unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+        vec3 throughput = vec3(throughputHalf);
+        vec3 accumRadiance = vec3(0.0);
 
         if (hitType == 2u) {
             // Sky miss fallback

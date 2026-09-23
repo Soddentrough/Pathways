@@ -321,14 +321,7 @@ void main() {
                 float tanSign = tri.v0.tangent.w != 0.0 ? tri.v0.tangent.w : 1.0;
 
                 matId = tri.materialId + hitInstMatOffset;
-                hit.hitData0 = vec4(closestT,
-                                   uintBitsToFloat(matId),
-                                   uintBitsToFloat(packOct32(hitNormal)),
-                                   uintBitsToFloat(packHalf2x16(hitUv)));
-                hit.hitData1 = vec4(uintBitsToFloat(packOct32(tanDir)),
-                                   tanSign,
-                                   uintBitsToFloat(uint(closestTri)),
-                                   uintBitsToFloat(0u)); // 0: triangle
+                hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign);
                 if (matId < pc.numMaterials) {
                     Material mat = materials[matId];
                     archetype = getMaterialArchetype(mat);
@@ -336,14 +329,7 @@ void main() {
             } else {
                 hitNormal = closestSphereNorm;
                 matId = spheres[closestSphere].materialId;
-                hit.hitData0 = vec4(closestT,
-                                   uintBitsToFloat(matId),
-                                   uintBitsToFloat(packOct32(hitNormal)),
-                                   uintBitsToFloat(packHalf2x16(vec2(0.0))));
-                hit.hitData1 = vec4(uintBitsToFloat(packOct32(vec3(1.0, 0.0, 0.0))),
-                                   1.0,
-                                   uintBitsToFloat(uint(closestSphere)),
-                                   uintBitsToFloat(1u)); // 1: sphere
+                hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
                 if (matId < pc.numMaterials) {
                     Material mat = materials[matId];
                     archetype = getMaterialArchetype(mat);
@@ -351,9 +337,7 @@ void main() {
             }
 
             bool isSpecular = (archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC);
-            uint packedPixel = pixelIndex | (isSpecular ? SPECULAR_FLAG_BIT : 0u);
-            state.throughputSeed = vec4(vec3(invSpp), uintBitsToFloat(seed));
-            state.radiancePixel = vec4(0.0, 0.0, 0.0, uintBitsToFloat(packedPixel));
+            state = packRayState(f16vec3(invSpp), seed, pixelIndex, isSpecular, false);
         }
 
         if (pc.sppSampleIndex == 0u) {

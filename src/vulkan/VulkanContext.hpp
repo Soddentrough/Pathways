@@ -102,12 +102,16 @@ public:
     bool isRDNA() const;
     bool isRDNA3() const { return m_architecture == GpuArchitecture::AmdRDNA3; }
     bool isRDNA4() const { return m_architecture == GpuArchitecture::AmdRDNA4; }
+    static constexpr uint32_t PATHWAYS_MIN_VULKAN_API_VERSION = VK_MAKE_API_VERSION(0, 1, 4, 341);
+
     bool hasDGC() const { return m_hasDGC; }
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
+    bool hasRtSubgroupSizeControl() const { return m_hasRtSubgroupSizeControl; }
     bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
     bool hasExternalMemoryFd() const { return m_hasExternalMemoryFd; }
     bool hasExternalMemoryDmaBuf() const { return m_hasExternalMemoryDmaBuf; }
+    bool isValidationEnabled() const { return m_validationLayersEnabled; }
     bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
     bool hasDgcExecutionSet() const { return m_hasDgcExecutionSet; }
     bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
@@ -136,6 +140,7 @@ private:
     void createInstance(const Config& config);
     void setupDebugMessenger();
     void selectPhysicalDevice(const Config& config, VkSurfaceKHR surface);
+    void verifyPhysicalDeviceRequirements();
     void createLogicalDevice(const Config& config);
     void initVMA();
 
@@ -158,6 +163,7 @@ private:
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;
+    bool m_hasRtSubgroupSizeControl = false;
     bool m_hasExternalMemoryHost = false;
     bool m_hasExternalMemoryFd = false;
     bool m_hasExternalMemoryDmaBuf = false;
@@ -173,6 +179,7 @@ private:
 #endif
     PciLinkInfo m_pciLinkInfo;
     std::string m_contextRole = "Primary GPU";
+    bool m_validationLayersEnabled = false;
 
     static uint32_t s_validationErrors;
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(

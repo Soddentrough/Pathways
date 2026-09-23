@@ -22,7 +22,9 @@ except ImportError as e:
 
 PATHWAYS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_PATHWAYS = os.path.join(PATHWAYS_ROOT, "build", "bin", "pathways")
-if not os.path.exists(BIN_PATHWAYS) and os.path.exists(os.path.join(PATHWAYS_ROOT, "build", "bin", "Release", "pathways.exe")):
+if not os.path.exists(BIN_PATHWAYS) and os.path.exists(os.path.join(PATHWAYS_ROOT, "build", "linux-release", "bin", "pathways")):
+    BIN_PATHWAYS = os.path.join(PATHWAYS_ROOT, "build", "linux-release", "bin", "pathways")
+elif not os.path.exists(BIN_PATHWAYS) and os.path.exists(os.path.join(PATHWAYS_ROOT, "build", "bin", "Release", "pathways.exe")):
     BIN_PATHWAYS = os.path.join(PATHWAYS_ROOT, "build", "bin", "Release", "pathways.exe")
 elif not os.path.exists(BIN_PATHWAYS) and os.path.exists(os.path.join(PATHWAYS_ROOT, "build", "bin", "pathways.exe")):
     BIN_PATHWAYS = os.path.join(PATHWAYS_ROOT, "build", "bin", "pathways.exe")
@@ -47,7 +49,8 @@ class TestResult:
         self.metrics[key] = val
 
 def run_pathways(args):
-    cmd = [BIN_PATHWAYS, "--headless"] + args
+    extra = os.environ.get("EXTRA_PATHWAYS_ARGS", "").split()
+    cmd = [BIN_PATHWAYS, "--headless"] + extra + args
     res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True)
     return res.returncode, res.stdout, res.stderr
 
@@ -118,6 +121,7 @@ def test_single_gpu_accumulation_stability():
             "--res", "1080p",
             "--upscaler", "upways",
             "--render-scale", "0.5",
+            "--sec-sort", "none",
             "--frames", str(fc),
             "--dump-frame", out_png
         ])

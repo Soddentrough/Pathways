@@ -205,11 +205,20 @@ Engine::Engine(const Config& config) : m_config(config) {
         aspect
     );
     m_camera->setAspect(aspect);
+    m_camera->setDynamicScaling(m_config.adaptive_speed);
 
     initVulkan();
     initScene();
     auto physicalDevices = VulkanContext::enumeratePhysicalDevices(m_context->getInstance());
-    if (physicalDevices.size() >= 2) {
+    uint32_t hwDeviceCount = 0;
+    for (auto pd : physicalDevices) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(pd, &props);
+        if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            hwDeviceCount++;
+        }
+    }
+    if (hwDeviceCount >= 2) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
     // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
@@ -700,7 +709,9 @@ void Engine::uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount) {
 }
 
 void Engine::createAccelerationStructures() {
-    if (!m_context->hasRayTracing()) return;
+    if (!m_context->hasRayTracing()) {
+        throw std::runtime_error("Hardware Ray Tracing is required under Vulkan 1.4 baseline but is not available.");
+    }
 
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
@@ -1788,7 +1799,8 @@ void Engine::initPipelines() {
         device, allocator,
         m_context->getRayTracingPipelineProperties(),
         m_rtpPipelineLayout,
-        rgenCode, rmissCode, shadowMissCode, rchitCode
+        rgenCode, rmissCode, shadowMissCode, rchitCode,
+        m_context->hasRtSubgroupSizeControl()
     );
     Logger::info("Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) created successfully.");
 
@@ -1814,7 +1826,8 @@ void Engine::initPipelines() {
         wfShadeEmissiveCode, wfShadePassthroughCode,
         m_context->hasDgcExecutionSet(),
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-        true // enableDgcPreprocess
+        true, // enableDgcPreprocess
+        m_context->hasSubgroupSizeControl()
     );
     Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 
@@ -1830,6 +1843,9 @@ void Engine::initPipelines() {
         );
         Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized successfully.");
     } catch (const std::exception& e) {
+        if (m_config.enable_nrc) {
+            throw std::runtime_error(std::string("NRC was explicitly requested (--nrc) but initialization failed: ") + e.what());
+        }
         Logger::warn("NRCManager initialization failed: {}", e.what());
     }
 
@@ -2331,6 +2347,9 @@ void Engine::createUpwaysPipelines() {
         );
         Logger::info("Upways Neural Reconstruction Pipeline initialized successfully.");
     } catch (const std::exception& e) {
+        if (m_config.upscaler_mode == UpscalerMode::Upways || m_config.upways_superres || m_config.denoiser_mode == DenoiserMode::Upways) {
+            throw std::runtime_error(std::string("Upways was explicitly requested but initialization failed: ") + e.what());
+        }
         Logger::warn("UpwaysPipeline initialization failed: {}", e.what());
     }
 }
@@ -3563,10 +3582,11 @@ void Engine::updateMergeDescriptors() {
         VkBuffer secBuffer = VK_NULL_HANDLE;
         VkDeviceSize curSize = bufferSize;
 
-        if (m_mgpu && m_mgpu->isZeroCopyActive()) {
+        if (m_mgpu && m_mgpu->isSecondaryInitialized() && (m_mgpu->isZeroCopyActive() || m_mgpu->isP2PDirectBarActive())) {
             secBuffer = m_mgpu->getPrimarySharedBuffer(slot);
             curSize = m_mgpu->getSharedBufferSize();
-        } else {
+        }
+        if (secBuffer == VK_NULL_HANDLE) {
             if (!m_secTransferBuffer || m_secTransferBuffer->getSize() < bufferSize) {
                 m_secTransferBuffer = std::make_unique<Buffer>(
                     allocator, bufferSize,
@@ -4318,6 +4338,9 @@ void Engine::renderFrame() {
                     m_mgpu->setMode(m_config.mgpu_mode);
                     m_mgpu->setFormat(m_config.accum_format);
                     m_mgpu->resize(m_config.width, m_config.height);
+                }
+                if (!m_mgpu->isSecondaryInitialized()) {
+                    m_config.mgpu_mode = MultiGpuMode::Off;
                 }
             } else if (m_mgpu) {
                 m_mgpu->setMode(MultiGpuMode::Off);
@@ -6062,6 +6085,8 @@ FrameStats Engine::getStats() const {
         }
         switch (m_config.secondary_sort_mode) {
             case SecondarySortMode::DirectionalDGC: stats.wavefront_stats.secondary_sort_mode_str = "directional"; break;
+            case SecondarySortMode::DirectCoherent: stats.wavefront_stats.secondary_sort_mode_str = "direct-coherent"; break;
+            case SecondarySortMode::DirectCoherentK8: stats.wavefront_stats.secondary_sort_mode_str = "direct-coherent-k8"; break;
             default: stats.wavefront_stats.secondary_sort_mode_str = "none"; break;
         }
         if (m_lastWavefrontProfile.valid) {

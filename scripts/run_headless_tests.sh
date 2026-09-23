@@ -22,10 +22,16 @@ else
     echo "amd-smi not found in known paths, continuing..."
 fi
 
+BUILD_DIR="${BUILD_DIR:-build}"
+if [ ! -f "${BUILD_DIR}/build.ninja" ] && [ -f "build/linux-release/build.ninja" ]; then
+    BUILD_DIR="build/linux-release"
+fi
+PATHWAYS_BIN="./${BUILD_DIR}/bin/pathways"
+
 # 2. Build / ensure binaries are up to date (limiting threads for Threadripper 3750X)
 echo ""
 echo "[2/4] Verifying build with ninja (-j16)..."
-ninja -C build -j16
+ninja -C "${BUILD_DIR}" -j16
 
 # Create output directory
 mkdir -p output
@@ -33,17 +39,17 @@ mkdir -p output
 # 2b. Run CTest unit test suites (Camera controls, ImGui headless, Shadow denoiser, TAA/A-Trous, Telemetry)
 echo ""
 echo "[2b] Running CTest Unit Test Suites..."
-ctest --test-dir build --output-on-failure
+ctest --test-dir "${BUILD_DIR}" --output-on-failure
 
 # 2c. Run Dynamic Scene Switching Tests
 echo ""
 echo "[2c] Running Dynamic Scene Switching Tests..."
-./build/bin/pathways --test-scene-switching
+"${PATHWAYS_BIN}" --test-scene-switching
 
 # 3. Test Suite 1: 1080p 16 SPP Full Quality Verification
 echo ""
 echo "[3/7] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -58,7 +64,7 @@ python3 scripts/verify_frame.py output/test_cornell_1080p.png output/stats_1080p
 # 4. Test Suite 2: 4K Native Real-Time Benchmark (<8ms Target)
 echo ""
 echo "[4/5] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 3840 \
     --height 2160 \
@@ -76,7 +82,7 @@ python3 scripts/verify_frame.py output/test_cornell_4k.png output/stats_4k.json 
 # 4b. Test Suite 2b: 4K Native Multi-GPU Interleaved Scanlines (1 SPP, Sub-8ms Target)
 echo ""
 echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1 SPP)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 3840 \
     --height 2160 \
@@ -94,7 +100,7 @@ python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png outp
 # 4c. Test Suite 2c: 4K Native Multi-GPU Frame Pacing & Camera Motion Regression Test
 echo ""
 echo "[4c] Running Test Suite 2c: 4K Native Multi-GPU Frame Pacing (Camera Motion, Host Zero-Copy)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 3840 \
     --height 2160 \
@@ -111,7 +117,7 @@ python3 scripts/verify_mgpu_pacing.py output/stats_4k_mgpu_motion.json 8.0 10.0 
 # 4d. Test Suite 2d: Multi-GPU + FSR 3.1 Dynamic Camera Motion & Seam Test (1440p Quality)
 echo ""
 echo "[4d] Running Test Suite 2d: Multi-GPU + FSR 3.1 Dynamic Camera Motion (1440p Quality, Dual R9700)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --scene scenes/classroom/classroom_extended.glb \
     --width 2560 \
@@ -130,7 +136,7 @@ python3 scripts/verify_mgpu_fsr3_motion.py output/test_classroom_mgpu_tile_fsr3_
 # 5. Test Suite 3: Multi-GPU Sample Parallelism (Dual Radeon AI PRO R9700)
 echo ""
 echo "[4/5] Running Test Suite 3: Multi-GPU Sample Parallelism (Dual R9700 @ PCIe 5.0 x16)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -145,7 +151,7 @@ python3 scripts/verify_frame.py output/test_mgpu_sample.png output/stats_mgpu_sa
 # 6. Test Suite 4: Multi-GPU Scaling Benchmark (Verify >=1.8x Speedup)
 echo ""
 echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual GPU >= 1.8x)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -158,7 +164,7 @@ echo "[5/6] Running Test Suite 4: Multi-GPU Scaling Verification (Single vs Dual
     --mgpu-mode off \
     --dump-stats output/stats_scaling_single.json
 
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -178,7 +184,7 @@ python3 scripts/verify_scaling.py output/stats_scaling_single.json output/stats_
 echo ""
 echo "[6a] Running Test Suite 5: glTF 2.0 Ingestion & Verification (Damaged Helmet)..."
 
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -193,7 +199,7 @@ python3 scripts/verify_frame.py output/test_gltf_helmet.png output/stats_gltf_he
 # 8. Test Suite 6: Extreme Scenes & Dielectric Transmission Stress Test (Cornell Caustic & Glass of Water)
 echo ""
 echo "[6b] Running Test Suite 6: Extreme Scenes Regression Verification (Caustics & Glass of Water)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -206,7 +212,7 @@ echo "[6b] Running Test Suite 6: Extreme Scenes Regression Verification (Caustic
 
 python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cornell_caustic.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 15.0
 
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -223,7 +229,7 @@ python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glas
 # 9. Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes (Dragon Dispersion, Car Concept, Breakfast Room)
 echo ""
 echo "[6c] Running Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -236,7 +242,7 @@ echo "[6c] Running Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes.
 
 python3 scripts/verify_frame.py output/test_dragon_dispersion.png output/stats_dragon_dispersion.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 25.0
 
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -249,7 +255,7 @@ python3 scripts/verify_frame.py output/test_dragon_dispersion.png output/stats_d
 
 python3 scripts/verify_frame.py output/test_bmw_m6.png output/stats_bmw_m6.json 1920 1080 20.0 --max-mean-lum 0.95 --max-blown-pct 50.0
 
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -265,7 +271,7 @@ python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_brea
 # 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Alias Table & Local RIS)
 echo ""
 echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -280,7 +286,7 @@ python3 scripts/verify_frame.py output/test_many_lights.png output/stats_many_li
 # 9c. Test Suite 6e: Hierarchical Light Tree (FEAT-02) Many-Lights Verification
 echo ""
 echo "[6e] Running Test Suite 6e: Many-Lights Scene with Hierarchical Light Tree (--light-tree)..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
     --height 1080 \
@@ -297,7 +303,7 @@ python3 scripts/verify_frame.py output/test_many_lights_tree.png output/stats_ma
 if [ -f "scenes/BuickRiviera/BuickRiviera.usdc" ]; then
     echo ""
     echo "[6f] Running Test Suite 6f: OpenUSD Scene Ingestion & Path Tracing (Buick Riviera)..."
-    ./build/bin/pathways \
+    "${PATHWAYS_BIN}" \
         --headless \
         --width 1920 \
         --height 1080 \
@@ -314,7 +320,7 @@ fi
 # 9e. Test Suite 6g: Procedural Cyber-City Megastructure & Multi-GPU 4K Real-Time Benchmark
 echo ""
 echo "[6g] Running Test Suite 6g: Procedural Cyber-City Multi-GPU 4K Real-Time Benchmark..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --scene cyber-city \
     --width 3840 \
@@ -330,7 +336,7 @@ python3 scripts/verify_frame.py output/test_cyber_city_4k.png output/stats_cyber
 # 9f. Test Suite 6h: Procedural Cyber-City Dynamic Multi-Frame Video Hologram E2E Verification
 echo ""
 echo "[6h] Running Test Suite 6h: Cyber-City Dynamic Multi-Frame Video Hologram Playback & Terrace View..."
-./build/bin/pathways \
+"${PATHWAYS_BIN}" \
     --headless \
     --scene cyber-city \
     --camera -6.8,29.0,36.5,2.0,25.0,-40.0,62.0 \
