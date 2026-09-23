@@ -25,7 +25,7 @@ docs/
 ## 1. Architecture & Engineering Specifications
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**:
-  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), AMD FSR 3.1 spatiotemporal super-resolution, ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
+  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 128-byte cache-line aligned geometry buffers (`TriangleShadeGPU`), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), AMD FSR 3.1 spatiotemporal super-resolution, ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
 
 ---
 

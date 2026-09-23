@@ -59,22 +59,28 @@ Pathways decomposes light transport into decoupled, specialized compute microker
 ### 2.1 The Wavefront Stages
 1. **Ray Classification (`shaders/compute/wavefront_classify.comp`)**:
    - Inspects surface intersection records produced by BVH traversal.
-   - Evaluates surface material archetype (Diffuse, Dielectric, Conductor, Complex, Emissive, Passthrough).
+   - Evaluates surface material archetype (Diffuse, Dielectric, Conductor, Complex, Emissive, Passthrough) directly via the 4-byte scalar `materialArchetypes` buffer (binding 34), bypassing full material structure loads into VGPRs.
    - Computes 16-bit composite sorting keys combining material archetype and quantized 3D Morton spatial codes.
    - Atomically stages rays into dedicated Structure-of-Arrays (SoA) ray queues via 64-bit Buffer Device Addresses (BDA).
-2. **GPU-Autonomous Command Synthesis**:
+2. **Ray Traversal & Intersection (`shaders/compute/wavefront_intersect.comp`)**:
+   - Evaluates fixed-function hardware BVH traversal using inline ray queries (`rayQueryEXT`).
+   - Retrieves triangle shading attributes from the 128-byte cache-line aligned `TriangleShadeGPU` buffer (binding 2).
+   - Conditionally evaluates tangent frames and object-to-world transforms exclusively for `COMPLEX`, `CONDUCTOR`, and `DIELECTRIC` archetypes, skipping tangent attribute loads and matrix math for diffuse and emissive surfaces.
+3. **GPU-Autonomous Command Synthesis**:
    - The classifier kernel synthesizes indirect dispatch commands directly into a device command buffer.
    - Updates `VkIndirectExecutionSetEXT` pipeline tokens on the device with zero CPU intervention.
-3. **Autonomous Microkernel Execution (`vkCmdExecuteGeneratedCommandsEXT`)**:
+4. **Autonomous Microkernel Execution (`vkCmdExecuteGeneratedCommandsEXT`)**:
    - Dispatches only the exact wave counts needed for each material queue.
+   - High-frequency diffuse and primary shading kernels query the compact 64-byte `ShadeMaterialGPU` buffer (binding 35), fetching packed albedo, emissive/specular, PBR parameters, and texture flags at 2 materials per 128B vector cache line.
+   - Secondary diffuse shading (`#if !IS_SECONDARY_BOUNCE`) bypasses normal map texture sampling and TBN perturbation, preserving vector registers and memory bandwidth for indirect diffuse GI.
    - Vector register pressure is tailored to each physical lobe:
-     - `shade_diffuse.comp`: Lambertian diffuse reflection + shadow query. Operates at **24 VGPRs** with **100% Wave32 hardware occupancy**.
-     - `shade_dielectric.comp`: Snell's law refraction, Total Internal Reflection (TIR), and volumetric Beer-Lambert absorption. Operates at **40 VGPRs** with **100% occupancy**.
+     - `shade_diffuse.comp`: Lambertian diffuse reflection. Operates at **24–32 VGPRs** (up to **100% Wave32 hardware occupancy** in pure shading mode; 52 VGPRs / 56.2% occupancy on secondary bounces).
+     - `shade_dielectric.comp`: Snell's law refraction, Total Internal Reflection (TIR), and volumetric Beer-Lambert absorption. Operates at **40–42 VGPRs** with **up to 100% occupancy** (62.5% with dispersion).
      - `shade_conductor.comp`: Anisotropic GGX specular microfacets with Fresnel-Conductor physics. Operates at **48 VGPRs** with **100% occupancy**.
-     - `shade_complex.comp`: Layered clearcoat, transmission, and sheen BSDFs. Operates at **64 VGPRs** with **50% occupancy**.
-4. **Shadow Occlusion (`shaders/compute/wavefront_shadow.comp`)**:
+     - `shade_complex.comp`: Layered clearcoat, transmission, and sheen BSDFs. Operates at **61–64 VGPRs** with **50% occupancy**.
+5. **Shadow Occlusion (`shaders/compute/wavefront_shadow.comp`)**:
    - Evaluates direct lighting visibility using binary inline ray queries (`rayQueryConfirmIntersectionEXT`), bypassing hit shader overhead.
-5. **Accumulation Resolve (`shaders/compute/accum_running_avg.comp`)**:
+6. **Accumulation Resolve (`shaders/compute/accum_running_avg.comp`)**:
    - Numerically stable progressive HDR accumulation using online Welford updates, preventing highlight blowout and floating-point accumulation drift.
 
 ---
@@ -171,3 +177,133 @@ Pathways ingests complex VFX and CAD production assets via OpenUSD (`UsdLoader.c
 - **High-Density Point Instancing (`UsdGeomPointInstancer`)**: Evaluates scenes exceeding 180,000 instances and ~360 million expanded triangles (e.g. `Scanlands.usdc`) without geometry flattening.
 - **Prototype BLAS Deduplication**: Instanced geometries reference compact deduplicated prototype BLAS acceleration structures, reducing VRAM footprint by up to 90% (e.g. 3.58 GB peak VRAM at 1080p for 359M instanced triangles).
 - **Dynamic Real-Time TLAS Build**: Builds top-level acceleration structures in <2.0 ms per frame on RDNA 4 hardware.
+
+---
+
+## 8. Hardware Data Structures & Cache-Line Alignment
+
+On modern GPU architectures such as AMD RDNA 4 (`gfx1201`), vector cache lines ($L0$ and $L1$) are strictly **128 bytes**. When memory transactions access unaligned data or structures that straddle 128-byte boundaries, the memory subsystem issues two memory requests instead of one—incurring a 100% bandwidth penalty ("split cache-line penalty"). Pathways structures all geometry and material buffers to ensure optimal cache-line alignment and minimal memory bandwidth.
+
+### 8.1 128-Byte Geometry Shading Buffer (`TriangleShadeGPU`)
+
+In traditional rasterization and path tracing engines, triangle vertex positions, normals, texture coordinates, and tangents are interleaved into a single fat vertex structure (e.g. 160+ bytes per triangle). In a wavefront path tracer, however:
+1. **Hardware BVH Traversal** requires only vertex positions during acceleration structure building (`VkAccelerationStructureGeometryTrianglesDataKHR`). Traversal itself runs in fixed-function ray tracing hardware.
+2. **Shading Kernels** need surface normals, texture coordinates, tangents, and material IDs to evaluate BSDFs and sample textures; they do *not* require vertex positions because world-space hit points are computed from ray origins, direction, and ray query hit distances $t$ ($\mathbf{p} = \mathbf{o} + t \cdot \mathbf{d}$).
+
+Pathways segregates positions from shading geometry into two decoupled buffers:
+- **`m_positionBuffer`**: A contiguous array of 16-byte `glm::vec4(x, y, z, 1.0f)` positions used strictly for hardware BLAS builds.
+- **`m_triangleShadeBuffer` (`TriangleShadeGPU`)**: An aligned 128-byte structure containing exclusively the attributes required during shading:
+
+| Field | GLSL / C++ Type | Byte Size | Description |
+| :--- | :--- | :---: | :--- |
+| `normal0_u0` | `vec4` / `glm::vec4` | 16 | Vertex 0 normal (`xyz`), Vertex 0 UV $u$ coordinate (`w`) |
+| `normal1_u1` | `vec4` / `glm::vec4` | 16 | Vertex 1 normal (`xyz`), Vertex 1 UV $u$ coordinate (`w`) |
+| `normal2_u2` | `vec4` / `glm::vec4` | 16 | Vertex 2 normal (`xyz`), Vertex 2 UV $u$ coordinate (`w`) |
+| `tan0_v0` | `vec4` / `glm::vec4` | 16 | Vertex 0 tangent (`xyz`), Vertex 0 UV $v$ coordinate (`w`) |
+| `tan1_v1` | `vec4` / `glm::vec4` | 16 | Vertex 1 tangent (`xyz`), Vertex 1 UV $v$ coordinate (`w`) |
+| `tan2_v2` | `vec4` / `glm::vec4` | 16 | Vertex 2 tangent (`xyz`), Vertex 2 UV $v$ coordinate (`w`) |
+| `tanSigns` | `vec4` / `glm::vec4` | 16 | Tangent handedness signs (`x: tan0.w, y: tan1.w, z: tan2.w, w: unused`) |
+| `materialId` | `uint32_t` | 4 | Scene material index |
+| `padding[3]` | `uint32_t[3]` | 12 | Alignment padding to guarantee 16-byte / 128-byte boundary |
+| **Total** | | **128 Bytes** | **Exactly 1 RDNA 4 Vector Cache Line (0 Split Cache-Line Penalty)** |
+
+```cpp
+struct alignas(16) TriangleShadeGPU {
+    glm::vec4 normal0_u0; // xyz: normal0, w: uv0.x
+    glm::vec4 normal1_u1; // xyz: normal1, w: uv1.x
+    glm::vec4 normal2_u2; // xyz: normal2, w: uv2.x
+    glm::vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
+    glm::vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
+    glm::vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
+    glm::vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: 0.0f
+    uint32_t materialId;
+    uint32_t padding[3];
+};
+static_assert(sizeof(TriangleShadeGPU) == 128, "TriangleShadeGPU must be exactly 128 bytes (1 L0 cache line)");
+```
+
+### 8.2 Compact 64-Byte Shading Material Buffer (`ShadeMaterialGPU`, Binding 35)
+
+Full physical material descriptions (`MaterialGPU`, 208 bytes) contain extended parameters for clearcoat, transmission, dispersion, sheen, and thin-film iridescence. In high-frequency shading (diffuse, primary ray dispatch, and shadow queries), the vast majority of hits require only core albedo, emissive, metallic-roughness, IOR, and texture handles.
+
+Pathways introduces a compact 64-byte material representation (`ShadeMaterialGPU`) bound at descriptor binding 35:
+- **Cache Packing**: Exactly **two** `ShadeMaterialGPU` entries fit into a single 128-byte vector cache line.
+- **Bandwidth Reduction**: Accessing material state incurs 64 bytes instead of 208 bytes—a **69.2% reduction in material read bandwidth**.
+
+| Field | Type | Size | Packed Contents |
+| :--- | :--- | :---: | :--- |
+| `albedo` | `vec4` | 16 | Base color factor (linear RGBA) |
+| `emissive_spec` | `vec4` | 16 | `xyz`: Emissive factor (linear RGB), `w`: Specular factor |
+| `pbrParams` | `vec4` | 16 | `x`: Roughness, `y`: Metallic, `z`: IOR, `w`: Diffuse transmission factor |
+| `tex_flags` | `uvec4` | 16 | `x`: `albedoTex \| (normalTex << 16)`<br>`y`: `mrTex \| (emissiveTex << 16)`<br>`z`: `diffTransTex \| (specularTex << 16)`<br>`w`: `(matType & 0xFFFF) \| (packHalf16(normalScale) << 16)` |
+| **Total** | | **64 Bytes** | **Packs 2 materials per 128B cache line (`alignas(16)`)** |
+
+### 8.3 4-Byte Scalar Material Archetype Buffer (`materialArchetypes`, Binding 34)
+
+During ray classification (`wavefront_classify.comp`) and ray intersection (`wavefront_intersect.comp`), the engine must identify each surface hit's BSDF archetype to route the ray to the correct queue or decide whether to evaluate tangents:
+$$\text{Archetype} \in \{\text{Diffuse}, \text{Dielectric}, \text{Conductor}, \text{Complex}, \text{Emissive}, \text{Passthrough}\}$$
+Instead of reading 64-byte or 208-byte material records, Pathways binds a dedicated array of 32-bit scalars (`uint materialArchetypes[]`) at binding 34:
+- Direct index lookup: `uint archetype = materialArchetypes[matId];`
+- **Zero Structure Cache Bloat**: Keeps classification and intersection inner loops lean, saving 60–204 bytes of memory fetch per ray hit and preserving VGPR registers.
+
+### 8.4 Secondary Bounce Tangent & Normal Map Bypass
+
+Secondary indirect bounces in diffuse environments carry low-frequency global illumination. Evaluating high-frequency normal maps and loading tangent frames on secondary diffuse bounces introduces significant ALU and memory overhead for imperceptible visual difference.
+
+Pathways deploys a two-tier tangent bypass:
+1. **Intersection Bypass (`wavefront_intersect.comp`)**:
+   Tangent vectors (`tan0_v0`, `tan1_v1`, `tan2_v2`, `tanSigns`) and object-to-world tangent matrix multiplications are executed **only** if the hit archetype is `COMPLEX`, `CONDUCTOR`, or `DIELECTRIC`:
+   ```glsl
+   if (archetype == MATERIAL_ARCHETYPE_COMPLEX || 
+       archetype == MATERIAL_ARCHETYPE_CONDUCTOR || 
+       archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
+       tanDir = getTriangleTangent(tri, closestBary);
+       tanDir = normalize(mat3(hitO2w) * tanDir);
+       tanSign = getTriangleTangentSign(tri);
+   }
+   ```
+   Diffuse and emissive hits bypass all 4 tangent `vec4` loads and $3\times 3$ matrix transforms.
+2. **Shading Bypass (`wavefront_shade_diffuse.comp`)**:
+   Compile-time specialization (`#if !IS_SECONDARY_BOUNCE`) strips normal map texture reads, unpack half operations, and TBN orthonormalization from secondary bounce shaders:
+   ```glsl
+   #if !IS_SECONDARY_BOUNCE
+   if (hitType == 0u && normalTex > 0u && normalTex <= 512u) {
+       vec3 normalMap = SAMPLE_SCENE_TEXTURE(normalTex, hitUv).rgb * 2.0 - 1.0;
+       normalMap.xy *= normalScale;
+       normalMap = normalize(normalMap);
+       geomTan = normalize(geomTan - dot(geomTan, hitNormal) * hitNormal);
+       vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
+       mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
+       hitNormal = normalize(tbn * normalMap);
+   }
+   #endif
+   ```
+   This drops secondary diffuse shader register pressure from 85 VGPRs to **52 VGPRs**, lifting occupancy to **56.2% (9 waves/SIMD)** on RDNA 4 hardware.
+
+### 8.5 Descriptor Set Binding Table
+
+The primary wavefront and compute pipelines bind scene data through descriptor set 0:
+
+| Binding | Resource Type | Name | Stride / Size | Purpose |
+| :---: | :--- | :--- | :---: | :--- |
+| **0** | `storageImage` | `accumImage` | RGBA32F / RGBA16F | Progressive accumulation & render target |
+| **1** | `uniformBuffer` | `cameraUBO` | 256 B | Camera projection, view matrices, resolution |
+| **2** | `storageBuffer` | `triangles` | **128 B** | Cache-line aligned shading geometry (`TriangleShadeGPU`) |
+| **3** | `storageBuffer` | `spheres` | 32 B | Procedural analytic spheres (`SphereGPU`) |
+| **4** | `storageBuffer` | `materials` | 208 B | Full glTF 2.0 extended PBR materials (`MaterialGPU`) |
+| **5** | `storageBuffer` | `lights` | 64 B | Analytical & directional scene lights |
+| **6** | `accelerationStructure` | `topLevelAS` | — | Hardware Top-Level Acceleration Structure (TLAS) |
+| **7** | `combinedSampler` | `environmentMap` | — | HDR/EXR equirectangular environment texture |
+| **8** | `combinedSampler[512]` | `sceneTextures` | — | Bindless/descriptor array of glTF/USD textures |
+| **9** | `storageBuffer` | `inStates` | 32 B | Input ray state queue (throughput, seed, radiance) |
+| **10** | `storageBuffer` | `outStates` | 32 B | Output ray state queue for next bounce |
+| **11** | `storageBuffer` | `queueCounters` | 64 B | Atomic workgroup and ray queue counters |
+| **20–22** | `storageBuffer` | `nrcQueue/Counters` | Variable | Neural Radiance Caching query, train, and counter buffers |
+| **23–24** | `storageImage` | `motionVectors / normalDepth` | RG16F / RGBA16F | Temporal motion vectors and G-Buffer normal/depth |
+| **25** | `storageBuffer` | `lightTree` | Variable | Hierarchical 3D Light Tree nodes |
+| **26–29** | `storageImage` | `albedoRough / specMetal / mlDiff / mlSpec` | RGBA16F | Denoising feature maps & separated diffuse/specular buffers |
+| **30** | `storageBuffer` | `instances` | 64 B | Scene mesh instance transforms and material offsets |
+| **31** | `storageImage` | `causticImage` | RGBA16F | Forward photon-traced caustic splat target |
+| **32** | `storageBuffer` | `restirReservoirs` | Variable | ReSTIR DI spatio-temporal light candidate reservoirs |
+| **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
+| **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |
