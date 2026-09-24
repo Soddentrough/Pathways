@@ -13,18 +13,14 @@
 
 namespace pathways {
 
-// Unified 32-byte ReSTIR PT Reservoir matching GLSL layout
+// Unified 16-byte ReSTIR DI Reservoir matching GLSL layout
 struct alignas(16) UnifiedReservoirPT {
-    uint32_t lightIndex_M;             // lower 16 bits: lightIndex / path candidate, upper 16 bits: M
+    uint32_t lightIndex_M;             // lower 16 bits: lightIndex / candidate, upper 16 bits: M
     float    wSum;                     // sum of weights / final evaluation weight W
-    uint32_t flags_uv_age;             // [0..7] age, [8] valid, [9..10] pathLength (1=DI, 2=GI), [11] lobe, [16..31] packed UV/oct
+    uint32_t flags_uv_age;             // [0..7] age, [8] valid, [9..10] pathLength (1=DI), [11] lobe, [16..31] packed UV
     float    targetPdf;                // scalar unshadowed target distribution p_hat
-    float    secondaryHitDist;         // distance from x0 to secondary vertex x1
-    uint32_t secondaryHitNormal;        // 32-bit octahedral packed normal of vertex x1
-    uint32_t secondaryRadianceRG;      // packed FP16 R and G radiance arriving from x1
-    uint32_t secondaryRadianceB_flags; // packed FP16 B radiance and pad
 };
-static_assert(sizeof(UnifiedReservoirPT) == 32, "UnifiedReservoirPT must be exactly 32 bytes for cache-aligned memory footprint");
+static_assert(sizeof(UnifiedReservoirPT) == 16, "UnifiedReservoirPT must be exactly 16 bytes for cache-aligned memory footprint");
 
 using ReservoirDI = UnifiedReservoirPT;
 

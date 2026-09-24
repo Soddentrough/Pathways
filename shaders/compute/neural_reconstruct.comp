@@ -51,10 +51,6 @@ struct UnifiedReservoirPT {
     float wSum;
     uint flags_uv_age;
     float targetPdf;
-    float secondaryHitDist;
-    uint secondaryHitNormal;
-    uint secondaryRadianceRG;
-    uint secondaryRadianceB_flags;
 };
 
 // Unified ReSTIR PT Reservoir Buffer (Binding 13)

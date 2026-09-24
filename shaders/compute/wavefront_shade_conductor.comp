@@ -204,15 +204,7 @@ void main() {
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
 
-            bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
-            if (enableRestir && bounce == 1u && length(skyColor) > 1e-3) {
-                vec3 n0 = imageLoad(uNormalDepthImage, pixelCoord).xyz;
-                vec3 fakeSkyPoint = origin + rayDir * 10000.0;
-                float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), fakeSkyPoint, -rayDir, skyColor);
-                if (p_hat > 0.0) {
-                    updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, 10000.0, -rayDir, skyColor, seed);
-                }
-            }
+
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
@@ -255,14 +247,7 @@ void main() {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
                     imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), 0.0));
                 }
-                bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
-                if (enableRestir && bounce == 1u && hitT > 1e-3) {
-                    vec3 n0 = imageLoad(uNormalDepthImage, pCoord).xyz;
-                    float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), hitPoint, hitNormal, emissive);
-                    if (p_hat > 0.0) {
-                        updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, hitT, hitNormal, emissive, seed);
-                    }
-                }
+
             }
 
             bool pathTerminated = false;
@@ -410,34 +395,6 @@ void main() {
                                     hasCandidate = true;
                                     usedRestir = true;
                                 }
-                            }
-                        } else if (pLen >= 2u) {
-                            vec3 secDir = unpackOct16((res.flags_uv_age >> 16u) & 0xFFFFu);
-                            float NdotL = dot(hitNormal, secDir);
-                            if (NdotL > 0.0 && res.secondaryHitDist > 1e-4) {
-                                vec3 H = normalize(V + secDir);
-                                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                                float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                                float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, ax, ay)
-                                                  : distributionGGX(NdotH, alphaRoughness);
-                                float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                                f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
-                                f16vec3 specBrdf = float16_t(clamp(D * G, 0.0, 65500.0)) * F;
-                                vec3 secRadiance = vec3(unpackRadianceRG(res.secondaryRadianceRG), float(unpackRadianceB(res.secondaryRadianceB_flags)));
-
-                                selectedLightIdx = 0u;
-                                selectedLightDir = secDir;
-                                selectedLightDist = res.secondaryHitDist;
-                                selectedLightEmission = secRadiance;
-                                selectedLightPdf = 1.0;
-                                selectedBrdf = specBrdf;
-                                selectedNdotL = NdotL;
-                                selectedMisWeight = 1.0;
-                                selectedTarget = max(res.targetPdf, 1e-6);
-                                totalWeightSum = res.wSum;
-                                hasCandidate = true;
-                                usedRestir = true;
                             }
                         }
                     }

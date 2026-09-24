@@ -81,10 +81,6 @@ void main() {
     emptyRes.wSum = 0.0;
     emptyRes.flags_uv_age = 0u; // invalid
     emptyRes.targetPdf = 0.0;
-    emptyRes.secondaryHitDist = 0.0;
-    emptyRes.secondaryHitNormal = 0u;
-    emptyRes.secondaryRadianceRG = 0u;
-    emptyRes.secondaryRadianceB_flags = 0u;
 
     uint rayIdx = pixelToRay[pixelIdx];
     if (rayIdx == 0xFFFFFFFFu) {
@@ -126,10 +122,6 @@ void main() {
     rCurr.wSum = 0.0;
     rCurr.flags_uv_age = 0u;
     rCurr.targetPdf = 0.0;
-    rCurr.secondaryHitDist = 0.0;
-    rCurr.secondaryHitNormal = 0u;
-    rCurr.secondaryRadianceRG = 0u;
-    rCurr.secondaryRadianceB_flags = 0u;
 
     const uint NUM_CANDIDATES = (pc.numLights > 0u) ? 4u : 0u;
     for (uint c = 0u; c < NUM_CANDIDATES; ++c) {
@@ -195,13 +187,6 @@ void main() {
                         float p_hat_prev_at_curr = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, prevLight, prevUV);
                         combineReservoirsDI(rCurr, rPrev, p_hat_prev_at_curr, seed);
                     }
-                } else if (prevPathLen >= 2u /* GI */) {
-                    vec3 secDir = unpackOct16(high16);
-                    vec3 secNormal = unpackOct32(rPrev.secondaryHitNormal);
-                    vec3 secRadiance = vec3(unpackRadianceRG(rPrev.secondaryRadianceRG), float(unpackRadianceB(rPrev.secondaryRadianceB_flags)));
-                    vec3 secHitPoint = hitPoint + secDir * rPrev.secondaryHitDist;
-                    float p_hat_prev_at_curr = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
-                    combineReservoirsDI(rCurr, rPrev, p_hat_prev_at_curr, seed);
                 }
             }
         }

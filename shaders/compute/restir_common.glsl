@@ -3,16 +3,12 @@
 
 #include "wavefront_common.glsl"
 
-// Unified 32-byte ReSTIR PT Reservoir layout (Direct + 1-Bounce Indirect Path Resampling)
+// Unified 16-byte ReSTIR DI Reservoir layout
 struct UnifiedReservoirPT {
     uint lightIndex_M;             // lower 16: lightIndex / candidate ID, upper 16: M sample count
     float wSum;                    // sum of candidate weights / final evaluation weight W
-    uint flags_uv_age;             // [0..7] age, [8] valid, [9..10] pathLength (1=DI, 2=GI), [11] lobe, [16..31] packed UV/oct
+    uint flags_uv_age;             // [0..7] age, [8] valid, [9..10] pathLength (1=DI), [11] lobe, [16..31] packed UV
     float targetPdf;               // scalar unshadowed target distribution p_hat
-    float secondaryHitDist;        // distance from x0 to secondary vertex x1
-    uint secondaryHitNormal;       // 32-bit octahedral packed normal of vertex x1
-    uint secondaryRadianceRG;      // packed FP16 R and G radiance arriving from x1
-    uint secondaryRadianceB_flags; // packed FP16 B radiance and pad
 };
 
 // Aliasing for compatibility across pipelines
@@ -207,29 +203,6 @@ void updateReservoirDI(inout UnifiedReservoirPT r, uint lightIdx, float weight, 
         r.lightIndex_M = packLightM(lightIdx, currentM);
         r.targetPdf = targetPdf;
         r.flags_uv_age = packUnifiedFlags(0u, 1u, 1u /* DI */, 0u, luv);
-        r.secondaryHitDist = 0.0;
-        r.secondaryHitNormal = 0u;
-        r.secondaryRadianceRG = 0u;
-        r.secondaryRadianceB_flags = 0u;
-    } else {
-        r.lightIndex_M = packLightM(getLightIndex(r.lightIndex_M), currentM);
-    }
-}
-
-// Update unified reservoir with indirect path candidate (k = 2)
-void updateReservoirGI(inout UnifiedReservoirPT r, uint pathSeed, float weight, float targetPdf,
-                       vec3 secDir, float secDist, vec3 secNormal, vec3 secRadiance, inout uint seed) {
-    r.wSum += weight;
-    uint currentM = getM(r.lightIndex_M) + 1u;
-    if (weight > 0.0 && (randFloat(seed) * r.wSum < weight || !isValidReservoir(r.flags_uv_age))) {
-        r.lightIndex_M = packLightM(pathSeed, currentM);
-        r.targetPdf = targetPdf;
-        uint oct16 = packOct16(secDir);
-        r.flags_uv_age = (0u & 0xFFu) | ((1u & 1u) << 8u) | ((2u & 3u) << 9u) | (oct16 << 16u);
-        r.secondaryHitDist = secDist;
-        r.secondaryHitNormal = packOct32(secNormal);
-        r.secondaryRadianceRG = packRadianceRG(f16vec2(secRadiance.rg));
-        r.secondaryRadianceB_flags = packRadianceB(float16_t(secRadiance.b), 0u);
     } else {
         r.lightIndex_M = packLightM(getLightIndex(r.lightIndex_M), currentM);
     }
@@ -249,10 +222,6 @@ void combineReservoirsDI(inout UnifiedReservoirPT rA, in UnifiedReservoirPT rB, 
         uint lobeB = (rB.flags_uv_age >> 11u) & 1u;
         uint high16 = (rB.flags_uv_age >> 16u) & 0xFFFFu;
         rA.flags_uv_age = (ageB & 0xFFu) | ((1u & 1u) << 8u) | ((pLenB & 3u) << 9u) | ((lobeB & 1u) << 11u) | (high16 << 16u);
-        rA.secondaryHitDist = rB.secondaryHitDist;
-        rA.secondaryHitNormal = rB.secondaryHitNormal;
-        rA.secondaryRadianceRG = rB.secondaryRadianceRG;
-        rA.secondaryRadianceB_flags = rB.secondaryRadianceB_flags;
     } else {
         rA.lightIndex_M = packLightM(getLightIndex(rA.lightIndex_M), combinedM);
     }

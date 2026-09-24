@@ -141,17 +141,6 @@ void main() {
                     float p_hat_partner = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, pUV);
                     combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
                 }
-            } else if (partnerPathLen >= 2u /* GI */) {
-                vec3 secDir = unpackOct16((rPartner.flags_uv_age >> 16u) & 0xFFFFu);
-                vec3 secNormal = unpackOct32(rPartner.secondaryHitNormal);
-                vec3 secRadiance = vec3(unpackRadianceRG(rPartner.secondaryRadianceRG), float(unpackRadianceB(rPartner.secondaryRadianceB_flags)));
-                vec3 partnerHitPoint = hitPoint + partnerOffset.x * ubo.viewInverse[0].xyz * 0.05; // estimated partner primary hit
-                vec3 secHitPoint = partnerHitPoint + secDir * rPartner.secondaryHitDist;
-
-                if (validateReconnectionFootprint(hitPoint, hitNormal, roughness, partnerHitPoint, partnerNorm, roughness, secHitPoint)) {
-                    float p_hat_partner = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
-                    combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
-                }
             }
         }
     }
@@ -196,17 +185,6 @@ void main() {
             vec2 nLuv = unpackUV(rNeighbor.flags_uv_age);
             float p_hat_at_center = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, nLuv);
             combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
-        } else if (nPathLen >= 2u /* GI */) {
-            vec3 secDir = unpackOct16((rNeighbor.flags_uv_age >> 16u) & 0xFFFFu);
-            vec3 secNormal = unpackOct32(rNeighbor.secondaryHitNormal);
-            vec3 secRadiance = vec3(unpackRadianceRG(rNeighbor.secondaryRadianceRG), float(unpackRadianceB(rNeighbor.secondaryRadianceB_flags)));
-            vec3 nHitPoint = hitPoint + dir * (nDepth - centerDepth);
-            vec3 secHitPoint = nHitPoint + secDir * rNeighbor.secondaryHitDist;
-
-            if (validateReconnectionFootprint(hitPoint, hitNormal, roughness, nHitPoint, nNormal, roughness, secHitPoint)) {
-                float p_hat_at_center = evalUnshadowedTargetGI(hitPoint, hitNormal, diffuseAlbedo, secHitPoint, secNormal, secRadiance);
-                combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
-            }
         }
     }
 

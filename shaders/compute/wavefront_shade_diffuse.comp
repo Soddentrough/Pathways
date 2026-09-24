@@ -223,15 +223,7 @@ void main() {
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
 
-            bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
-            if (enableRestir && bounce == 1u && length(skyColor) > 1e-3) {
-                vec3 n0 = imageLoad(uNormalDepthImage, pixelCoord).xyz;
-                vec3 fakeSkyPoint = origin + rayDir * 10000.0;
-                float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), fakeSkyPoint, -rayDir, skyColor);
-                if (p_hat > 0.0) {
-                    updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, 10000.0, -rayDir, skyColor, seed);
-                }
-            }
+
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -352,14 +344,7 @@ void main() {
                         imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), 0.0));
                     }
                 }
-                bool enableRestir = ((ubo.flags & (1 << 9)) != 0);
-                if (enableRestir && bounce == 1u && hitT > 1e-3) {
-                    vec3 n0 = imageLoad(uNormalDepthImage, pCoord).xyz;
-                    float p_hat = evalUnshadowedTargetGI(origin, n0, f16vec3(1.0), hitPoint, hitNormal, emissive);
-                    if (p_hat > 0.0) {
-                        updateReservoirGI(restirReservoirs[pixelIndex], seed, p_hat, p_hat, rayDir, hitT, hitNormal, emissive, seed);
-                    }
-                }
+
             }
 
             f16vec3 diffuseColor = f16vec3(baseColor.rgb);
@@ -608,27 +593,6 @@ void main() {
                                     hasCandidate = true;
                                     usedRestir = true;
                                 }
-                            }
-                        } else if (pLen >= 2u) {
-                            // Secondary path vertex reconnection (GI candidate)
-                            vec3 secDir = unpackOct16((res.flags_uv_age >> 16u) & 0xFFFFu);
-                            float rawNdotL = dot(hitNormal, secDir);
-                            bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
-                            float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
-                            if (NdotL > 0.0 && (rawNdotL > 0.0 || isTrans) && res.secondaryHitDist > 1e-4) {
-                                vec3 secRadiance = vec3(unpackRadianceRG(res.secondaryRadianceRG), float(unpackRadianceB(res.secondaryRadianceB_flags)));
-                                selectedLightIdx = 0u;
-                                selectedLightDir = secDir;
-                                selectedLightDist = res.secondaryHitDist;
-                                selectedLightEmission = secRadiance;
-                                selectedLightPdf = 1.0;
-                                selectedLightSelectPdf = 1.0;
-                                selectedNdotL = NdotL;
-                                selectedIsTrans = isTrans;
-                                selectedTarget = max(res.targetPdf, 1e-6);
-                                totalWeightSum = res.wSum;
-                                hasCandidate = true;
-                                usedRestir = true;
                             }
                         }
                     }
