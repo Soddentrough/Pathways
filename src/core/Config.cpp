@@ -186,7 +186,8 @@ void Config::printUsage(const char* progName) {
               << "  --indirect-clamp <float> Maximum indirect / secondary bounce radiance luminance (default: 35.0, 0 = disabled)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
-              << "  --batches <int|auto>    Number of coarse batches (default: auto, 1 = monolithic)\n"
+              << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
+              << "  --macro-tiles <int|auto> Alias for --batches\n"
               << "  --batch-size <int|auto> Coarse batch pixel budget (e.g. 1000000, 2000000; default: auto)\n"
               << "  --batch-pixels <int>    Alias for --batch-size\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
@@ -415,15 +416,15 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--batches" && i + 1 < argc) {
+        } else if ((arg == "--batches" || arg == "--macro-tiles") && i + 1 < argc) {
             std::string val = argv[++i];
             if (val == "auto") {
                 cfg.batch_count = 0;
             } else {
                 cfg.batch_count = static_cast<uint32_t>(std::stoul(val));
             }
-        } else if (arg.starts_with("--batches=")) {
-            std::string val = arg.substr(10);
+        } else if (arg.starts_with("--batches=") || arg.starts_with("--macro-tiles=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
             if (val == "auto") {
                 cfg.batch_count = 0;
             } else {

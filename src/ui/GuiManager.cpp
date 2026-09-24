@@ -1211,10 +1211,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             const char* batchModes[] = {
                 "Auto (Device Adaptive)",
                 "Monolithic (1 Batch - Full Screen)",
-                "2 Batches",
-                "4 Batches (Target ~2M Rays)",
-                "8 Batches (Target ~1M Rays - Strix Halo/APU)",
-                "16 Batches (Target 8K / Ultra High-Res)"
+                "2 Batches (2x1 Grid)",
+                "4 Batches (2x2 Grid - Optimal for 4K)",
+                "8 Batches (4x2 Grid - Bounded VRAM)",
+                "16 Batches (4x4 Grid - Ultra High-Res)"
             };
             int currentBatchMode = 0;
             if (config.batch_count == 0) currentBatchMode = 0;
@@ -1241,7 +1241,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             } else if (config.batch_count == 1) {
                 ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "  -> Monolithic: 1 batch (full-frame queues, max occupancy on small resolutions)");
             } else {
-                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Partitioned: %u coarse batches (bounded queue VRAM footprint)", config.batch_count);
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Partitioned: %u coarse 2D batches (bounded VRAM, 2D spatial cache locality)", config.batch_count);
             }
 
             ImGui::Spacing();

@@ -164,6 +164,7 @@ private:
     uint32_t m_currentBatchPixels = 0;
     uint32_t getTargetBatchPixels() const;
     uint32_t getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const;
+    uint32_t getEffectiveBatchPixels(uint32_t renderW, uint32_t renderH, uint32_t batchCount) const;
 
     // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
     VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;

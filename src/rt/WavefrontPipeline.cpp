@@ -667,17 +667,44 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     }
     if (numBatches < 1) numBatches = 1;
 
-    uint32_t batchHeight = (height + numBatches - 1) / numBatches;
+    uint32_t numBatchesX = 1, numBatchesY = 1;
+    if (numBatches > 1) {
+        float screenAspect = static_cast<float>(width) / static_cast<float>(height);
+        float bestMetric = 1e9f;
+        uint32_t bestNx = 1, bestNy = 1;
+        for (uint32_t nx = 1; nx <= numBatches; ++nx) {
+            if (numBatches % nx == 0) {
+                uint32_t ny = numBatches / nx;
+                float tileAspect = screenAspect * (static_cast<float>(ny) / static_cast<float>(nx));
+                float metric = std::abs(std::log(tileAspect));
+                if (metric < bestMetric) {
+                    bestMetric = metric;
+                    bestNx = nx;
+                    bestNy = ny;
+                }
+            }
+        }
+        numBatchesX = bestNx;
+        numBatchesY = bestNy;
+    }
+
+    uint32_t batchBaseW = width / numBatchesX;
+    uint32_t batchRemW  = width % numBatchesX;
+    uint32_t batchBaseH = height / numBatchesY;
+    uint32_t batchRemH  = height % numBatchesY;
 
     for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
         for (uint32_t batch = 0; batch < numBatches; ++batch) {
             uint32_t globalBatchIdx = sampleIdx * numBatches + batch;
             bool shouldProfile = (globalBatchIdx == 0);
 
-            uint32_t batchOffX = (numBatches > 1) ? 0 : sceneData.tileOffsetX;
-            uint32_t batchOffY = (numBatches > 1) ? batch * batchHeight : sceneData.tileOffsetY;
-            uint32_t curBatchW = width;
-            uint32_t curBatchH = (numBatches > 1) ? std::min(batchHeight, height - batchOffY) : height;
+            uint32_t bx = (numBatches > 1) ? (batch % numBatchesX) : 0u;
+            uint32_t by = (numBatches > 1) ? (batch / numBatchesX) : 0u;
+
+            uint32_t batchOffX = (numBatches > 1) ? (bx * batchBaseW + std::min(bx, batchRemW)) : sceneData.tileOffsetX;
+            uint32_t batchOffY = (numBatches > 1) ? (by * batchBaseH + std::min(by, batchRemH)) : sceneData.tileOffsetY;
+            uint32_t curBatchW = (numBatches > 1) ? (batchBaseW + (bx < batchRemW ? 1u : 0u)) : width;
+            uint32_t curBatchH = (numBatches > 1) ? (batchBaseH + (by < batchRemH ? 1u : 0u)) : height;
             uint32_t tileSzX = (numBatches > 1) ? curBatchW : 0;
             uint32_t tileSzY = (numBatches > 1) ? curBatchH : 0;
 

@@ -1822,7 +1822,10 @@ uint32_t Engine::getTargetBatchPixels() const {
     VkPhysicalDeviceType devType = m_context->getDeviceProperties().deviceType;
     if (devType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
         // Profile A: UMA / APU (e.g. AMD Strix Halo, Phoenix)
-        return 1000000u; // 1.0M pixels (~164 MB queue set)
+        // High-end APUs like Strix Halo feature large unified memory (up to 128GB LPDDR5X) and 40 CUs.
+        // A 2.0M pixel budget (~360 MB per queue slot) maintains high CU occupancy across multi-bounce GI
+        // while cutting queue memory footprint by >73% from monolithic 4K.
+        return 2000000u;
     }
 
     // Query device-local VRAM budget
@@ -1853,7 +1856,34 @@ uint32_t Engine::getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) cons
     if (targetBatch == 0 || totalPixels <= targetBatch) {
         return 1u; // Monolithic short-circuit (e.g. 1080p)
     }
-    return (totalPixels + targetBatch - 1) / targetBatch;
+    uint32_t count = (totalPixels + targetBatch - 1) / targetBatch;
+    // Cap auto batch count to at most 4 when max_bounces > 2 to prevent secondary ray CU starvation
+    if (m_config.max_bounces > 2 && count > 4u) {
+        count = 4u;
+    }
+    return count;
+}
+
+uint32_t Engine::getEffectiveBatchPixels(uint32_t renderW, uint32_t renderH, uint32_t batchCount) const {
+    if (batchCount <= 1) return renderW * renderH;
+    float screenAspect = static_cast<float>(renderW) / static_cast<float>(renderH);
+    float bestMetric = 1e9f;
+    uint32_t bestNx = 1, bestNy = 1;
+    for (uint32_t nx = 1; nx <= batchCount; ++nx) {
+        if (batchCount % nx == 0) {
+            uint32_t ny = batchCount / nx;
+            float tileAspect = screenAspect * (static_cast<float>(ny) / static_cast<float>(nx));
+            float metric = std::abs(std::log(tileAspect));
+            if (metric < bestMetric) {
+                bestMetric = metric;
+                bestNx = nx;
+                bestNy = ny;
+            }
+        }
+    }
+    uint32_t maxW = (renderW + bestNx - 1) / bestNx;
+    uint32_t maxH = (renderH + bestNy - 1) / bestNy;
+    return maxW * maxH;
 }
 
 void Engine::initPipelines() {
@@ -2007,7 +2037,7 @@ void Engine::initPipelines() {
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
     uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
-    uint32_t initBatchPixels = (m_config.width * m_config.height + initBatchCount - 1) / initBatchCount;
+    uint32_t initBatchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, initBatchCount);
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
 
@@ -4881,7 +4911,7 @@ void Engine::renderFrame() {
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
             uint32_t activeBatchCount = getEffectiveBatchCount(renderW, renderH);
-            uint32_t activeBatchPixels = (renderW * renderH + activeBatchCount - 1) / activeBatchCount;
+            uint32_t activeBatchPixels = getEffectiveBatchPixels(renderW, renderH, activeBatchCount);
             if (activeBatchCount != m_currentBatchCount || activeBatchPixels != m_currentBatchPixels) {
                 m_currentBatchCount = activeBatchCount;
                 m_currentBatchPixels = activeBatchPixels;
@@ -6824,7 +6854,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     if (m_wavefrontPipeline) {
         uint32_t batchCount = getEffectiveBatchCount(m_config.width, m_config.height);
-        uint32_t batchPixels = (m_config.width * m_config.height + batchCount - 1) / batchCount;
+        uint32_t batchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, batchCount);
         m_currentBatchCount = batchCount;
         m_currentBatchPixels = batchPixels;
         m_wavefrontPipeline->resize(m_config.width, m_config.height, batchPixels);
