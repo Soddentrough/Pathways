@@ -54,12 +54,13 @@ enum class UpscalerMode {
     Upways, // Pathways Native Neural Combined Denoiser & Super-Resolution (Wave32 WMMA)
     FSR1    // AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)
 };
-
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
     bool use_morton = false; // 2D Morton Z-curve mapping for wavefront classification (default: false / linear raster)
-    uint32_t macro_tile_size = 0; // Macro-tile cache panning size (0 = disabled / full screen, 256 = 256x256 L2 pinned)
+    uint32_t macro_tiles = 0; // Number of macro-tiles to partition screen into for cache residency (e.g. 2, 4, 8; 0 or 1 = monolithic full screen [default])
+    uint32_t macro_tiles_x = 0; // Explicit horizontal macro-tile count (0 = auto-calculate based on aspect ratio)
+    uint32_t macro_tiles_y = 0; // Explicit vertical macro-tile count (0 = auto-calculate based on aspect ratio)
     SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default]
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]

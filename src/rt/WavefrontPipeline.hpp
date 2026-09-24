@@ -44,7 +44,9 @@ struct WavefrontSceneData {
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
     float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
     bool inlineShadows = true;            // Inline shadow rays via hardware ray queries (bypasses separate shadow microkernel)
-    uint32_t macroTileSize = 0;           // Macro-tile cache panning (0 = disabled / full frame, 256 = 256x256 L2 pinned)
+    uint32_t macroTiles = 0;              // Macro-tile screen partitioning (0 or 1 = disabled / full screen, 2 = 2 tiles, 4 = 4 tiles, etc.)
+    uint32_t macroTilesX = 0;             // Explicit horizontal macro-tile count (0 = auto-calculate based on aspect ratio)
+    uint32_t macroTilesY = 0;             // Explicit vertical macro-tile count (0 = auto-calculate based on aspect ratio)
 };
 
 class WavefrontPipeline {

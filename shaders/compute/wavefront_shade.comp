@@ -153,6 +153,7 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint captureMlData;
     float indirectClamp;
+    uint isLastTile;
 } pc;
 
 void main() {
@@ -770,50 +771,52 @@ void main() {
         uint totalWgs = gl_NumWorkGroups.x;
         uint retired = atomicAdd(queueCounters.retiredWorkgroups, 1u);
         if (retired == totalWgs - 1u) {
-            uint shadowCount = queueCounters.shadowRayCount;
-            uint shadowGroups = (shadowCount + 31u) / 32u;
-            uint b = pc.currentBounce;
-
-            indirect.bounceDispatches[b].shadowDispatch.x = shadowGroups;
-            indirect.bounceDispatches[b].shadowDispatch.y = 1u;
-            indirect.bounceDispatches[b].shadowDispatch.z = 1u;
-            indirect.bounceDispatches[b].shadowDispatch.pad = shadowCount;
-
-            dgcStream.bounceDGC[b].shadowCmd.pipelineIndex = 3u;
-            dgcStream.bounceDGC[b].shadowCmd.x = shadowGroups;
-            dgcStream.bounceDGC[b].shadowCmd.y = 1u;
-            dgcStream.bounceDGC[b].shadowCmd.z = 1u;
-
-            uint nextCount = queueCounters.nextActiveCount;
-            uint intersectGroups = (nextCount + 31u) / 32u;
-            indirect.bounceDispatches[b].intersectDispatch.x = intersectGroups;
-            indirect.bounceDispatches[b].intersectDispatch.y = 1u;
-            indirect.bounceDispatches[b].intersectDispatch.z = 1u;
-            indirect.bounceDispatches[b].intersectDispatch.pad = nextCount;
-
-            dgcStream.bounceDGC[b].intersectCmd.pipelineIndex = 1u;
-            dgcStream.bounceDGC[b].intersectCmd.x = intersectGroups;
-            dgcStream.bounceDGC[b].intersectCmd.y = 1u;
-            dgcStream.bounceDGC[b].intersectCmd.z = 1u;
-
-            if (b + 1u < pc.maxBounces) {
-                indirect.bounceDispatches[b + 1u].shadeDispatch.x = intersectGroups;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.y = 1u;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.z = 1u;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.pad = nextCount;
-
-                dgcStream.bounceDGC[b + 1u].shadeCmd.pipelineIndex = 2u;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.x = intersectGroups;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.y = 1u;
-                dgcStream.bounceDGC[b + 1u].shadeCmd.z = 1u;
-            }
-
-            queueCounters.totalIntersectWorkgroups = intersectGroups;
-            queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
-            queueCounters.nextActiveCount = 0u;
-            queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;
+            if (pc.isLastTile != 0u) {
+                uint shadowCount = queueCounters.shadowRayCount;
+                uint shadowGroups = (shadowCount + 31u) / 32u;
+                uint b = pc.currentBounce;
+
+                indirect.bounceDispatches[b].shadowDispatch.x = shadowGroups;
+                indirect.bounceDispatches[b].shadowDispatch.y = 1u;
+                indirect.bounceDispatches[b].shadowDispatch.z = 1u;
+                indirect.bounceDispatches[b].shadowDispatch.pad = shadowCount;
+
+                dgcStream.bounceDGC[b].shadowCmd.pipelineIndex = 3u;
+                dgcStream.bounceDGC[b].shadowCmd.x = shadowGroups;
+                dgcStream.bounceDGC[b].shadowCmd.y = 1u;
+                dgcStream.bounceDGC[b].shadowCmd.z = 1u;
+
+                uint nextCount = queueCounters.nextActiveCount;
+                uint intersectGroups = (nextCount + 31u) / 32u;
+                indirect.bounceDispatches[b].intersectDispatch.x = intersectGroups;
+                indirect.bounceDispatches[b].intersectDispatch.y = 1u;
+                indirect.bounceDispatches[b].intersectDispatch.z = 1u;
+                indirect.bounceDispatches[b].intersectDispatch.pad = nextCount;
+
+                dgcStream.bounceDGC[b].intersectCmd.pipelineIndex = 1u;
+                dgcStream.bounceDGC[b].intersectCmd.x = intersectGroups;
+                dgcStream.bounceDGC[b].intersectCmd.y = 1u;
+                dgcStream.bounceDGC[b].intersectCmd.z = 1u;
+
+                if (b + 1u < pc.maxBounces) {
+                    indirect.bounceDispatches[b + 1u].shadeDispatch.x = intersectGroups;
+                    indirect.bounceDispatches[b + 1u].shadeDispatch.y = 1u;
+                    indirect.bounceDispatches[b + 1u].shadeDispatch.z = 1u;
+                    indirect.bounceDispatches[b + 1u].shadeDispatch.pad = nextCount;
+
+                    dgcStream.bounceDGC[b + 1u].shadeCmd.pipelineIndex = 2u;
+                    dgcStream.bounceDGC[b + 1u].shadeCmd.x = intersectGroups;
+                    dgcStream.bounceDGC[b + 1u].shadeCmd.y = 1u;
+                    dgcStream.bounceDGC[b + 1u].shadeCmd.z = 1u;
+                }
+
+                queueCounters.totalIntersectWorkgroups = intersectGroups;
+                queueCounters.currentShadowCount = shadowCount;
+                queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+                queueCounters.nextActiveCount = 0u;
+                queueCounters.shadowRayCount = 0u;
+            }
         }
     }
 }

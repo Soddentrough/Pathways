@@ -124,6 +124,51 @@ bool parseVec3(std::string_view str, glm::vec3& outVec) {
     }
     return false;
 }
+
+void parseAccumulationOption(std::string_view val, Config& cfg) {
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
+    while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.remove_suffix(1);
+    if (val.empty()) return;
+
+    std::string s;
+    s.reserve(val.size());
+    for (char c : val) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (s == "0" || s == "off" || s == "none" || s == "false" || s == "no" || s == "disable" || s == "disabled") {
+        cfg.progressive_accumulation = false;
+        cfg.max_accum_frames = 0;
+    } else if (s == "unlimited" || s == "inf" || s == "infinity" || s == "infinite") {
+        cfg.progressive_accumulation = true;
+        cfg.max_accum_frames = 0;
+    } else if (s == "on" || s == "true" || s == "enable" || s == "enabled" || s == "yes" || s == "default") {
+        cfg.progressive_accumulation = true;
+        if (cfg.max_accum_frames == 0) {
+            cfg.max_accum_frames = 2048;
+        }
+    } else if (!s.empty() && s.front() == '-') {
+        Logger::warn("Invalid negative accumulation option '{}'. Expected positive integer, '0', 'off', or 'unlimited'.", val);
+    } else {
+        try {
+            unsigned long frames = std::stoul(s);
+            if (frames == 0) {
+                cfg.progressive_accumulation = false;
+                cfg.max_accum_frames = 0;
+            } else {
+                cfg.progressive_accumulation = true;
+                cfg.max_accum_frames = static_cast<uint32_t>(frames);
+            }
+        } catch (...) {
+            Logger::warn("Invalid accumulation option '{}'. Expected positive integer, '0', 'off', or 'unlimited'.", val);
+        }
+    }
+}
+
+bool isValueToken(const char* token) {
+    if (!token || token[0] == '\0') return false;
+    if (token[0] != '-') return true;
+    if (token[1] != '\0' && std::isdigit(static_cast<unsigned char>(token[1]))) return true;
+    return false;
+}
 } // namespace
 
 void Config::printUsage(const char* progName) {
@@ -143,7 +188,7 @@ void Config::printUsage(const char* progName) {
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
-              << "  --hdri <path>           Path to HDR/EXR environment map\n"
+              << "  --accumulation <int|off> Progressive static accumulation limit (default: 2048; 0 or 'off' to disable, 'unlimited' for continuous; alias: --accum)\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
               << "  --denoiser <mode>       Denoising mode: 'none' (Pure MC [default]), 'upways' (Wave32 WMMA)\n"
               << "  --upscaler <mode>       Upscaler mode: 'none' (1:1 native [default]), 'fsr3' (AMD FSR 3.1), 'upways' (Combined Denoiser/SR), 'fsr1' (Spatial EASU+RCAS)\n"
@@ -184,6 +229,7 @@ void Config::printUsage(const char* progName) {
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
               << "  --indirect-clamp <float> Maximum indirect / secondary bounce radiance luminance (default: 35.0, 0 = disabled)\n"
+              << "  --macro-tiles <count>   Number of macro-tiles to partition screen into for cache residency (e.g. 2, 4, 8, or 2x2; default: 0 = disabled / full screen)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
@@ -408,10 +454,32 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
-        } else if ((arg == "--macro-tile" || arg == "--macro-tile-size") && i + 1 < argc) {
-            cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
-            cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if ((arg == "--macro-tiles" || arg == "--macro-tile" || arg == "--macro-tile-count") && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t xPos = val.find('x');
+            if (xPos == std::string::npos) xPos = val.find('X');
+            if (xPos != std::string::npos) {
+                cfg.macro_tiles_x = static_cast<uint32_t>(std::stoul(val.substr(0, xPos)));
+                cfg.macro_tiles_y = static_cast<uint32_t>(std::stoul(val.substr(xPos + 1)));
+                cfg.macro_tiles = cfg.macro_tiles_x * cfg.macro_tiles_y;
+            } else {
+                cfg.macro_tiles = static_cast<uint32_t>(std::stoul(val));
+                cfg.macro_tiles_x = 0;
+                cfg.macro_tiles_y = 0;
+            }
+        } else if (arg.starts_with("--macro-tiles=") || arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-count=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            size_t xPos = val.find('x');
+            if (xPos == std::string::npos) xPos = val.find('X');
+            if (xPos != std::string::npos) {
+                cfg.macro_tiles_x = static_cast<uint32_t>(std::stoul(val.substr(0, xPos)));
+                cfg.macro_tiles_y = static_cast<uint32_t>(std::stoul(val.substr(xPos + 1)));
+                cfg.macro_tiles = cfg.macro_tiles_x * cfg.macro_tiles_y;
+            } else {
+                cfg.macro_tiles = static_cast<uint32_t>(std::stoul(val));
+                cfg.macro_tiles_x = 0;
+                cfg.macro_tiles_y = 0;
+            }
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "upways") {
@@ -804,11 +872,17 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-accumulation" || arg == "--realtime") {
             cfg.progressive_accumulation = false;
-        } else if ((arg == "--accum-cutoff" || arg == "--max-accum-frames" || arg == "--accum-limit") && i + 1 < argc) {
-            cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") || arg.starts_with("--accum-limit=")) {
+        } else if ((arg == "--accumulation" || arg == "--accum" || arg == "--accum-cutoff" ||
+                    arg == "--max-accum-frames" || arg == "--accum-limit") &&
+                   i + 1 < argc && isValueToken(argv[i + 1])) {
+            parseAccumulationOption(argv[++i], cfg);
+        } else if (arg == "--accumulation" || arg == "--accum") {
+            cfg.progressive_accumulation = true;
+        } else if (arg.starts_with("--accumulation=") || arg.starts_with("--accum=") ||
+                   arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") ||
+                   arg.starts_with("--accum-limit=")) {
             size_t eq = arg.find('=');
-            cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(arg.substr(eq + 1)));
+            parseAccumulationOption(arg.substr(eq + 1), cfg);
         } else if (arg == "--no-indirect" || arg == "--direct-only") {
             cfg.enable_indirect_light = false;
         } else if (arg == "--no-hdr") {

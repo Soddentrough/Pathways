@@ -256,6 +256,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--windowed` | *(flag)* | Launch in windowed mode (`--no-fullscreen`) | Fullscreen |
 | `--spp` | `<int>` | Samples per pixel accumulated per frame | `1` |
 | `--max-bounces` | `<int>` | Maximum path depth / ray bounces (or `--bounces`) | `4` |
+| `--accumulation`, `--accum` | `<int>` \| `off` \| `unlimited` | Set progressive static accumulation frame limit (0 or `off` to disable accumulation, `unlimited` for continuous) | `2048` |
 | `--no-accumulation` | *(flag)* | Disable progressive static accumulation (evaluate real-time noise; `--realtime`) | Accumulation on |
 | `--indirect-clamp` | `<float>` | Secondary bounce radiance luminance clamp to eliminate fireflies (0 = disabled) | `35.0` |
 | `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `dual` |

@@ -104,7 +104,95 @@ int main() {
         Config cFps1 = Config::parse(3, const_cast<char**>(argvFps1));
         assert_near(cFps1.target_frame_time_ms, 16.6667f, 0.01f, "--target-fps auto-derives frame budget");
 
-        std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, and frame budget successfully verified." << std::endl;
+        // Progressive accumulation defaults
+        check_true(cfgDef.progressive_accumulation == true, "Default progressive accumulation is enabled");
+        check_true(cfgDef.max_accum_frames == 2048, "Default max_accum_frames is 2048");
+
+        // Setting accumulation limit via --accumulation and --accum
+        const char* argvAccum1[] = { "pathways", "--accumulation", "512" };
+        Config cAccum1 = Config::parse(3, const_cast<char**>(argvAccum1));
+        check_true(cAccum1.progressive_accumulation == true, "--accumulation 512 enables accumulation");
+        check_true(cAccum1.max_accum_frames == 512, "--accumulation 512 sets max_accum_frames to 512");
+
+        const char* argvAccum2[] = { "pathways", "--accumulation=1024" };
+        Config cAccum2 = Config::parse(2, const_cast<char**>(argvAccum2));
+        check_true(cAccum2.progressive_accumulation == true, "--accumulation=1024 enables accumulation");
+        check_true(cAccum2.max_accum_frames == 1024, "--accumulation=1024 sets max_accum_frames to 1024");
+
+        const char* argvAccum3[] = { "pathways", "--accum", "256" };
+        Config cAccum3 = Config::parse(3, const_cast<char**>(argvAccum3));
+        check_true(cAccum3.progressive_accumulation == true, "--accum 256 enables accumulation");
+        check_true(cAccum3.max_accum_frames == 256, "--accum 256 sets max_accum_frames to 256");
+
+        const char* argvAccum4[] = { "pathways", "--accum=128" };
+        Config cAccum4 = Config::parse(2, const_cast<char**>(argvAccum4));
+        check_true(cAccum4.progressive_accumulation == true, "--accum=128 enables accumulation");
+        check_true(cAccum4.max_accum_frames == 128, "--accum=128 sets max_accum_frames to 128");
+
+        // Turning accumulation off (0, off, none, false)
+        const char* argvAccumOff1[] = { "pathways", "--accumulation", "0" };
+        Config cAccumOff1 = Config::parse(3, const_cast<char**>(argvAccumOff1));
+        check_true(!cAccumOff1.progressive_accumulation, "--accumulation 0 disables accumulation");
+
+        const char* argvAccumOff2[] = { "pathways", "--accumulation=0" };
+        Config cAccumOff2 = Config::parse(2, const_cast<char**>(argvAccumOff2));
+        check_true(!cAccumOff2.progressive_accumulation, "--accumulation=0 disables accumulation");
+
+        const char* argvAccumOff3[] = { "pathways", "--accumulation", "off" };
+        Config cAccumOff3 = Config::parse(3, const_cast<char**>(argvAccumOff3));
+        check_true(!cAccumOff3.progressive_accumulation, "--accumulation off disables accumulation");
+
+        const char* argvAccumOff4[] = { "pathways", "--accumulation=off" };
+        Config cAccumOff4 = Config::parse(2, const_cast<char**>(argvAccumOff4));
+        check_true(!cAccumOff4.progressive_accumulation, "--accumulation=off disables accumulation");
+
+        const char* argvAccumOff5[] = { "pathways", "--accumulation", "none" };
+        Config cAccumOff5 = Config::parse(3, const_cast<char**>(argvAccumOff5));
+        check_true(!cAccumOff5.progressive_accumulation, "--accumulation none disables accumulation");
+
+        const char* argvAccumOff6[] = { "pathways", "--accumulation", "false" };
+        Config cAccumOff6 = Config::parse(3, const_cast<char**>(argvAccumOff6));
+        check_true(!cAccumOff6.progressive_accumulation, "--accumulation false disables accumulation");
+
+        const char* argvAccumOff7[] = { "pathways", "--accum", "0" };
+        Config cAccumOff7 = Config::parse(3, const_cast<char**>(argvAccumOff7));
+        check_true(!cAccumOff7.progressive_accumulation, "--accum 0 disables accumulation");
+
+        const char* argvAccumOff8[] = { "pathways", "--accum", "off" };
+        Config cAccumOff8 = Config::parse(3, const_cast<char**>(argvAccumOff8));
+        check_true(!cAccumOff8.progressive_accumulation, "--accum off disables accumulation");
+
+        const char* argvAccumOff9[] = { "pathways", "--accum=off" };
+        Config cAccumOff9 = Config::parse(2, const_cast<char**>(argvAccumOff9));
+        check_true(!cAccumOff9.progressive_accumulation, "--accum=off disables accumulation");
+
+        const char* argvAccumOff10[] = { "pathways", "--no-accumulation" };
+        Config cAccumOff10 = Config::parse(2, const_cast<char**>(argvAccumOff10));
+        check_true(!cAccumOff10.progressive_accumulation, "--no-accumulation disables accumulation");
+
+        const char* argvAccumOff11[] = { "pathways", "--realtime" };
+        Config cAccumOff11 = Config::parse(2, const_cast<char**>(argvAccumOff11));
+        check_true(!cAccumOff11.progressive_accumulation, "--realtime disables accumulation");
+
+        // Unlimited accumulation
+        const char* argvAccumUnlim1[] = { "pathways", "--accumulation", "unlimited" };
+        Config cAccumUnlim1 = Config::parse(3, const_cast<char**>(argvAccumUnlim1));
+        check_true(cAccumUnlim1.progressive_accumulation == true, "--accumulation unlimited enables accumulation");
+        check_true(cAccumUnlim1.max_accum_frames == 0, "--accumulation unlimited sets max_accum_frames to 0 (unlimited)");
+
+        const char* argvAccumUnlim2[] = { "pathways", "--accum=inf" };
+        Config cAccumUnlim2 = Config::parse(2, const_cast<char**>(argvAccumUnlim2));
+        check_true(cAccumUnlim2.progressive_accumulation == true, "--accum=inf enables accumulation");
+        check_true(cAccumUnlim2.max_accum_frames == 0, "--accum=inf sets max_accum_frames to 0 (unlimited)");
+
+        // Combined: SPP + bounces + accumulation off
+        const char* argvCombo[] = { "pathways", "--spp", "4", "--bounces", "2", "--accumulation", "off" };
+        Config cCombo = Config::parse(7, const_cast<char**>(argvCombo));
+        check_true(cCombo.spp == 4, "--spp 4 parsed in combination");
+        check_true(cCombo.max_bounces == 2, "--bounces 2 parsed in combination");
+        check_true(!cCombo.progressive_accumulation, "--accumulation off parsed in combination");
+
+        std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, frame budget, and accumulation successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

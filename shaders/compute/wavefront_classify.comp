@@ -580,9 +580,12 @@ void main() {
                 queueCounters.totalShadeWorkgroups = totalShadeWgs;
                 queueCounters.activeMaterialSequenceCount = (totalShadeWgs > 0u) ? 6u : 0u;
 
-                if (totalShadeWgs == 0u) {
+                bool isFirstTile = (pc.tileSizeX == 0u && pc.tileSizeY == 0u) || (pc.tileOffsetX == 0u && pc.tileOffsetY == 0u);
+                if (totalShadeWgs == 0u && isFirstTile) {
                     indirect.commands[6].x = 0u;
                     indirect.commands[7].x = 0u;
+                }
+                if (totalShadeWgs == 0u) {
                     for (uint c = 0u; c < 6u; ++c) {
                         dgcStream.commands[c].x = 0u;
                     }
@@ -601,9 +604,12 @@ void main() {
                 dgcStream.commands[0].z = 1u;
             }
 
-            queueCounters.currentShadowCount = 0u;
-            queueCounters.nextActiveCount = 0u;
-            queueCounters.shadowRayCount = 0u;
+            bool isFirstTile = (pc.tileSizeX == 0u && pc.tileSizeY == 0u) || (pc.tileOffsetX == 0u && pc.tileOffsetY == 0u);
+            if (isFirstTile) {
+                queueCounters.currentShadowCount = 0u;
+                queueCounters.nextActiveCount = 0u;
+                queueCounters.shadowRayCount = 0u;
+            }
             queueCounters.retiredWorkgroups = 0u;
         }
     }
