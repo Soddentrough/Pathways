@@ -309,12 +309,18 @@ void main() {
                 vec3 localNormal = getTriangleNormal(tri, closestBary);
                 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
                 hitUv = getTriangleUV(tri, closestBary);
-                vec3 tanDir = getTriangleTangent(tri, closestBary);
-                tanDir = normalize(mat3(hitO2w) * tanDir);
-                float tanSign = getTriangleTangentSign(tri);
+                matId = tri.materialId + hitInstMatOffset;
+                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
+
+                vec3 tanDir = vec3(1.0, 0.0, 0.0);
+                float tanSign = 1.0;
+                if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
+                    tanDir = getTriangleTangent(tri, closestBary);
+                    tanDir = normalize(mat3(hitO2w) * tanDir);
+                    tanSign = getTriangleTangentSign(tri);
+                }
 
                 hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign);
-                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
             } else {
                 hitNormal = closestSphereNorm;
                 matId = spheres[closestSphere].materialId;
