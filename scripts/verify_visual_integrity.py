@@ -178,6 +178,18 @@ def verify_cornell_semantic_materials(img):
     back_mean = max(float(np.mean(back_bgr)), 1.0)
     back_chroma = float(max(abs(back_bgr[2] - back_bgr[1]), abs(back_bgr[1] - back_bgr[0]), abs(back_bgr[2] - back_bgr[0])) / back_mean)
 
+    # Conductor / Metallic mirror sphere in foreground: x in [0.55*w, 0.65*w], y in [0.70*h, 0.85*h]
+    metal_sphere = img[int(0.70*h):int(0.85*h), int(0.55*w):int(0.65*w)].astype(float)
+    metal_bgr = np.mean(metal_sphere, axis=(0, 1))
+    metal_lum = float(0.2126 * metal_bgr[2] + 0.7152 * metal_bgr[1] + 0.0722 * metal_bgr[0])
+    metal_black_pct = float(np.mean(np.mean(metal_sphere, axis=2) < 5.0) * 100.0)
+
+    # Dielectric / Glass sphere on left: x in [0.30*w, 0.42*w], y in [0.50*h, 0.65*h]
+    glass_sphere = img[int(0.50*h):int(0.65*h), int(0.30*w):int(0.42*w)].astype(float)
+    glass_bgr = np.mean(glass_sphere, axis=(0, 1))
+    glass_lum = float(0.2126 * glass_bgr[2] + 0.7152 * glass_bgr[1] + 0.0722 * glass_bgr[0])
+    glass_black_pct = float(np.mean(np.mean(glass_sphere, axis=2) < 5.0) * 100.0)
+
     errors = []
     if left_red_ratio < 1.20:
         errors.append(f"Left wall missing red material (ratio {left_red_ratio:.2f} < 1.20, R={left_bgr[2]:.1f}, G={left_bgr[1]:.1f}, B={left_bgr[0]:.1f})")
@@ -187,6 +199,10 @@ def verify_cornell_semantic_materials(img):
         errors.append(f"Ceiling light missing emission (luminance {light_lum:.1f} < 180.0)")
     if back_chroma > 0.25:
         errors.append(f"Back wall chromatic distortion (delta {back_chroma:.3f} > 0.25)")
+    if metal_lum < 100.0 or metal_black_pct > 1.0:
+        errors.append(f"Metallic mirror sphere missing reflection / pitch black collapse (lum {metal_lum:.1f} < 100.0, black_pct {metal_black_pct:.1f}% > 1.0%)")
+    if glass_lum < 120.0 or glass_black_pct > 1.0:
+        errors.append(f"Glass sphere missing transmission / black collapse (lum {glass_lum:.1f} < 120.0, black_pct {glass_black_pct:.1f}% > 1.0%)")
 
     return {
         "valid": len(errors) == 0,
@@ -194,7 +210,11 @@ def verify_cornell_semantic_materials(img):
         "left_red_ratio": left_red_ratio,
         "right_green_ratio": right_green_ratio,
         "light_lum": light_lum,
-        "back_chroma": back_chroma
+        "back_chroma": back_chroma,
+        "metal_lum": metal_lum,
+        "metal_black_pct": metal_black_pct,
+        "glass_lum": glass_lum,
+        "glass_black_pct": glass_black_pct
     }
 
 def test_single_gpu_accumulation_stability():
@@ -266,7 +286,7 @@ def test_single_gpu_accumulation_stability():
     result.record("right_green_ratio", mat_check["right_green_ratio"])
     result.record("light_lum", mat_check["light_lum"])
     result.record("white_wall_chroma_delta", mat_check["back_chroma"])
-    print(f"  Semantic Materials: LeftRed={mat_check['left_red_ratio']:.2f}, RightGreen={mat_check['right_green_ratio']:.2f}, LightLum={mat_check['light_lum']:.1f}, WallChroma={mat_check['back_chroma']:.3f}")
+    print(f"  Semantic Materials: LeftRed={mat_check['left_red_ratio']:.2f}, RightGreen={mat_check['right_green_ratio']:.2f}, LightLum={mat_check['light_lum']:.1f}, WallChroma={mat_check['back_chroma']:.3f}, MetalLum={mat_check['metal_lum']:.1f}, GlassLum={mat_check['glass_lum']:.1f}")
     if not mat_check["valid"]:
         for err in mat_check["errors"]:
             result.fail(err)
@@ -288,8 +308,8 @@ def test_single_gpu_accumulation_stability():
         print(f"  Channel Correlations: R={comp['corrs']['R']:.4f}, G={comp['corrs']['G']:.4f}, B={comp['corrs']['B']:.4f}, CrossBR={comp['corrs']['cross_BR']:.4f}")
 
         # Check macro structural similarity (catches missing/broken meshes and gross errors)
-        if comp["low_ssim"] < 0.85:
-            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.85")
+        if comp["low_ssim"] < 0.90:
+            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.90")
 
         # Check color channel polarity and swap detection (e.g. Vulkan BGR vs RGB bug)
         if comp["corrs"]["R"] < 0.70 or comp["corrs"]["G"] < 0.70 or comp["corrs"]["B"] < 0.70:

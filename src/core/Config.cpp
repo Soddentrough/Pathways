@@ -159,7 +159,7 @@ void Config::printUsage(const char* progName) {
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
               << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
-              << "  --restir-pt, --restir-di Enable ReSTIR PT Enhanced (Unified Path Reservoir Resampling) [default: disabled]\n"
+              << "  --restir                Enable ReSTIR spatio-temporal reservoir resampling [default: disabled]\n"
               << "  --restir-m-cap <int>    Temporal history M-cap for ReSTIR (default: 30)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"

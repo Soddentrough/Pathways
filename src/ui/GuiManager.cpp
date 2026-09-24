@@ -1494,13 +1494,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("ReSTIR Path Resampling (gfx1201 Ultra-Lean):");
-            if (ImGui::Checkbox("Enable ReSTIR PT", &config.enable_restir_di)) {
+            ImGui::TextDisabled("ReSTIR Resampling (Unified 16B Reservoirs):");
+            if (ImGui::Checkbox("Enable ReSTIR", &config.enable_restir_di)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatio-temporal path reservoir resampling (ReSTIR PT) with unified reservoirs and multi-scale spatial reuse. Opt-in via --restir-pt.");
+                ImGui::SetTooltip("Spatio-temporal reservoir resampling (ReSTIR) with unified 16B reservoirs and multi-scale spatial reuse. Opt-in via --restir.");
             }
             if (config.enable_restir_di) {
                 ImGui::Indent();

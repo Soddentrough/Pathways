@@ -548,8 +548,9 @@ void main() {
             if (!pathTerminated) {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
                     pathTerminated = true;
-                vec3 H;
-                if (pc.secondarySortMode >= 2u) {
+                } else {
+                    vec3 H;
+                    if (pc.secondarySortMode >= 2u) {
                     uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
                     uint frameRot = pc.frameIndex + pc.currentBounce * 3u;
                     H = isAniso ? sampleAnisotropicGGXCoherent(hitNormal, T, B, ax, ay, seed, clusterK, frameRot)
