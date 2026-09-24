@@ -179,7 +179,9 @@ void main() {
         uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
         ivec2 localCoord;
         if (pc.useMorton != 0u) {
-            localCoord = getPixelCoordsMorton8x4(linearIdx, pc.tileSizeX, pc.tileSizeY);
+            uint tilePixels = pc.tileSizeX * pc.tileSizeY;
+            uint pixelIdx = (tilePixels > 0u) ? (linearIdx % tilePixels) : linearIdx;
+            localCoord = getPixelCoordsMorton8x4(pixelIdx, pc.tileSizeX, pc.tileSizeY);
         } else {
             localCoord = globalID;
         }
@@ -191,7 +193,9 @@ void main() {
     } else {
         uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
         if (pc.useMorton != 0u) {
-            pixelCoord = getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height);
+            uint totalPixels = pc.width * pc.height;
+            uint pixelIdx = (totalPixels > 0u) ? (linearIdx % totalPixels) : linearIdx;
+            pixelCoord = getPixelCoordsMorton8x4(pixelIdx, pc.width, pc.height);
         } else {
             pixelCoord = globalID;
         }

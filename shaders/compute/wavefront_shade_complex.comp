@@ -785,7 +785,7 @@ void main() {
 
             // Ambient Skylight Irradiance:
             // When an environment map is present, illuminate open-air diffuse surfaces with ambient daylight.
-            if (!pathTerminated && enableDirect && pc.hasEnvMap == 1u) {
+            if (bounce == 0u && !pathTerminated && enableDirect && pc.hasEnvMap == 1u) {
                 float upFactor = clamp(hitNormal.y * 0.5 + 0.5, 0.0, 1.0);
                 float zenithFactor = clamp(hitNormal.y, 0.0, 1.0);
                 vec3 skyZenith = vec3(0.08, 0.18, 0.45);
@@ -794,7 +794,7 @@ void main() {
                 vec3 upperSky = mix(skyHorizon, skyZenith, pow(zenithFactor, 0.6));
                 vec3 skyHemisphere = mix(groundReflect, upperSky, upFactor) * pc.envMapIntensity;
 
-                vec3 ambientRad = vec3(diffuseColor) * skyHemisphere * 0.22;
+                vec3 ambientRad = vec3(throughput) * (vec3(diffuseColor) * skyHemisphere * 0.22);
 
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);

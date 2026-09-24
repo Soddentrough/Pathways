@@ -1809,6 +1809,53 @@ VkShaderModule Engine::createShaderModule(const std::vector<char>& code) {
     return shaderModule;
 }
 
+uint32_t Engine::getTargetBatchPixels() const {
+    if (m_config.batch_pixels > 0) {
+        return m_config.batch_pixels;
+    }
+    if (m_config.batch_count > 0) {
+        uint32_t totalPixels = m_config.width * m_config.height;
+        return (totalPixels + m_config.batch_count - 1) / m_config.batch_count;
+    }
+
+    // Programmatic hardware profile detection
+    VkPhysicalDeviceType devType = m_context->getDeviceProperties().deviceType;
+    if (devType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        // Profile A: UMA / APU (e.g. AMD Strix Halo, Phoenix)
+        return 1000000u; // 1.0M pixels (~164 MB queue set)
+    }
+
+    // Query device-local VRAM budget
+    VkDeviceSize totalDeviceVram = 0;
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(m_context->getPhysicalDevice(), &memProps);
+    for (uint32_t i = 0; i < memProps.memoryHeapCount; ++i) {
+        if (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            totalDeviceVram += memProps.memoryHeaps[i].size;
+        }
+    }
+
+    if (totalDeviceVram <= 8ULL * 1024 * 1024 * 1024) {
+        // Profile B: Mid dGPU (<= 8GB VRAM)
+        return 1500000u; // 1.5M pixels (~246 MB queue set)
+    }
+
+    // Profile C: Pro / Enthusiast dGPU (> 8GB VRAM, e.g. Dual Radeon AI PRO R9700)
+    return 2000000u; // 2.0M pixels (~330 MB queue set)
+}
+
+uint32_t Engine::getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const {
+    if (m_config.batch_count > 0) {
+        return m_config.batch_count;
+    }
+    uint32_t totalPixels = renderW * renderH;
+    uint32_t targetBatch = getTargetBatchPixels();
+    if (targetBatch == 0 || totalPixels <= targetBatch) {
+        return 1u; // Monolithic short-circuit (e.g. 1080p)
+    }
+    return (totalPixels + targetBatch - 1) / targetBatch;
+}
+
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
@@ -1959,6 +2006,11 @@ void Engine::initPipelines() {
     auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
 
+    uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
+    uint32_t initBatchPixels = (m_config.width * m_config.height + initBatchCount - 1) / initBatchCount;
+    m_currentBatchCount = initBatchCount;
+    m_currentBatchPixels = initBatchPixels;
+
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         device, allocator,
         m_config.width, m_config.height,
@@ -1968,7 +2020,8 @@ void Engine::initPipelines() {
         m_context->hasDgcExecutionSet(),
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
         true, // enableDgcPreprocess
-        m_context->hasSubgroupSizeControl()
+        m_context->hasSubgroupSizeControl(),
+        initBatchPixels
     );
     Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 
@@ -4827,8 +4880,17 @@ void Engine::renderFrame() {
             wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
-            wfSceneData.inlineShadows = m_config.inline_primary_shadows;
+            uint32_t activeBatchCount = getEffectiveBatchCount(renderW, renderH);
+            uint32_t activeBatchPixels = (renderW * renderH + activeBatchCount - 1) / activeBatchCount;
+            if (activeBatchCount != m_currentBatchCount || activeBatchPixels != m_currentBatchPixels) {
+                m_currentBatchCount = activeBatchCount;
+                m_currentBatchPixels = activeBatchPixels;
+                m_wavefrontPipeline->resize(renderW, renderH, activeBatchPixels);
+            }
+
             wfSceneData.macroTileSize = m_config.macro_tile_size;
+            wfSceneData.batchCount = activeBatchCount;
+            wfSceneData.batchPixels = activeBatchPixels;
             wfSceneData.fullWidth = renderW;
             wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
                                         m_config.upscaler_mode == UpscalerMode::Upways ||
@@ -6761,7 +6823,11 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
 
     if (m_wavefrontPipeline) {
-        m_wavefrontPipeline->resize(m_config.width, m_config.height);
+        uint32_t batchCount = getEffectiveBatchCount(m_config.width, m_config.height);
+        uint32_t batchPixels = (m_config.width * m_config.height + batchCount - 1) / batchCount;
+        m_currentBatchCount = batchCount;
+        m_currentBatchPixels = batchPixels;
+        m_wavefrontPipeline->resize(m_config.width, m_config.height, batchPixels);
     }
 
     updateAllImageDescriptors();

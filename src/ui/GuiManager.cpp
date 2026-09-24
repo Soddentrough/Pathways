@@ -1206,6 +1206,43 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             } else {
                 ImGui::TextDisabled("  -> Unclamped indirect radiance (Pure Monte Carlo)");
             }
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Coarse Batch Partitioning:");
+            const char* batchModes[] = {
+                "Auto (Device Adaptive)",
+                "Monolithic (1 Batch - Full Screen)",
+                "2 Batches",
+                "4 Batches (Target ~2M Rays)",
+                "8 Batches (Target ~1M Rays - Strix Halo/APU)",
+                "16 Batches (Target 8K / Ultra High-Res)"
+            };
+            int currentBatchMode = 0;
+            if (config.batch_count == 0) currentBatchMode = 0;
+            else if (config.batch_count == 1) currentBatchMode = 1;
+            else if (config.batch_count == 2) currentBatchMode = 2;
+            else if (config.batch_count == 4) currentBatchMode = 3;
+            else if (config.batch_count == 8) currentBatchMode = 4;
+            else if (config.batch_count == 16) currentBatchMode = 5;
+            else currentBatchMode = 0;
+
+            if (ImGui::Combo("Batching Mode##WfBatch", &currentBatchMode, batchModes, IM_ARRAYSIZE(batchModes))) {
+                if (currentBatchMode == 0) config.batch_count = 0;
+                else if (currentBatchMode == 1) config.batch_count = 1;
+                else if (currentBatchMode == 2) config.batch_count = 2;
+                else if (currentBatchMode == 3) config.batch_count = 4;
+                else if (currentBatchMode == 4) config.batch_count = 8;
+                else if (currentBatchMode == 5) config.batch_count = 16;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+
+            if (config.batch_count == 0) {
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Adaptive: Programmatically sized based on GPU VRAM, CUs & cache profile");
+            } else if (config.batch_count == 1) {
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "  -> Monolithic: 1 batch (full-frame queues, max occupancy on small resolutions)");
+            } else {
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Partitioned: %u coarse batches (bounded queue VRAM footprint)", config.batch_count);
+            }
 
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Acceleration Structure Telemetry:");

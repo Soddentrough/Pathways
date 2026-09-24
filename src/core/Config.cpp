@@ -186,6 +186,9 @@ void Config::printUsage(const char* progName) {
               << "  --indirect-clamp <float> Maximum indirect / secondary bounce radiance luminance (default: 35.0, 0 = disabled)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
+              << "  --batches <int|auto>    Number of coarse batches (default: auto, 1 = monolithic)\n"
+              << "  --batch-size <int|auto> Coarse batch pixel budget (e.g. 1000000, 2000000; default: auto)\n"
+              << "  --batch-pixels <int>    Alias for --batch-size\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
               << "  --adaptive-speed        Enable distance-adaptive camera speed (smooth approach) [default: enabled]\n"
@@ -412,6 +415,34 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+        } else if (arg == "--batches" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto") {
+                cfg.batch_count = 0;
+            } else {
+                cfg.batch_count = static_cast<uint32_t>(std::stoul(val));
+            }
+        } else if (arg.starts_with("--batches=")) {
+            std::string val = arg.substr(10);
+            if (val == "auto") {
+                cfg.batch_count = 0;
+            } else {
+                cfg.batch_count = static_cast<uint32_t>(std::stoul(val));
+            }
+        } else if ((arg == "--batch-size" || arg == "--batch-pixels") && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto") {
+                cfg.batch_pixels = 0;
+            } else {
+                cfg.batch_pixels = static_cast<uint32_t>(std::stoul(val));
+            }
+        } else if (arg.starts_with("--batch-size=") || arg.starts_with("--batch-pixels=")) {
+            std::string val = arg.substr(arg.find('=') + 1);
+            if (val == "auto") {
+                cfg.batch_pixels = 0;
+            } else {
+                cfg.batch_pixels = static_cast<uint32_t>(std::stoul(val));
+            }
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "upways") {

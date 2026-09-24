@@ -59,7 +59,9 @@ struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
     bool use_morton = false; // 2D Morton Z-curve mapping for wavefront classification (default: false / linear raster)
-    uint32_t macro_tile_size = 0; // Macro-tile cache panning size (0 = disabled / full screen, 256 = 256x256 L2 pinned)
+    uint32_t macro_tile_size = 0; // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
+    uint32_t batch_count = 0;    // Coarse batch count (0 = auto-detect based on GPU profile, 1 = monolithic, 2, 4, 8, etc.)
+    uint32_t batch_pixels = 0;   // Coarse batch ray budget in pixels (0 = auto-detect based on GPU profile)
     SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default]
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]

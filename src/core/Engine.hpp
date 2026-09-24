@@ -160,6 +160,10 @@ private:
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
     std::unique_ptr<NRCManager> m_nrcManager;
     WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
+    uint32_t m_currentBatchCount = 0;
+    uint32_t m_currentBatchPixels = 0;
+    uint32_t getTargetBatchPixels() const;
+    uint32_t getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const;
 
     // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
     VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;

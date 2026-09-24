@@ -14,6 +14,37 @@ namespace pathways {
 
 class Image;
 
+struct QueueCountersBuffer {
+    uint32_t activeRayCount;
+    uint32_t nextActiveCount;
+    uint32_t totalProcessed;
+    uint32_t shadowRayCount;
+    uint32_t retiredWorkgroups;
+    uint32_t currentShadowCount;
+    uint32_t diffuseCount;
+    uint32_t dielectricCount;
+    uint32_t conductorCount;
+    uint32_t complexCount;
+    uint32_t emissiveCount;
+    uint32_t alphamaskCount;
+    uint32_t nextDiffuseCount;
+    uint32_t nextDielectricCount;
+    uint32_t nextConductorCount;
+    uint32_t nextComplexCount;
+    uint32_t nextEmissiveCount;
+    uint32_t nextAlphamaskCount;
+    uint32_t currentMaterialCounts[6];
+    uint32_t totalShadeWorkgroups;
+    uint32_t octantCounts[8];
+    uint32_t currentOctantCounts[8];
+    uint32_t totalIntersectWorkgroups;
+    uint32_t secondaryRayCount;
+    uint32_t activeMaterialSequenceCount;
+    uint32_t pad[20];
+};
+static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
+static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
+
 struct WavefrontSceneData {
     uint32_t numTriangles = 0;
     uint32_t numSpheres = 0;
@@ -44,7 +75,9 @@ struct WavefrontSceneData {
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
     float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
     bool inlineShadows = true;            // Inline shadow rays via hardware ray queries (bypasses separate shadow microkernel)
-    uint32_t macroTileSize = 0;           // Macro-tile cache panning (0 = disabled / full frame, 256 = 256x256 L2 pinned)
+    uint32_t macroTileSize = 0;           // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
+    uint32_t batchCount = 0;              // Coarse batch count (0 = auto-detect, 1 = monolithic, 2, 4, 8...)
+    uint32_t batchPixels = 0;             // Coarse batch ray budget in pixels (0 = auto-detect)
 };
 
 class WavefrontPipeline {
@@ -68,7 +101,8 @@ public:
                       const std::vector<char>& shadeDiffuseSecCode = {},
                       const std::vector<char>& shadeComplexSecCode = {},
                       bool enableDgcPreprocess = true,
-                      bool supportsSubgroupSizeControl = true);
+                      bool supportsSubgroupSizeControl = true,
+                      uint32_t maxBatchPixels = 0);
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -104,7 +138,7 @@ public:
                                 VkBuffer shadeMaterialBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize shadeMaterialSize = 0);
 
-    void resize(uint32_t width, uint32_t height);
+    void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
 
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,
@@ -180,6 +214,7 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_maxCapacity = 0;
+    uint32_t m_maxBatchPixels = 0;
     uint32_t m_sortMode = 0;
     uint32_t m_secondarySortMode = 0;
     bool m_supportsExecutionSet = false;
