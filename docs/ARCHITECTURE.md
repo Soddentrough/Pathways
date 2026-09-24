@@ -67,9 +67,10 @@ Pathways decomposes light transport into decoupled, specialized compute microker
    - Retrieves triangle shading attributes from the 128-byte cache-line aligned `TriangleShadeGPU` buffer (binding 2).
    - Conditionally evaluates tangent frames and object-to-world transforms exclusively for `COMPLEX`, `CONDUCTOR`, and `DIELECTRIC` archetypes, skipping tangent attribute loads and matrix math for diffuse and emissive surfaces.
 3. **GPU-Autonomous Command Synthesis**:
-   - The classifier kernel synthesizes indirect dispatch commands directly into a device command buffer.
-   - Updates `VkIndirectExecutionSetEXT` pipeline tokens on the device with zero CPU intervention.
-4. **Autonomous Microkernel Execution (`vkCmdExecuteGeneratedCommandsEXT`)**:
+   - The classifier kernel synthesizes indirect dispatch commands directly into device command/indirect argument buffers on the GPU.
+   - **Production Baseline (Default)**: Writes 6 `VkDispatchIndirectCommand` records into device memory (`m_indirectArgs`), executed via GPU indirect dispatches (`vkCmdDispatchIndirect`). Empty queues have `groupCountX = 0` and are skipped on the GPU with zero wave launches and zero CPU synchronization.
+   - **Experimental Execution Sets (`--dgc-execset`)**: Synthesizes 2-token indirect sequences (`VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT` + `DISPATCH_EXT`) into `VkIndirectExecutionSetEXT` for single-call execution via `vkCmdExecuteGeneratedCommandsEXT`. Currently experimental and disabled by default due to driver limitations (e.g. Mesa RADV) where compute indirect execution sets do not dynamically switch pipelines.
+4. **Autonomous Microkernel Execution**:
    - Dispatches only the exact wave counts needed for each material queue.
    - High-frequency diffuse and primary shading kernels query the compact 64-byte `ShadeMaterialGPU` buffer (binding 35), fetching packed albedo, emissive/specular, PBR parameters, and texture flags at 2 materials per 128B vector cache line.
    - Secondary diffuse shading (`#if !IS_SECONDARY_BOUNCE`) bypasses normal map texture sampling and TBN perturbation, preserving vector registers and memory bandwidth for indirect diffuse GI.
@@ -82,6 +83,19 @@ Pathways decomposes light transport into decoupled, specialized compute microker
    - Evaluates direct lighting visibility using binary inline ray queries (`rayQueryConfirmIntersectionEXT`), bypassing hit shader overhead.
 6. **Accumulation Resolve (`shaders/compute/accum_running_avg.comp`)**:
    - Numerically stable progressive HDR accumulation using online Welford updates, preventing highlight blowout and floating-point accumulation drift.
+
+### 2.2 Coarse-Batch Wavefront Partitioning & 2D Macro-Tile Decomposition ($O(1)$ Memory Scaling)
+Staging all ray queues simultaneously across a native 4K UHD viewport ($3840 \times 2160 = 8.29\text{M pixels}$) consumes approximately **2,721 MB of VRAM** for double-buffered ray and state queues. On unified memory architectures (APUs/UMA) where CPU and GPU share memory bandwidth, cycling this volume of memory each frame induces severe memory unit stalls (>60%).
+
+Pathways solves this with **GPU-Autonomous Coarse-Batch Wavefront Partitioning**:
+1. **Target Batch Pixel Budget**: Ray queues are sized strictly for an on-chip pixel budget ($2.0\text{M pixels}$ on APU/UMA platforms, $1.0\text{M pixels}$ on discrete GPUs) via `getTargetBatchPixels()`.
+2. **2D Aspect-Ratio Grid Decomposition**: Rather than 1D horizontal strips (which sever vertical spatial neighbors and cause up to a 35% cache-locality regression on textured assets), the viewport is partitioned into a 2D tile grid ($2 \times 1, 2 \times 2, 4 \times 2, 3 \times 3$) matching screen aspect ratio:
+   $$\text{TileWidth} = \left\lceil \frac{W}{G_x} \right\rceil, \quad \text{TileHeight} = \left\lceil \frac{H}{G_y} \right\rceil$$
+   This preserves 2D spatial texture and BVH cache locality across both primary and secondary rays.
+3. **Adaptive Secondary Ray CU Occupancy Capping**: In multi-bounce diffuse GI scenes (`max_bounces > 2`), dividing the screen into too many batches causes Compute Unit starvation on Bounces 2–3 due to diminishing active ray counts. Pathways dynamically caps auto-batches to $\le 4$, ensuring sufficient ray volume to saturate all SIMD execution units while keeping queue memory locked at **~699 MB at 4K (-74.3% reduction)**.
+4. **True $O(1)$ Memory Scaling**: Rendering at 8K ($7680 \times 4320$) simply schedules a $4 \times 4$ macro-tile grid without expanding ray queue memory beyond the configured batch budget.
+
+Configurable via `--macro-tiles <count>` (or `--batches <count>`). For empirical SPM cache analysis, see [docs/reports/wavefront_batching_head_to_head.md](reports/wavefront_batching_head_to_head.md).
 
 ---
 
@@ -157,9 +171,27 @@ Pathways provides two super-resolution options:
 - Processes jittered low-resolution color, inverted depth, and motion vectors through Lanczos accumulation and Robust Contrast Adaptive Sharpening (RCAS).
 - Multi-GPU checkerboard tile reprojection ensures jitter-free temporal stability across alternating GPU frames.
 
-### 5.2 Pathways Upways ML Neural Reconstruction
-- Native in-engine neural reconstruction driven by `VK_KHR_cooperative_matrix` Wave32 Wave Matrix Multiply Accumulate (WMMA) instructions on RDNA 4 (`gfx1201`).
-- Evaluates INT8/FP16 quantized recurrent convolutional autoencoders directly on device tensor cores, reconstructing 4K HDR images from 1 SPP inputs.
+### 5.2 Pathways Upways Neural Reconstruction & Continuous Super-Resolution (Wave32 WMMA)
+Pathways integrates a native in-engine neural reconstructor and continuous super-resolution pipeline (`src/rt/UpwaysPipeline.cpp`, `shaders/compute/upways_reconstruct.comp`) accelerated directly on hardware tensor cores via Vulkan `VK_KHR_cooperative_matrix`:
+- **Wave32 WMMA Tensor Architecture**:
+  - Targets AMD RDNA hardware matrix instructions (`v_wmma_f32_16x16x16_f16`) with native subgroup size 32.
+  - Features a 4-layer fully connected topology: `FC1` ($32 \to 64$), `FC2` ($64 \to 64$), `FC3` ($64 \to 64$), and `FC4` ($64 \to 16$).
+  - **Zero VRAM Traffic for Inference**: All intermediate activations (`s_acc`, `s_fc1_out`, `s_fc2_out`, `s_fc3_out`, `s_fc4_out`) execute entirely within Local Data Share (LDS) shared memory across 16-pixel workgroups, completely eliminating memory bus bandwidth overhead during inference.
+- **Physical Demodulation & Invertible Logarithmic Compression**:
+  - Compresses input radiance ($0$ to $10,000+$ nits) into an invertible logarithmic space:
+    $$\mathbf{y} = \text{sign}(\mathbf{x}) \cdot \log\big(1 + \mu \|\mathbf{x}\|\big)$$
+    preventing high-energy specular fireflies from destabilizing temporal history.
+  - Demodulates smooth irradiance from base albedo and surface roughness before inference, reconstructing pin-sharp high-frequency texture details at target display resolution.
+- **Dual-Stream Temporal Reprojection & Confidence Gating**:
+  - Warps independent temporal histories using surface motion vectors ($\mathbf{v}_{\text{surface}}$) for diffuse GI and virtual hit specular vectors ($\mathbf{v}_{\text{specular}}$) with planar depth-aware disocclusion confidence gating, eliminating ghosting during rapid camera motion.
+- **Continuous 2.0x Super-Resolution (`--upways-sr`)**:
+  - Ingests fractional subpixel coordinate phase offsets ($\text{fract}(\text{inCoordF})$ in channels 30–31) to reconstruct high-frequency geometric edges from lower-resolution render targets (e.g. 1080p $\to$ 4K in **8.62 ms / 116 FPS** on Veach Ajar).
+- **Compacted Weight Buffer & Embedded Fallback**:
+  - Uses an ultra-lean **16,704-byte** serialized FP16 SSBO binary (`data/models/upways_weights.bin`), automatically packaged by CMake (`cmake/PackageUpwaysWeights.cmake`) from the adjacent `~/Development/Upways` repository when present, with an embedded compiled-in fallback C++ header (`src/rt/upways_default_weights.hpp`) for 100% self-contained standalone execution.
+- **Hardware Timestamp Profiling**:
+  - Instrumented with dedicated Vulkan GPU query timestamps (`qBase + 4/5`), exposing microsecond-accurate inference latency (`m_lastUpwaysMs`) in `EngineStats` and telemetry JSON dumps.
+- **Unified Scaler CLI (`--scaler`)**:
+  - Consolidated `--scaler <mode> [ratio|res]` syntax supporting interchangeable scaler engines (`upways`, `fsr`, `fsr1`, `none`), standard presets (`native`, `quality`, `balanced`, `performance`, `ultra`), or arbitrary internal rendering resolutions (e.g. `--res 4k --scaler upways 1080` or `--scaler upways quality`). Legacy `--denoiser upways` and `--upways-sr` remain fully supported as seamless aliases.
 
 ---
 

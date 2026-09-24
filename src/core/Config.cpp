@@ -309,8 +309,18 @@ void Config::printUsage(const char* progName) {
               << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
               << "  --macro-tiles <int|auto> Alias for --batches\n"
               << "  --batch-size <int|auto> Coarse batch pixel budget (e.g. 1000000, 2000000; default: auto)\n"
-              << "  --batch-pixels <int>    Alias for --batch-size\n"
-              << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
+              << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes.\n"
+              << "                            What it is: Uses VK_EXT_device_generated_commands Indirect Execution\n"
+              << "                            Sets (VkIndirectExecutionSetEXT) to dynamically bind specialized\n"
+              << "                            compute material pipelines on the GPU via indirect token streams\n"
+              << "                            in a single vkCmdExecuteGeneratedCommandsEXT call.\n"
+              << "                            Needs: Driver support for compute indirect execution set pipeline switching.\n"
+              << "                            Why disabled: Current Vulkan drivers (including Mesa RADV 26.x) fail to switch\n"
+              << "                            compute pipelines dynamically via indirect execution set tokens, running\n"
+              << "                            only the initial pipeline and dropping secondary rays/reflections.\n"
+              << "                            The default multi-dispatch indirect path is already 100% GPU-driven,\n"
+              << "                            skips empty material queues with zero wave launches, and is fully correct.\n"
+              << "  --no-dgc-execset        Explicitly disable DGC Execution Sets (enforce default multi-dispatch indirect)\n\n"
               << "Camera & Navigation:\n"
               << "  --adaptive-speed        Enable distance-adaptive camera speed (smooth approach) [default: enabled]\n"
               << "  --no-adaptive-speed     Disable distance-adaptive camera speed (constant velocity)\n"
@@ -918,6 +928,11 @@ Config Config::parse(int argc, char* argv[]) {
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
             continue;
         }
+        if (arg == "--no-dgc-batch-preprocess" || arg == "--no-dgc-tier2-batch") {
+            cfg.dgc_batch_preprocess = false;
+            setEnvVar("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS", "1");
+            continue;
+        }
         if (arg == "--no-inline-shadows") {
             cfg.inline_primary_shadows = false;
             continue;
@@ -925,6 +940,7 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
             setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
             setEnvVar("PATHWAYS_ENABLE_MATERIAL_DGC", "1");
+            Logger::warn("--dgc-execset enabled: Experimental compute execution sets active. Note: drivers such as Mesa RADV may fail to switch compute pipelines dynamically via execution set tokens.");
             continue;
         }
         if (arg == "--no-dgc-execset" || arg == "--no-dgc-tier2-execset") {

@@ -930,10 +930,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             uint32_t shadowSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassShadow);
             uint32_t intersectSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassIntersect);
 
+            bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
             if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                 if (needShadowDispatch) {
                     m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1);
-                    if (needIntersect) {
+                    if (batchPreprocess && needIntersect) {
                         m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                         m_dgcManager->recordPreprocessBarrier(cmd, shadowSlice, 2);
                     } else {
@@ -975,6 +976,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
             // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
             if (b + 1 < maxBounces) {
+                if (!batchPreprocess && needShadowDispatch && m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
+                    m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
+                    m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
+                }
                 float maxRayDist = 10000.0f;
                 if (sceneData.enableDistanceClamping) {
                     if (sceneData.maxSecondaryRayDistance > 0.0f) {

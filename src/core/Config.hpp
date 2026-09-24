@@ -119,6 +119,7 @@ struct Config {
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
+    bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)
     // Denoiser Defaults & Rationale:
     // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None).
     // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise

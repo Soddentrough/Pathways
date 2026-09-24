@@ -78,6 +78,21 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 
 ---
 
+### 5. Veach Ajar (Lighting Variance & Narrow Portal)
+
+*Canonical physical light transport research scene. Evaluates extreme variance caused by indirect illumination and caustics spilling through a narrow door portal from a brightly lit room into a dark hallway across 382K triangles and 13 materials.*
+
+| Scene Metric / Telemetry | Measurement & Specification |
+| :--- | :--- |
+| **Geometry & Instances** | 382,690 Triangles (383K) • 1 Instance • 2 Emissive Mesh Lights |
+| **Acceleration Structures** | BLAS: 46.30 MB (compacted from 59.3 MB, -21.9%) • TLAS: 0.44 KB |
+| **BSDF Material Models** | glTF 2.0 PBR Metallic-Roughness, dielectric transmission, dielectric caustic bounds, narrow portal aperture |
+| **RDNA 4 Single-GPU (4K Native)** | **26.35 ms (38.0 FPS)** • **1.26 GigaRays/s** (Pure MC Baseline) |
+| **Native 4K Upways Denoising** | **28.82 ms (34.7 FPS)** (Wave32 WMMA tensor reconstruction, only 2.47 ms inference overhead) |
+| **4K Continuous Super-Res (`--upways-sr`)** | **8.62 ms (116.0 FPS)** • **3.3x Speedup** (Reconstructed 1080p -> 4K) |
+
+---
+
 ## Key Capabilities & Architecture
 
 > For complete mathematical formulations, pipeline stages, buffer layouts, and microkernel specifications, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -91,6 +106,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 - **3D Spatial-Morton + Material Dual-Binning (Default)**: Clusters rays by 16-bit composite keys combining material archetype with quantized 3D Morton spatial cells, achieving instruction coherence while preserving L0/L1 texture and geometry cache locality.
 - **Producer-Side Binning & Directional DGC Queuing**: Partitions secondary rays directly at emission time across 8 directional octant bins using Wave32 ballot leader-election loops, eliminating post-hoc sort passes and scattered gather memory fetches during downstream BVH traversal.
 - **Secondary Ray Clamping & Streamlining**: Scene-scale invariant distance clamping and radiance luminance clamping (`--indirect-clamp`, default 35.0) to eliminate specular/caustic fireflies and boost secondary bounce throughput.
+- **2D Aspect-Ratio Macro-Tile Partitioning ($O(1)$ Memory Scaling)**: Rather than allocating monolithic full-screen ray queues (which demand 2,721 MB of VRAM at 4K), Pathways partitions the viewport into a 2D tile grid ($2 \times 1, 2 \times 2, 4 \times 2, 3 \times 3$) sized to an on-chip budget (2.0M pixels on APU/UMA, 1.0M on discrete). This drops queue VRAM footprint to **699 MB (-74.3%)** while preserving 2D spatial texture and BVH cache locality. Multi-bounce diffuse GI scenes dynamically cap auto-batches to $\le 4$ to maintain 100% SIMD Compute Unit occupancy across secondary bounces.
 - **Buffer Device Address (BDA) Ray Queuing**: Lock-free, atomic queue allocation using 64-bit device addresses for high-throughput ray staging.
 - **Hardware Ray Tracing**: Full support for dedicated hardware BVH traversal via `VK_KHR_ray_tracing_pipeline` (RTP) and inline `VK_KHR_ray_query`.
 
@@ -263,11 +279,16 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--indirect-clamp` | `<float>` | Secondary bounce radiance luminance clamp to eliminate fireflies (0 = disabled) | `35.0` |
 | `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `dual` |
 | `--sec-sort` | `none` \| `directional` | Secondary ray coherency sort mode (Option 1 on-chip DGC octant binning) | `none` |
-| `--scaler` | `<mode> [ratio\|res]` | Consolidated upscaler: `upways`, `fsr`, `fsr1`, `none`. Presets: `native`, `quality`, `balanced`, `performance`, `ultra`, or arbitrary resolution (`1080`, `1440`, `1920x1080`, `0.75`) | `none` |
-| `--preset` | `quality` \| `balanced` \| `perf` \| `ultra` | Scaling ratio preset or resolution override | `quality` |
+| `--macro-tiles`, `--batches` | `<int>` | 2D macro-tile batch count for wavefront queue partitioning (0 = auto based on budget) | `0` (Auto) |
+| `--scaler`, `--upscaler` | `<mode> [ratio\|res]` | Consolidated upscaler: `upways`, `fsr`, `fsr1`, `none`. Presets: `native`, `quality`, `balanced`, `performance`, `ultra`, or arbitrary resolution (`1080`, `1440`, `1920x1080`, `0.75`) | `none` |
+| `--preset`, `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra` | Scaling ratio preset or resolution override | `quality` |
 | `--upscaler-sharpening` | *(flag)* | Enable Robust Contrast Adaptive Sharpening (RCAS) pass | Disabled |
 | `--upscaler-sharpness` | `<float>` | RCAS contrast-adaptive sharpness factor `[0.0 - 1.0]` | `0.0` |
 | `--denoiser` | `none` \| `upways` | Denoising mode: Pure Monte Carlo (unbiased) or Upways Wave32 WMMA | `none` |
+| `--upways` | *(flag)* | Enable Upways Neural Denoising with Wave32 WMMA (1:1 native resolution) | Disabled |
+| `--upways-sr` | *(flag)* | Enable Upways Continuous Super-Resolution (2.0x neural upscaling; `--upways-superres`) | Disabled |
+| `--upways-weights` | `<path>` | Custom path to Upways neural weights binary (`upways_weights.bin`) | `data/models/upways_weights.bin` |
+| `--capture-training-data` | `<dir>` | Save paired Upways neural reconstruction dataset to directory | Disabled |
 | `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
 | `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
 | `--nrc` | *(flag)* | Enable Neural Radiance Caching with Wave32 WMMA | Disabled |
@@ -431,6 +452,7 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - **[Windows 11 Build Guide](docs/BUILD_WINDOWS.md)**: MSYS2 UCRT64 toolchain, PowerShell automation, and CPack packaging.
 - **[Vulkan API Call Audit](docs/VULKAN_API_AUDIT.md)**: Specification tracking and multi-platform Vulkan Hardware Database comparison.
 - **[Material Shader Review](docs/reports/material_shader_review.md)**: In-depth physical BSDF and microarchitectural audit.
+- **[Wavefront Batching & Queue Scaling Report](docs/reports/wavefront_batching_head_to_head.md)**: Empirical SPM counter analysis of 2D macro-tiling, 74.3% VRAM queue reduction, and cache locality.
 - **[Scanlands Benchmark Report](docs/reports/scanlands_benchmark_report.md)**: High-density point-instancing (359M triangles) single-GPU benchmark report.
 
 ---

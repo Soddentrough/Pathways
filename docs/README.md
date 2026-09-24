@@ -14,8 +14,12 @@ docs/
 ├── BUILD_WINDOWS.md                    # Windows 11 Build, MSYS2 & Packaging Guide
 ├── VULKAN_API_AUDIT.md                 # Complete Vulkan 1.4 API Call Audit & Platform Coverage
 ├── reports/                            # Empirical Benchmarking & Deep Technical Audits
+│   ├── wavefront_batching_head_to_head.md # 2D Macro-Tile Partitioning & Queue Scaling Report
+│   ├── strix_halo_gfx1151_profiling_report.md # AMD Strix Halo / RDNA 3.5 Hardware Profiling
+│   ├── uma_optimization_isolation_study.md # UMA Memory Bandwidth & Payload Isolation Study
 │   ├── material_shader_review.md       # Comprehensive Material Shader & BSDF Mathematical Review
-│   └── scanlands_benchmark_report.md   # Scanlands 359M Triangle Single-GPU Performance Benchmark
+│   ├── scanlands_benchmark_report.md   # Scanlands 359M Triangle Single-GPU Performance Benchmark
+│   └── camera_aspect_fov_fix.md        # Hor+ Camera Aspect Ratio & Projection Matrix Derivation
 ├── images/                             # Real-time 4K reference renders & architectural diagrams
 └── [idea_* / scratch_*]                # Internal research scratchpads & feature proposals (gitignored)
 ```
@@ -47,12 +51,20 @@ docs/
 
 ## 4. Empirical Benchmarking & Technical Reports
 
-The [`reports/`](reports/) directory contains formal research reports and architectural audits:
+The [`reports/`](reports/) directory contains formal research reports, architectural audits, and hardware profiling studies:
 
+- **[reports/wavefront_batching_head_to_head.md](reports/wavefront_batching_head_to_head.md)**:
+  Empirical benchmark and bare-metal SPM hardware counter analysis (L0/L1/L2 hit rates, memory stalls, VRAM bandwidth) comparing Monolithic, 1D Horizontal Strips, and 2D Macro-Tile Partitioning on AMD Strix Halo (Radeon 8060S). Documents the 74.3% VRAM queue reduction (699 MB vs 2,721 MB at 4K) and adaptive secondary ray CU occupancy capping.
+- **[reports/strix_halo_gfx1151_profiling_report.md](reports/strix_halo_gfx1151_profiling_report.md)**:
+  Deep-dive hardware profiling report on the AMD RDNA 3.5 / gfx1151 architecture (RYZEN AI MAX+ 395 w/ Radeon 8060S). Evaluates Wave32 execution, hardware ray queries, and unified memory bandwidth constraints.
+- **[reports/uma_optimization_isolation_study.md](reports/uma_optimization_isolation_study.md)**:
+  Isolation study of UMA memory bandwidth optimizations, analyzing 48-byte ray payload compaction, 64-byte shading materials, and direct coherent ray queuing.
 - **[reports/material_shader_review.md](reports/material_shader_review.md)**:
   Comprehensive mathematical and microarchitectural audit of Pathways BSDF formulations (microfacet normal distributions, Smith correlated masking-shadowing, dielectric transmission, Airy thin-film iridescence, and RDNA 4 VGPR occupancy optimization).
 - **[reports/scanlands_benchmark_report.md](reports/scanlands_benchmark_report.md)**:
   Empirical single-GPU performance benchmark running the `Scanlands` OpenUSD production landscape asset (187,491 foliage instances, 358.9M instanced triangles) on an AMD Radeon AI PRO R9700. Covers VRAM safety, dynamic TLAS generation, and unoccluded frame pacing.
+- **[reports/camera_aspect_fov_fix.md](reports/camera_aspect_fov_fix.md)**:
+  Mathematical derivation and verification of Hor+ camera aspect ratio synchronization, portrait adaptive FOV, and reference projection matrices.
 
 ---
 

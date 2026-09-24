@@ -339,6 +339,7 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
     } else {
         Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", primaryPipelines.size());
     }
+    Logger::warn("Experimental DGC Material Execution Set active. Note: drivers such as Mesa RADV may fail to switch compute pipelines dynamically via indirect execution set tokens.");
 }
 
 void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
