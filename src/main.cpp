@@ -95,6 +95,16 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched to BMW M6 and rendered 3 frames cleanly.");
 
+            // Switch to scene 6b: Veach Ajar
+            if (std::filesystem::exists("scenes/veach-ajar/veach_ajar_extended.glb")) {
+                if (!engine.loadScene("scenes/veach-ajar/veach_ajar_extended.glb")) {
+                    pathways::Logger::error("Test failed: loadScene Veach Ajar failed.");
+                    return 1;
+                }
+                for (int i = 0; i < 3; ++i) engine.renderFrame();
+                pathways::Logger::info("[PASS] Switched to Veach Ajar and rendered 3 frames cleanly.");
+            }
+
             // Switch to scene 7: Cornell Caustic Extended (Tier 1 Research Scene)
             if (!engine.loadScene("scenes/cornell-caustic/cornell_caustic_extended.glb")) {
                 pathways::Logger::error("Test failed: loadScene Cornell Caustic failed.");

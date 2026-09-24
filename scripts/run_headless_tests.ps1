@@ -38,7 +38,7 @@ Write-Host "  Windows 11 Native Test Runner (Toolchain: $Toolchain)" -Foreground
 Write-Host "==========================================================" -ForegroundColor Magenta
 
 # 1. Build project
-Write-Host "`n[1/6] Building project via build.ps1..." -ForegroundColor Cyan
+Write-Host "`n[1/7] Building project via build.ps1..." -ForegroundColor Cyan
 .\build.ps1 -Toolchain $Toolchain -Config Release
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Build failed!"
@@ -59,7 +59,7 @@ if (-not (Test-Path $OutputDir)) {
 }
 
 # 2. Run camera controls unit test suite
-Write-Host "`n[2/6] Running Camera & FPS Navigation Unit Tests..." -ForegroundColor Cyan
+Write-Host "`n[2/7] Running Camera & FPS Navigation Unit Tests..." -ForegroundColor Cyan
 & $TestExe
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Camera unit tests failed!"
@@ -67,7 +67,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 3. Test Suite 1: 1080p 16 SPP Full Quality Verification
-Write-Host "`n[3/6] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..." -ForegroundColor Cyan
+Write-Host "`n[3/7] Running Test Suite 1: 1080p @ 16 SPP (PNG + OpenEXR + Stats)..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
@@ -85,7 +85,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 4. Test Suite 2: 4K Native Real-Time Benchmark (<8ms Target)
-Write-Host "`n[4/6] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)..." -ForegroundColor Cyan
+Write-Host "`n[4/7] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 3840 `
@@ -105,7 +105,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 5. Test Suite 3: glTF 2.0 Ingestion Pipeline (Damaged Helmet)
-Write-Host "`n[5/6] Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
+Write-Host "`n[5/7] Running glTF Damaged Helmet scene test..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
@@ -123,7 +123,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 6. Test Suite 4: Many-Lights Scene (64 Lights) Procedural Cornell Box
-Write-Host "`n[6/6] Running Many-Lights (64 Lights) Scene Test..." -ForegroundColor Cyan
+Write-Host "`n[6/7] Running Many-Lights (64 Lights) Scene Test..." -ForegroundColor Cyan
 & $PathwaysExe `
     --headless `
     --width 1920 `
@@ -138,6 +138,28 @@ Write-Host "`n[6/6] Running Many-Lights (64 Lights) Scene Test..." -ForegroundCo
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Many-Lights scene verification failed!"
     exit $LASTEXITCODE
+}
+
+# 7. Test Suite 5: glTF Research Scene (Veach Ajar)
+$VeachAjarPath = Join-Path $RootDir "scenes\veach-ajar\veach_ajar_extended.glb"
+if (Test-Path $VeachAjarPath) {
+    Write-Host "`n[7/7] Running glTF Veach Ajar research scene test..." -ForegroundColor Cyan
+    & $PathwaysExe `
+        --headless `
+        --width 1920 `
+        --height 1080 `
+        --spp 4 `
+        --max-bounces 4 `
+        --frames 10 `
+        --scene "scenes/veach-ajar/veach_ajar_extended.glb" `
+        --dump-frame (Join-Path $OutputDir "test_veach_ajar.png") `
+        --dump-stats (Join-Path $OutputDir "stats_veach_ajar.json")
+
+    & $Python scripts/verify_frame.py (Join-Path $OutputDir "test_veach_ajar.png") (Join-Path $OutputDir "stats_veach_ajar.json") 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 25.0
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "glTF Veach Ajar verification failed!"
+        exit $LASTEXITCODE
+    }
 }
 
 Write-Host "`n==========================================================" -ForegroundColor Green

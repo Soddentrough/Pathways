@@ -98,6 +98,13 @@ TARGET_SCENES = [
         "category": "Automotive Clearcoat & Specular",
         "args": ["--scene", "scenes/bmw-m6/bmw_m6_extended.glb"],
         "desc": "Automotive PBR clearcoat, metallic flakes, and high-frequency curved reflections."
+    },
+    {
+        "id": "veach_ajar",
+        "name": "Veach Ajar",
+        "category": "Lighting Variance & Narrow Portal",
+        "args": ["--scene", "scenes/veach-ajar/veach_ajar_extended.glb"],
+        "desc": "Extreme lighting variance stress test through a narrow door portal."
     }
 ]
 

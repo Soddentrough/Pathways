@@ -44,6 +44,12 @@ TARGET_SCENES = [
         "name": "Cyber City",
         "category": "High-Density Multi-BLAS Instancing",
         "args": ["--scene", "cyber-city"]
+    },
+    {
+        "id": "veach_ajar",
+        "name": "Veach Ajar",
+        "category": "Lighting Variance & Portal GI",
+        "args": ["--scene", "scenes/veach-ajar/veach_ajar_extended.glb"]
     }
 ]
 

@@ -54,6 +54,12 @@ DEFAULT_SCENES = {
         "desc": "Complex interior architectural GI with high occlusion",
         "camera": None
     },
+    "veach_ajar": {
+        "name": "Veach Ajar",
+        "path": "scenes/veach-ajar/veach_ajar_extended.glb",
+        "desc": "Extreme lighting variance stress test through a narrow door portal",
+        "camera": None
+    },
     "living_room": {
         "name": "Living Room Extended",
         "path": "scenes/living-room/living_room_extended.glb",

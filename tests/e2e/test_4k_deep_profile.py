@@ -354,7 +354,8 @@ class Test4KDeepProfileSuite:
         """Tier 1: Verify 4K execution across representative showcase scenes."""
         scenes = [
             ("scenes/cornell-caustic/cornell_caustic_extended.glb", "caustic"),
-            ("scenes/glass-of-water/glass_of_water_extended.glb", "glass")
+            ("scenes/glass-of-water/glass_of_water_extended.glb", "glass"),
+            ("scenes/veach-ajar/veach_ajar_extended.glb", "veach_ajar")
         ]
 
         for scene_rel_path, tag in scenes:

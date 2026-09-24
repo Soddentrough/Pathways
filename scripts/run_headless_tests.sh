@@ -226,7 +226,7 @@ python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cor
 
 python3 scripts/verify_frame.py output/test_glass_of_water.png output/stats_glass_of_water.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 10.0
 
-# 9. Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes (Dragon Dispersion, Car Concept, Breakfast Room)
+# 9. Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes (Dragon Dispersion, Car Concept, Breakfast Room, Veach Ajar)
 echo ""
 echo "[6c] Running Test Suite 6c: Curated glTF 2.0 Extensions & Research Scenes..."
 "${PATHWAYS_BIN}" \
@@ -267,6 +267,19 @@ python3 scripts/verify_frame.py output/test_bmw_m6.png output/stats_bmw_m6.json 
     --dump-stats output/stats_breakfast_room.json
 
 python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_breakfast_room.json 1920 1080 35.0 --max-mean-lum 0.50 --max-blown-pct 8.0
+
+"${PATHWAYS_BIN}" \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --scene scenes/veach-ajar/veach_ajar_extended.glb \
+    --dump-frame output/test_veach_ajar.png \
+    --dump-stats output/stats_veach_ajar.json
+
+python3 scripts/verify_frame.py output/test_veach_ajar.png output/stats_veach_ajar.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 25.0
 
 # 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Alias Table & Local RIS)
 echo ""

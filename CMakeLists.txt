@@ -619,6 +619,7 @@ set(CURATED_SCENE_DIRS
     PointInstancedMedCity
     Kitchen_set
     BuickRiviera
+    veach-ajar
 )
 
 if(WIN32)
