@@ -1,5 +1,6 @@
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/upways_weights.hpp"
+#include "rt/upways_default_weights.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -95,17 +96,21 @@ int main() {
     check_true(upways::LAYER_FC2.outChannels % 16 == 0, "fc2 outChannels must be multiple of 16");
     std::cout << "  -> Wave32 WMMA 16x16 cooperative matrix alignment verified across all network layers." << std::endl;
 
-    // 5. Verify Exported Weights File Existence and Size
-    std::cout << "[TEST 5] Exported Weights File Binary Integrity..." << std::endl;
+    // 5. Verify Exported Weights and Embedded Fallback Integrity
+    std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
+    check_true(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == upways::TOTAL_WEIGHT_BUFFER_SIZE,
+               "Embedded DEFAULT_UPWAYS_WEIGHTS size must match TOTAL_WEIGHT_BUFFER_SIZE exactly");
+    check_true(upways::EMBEDDED_WEIGHTS_SIZE == upways::TOTAL_WEIGHT_BUFFER_SIZE,
+               "EMBEDDED_WEIGHTS_SIZE must match TOTAL_WEIGHT_BUFFER_SIZE");
+    std::cout << "  -> Embedded default neural weights verified (" << sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) << " bytes)." << std::endl;
+
     std::vector<std::string> searchPaths = {
         "data/models/upways_weights.bin",
         "../data/models/upways_weights.bin",
         "../../data/models/upways_weights.bin",
         "../../../data/models/upways_weights.bin",
-        "/home/naoki/Development/Pathways/data/models/upways_weights.bin",
-        "/home/naoki/Development/Upways/checkpoints/neural_reconstruct_run/upways_weights.bin",
-        "/home/naoki/Development/Upways/checkpoints/upways3_multiscale_kpn/vulkan_export/upways_v3_weights.bin",
-        "/home/naoki/Development/Upways/checkpoints/run_multiscene_superres/vulkan_export/upways_weights.bin"
+        "build/bin/data/models/upways_weights.bin",
+        "bin/data/models/upways_weights.bin"
     };
     std::string foundPath;
     for (const auto& p : searchPaths) {
@@ -114,10 +119,13 @@ int main() {
             break;
         }
     }
-    check_true(!foundPath.empty(), "upways_weights.bin must exist in at least one standard search path");
-    auto fileSize = std::filesystem::file_size(foundPath);
-    check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must exactly match TOTAL_WEIGHT_BUFFER_SIZE");
-    std::cout << "  -> Weight file binary verified at: " << foundPath << " (" << fileSize << " bytes)." << std::endl;
+    if (!foundPath.empty()) {
+        auto fileSize = std::filesystem::file_size(foundPath);
+        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must exactly match TOTAL_WEIGHT_BUFFER_SIZE");
+        std::cout << "  -> External weight file binary verified at: " << foundPath << " (" << fileSize << " bytes)." << std::endl;
+    } else {
+        std::cout << "  -> Note: External file not in immediate path; verified embedded fallback is fully intact." << std::endl;
+    }
 
     // 6. Verify Disocclusion Confidence Gating Math
     std::cout << "[TEST 6] Disocclusion Confidence Gating..." << std::endl;

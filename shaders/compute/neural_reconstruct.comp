@@ -119,8 +119,7 @@ vec2 GetDilatedSurfaceMV(ivec2 renderCoord) {
             if (dx == 0 && dy == 0) continue;
             ivec2 c = clamp(renderCoord + ivec2(dx, dy), ivec2(0), ivec2(u_RenderRes) - 1);
             float d = imageLoad(uNormalDepth, c).w;
-            // Only dilate if neighbor belongs to the same continuous surface layer
-            if (d > 0.0 && d < minDepth && abs(d - centerDepth) < 0.20 * min(d, centerDepth)) {
+            if (d > 0.0 && d < minDepth) {
                 minDepth = d;
                 bestMV = imageLoad(uSurfaceMV, c).xy;
             }

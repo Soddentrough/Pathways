@@ -1,6 +1,14 @@
 #include "UpwaysPipeline.hpp"
 #include "core/Logger.hpp"
 #include "upways_weights.hpp"
+#include "upways_default_weights.hpp"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <fstream>
 #include <filesystem>
@@ -72,22 +80,39 @@ UpwaysPipeline::~UpwaysPipeline() {
 }
 
 void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
+    std::filesystem::path exeDir;
+#ifdef _WIN32
+    char exePathBuf[MAX_PATH] = {0};
+    if (GetModuleFileNameA(NULL, exePathBuf, MAX_PATH)) {
+        exeDir = std::filesystem::path(exePathBuf).parent_path();
+    }
+#elif defined(__linux__)
+    std::error_code ec;
+    auto p = std::filesystem::canonical("/proc/self/exe", ec);
+    if (!ec) exeDir = p.parent_path();
+#endif
+
     std::vector<std::string> candidates;
     if (!weightsPath.empty()) {
         candidates.push_back(weightsPath);
+    }
+    if (!exeDir.empty()) {
+        candidates.push_back((exeDir / "data" / "models" / "upways_weights.bin").string());
+        candidates.push_back((exeDir / "upways_weights.bin").string());
+        candidates.push_back((exeDir / ".." / "share" / "pathways" / "data" / "models" / "upways_weights.bin").string());
     }
     candidates.push_back("data/models/upways_weights.bin");
     candidates.push_back("../data/models/upways_weights.bin");
     candidates.push_back("../../data/models/upways_weights.bin");
     candidates.push_back("../../../data/models/upways_weights.bin");
-    candidates.push_back("/home/naoki/Development/Pathways/data/models/upways_weights.bin");
-    candidates.push_back("/home/naoki/Development/Upways/checkpoints/upways_kpn_production/vulkan_export/upways_kpn_weights.bin");
-    candidates.push_back("/home/naoki/Development/Upways/checkpoints/neural_reconstruct_run/upways_weights.bin");
+    candidates.push_back("/usr/share/pathways/data/models/upways_weights.bin");
+    candidates.push_back("/usr/local/share/pathways/data/models/upways_weights.bin");
     candidates.push_back("upways_weights.bin");
 
     std::string foundPath;
     for (const auto& p : candidates) {
-        if (std::filesystem::exists(p)) {
+        std::error_code ec2;
+        if (std::filesystem::exists(p, ec2) && !std::filesystem::is_directory(p, ec2)) {
             foundPath = p;
             break;
         }
@@ -107,9 +132,10 @@ void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
     }
 
     if (weightBytes.empty()) {
-        Logger::warn("UpwaysPipeline could not find weights file. Initializing default weight buffer ({} bytes)",
-                     upways::TOTAL_WEIGHT_BUFFER_SIZE);
-        weightBytes.resize(upways::TOTAL_WEIGHT_BUFFER_SIZE, 0);
+        Logger::info("UpwaysPipeline using embedded default neural reconstructor weights ({} bytes)",
+                     sizeof(upways::DEFAULT_UPWAYS_WEIGHTS));
+        weightBytes.assign(upways::DEFAULT_UPWAYS_WEIGHTS,
+                           upways::DEFAULT_UPWAYS_WEIGHTS + sizeof(upways::DEFAULT_UPWAYS_WEIGHTS));
     }
 
     if (weightBytes.size() < upways::TOTAL_WEIGHT_BUFFER_SIZE) {

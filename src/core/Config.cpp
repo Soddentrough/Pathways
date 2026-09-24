@@ -83,6 +83,68 @@ bool parseResolutionString(std::string_view str, uint32_t& outW, uint32_t& outH)
     return false;
 }
 
+bool parseUpscaleRatioOrResolution(std::string_view val, float& outScale, uint32_t& outW, uint32_t& outH) {
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
+    while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.remove_suffix(1);
+    if (val.empty()) return false;
+
+    std::string s;
+    s.reserve(val.size());
+    for (char c : val) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    // Standard presets / ratios
+    if (s == "native" || s == "1x" || s == "1:1") {
+        outScale = 1.0f;
+        outW = 0; outH = 0;
+        return true;
+    }
+    if (s == "quality" || s == "q") {
+        outScale = 0.6667f; // 1.5x upscaling (e.g. 1440p -> 4K)
+        outW = 0; outH = 0;
+        return true;
+    }
+    if (s == "balanced" || s == "bal") {
+        outScale = 0.5882f; // ~1.7x upscaling
+        outW = 0; outH = 0;
+        return true;
+    }
+    if (s == "performance" || s == "perf" || s == "p" || s == "2x") {
+        outScale = 0.5000f; // 2.0x upscaling (e.g. 1080p -> 4K)
+        outW = 0; outH = 0;
+        return true;
+    }
+    if (s == "ultra-performance" || s == "ultra_performance" || s == "ultra" || s == "up" || s == "3x" || s == "ultra performance") {
+        outScale = 0.3333f; // 3.0x upscaling (e.g. 720p -> 4K)
+        outW = 0; outH = 0;
+        return true;
+    }
+
+    // Check for arbitrary resolution string (e.g. 1080p, 1440p, 720p, 1920x1080, 1280x720, etc.)
+    uint32_t rw = 0, rh = 0;
+    if (parseResolutionString(val, rw, rh) && rw > 0 && rh > 0) {
+        outScale = 0.0f;
+        outW = rw;
+        outH = rh;
+        return true;
+    }
+
+    // Check for arbitrary numeric float / ratio (e.g. 0.75, 0.5, 0.6667, 1.5, 2.0)
+    try {
+        size_t idx = 0;
+        float scale = std::stof(std::string(val), &idx);
+        if (idx > 0 && scale > 0.05f && scale <= 4.0f) {
+            if (scale > 1.0f) {
+                scale = 1.0f / scale;
+            }
+            outScale = scale;
+            outW = 0; outH = 0;
+            return true;
+        }
+    } catch (...) {}
+
+    return false;
+}
+
 std::vector<float> parseNumbers(std::string_view str) {
     std::vector<float> numbers;
     while (!str.empty() && (str.front() == ' ' || str.front() == '\t' || str.front() == '[' || str.front() == '(')) {
@@ -150,9 +212,11 @@ void Config::printUsage(const char* progName) {
               << "  --upscaler-sharpening   Enable additional RCAS sharpening pass [default: disabled]\n"
               << "  --upscaler-sharpness <f> RCAS contrast-adaptive sharpness factor [0.0 - 1.0] (default: 0.0)\n"
               << "  --render-scale <float>  Continuous internal render scale factor (e.g. 0.6667 for 1.5x, 0.5 for 2.0x)\n"
-              << "  --upways                Enable Upways Neural Denoising with Wave32 WMMA\n"
-              << "  --upways-sr             Enable Upways Continuous Super-Resolution (2.0x upscaling)\n"
-              << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin)\n"
+              << "  --upways [preset|WxH]   Enable Upways Neural Denoising with Wave32 WMMA [optional ratio: native, quality, balanced, performance, ultra, or <W>x<H>]\n"
+              << "  --upways-sr [preset]    Enable Upways Continuous Super-Resolution (defaults to 2.0x performance)\n"
+              << "  --fsr, --fsr3 [preset]  Enable AMD FSR 3.1 Upscaling [optional ratio: native, quality, balanced, performance, ultra, or <W>x<H>]\n"
+              << "  --preset <preset|WxH>   Scaling ratio preset: native, quality, balanced, performance, ultra, or <W>x<H>\n"
+              << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin, or embedded fallback)\n"
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
@@ -555,33 +619,204 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--upways") {
-            cfg.upways_superres = false;
             cfg.denoiser_mode = DenoiserMode::Upways;
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string param = argv[i + 1];
+                if (param == "ultra" && i + 2 < argc && std::string_view(argv[i + 2]) == "performance") {
+                    param = "ultra-performance";
+                    i++;
+                }
+                if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                    i++;
+                    if (rw > 0 && rh > 0) {
+                        cfg.render_width = rw;
+                        cfg.render_height = rh;
+                    } else {
+                        cfg.render_scale = scale;
+                        cfg.render_width = 0;
+                        cfg.render_height = 0;
+                        if (scale < 0.999f) {
+                            cfg.upways_superres = true;
+                            cfg.upscaler_mode = UpscalerMode::Upways;
+                        } else {
+                            cfg.upways_superres = false;
+                            cfg.upscaler_mode = UpscalerMode::None;
+                        }
+                    }
+                    continue;
+                }
+            }
+            cfg.upways_superres = false;
+            cfg.upscaler_mode = UpscalerMode::None;
+            cfg.render_scale = 1.0f;
+            cfg.render_width = 0;
+            cfg.render_height = 0;
+            continue;
+        }
+        if (arg.starts_with("--upways=")) {
+            cfg.denoiser_mode = DenoiserMode::Upways;
+            std::string param = arg.substr(arg.find('=') + 1);
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                if (rw > 0 && rh > 0) {
+                    cfg.render_width = rw;
+                    cfg.render_height = rh;
+                } else {
+                    cfg.render_scale = scale;
+                    cfg.render_width = 0;
+                    cfg.render_height = 0;
+                    if (scale < 0.999f) {
+                        cfg.upways_superres = true;
+                        cfg.upscaler_mode = UpscalerMode::Upways;
+                    } else {
+                        cfg.upways_superres = false;
+                        cfg.upscaler_mode = UpscalerMode::None;
+                    }
+                }
+            } else {
+                cfg.upways_superres = false;
+                cfg.upscaler_mode = UpscalerMode::None;
+                cfg.render_scale = 1.0f;
+            }
             continue;
         }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
-            cfg.upways_superres = true;
             cfg.denoiser_mode = DenoiserMode::Upways;
+            cfg.upways_superres = true;
             cfg.upscaler_mode = UpscalerMode::Upways;
-            if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f;
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string param = argv[i + 1];
+                if (param == "ultra" && i + 2 < argc && std::string_view(argv[i + 2]) == "performance") {
+                    param = "ultra-performance";
+                    i++;
+                }
+                if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                    i++;
+                    if (rw > 0 && rh > 0) {
+                        cfg.render_width = rw;
+                        cfg.render_height = rh;
+                    } else {
+                        cfg.render_scale = scale;
+                        cfg.render_width = 0;
+                        cfg.render_height = 0;
+                    }
+                    continue;
+                }
+            }
+            if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
+            continue;
+        }
+        if (arg.starts_with("--upways-sr=") || arg.starts_with("--upways-superres=")) {
+            cfg.denoiser_mode = DenoiserMode::Upways;
+            cfg.upways_superres = true;
+            cfg.upscaler_mode = UpscalerMode::Upways;
+            std::string param = arg.substr(arg.find('=') + 1);
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                if (rw > 0 && rh > 0) {
+                    cfg.render_width = rw;
+                    cfg.render_height = rh;
+                } else {
+                    cfg.render_scale = scale;
+                    cfg.render_width = 0;
+                    cfg.render_height = 0;
+                }
+            } else if (cfg.render_scale >= 1.0f && cfg.render_width == 0) {
+                cfg.render_scale = 0.5f;
+            }
+            continue;
+        }
+        if (arg == "--fsr" || arg == "--fsr3" || arg == "--fsr3.1") {
+            cfg.upscaler_mode = UpscalerMode::FSR3;
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string param = argv[i + 1];
+                if (param == "ultra" && i + 2 < argc && std::string_view(argv[i + 2]) == "performance") {
+                    param = "ultra-performance";
+                    i++;
+                }
+                if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                    i++;
+                    if (rw > 0 && rh > 0) {
+                        cfg.render_width = rw;
+                        cfg.render_height = rh;
+                    } else {
+                        cfg.render_scale = scale;
+                        cfg.render_width = 0;
+                        cfg.render_height = 0;
+                    }
+                    continue;
+                }
+            }
+            if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f;
+            continue;
+        }
+        if (arg.starts_with("--fsr=") || arg.starts_with("--fsr3=") || arg.starts_with("--fsr3.1=")) {
+            cfg.upscaler_mode = UpscalerMode::FSR3;
+            std::string param = arg.substr(arg.find('=') + 1);
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                if (rw > 0 && rh > 0) {
+                    cfg.render_width = rw;
+                    cfg.render_height = rh;
+                } else {
+                    cfg.render_scale = scale;
+                    cfg.render_width = 0;
+                    cfg.render_height = 0;
+                }
+            } else if (cfg.render_scale >= 1.0f && cfg.render_width == 0) {
+                cfg.render_scale = 0.6667f;
+            }
             continue;
         }
         if (arg == "--upscaler" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
                 cfg.upscaler_mode = UpscalerMode::FSR3;
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f; // Default to 1.5x Quality mode
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f; // Default to 1.5x Quality mode
             } else if (mode == "upways" || mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upscaler_mode = UpscalerMode::Upways;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways; // Combined denoiser & upscaler
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f; // Default to 2.0x Super-Resolution
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default to 2.0x Super-Resolution
             } else if (mode == "fsr1" || mode == "cas" || mode == "spatial") {
                 cfg.upscaler_mode = UpscalerMode::FSR1;
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f;
             } else if (mode == "none" || mode == "off") {
                 cfg.upscaler_mode = UpscalerMode::None;
                 cfg.upways_superres = false;
+            }
+
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string param = argv[i + 1];
+                if (param == "ultra" && i + 2 < argc && std::string_view(argv[i + 2]) == "performance") {
+                    param = "ultra-performance";
+                    i++;
+                }
+                float scale = 0.0f;
+                uint32_t rw = 0, rh = 0;
+                if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                    i++;
+                    if (rw > 0 && rh > 0) {
+                        cfg.render_width = rw;
+                        cfg.render_height = rh;
+                    } else {
+                        cfg.render_scale = scale;
+                        cfg.render_width = 0;
+                        cfg.render_height = 0;
+                        if (cfg.upscaler_mode == UpscalerMode::Upways) {
+                            cfg.upways_superres = (scale < 0.999f);
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -589,33 +824,38 @@ Config Config::parse(int argc, char* argv[]) {
             std::string mode = arg.substr(arg.find('=') + 1);
             if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
                 cfg.upscaler_mode = UpscalerMode::FSR3;
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f;
             } else if (mode == "upways" || mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upscaler_mode = UpscalerMode::Upways;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "fsr1" || mode == "cas" || mode == "spatial") {
                 cfg.upscaler_mode = UpscalerMode::FSR1;
-                if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.6667f;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f;
             } else if (mode == "none" || mode == "off") {
                 cfg.upscaler_mode = UpscalerMode::None;
                 cfg.upways_superres = false;
             }
             continue;
         }
-        if ((arg == "--upscaler-preset" || arg == "--upscaler-quality") && i + 1 < argc) {
-            std::string preset = argv[++i];
-            if (preset == "native") {
-                cfg.render_scale = 1.0f;
-            } else if (preset == "quality" || preset == "q") {
-                cfg.render_scale = 0.6667f; // 1.5x (e.g. 1440p -> 4K)
-            } else if (preset == "balanced" || preset == "bal") {
-                cfg.render_scale = 0.5882f; // ~1.7x
-            } else if (preset == "performance" || preset == "perf" || preset == "p") {
-                cfg.render_scale = 0.5000f; // 2.0x (e.g. 1080p -> 4K)
-            } else if (preset == "ultra-performance" || preset == "ultra_performance" || preset == "ultra_perf") {
-                cfg.render_scale = 0.3333f; // 3.0x (e.g. 720p -> 4K)
+        if ((arg == "--preset" || arg == "--upscaler-preset" || arg == "--scale-preset" || arg == "--upscaler-quality") && i + 1 < argc) {
+            std::string param = argv[++i];
+            if (param == "ultra" && i + 1 < argc && std::string_view(argv[i + 1]) == "performance") {
+                param = "ultra-performance";
+                i++;
+            }
+            float scale = 0.0f;
+            uint32_t rw = 0, rh = 0;
+            if (parseUpscaleRatioOrResolution(param, scale, rw, rh)) {
+                if (rw > 0 && rh > 0) {
+                    cfg.render_width = rw;
+                    cfg.render_height = rh;
+                } else {
+                    cfg.render_scale = scale;
+                    cfg.render_width = 0;
+                    cfg.render_height = 0;
+                }
             }
             continue;
         }
@@ -1122,6 +1362,22 @@ Config Config::parse(int argc, char* argv[]) {
 
     if (cfg.custom_resolution && !fullscreen_explicit) {
         cfg.fullscreen = false;
+    }
+
+    if (cfg.render_width > 0 && cfg.render_height > 0) {
+        if (cfg.render_width < cfg.width || cfg.render_height < cfg.height) {
+            cfg.render_scale = static_cast<float>(cfg.render_width) / static_cast<float>(cfg.width);
+            if (cfg.denoiser_mode == DenoiserMode::Upways && cfg.upscaler_mode == UpscalerMode::None) {
+                cfg.upways_superres = true;
+                cfg.upscaler_mode = UpscalerMode::Upways;
+            }
+        } else {
+            cfg.render_scale = 1.0f;
+            if (cfg.upscaler_mode == UpscalerMode::Upways) {
+                cfg.upways_superres = false;
+                cfg.upscaler_mode = UpscalerMode::None;
+            }
+        }
     }
 
     if (!cfg.capture_training_data_dir.empty()) {

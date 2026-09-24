@@ -76,7 +76,24 @@ struct Config {
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;
+    uint32_t render_width = 0;   // Explicit internal ray tracing render width (0 = derived from render_scale * width)
+    uint32_t render_height = 0;  // Explicit internal ray tracing render height (0 = derived from render_scale * height)
     float exposure = 1.0f;
+
+    uint32_t getRenderWidth() const {
+        if (render_width > 0) return render_width;
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
+            return std::max(1u, static_cast<uint32_t>(width * render_scale));
+        }
+        return width;
+    }
+    uint32_t getRenderHeight() const {
+        if (render_height > 0) return render_height;
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
+            return std::max(1u, static_cast<uint32_t>(height * render_scale));
+        }
+        return height;
+    }
 
     // Dynamic Quality Governor & Target Frame Rate Limiter
     uint32_t target_fps = 0;          // 0 = uncapped [Default]

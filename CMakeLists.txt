@@ -363,6 +363,25 @@ if(WIN32)
     endif()
 endif()
 
+# Deploy default neural reconstruction weights to build tree
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
+    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
+    endif()
+    add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+            "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights.bin"
+        COMMENT "Deploying Upways neural weights to build tree"
+    )
+endif()
+
 # Testing
 enable_testing()
 
