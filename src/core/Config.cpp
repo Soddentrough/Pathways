@@ -230,13 +230,19 @@ Config Config::parse(int argc, char* argv[]) {
 
         if (arg == "--headless") {
             cfg.headless = true;
-        } else if (arg == "--fullscreen") {
+            continue;
+        }
+        if (arg == "--fullscreen") {
             cfg.fullscreen = true;
             fullscreen_explicit = true;
-        } else if (arg == "--windowed" || arg == "--no-fullscreen") {
+            continue;
+        }
+        if (arg == "--windowed" || arg == "--no-fullscreen") {
             cfg.fullscreen = false;
             fullscreen_explicit = true;
-        } else if ((arg == "-r" || arg == "--res" || arg == "--resolution") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "-r" || arg == "--res" || arg == "--resolution") && i + 1 < argc) {
             std::string val = argv[++i];
             uint32_t rw = 0, rh = 0;
             if (parseResolutionString(val, rw, rh)) {
@@ -250,7 +256,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Unknown resolution preset '{}'. Expected 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>.", val);
             }
-        } else if (arg.starts_with("--res=") || arg.starts_with("--resolution=") || arg.starts_with("-r=")) {
+            continue;
+        }
+        if (arg.starts_with("--res=") || arg.starts_with("--resolution=") || arg.starts_with("-r=")) {
             size_t eq = arg.find('=');
             std::string val = arg.substr(eq + 1);
             uint32_t rw = 0, rh = 0;
@@ -265,62 +273,114 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Unknown resolution preset '{}'. Expected 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>.", val);
             }
-        } else if (arg == "--width" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--width" && i + 1 < argc) {
             cfg.width = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.custom_resolution = true;
-        } else if (arg == "--height" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--height" && i + 1 < argc) {
             cfg.height = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.custom_resolution = true;
-        } else if (arg == "--spp" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--spp" && i + 1 < argc) {
             cfg.spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--spp=")) {
+            continue;
+        }
+        if (arg.starts_with("--spp=")) {
             cfg.spp = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if ((arg == "--max-bounces" || arg == "--bounces") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--max-bounces" || arg == "--bounces") && i + 1 < argc) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--max-bounces=")) {
+            continue;
+        }
+        if (arg.starts_with("--max-bounces=")) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg.starts_with("--bounces=")) {
+            continue;
+        }
+        if (arg.starts_with("--bounces=")) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
             cfg.frame_limit = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--warmup-frames" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--warmup-frames" && i + 1 < argc) {
             cfg.warmup_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--render-scale" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--render-scale" && i + 1 < argc) {
             cfg.render_scale = std::stof(argv[++i]);
-        } else if (arg.starts_with("--render-scale=")) {
+            continue;
+        }
+        if (arg.starts_with("--render-scale=")) {
             cfg.render_scale = std::stof(arg.substr(arg.find('=') + 1));
-        } else if (arg == "--exposure" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--exposure" && i + 1 < argc) {
             cfg.exposure = std::stof(argv[++i]);
-        } else if (arg == "--scene" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--scene" && i + 1 < argc) {
             cfg.scene_path = argv[++i];
-        } else if (arg == "--hdri" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--hdri" && i + 1 < argc) {
             cfg.hdri_path = argv[++i];
             cfg.custom_hdri = true;
-        } else if (arg == "--dump-frame" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--dump-frame" && i + 1 < argc) {
             cfg.dump_frame_path = argv[++i];
-        } else if (arg == "--dump-8bit" || arg == "--png-8bit") {
+            continue;
+        }
+        if (arg == "--dump-8bit" || arg == "--png-8bit") {
             cfg.dump_8bit_png = true;
-        } else if (arg == "--dump-ui" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--dump-ui" && i + 1 < argc) {
             cfg.dump_ui_path = argv[++i];
-        } else if (arg == "--dump-hdr" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--dump-hdr" && i + 1 < argc) {
             cfg.dump_hdr_path = argv[++i];
-        } else if (arg == "--dump-stats" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--dump-stats" && i + 1 < argc) {
             cfg.dump_stats_path = argv[++i];
-        } else if ((arg == "--capture-training-data" || arg == "--capture-data") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--capture-training-data" || arg == "--capture-data") && i + 1 < argc) {
             cfg.capture_training_data_dir = argv[++i];
-        } else if (arg == "--capture-frames" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--capture-frames" && i + 1 < argc) {
             cfg.capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--capture-reference-spp" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--capture-reference-spp" && i + 1 < argc) {
             cfg.capture_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--capture-channels" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--capture-channels" && i + 1 < argc) {
             cfg.capture_channels = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.capture_normals = (cfg.capture_channels >= 19);
-        } else if (arg == "--no-capture-normals") {
+            continue;
+        }
+        if (arg == "--no-capture-normals") {
             cfg.capture_normals = false;
             cfg.capture_channels = 16;
-        } else if (arg == "--gpu" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--gpu" && i + 1 < argc) {
             cfg.gpu_index = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--mgpu") {
+            continue;
+        }
+        if (arg == "--mgpu") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 std::string mode = argv[++i];
                 if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
@@ -343,7 +403,9 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.mgpu_mode = MultiGpuMode::CheckerboardTile;
                 cfg.mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
             }
-        } else if (arg.starts_with("--mgpu=")) {
+            continue;
+        }
+        if (arg.starts_with("--mgpu=")) {
             std::string mode = arg.substr(7);
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
             else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
@@ -360,7 +422,9 @@ Config Config::parse(int argc, char* argv[]) {
             }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
-        } else if (arg == "--mgpu-mode" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--mgpu-mode" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
             else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
@@ -377,7 +441,9 @@ Config Config::parse(int argc, char* argv[]) {
             }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
-        } else if (arg.starts_with("--mgpu-mode=")) {
+            continue;
+        }
+        if (arg.starts_with("--mgpu-mode=")) {
             std::string mode = arg.substr(12);
             if (mode == "off" || mode == "none") cfg.mgpu_mode = MultiGpuMode::Off;
             else if (mode == "interleave" || mode == "interleaved" || mode == "scanline" || mode == "line") {
@@ -394,7 +460,9 @@ Config Config::parse(int argc, char* argv[]) {
             }
             else if (mode == "auto") cfg.mgpu_mode = MultiGpuMode::Auto;
             else cfg.mgpu_mode = MultiGpuMode::Off;
-        } else if (arg == "--mgpu-transfer" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--mgpu-transfer" && i + 1 < argc) {
             std::string tmode = argv[++i];
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
@@ -403,7 +471,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
-        } else if (arg.starts_with("--mgpu-transfer=")) {
+            continue;
+        }
+        if (arg.starts_with("--mgpu-transfer=")) {
             std::string tmode = arg.substr(16);
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
@@ -412,39 +482,53 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
-        } else if ((arg == "--macro-tile" || arg == "--macro-tile-size") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--macro-tile" || arg == "--macro-tile-size") && i + 1 < argc) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
+            continue;
+        }
+        if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
             cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if ((arg == "--batches" || arg == "--macro-tiles") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--batches" || arg == "--macro-tiles") && i + 1 < argc) {
             std::string val = argv[++i];
             if (val == "auto") {
                 cfg.batch_count = 0;
             } else {
                 cfg.batch_count = static_cast<uint32_t>(std::stoul(val));
             }
-        } else if (arg.starts_with("--batches=") || arg.starts_with("--macro-tiles=")) {
+            continue;
+        }
+        if (arg.starts_with("--batches=") || arg.starts_with("--macro-tiles=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             if (val == "auto") {
                 cfg.batch_count = 0;
             } else {
                 cfg.batch_count = static_cast<uint32_t>(std::stoul(val));
             }
-        } else if ((arg == "--batch-size" || arg == "--batch-pixels") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--batch-size" || arg == "--batch-pixels") && i + 1 < argc) {
             std::string val = argv[++i];
             if (val == "auto") {
                 cfg.batch_pixels = 0;
             } else {
                 cfg.batch_pixels = static_cast<uint32_t>(std::stoul(val));
             }
-        } else if (arg.starts_with("--batch-size=") || arg.starts_with("--batch-pixels=")) {
+            continue;
+        }
+        if (arg.starts_with("--batch-size=") || arg.starts_with("--batch-pixels=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             if (val == "auto") {
                 cfg.batch_pixels = 0;
             } else {
                 cfg.batch_pixels = static_cast<uint32_t>(std::stoul(val));
             }
-        } else if (arg == "--denoiser" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "upways") {
                 cfg.upways_superres = false;
@@ -455,7 +539,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             }
-        } else if (arg.starts_with("--denoiser=")) {
+            continue;
+        }
+        if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             if (mode == "upways") {
                 cfg.upways_superres = false;
@@ -466,15 +552,21 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             }
-        } else if (arg == "--upways") {
+            continue;
+        }
+        if (arg == "--upways") {
             cfg.upways_superres = false;
             cfg.denoiser_mode = DenoiserMode::Upways;
-        } else if (arg == "--upways-sr" || arg == "--upways-superres") {
+            continue;
+        }
+        if (arg == "--upways-sr" || arg == "--upways-superres") {
             cfg.upways_superres = true;
             cfg.denoiser_mode = DenoiserMode::Upways;
             cfg.upscaler_mode = UpscalerMode::Upways;
             if (cfg.render_scale >= 1.0f) cfg.render_scale = 0.5f;
-        } else if (arg == "--upscaler" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--upscaler" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
                 cfg.upscaler_mode = UpscalerMode::FSR3;
@@ -491,7 +583,9 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upscaler_mode = UpscalerMode::None;
                 cfg.upways_superres = false;
             }
-        } else if (arg.starts_with("--upscaler=")) {
+            continue;
+        }
+        if (arg.starts_with("--upscaler=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             if (mode == "fsr3" || mode == "fsr3.1" || mode == "fsr") {
                 cfg.upscaler_mode = UpscalerMode::FSR3;
@@ -508,7 +602,9 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upscaler_mode = UpscalerMode::None;
                 cfg.upways_superres = false;
             }
-        } else if ((arg == "--upscaler-preset" || arg == "--upscaler-quality") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--upscaler-preset" || arg == "--upscaler-quality") && i + 1 < argc) {
             std::string preset = argv[++i];
             if (preset == "native") {
                 cfg.render_scale = 1.0f;
@@ -521,48 +617,86 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (preset == "ultra-performance" || preset == "ultra_performance" || preset == "ultra_perf") {
                 cfg.render_scale = 0.3333f; // 3.0x (e.g. 720p -> 4K)
             }
-        } else if (arg == "--upscaler-sharpening") {
+            continue;
+        }
+        if (arg == "--upscaler-sharpening") {
             cfg.upscaler_sharpening = true;
             if (cfg.upscaler_sharpness <= 0.0f) {
                 cfg.upscaler_sharpness = 0.5f;
             }
-        } else if (arg == "--upscaler-sharpness" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--upscaler-sharpness" && i + 1 < argc) {
             cfg.upscaler_sharpness = std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
             cfg.upscaler_sharpening = (cfg.upscaler_sharpness > 0.0f);
-        } else if (arg.starts_with("--upscaler-sharpness=")) {
+            continue;
+        }
+        if (arg.starts_with("--upscaler-sharpness=")) {
             cfg.upscaler_sharpness = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.0f, 1.0f);
             cfg.upscaler_sharpening = (cfg.upscaler_sharpness > 0.0f);
-        } else if (arg == "--upways-weights" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--upways-weights" && i + 1 < argc) {
             cfg.upways_weights_path = argv[++i];
-        } else if (arg.starts_with("--upways-weights=")) {
+            continue;
+        }
+        if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
-        } else if (arg == "--light-tree") {
+            continue;
+        }
+        if (arg == "--light-tree") {
             cfg.enable_light_tree = true;
-        } else if (arg == "--no-light-tree") {
+            continue;
+        }
+        if (arg == "--no-light-tree") {
             cfg.enable_light_tree = false;
-        } else if (arg == "--nrc") {
+            continue;
+        }
+        if (arg == "--nrc") {
             cfg.enable_nrc = true;
-        } else if (arg == "--nrc-bounce" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--nrc-bounce" && i + 1 < argc) {
             cfg.nrc_bounce = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--nrc-bounce=")) {
+            continue;
+        }
+        if (arg.starts_with("--nrc-bounce=")) {
             cfg.nrc_bounce = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--nrc-train-ratio" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--nrc-train-ratio" && i + 1 < argc) {
             cfg.nrc_train_ratio = std::stof(argv[++i]);
-        } else if (arg.starts_with("--nrc-train-ratio=")) {
+            continue;
+        }
+        if (arg.starts_with("--nrc-train-ratio=")) {
             cfg.nrc_train_ratio = std::stof(arg.substr(arg.find('=') + 1));
-        } else if (arg == "--caustics") {
+            continue;
+        }
+        if (arg == "--caustics") {
             cfg.enable_caustics = true;
-        } else if (arg == "--caustic-photons" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--caustic-photons" && i + 1 < argc) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--caustic-photons=")) {
+            continue;
+        }
+        if (arg.starts_with("--caustic-photons=")) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if (arg == "--restir-pt" || arg == "--restir-di" || arg == "--restir") {
+            continue;
+        }
+        if (arg == "--restir-pt" || arg == "--restir-di" || arg == "--restir") {
             cfg.enable_restir_di = true;
-        } else if (arg == "--restir-m-cap" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--restir-m-cap" && i + 1 < argc) {
             cfg.restir_di_m_cap = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--restir-m-cap=")) {
+            continue;
+        }
+        if (arg.starts_with("--restir-m-cap=")) {
             cfg.restir_di_m_cap = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
-        } else if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));
             if (sz == 16 || sz == 32 || sz == 64 || sz == 128) {
                 cfg.tile_size = sz;
@@ -570,73 +704,119 @@ Config Config::parse(int argc, char* argv[]) {
                 Logger::warn("Invalid tile size {} specified. Must be 16, 32, 64, or 128. Defaulting to 64.", sz);
                 cfg.tile_size = 64;
             }
-        } else if ((arg == "--wavefront-sort" || arg == "--wf-sort" || arg == "--material-sort") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--wavefront-sort" || arg == "--wf-sort" || arg == "--material-sort") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
-        } else if (arg.starts_with("--wavefront-sort=") || arg.starts_with("--wf-sort=") || arg.starts_with("--material-sort=")) {
+            continue;
+        }
+        if (arg.starts_with("--wavefront-sort=") || arg.starts_with("--wf-sort=") || arg.starts_with("--material-sort=")) {
             std::string s = arg.substr(arg.find('=') + 1);
             if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
-        } else if (arg == "--use-morton" || arg == "--morton") {
+            continue;
+        }
+        if (arg == "--use-morton" || arg == "--morton") {
             cfg.use_morton = true;
-        } else if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
             else if (s == "coherent" || s == "direct" || s == "direct-coherent" || s == "xiang" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherent;
             else if (s == "coherent-k8" || s == "direct-k8" || s == "3") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
-        } else if (arg.starts_with("--sec-sort=") || arg.starts_with("--secondary-sort=") || arg.starts_with("-ss=")) {
+            continue;
+        }
+        if (arg.starts_with("--sec-sort=") || arg.starts_with("--secondary-sort=") || arg.starts_with("-ss=")) {
             std::string s = arg.substr(arg.find('=') + 1);
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
             else if (s == "coherent" || s == "direct" || s == "direct-coherent" || s == "xiang" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherent;
             else if (s == "coherent-k8" || s == "direct-k8" || s == "3") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
-        } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
+            continue;
+        }
+        if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
             cfg.streamline_secondary_shading = false;
-        } else if (arg == "--no-distance-clamping" || arg == "--no-ray-clamping") {
+            continue;
+        }
+        if (arg == "--no-distance-clamping" || arg == "--no-ray-clamping") {
             cfg.distance_clamping = false;
-        } else if ((arg == "--sec-max-dist" || arg == "--secondary-max-distance") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--sec-max-dist" || arg == "--secondary-max-distance") && i + 1 < argc) {
             cfg.max_secondary_distance = std::stof(argv[++i]);
-        } else if (arg.starts_with("--sec-max-dist=") || arg.starts_with("--secondary-max-distance=")) {
+            continue;
+        }
+        if (arg.starts_with("--sec-max-dist=") || arg.starts_with("--secondary-max-distance=")) {
             cfg.max_secondary_distance = std::stof(arg.substr(arg.find('=') + 1));
-        } else if ((arg == "--indirect-clamp" || arg == "--sec-clamp") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--indirect-clamp" || arg == "--sec-clamp") && i + 1 < argc) {
             cfg.indirect_clamp = std::max(0.0f, std::stof(argv[++i]));
-        } else if (arg.starts_with("--indirect-clamp=") || arg.starts_with("--sec-clamp=")) {
+            continue;
+        }
+        if (arg.starts_with("--indirect-clamp=") || arg.starts_with("--sec-clamp=")) {
             cfg.indirect_clamp = std::max(0.0f, std::stof(arg.substr(arg.find('=') + 1)));
-        } else if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
-        } else if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
+            continue;
+        }
+        if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
             cfg.dgc_preprocess = false;
             setEnvVar("PATHWAYS_DISABLE_DGC_PREPROCESS", "1");
-        } else if (arg == "--no-inline-shadows") {
+            continue;
+        }
+        if (arg == "--no-inline-shadows") {
             cfg.inline_primary_shadows = false;
-        } else if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
+            continue;
+        }
+        if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
             setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
             setEnvVar("PATHWAYS_ENABLE_MATERIAL_DGC", "1");
-        } else if (arg == "--no-dgc-execset" || arg == "--no-dgc-tier2-execset") {
+            continue;
+        }
+        if (arg == "--no-dgc-execset" || arg == "--no-dgc-tier2-execset") {
             setEnvVar("PATHWAYS_DISABLE_DGC_EXECSET", "1");
             setEnvVar("PATHWAYS_DISABLE_MATERIAL_DGC", "1");
-        } else if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
+            continue;
+        }
+        if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {
             cfg.double_buffered_shared_mem = false;
-        } else if (arg == "--camera-motion") {
+            continue;
+        }
+        if (arg == "--camera-motion") {
             cfg.camera_motion = true;
-        } else if (arg == "--adaptive-speed" || arg == "--distance-adaptive-speed") {
+            continue;
+        }
+        if (arg == "--adaptive-speed" || arg == "--distance-adaptive-speed") {
             cfg.adaptive_speed = true;
-        } else if (arg == "--no-adaptive-speed" || arg == "--no-distance-adaptive-speed") {
+            continue;
+        }
+        if (arg == "--no-adaptive-speed" || arg == "--no-distance-adaptive-speed") {
             cfg.adaptive_speed = false;
-        } else if (arg == "--gamepad-deadzone" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--gamepad-deadzone" && i + 1 < argc) {
             cfg.gamepad_deadzone = std::clamp(std::stof(argv[++i]), 0.01f, 0.50f);
-        } else if (arg.starts_with("--gamepad-deadzone=")) {
+            continue;
+        }
+        if (arg.starts_with("--gamepad-deadzone=")) {
             cfg.gamepad_deadzone = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.01f, 0.50f);
-        } else if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {
             std::string combinedStr = argv[++i];
             auto nums = parseNumbers(combinedStr);
             while (nums.size() < 6 && i + 1 < argc) {
@@ -673,7 +853,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid --camera argument '{}'. Expected at least 6 values: px,py,pz,tx,ty,tz[,fov]", combinedStr);
             }
-        } else if (arg.starts_with("--camera=") || arg.starts_with("-c=")) {
+            continue;
+        }
+        if (arg.starts_with("--camera=") || arg.starts_with("-c=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             auto nums = parseNumbers(val);
             if (nums.size() >= 6) {
@@ -690,7 +872,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid --camera argument '{}'. Expected at least 6 values: px,py,pz,tx,ty,tz[,fov]", val);
             }
-        } else if ((arg == "--camera-pos" || arg == "--cam-pos" || arg == "--camera-position" || arg == "--cam-position") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--camera-pos" || arg == "--cam-pos" || arg == "--camera-position" || arg == "--cam-position") && i + 1 < argc) {
             std::string combinedStr = argv[++i];
             glm::vec3 pos;
             if (parseVec3(combinedStr, pos)) {
@@ -706,7 +890,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera position '{}'. Expected x,y,z", combinedStr);
             }
-        } else if (arg.starts_with("--camera-pos=") || arg.starts_with("--cam-pos=") ||
+            continue;
+        }
+        if (arg.starts_with("--camera-pos=") || arg.starts_with("--cam-pos=") ||
                    arg.starts_with("--camera-position=") || arg.starts_with("--cam-position=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             glm::vec3 pos;
@@ -715,7 +901,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera position '{}'. Expected x,y,z", val);
             }
-        } else if ((arg == "--camera-target" || arg == "--cam-target" || arg == "--camera-lookat" || arg == "--cam-lookat") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--camera-target" || arg == "--cam-target" || arg == "--camera-lookat" || arg == "--cam-lookat") && i + 1 < argc) {
             std::string combinedStr = argv[++i];
             glm::vec3 target;
             if (parseVec3(combinedStr, target)) {
@@ -731,7 +919,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera target '{}'. Expected x,y,z", combinedStr);
             }
-        } else if (arg.starts_with("--camera-target=") || arg.starts_with("--cam-target=") ||
+            continue;
+        }
+        if (arg.starts_with("--camera-target=") || arg.starts_with("--cam-target=") ||
                    arg.starts_with("--camera-lookat=") || arg.starts_with("--cam-lookat=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             glm::vec3 target;
@@ -740,7 +930,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera target '{}'. Expected x,y,z", val);
             }
-        } else if ((arg == "--camera-up" || arg == "--cam-up") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--camera-up" || arg == "--cam-up") && i + 1 < argc) {
             std::string combinedStr = argv[++i];
             glm::vec3 up;
             if (parseVec3(combinedStr, up)) {
@@ -756,7 +948,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera up vector '{}'. Expected x,y,z", combinedStr);
             }
-        } else if (arg.starts_with("--camera-up=") || arg.starts_with("--cam-up=")) {
+            continue;
+        }
+        if (arg.starts_with("--camera-up=") || arg.starts_with("--cam-up=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             glm::vec3 up;
             if (parseVec3(val, up)) {
@@ -764,20 +958,26 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 Logger::warn("Invalid camera up vector '{}'. Expected x,y,z", val);
             }
-        } else if ((arg == "--camera-fov" || arg == "--cam-fov" || arg == "--fov") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--camera-fov" || arg == "--cam-fov" || arg == "--fov") && i + 1 < argc) {
             try {
                 cfg.camera_fov = std::stof(argv[++i]);
             } catch (...) {
                 Logger::warn("Invalid camera fov '{}'. Expected degrees float", argv[i]);
             }
-        } else if (arg.starts_with("--camera-fov=") || arg.starts_with("--cam-fov=") || arg.starts_with("--fov=")) {
+            continue;
+        }
+        if (arg.starts_with("--camera-fov=") || arg.starts_with("--cam-fov=") || arg.starts_with("--fov=")) {
             std::string val = arg.substr(arg.find('=') + 1);
             try {
                 cfg.camera_fov = std::stof(val);
             } catch (...) {
                 Logger::warn("Invalid camera fov '{}'. Expected degrees float", val);
             }
-        } else if ((arg == "--pipeline" || arg == "-p") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--pipeline" || arg == "-p") && i + 1 < argc) {
             std::string pipeStr = argv[++i];
             std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
             if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
@@ -785,7 +985,9 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.pipeline_type = PipelineType::Wavefront;
             }
-        } else if (arg.starts_with("--pipeline=")) {
+            continue;
+        }
+        if (arg.starts_with("--pipeline=")) {
             std::string pipeStr = arg.substr(arg.find('=') + 1);
             std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
             if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
@@ -793,78 +995,129 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.pipeline_type = PipelineType::Wavefront;
             }
-        } else if (arg == "--visualize-split" || arg == "--show-split") {
+            continue;
+        }
+        if (arg == "--visualize-split" || arg == "--show-split") {
             cfg.visualize_mgpu_split = true;
-        } else if (arg == "--log-interval") {
+            continue;
+        }
+        if (arg == "--log-interval") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cfg.log_interval_sec = std::stof(argv[++i]);
             } else {
                 cfg.log_interval_sec = 10.0f;
             }
-        } else if (arg == "--benchmark") {
+            continue;
+        }
+        if (arg == "--benchmark") {
             cfg.benchmark = true;
-        } else if (arg == "--test-scene-switching") {
+            continue;
+        }
+        if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
             cfg.headless = true;
-        } else if (arg == "--target-fps" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--target-fps" && i + 1 < argc) {
             cfg.target_fps = static_cast<uint32_t>(std::stoul(argv[++i]));
             cfg.adaptive_spp = (cfg.target_fps > 0);
             if (!frame_time_explicit && cfg.target_fps > 0) {
                 cfg.target_frame_time_ms = 1000.0f / static_cast<float>(cfg.target_fps);
             }
-        } else if (arg.starts_with("--target-fps=")) {
+            continue;
+        }
+        if (arg.starts_with("--target-fps=")) {
             cfg.target_fps = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
             cfg.adaptive_spp = (cfg.target_fps > 0);
             if (!frame_time_explicit && cfg.target_fps > 0) {
                 cfg.target_frame_time_ms = 1000.0f / static_cast<float>(cfg.target_fps);
             }
-        } else if ((arg == "--target-frame-time" || arg == "--frame-budget") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--target-frame-time" || arg == "--frame-budget") && i + 1 < argc) {
             cfg.target_frame_time_ms = std::stof(argv[++i]);
             frame_time_explicit = true;
-        } else if (arg.starts_with("--target-frame-time=") || arg.starts_with("--frame-budget=")) {
+            continue;
+        }
+        if (arg.starts_with("--target-frame-time=") || arg.starts_with("--frame-budget=")) {
             cfg.target_frame_time_ms = std::stof(arg.substr(arg.find('=') + 1));
             frame_time_explicit = true;
-        } else if (arg == "--adaptive-spp") {
+            continue;
+        }
+        if (arg == "--adaptive-spp") {
             cfg.adaptive_spp = true;
-        } else if (arg == "--min-spp" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--min-spp" && i + 1 < argc) {
             cfg.min_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--max-spp" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--max-spp" && i + 1 < argc) {
             cfg.max_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--min-bounces" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--min-bounces" && i + 1 < argc) {
             cfg.min_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--max-dynamic-bounces" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--max-dynamic-bounces" && i + 1 < argc) {
             cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--no-accumulation" || arg == "--realtime") {
+            continue;
+        }
+        if (arg == "--no-accumulation" || arg == "--realtime") {
             cfg.progressive_accumulation = false;
-        } else if ((arg == "--accum-cutoff" || arg == "--max-accum-frames" || arg == "--accum-limit") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--accum-cutoff" || arg == "--max-accum-frames" || arg == "--accum-limit") && i + 1 < argc) {
             cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") || arg.starts_with("--accum-limit=")) {
+            continue;
+        }
+        if (arg.starts_with("--accum-cutoff=") || arg.starts_with("--max-accum-frames=") || arg.starts_with("--accum-limit=")) {
             size_t eq = arg.find('=');
             cfg.max_accum_frames = static_cast<uint32_t>(std::stoul(arg.substr(eq + 1)));
-        } else if (arg == "--no-indirect" || arg == "--direct-only") {
+            continue;
+        }
+        if (arg == "--no-indirect" || arg == "--direct-only") {
             cfg.enable_indirect_light = false;
-        } else if (arg == "--no-hdr") {
+            continue;
+        }
+        if (arg == "--no-hdr") {
             cfg.enable_hdr = false;
-        } else if (arg == "--hdr-peak" && i + 1 < argc) {
+            continue;
+        }
+        if (arg == "--hdr-peak" && i + 1 < argc) {
             cfg.hdr_peak_nits = std::stof(argv[++i]);
             cfg.custom_hdr_peak = true;
-        } else if (arg.starts_with("--hdr-peak=")) {
+            continue;
+        }
+        if (arg.starts_with("--hdr-peak=")) {
             cfg.hdr_peak_nits = std::stof(arg.substr(arg.find('=') + 1));
             cfg.custom_hdr_peak = true;
-        } else if ((arg == "--hdr-white" || arg == "--hdr-paper-white") && i + 1 < argc) {
+            continue;
+        }
+        if ((arg == "--hdr-white" || arg == "--hdr-paper-white") && i + 1 < argc) {
             cfg.hdr_paper_white_nits = std::stof(argv[++i]);
-        } else if (arg.starts_with("--hdr-white=") || arg.starts_with("--hdr-paper-white=")) {
+            continue;
+        }
+        if (arg.starts_with("--hdr-white=") || arg.starts_with("--hdr-paper-white=")) {
             cfg.hdr_paper_white_nits = std::stof(arg.substr(arg.find('=') + 1));
-        } else if (arg == "--no-validation") {
+            continue;
+        }
+        if (arg == "--no-validation") {
             cfg.validation_layers = false;
-        } else if (arg == "--debug") {
+            continue;
+        }
+        if (arg == "--debug") {
             Logger::setLogLevel(LogLevel::Debug);
-        } else if (arg == "-h" || arg == "--help") {
+            continue;
+        }
+        if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             std::exit(0);
-        } else {
-            Logger::warn("Unknown command-line argument: {}", arg);
+            continue;
         }
+
+        Logger::warn("Unknown command-line argument: {}", arg);
     }
 
     if (cfg.custom_resolution && !fullscreen_explicit) {
