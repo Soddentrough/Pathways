@@ -187,7 +187,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl ${SHADER_DIR}/compute/restir_common.glsl
+            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl ${SHADER_DIR}/compute/upways_common_v3.glsl ${SHADER_DIR}/compute/restir_common.glsl
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})

@@ -401,6 +401,7 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     ubo.prevViewProj = m_hasPrevViewProj ? m_prevViewProj : unjitteredViewProj;
     if (updatePrev) {
         m_prevViewProj = unjitteredViewProj; // Store unjittered for velocity estimation
+        m_prevView = view;
         m_hasPrevViewProj = true;
     }
 
@@ -419,6 +420,7 @@ void Camera::advanceFrame() {
     glm::mat4 view = getViewMatrix();
     glm::mat4 unjitteredProj = getProjectionMatrix();
     m_prevViewProj = unjitteredProj * view;
+    m_prevView = view;
     m_hasPrevViewProj = true;
 }
 

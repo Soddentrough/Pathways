@@ -2630,33 +2630,23 @@ void Engine::updateUpwaysDescriptors() {
 
     VkImageView normDepthView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
     VkImageView motionView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView albedoView = m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE);
+    VkImageView albedoView = (m_config.pipeline_type == PipelineType::Wavefront && m_mlAlbedoRoughnessImage)
+        ? m_mlAlbedoRoughnessImage->getImageView()
+        : (m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE));
     VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : motionView;
     VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_accumImage->getImageView();
     VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : m_accumImage->getImageView();
 
-    VkBuffer restirBuffer0 = VK_NULL_HANDLE;
-    VkBuffer restirBuffer1 = VK_NULL_HANDLE;
-    if (m_restirManager && m_config.enable_restir_di) {
-        Buffer* sBuf0 = m_restirManager->getSpatialReservoirBuffer(0);
-        Buffer* sBuf1 = m_restirManager->getSpatialReservoirBuffer(1);
-        if (sBuf0) restirBuffer0 = sBuf0->getBuffer();
-        if (sBuf1) restirBuffer1 = sBuf1->getBuffer();
-    }
-
-    VkImageView confView = m_upwaysPipeline->getConfidenceImage() ? m_upwaysPipeline->getConfidenceImage()->getImageView() : VK_NULL_HANDLE;
-
     m_upwaysPipeline->updateDescriptors(
-        m_accumImage->getImageView(),
-        normDepthView,
-        motionView,
-        albedoView,
-        specMotionView,
         diffView,
         specView,
-        restirBuffer0,
-        confView,
-        restirBuffer1
+        normDepthView,
+        albedoView,
+        motionView,
+        specMotionView,
+        specMotionView,
+        albedoView,
+        normDepthView
     );
 
     if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage()) {
@@ -2693,8 +2683,34 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
         updateUpwaysDescriptors();
     }
 
+    glm::mat4 currInvView(1.0f);
+    glm::mat4 prevViewProj(1.0f);
+    glm::mat4 invProj(1.0f);
+    glm::mat4 prevView(1.0f);
+    glm::vec2 jitter(0.0f);
+
+    if (m_camera) {
+        if (resetHistory) {
+            m_camera->resetPrevViewProj();
+        }
+        bool enableJitter = (m_config.upscaler_mode == UpscalerMode::Upways || m_config.upways_superres);
+        CameraUniform ubo = m_camera->getUniformData(
+            m_frameIndex, 1, m_config.max_bounces, 0,
+            enableJitter, inW, inH, 0, false
+        );
+        currInvView = ubo.viewInverse;
+        prevViewProj = m_camera->getPrevViewProjMatrix();
+        invProj = ubo.projInverse;
+        prevView = m_camera->getPrevViewMatrix();
+        jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
+    }
+
     uint32_t totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u;
-    m_upwaysPipeline->recordFrame(cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame, 0, 0, 0, 0, 0, totalSamples);
+
+    m_upwaysPipeline->recordFrame(
+        cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame,
+        currInvView, prevViewProj, invProj, prevView, jitter, totalSamples
+    );
     return true;
 }
 
@@ -4095,11 +4111,11 @@ void Engine::initQueryPool() {
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 4 * MAX_FRAMES_IN_FLIGHT; // 4 timestamps per frame in flight
+    queryInfo.queryCount = QUERIES_PER_FRAME * MAX_FRAMES_IN_FLIGHT; // 6 timestamps per frame in flight
     vkCreateQueryPool(device, &queryInfo, nullptr, &m_queryPool);
 
     m_timestampPeriod = m_context->getDeviceProperties().limits.timestampPeriod;
-    Logger::info("GPU Timestamp Profiler initialized (period: {:.2f} ns/tick)", m_timestampPeriod);
+    Logger::info("GPU Timestamp Profiler initialized (period: {:.2f} ns/tick, {} queries/frame)", m_timestampPeriod, QUERIES_PER_FRAME);
 }
 
 void Engine::setCameraMode(bool active) {
@@ -4388,9 +4404,9 @@ void Engine::renderFrame() {
 
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
-        uint32_t qBase = m_currentFrame * 4;
-        uint64_t timestamps[4] = {0, 0, 0, 0};
-        vkGetQueryPoolResults(device, m_queryPool, qBase, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
+        uint64_t timestamps[QUERIES_PER_FRAME] = {0};
+        vkGetQueryPoolResults(device, m_queryPool, qBase, QUERIES_PER_FRAME, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         double gpuRtMs = 0.0;
         if (timestamps[1] > timestamps[0]) {
             gpuRtMs = (timestamps[1] - timestamps[0]) * m_timestampPeriod * 1e-6;
@@ -4399,19 +4415,25 @@ void Engine::renderFrame() {
         if (timestamps[3] > timestamps[2]) {
             gpuTonemapMs = (timestamps[3] - timestamps[2]) * m_timestampPeriod * 1e-6;
         }
+        double gpuUpwaysMs = 0.0;
+        if (timestamps[5] > timestamps[4]) {
+            gpuUpwaysMs = (timestamps[5] - timestamps[4]) * m_timestampPeriod * 1e-6;
+        }
         if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
         if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
+        if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
 
         double secGpuMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
-            : (gpuRtMs + gpuTonemapMs);
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
+            : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
         m_lastTonemapMs = gpuTonemapMs;
+        m_lastUpwaysMs = gpuUpwaysMs;
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
 
         if (!completedSlotSkipped) {
@@ -4794,10 +4816,6 @@ void Engine::renderFrame() {
 
     if (!isMgpu) {
         // --- Single GPU Execution Path ---
-        if (m_camera) {
-            m_camera->advanceFrame();
-        }
-
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -4823,8 +4841,8 @@ void Engine::renderFrame() {
             vkCmdPipelineBarrier2(cmd, &frameStartDep);
         }
 
-        uint32_t qBase = m_currentFrame * 4;
-        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
+        uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
+        vkCmdResetQueryPool(cmd, m_queryPool, qBase, QUERIES_PER_FRAME);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         // GPU-Timeline TLAS Update / Refit (Tier 3)
@@ -5083,7 +5101,9 @@ void Engine::renderFrame() {
         m_temporalResetRequested = false;
         bool upwaysRun = false;
         if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
             upwaysRun = dispatchUpways(cmd, resetTemporal);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         // AMD FidelityFX Super Resolution 3.1
@@ -5224,10 +5244,6 @@ void Engine::renderFrame() {
             m_cameraUBOs[m_currentFrame]->copyFrom(&uboPrim, sizeof(CameraUniform));
         }
 
-        if (m_camera) {
-            m_camera->advanceFrame();
-        }
-
         if (m_mgpu) {
             m_mgpu->setConfig(m_config);
         }
@@ -5264,8 +5280,8 @@ void Engine::renderFrame() {
         rtBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &rtBeginInfo);
 
-        uint32_t qBase = m_currentFrame * 4;
-        vkCmdResetQueryPool(cmd, m_queryPool, qBase, 4);
+        uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
+        vkCmdResetQueryPool(cmd, m_queryPool, qBase, QUERIES_PER_FRAME);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
 
         // GPU-Timeline TLAS Update / Refit (Tier 3)
@@ -5512,7 +5528,9 @@ void Engine::renderFrame() {
         m_temporalResetRequested = false;
         bool upwaysRun = false;
         if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
             upwaysRun = dispatchUpways(activeCmd, resetTemporal);
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         // AMD FidelityFX Super Resolution 3.1
@@ -5934,9 +5952,9 @@ void Engine::dumpOutputFiles() {
     uint32_t drainCount = std::min(m_totalFramesRendered, MAX_FRAMES_IN_FLIGHT);
     for (uint32_t d = 0; d < drainCount; ++d) {
         uint32_t slot = (m_totalFramesRendered - drainCount + d) % MAX_FRAMES_IN_FLIGHT;
-        uint32_t qBase = slot * 4;
-        uint64_t timestamps[4] = {0, 0, 0, 0};
-        vkGetQueryPoolResults(device, m_queryPool, qBase, 4, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        uint32_t qBase = slot * QUERIES_PER_FRAME;
+        uint64_t timestamps[QUERIES_PER_FRAME] = {0};
+        vkGetQueryPoolResults(device, m_queryPool, qBase, QUERIES_PER_FRAME, sizeof(timestamps), timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         double gpuRtMs = 0.0;
         if (timestamps[1] > timestamps[0]) {
             gpuRtMs = (timestamps[1] - timestamps[0]) * m_timestampPeriod * 1e-6;
@@ -5945,16 +5963,21 @@ void Engine::dumpOutputFiles() {
         if (timestamps[3] > timestamps[2]) {
             gpuTonemapMs = (timestamps[3] - timestamps[2]) * m_timestampPeriod * 1e-6;
         }
+        double gpuUpwaysMs = 0.0;
+        if (timestamps[5] > timestamps[4]) {
+            gpuUpwaysMs = (timestamps[5] - timestamps[4]) * m_timestampPeriod * 1e-6;
+        }
         if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
         if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
+        if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
 
         double secGpuMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
         }
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs)
-            : (gpuRtMs + gpuTonemapMs);
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
+            : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         uint32_t lastCompletedSlot = (m_totalFramesRendered - 1) % MAX_FRAMES_IN_FLIGHT;
         bool lastSlotSkipped = m_slotSkippedRayTracing[lastCompletedSlot];
@@ -5967,6 +5990,7 @@ void Engine::dumpOutputFiles() {
             m_lastGpuRtMs = gpuRtMs;
             m_lastSecGpuMs = secGpuMs;
             m_lastTonemapMs = gpuTonemapMs;
+            m_lastUpwaysMs = gpuUpwaysMs;
             m_lastFrameTimeMs = totalGpuMs;
             m_frameTimesMs.push_back(m_lastFrameTimeMs);
 
@@ -6234,6 +6258,10 @@ void Engine::dumpOutputFiles() {
         FrameStats stats = getStats();
         ImageDumper::saveStatsJSON(m_config.dump_stats_path, stats);
     }
+
+    if (m_camera) {
+        m_camera->advanceFrame();
+    }
 }
 
 FrameStats Engine::getStats() const {
@@ -6357,6 +6385,7 @@ FrameStats Engine::getStats() const {
     stats.primary_gpu_time_ms = m_lastGpuRtMs;
     stats.secondary_gpu_time_ms = m_lastSecGpuMs;
     stats.tonemap_time_ms = m_lastTonemapMs;
+    stats.upways_time_ms = m_lastUpwaysMs;
     stats.num_triangles = m_numTriangles;
     stats.num_instanced_triangles = m_numInstancedTriangles;
     stats.num_instances = m_numInstances;

@@ -190,6 +190,7 @@ private:
     std::vector<VkSemaphore> m_renderFinishedSemaphores;
 
     // Timestamp Profiling
+    static constexpr uint32_t QUERIES_PER_FRAME = 6;
     VkQueryPool m_queryPool = VK_NULL_HANDLE;
     float m_timestampPeriod = 1.0f; // ns per tick
 
@@ -368,6 +369,7 @@ private:
     double m_lastGpuRtMs = 0.0;
     double m_lastSecGpuMs = 0.0;
     double m_lastTonemapMs = 0.0;
+    double m_lastUpwaysMs = 0.0;
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotSkippedRayTracing = {false, false};
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;

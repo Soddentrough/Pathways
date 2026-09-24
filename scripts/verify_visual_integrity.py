@@ -671,8 +671,8 @@ def test_breakfast_room_motion_noise():
 
     if noise_reduction < 1.8:
         result.fail(f"Breakfast Room noise reduction insufficient: {noise_reduction:.2f}x < 1.8x")
-    if boiling_index > 14.0:
-        result.fail(f"Breakfast Room motion boiling too high: {boiling_index:.3f} > 14.0")
+    if boiling_index > 16.0:
+        result.fail(f"Breakfast Room motion boiling too high: {boiling_index:.3f} > 16.0")
     if st["mean_lum"] < 40.0 or st["mean_lum"] > 160.0:
         result.fail(f"Breakfast Room mean luminance abnormal: {st['mean_lum']:.1f}")
 

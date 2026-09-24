@@ -1,65 +1,61 @@
 #pragma once
 
-// Auto-generated Pure Neural Reconstructor FP16 WMMA Weights Header
-// Matrix Layout: Transposed (C_in, C_out) Row-Major with stride C_out
+// Auto-generated Upways Wave32 WMMA KPN Reconstructor FP16 Weights Header
+// Target: 32 -> 128 -> 32 Multi-Scale Kernel Prediction Network
+// Matching shaders/compute/neural_reconstruct.comp
 #include <cstdint>
 
 namespace upways {
 
+struct KPNWeightsBuffer {
+    uint16_t w_l1[32 * 128]; // Offset 0, 8192 bytes
+    uint16_t w_l2[128 * 32]; // Offset 8192, 8192 bytes
+    uint16_t b_l1[128];      // Offset 16384, 256 bytes
+    uint16_t b_l2[32];       // Offset 16640, 64 bytes
+};
+
+constexpr uint32_t KPN_W_L1_OFFSET = 0;
+constexpr uint32_t KPN_W_L1_SIZE   = 8192;
+constexpr uint32_t KPN_W_L2_OFFSET = 8192;
+constexpr uint32_t KPN_W_L2_SIZE   = 8192;
+constexpr uint32_t KPN_B_L1_OFFSET = 16384;
+constexpr uint32_t KPN_B_L1_SIZE   = 256;
+constexpr uint32_t KPN_B_L2_OFFSET = 16640;
+constexpr uint32_t KPN_B_L2_SIZE   = 64;
+
+constexpr uint32_t TOTAL_KPN_WEIGHT_BUFFER_SIZE = 16704;
+constexpr uint32_t TOTAL_WEIGHT_BUFFER_SIZE = 16704;
+
 struct LayerDescriptor {
-    uint32_t weightOffset; // Byte offset from start of SSBO
-    uint32_t weightSize;   // Size in bytes
-    uint32_t biasOffset;   // Bias byte offset (16-byte aligned)
-    uint32_t biasSize;     // Bias size in bytes
-    uint32_t outChannels;  // C_out
-    uint32_t inChannels;   // C_in
-    uint32_t stride;       // Row stride (C_out)
+    uint32_t weightOffset;
+    uint32_t weightSize;
+    uint32_t biasOffset;
+    uint32_t biasSize;
+    uint32_t outChannels;
+    uint32_t inChannels;
+    uint32_t stride;
 };
 
-constexpr uint32_t TOTAL_WEIGHT_BUFFER_SIZE = 22944;
-
-// Layer: fc1
+// Layer: fc1 (32 -> 128)
 inline constexpr LayerDescriptor LAYER_FC1 = {
-    .weightOffset = 0,
-    .weightSize   = 4096,
-    .biasOffset   = 4096,
-    .biasSize     = 128,
-    .outChannels  = 64,
+    .weightOffset = KPN_W_L1_OFFSET,
+    .weightSize   = KPN_W_L1_SIZE,
+    .biasOffset   = KPN_B_L1_OFFSET,
+    .biasSize     = KPN_B_L1_SIZE,
+    .outChannels  = 128,
     .inChannels   = 32,
-    .stride       = 64
+    .stride       = 128
 };
 
-// Layer: fc2
+// Layer: fc2 (128 -> 32)
 inline constexpr LayerDescriptor LAYER_FC2 = {
-    .weightOffset = 4224,
-    .weightSize   = 8192,
-    .biasOffset   = 12416,
-    .biasSize     = 128,
-    .outChannels  = 64,
-    .inChannels   = 64,
-    .stride       = 64
-};
-
-// Layer: fc3
-inline constexpr LayerDescriptor LAYER_FC3 = {
-    .weightOffset = 12544,
-    .weightSize   = 8192,
-    .biasOffset   = 20736,
-    .biasSize     = 128,
-    .outChannels  = 64,
-    .inChannels   = 64,
-    .stride       = 64
-};
-
-// Layer: fc4
-inline constexpr LayerDescriptor LAYER_FC4 = {
-    .weightOffset = 20864,
-    .weightSize   = 2048,
-    .biasOffset   = 22912,
-    .biasSize     = 32,
-    .outChannels  = 16,
-    .inChannels   = 64,
-    .stride       = 16
+    .weightOffset = KPN_W_L2_OFFSET,
+    .weightSize   = KPN_W_L2_SIZE,
+    .biasOffset   = KPN_B_L2_OFFSET,
+    .biasSize     = KPN_B_L2_SIZE,
+    .outChannels  = 32,
+    .inChannels   = 128,
+    .stride       = 32
 };
 
 } // namespace upways

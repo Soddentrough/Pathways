@@ -149,6 +149,7 @@ struct FrameStats {
     double primary_gpu_time_ms = 0.0;
     double secondary_gpu_time_ms = 0.0;
     double tonemap_time_ms = 0.0;
+    double upways_time_ms = 0.0;
     double pcie_transfer_time_ms = 0.0;
 
     // Wavefront Sub-Pass & Bounce Breakdown
@@ -212,6 +213,7 @@ struct FrameStats {
         double primary_gpu_time_ms = 0.0;
         double secondary_gpu_time_ms = 0.0;
         double tonemap_time_ms = 0.0;
+        double upways_time_ms = 0.0;
         double gigarays_per_second = 0.0;
         double target_frame_time_ms = 8.3;
         bool target_achieved = false;

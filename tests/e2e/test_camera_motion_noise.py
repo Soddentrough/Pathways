@@ -869,7 +869,7 @@ class CameraMotionTestSuite:
 
             # Tier 3
             (3, self.test_t3_01_motion_with_fsr3),
-            (3, self.test_t3_02_motion_with_temporal_accum),
+            (3, self.test_t3_02_motion_with_upways),
             (3, self.test_t3_03_motion_mgpu_sample_parallel),
             (3, self.test_t3_04_motion_mgpu_checkerboard_tile),
             (3, self.test_t3_05_motion_with_nrc),

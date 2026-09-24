@@ -114,7 +114,13 @@ public:
 
     bool hasMoved() const { return m_moved; }
     void resetMoved() { m_moved = false; }
-    void resetPrevViewProj() { m_hasPrevViewProj = false; }
+    void resetPrevViewProj() {
+        m_hasPrevViewProj = false;
+        m_prevViewProj = glm::mat4(1.0f);
+        m_prevView = glm::mat4(1.0f);
+    }
+    glm::mat4 getPrevViewMatrix() const { return m_hasPrevViewProj ? m_prevView : getViewMatrix(); }
+    glm::mat4 getPrevViewProjMatrix() const { return m_hasPrevViewProj ? m_prevViewProj : (getProjectionMatrix() * getViewMatrix()); }
     glm::vec3 getVelocity() const { return m_velocity; }
 
 private:
@@ -153,6 +159,7 @@ private:
     bool m_moved = true;
     glm::vec3 m_velocity{ 0.0f };
     mutable glm::mat4 m_prevViewProj{ 1.0f };
+    mutable glm::mat4 m_prevView{ 1.0f };
     mutable bool m_hasPrevViewProj = false;
 };
 
