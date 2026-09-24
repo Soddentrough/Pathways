@@ -4828,6 +4828,7 @@ void Engine::renderFrame() {
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
             wfSceneData.inlineShadows = m_config.inline_primary_shadows;
+            wfSceneData.macroTileSize = m_config.macro_tile_size;
             wfSceneData.fullWidth = renderW;
             wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
                                         m_config.upscaler_mode == UpscalerMode::Upways ||

@@ -649,41 +649,63 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         m_dummyImageTransitioned = true;
     }
 
-    // 3. Monolithic DGC Frame Recording
+    // 3. Monolithic or Macro-Tiled Frame Recording
+    uint32_t macroTile = sceneData.macroTileSize;
+    uint32_t numTilesX = (macroTile > 0 && sceneData.tileOffsetX == 0 && sceneData.tileOffsetY == 0)
+                         ? (width + macroTile - 1) / macroTile : 1;
+    uint32_t numTilesY = (macroTile > 0 && sceneData.tileOffsetX == 0 && sceneData.tileOffsetY == 0)
+                         ? (height + macroTile - 1) / macroTile : 1;
+
     for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
-        bool shouldProfile = (sampleIdx == 0);
+        for (uint32_t ty = 0; ty < numTilesY; ++ty) {
+            for (uint32_t tx = 0; tx < numTilesX; ++tx) {
+                bool shouldProfile = (sampleIdx == 0 && tx == 0 && ty == 0);
 
-        // 3a. Classify & Primary Ray Generation
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
+                uint32_t tileOffX = (numTilesX > 1) ? tx * macroTile : sceneData.tileOffsetX;
+                uint32_t tileOffY = (numTilesY > 1) ? ty * macroTile : sceneData.tileOffsetY;
+                uint32_t curTileW = (numTilesX > 1) ? std::min(macroTile, width - tileOffX) : width;
+                uint32_t curTileH = (numTilesY > 1) ? std::min(macroTile, height - tileOffY) : height;
+                uint32_t tileSzX = (numTilesX > 1) ? curTileW : 0;
+                uint32_t tileSzY = (numTilesY > 1) ? curTileH : 0;
 
-        uint32_t classifyPC[21] = {
-            sceneData.numTriangles,
-            sceneData.numSpheres,
-            sceneData.numMaterials,
-            sceneData.numLights,
-            width,
-            height,
-            sceneData.useMorton,
-            sceneData.hasEnvMap,
-            std::bit_cast<uint32_t>(sceneData.envMapIntensity),
-            m_maxCapacity,
-            sampleIdx,
-            sceneData.useHardwareRT,
-            sceneData.tileOffsetX,
-            sceneData.tileOffsetY,
-            0,
-            0,
-            sceneData.sortMode,
-            sceneData.numOpaqueTriangles,
-            fw,
-            fh,
-            sceneData.captureMlData
-        };
-        vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
-        if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
-        vkCmdDispatch(cmd, (width + 7) / 8, (height + 3) / 4, 1);
-        if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], 2);
+                if ((numTilesX > 1 || numTilesY > 1) && (tx > 0 || ty > 0)) {
+                    vkCmdFillBuffer(cmd, m_indirectArgs[frameSlot]->getBuffer(), 0, indirectClearBytes, 0);
+                    vkCmdFillBuffer(cmd, m_dgcStream[frameSlot]->getBuffer(), 0, dgcClearBytes, 0);
+                    vkCmdFillBuffer(cmd, m_queueCounters[frameSlot]->getBuffer(), 0, 256, 0);
+                    vkCmdPipelineBarrier2(cmd, &clearDep);
+                }
+
+                // 3a. Classify & Primary Ray Generation
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
+
+                uint32_t classifyPC[21] = {
+                    sceneData.numTriangles,
+                    sceneData.numSpheres,
+                    sceneData.numMaterials,
+                    sceneData.numLights,
+                    curTileW,
+                    curTileH,
+                    sceneData.useMorton,
+                    sceneData.hasEnvMap,
+                    std::bit_cast<uint32_t>(sceneData.envMapIntensity),
+                    m_maxCapacity,
+                    sampleIdx,
+                    sceneData.useHardwareRT,
+                    tileOffX,
+                    tileOffY,
+                    tileSzX,
+                    tileSzY,
+                    sceneData.sortMode,
+                    sceneData.numOpaqueTriangles,
+                    fw,
+                    fh,
+                    sceneData.captureMlData
+                };
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
+                if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
+                vkCmdDispatch(cmd, (curTileW + 7) / 8, (curTileH + 3) / 4, 1);
+                if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], 2);
 
         // Barrier: Classify -> Bounce 0 Shade (Indirect / DGC dispatch, scoped buffer barriers)
         std::vector<VkBufferMemoryBarrier2> c2sBarriers;
@@ -723,7 +745,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         c2sDep.pBufferMemoryBarriers = c2sBarriers.data();
         vkCmdPipelineBarrier2(cmd, &c2sDep);
 
-        if (sampleIdx == 0 && m_postClassifyCallback) {
+        if (sampleIdx == 0 && tx == 0 && ty == 0 && m_postClassifyCallback) {
             m_postClassifyCallback(cmd, frameSlot);
         }
 
@@ -993,6 +1015,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 }
             }
         } // end multi-bounce loop
+            } // end tx
+        } // end ty
 
         if (sampleIdx + 1 < spp) {
             // Synchronize accumulation image and reset queue counters for the next sample iteration

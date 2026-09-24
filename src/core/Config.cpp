@@ -408,6 +408,10 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
+        } else if ((arg == "--macro-tile" || arg == "--macro-tile-size") && i + 1 < argc) {
+            cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg.starts_with("--macro-tile=") || arg.starts_with("--macro-tile-size=")) {
+            cfg.macro_tile_size = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
         } else if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "upways") {
