@@ -363,6 +363,25 @@ if(WIN32)
     endif()
 endif()
 
+# Package and embed Upways neural reconstruction weights
+set(UPWAYS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Upways" CACHE PATH "Path to Upways ML repository")
+option(PATHWAYS_AUTO_PACKAGE_UPWAYS "Auto-package updated weights from Upways during build" ON)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageUpwaysWeights.cmake")
+
+add_custom_target(package_upways_weights
+    COMMAND ${CMAKE_COMMAND}
+        -DCMAKE_CURRENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        -DUPWAYS_DIR="${UPWAYS_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageUpwaysWeights.cmake"
+    BYPRODUCTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_weights.hpp"
+    COMMENT "Checking and packaging updated Upways neural weights"
+)
+
+add_dependencies(pathways package_upways_weights)
+
 # Deploy default neural reconstruction weights to build tree
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
@@ -522,6 +541,7 @@ target_include_directories(test_upways_pipeline PRIVATE
     ${THIRD_PARTY_DIR}/glm
 )
 target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
+add_dependencies(test_upways_pipeline package_upways_weights)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
 add_test(NAME VisualIntegrity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_visual_integrity.py)
 
