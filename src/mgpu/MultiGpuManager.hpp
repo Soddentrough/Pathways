@@ -28,7 +28,6 @@ struct GpuDeviceNode {
     std::string deviceName;
     std::unique_ptr<VulkanContext> context;
     std::unique_ptr<Image> accumTarget;
-    std::unique_ptr<Buffer> p2pStagingBuffer;
 
     static constexpr uint32_t NUM_IN_FLIGHT = 2;
 
@@ -158,8 +157,7 @@ public:
 
     enum class InterGpuTransferMode {
         P2P_Direct_BAR,       // Linux DMA-BUF direct PCIe P2P
-        ZeroCopy_HostMemory,  // VK_EXT_external_memory_host (fallback)
-        CpuStaging            // CPU memcpy staging (fallback)
+        ZeroCopy_HostMemory   // VK_EXT_external_memory_host
     };
 
     InterGpuTransferMode getTransferMode() const { return m_transferMode; }
@@ -167,13 +165,12 @@ public:
         switch (m_transferMode) {
             case InterGpuTransferMode::P2P_Direct_BAR: return "P2P Direct BAR (DMA-BUF)";
             case InterGpuTransferMode::ZeroCopy_HostMemory: return "Zero-Copy Host Memory (external_memory_host)";
-            case InterGpuTransferMode::CpuStaging: return "CPU Staging Copy";
         }
         return "Unknown";
     }
-    bool isP2PDirectBarActive() const { return m_transferMode == InterGpuTransferMode::P2P_Direct_BAR; }
-    bool isZeroCopyActive() const { return m_transferMode != InterGpuTransferMode::CpuStaging; }
-    bool isCrossGpuSyncActive() const { return m_useCrossGpuSync; }
+    bool isP2PDirectBarActive() const { return m_active && (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR); }
+    bool isZeroCopyActive() const { return m_active && (m_transferMode == InterGpuTransferMode::ZeroCopy_HostMemory); }
+    bool isCrossGpuSyncActive() const { return m_active && m_useCrossGpuSync; }
     VkSemaphore getImportedSemaphore(uint32_t slot = 0) const {
         if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
         return m_devices[0]->primImportedSemaphores[slot % GpuDeviceNode::NUM_IN_FLIGHT];
@@ -262,7 +259,7 @@ private:
     std::array<bool, 2> m_slotSubmitted = { false, false };
     bool m_workerBusy = false;
 
-    InterGpuTransferMode m_transferMode = InterGpuTransferMode::CpuStaging;
+    InterGpuTransferMode m_transferMode = InterGpuTransferMode::ZeroCopy_HostMemory;
 
     // Direct P2P Device-Local BAR Buffers (Double-buffered via Linux DMA-BUF)
     std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_p2pMemSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };

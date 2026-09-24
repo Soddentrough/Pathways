@@ -37,8 +37,10 @@ enum class WavefrontSortMode {
 };
 
 enum class SecondarySortMode {
-    None,           // Standard unsorted secondary rays (Default)
-    DirectionalDGC  // Option 1: On-Chip Directional Multi-Queue Binning via DGC & subgroup ballots
+    None = 0,           // Standard unsorted secondary rays (Default)
+    DirectionalDGC = 1, // Option 1: On-Chip Directional Multi-Queue Binning via DGC & subgroup ballots
+    DirectCoherent = 2, // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4)
+    DirectCoherentK8 = 3 // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=8)
 };
 
 enum class DenoiserMode {
@@ -57,7 +59,7 @@ struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
     bool use_morton = false; // 2D Morton Z-curve mapping for wavefront classification (default: false / linear raster)
-    SecondarySortMode secondary_sort_mode = SecondarySortMode::None; // Secondary ray BVH traversal coherency mode
+    SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default]
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
     float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
@@ -130,8 +132,7 @@ struct Config {
     MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge; // Multi-GPU upscaling topology: PostMerge (Final Frame) or SampleBlend (Merged Frames)
     enum class MgpuTransferMode {
         Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory, high performance default)
-        P2P,      // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR)
-        Staging   // CPU memcpy staging (Fallback)
+        P2P       // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR)
     };
     MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::Host;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Preserve FP16 bandwidth and performance)
@@ -141,6 +142,7 @@ struct Config {
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
+    bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
 
     // Camera view overrides (useful for headless testing & reproducible framing)

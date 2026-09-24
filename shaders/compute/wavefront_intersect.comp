@@ -192,35 +192,14 @@ void main() {
                 tanSign = getTriangleTangentSign(tri);
             }
 
-            hit.hitData0 = vec4(closestT,
-                               uintBitsToFloat(matId),
-                               uintBitsToFloat(packOct32(hitNormal)),
-                               uintBitsToFloat(packHalf2x16(hitUv)));
-            hit.hitData1 = vec4(uintBitsToFloat(packOct32(tanDir)),
-                               tanSign,
-                               uintBitsToFloat(uint(closestTri)),
-                               uintBitsToFloat(0u)); // 0: triangle
+            hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign);
         } else if (closestSphere >= 0) {
             vec3 hitNormal = (origin + closestT * direction - spheres[closestSphere].centerRadius.xyz) / spheres[closestSphere].centerRadius.w;
             uint matId = spheres[closestSphere].materialId;
-            hit.hitData0 = vec4(closestT,
-                               uintBitsToFloat(matId),
-                               uintBitsToFloat(packOct32(hitNormal)),
-                               uintBitsToFloat(packHalf2x16(vec2(0.0))));
-            hit.hitData1 = vec4(uintBitsToFloat(packOct32(vec3(1.0, 0.0, 0.0))),
-                               1.0,
-                               uintBitsToFloat(uint(closestSphere)),
-                               uintBitsToFloat(1u)); // 1: sphere
+            hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
             archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
         } else {
-            hit.hitData0 = vec4(closestT,
-                               uintBitsToFloat(0u),
-                               uintBitsToFloat(packOct32(vec3(0.0, 1.0, 0.0))),
-                               uintBitsToFloat(0u));
-            hit.hitData1 = vec4(uintBitsToFloat(packOct32(vec3(1.0, 0.0, 0.0))),
-                               1.0,
-                               uintBitsToFloat(0xFFFFFFFFu),
-                               uintBitsToFloat(2u)); // 2: miss
+            hit = packRayHit(closestT, 0u, 2u, vec3(0.0, 1.0, 0.0), vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
             archetype = MATERIAL_ARCHETYPE_DIFFUSE; // Miss radiance evaluated in diffuse microkernel
         }
     }
@@ -235,7 +214,7 @@ void main() {
         if (pc.sortMode == 3u) {
             // Technique D: 3D Spatial-Morton + Material Dual-Binning via Intra-Wave Bitonic Sort
             uint mortonCode = 0u;
-            uint hitType = floatBitsToUint(hit.hitData1.w);
+            uint hitType = (floatBitsToUint(hit.hitData0.w) >> 16u) & 0x3u;
             if (inRange && hitType != 2u) {
                 vec3 hitP = origin + hit.hitData0.x * direction;
                 vec3 pNorm = fract((hitP * 0.1) + 0.5);

@@ -83,7 +83,10 @@ if(WIN32)
 endif()
 
 # Find system packages
-find_package(Vulkan REQUIRED)
+find_package(Vulkan 1.4 REQUIRED)
+if(Vulkan_VERSION VERSION_LESS "1.4.341")
+    message(FATAL_ERROR "Pathways requires Vulkan SDK/Runtime >= 1.4.341. Found: ${Vulkan_VERSION}")
+endif()
 find_package(SDL3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -96,6 +99,7 @@ if(FFMPEG_FOUND)
     add_compile_definitions(PATHWAYS_HAS_FFMPEG)
 endif()
 
+message(STATUS "Vulkan Version: ${Vulkan_VERSION}")
 message(STATUS "Vulkan Include Dir: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "Vulkan Libraries: ${Vulkan_LIBRARIES}")
 message(STATUS "SDL3 Include Dir: ${SDL3_INCLUDE_DIRS}")
@@ -156,8 +160,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/compute/nrc_resolve.comp
     ${SHADER_DIR}/compute/dgc_compact.comp
-    ${SHADER_DIR}/compute/raytrace_comp.comp
-    ${SHADER_DIR}/compute/wavefront_persistent.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/upways_reconstruct.comp
     ${SHADER_DIR}/compute/neural_reconstruct.comp

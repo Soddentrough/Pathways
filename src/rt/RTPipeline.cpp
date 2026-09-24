@@ -16,8 +16,10 @@ RTPipeline::RTPipeline(VkDevice device, VmaAllocator allocator,
                        const std::vector<char>& rgenCode,
                        const std::vector<char>& rmissCode,
                        const std::vector<char>& shadowMissCode,
-                       const std::vector<char>& rchitCode)
-    : m_device(device), m_allocator(allocator), m_rtProps(rtProps), m_pipelineLayout(pipelineLayout) {
+                       const std::vector<char>& rchitCode,
+                       bool supportsSubgroupSizeControl)
+    : m_device(device), m_allocator(allocator), m_rtProps(rtProps), m_pipelineLayout(pipelineLayout),
+      m_supportsSubgroupSizeControl(supportsSubgroupSizeControl) {
     loadFunctionPointers();
     createPipeline(rgenCode, rmissCode, shadowMissCode, rchitCode);
     createShaderBindingTable();
@@ -79,28 +81,28 @@ void RTPipeline::createPipeline(const std::vector<char>& rgenCode,
     stages[0].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     stages[0].module = rgenModule;
     stages[0].pName = "main";
-    stages[0].pNext = &subgroupSize32;
+    stages[0].pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
 
     // Stage 1: Primary Miss
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[1].module = rmissModule;
     stages[1].pName = "main";
-    stages[1].pNext = &subgroupSize32;
+    stages[1].pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
 
     // Stage 2: Shadow Miss
     stages[2].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[2].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[2].module = shadowMissModule;
     stages[2].pName = "main";
-    stages[2].pNext = &subgroupSize32;
+    stages[2].pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
 
     // Stage 3: Closest Hit
     stages[3].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[3].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     stages[3].module = rchitModule;
     stages[3].pName = "main";
-    stages[3].pNext = &subgroupSize32;
+    stages[3].pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
 
     std::vector<VkRayTracingShaderGroupCreateInfoKHR> groups(4);
     // Group 0: Raygen

@@ -10,7 +10,7 @@ class Buffer {
 public:
     Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage,
            VmaMemoryUsage memoryUsage, VmaAllocationCreateFlags flags = 0, VkDeviceSize minAlignment = 0,
-           VkBufferUsageFlags2KHR usage2 = 0);
+           VkBufferUsageFlags2 usage2 = 0);
     ~Buffer();
 
     Buffer(const Buffer&) = delete;

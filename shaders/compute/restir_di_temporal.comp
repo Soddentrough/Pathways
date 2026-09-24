@@ -94,8 +94,12 @@ void main() {
 
     RayGeometry geom = inGeoms[rayIdx];
     RayHit hit = inHits[rayIdx];
-    uint hitType = floatBitsToUint(hit.hitData1.w);
-    float hitT = hit.hitData0.x;
+    float hitT;
+    uint matId, hitType;
+    vec3 hitNormal, geomTan;
+    vec2 hitUv;
+    float tanSign;
+    unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
 
     // Inactive ray, sky miss, or invalid hit
     if (hitType == 2u || hitT <= 0.0) {
@@ -103,7 +107,6 @@ void main() {
         return;
     }
 
-    uint matId = floatBitsToUint(hit.hitData0.y);
     Material mat = materials[matId];
 
     // Pure dielectric (glass, water) has no direct diffuse/specular NEE lighting
@@ -115,7 +118,6 @@ void main() {
     vec3 origin = geom.originPackedDir.xyz;
     vec3 dir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
     vec3 hitPoint = origin + dir * hitT;
-    vec3 hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.z));
     f16vec3 diffuseAlbedo = f16vec3(mat.albedo.rgb);
 
     // --- PHASE 1: Generate Fresh Candidates (Fused Candidate Generation) ---

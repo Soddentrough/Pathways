@@ -1151,20 +1151,28 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Secondary Ray Coherency Sort:");
                 const char* secSortModes[] = {
                     "None (Linear Unsorted Queue)",
-                    "Directional DGC (Producer-Side Binning, 8 Bins)"
+                    "Directional DGC (Producer-Side Binning, 8 Bins)",
+                    "Direct Coherent (Xiang 2023, 4-Lane Cluster)",
+                    "Direct Coherent (Xiang 2023, 8-Lane Cluster)"
                 };
                 int currentSecSort = 0;
                 if (config.secondary_sort_mode == SecondarySortMode::None) currentSecSort = 0;
                 else if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) currentSecSort = 1;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent) currentSecSort = 2;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) currentSecSort = 3;
 
                 if (ImGui::Combo("Secondary Ray Sort##SecSort", &currentSecSort, secSortModes, IM_ARRAYSIZE(secSortModes))) {
                     if (currentSecSort == 0) config.secondary_sort_mode = SecondarySortMode::None;
                     else if (currentSecSort == 1) config.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+                    else if (currentSecSort == 2) config.secondary_sort_mode = SecondarySortMode::DirectCoherent;
+                    else if (currentSecSort == 3) config.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
                     settingsChanged = true;
                 }
 
                 if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 8 Dedicated Octant Sub-Queues (Zero Indirection Buffer, Contiguous)");
+                } else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent || config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> On-Chip Subgroup Tangent-Space Coherent Sampling (0 VRAM sorting overhead)");
                 } else {
                     ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
                 }

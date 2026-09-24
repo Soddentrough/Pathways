@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -286,34 +287,107 @@ uint getDirectionalOctant(vec3 dir) {
     return (dir.x >= 0.0 ? 1u : 0u) | (dir.y >= 0.0 ? 2u : 0u) | (dir.z >= 0.0 ? 4u : 0u);
 }
 
+// Build orthonormal basis (b1, b2) from unit normal n (Duff et al.)
+void buildOrthonormalBasis(vec3 n, out vec3 b1, out vec3 b2) {
+    float sign = (n.z >= 0.0) ? 1.0 : -1.0;
+    float a = -1.0 / (sign + n.z);
+    float b = n.x * n.y * a;
+    b1 = vec3(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    b2 = vec3(b, sign + n.y * n.y * a, -n.y);
+}
+
+uint packTangentAngle13(vec3 normal, vec3 tangent) {
+    vec3 b1, b2;
+    buildOrthonormalBasis(normal, b1, b2);
+    float x = dot(tangent, b1);
+    float y = dot(tangent, b2);
+    float angle = atan(y, x);
+    float u = (angle + 3.141592653589793) * (8192.0 / 6.283185307179586);
+    return uint(clamp(u, 0.0, 8191.0));
+}
+
+vec3 unpackTangentAngle13(vec3 normal, uint code) {
+    vec3 b1, b2;
+    buildOrthonormalBasis(normal, b1, b2);
+    float angle = (float(code) + 0.5) * (6.283185307179586 / 8192.0) - 3.141592653589793;
+    return normalize(b1 * cos(angle) + b2 * sin(angle));
+}
+
 // 16-byte packed ray geometry (read by intersect & shade)
 struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
-// 32-byte cache-line aligned pre-interpolated ray hit (written by intersect/classify, read by shade)
+// 16-byte packed pre-interpolated ray hit (written by intersect/classify, read by shade)
 struct RayHit {
     vec4 hitData0;
     // x: hitT (float)
-    // y: uintBitsToFloat(matId)
-    // z: uintBitsToFloat(packOct32(hitNormal))
-    // w: uintBitsToFloat(packHalf2x16(hitUv))
-    vec4 hitData1;
-    // x: uintBitsToFloat(packOct32(geomTangent.xyz))
-    // y: geomTangent.w (tangent sign)
-    // z: uintBitsToFloat(primitiveIndex)
-    // w: uintBitsToFloat(hitType) (0: triangle, 1: sphere, 2: miss)
+    // y: uintBitsToFloat(packOct32(hitNormal))
+    // z: uintBitsToFloat(packHalf2x16(hitUv))
+    // w: uintBitsToFloat(packedInfo)
+    // packedInfo:
+    // bits 0..15: matId (16 bits)
+    // bits 16..17: hitType (2 bits: 0: triangle, 1: sphere, 2: miss)
+    // bit 18: tanSign (1 bit: 0: positive +1.0, 1: negative -1.0)
+    // bits 19..31: tanAngle13 (13 bits: angle in [0, 8191])
 };
 
-// 32-byte cache-line aligned ray state (read/written by shade, NEVER touched by intersect)
+RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign) {
+    RayHit hit;
+    uint tSignBit = (tanSign < 0.0) ? 1u : 0u;
+    uint angleCode = packTangentAngle13(hitNormal, geomTan);
+    uint packedInfo = (matId & 0xFFFFu) | ((hitType & 0x3u) << 16u) | (tSignBit << 18u) | ((angleCode & 0x1FFFu) << 19u);
+    hit.hitData0 = vec4(hitT,
+                        uintBitsToFloat(packOct32(hitNormal)),
+                        uintBitsToFloat(packHalf2x16(hitUv)),
+                        uintBitsToFloat(packedInfo));
+    return hit;
+}
+
+void unpackRayHit(RayHit hit, out float hitT, out uint matId, out uint hitType, out vec3 hitNormal, out vec2 hitUv, out vec3 geomTan, out float tanSign) {
+    hitT = hit.hitData0.x;
+    hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.y));
+    hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.z));
+    uint packedInfo = floatBitsToUint(hit.hitData0.w);
+    matId = packedInfo & 0xFFFFu;
+    hitType = (packedInfo >> 16u) & 0x3u;
+    tanSign = ((packedInfo >> 18u) & 1u) != 0u ? -1.0 : 1.0;
+    geomTan = unpackTangentAngle13(hitNormal, (packedInfo >> 19u) & 0x1FFFu);
+}
+
+// 16-byte packed ray state (read/written by shade, NEVER touched by intersect)
 struct RayState {
-    vec4 throughputSeed;  // rgb: throughput, w: uintBitsToFloat(seed) (16 bytes)
-    vec4 radiancePixel;   // rgb: accumRadiance, w: uintBitsToFloat(pixelIndex | specularFlag) (16 bytes)
+    uvec4 stateData;
+    // x: packHalf2x16(throughput.rg)
+    // y: packHalf2x16(vec2(throughput.b, 0.0)) | (flags << 16u)
+    // z: seed
+    // w: pixelIndex | specularFlag
 };
 
 #define SPECULAR_FLAG_BIT             (1u << 31)
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
 #define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
+
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
+    RayState s;
+    s.stateData.x = packHalf2x16(vec2(throughput.rg));
+    uint flags = (isSpecularPath ? 1u : 0u) | (causticApplied ? 2u : 0u);
+    s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u);
+    s.stateData.z = seed;
+    s.stateData.w = (pixelIndex & PIXEL_INDEX_MASK) | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u) | (causticApplied ? CAUSTIC_APPLIED_BIT : 0u);
+    return s;
+}
+
+void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
+    vec2 rg = unpackHalf2x16(s.stateData.x);
+    vec2 bz = unpackHalf2x16(s.stateData.y & 0xFFFFu);
+    throughput = f16vec3(rg.x, rg.y, bz.x);
+    seed = s.stateData.z;
+    uint rawPixel = s.stateData.w;
+    pixelIndex = rawPixel & PIXEL_INDEX_MASK;
+    isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
+    causticApplied = (rawPixel & CAUSTIC_APPLIED_BIT) != 0u;
+}
 
 #define MATERIAL_ARCHETYPE_DIFFUSE    0u
 #define MATERIAL_ARCHETYPE_DIELECTRIC 1u
@@ -461,14 +535,45 @@ vec2 directionToEquirectangular(vec3 dir) {
     return vec2((phi + PI) / TWO_PI, theta / PI);
 }
 
-// 2D Morton Z-curve mapping for an 8x4 Wave32 block
+// 2D Morton Z-curve mapping with 2D Macro-Tile Workgroup Swizzling
 ivec2 getPixelCoordsMorton8x4(uint linearIdx, uint width, uint height) {
     uint tilesX = (width + 7u) / 8u;
+    uint tilesY = (height + 3u) / 4u;
     uint tileIdx = linearIdx / 32u;
     uint inTile = linearIdx % 32u;
-    uint tileX = tileIdx % tilesX;
-    uint tileY = tileIdx / tilesX;
 
+    // Macro-Tile Swizzle: Cluster workgroups into 8x8 2D macro-tiles (64x32 pixels)
+    // to maximize L0/L1/L2 cache locality during BVH traversal without host barriers
+    uint TW = 8u;
+    uint TH = 8u;
+    uint chunkSize = 64u;
+    uint stripSize = TW * tilesY;
+    uint stripIdx = (stripSize > 0u) ? (tileIdx / stripSize) : 0u;
+    uint inStrip = (stripSize > 0u) ? (tileIdx % stripSize) : 0u;
+    uint fullChunksH = tilesY / TH;
+    uint remainderStart = fullChunksH * chunkSize;
+
+    uint tileX;
+    uint tileY;
+    if (inStrip < remainderStart) {
+        uint chunkIdx = inStrip / chunkSize;
+        uint inChunk = inStrip % chunkSize;
+        uint localX = ((inChunk >> 0u) & 1u) | (((inChunk >> 2u) & 1u) << 1u) | (((inChunk >> 4u) & 1u) << 2u);
+        uint localY = ((inChunk >> 1u) & 1u) | (((inChunk >> 3u) & 1u) << 1u) | (((inChunk >> 5u) & 1u) << 2u);
+        tileX = stripIdx * TW + localX;
+        tileY = chunkIdx * TH + localY;
+    } else {
+        uint rem = inStrip - remainderStart;
+        tileX = stripIdx * TW + (rem % TW);
+        tileY = fullChunksH * TH + (rem / TW);
+    }
+
+    if (tileX >= tilesX || tileY >= tilesY) {
+        tileX = (tilesX > 0u) ? (tileIdx % tilesX) : 0u;
+        tileY = (tilesX > 0u) ? (tileIdx / tilesX) : 0u;
+    }
+
+    // Intra-wave 2D Morton Z-curve mapping (8x4 pixels per 32-lane wave)
     uint mx = ((inTile >> 0u) & 1u) | (((inTile >> 2u) & 1u) << 1u) | (((inTile >> 4u) & 1u) << 2u);
     uint my = ((inTile >> 1u) & 1u) | (((inTile >> 3u) & 1u) << 1u);
 
@@ -517,6 +622,91 @@ vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
 
     return normalize(tangent * (cos(phi) * sinTheta) +
                      bitangent * (sin(phi) * sinTheta) +
+                     normal * cosTheta);
+}
+
+// Direct Coherent Cosine-Weighted Hemisphere Sampling (Xiang et al. 2023)
+// Interleaved Subgroup Grouping: Partitions 32-lane wave into 8 disjoint groups of 4 lanes (or 4 of 8)
+// with a 2D spatial stride (min pixel dist >= 2.23) to eliminate spatial correlation in 3x3 filter windows
+// while preserving SIMD execution coherence during BVH traversal.
+// Uses Duff et al. continuous orthonormal basis to eliminate tangent frame boundary flips.
+vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSize, uint frameIndex) {
+    uint k = (clusterSize == 8u) ? 8u : 4u;
+    uint lane = gl_SubgroupInvocationID;
+    uint lane32 = lane & 31u;
+    uint waveBase = lane & ~31u;
+    uint row = lane32 >> 3u;
+    uint col = lane32 & 7u;
+
+    uvec4 activeDiffuse = subgroupBallot(true);
+
+    uint leaderLane = lane;
+    if (k == 4u) {
+        // 8 groups of 4 lanes. Spatial stride: (col + row * 5) % 8
+        uint g = (col + row * 5u) & 7u;
+        uint rot = frameIndex & 3u;
+        const uint colShifts[4] = uint[4](0u, 3u, 6u, 1u);
+        uint preferred = waveBase + ((g + colShifts[rot]) & 7u) + (rot << 3u);
+
+        bool prefActive = ((activeDiffuse[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
+        if (prefActive) {
+            leaderLane = preferred;
+        } else {
+            leaderLane = preferred;
+            for (uint i = 1u; i < 4u; ++i) {
+                uint tryRot = (rot + i) & 3u;
+                uint cand = waveBase + ((g + colShifts[tryRot]) & 7u) + (tryRot << 3u);
+                if (((activeDiffuse[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
+                    leaderLane = cand;
+                    break;
+                }
+            }
+        }
+    } else {
+        // 4 groups of 8 lanes. Spatial stride: (col + row * 3) % 4
+        uint g = (col + row * 3u) & 3u;
+        uint rot = frameIndex & 7u;
+        uint rotRow = rot >> 1u;
+        uint rotColBase = (g + (rotRow * 1u)) & 3u;
+        uint rotCol = rotColBase + ((rot & 1u) << 2u);
+        uint preferred = waveBase + (rotRow << 3u) + rotCol;
+
+        bool prefActive = ((activeDiffuse[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
+        if (prefActive) {
+            leaderLane = preferred;
+        } else {
+            leaderLane = preferred;
+            for (uint i = 1u; i < 8u; ++i) {
+                uint tryRot = (rot + i) & 7u;
+                uint tryRow = tryRot >> 1u;
+                uint tryCol = ((g + (tryRow * 1u)) & 3u) + ((tryRot & 1u) << 2u);
+                uint cand = waveBase + (tryRow << 3u) + tryCol;
+                if (((activeDiffuse[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
+                    leaderLane = cand;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Advance PRNG for every lane (guarantees cross-bounce randomness)
+    vec2 rLocal = randVec2(seed);
+
+    // Broadcast leader's tangent-space direction sample across cluster
+    vec2 r;
+    r.x = subgroupShuffle(rLocal.x, leaderLane);
+    r.y = subgroupShuffle(rLocal.y, leaderLane);
+
+    // Continuous orthonormal basis projection (Duff et al.)
+    float phi = TWO_PI * r.x;
+    float cosTheta = sqrt(r.y);
+    float sinTheta = sqrt(max(0.0, 1.0 - r.y));
+
+    vec3 b1, b2;
+    buildOrthonormalBasis(normal, b1, b2);
+
+    return normalize(b1 * (cos(phi) * sinTheta) +
+                     b2 * (sin(phi) * sinTheta) +
                      normal * cosTheta);
 }
 
@@ -584,15 +774,6 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
     vec3 bitangent = cross(N, tangent);
 
     return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
-}
-
-// Orthonormal basis construction (Duff et al. 2017)
-void buildOrthonormalBasis(vec3 n, out vec3 b1, out vec3 b2) {
-    float signVal = n.z >= 0.0 ? 1.0 : -1.0;
-    float a = -1.0 / (signVal + n.z);
-    float b = n.x * n.y * a;
-    b1 = vec3(1.0 + signVal * n.x * n.x * a, signVal * b, -signVal * n.x);
-    b2 = vec3(b, signVal + n.y * n.y * a, -n.y);
 }
 
 // Visible Normal Distribution Function (VNDF) Sampling (Dupuy & Heitz 2023)

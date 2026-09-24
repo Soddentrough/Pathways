@@ -69,6 +69,16 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
         max_val = float(arr.max())
         min_val = float(arr.min())
 
+        if np.isnan(arr).any():
+            print(f"\033[31m[FAIL]\033[0m Image contains NaN floating point values")
+            return False
+        if np.isinf(arr).any():
+            print(f"\033[31m[FAIL]\033[0m Image contains Infinite floating point values")
+            return False
+        if min_val < 0.0:
+            print(f"\033[31m[FAIL]\033[0m Negative pixel radiance detected: min={min_val:.4f}")
+            return False
+
         if max_val == 0.0:
             print(f"\033[31m[FAIL]\033[0m Image is completely black (zero radiance rendered)")
             return False
@@ -83,8 +93,11 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
         shadow_pct = float(np.mean(shadow_mask) * 100.0)
         blown_mask = lum > 0.95
         blown_pct = float(np.mean(blown_mask) * 100.0)
+        p05 = float(np.percentile(lum, 5.0))
+        p95 = float(np.percentile(lum, 95.0))
+        contrast = p95 - p05
 
-        print(f"\033[32m[PASS]\033[0m Luminance stats: Mean={mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Blown Out (>0.95): {blown_pct:.2f}% | Range: [{min_val:.3f}, {max_val:.3f}]")
+        print(f"\033[32m[PASS]\033[0m Luminance stats: Mean={mean_lum:.4f} | Deep Shadows (<0.05): {shadow_pct:.2f}% | Blown Out (>0.95): {blown_pct:.2f}% | Contrast={contrast:.3f} | Range: [{min_val:.3f}, {max_val:.3f}]")
 
         if min_mean_lum is not None and mean_lum < min_mean_lum:
             print(f"\033[31m[FAIL]\033[0m Mean luminance {mean_lum:.4f} below floor {min_mean_lum:.4f} (underexposed / dark collapse)")
@@ -119,7 +132,18 @@ def verify_frame(png_path, expected_width=None, expected_height=None, reference_
                 mse = float(np.mean((arr - ref_arr) ** 2))
                 psnr = float(20.0 * np.log10(1.0 / np.sqrt(mse))) if mse > 1e-10 else 99.0
 
+                # Color channel cross-correlations (detects inverted colors, BGR vs RGB swaps)
+                corr_r = float(np.corrcoef(arr[:, :, 0].flatten(), ref_arr[:, :, 0].flatten())[0, 1])
+                corr_g = float(np.corrcoef(arr[:, :, 1].flatten(), ref_arr[:, :, 1].flatten())[0, 1])
+                corr_b = float(np.corrcoef(arr[:, :, 2].flatten(), ref_arr[:, :, 2].flatten())[0, 1])
+                cross_br = float(np.corrcoef(arr[:, :, 0].flatten(), ref_arr[:, :, 2].flatten())[0, 1])
+
                 print(f"\033[32m[PASS]\033[0m Ground Truth Comparison against {os.path.basename(reference_path)}: MAE={mae:.4f}, PSNR={psnr:.2f} dB")
+                print(f"       Channel Correlations: R={corr_r:.4f}, G={corr_g:.4f}, B={corr_b:.4f}, CrossBR={cross_br:.4f}")
+
+                if cross_br > corr_r and cross_br > corr_b:
+                    print(f"\033[31m[FAIL]\033[0m Channel swap detected: Red and Blue channels are swapped (Vulkan BGR/RGB mismatch)")
+                    return False
 
                 if max_mae is not None and mae > max_mae:
                     print(f"\033[31m[FAIL]\033[0m MAE {mae:.4f} exceeds tolerance {max_mae:.4f}")

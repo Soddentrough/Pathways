@@ -66,7 +66,8 @@ public:
                       bool supportsExecutionSet = false,
                       const std::vector<char>& shadeDiffuseSecCode = {},
                       const std::vector<char>& shadeComplexSecCode = {},
-                      bool enableDgcPreprocess = true);
+                      bool enableDgcPreprocess = true,
+                      bool supportsSubgroupSizeControl = true);
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -186,9 +187,9 @@ private:
     // Ray Work Queues & Counter SSBOs (SoA Layout) - Double-buffered per in-flight frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueA;  // 16B RayGeometry
     std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueB;  // 16B RayGeometry
-    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueA; // 32B RayState
-    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueB; // 32B RayState
-    std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 32B RayHit
+    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueA; // 16B PackedRayState
+    std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueB; // 16B PackedRayState
+    std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 16B PackedRayHit
     std::array<std::unique_ptr<Buffer>, 2> m_materialIndexQueue; // 4B index * 6 archetypes (Index-Based Material Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Directional DGC Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_shadowQueue;    // 32B PackedShadowRay
@@ -228,6 +229,7 @@ private:
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;
     bool m_dummyImageTransitioned = false;
+    bool m_supportsSubgroupSizeControl = true;
 };
 
 } // namespace pathways

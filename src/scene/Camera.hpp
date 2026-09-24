@@ -80,6 +80,8 @@ public:
     float getSensitivity() const { return m_sensitivity; }
     bool isDynamicScaling() const { return m_dynamicScaling; }
     void setDynamicScaling(bool enable) { m_dynamicScaling = enable; }
+    bool isAdaptiveSpeed() const { return m_dynamicScaling; }
+    void setAdaptiveSpeed(bool enable) { m_dynamicScaling = enable; }
     void focusOnTarget(glm::vec3 target, float targetRadius = 0.0f);
     void resetToDefault();
     void setDefaultFraming(glm::vec3 position, glm::vec3 target, float fov) {
@@ -136,7 +138,7 @@ private:
     glm::vec3 m_orbitPivot{ 0.0f, 1.0f, 0.0f };
     float m_orbitRadius = 2.0f;
     bool m_orbiting = false;
-    bool m_dynamicScaling = false;
+    bool m_dynamicScaling = true; // Distance-adaptive movement speed (smooth approach to focus) [Default: true]
     float m_baseSpeed = 3.0f;
     float m_minSpeed = 0.05f;
     float m_maxSpeed = 50.0f;

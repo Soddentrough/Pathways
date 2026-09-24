@@ -26,13 +26,27 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
                      VkSwapchainKHR oldSwapchain)
     : m_device(device), m_context(context) {
 
-    VkSurfaceCapabilitiesKHR capabilities;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &capabilities);
+    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo{};
+    surfaceInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+    surfaceInfo.surface = surface;
+
+    VkSurfaceCapabilities2KHR capabilities2{};
+    capabilities2.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+    vkGetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, &surfaceInfo, &capabilities2);
+    const VkSurfaceCapabilitiesKHR& capabilities = capabilities2.surfaceCapabilities;
 
     uint32_t formatCount = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, nullptr);
+    vkGetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, &surfaceInfo, &formatCount, nullptr);
+    std::vector<VkSurfaceFormat2KHR> formats2(formatCount);
+    for (auto& f : formats2) {
+        f.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+    }
+    vkGetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, &surfaceInfo, &formatCount, formats2.data());
+
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
+    for (uint32_t i = 0; i < formatCount; ++i) {
+        formats[i] = formats2[i].surfaceFormat;
+    }
 
     Logger::debug("Surface formats supported by display ({} available):", formatCount);
     for (const auto& f : formats) {

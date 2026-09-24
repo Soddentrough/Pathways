@@ -172,14 +172,14 @@ void Config::printUsage(const char* progName) {
               << "Multi-GPU Subsystem:\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
-              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR), 'staging'\n"
+              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR)\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
               << "Wavefront Architecture:\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', or 'archetype' (A & B)\n"
               << "  --use-morton            Enable 2D Morton Z-curve mapping for wavefront classification (default: disabled / linear raster)\n"
-              << "  --sec-sort <mode>       Secondary ray coherency sort mode: 'none' [default], or 'directional' (Option 1 DGC)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency mode: 'direct'/'coherent' (Xiang 2023, K=4) [default], 'coherent-k8' (K=8), 'none', or 'directional' (Option 1 DGC)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
@@ -188,6 +188,8 @@ void Config::printUsage(const char* progName) {
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes\n\n"
               << "Camera & Navigation:\n"
+              << "  --adaptive-speed        Enable distance-adaptive camera speed (smooth approach) [default: enabled]\n"
+              << "  --no-adaptive-speed     Disable distance-adaptive camera speed (constant velocity)\n"
               << "  --camera-motion         Simulate continuous camera motion\n"
               << "  --gamepad-deadzone <float> Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)\n"
               << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
@@ -393,7 +395,7 @@ Config Config::parse(int argc, char* argv[]) {
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
-                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Staging;
+                throw std::runtime_error("CPU staging transfer mode has been eliminated under Vulkan 1.4 baseline. Slower workarounds are not supported.");
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
@@ -402,7 +404,7 @@ Config Config::parse(int argc, char* argv[]) {
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
-                cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Staging;
+                throw std::runtime_error("CPU staging transfer mode has been eliminated under Vulkan 1.4 baseline. Slower workarounds are not supported.");
             } else {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::Host;
             }
@@ -547,10 +549,14 @@ Config Config::parse(int argc, char* argv[]) {
         } else if ((arg == "--sec-sort" || arg == "--secondary-sort" || arg == "-ss") && i + 1 < argc) {
             std::string s = argv[++i];
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+            else if (s == "coherent" || s == "direct" || s == "direct-coherent" || s == "xiang" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherent;
+            else if (s == "coherent-k8" || s == "direct-k8" || s == "3") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if (arg.starts_with("--sec-sort=") || arg.starts_with("--secondary-sort=") || arg.starts_with("-ss=")) {
             std::string s = arg.substr(arg.find('=') + 1);
             if (s == "directional" || s == "dir" || s == "dgc" || s == "octant" || s == "1") cfg.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+            else if (s == "coherent" || s == "direct" || s == "direct-coherent" || s == "xiang" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherent;
+            else if (s == "coherent-k8" || s == "direct-k8" || s == "3") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
         } else if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
             cfg.streamline_secondary_shading = false;
@@ -586,6 +592,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.double_buffered_shared_mem = false;
         } else if (arg == "--camera-motion") {
             cfg.camera_motion = true;
+        } else if (arg == "--adaptive-speed" || arg == "--distance-adaptive-speed") {
+            cfg.adaptive_speed = true;
+        } else if (arg == "--no-adaptive-speed" || arg == "--no-distance-adaptive-speed") {
+            cfg.adaptive_speed = false;
         } else if (arg == "--gamepad-deadzone" && i + 1 < argc) {
             cfg.gamepad_deadzone = std::clamp(std::stof(argv[++i]), 0.01f, 0.50f);
         } else if (arg.starts_with("--gamepad-deadzone=")) {
