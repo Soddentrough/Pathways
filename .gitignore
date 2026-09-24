@@ -62,6 +62,8 @@ scenes/*/
 !scenes/BuickRiviera/**
 !scenes/cyber_city/
 !scenes/cyber_city/**
+!scenes/veach-ajar/
+!scenes/veach-ajar/**
 
 # Inside shipped scene subdirectories, exclude duplicate core models, temporary backups, and reference PNG renders
 scenes/*/*_core.glb
