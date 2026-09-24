@@ -153,13 +153,10 @@ Pathways includes an automated testing and regression suite:
 # 1. Full headless test harness (12 regression checks & visual verifications)
 ./scripts/run_headless_tests.sh
 
-# 2. CTest unit tests (16 unit tests covering cameras, descriptors, WMMA, and instancing)
+# 2. CTest unit tests (covering cameras, descriptors, WMMA, and point instancing)
 ctest --test-dir build --output-on-failure
 
-# 3. Scanlands point-instancing end-to-end test suite
-./scripts/run_scanlands_e2e_tests.sh
-
-# 4. Vulkan API specification auditor
+# 3. Vulkan API specification auditor
 python3 scripts/audit_vulkan_api.py -w all --exclude-mobile
 ```
 

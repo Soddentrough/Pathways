@@ -453,7 +453,6 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - **[Vulkan API Call Audit](docs/VULKAN_API_AUDIT.md)**: Specification tracking and multi-platform Vulkan Hardware Database comparison.
 - **[Material Shader Review](docs/reports/material_shader_review.md)**: In-depth physical BSDF and microarchitectural audit.
 - **[Wavefront Batching & Queue Scaling Report](docs/reports/wavefront_batching_head_to_head.md)**: Empirical SPM counter analysis of 2D macro-tiling, 74.3% VRAM queue reduction, and cache locality.
-- **[Scanlands Benchmark Report](docs/reports/scanlands_benchmark_report.md)**: High-density point-instancing (359M triangles) single-GPU benchmark report.
 
 ---
 

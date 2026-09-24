@@ -206,8 +206,8 @@ Pathways implements ReSTIR Direct Illumination (`src/rt/ReSTIRManager.cpp`) to h
 ## 7. OpenUSD Stage Ingestion & High-Density Instancing
 
 Pathways ingests complex VFX and CAD production assets via OpenUSD (`UsdLoader.cpp`):
-- **High-Density Point Instancing (`UsdGeomPointInstancer`)**: Evaluates scenes exceeding 180,000 instances and ~360 million expanded triangles (e.g. `Scanlands.usdc`) without geometry flattening.
-- **Prototype BLAS Deduplication**: Instanced geometries reference compact deduplicated prototype BLAS acceleration structures, reducing VRAM footprint by up to 90% (e.g. 3.58 GB peak VRAM at 1080p for 359M instanced triangles).
+- **High-Density Point Instancing (`UsdGeomPointInstancer`)**: Evaluates scenes with tens of thousands of instances and tens of millions of expanded triangles (e.g. `PointInstancedMedCity.usd` with 40,001 instances and ~49M triangles) without geometry flattening.
+- **Prototype BLAS Deduplication**: Instanced geometries reference compact deduplicated prototype BLAS acceleration structures, reducing VRAM footprint by up to 90%.
 - **Dynamic Real-Time TLAS Build**: Builds top-level acceleration structures in <2.0 ms per frame on RDNA 4 hardware.
 
 ---

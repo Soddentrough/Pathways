@@ -18,7 +18,6 @@ docs/
 │   ├── strix_halo_gfx1151_profiling_report.md # AMD Strix Halo / RDNA 3.5 Hardware Profiling
 │   ├── uma_optimization_isolation_study.md # UMA Memory Bandwidth & Payload Isolation Study
 │   ├── material_shader_review.md       # Comprehensive Material Shader & BSDF Mathematical Review
-│   ├── scanlands_benchmark_report.md   # Scanlands 359M Triangle Single-GPU Performance Benchmark
 │   └── camera_aspect_fov_fix.md        # Hor+ Camera Aspect Ratio & Projection Matrix Derivation
 ├── images/                             # Real-time 4K reference renders & architectural diagrams
 └── [idea_* / scratch_*]                # Internal research scratchpads & feature proposals (gitignored)
@@ -61,8 +60,6 @@ The [`reports/`](reports/) directory contains formal research reports, architect
   Isolation study of UMA memory bandwidth optimizations, analyzing 48-byte ray payload compaction, 64-byte shading materials, and direct coherent ray queuing.
 - **[reports/material_shader_review.md](reports/material_shader_review.md)**:
   Comprehensive mathematical and microarchitectural audit of Pathways BSDF formulations (microfacet normal distributions, Smith correlated masking-shadowing, dielectric transmission, Airy thin-film iridescence, and RDNA 4 VGPR occupancy optimization).
-- **[reports/scanlands_benchmark_report.md](reports/scanlands_benchmark_report.md)**:
-  Empirical single-GPU performance benchmark running the `Scanlands` OpenUSD production landscape asset (187,491 foliage instances, 358.9M instanced triangles) on an AMD Radeon AI PRO R9700. Covers VRAM safety, dynamic TLAS generation, and unoccluded frame pacing.
 - **[reports/camera_aspect_fov_fix.md](reports/camera_aspect_fov_fix.md)**:
   Mathematical derivation and verification of Hor+ camera aspect ratio synchronization, portrait adaptive FOV, and reference projection matrices.
 
