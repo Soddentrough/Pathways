@@ -771,7 +771,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
                 c2sBarriers.push_back(makeBufferBarrier2(m_dgcStream[frameSlot]->getBuffer(),
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                    VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                    VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT));
             }
             c2sBarriers.push_back(makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -850,10 +851,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                 uint32_t sliceIdx = DGCManager::getSliceIndex(frameSlot, b);
                 VkDeviceAddress seqCountAddr = 0;
-                if (m_queueCounters[frameSlot]) {
-                    seqCountAddr = m_queueCounters[frameSlot]->getDeviceAddress(m_device) +
-                                   offsetof(QueueCountersBuffer, activeMaterialSequenceCount);
-                }
                 if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
                     m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
                     m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
@@ -1051,7 +1048,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 if (useMaterialSort && m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
                     d2sBarriers.push_back(makeBufferBarrier2(m_dgcStream[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT, VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
+                        VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                        VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT));
                 }
                 d2sBarriers.push_back(makeBufferBarrier2(m_queueCounters[frameSlot]->getBuffer(),
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

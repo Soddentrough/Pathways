@@ -309,6 +309,7 @@ void Config::printUsage(const char* progName) {
               << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
               << "  --macro-tiles <int|auto> Alias for --batches\n"
               << "  --batch-size <int|auto> Coarse batch pixel budget (e.g. 1000000, 2000000; default: auto)\n"
+              << "  --batch-pixels <int>    Alias for --batch-size\n"
               << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes.\n"
               << "                            What it is: Uses VK_EXT_device_generated_commands Indirect Execution\n"
               << "                            Sets (VkIndirectExecutionSetEXT) to dynamically bind specialized\n"

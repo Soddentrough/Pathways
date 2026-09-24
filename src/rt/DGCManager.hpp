@@ -84,6 +84,7 @@ public:
 private:
     void loadFunctionPointers();
     void ensurePreprocessBuffer(VkPipeline pipeline, uint32_t maxSequenceCount);
+    void ensureMaterialPreprocessBuffer(uint32_t maxSequenceCount = 6);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
@@ -96,6 +97,8 @@ private:
     VkIndirectExecutionSetEXT m_materialExecutionSetSecondary = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
+    std::unique_ptr<Buffer> m_materialPreprocessBuffer;
+    VkDeviceSize m_materialSliceSize = 0;
     bool m_supported = false;
     bool m_materialDGCSupported = false;
     bool m_explicitPreprocess = true;
