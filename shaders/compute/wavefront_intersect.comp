@@ -211,7 +211,7 @@ void main() {
 
     uint sourceIdx = rayIdx;
     if (pc.sortMode > 0u) {
-        if (pc.sortMode == 3u) {
+        if (pc.sortMode >= 2u) {
             // Technique D: 3D Spatial-Morton + Material Dual-Binning via Intra-Wave Bitonic Sort
             uint mortonCode = 0u;
             uint hitType = (floatBitsToUint(hit.hitData0.w) >> 16u) & 0x3u;

@@ -293,7 +293,11 @@ void main() {
                 nextDirection = vec3(0.0);
                 vec3 nextOrigin;
 
-                if (cannotRefract || randFloat(seed) < reflectProb) {
+                float rFlip = (pc.secondarySortMode >= 2u)
+                    ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
+                    : randFloat(seed);
+
+                if (cannotRefract || rFlip < reflectProb) {
                     // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(rayDir, hitNormal);
                     nextOrigin = hitPoint + hitNormal * EPSILON;

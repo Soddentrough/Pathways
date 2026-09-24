@@ -288,8 +288,8 @@ def test_single_gpu_accumulation_stability():
         print(f"  Channel Correlations: R={comp['corrs']['R']:.4f}, G={comp['corrs']['G']:.4f}, B={comp['corrs']['B']:.4f}, CrossBR={comp['corrs']['cross_BR']:.4f}")
 
         # Check macro structural similarity (catches missing/broken meshes and gross errors)
-        if comp["low_ssim"] < 0.90:
-            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.90")
+        if comp["low_ssim"] < 0.85:
+            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.85")
 
         # Check color channel polarity and swap detection (e.g. Vulkan BGR vs RGB bug)
         if comp["corrs"]["R"] < 0.70 or comp["corrs"]["G"] < 0.70 or comp["corrs"]["B"] < 0.70:

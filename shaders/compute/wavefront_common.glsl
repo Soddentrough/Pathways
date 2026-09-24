@@ -627,10 +627,10 @@ vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
 
 // Direct Coherent Cosine-Weighted Hemisphere Sampling (Xiang et al. 2023)
 // Interleaved Subgroup Grouping: Partitions 32-lane wave into 8 disjoint groups of 4 lanes (or 4 of 8)
-// with a 2D spatial stride (min pixel dist >= 2.23) to eliminate spatial correlation in 3x3 filter windows
+// 2D Spatial Stride Leader Lane Computation for On-Chip Subgroup Shuffle
+// Uses a 2D spatial stride (min pixel dist >= 2.23) to eliminate spatial correlation in 3x3 filter windows
 // while preserving SIMD execution coherence during BVH traversal.
-// Uses Duff et al. continuous orthonormal basis to eliminate tangent frame boundary flips.
-vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSize, uint frameIndex) {
+uint getCoherentLeaderLane(uint clusterSize, uint frameIndex) {
     uint k = (clusterSize == 8u) ? 8u : 4u;
     uint lane = gl_SubgroupInvocationID;
     uint lane32 = lane & 31u;
@@ -638,7 +638,7 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
     uint row = lane32 >> 3u;
     uint col = lane32 & 7u;
 
-    uvec4 activeDiffuse = subgroupBallot(true);
+    uvec4 activeLanes = subgroupBallot(true);
 
     uint leaderLane = lane;
     if (k == 4u) {
@@ -648,7 +648,7 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
         const uint colShifts[4] = uint[4](0u, 3u, 6u, 1u);
         uint preferred = waveBase + ((g + colShifts[rot]) & 7u) + (rot << 3u);
 
-        bool prefActive = ((activeDiffuse[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
+        bool prefActive = ((activeLanes[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
         if (prefActive) {
             leaderLane = preferred;
         } else {
@@ -656,7 +656,7 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
             for (uint i = 1u; i < 4u; ++i) {
                 uint tryRot = (rot + i) & 3u;
                 uint cand = waveBase + ((g + colShifts[tryRot]) & 7u) + (tryRot << 3u);
-                if (((activeDiffuse[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
+                if (((activeLanes[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
                     leaderLane = cand;
                     break;
                 }
@@ -671,7 +671,7 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
         uint rotCol = rotColBase + ((rot & 1u) << 2u);
         uint preferred = waveBase + (rotRow << 3u) + rotCol;
 
-        bool prefActive = ((activeDiffuse[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
+        bool prefActive = ((activeLanes[preferred >> 5u] >> (preferred & 31u)) & 1u) != 0u;
         if (prefActive) {
             leaderLane = preferred;
         } else {
@@ -681,13 +681,20 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
                 uint tryRow = tryRot >> 1u;
                 uint tryCol = ((g + (tryRow * 1u)) & 3u) + ((tryRot & 1u) << 2u);
                 uint cand = waveBase + (tryRow << 3u) + tryCol;
-                if (((activeDiffuse[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
+                if (((activeLanes[cand >> 5u] >> (cand & 31u)) & 1u) != 0u) {
                     leaderLane = cand;
                     break;
                 }
             }
         }
     }
+    return leaderLane;
+}
+
+// Coherent Cosine Hemisphere Sampling via On-Chip Subgroup Shuffle (Xiang et al. 2023)
+// Uses Duff et al. continuous orthonormal basis to eliminate tangent frame boundary flips.
+vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSize, uint frameIndex) {
+    uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
 
     // Advance PRNG for every lane (guarantees cross-bounce randomness)
     vec2 rLocal = randVec2(seed);
@@ -708,6 +715,13 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
     return normalize(b1 * (cos(phi) * sinTheta) +
                      b2 * (sin(phi) * sinTheta) +
                      normal * cosTheta);
+}
+
+// Coherent PRNG Float Sample via Subgroup Shuffle (for coherent Fresnel reflection/refraction coin-flips)
+float randFloatCoherent(inout uint seed, uint clusterSize, uint frameIndex) {
+    uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
+    float rLocal = randFloat(seed);
+    return subgroupShuffle(rLocal, leaderLane);
 }
 
 // Schlick's approximation for Fresnel reflectance
@@ -813,6 +827,45 @@ float distributionAnisotropicGGX(float TdotH, float BdotH, float NdotH, float ax
 // Sample Anisotropic GGX microfacet normal
 vec3 sampleAnisotropicGGX(vec3 N, vec3 T, vec3 B, float ax, float ay, inout uint seed) {
     vec2 xi = randVec2(seed);
+    float phi = atan(ay * sin(TWO_PI * xi.x), ax * cos(TWO_PI * xi.x));
+    if (phi < 0.0) phi += TWO_PI;
+    float cosTheta = sqrt(clamp((1.0 - xi.y) / max(xi.y * (ax * cos(phi) * ax * cos(phi) + ay * sin(phi) * ay * sin(phi) - 1.0) + 1.0, 1e-7), 0.0, 1.0));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    return normalize(T * H_local.x + B * H_local.y + N * H_local.z);
+}
+
+// Coherent GGX Microfacet Sampling via Subgroup Shuffle (Xiang et al. 2023)
+vec3 sampleGGXCoherent(vec3 N, float alpha, inout uint seed, uint clusterSize, uint frameIndex) {
+    uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
+    vec2 rLocal = randVec2(seed);
+
+    vec2 xi;
+    xi.x = subgroupShuffle(rLocal.x, leaderLane);
+    xi.y = subgroupShuffle(rLocal.y, leaderLane);
+
+    float a2 = max(alpha * alpha, 1e-6);
+    float phi = TWO_PI * xi.x;
+    float cosTheta = sqrt(clamp((1.0 - xi.y) / max(1.0 + (a2 - 1.0) * xi.y, 1e-7), 0.0, 1.0));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    vec3 b1, b2;
+    buildOrthonormalBasis(N, b1, b2);
+
+    return normalize(b1 * H_local.x + b2 * H_local.y + N * H_local.z);
+}
+
+// Coherent Anisotropic GGX Microfacet Sampling via Subgroup Shuffle
+vec3 sampleAnisotropicGGXCoherent(vec3 N, vec3 T, vec3 B, float ax, float ay, inout uint seed, uint clusterSize, uint frameIndex) {
+    uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
+    vec2 rLocal = randVec2(seed);
+
+    vec2 xi;
+    xi.x = subgroupShuffle(rLocal.x, leaderLane);
+    xi.y = subgroupShuffle(rLocal.y, leaderLane);
+
     float phi = atan(ay * sin(TWO_PI * xi.x), ax * cos(TWO_PI * xi.x));
     if (phi < 0.0) phi += TWO_PI;
     float cosTheta = sqrt(clamp((1.0 - xi.y) / max(xi.y * (ax * cos(phi) * ax * cos(phi) + ay * sin(phi) * ay * sin(phi) - 1.0) + 1.0, 1e-7), 0.0, 1.0));
