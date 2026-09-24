@@ -83,14 +83,14 @@ struct Config {
     uint32_t getRenderWidth() const {
         if (render_width > 0) return render_width;
         if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
-            return std::max(1u, static_cast<uint32_t>(width * render_scale));
+            return std::max(1u, static_cast<uint32_t>(std::round(width * render_scale)));
         }
         return width;
     }
     uint32_t getRenderHeight() const {
         if (render_height > 0) return render_height;
         if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
-            return std::max(1u, static_cast<uint32_t>(height * render_scale));
+            return std::max(1u, static_cast<uint32_t>(std::round(height * render_scale)));
         }
         return height;
     }

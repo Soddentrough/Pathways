@@ -1,6 +1,7 @@
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/upways_weights.hpp"
 #include "rt/upways_default_weights.hpp"
+#include "core/Config.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -275,8 +276,80 @@ int main() {
         std::cout << "  -> Estimated 4K dispatch latency: " << estimatedDispatchTimeMs << " ms (Budget < " << totalDispatchBudgetMs << " ms)." << std::endl;
     }
 
+    // 10. Verify Consolidated Scaler CLI Configuration & Harmonization
+    std::cout << "[TEST 10] Consolidated Scaler CLI Configuration & Harmonization..." << std::endl;
+    {
+        // 10a: --res 4k --scaler upways quality
+        const char* argv1[] = { "pathways", "--res", "4k", "--scaler", "upways", "quality" };
+        Config c1 = Config::parse(6, const_cast<char**>(argv1));
+        check_true(c1.width == 3840 && c1.height == 2160, "c1 output resolution must be 3840x2160");
+        check_true(c1.upscaler_mode == UpscalerMode::Upways, "c1 upscaler_mode must be Upways");
+        check_true(c1.upways_superres == true, "c1 upways_superres must be true");
+        check_true(c1.denoiser_mode == DenoiserMode::Upways, "c1 denoiser_mode must be Upways");
+        check_true(c1.getRenderWidth() == 2560 && c1.getRenderHeight() == 1440, "c1 internal resolution must be 2560x1440 (1.5x)");
+        std::cout << "  -> Verified: --res 4k --scaler upways quality -> 2560x1440 to 3840x2160." << std::endl;
+
+        // 10b: --res 4k --scaler fsr quality
+        const char* argv2[] = { "pathways", "--res", "4k", "--scaler", "fsr", "quality" };
+        Config c2 = Config::parse(6, const_cast<char**>(argv2));
+        check_true(c2.width == 3840 && c2.height == 2160, "c2 output resolution must be 3840x2160");
+        check_true(c2.upscaler_mode == UpscalerMode::FSR3, "c2 upscaler_mode must be FSR3");
+        check_true(c2.getRenderWidth() == 2560 && c2.getRenderHeight() == 1440, "c2 internal resolution must be 2560x1440 (1.5x)");
+        std::cout << "  -> Verified: --res 4k --scaler fsr quality -> 2560x1440 to 3840x2160." << std::endl;
+
+        // 10c: --res 4k --scaler upways 1080
+        const char* argv3[] = { "pathways", "--res", "4k", "--scaler", "upways", "1080" };
+        Config c3 = Config::parse(6, const_cast<char**>(argv3));
+        check_true(c3.width == 3840 && c3.height == 2160, "c3 output resolution must be 3840x2160");
+        check_true(c3.upscaler_mode == UpscalerMode::Upways, "c3 upscaler_mode must be Upways");
+        check_true(c3.upways_superres == true, "c3 upways_superres must be true");
+        check_true(c3.getRenderWidth() == 1920 && c3.getRenderHeight() == 1080, "c3 internal resolution must be 1920x1080 (2.0x)");
+        std::cout << "  -> Verified: --res 4k --scaler upways 1080 -> 1920x1080 to 3840x2160." << std::endl;
+
+        // 10d: --res 4k --scaler fsr 1080
+        const char* argv4[] = { "pathways", "--res", "4k", "--scaler", "fsr", "1080" };
+        Config c4 = Config::parse(6, const_cast<char**>(argv4));
+        check_true(c4.width == 3840 && c4.height == 2160, "c4 output resolution must be 3840x2160");
+        check_true(c4.upscaler_mode == UpscalerMode::FSR3, "c4 upscaler_mode must be FSR3");
+        check_true(c4.getRenderWidth() == 1920 && c4.getRenderHeight() == 1080, "c4 internal resolution must be 1920x1080 (2.0x)");
+        std::cout << "  -> Verified: --res 4k --scaler fsr 1080 -> 1920x1080 to 3840x2160." << std::endl;
+
+        // 10e: --scaler upways 1080 --res 4k (reverse argument order)
+        const char* argv5[] = { "pathways", "--scaler", "upways", "1080", "--res", "4k" };
+        Config c5 = Config::parse(6, const_cast<char**>(argv5));
+        check_true(c5.width == 3840 && c5.height == 2160, "c5 output resolution must be 3840x2160");
+        check_true(c5.upscaler_mode == UpscalerMode::Upways, "c5 upscaler_mode must be Upways");
+        check_true(c5.upways_superres == true, "c5 upways_superres must be true");
+        check_true(c5.getRenderWidth() == 1920 && c5.getRenderHeight() == 1080, "c5 internal resolution must be 1920x1080 (2.0x)");
+        std::cout << "  -> Verified: --scaler upways 1080 --res 4k (reversed order) -> 1920x1080 to 3840x2160." << std::endl;
+
+        // 10f: --res 4k --scaler upways native
+        const char* argv6[] = { "pathways", "--res", "4k", "--scaler", "upways", "native" };
+        Config c6 = Config::parse(6, const_cast<char**>(argv6));
+        check_true(c6.width == 3840 && c6.height == 2160, "c6 output resolution must be 3840x2160");
+        check_true(c6.upscaler_mode == UpscalerMode::None, "c6 upscaler_mode must be None for native");
+        check_true(c6.upways_superres == false, "c6 upways_superres must be false for native");
+        check_true(c6.denoiser_mode == DenoiserMode::Upways, "c6 denoiser_mode must be Upways");
+        check_true(c6.getRenderWidth() == 3840 && c6.getRenderHeight() == 2160, "c6 internal resolution must be 3840x2160 (1:1 native)");
+        std::cout << "  -> Verified: --res 4k --scaler upways native -> 3840x2160 (1:1 native denoising)." << std::endl;
+
+        // 10g: --res 4k --scaler off
+        const char* argv7[] = { "pathways", "--res", "4k", "--scaler", "off" };
+        Config c7 = Config::parse(5, const_cast<char**>(argv7));
+        check_true(c7.upscaler_mode == UpscalerMode::None, "c7 upscaler_mode must be None for off");
+        check_true(c7.upways_superres == false, "c7 upways_superres must be false for off");
+        check_true(c7.getRenderWidth() == 3840 && c7.getRenderHeight() == 2160, "c7 internal resolution must be 3840x2160");
+        std::cout << "  -> Verified: --res 4k --scaler off -> upscaling disabled." << std::endl;
+
+        // 10h: --res 4k --scaler upways ultra performance
+        const char* argv8[] = { "pathways", "--res", "4k", "--scaler", "upways", "ultra", "performance" };
+        Config c8 = Config::parse(7, const_cast<char**>(argv8));
+        check_true(c8.getRenderWidth() == 1280 && c8.getRenderHeight() == 720, "c8 internal resolution must be 1280x720 (3.0x ultra performance)");
+        std::cout << "  -> Verified: --res 4k --scaler upways ultra performance -> 1280x720 to 3840x2160." << std::endl;
+    }
+
     std::cout << "\n==========================================================" << std::endl;
-    std::cout << " [SUCCESS] All Upways Vulkan Pipeline Invariant Tests Passed! (9/9)" << std::endl;
+    std::cout << " [SUCCESS] All Upways Vulkan Pipeline Invariant Tests Passed! (10/10)" << std::endl;
     std::cout << "==========================================================" << std::endl;
     return 0;
 }

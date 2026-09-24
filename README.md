@@ -211,7 +211,10 @@ ctest --test-dir build --output-on-failure
 ./build/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
 
 # Launch glTF scene with AMD FSR 3.1 Super-Resolution
-./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --upscaler fsr3 --upscaler-preset quality
+./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --scaler fsr quality
+
+# Launch 4K rendering with Upways Wave32 Neural Super-Resolution from 1080p
+./build/bin/pathways --scene scenes/living-room/living_room.glb --res 4k --scaler upways 1080
 
 # Launch in windowed mode with target frame pacing at 1440p
 ./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
@@ -260,8 +263,8 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--indirect-clamp` | `<float>` | Secondary bounce radiance luminance clamp to eliminate fireflies (0 = disabled) | `35.0` |
 | `--wavefront-sort` | `dual` \| `archetype` \| `none` | Material sorting mode: 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `dual` |
 | `--sec-sort` | `none` \| `directional` | Secondary ray coherency sort mode (Option 1 on-chip DGC octant binning) | `none` |
-| `--upscaler` | `none` \| `fsr3` \| `upways` \| `fsr1` | Super-resolution upscaler: AMD FSR 3.1, Upways Neural, or Spatial EASU+RCAS | `none` |
-| `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra-perf` | Super-resolution scale preset (1.5x, 1.7x, 2.0x, 3.0x) | `quality` |
+| `--scaler` | `<mode> [ratio\|res]` | Consolidated upscaler: `upways`, `fsr`, `fsr1`, `none`. Presets: `native`, `quality`, `balanced`, `performance`, `ultra`, or arbitrary resolution (`1080`, `1440`, `1920x1080`, `0.75`) | `none` |
+| `--preset` | `quality` \| `balanced` \| `perf` \| `ultra` | Scaling ratio preset or resolution override | `quality` |
 | `--upscaler-sharpening` | *(flag)* | Enable Robust Contrast Adaptive Sharpening (RCAS) pass | Disabled |
 | `--upscaler-sharpness` | `<float>` | RCAS contrast-adaptive sharpness factor `[0.0 - 1.0]` | `0.0` |
 | `--denoiser` | `none` \| `upways` | Denoising mode: Pure Monte Carlo (unbiased) or Upways Wave32 WMMA | `none` |

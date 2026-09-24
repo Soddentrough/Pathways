@@ -514,6 +514,8 @@ add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 # Upways Neural Denoiser & Super-Resolution Wave32 WMMA Unit Test Target
 add_executable(test_upways_pipeline
     tests/test_upways_pipeline.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
 )
 target_include_directories(test_upways_pipeline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
