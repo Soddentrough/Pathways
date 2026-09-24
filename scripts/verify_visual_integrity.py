@@ -62,8 +62,15 @@ def compute_image_stats(img):
     lum = 0.2126 * img[:, :, 2] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 0]
     mean_lum = float(np.mean(lum))
     max_lum = float(np.max(lum))
+    min_val = float(np.min(img))
     clipped_pct = float(np.mean(lum >= 245.0) * 100.0)
     black_pct = float(np.mean(lum <= 2.0) * 100.0)
+    p05 = float(np.percentile(lum, 5.0))
+    p95 = float(np.percentile(lum, 95.0))
+    contrast = p95 - p05
+
+    has_nan = bool(np.isnan(img).any())
+    has_inf = bool(np.isinf(img).any())
 
     # Centerline discontinuities (Row W/2, Col H/2)
     mid_x, mid_y = w // 2, h // 2
@@ -78,17 +85,24 @@ def compute_image_stats(img):
     return {
         "width": w,
         "height": h,
+        "channels": c,
         "mean_rgb": [float(x) for x in mean_rgb],
         "mean_lum": mean_lum,
         "max_lum": max_lum,
+        "min_val": min_val,
         "clipped_pct": clipped_pct,
         "black_pct": black_pct,
+        "p05": p05,
+        "p95": p95,
+        "contrast": contrast,
+        "has_nan": has_nan,
+        "has_inf": has_inf,
         "row_ratio": row_ratio,
         "col_ratio": col_ratio
     }
 
 def compute_reference_comparison(img, ref_img):
-    """Computes PSNR and SSIM against ground truth reference."""
+    """Computes PSNR, SSIM, low-frequency SSIM, edge correlation, and channel correlations."""
     h, w, _ = img.shape
     ref_h, ref_w, _ = ref_img.shape
     if (h, w) != (ref_h, ref_w):
@@ -102,10 +116,85 @@ def compute_reference_comparison(img, ref_img):
     gray_b = cv2.cvtColor(ref_resized, cv2.COLOR_BGR2GRAY)
     ssim_val = float(compute_ssim(gray_a, gray_b))
 
+    # Low-frequency SSIM: Gaussian blur suppresses zero-mean Monte Carlo sample noise (decays as 1/sqrt(N))
+    # while preserving macro geometry silhouettes, material patches, and overall illumination.
+    blur_a = cv2.GaussianBlur(img, (0, 0), 3.0)
+    blur_b = cv2.GaussianBlur(ref_resized, (0, 0), 3.0)
+    low_gray_a = cv2.cvtColor(blur_a, cv2.COLOR_BGR2GRAY)
+    low_gray_b = cv2.cvtColor(blur_b, cv2.COLOR_BGR2GRAY)
+    low_ssim = float(compute_ssim(low_gray_a, low_gray_b))
+
+    # Edge correlation: normalized cross-correlation of Sobel gradients on smoothed luminance
+    sobel_a = cv2.Sobel(low_gray_a, cv2.CV_32F, 1, 1, ksize=3)
+    sobel_b = cv2.Sobel(low_gray_b, cv2.CV_32F, 1, 1, ksize=3)
+    mag_a = np.abs(sobel_a)
+    mag_b = np.abs(sobel_b)
+    norm_a = np.linalg.norm(mag_a)
+    norm_b = np.linalg.norm(mag_b)
+    edge_corr = float(np.sum(mag_a * mag_b) / (norm_a * norm_b)) if (norm_a >= 1e-4 and norm_b >= 1e-4) else 1.0
+
+    # Color channel cross-correlations (detects inverted colors, BGR vs RGB swaps)
+    corrs = {}
+    for idx, name in enumerate(["B", "G", "R"]):
+        a = img[:, :, idx].astype(float) - np.mean(img[:, :, idx])
+        b = ref_resized[:, :, idx].astype(float) - np.mean(ref_resized[:, :, idx])
+        norm_ca = np.linalg.norm(a)
+        norm_cb = np.linalg.norm(b)
+        corrs[name] = float(np.sum(a * b) / (norm_ca * norm_cb)) if (norm_ca >= 1e-4 and norm_cb >= 1e-4) else 1.0
+
+    # Cross-channel check (B vs R) to catch BGR vs RGB swap bugs
+    a_b = img[:, :, 0].astype(float) - np.mean(img[:, :, 0])
+    b_r = ref_resized[:, :, 2].astype(float) - np.mean(ref_resized[:, :, 2])
+    norm_ab = np.linalg.norm(a_b)
+    norm_br = np.linalg.norm(b_r)
+    corrs["cross_BR"] = float(np.sum(a_b * b_r) / (norm_ab * norm_br)) if (norm_ab >= 1e-4 and norm_br >= 1e-4) else 0.0
+
     return {
         "mse": mse,
         "psnr": psnr,
-        "ssim": ssim_val
+        "ssim": ssim_val,
+        "low_ssim": low_ssim,
+        "edge_corr": edge_corr,
+        "corrs": corrs
+    }
+
+def verify_cornell_semantic_materials(img):
+    """Validates semantic material invariants on canonical Cornell Box scenes."""
+    h, w, _ = img.shape
+    left_wall = img[int(0.25*h):int(0.75*h), int(0.05*w):int(0.20*w)].astype(float)
+    right_wall = img[int(0.25*h):int(0.75*h), int(0.80*w):int(0.95*w)].astype(float)
+    ceiling_light = img[int(0.05*h):int(0.15*h), int(0.40*w):int(0.60*w)].astype(float)
+    back_wall = img[int(0.25*h):int(0.75*h), int(0.40*w):int(0.60*w)].astype(float)
+
+    left_bgr = np.mean(left_wall, axis=(0, 1))
+    right_bgr = np.mean(right_wall, axis=(0, 1))
+    back_bgr = np.mean(back_wall, axis=(0, 1))
+
+    light_lum = float(np.mean(0.2126 * ceiling_light[:, :, 2] + 0.7152 * ceiling_light[:, :, 1] + 0.0722 * ceiling_light[:, :, 0]))
+
+    left_red_ratio = float(left_bgr[2] / max(max(left_bgr[0], left_bgr[1]), 1.0))
+    right_green_ratio = float(right_bgr[1] / max(max(right_bgr[0], right_bgr[2]), 1.0))
+
+    back_mean = max(float(np.mean(back_bgr)), 1.0)
+    back_chroma = float(max(abs(back_bgr[2] - back_bgr[1]), abs(back_bgr[1] - back_bgr[0]), abs(back_bgr[2] - back_bgr[0])) / back_mean)
+
+    errors = []
+    if left_red_ratio < 1.20:
+        errors.append(f"Left wall missing red material (ratio {left_red_ratio:.2f} < 1.20, R={left_bgr[2]:.1f}, G={left_bgr[1]:.1f}, B={left_bgr[0]:.1f})")
+    if right_green_ratio < 1.20:
+        errors.append(f"Right wall missing green material (ratio {right_green_ratio:.2f} < 1.20, R={right_bgr[2]:.1f}, G={right_bgr[1]:.1f}, B={right_bgr[0]:.1f})")
+    if light_lum < 180.0:
+        errors.append(f"Ceiling light missing emission (luminance {light_lum:.1f} < 180.0)")
+    if back_chroma > 0.25:
+        errors.append(f"Back wall chromatic distortion (delta {back_chroma:.3f} > 0.25)")
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "left_red_ratio": left_red_ratio,
+        "right_green_ratio": right_green_ratio,
+        "light_lum": light_lum,
+        "back_chroma": back_chroma
     }
 
 def test_single_gpu_accumulation_stability():
@@ -121,7 +210,6 @@ def test_single_gpu_accumulation_stability():
             "--res", "1080p",
             "--upscaler", "upways",
             "--render-scale", "0.5",
-            "--sec-sort", "none",
             "--frames", str(fc),
             "--dump-frame", out_png
         ])
@@ -136,9 +224,21 @@ def test_single_gpu_accumulation_stability():
 
         st = compute_image_stats(img)
         stats_list.append((fc, st, img))
-        print(f"  Frame {fc:2d}: MeanLum={st['mean_lum']:.1f}, MaxLum={st['max_lum']:.1f}, Clipped={st['clipped_pct']:.2f}%")
+        print(f"  Frame {fc:2d}: MeanLum={st['mean_lum']:.1f}, MaxLum={st['max_lum']:.1f}, Clipped={st['clipped_pct']:.2f}%, Contrast={st['contrast']:.1f}")
 
-    # Invariant 1: Proper exposure (no overexposure blowout and no underexposure blackout)
+    # Invariant 1: Proper dimensions, valid gamut, no NaNs/Infs
+    final_st = stats_list[-1][1]
+    final_img = stats_list[-1][2]
+    if final_st["width"] != 1920 or final_st["height"] != 1080:
+        result.fail(f"Incorrect image resolution: expected 1920x1080, got {final_st['width']}x{final_st['height']}")
+    if final_st["has_nan"]:
+        result.fail("Invalid output: NaN values detected in rendered image")
+    if final_st["has_inf"]:
+        result.fail("Invalid output: Infinite values detected in rendered image")
+    if final_st["min_val"] < 0.0:
+        result.fail(f"Invalid output: Negative color values detected ({final_st['min_val']:.4f})")
+
+    # Invariant 2: Proper exposure & dynamic range (no blowout, blackout, or contrast collapse)
     for fc, st, _ in stats_list:
         if st["mean_lum"] > 215.0:
             result.fail(f"Overexposure blowout detected at frame {fc}: Mean luminance {st['mean_lum']:.1f} > 215.0")
@@ -148,8 +248,10 @@ def test_single_gpu_accumulation_stability():
             result.fail(f"Underexposure blackout / red mud collapse detected at frame {fc}: Mean luminance {st['mean_lum']:.1f} < 45.0")
         if st["max_lum"] < 120.0:
             result.fail(f"Insufficient dynamic range at frame {fc}: Max luminance {st['max_lum']:.1f} < 120.0")
+        if st["contrast"] < 35.0:
+            result.fail(f"Contrast collapse at frame {fc}: P95-P05 contrast {st['contrast']:.1f} < 35.0")
 
-    # Invariant 2: Accumulation drift bounded (allows natural MC convergence but forbids runaway)
+    # Invariant 3: Accumulation drift bounded (allows natural MC convergence but forbids runaway)
     f1_lum = stats_list[0][1]["mean_lum"]
     f30_lum = stats_list[-1][1]["mean_lum"]
     drift_pct = abs(f30_lum - f1_lum) / f1_lum * 100.0
@@ -158,29 +260,42 @@ def test_single_gpu_accumulation_stability():
     if drift_pct > 35.0:
         result.fail(f"Accumulation exposure runaway: Drift {drift_pct:.2f}% > 35.0%")
 
-    # Invariant 3: Chromatic neutrality on white back wall patch [250:380, 800:1000]
-    wall_patch = stats_list[-1][2][250:380, 800:1000].astype(float)
-    mean_bgr = np.mean(wall_patch, axis=(0, 1))
-    b, g, r = mean_bgr[0], mean_bgr[1], mean_bgr[2]
-    chroma_delta = max(abs(r - g), abs(g - b), abs(r - b)) / max(np.mean(mean_bgr), 1.0)
-    result.record("white_wall_chroma_delta", chroma_delta)
-    print(f"  White Wall Chromatic Delta: {chroma_delta:.3f} (R={r:.1f}, G={g:.1f}, B={b:.1f})")
-    if chroma_delta > 0.25:
-        result.fail(f"White wall chromatic distortion detected: Chroma delta {chroma_delta:.3f} > 0.25")
+    # Invariant 4: Semantic Material Invariants (Catches missing materials, magenta/gray fallbacks)
+    mat_check = verify_cornell_semantic_materials(final_img)
+    result.record("left_red_ratio", mat_check["left_red_ratio"])
+    result.record("right_green_ratio", mat_check["right_green_ratio"])
+    result.record("light_lum", mat_check["light_lum"])
+    result.record("white_wall_chroma_delta", mat_check["back_chroma"])
+    print(f"  Semantic Materials: LeftRed={mat_check['left_red_ratio']:.2f}, RightGreen={mat_check['right_green_ratio']:.2f}, LightLum={mat_check['light_lum']:.1f}, WallChroma={mat_check['back_chroma']:.3f}")
+    if not mat_check["valid"]:
+        for err in mat_check["errors"]:
+            result.fail(err)
 
-    # Invariant 4: Ground truth reference similarity
+    # Invariant 5: Macro Geometry & Color Space Invariants (Noise-Immune Reference Comparison)
     ref_path = os.path.join(REF_DIR, "cornell_upways_1080p.png")
     if os.path.exists(ref_path):
         ref_img = cv2.imread(ref_path)
-        comp = compute_reference_comparison(stats_list[-1][2], ref_img)
+        comp = compute_reference_comparison(final_img, ref_img)
         result.record("psnr_vs_ref", comp["psnr"])
         result.record("ssim_vs_ref", comp["ssim"])
-        print(f"  Ground Truth Reference Similarity: PSNR={comp['psnr']:.2f} dB, SSIM={comp['ssim']:.4f}")
-        if comp["psnr"] < 25.0:
-            result.fail(f"PSNR too low against reference: {comp['psnr']:.2f} dB < 25.0 dB")
-        if comp["ssim"] < 0.70:
-            result.fail(f"SSIM too low against reference: {comp['ssim']:.4f} < 0.70")
+        result.record("low_ssim_vs_ref", comp["low_ssim"])
+        result.record("edge_corr_vs_ref", comp["edge_corr"])
+        result.record("channel_corr_R", comp["corrs"]["R"])
+        result.record("channel_corr_G", comp["corrs"]["G"])
+        result.record("channel_corr_B", comp["corrs"]["B"])
 
+        print(f"  Reference Comparison: LowSSIM={comp['low_ssim']:.4f}, EdgeCorr={comp['edge_corr']:.4f}, RawPSNR={comp['psnr']:.2f} dB, RawSSIM={comp['ssim']:.4f}")
+        print(f"  Channel Correlations: R={comp['corrs']['R']:.4f}, G={comp['corrs']['G']:.4f}, B={comp['corrs']['B']:.4f}, CrossBR={comp['corrs']['cross_BR']:.4f}")
+
+        # Check macro structural similarity (catches missing/broken meshes and gross errors)
+        if comp["low_ssim"] < 0.90:
+            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.90")
+
+        # Check color channel polarity and swap detection (e.g. Vulkan BGR vs RGB bug)
+        if comp["corrs"]["R"] < 0.70 or comp["corrs"]["G"] < 0.70 or comp["corrs"]["B"] < 0.70:
+            result.fail(f"Color channel distortion: Correlations R={comp['corrs']['R']:.2f}, G={comp['corrs']['G']:.2f}, B={comp['corrs']['B']:.2f} below 0.70")
+        if comp["corrs"]["cross_BR"] > comp["corrs"]["R"] and comp["corrs"]["cross_BR"] > comp["corrs"]["B"]:
+            result.fail("Inverted colors / Channel swap detected: Red and Blue channels are swapped (Vulkan BGR/RGB mismatch)")
 
     return result
 

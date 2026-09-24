@@ -10,6 +10,8 @@ compile_commands.json
 output/
 telemetry/
 scratch/
+profiles/
+*.rgp
 data/dataset*/
 /*.png
 /*.exr
@@ -22,6 +24,9 @@ CMakeUserPresets.json
 *.rar
 
 # Scene assets
+*.blend
+*.blend1
+scenes/*.blend
 # Generated test artifacts and loose debug textures
 scenes/pbr_*
 scenes/textured_quad.gltf
