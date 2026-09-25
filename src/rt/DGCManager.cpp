@@ -417,7 +417,6 @@ void DGCManager::ensureMaterialPreprocessBuffer(uint32_t maxSequenceCount) {
     );
     Logger::info("Allocated DGC material preprocess buffer (reqSize: {} bytes, align: {} bytes, slice: {} bytes, total: {} bytes).",
                  reqSize, align, m_materialSliceSize, totalSize);
->>>>>>> 3c2b03c (rt: Enhance DGC Execution Set spec compliance and retain indirect multi-dispatch default)
 }
 
 void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
