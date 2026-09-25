@@ -956,6 +956,16 @@ void Engine::initScene() {
                     break;
                 }
             }
+        } else if (m_config.scene_path == "infinity-mirror" || m_config.scene_path == "procedural:infinity-mirror") {
+            Logger::info("Loading Procedural Infinity Mirror Scene...");
+            m_sceneData = ProceduralScene::createInfinityMirrorScene();
+            m_currentSceneIndex = -1;
+            for (size_t i = 0; i < m_availableScenes.size(); ++i) {
+                if (m_availableScenes[i].filepath == "procedural:infinity-mirror") {
+                    m_currentSceneIndex = static_cast<int>(i);
+                    break;
+                }
+            }
         } else {
             std::string resolvedScene = m_config.scene_path;
             if (!std::filesystem::exists(resolvedScene)) {
@@ -1680,6 +1690,9 @@ bool Engine::loadScene(const std::string& filepath) {
     } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
         Logger::info("Loading Procedural Cyber City Megastructure...");
         newScene = ProceduralScene::createCyberCityScene();
+    } else if (filepath == "procedural:infinity-mirror" || filepath == "infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity_mirror") {
+        Logger::info("Loading Procedural Infinity Mirror Scene...");
+        newScene = ProceduralScene::createInfinityMirrorScene();
     } else {
         if (UsdLoader::isUsdFile(filepath)) {
             Logger::info("Loading OpenUSD scene '{}'...", filepath);
@@ -5890,6 +5903,8 @@ void Engine::renderFrame() {
                         targetLabel = "Procedural Many-Lights";
                     } else if (guiActions.newScenePath == "procedural:cyber-city" || guiActions.newScenePath == "procedural:cyber_city" || guiActions.newScenePath == "cyber-city" || guiActions.newScenePath == "cyber_city" || guiActions.newScenePath == "Procedural Cyber City") {
                         targetLabel = "Procedural Cyber City";
+                    } else if (guiActions.newScenePath == "procedural:infinity-mirror" || guiActions.newScenePath == "infinity-mirror" || guiActions.newScenePath == "procedural:infinity_mirror" || guiActions.newScenePath == "infinity_mirror") {
+                        targetLabel = "Procedural Infinity Mirror (40+ Bounces)";
                     } else {
                         targetLabel = SceneRegistry::formatSceneName(std::filesystem::path(guiActions.newScenePath).stem().string());
                     }
