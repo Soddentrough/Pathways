@@ -21,19 +21,20 @@ struct QueueCountersBuffer {
     uint32_t shadowRayCount;
     uint32_t retiredWorkgroups;
     uint32_t currentShadowCount;
-    uint32_t diffuseCount;
-    uint32_t dielectricCount;
-    uint32_t conductorCount;
+    uint32_t diffuseCount; // Standard count
     uint32_t complexCount;
+    uint32_t dielectricCount;
     uint32_t emissiveCount;
-    uint32_t alphamaskCount;
+    uint32_t conductorCount; // Reserved
+    uint32_t alphamaskCount; // Reserved
     uint32_t nextDiffuseCount;
-    uint32_t nextDielectricCount;
-    uint32_t nextConductorCount;
     uint32_t nextComplexCount;
+    uint32_t nextDielectricCount;
     uint32_t nextEmissiveCount;
-    uint32_t nextAlphamaskCount;
-    uint32_t currentMaterialCounts[6];
+    uint32_t nextConductorCount; // Reserved
+    uint32_t nextAlphamaskCount; // Reserved
+    uint32_t currentMaterialCounts[4];
+    uint32_t padMat[2];
     uint32_t totalShadeWorkgroups;
     uint32_t octantCounts[8];
     uint32_t currentOctantCounts[8];
@@ -74,7 +75,7 @@ struct WavefrontSceneData {
     uint32_t fullHeight = 0;              // Full unclipped frame resolution height
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
     float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
-    bool inlineShadows = true;            // Inline shadow rays via hardware ray queries (bypasses separate shadow microkernel)
+    bool inlineShadows = false;           // Detached shadow queue evaluation (Default: false for max occupancy & 0 LDS)
     uint32_t macroTileSize = 0;           // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
     uint32_t batchCount = 0;              // Coarse batch count (0 = auto-detect, 1 = monolithic, 2, 4, 8...)
     uint32_t batchPixels = 0;             // Coarse batch ray budget in pixels (0 = auto-detect)
@@ -139,6 +140,7 @@ public:
                                 VkDeviceSize shadeMaterialSize = 0);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
+    uint32_t getMaxCapacity() const { return m_maxCapacity; }
 
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,

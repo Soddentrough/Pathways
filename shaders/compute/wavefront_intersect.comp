@@ -38,19 +38,20 @@ layout(std430, binding = 11) buffer QueueCountersBuffer {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -173,7 +174,7 @@ void main() {
     }
 
     RayHit hit;
-    uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
+    uint archetype = MATERIAL_ARCHETYPE_STANDARD;
     if (inRange) {
         if (closestTri >= 0) {
             Triangle tri = triangles[closestTri];
@@ -182,11 +183,11 @@ void main() {
             vec2 hitUv = getTriangleUV(tri, closestBary);
 
             uint matId = tri.materialId + hitInstMatOffset;
-            archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
+            archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_STANDARD;
 
             vec3 tanDir = vec3(1.0, 0.0, 0.0);
             float tanSign = 1.0;
-            if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
+            if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_STANDARD || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
                 tanDir = getTriangleTangent(tri, closestBary);
                 tanDir = normalize(mat3(hitO2w) * tanDir);
                 tanSign = getTriangleTangentSign(tri);
@@ -197,10 +198,10 @@ void main() {
             vec3 hitNormal = (origin + closestT * direction - spheres[closestSphere].centerRadius.xyz) / spheres[closestSphere].centerRadius.w;
             uint matId = spheres[closestSphere].materialId;
             hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
-            archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
+            archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_STANDARD;
         } else {
             hit = packRayHit(closestT, 0u, 2u, vec3(0.0, 1.0, 0.0), vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
-            archetype = MATERIAL_ARCHETYPE_DIFFUSE; // Miss radiance evaluated in diffuse microkernel
+            archetype = MATERIAL_ARCHETYPE_STANDARD; // Miss radiance evaluated in standard microkernel
         }
     }
 
@@ -248,7 +249,7 @@ void main() {
         }
 
         // Subgroup Ballot Multi-Queue Partitioning into Material Index Queue (4-byte indirection)
-        for (uint k = 0u; k < 6u; ++k) {
+        for (uint k = 0u; k < 4u; ++k) {
             bool isMatch = (inRange && archetype == k);
             uvec4 matBallot = subgroupBallot(isMatch);
             uint matchCount = subgroupBallotBitCount(matBallot);
@@ -259,11 +260,9 @@ void main() {
                 uint waveQueueBase = 0u;
                 if (gl_SubgroupInvocationID == leader) {
                     if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
-                    else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
-                    else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.conductorCount, matchCount);
-                    else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
-                    else if (k == 4u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
-                    else if (k == 5u) waveQueueBase = atomicAdd(queueCounters.alphamaskCount, matchCount);
+                    else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
+                    else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
+                    else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
                 }
                 waveQueueBase = subgroupBroadcast(waveQueueBase, leader);
 
@@ -286,91 +285,68 @@ void main() {
             uint b = pc.currentBounce;
             uint nextB = b + 1u;
             if (pc.sortMode > 0u && nextB < pc.maxBounces) {
-                uint diffCnt = atomicExchange(queueCounters.diffuseCount, 0u);
-                uint dielCnt = atomicExchange(queueCounters.dielectricCount, 0u);
-                uint condCnt = atomicExchange(queueCounters.conductorCount, 0u);
+                uint stdCnt  = atomicExchange(queueCounters.diffuseCount, 0u);
                 uint compCnt = atomicExchange(queueCounters.complexCount, 0u);
+                uint dielCnt = atomicExchange(queueCounters.dielectricCount, 0u);
                 uint emisCnt = atomicExchange(queueCounters.emissiveCount, 0u);
-                uint passCnt = atomicExchange(queueCounters.alphamaskCount, 0u);
 
-                queueCounters.currentMaterialCounts[0] = diffCnt;
-                queueCounters.currentMaterialCounts[1] = dielCnt;
-                queueCounters.currentMaterialCounts[2] = condCnt;
-                queueCounters.currentMaterialCounts[3] = compCnt;
-                queueCounters.currentMaterialCounts[4] = emisCnt;
-                queueCounters.currentMaterialCounts[5] = passCnt;
+                queueCounters.currentMaterialCounts[0] = stdCnt;
+                queueCounters.currentMaterialCounts[1] = compCnt;
+                queueCounters.currentMaterialCounts[2] = dielCnt;
+                queueCounters.currentMaterialCounts[3] = emisCnt;
 
-                uint diffGroups = (diffCnt + 31u) / 32u;
-                uint dielGroups = (dielCnt + 31u) / 32u;
-                uint condGroups = (condCnt + 31u) / 32u;
+                uint stdGroups  = (stdCnt + 31u) / 32u;
                 uint compGroups = (compCnt + 31u) / 32u;
+                uint dielGroups = (dielCnt + 31u) / 32u;
                 uint emisGroups = (emisCnt + 31u) / 32u;
-                uint passGroups = (passCnt + 31u) / 32u;
 
-                // Bounce nextB Shading Commands (Sequence 0..5)
-                indirect.commands[nextB * 16u + 0u].x = diffGroups;
+                // Bounce nextB Shading Commands (Sequence 0..3)
+                indirect.commands[nextB * 16u + 0u].x = stdGroups;
                 indirect.commands[nextB * 16u + 0u].y = 1u;
                 indirect.commands[nextB * 16u + 0u].z = 1u;
-                indirect.commands[nextB * 16u + 0u].pad = diffCnt;
+                indirect.commands[nextB * 16u + 0u].pad = stdCnt;
 
-                indirect.commands[nextB * 16u + 1u].x = dielGroups;
+                indirect.commands[nextB * 16u + 1u].x = compGroups;
                 indirect.commands[nextB * 16u + 1u].y = 1u;
                 indirect.commands[nextB * 16u + 1u].z = 1u;
-                indirect.commands[nextB * 16u + 1u].pad = dielCnt;
+                indirect.commands[nextB * 16u + 1u].pad = compCnt;
 
-                indirect.commands[nextB * 16u + 2u].x = condGroups;
+                indirect.commands[nextB * 16u + 2u].x = dielGroups;
                 indirect.commands[nextB * 16u + 2u].y = 1u;
                 indirect.commands[nextB * 16u + 2u].z = 1u;
-                indirect.commands[nextB * 16u + 2u].pad = condCnt;
+                indirect.commands[nextB * 16u + 2u].pad = dielCnt;
 
-                indirect.commands[nextB * 16u + 3u].x = compGroups;
+                indirect.commands[nextB * 16u + 3u].x = emisGroups;
                 indirect.commands[nextB * 16u + 3u].y = 1u;
                 indirect.commands[nextB * 16u + 3u].z = 1u;
-                indirect.commands[nextB * 16u + 3u].pad = compCnt;
+                indirect.commands[nextB * 16u + 3u].pad = emisCnt;
 
-                indirect.commands[nextB * 16u + 4u].x = emisGroups;
-                indirect.commands[nextB * 16u + 4u].y = 1u;
-                indirect.commands[nextB * 16u + 4u].z = 1u;
-                indirect.commands[nextB * 16u + 4u].pad = emisCnt;
+                indirect.commands[nextB * 16u + 4u].x = 0u;
+                indirect.commands[nextB * 16u + 5u].x = 0u;
 
-                indirect.commands[nextB * 16u + 5u].x = passGroups;
-                indirect.commands[nextB * 16u + 5u].y = 1u;
-                indirect.commands[nextB * 16u + 5u].z = 1u;
-                indirect.commands[nextB * 16u + 5u].pad = passCnt;
-
-                dgcStream.commands[nextB * 16u + 0u].pipelineIndex = 0u; // Diffuse
-                dgcStream.commands[nextB * 16u + 0u].x = diffGroups;
+                dgcStream.commands[nextB * 16u + 0u].pipelineIndex = 0u; // Standard
+                dgcStream.commands[nextB * 16u + 0u].x = stdGroups;
                 dgcStream.commands[nextB * 16u + 0u].y = 1u;
                 dgcStream.commands[nextB * 16u + 0u].z = 1u;
 
-                dgcStream.commands[nextB * 16u + 1u].pipelineIndex = 1u; // Dielectric
-                dgcStream.commands[nextB * 16u + 1u].x = dielGroups;
+                dgcStream.commands[nextB * 16u + 1u].pipelineIndex = 1u; // Complex
+                dgcStream.commands[nextB * 16u + 1u].x = compGroups;
                 dgcStream.commands[nextB * 16u + 1u].y = 1u;
                 dgcStream.commands[nextB * 16u + 1u].z = 1u;
 
-                dgcStream.commands[nextB * 16u + 2u].pipelineIndex = 2u; // Conductor
-                dgcStream.commands[nextB * 16u + 2u].x = condGroups;
+                dgcStream.commands[nextB * 16u + 2u].pipelineIndex = 2u; // Dielectric
+                dgcStream.commands[nextB * 16u + 2u].x = dielGroups;
                 dgcStream.commands[nextB * 16u + 2u].y = 1u;
                 dgcStream.commands[nextB * 16u + 2u].z = 1u;
 
-                dgcStream.commands[nextB * 16u + 3u].pipelineIndex = 3u; // Complex
-                dgcStream.commands[nextB * 16u + 3u].x = compGroups;
+                dgcStream.commands[nextB * 16u + 3u].pipelineIndex = 3u; // Emissive
+                dgcStream.commands[nextB * 16u + 3u].x = emisGroups;
                 dgcStream.commands[nextB * 16u + 3u].y = 1u;
                 dgcStream.commands[nextB * 16u + 3u].z = 1u;
 
-                dgcStream.commands[nextB * 16u + 4u].pipelineIndex = 4u; // Emissive
-                dgcStream.commands[nextB * 16u + 4u].x = emisGroups;
-                dgcStream.commands[nextB * 16u + 4u].y = 1u;
-                dgcStream.commands[nextB * 16u + 4u].z = 1u;
-
-                dgcStream.commands[nextB * 16u + 5u].pipelineIndex = 5u; // AlphaMask
-                dgcStream.commands[nextB * 16u + 5u].x = passGroups;
-                dgcStream.commands[nextB * 16u + 5u].y = 1u;
-                dgcStream.commands[nextB * 16u + 5u].z = 1u;
-
-                uint totalShadeWgs = diffGroups + dielGroups + condGroups + compGroups + emisGroups + passGroups;
+                uint totalShadeWgs = stdGroups + compGroups + dielGroups + emisGroups;
                 queueCounters.totalShadeWorkgroups = totalShadeWgs;
-                queueCounters.activeMaterialSequenceCount = (totalShadeWgs > 0u) ? 6u : 0u;
+                queueCounters.activeMaterialSequenceCount = (totalShadeWgs > 0u) ? 4u : 0u;
 
                 if (totalShadeWgs == 0u) {
                     indirect.commands[nextB * 16u + 6u].x = 0u;

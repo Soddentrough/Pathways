@@ -61,19 +61,20 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -141,11 +142,11 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint activeCount = queueCounters.currentMaterialCounts[4]; // Emissive queue
+    uint activeCount = queueCounters.currentMaterialCounts[3]; // Emissive queue
     bool inRange = (idx < activeCount);
 
     if (inRange) {
-        uint rayIdx = materialIndices[4u * pc.maxQueueCapacity + idx];
+        uint rayIdx = materialIndices[3u * pc.maxQueueCapacity + idx];
         RayGeometry geom = inGeoms[rayIdx];
         RayHit hit = inHits[rayIdx];
         RayState state = inStates[rayIdx];

@@ -45,7 +45,7 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                             continue;
                         }
                     }
-                    if (arch == MATERIAL_ARCHETYPE_ALPHAMASK) {
+                    if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                         Material mat = materials[matId];
                         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rqAlpha, false);
                         Triangle ctri = triangles[triIdx];

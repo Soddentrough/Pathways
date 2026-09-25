@@ -2041,6 +2041,10 @@ void Engine::initPipelines() {
 
     uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
     uint32_t initBatchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, initBatchCount);
+    if (m_config.mgpu_mode != MultiGpuMode::Off) {
+        initBatchCount = 1;
+        initBatchPixels = m_config.width * m_config.height;
+    }
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
 
@@ -5412,9 +5416,9 @@ void Engine::renderFrame() {
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
-            totalCompositeSpp = (!isSampleBlendFsr3) ? (primSpp + secSpp) : 0u;
+            totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel && !isSampleBlendFsr3) ? (primSpp + secSpp) : 0u;
             CameraUniform uboPrim = ubo;
-            if (m_config.pipeline_type == PipelineType::Wavefront && totalCompositeSpp > 0u) {
+            if (activeMode == MultiGpuMode::SampleParallel && m_config.pipeline_type == PipelineType::Wavefront && totalCompositeSpp > 0u) {
                 uboPrim.spp = totalCompositeSpp;
             } else {
                 uboPrim.spp = primSpp;
@@ -5578,6 +5582,13 @@ void Engine::renderFrame() {
 
                 if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                     dispatchCausticTrace(cmd, m_currentFrame);
+                }
+
+                uint32_t mgpuRequiredCapacity = dispatchWidth * dispatchHeight;
+                if (m_wavefrontPipeline->getMaxCapacity() < mgpuRequiredCapacity) {
+                    m_currentBatchPixels = mgpuRequiredCapacity;
+                    m_currentBatchCount = 1;
+                    m_wavefrontPipeline->resize(renderW, renderH, mgpuRequiredCapacity);
                 }
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,

@@ -123,43 +123,34 @@ inline ShadeMaterialGPU createShadeMaterial(const MaterialGPU& mat) {
 }
 
 enum MaterialArchetype : uint32_t {
+    MATERIAL_ARCHETYPE_STANDARD   = 0,
+    MATERIAL_ARCHETYPE_COMPLEX    = 1,
+    MATERIAL_ARCHETYPE_DIELECTRIC = 2,
+    MATERIAL_ARCHETYPE_EMISSIVE   = 3,
+    NUM_MATERIAL_ARCHETYPES       = 4,
+    // Backward compatibility aliases
     MATERIAL_ARCHETYPE_DIFFUSE    = 0,
-    MATERIAL_ARCHETYPE_DIELECTRIC = 1,
-    MATERIAL_ARCHETYPE_CONDUCTOR  = 2,
-    MATERIAL_ARCHETYPE_COMPLEX    = 3,
-    MATERIAL_ARCHETYPE_EMISSIVE   = 4,
-    MATERIAL_ARCHETYPE_ALPHAMASK  = 5,
-    NUM_MATERIAL_ARCHETYPES       = 6
+    MATERIAL_ARCHETYPE_CONDUCTOR  = 0,
+    MATERIAL_ARCHETYPE_ALPHAMASK  = 0
 };
 
 inline uint32_t computeMaterialArchetype(const MaterialGPU& mat) {
-    // 1. Alpha cutout passthrough: only true alpha-masked surfaces with textures
-    if (mat.alphaMode == ALPHA_MODE_MASK && mat.albedoTex > 0u) {
-        return MATERIAL_ARCHETYPE_ALPHAMASK;
-    }
-    // 2. Pure emissive mesh lights: pure emitters without scattering BSDF
+    // 1. Pure emissive mesh lights: pure emitters without scattering BSDF
     if ((mat.type & 0xFFu) == MATERIAL_EMISSIVE ||
         (glm::length(glm::vec3(mat.emissive)) > 0.1f && mat.albedoTex == 0u && glm::length(glm::vec3(mat.albedo)) < 0.05f && mat.metallic < 0.01f && mat.transmission < 0.01f)) {
         return MATERIAL_ARCHETYPE_EMISSIVE;
     }
-    // 3. Procedural wet pavement & puddle surfaces (evaluated in diffuse microkernel)
-    if ((mat.type & MATERIAL_FLAG_PROCEDURAL_PUDDLE) != 0u) {
-        return MATERIAL_ARCHETYPE_DIFFUSE;
-    }
-    // 4. Multi-layer complex PBR (Clearcoat on top of substrate, or Sheen)
-    if (mat.clearcoat > 0.001f || mat.clearcoatTex > 0u || glm::length(mat.sheenColor) > 0.001f || mat.sheenTex > 0u) {
+    // 2. Multi-layer complex PBR (Clearcoat on top of substrate, Sheen, Anisotropy, or Iridescence)
+    if (mat.clearcoat > 0.001f || mat.clearcoatTex > 0u || glm::length(mat.sheenColor) > 0.001f || mat.sheenTex > 0u ||
+        mat.anisotropyStrength > 0.001f || mat.anisotropyTex > 0u || mat.iridescence > 0.001f) {
         return MATERIAL_ARCHETYPE_COMPLEX;
     }
-    // 5. Pure dielectric transmission / refraction / glass / dispersion / procedural water
+    // 3. Pure dielectric transmission / refraction / glass / dispersion / procedural water
     if (mat.transmission > 0.001f || (mat.type & 0xFFu) == MATERIAL_DIELECTRIC || (mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u || mat.dispersion > 0.001f) {
         return MATERIAL_ARCHETYPE_DIELECTRIC;
     }
-    // 6. Metallic conductors (GGX microfacet specular reflection, anisotropy, iridescence)
-    if ((mat.type & 0xFFu) == MATERIAL_METALLIC || mat.metallic > 0.5f || mat.anisotropyStrength > 0.001f || mat.iridescence > 0.001f) {
-        return MATERIAL_ARCHETYPE_CONDUCTOR;
-    }
-    // 7. Dielectric diffuse base + GGX specular dual-lobe PBR (plastics, wood, stone, cloth)
-    return MATERIAL_ARCHETYPE_DIFFUSE;
+    // 4. Standard PBR (Dielectric diffuse base + GGX specular dual-lobe reflection, and Metallic conductors)
+    return MATERIAL_ARCHETYPE_STANDARD;
 }
 
 } // namespace pathways
