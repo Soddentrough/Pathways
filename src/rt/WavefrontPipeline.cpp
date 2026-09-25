@@ -211,8 +211,8 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
     VkDeviceSize shadowQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
 
-    // MaterialIndexQueue = 6 archetypes * 4 bytes * maxCapacity (Index-Based Material Queues)
-    VkDeviceSize matIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 6 * sizeof(uint32_t);
+    // MaterialIndexQueue = 4 archetypes * 4 bytes * maxCapacity (Index-Based Material Queues)
+    VkDeviceSize matIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 4 * sizeof(uint32_t);
     VkDeviceSize secIndexQueueSize = static_cast<VkDeviceSize>(capacity) * 8 * sizeof(uint32_t);
     VkDeviceSize pixelToRayQueueSize = static_cast<VkDeviceSize>(m_width) * m_height * sizeof(uint32_t);
 
@@ -553,27 +553,23 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
         m_shadowPipeline
     });
 
-    if (m_shadeDiffusePipeline && m_shadeDielectricPipeline && m_shadeConductorPipeline && m_shadeComplexPipeline) {
+    if (m_shadeDiffusePipeline && m_shadeComplexPipeline && m_shadeDielectricPipeline && m_shadeEmissivePipeline) {
         m_primaryMatPipelines = {
-            m_shadeDiffusePipeline,
-            m_shadeDielectricPipeline,
-            m_shadeConductorPipeline,
-            m_shadeComplexPipeline
+            m_shadeDiffusePipeline,     // Slot 0: STANDARD (Diffuse + Conductor)
+            m_shadeComplexPipeline,     // Slot 1: COMPLEX
+            m_shadeDielectricPipeline,  // Slot 2: DIELECTRIC
+            m_shadeEmissivePipeline     // Slot 3: EMISSIVE
         };
-        if (m_shadeEmissivePipeline) m_primaryMatPipelines.push_back(m_shadeEmissivePipeline);
-        if (m_shadePassthroughPipeline) m_primaryMatPipelines.push_back(m_shadePassthroughPipeline);
 
         VkPipeline secDiffuse = m_shadeDiffuseSecPipeline ? m_shadeDiffuseSecPipeline : m_shadeDiffusePipeline;
         VkPipeline secComplex = m_shadeComplexSecPipeline ? m_shadeComplexSecPipeline : m_shadeComplexPipeline;
 
         m_secondaryMatPipelines = {
-            secDiffuse,
-            m_shadeDielectricPipeline,
-            m_shadeConductorPipeline,
-            secComplex
+            secDiffuse,                 // Slot 0: STANDARD Sec
+            secComplex,                 // Slot 1: COMPLEX Sec
+            m_shadeDielectricPipeline,  // Slot 2: DIELECTRIC
+            m_shadeEmissivePipeline     // Slot 3: EMISSIVE
         };
-        if (m_shadeEmissivePipeline) m_secondaryMatPipelines.push_back(m_shadeEmissivePipeline);
-        if (m_shadePassthroughPipeline) m_secondaryMatPipelines.push_back(m_shadePassthroughPipeline);
 
         m_dgcManager->initMaterialExecutionSets(m_primaryMatPipelines, m_secondaryMatPipelines);
     }
@@ -1149,14 +1145,14 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
         uint32_t intersectX, intersectY, intersectZ, nextCount;
     };
     struct BounceMaterialDispatchCPU {
-        uint32_t diffX, diffY, diffZ, diffCount;
-        uint32_t dielX, dielY, dielZ, dielCount;
-        uint32_t condX, condY, condZ, condCount;
-        uint32_t compX, compY, compZ, compCount;
-        uint32_t emisX, emisY, emisZ, emisCount;
-        uint32_t passX, passY, passZ, passCount;
-        uint32_t shadowX, shadowY, shadowZ, shadowCount;
-        uint32_t intersectX, intersectY, intersectZ, nextCount;
+        uint32_t diffX, diffY, diffZ, diffCount;     // Slot 0: Standard
+        uint32_t compX, compY, compZ, compCount;     // Slot 1: Complex
+        uint32_t dielX, dielY, dielZ, dielCount;     // Slot 2: Dielectric
+        uint32_t emisX, emisY, emisZ, emisCount;     // Slot 3: Emissive
+        uint32_t pad0X, pad0Y, pad0Z, pad0Count;     // Slot 4: Unused
+        uint32_t pad1X, pad1Y, pad1Z, pad1Count;     // Slot 5: Unused
+        uint32_t shadowX, shadowY, shadowZ, shadowCount; // Slot 6: Shadow
+        uint32_t intersectX, intersectY, intersectZ, nextCount; // Slot 7: Intersect
         struct OctantDispatch {
             uint32_t x, y, z, count;
         } octants[8];
@@ -1181,12 +1177,12 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
 
         if (isMaterialMode && matDispatches) {
             bp.diffCount = matDispatches[b].diffCount;
-            bp.dielCount = matDispatches[b].dielCount;
-            bp.condCount = matDispatches[b].condCount;
             bp.compCount = matDispatches[b].compCount;
+            bp.dielCount = matDispatches[b].dielCount;
             bp.emisCount = matDispatches[b].emisCount;
-            bp.passCount = matDispatches[b].passCount;
-            bp.activeCount = bp.diffCount + bp.dielCount + bp.condCount + bp.compCount + bp.emisCount + bp.passCount;
+            bp.condCount = 0;
+            bp.passCount = 0;
+            bp.activeCount = bp.diffCount + bp.compCount + bp.dielCount + bp.emisCount;
             bp.shadowCount = matDispatches[b].shadowCount;
 
             if (m_secondarySortMode == 1) {
@@ -1243,8 +1239,8 @@ void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double times
         std::string shadowStr = (bp.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms ({} rays)", bp.shadowMs, bp.shadowCount)
                                                        : "Shadow: Inline (on-chip)";
         if (isMaterialMode) {
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms (diff: {}, diel: {}, cond: {}, comp: {}, emis: {}, pass: {}) | {} | Intersect: {:.3f} ms ({} rays)",
-                         bp.bounce, bp.shadeMs, bp.diffCount, bp.dielCount, bp.condCount, bp.compCount, bp.emisCount, bp.passCount,
+            Logger::info("      [Bounce {}] Shade: {:.3f} ms (std: {}, comp: {}, diel: {}, emis: {}) | {} | Intersect: {:.3f} ms ({} rays)",
+                         bp.bounce, bp.shadeMs, bp.diffCount, bp.compCount, bp.dielCount, bp.emisCount,
                          shadowStr, bp.intersectMs, bp.nextCount);
         } else {
             Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | {} | Intersect: {:.3f} ms ({} rays)",

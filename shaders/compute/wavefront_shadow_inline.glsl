@@ -20,15 +20,15 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
             uint matId = triangles[triIdx].materialId + inst.materialOffset;
             uint arch = materialArchetypes[matId];
             
-            if (arch == 4u || (!enableCaustics && arch == 1u)) { // EMISSIVE or DIELECTRIC
+            if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
                 continue;
             }
-            if (enableCaustics && arch == 1u) {
+            if (enableCaustics && arch == 2u) {
                 if (materials[matId].thickness <= 0.001) {
                     continue;
                 }
             }
-            if (arch == 5u) { // ALPHAMASK
+            if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                 Material mat = materials[matId];
                 vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
                 Triangle ctri = triangles[triIdx];

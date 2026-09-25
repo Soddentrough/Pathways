@@ -109,6 +109,9 @@ private:
     std::unique_ptr<Buffer> m_lightTreeBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::unique_ptr<Buffer> m_uiDumpBuffer;
+    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_centerDepthBuffers;
+    float m_gpuCenterDepth = 0.0f;
+    bool m_hasGpuCenterDepth = false;
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> m_positionBuffer;

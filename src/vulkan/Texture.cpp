@@ -442,6 +442,58 @@ std::unique_ptr<Texture> Texture::createProceduralNightHdrSky(
     );
 }
 
+std::unique_ptr<Texture> Texture::createProceduralStudioHdrSky(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    uint32_t width, uint32_t height
+) {
+    std::vector<glm::vec4> pixels(width * height);
+    const float PI = 3.14159265358979323846f;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+        float theta = v * PI;
+        float cosTheta = std::cos(theta);
+        float sinTheta = std::sin(theta);
+
+        for (uint32_t x = 0; x < width; ++x) {
+            float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
+            float phi = (u * 2.0f - 1.0f) * PI;
+
+            glm::vec3 dir = glm::normalize(glm::vec3(
+                sinTheta * std::cos(phi),
+                cosTheta,
+                sinTheta * std::sin(phi)
+            ));
+
+            glm::vec3 radiance(0.0f);
+
+            if (dir.y > 0.0f) {
+                // Subtle dark studio ambient gradient (deep charcoal/slate ceiling)
+                // Pure indoor gallery space without direct sunlight or sky disk
+                float skyFactor = std::pow(dir.y, 0.6f);
+                glm::vec3 zenithColor(0.003f, 0.003f, 0.004f);
+                glm::vec3 horizonColor(0.008f, 0.008f, 0.010f);
+                radiance = glm::mix(horizonColor, zenithColor, skyFactor);
+            } else {
+                // Dark matte ground / studio floor reflection
+                float groundFactor = std::clamp(-dir.y, 0.0f, 1.0f);
+                glm::vec3 deepGround(0.001f, 0.001f, 0.0015f);
+                glm::vec3 horizonHaze(0.008f, 0.008f, 0.010f);
+                radiance = glm::mix(horizonHaze, deepGround, groundFactor);
+            }
+
+            pixels[y * width + x] = glm::vec4(radiance, 1.0f);
+        }
+    }
+
+    size_t byteSize = pixels.size() * sizeof(glm::vec4);
+    return createFromPixels(
+        device, allocator, queue, pool,
+        width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
+        pixels.data(), byteSize, true
+    );
+}
+
 std::unique_ptr<Texture> Texture::loadFromFile(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
     const std::string& filepath
@@ -531,10 +583,17 @@ std::unique_ptr<Texture> Texture::createSceneEnvironmentMap(
         bool isCyber = (hdriPath == "night" || hdriPath == "night-sky" ||
                         scenePath == "cyber-city" || scenePath == "procedural:cyber-city" ||
                         scenePath == "procedural:cyber_city" || scenePath == "cyber_city" ||
-                        scenePath == "Procedural Cyber City");
+                        scenePath == "Procedural Cyber City" || scenePath == "Cyber City");
+        bool isInfinityMirror = (hdriPath == "studio" || hdriPath == "dark" ||
+                                 scenePath == "infinity-mirror" || scenePath == "procedural:infinity-mirror" ||
+                                 scenePath == "procedural:infinity_mirror" || scenePath == "infinity_mirror" ||
+                                 scenePath == "Procedural Infinity Mirror" || scenePath == "Infinity Mirror");
         if (isCyber) {
             envMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
             Logger::info("Initialized procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
+        } else if (isInfinityMirror) {
+            envMap = Texture::createProceduralStudioHdrSky(device, allocator, queue, pool);
+            Logger::info("Initialized procedural Dark Studio HDRI environment (512x256, 32-bit Float, No Sun).");
         } else {
             envMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
             Logger::info("Initialized procedural Day HDRI sky dome (512x256, 32-bit Float).");

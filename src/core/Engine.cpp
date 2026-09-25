@@ -31,6 +31,23 @@
 namespace pathways {
 
 namespace {
+inline float halfToFloat(uint16_t h) {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h & 0x7C00u) >> 10;
+    uint32_t mant = (h & 0x03FFu);
+    if (exp == 0) {
+        if (mant == 0) return std::bit_cast<float>(sign);
+        while ((mant & 0x0400u) == 0) { mant <<= 1; exp--; }
+        exp++;
+        mant &= ~0x0400u;
+    } else if (exp == 31) {
+        return std::bit_cast<float>(sign | 0x7F800000u | (mant << 13));
+    }
+    exp = exp + (127 - 15);
+    mant = mant << 13;
+    return std::bit_cast<float>(sign | (exp << 23) | mant);
+}
+
 std::string queryOperatingSystem() {
     std::ifstream osRelease("/etc/os-release");
     if (osRelease.is_open()) {
@@ -956,12 +973,12 @@ void Engine::initScene() {
                     break;
                 }
             }
-        } else if (m_config.scene_path == "infinity-mirror" || m_config.scene_path == "procedural:infinity-mirror") {
-            Logger::info("Loading Procedural Infinity Mirror Scene...");
+        } else if (m_config.scene_path == "infinity-mirror" || m_config.scene_path == "procedural:infinity-mirror" || m_config.scene_path == "infinity_mirror" || m_config.scene_path == "procedural:infinity_mirror" || m_config.scene_path == "Infinity Mirror" || m_config.scene_path == "Procedural Infinity Mirror") {
+            Logger::info("Loading Infinity Mirror Corridor...");
             m_sceneData = ProceduralScene::createInfinityMirrorScene();
             m_currentSceneIndex = -1;
             for (size_t i = 0; i < m_availableScenes.size(); ++i) {
-                if (m_availableScenes[i].filepath == "procedural:infinity-mirror") {
+                if (m_availableScenes[i].filepath == "infinity-mirror" || m_availableScenes[i].filepath == "procedural:infinity-mirror") {
                     m_currentSceneIndex = static_cast<int>(i);
                     break;
                 }
@@ -1272,6 +1289,16 @@ void Engine::initScene() {
         );
     }
 
+    // Center pixel G-buffer depth readback buffers (Double-buffered, 16 bytes for 1 RGBA16F texel)
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        m_centerDepthBuffers[i] = std::make_unique<Buffer>(
+            allocator, 16,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_TO_CPU,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+        );
+    }
+
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     createAccelerationStructures();
 
@@ -1330,7 +1357,9 @@ void Engine::requestSceneChange(const std::string& filepath) {
         } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
             prettyName = "Procedural Many-Lights";
         } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
-            prettyName = "Procedural Cyber City";
+            prettyName = "Cyber City";
+        } else if (filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "Procedural Infinity Mirror" || filepath == "Infinity Mirror") {
+            prettyName = "Infinity Mirror";
         } else {
             prettyName = SceneRegistry::formatSceneName(stem);
         }
@@ -1356,6 +1385,9 @@ void Engine::requestSceneChange(const std::string& filepath) {
         } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
             Logger::info("Dynamic Scene Switch: Loading Procedural Cyber City Megastructure...");
             return ProceduralScene::createCyberCityScene();
+        } else if (filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "Procedural Infinity Mirror" || filepath == "Infinity Mirror") {
+            Logger::info("Dynamic Scene Switch: Loading Infinity Mirror Corridor...");
+            return ProceduralScene::createInfinityMirrorScene();
         } else {
             Logger::info("Dynamic Scene Switch: Loading '{}'...", filepath);
             if (UsdLoader::isUsdFile(filepath)) {
@@ -1690,8 +1722,8 @@ bool Engine::loadScene(const std::string& filepath) {
     } else if (filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "cyber-city" || filepath == "cyber_city" || filepath == "Procedural Cyber City") {
         Logger::info("Loading Procedural Cyber City Megastructure...");
         newScene = ProceduralScene::createCyberCityScene();
-    } else if (filepath == "procedural:infinity-mirror" || filepath == "infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity_mirror") {
-        Logger::info("Loading Procedural Infinity Mirror Scene...");
+    } else if (filepath == "procedural:infinity-mirror" || filepath == "infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity_mirror" || filepath == "Procedural Infinity Mirror" || filepath == "Infinity Mirror") {
+        Logger::info("Loading Infinity Mirror Corridor...");
         newScene = ProceduralScene::createInfinityMirrorScene();
     } else {
         if (UsdLoader::isUsdFile(filepath)) {
@@ -2054,6 +2086,10 @@ void Engine::initPipelines() {
 
     uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
     uint32_t initBatchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, initBatchCount);
+    if (m_config.mgpu_mode != MultiGpuMode::Off) {
+        initBatchCount = 1;
+        initBatchPixels = m_config.width * m_config.height;
+    }
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
 
@@ -4470,6 +4506,20 @@ void Engine::updateInput() {
     const bool* keyState = SDL_GetKeyboardState(nullptr);
     if (!keyState) return;
 
+    glm::vec3 camPos = m_camera->getPosition();
+    glm::vec3 camFront = m_camera->getFront();
+    bool hitGeometry = false;
+    glm::vec3 hitPoint = camPos + camFront * m_camera->getFocalDistance();
+    if (m_hasGpuCenterDepth && m_gpuCenterDepth > 0.05f) {
+        m_camera->setLookDistance(m_gpuCenterDepth);
+        hitGeometry = true;
+        hitPoint = camPos + camFront * m_gpuCenterDepth;
+    } else {
+        // Looking at open sky or empty space: use cruising scale distance
+        float fallbackDist = std::max(m_camera->getFocalDistance() * 2.5f, m_camera->getSceneScale());
+        m_camera->setLookDistance(fallbackDist);
+    }
+
     float forward = 0.0f;
     float strafe = 0.0f;
     float vertical = 0.0f;
@@ -4487,13 +4537,7 @@ void Engine::updateInput() {
 
     if (ctrl) {
         if (!m_camera->isOrbiting()) {
-            // Find target object along view ray
-            float hitDist = 0.0f;
-            glm::vec3 hitPoint;
-            std::string hitName;
-            glm::vec3 camPos = m_camera->getPosition();
-            glm::vec3 camFront = m_camera->getFront();
-            if (m_sceneData.raycast(camPos, camFront, 5000.0f, hitDist, hitPoint, &hitName)) {
+            if (hitGeometry) {
                 m_camera->startOrbit(hitPoint);
             } else {
                 // Fallback: project centralTarget or use focal distance along view ray
@@ -4544,6 +4588,22 @@ void Engine::renderFrame() {
     VkQueue queue = m_context->getGraphicsQueue();
 
     vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+
+    // Read back center pixel G-buffer depth from completed frame slot
+    if (m_totalFramesRendered >= 1 && m_centerDepthBuffers[m_currentFrame]) {
+        m_centerDepthBuffers[m_currentFrame]->invalidate();
+        const uint16_t* raw16 = static_cast<const uint16_t*>(m_centerDepthBuffers[m_currentFrame]->map());
+        if (raw16) {
+            float depth = halfToFloat(raw16[3]);
+            if (depth > 0.05f && depth < 9000.0f) {
+                m_gpuCenterDepth = depth;
+                m_hasGpuCenterDepth = true;
+            } else {
+                m_hasGpuCenterDepth = false;
+            }
+            m_centerDepthBuffers[m_currentFrame]->unmap();
+        }
+    }
 
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -5211,6 +5271,52 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
+        // 1-pixel GPU G-buffer depth readback of the center pixel for zero-overhead hardware camera adaptive speed
+        if (!skipRayTracing && m_normalDepthImage && m_centerDepthBuffers[m_currentFrame]) {
+            VkBufferImageCopy copyRegion{};
+            copyRegion.bufferOffset = 0;
+            copyRegion.bufferRowLength = 0;
+            copyRegion.bufferImageHeight = 0;
+            copyRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.imageOffset = { static_cast<int32_t>(renderW / 2), static_cast<int32_t>(renderH / 2), 0 };
+            copyRegion.imageExtent = { 1, 1, 1 };
+
+            VkImageMemoryBarrier2 preCopy{};
+            preCopy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            preCopy.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            preCopy.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            preCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            preCopy.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            preCopy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopy.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopy.image = m_normalDepthImage->getImage();
+            preCopy.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            preDep.imageMemoryBarrierCount = 1;
+            preDep.pImageMemoryBarriers = &preCopy;
+            vkCmdPipelineBarrier2(cmd, &preDep);
+
+            vkCmdCopyImageToBuffer(cmd, m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                                   m_centerDepthBuffers[m_currentFrame]->getBuffer(), 1, &copyRegion);
+
+            VkImageMemoryBarrier2 postCopy{};
+            postCopy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            postCopy.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            postCopy.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            postCopy.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            postCopy.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            postCopy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postCopy.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postCopy.image = m_normalDepthImage->getImage();
+            postCopy.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            postDep.imageMemoryBarrierCount = 1;
+            postDep.pImageMemoryBarriers = &postCopy;
+            vkCmdPipelineBarrier2(cmd, &postDep);
+        }
+
         bool needUpscaler = (m_config.denoiser_mode == DenoiserMode::Upways ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
                              m_config.upscaler_mode == UpscalerMode::FSR3);
@@ -5425,9 +5531,9 @@ void Engine::renderFrame() {
                 uboSec.frameIndex = m_frameIndex + 1000003u;
             }
 
-            totalCompositeSpp = (!isSampleBlendFsr3) ? (primSpp + secSpp) : 0u;
+            totalCompositeSpp = (activeMode == MultiGpuMode::SampleParallel && !isSampleBlendFsr3) ? (primSpp + secSpp) : 0u;
             CameraUniform uboPrim = ubo;
-            if (m_config.pipeline_type == PipelineType::Wavefront && totalCompositeSpp > 0u) {
+            if (activeMode == MultiGpuMode::SampleParallel && m_config.pipeline_type == PipelineType::Wavefront && totalCompositeSpp > 0u) {
                 uboPrim.spp = totalCompositeSpp;
             } else {
                 uboPrim.spp = primSpp;
@@ -5591,6 +5697,13 @@ void Engine::renderFrame() {
 
                 if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                     dispatchCausticTrace(cmd, m_currentFrame);
+                }
+
+                uint32_t mgpuRequiredCapacity = dispatchWidth * dispatchHeight;
+                if (m_wavefrontPipeline->getMaxCapacity() < mgpuRequiredCapacity) {
+                    m_currentBatchPixels = mgpuRequiredCapacity;
+                    m_currentBatchCount = 1;
+                    m_wavefrontPipeline->resize(renderW, renderH, mgpuRequiredCapacity);
                 }
 
                 m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, dispatchWidth, dispatchHeight,
@@ -5903,8 +6016,8 @@ void Engine::renderFrame() {
                         targetLabel = "Procedural Many-Lights";
                     } else if (guiActions.newScenePath == "procedural:cyber-city" || guiActions.newScenePath == "procedural:cyber_city" || guiActions.newScenePath == "cyber-city" || guiActions.newScenePath == "cyber_city" || guiActions.newScenePath == "Procedural Cyber City") {
                         targetLabel = "Procedural Cyber City";
-                    } else if (guiActions.newScenePath == "procedural:infinity-mirror" || guiActions.newScenePath == "infinity-mirror" || guiActions.newScenePath == "procedural:infinity_mirror" || guiActions.newScenePath == "infinity_mirror") {
-                        targetLabel = "Procedural Infinity Mirror (40+ Bounces)";
+                    } else if (guiActions.newScenePath == "procedural:infinity-mirror" || guiActions.newScenePath == "infinity-mirror" || guiActions.newScenePath == "procedural:infinity_mirror" || guiActions.newScenePath == "infinity_mirror" || guiActions.newScenePath == "Procedural Infinity Mirror" || guiActions.newScenePath == "Infinity Mirror") {
+                        targetLabel = "Infinity Mirror";
                     } else {
                         targetLabel = SceneRegistry::formatSceneName(std::filesystem::path(guiActions.newScenePath).stem().string());
                     }

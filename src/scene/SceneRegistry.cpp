@@ -171,30 +171,30 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     std::vector<SceneEntry> entries;
     namespace fs = std::filesystem;
 
-    // 0. Always add Procedural Cornell Box as index 0
+    // 0. Always add Cornell Box as index 0
     SceneEntry cornellBox;
-    cornellBox.label = "Procedural Cornell Box";
-    cornellBox.filepath = ""; // Empty filepath represents built-in procedural scene
+    cornellBox.label = "Cornell Box";
+    cornellBox.filepath = "cornell-box";
     cornellBox.group = "Procedural";
     cornellBox.triangleCount = 2048;
     cornellBox.materialCount = 7;
     cornellBox.fileSizeBytes = 0;
     entries.push_back(cornellBox);
 
-    // 0b. Add Procedural Many-Lights Cornell Box as index 1
+    // 0b. Add Many-Lights Cornell Box as index 1
     SceneEntry manyLights;
-    manyLights.label = "Procedural Many-Lights (64 Lights)";
-    manyLights.filepath = "procedural:many-lights";
+    manyLights.label = "Many-Lights (64 Lights)";
+    manyLights.filepath = "many-lights";
     manyLights.group = "Procedural";
     manyLights.triangleCount = 2176;
     manyLights.materialCount = 7;
     manyLights.fileSizeBytes = 0;
     entries.push_back(manyLights);
 
-    // 0c. Add Procedural Cyber City as index 2
+    // 0c. Add Cyber City as index 2
     SceneEntry cyberCity;
-    cyberCity.label = "Procedural Cyber City";
-    cyberCity.filepath = "procedural:cyber-city";
+    cyberCity.label = "Cyber City";
+    cyberCity.filepath = "cyber-city";
     cyberCity.group = "Procedural";
     cyberCity.triangleCount = 26552; // 19 modular BLAS prototypes
     cyberCity.instancedTriangleCount = 13587182; // Over 13.5M instanced triangles
@@ -202,6 +202,16 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     cyberCity.materialCount = 48;
     cyberCity.fileSizeBytes = 0;
     entries.push_back(cyberCity);
+
+    // 0d. Add Infinity Mirror as index 3
+    SceneEntry infinityMirror;
+    infinityMirror.label = "Infinity Mirror";
+    infinityMirror.filepath = "infinity-mirror";
+    infinityMirror.group = "Procedural";
+    infinityMirror.triangleCount = 14172;
+    infinityMirror.materialCount = 12;
+    infinityMirror.fileSizeBytes = 0;
+    entries.push_back(infinityMirror);
 
     if (scenesDir.empty()) {
         return entries;

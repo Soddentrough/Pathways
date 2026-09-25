@@ -346,6 +346,14 @@ int main() {
         Config c8 = Config::parse(7, const_cast<char**>(argv8));
         check_true(c8.getRenderWidth() == 1280 && c8.getRenderHeight() == 720, "c8 internal resolution must be 1280x720 (3.0x ultra performance)");
         std::cout << "  -> Verified: --res 4k --scaler upways ultra performance -> 1280x720 to 3840x2160." << std::endl;
+
+        // 10i: --res 4k --scaler upways (default without preset parameter)
+        const char* argv9[] = { "pathways", "--res", "4k", "--scaler", "upways" };
+        Config c9 = Config::parse(5, const_cast<char**>(argv9));
+        check_true(c9.upscaler_mode == UpscalerMode::Upways, "c9 upscaler_mode must be Upways");
+        check_true(c9.upways_superres == true, "c9 upways_superres must be true");
+        check_true(c9.getRenderWidth() == 1920 && c9.getRenderHeight() == 1080, "c9 internal resolution must default to 1920x1080 (2.0x)");
+        std::cout << "  -> Verified: --res 4k --scaler upways (default) -> 1920x1080 to 3840x2160." << std::endl;
     }
 
     std::cout << "\n==========================================================" << std::endl;

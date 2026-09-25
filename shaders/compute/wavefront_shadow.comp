@@ -49,19 +49,20 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -118,15 +119,15 @@ void main() {
             uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
             uint matId = triangles[triIdx].materialId + inst.materialOffset;
             uint arch = materialArchetypes[matId];
-            if (arch == 4u || (!enableCaustics && arch == 1u)) {
+            if (arch == 3u || (!enableCaustics && arch == 2u)) {
                 continue;
             }
-            if (enableCaustics && arch == 1u) {
+            if (enableCaustics && arch == 2u) {
                 if (materials[matId].thickness <= 0.001) {
                     continue;
                 }
             }
-            if (arch == 5u) {
+            if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                 Material mat = materials[matId];
                 vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
                 Triangle ctri = triangles[triIdx];
@@ -168,7 +169,7 @@ void main() {
         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (pc.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
         vec4 prev = imageLoad(uAccumImage, pixelCoord);
-        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), 0.0));
+        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
 
         if (pc.captureMlData != 0u) {
             if (isSpecular > 0.5) {

@@ -221,7 +221,7 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
     if (tid < 64) {
         uint lx = tid % 8;
         uint ly = tid / 8;
-        ivec2 coord = renderTileOrigin + ivec2(lx, ly);
+        ivec2 coord = clamp(renderTileOrigin + ivec2(lx, ly), ivec2(0), max(ivec2(0), ivec2(u_RenderRes) - 1));
 
         float depth = s_haloDepth[ly + 1][lx + 1];
         f16vec2 norm_xy = unpackFloat2x16(s_haloNormal_XY[ly + 1][lx + 1]);
@@ -395,8 +395,14 @@ void main() {
     uint tid = gl_LocalInvocationIndex;
     uint sgId = gl_SubgroupID;
     bool isNative = (u_ScaleFactor.x <= 1.25);
-    ivec2 renderTileOrigin  = ivec2(gl_WorkGroupID.xy) * int(RENDER_TILE_DIM);
-    ivec2 displayTileOrigin = isNative ? renderTileOrigin : (ivec2(gl_WorkGroupID.xy) * int(DISPLAY_TILE_DIM));
+    ivec2 displayTileOrigin = isNative ? (ivec2(gl_WorkGroupID.xy) * int(RENDER_TILE_DIM)) : (ivec2(gl_WorkGroupID.xy) * int(DISPLAY_TILE_DIM));
+    ivec2 renderTileOrigin;
+    if (isNative) {
+        renderTileOrigin = displayTileOrigin;
+    } else {
+        vec2 renderCenter = (vec2(displayTileOrigin) + 7.5) / u_ScaleFactor - u_JitterOffset;
+        renderTileOrigin = clamp(ivec2(round(renderCenter - 3.5)), ivec2(0), max(ivec2(0), ivec2(u_RenderRes) - int(RENDER_TILE_DIM)));
+    }
 
     // 1. Cooperative load of 10x10 halo into LDS
     LoadRenderTileLDS(renderTileOrigin);

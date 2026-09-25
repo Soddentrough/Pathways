@@ -69,6 +69,8 @@ void Camera::setSceneScale(float sceneRadius, float focalDistance, glm::vec3 cen
     m_sceneScale = std::max(sceneRadius, 0.05f);
     m_focalDistance = (focalDistance > 0.01f) ? focalDistance : m_sceneScale;
     m_centralTarget = centralTarget;
+    m_hasLookDistance = false;
+    m_lookDistance = 0.0f;
 
     // Constant Half-Distance Time Law:
     // Move half the distance to the central object in T_half = 2.0 seconds:
@@ -88,9 +90,18 @@ void Camera::setSceneScale(float sceneRadius, float focalDistance, glm::vec3 cen
     m_moved = true;
 }
 
+void Camera::setLookDistance(float dist) {
+    m_lookDistance = std::max(dist, 0.05f);
+    m_hasLookDistance = true;
+}
+
 float Camera::getCurrentTargetDistance() const {
+    if (m_hasLookDistance && m_lookDistance > 0.001f) {
+        constexpr float minD = 0.05f;
+        return std::max(m_lookDistance, minD);
+    }
     float dist = glm::length(m_centralTarget - m_position);
-    float minD = std::max(0.05f, 0.05f * m_sceneScale);
+    float minD = std::max(0.05f, 0.02f * m_sceneScale);
     return std::max(dist, minD);
 }
 
@@ -120,6 +131,8 @@ void Camera::focusOnTarget(glm::vec3 target, float targetRadius) {
 
     float desiredDist = (targetRadius > 0.01f) ? (targetRadius * 2.5f) : m_focalDistance;
     lookAt(target + dir * desiredDist, target);
+    m_hasLookDistance = false;
+    m_lookDistance = 0.0f;
     m_speed = m_baseSpeed;
     m_moved = true;
 }
@@ -143,6 +156,8 @@ void Camera::setSensitivity(float sens) {
 void Camera::resetToDefault() {
     lookAt(m_defaultPosition, m_defaultTarget);
     setFov(m_defaultFov);
+    m_hasLookDistance = false;
+    m_lookDistance = 0.0f;
     m_speed = m_baseSpeed;
 }
 
@@ -150,6 +165,7 @@ void Camera::update(float deltaTime) {
     if (deltaTime <= 0.0f) {
         return;
     }
+
     // Camera velocity damping and perceptible movement thresholding (R1).
     // If camera was actively moved this frame (m_moved == true), velocity is actively driven
     // and must not be decayed. Damping applies only when un-driven to eliminate residual coasting (< 50 ms).

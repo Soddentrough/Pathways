@@ -898,7 +898,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                 ImGui::TextDisabled("(%s)", cur.formatFileSize().c_str());
                             }
                         } else {
-                            ImGui::TextDisabled("  > Built-in GPU procedural Cornell box geometry");
+                            ImGui::TextDisabled("  > Built-in procedural geometry");
                         }
                     }
                     ImGui::EndChild();

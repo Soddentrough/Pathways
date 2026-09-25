@@ -78,6 +78,10 @@ public:
     void adjustSpeedByWheel(float wheelDelta);
     void setSensitivity(float sens);
     float getSensitivity() const { return m_sensitivity; }
+    void setLookDistance(float dist);
+    void clearLookDistance() { m_hasLookDistance = false; }
+    bool hasLookDistance() const { return m_hasLookDistance; }
+    float getLookDistance() const { return m_lookDistance; }
     bool isDynamicScaling() const { return m_dynamicScaling; }
     void setDynamicScaling(bool enable) { m_dynamicScaling = enable; }
     bool isAdaptiveSpeed() const { return m_dynamicScaling; }
@@ -145,6 +149,8 @@ private:
     float m_orbitRadius = 2.0f;
     bool m_orbiting = false;
     bool m_dynamicScaling = true; // Distance-adaptive movement speed (smooth approach to focus) [Default: true]
+    float m_lookDistance = 0.0f;
+    bool m_hasLookDistance = false;
     float m_baseSpeed = 3.0f;
     float m_minSpeed = 0.05f;
     float m_maxSpeed = 50.0f;

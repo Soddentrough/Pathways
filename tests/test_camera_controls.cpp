@@ -222,6 +222,35 @@ int main() {
         std::cout << "[PASS] Distance-adaptive speed (smooth approach scaling & clamping) verified." << std::endl;
     }
 
+    // 11d. Geometry Look-Distance Adaptive Speed (Real-time Raycast targeting)
+    {
+        Camera camLook(glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 1.0f, -1.0f), 45.0f, 16.0f / 9.0f);
+        camLook.setSceneScale(4.0f, 4.0f, glm::vec3(0.0f, 1.0f, 0.0f));
+        float baseSpeed = camLook.getBaseSpeed();
+
+        // Even though camera is at position == centralTarget (where dist to centralTarget is 0),
+        // look distance to geometry takes precedence:
+        camLook.setLookDistance(4.0f);
+        check_true(camLook.hasLookDistance(), "Camera must report hasLookDistance");
+        assert_near(camLook.getCurrentTargetDistance(), 4.0f, 0.001f, "Target distance must match look distance");
+        assert_near(camLook.getEffectiveSpeed(), baseSpeed, 0.01f, "Effective speed equals base speed at focal look distance");
+
+        // Close-up look distance (e.g. 0.8m, 1/5th focal distance) -> speed slows down
+        camLook.setLookDistance(0.8f);
+        assert_near(camLook.getCurrentTargetDistance(), 0.8f, 0.001f, "Target distance must update to close-up look distance");
+        assert_near(camLook.getEffectiveSpeed(), baseSpeed * 0.20f, 0.01f, "Effective speed slows down for close-up object inspection");
+
+        // Distant look distance (e.g. 12m, 3x focal distance) -> speed accelerates
+        camLook.setLookDistance(12.0f);
+        assert_near(camLook.getCurrentTargetDistance(), 12.0f, 0.001f, "Target distance must update to distant look distance");
+        assert_near(camLook.getEffectiveSpeed(), baseSpeed * 3.0f, 0.01f, "Effective speed accelerates when pointed at distant geometry");
+
+        // Clearing look distance restores fallback to central target
+        camLook.clearLookDistance();
+        check_true(!camLook.hasLookDistance(), "Camera must report no look distance after clear");
+        std::cout << "[PASS] Geometry look-distance adaptive speed verified." << std::endl;
+    }
+
     // 12. Mouse wheel speed adjustment (multiplicative)
     float speedBeforeWheel = cam.getSpeed();
     cam.adjustSpeedByWheel(1.0f); // Scroll up -> speed * 1.25
@@ -578,6 +607,69 @@ int main() {
         assert_near(cfgDeadzoneEq.gamepad_deadzone, 0.30f, 0.001f, "Config parses --gamepad-deadzone=");
 
         std::cout << "[PASS] Frame time spike clamping, key release robustness & configurable gamepad deadzone verified." << std::endl;
+    }
+
+    // 24. Real-time Scene Raycast & Dynamic Adaptive Speed Verification
+    {
+        // 24a. Monolithic scene with retained geometry (Infinity Mirror)
+        SceneData mirrorScene = ProceduralScene::createInfinityMirrorScene();
+        check_true(!mirrorScene.triangles.empty(), "Infinity mirror scene must retain host triangles for raycasting");
+
+        Camera cam(glm::vec3(0.0f, 1.2f, 4.0f), glm::vec3(0.0f, 1.2f, 0.0f), 45.0f, 16.0f / 9.0f);
+        cam.setSceneScale(mirrorScene.sceneRadius, mirrorScene.focalDistance, mirrorScene.centralTarget);
+        float baseSpeed = cam.getBaseSpeed();
+
+        // Probing geometry at 3 different distances along view ray
+        float hitDistFar = 0.0f, hitDistMid = 0.0f, hitDistClose = 0.0f;
+        glm::vec3 hitPoint;
+        std::string hitName;
+
+        // Position 1: Far (Z = 5.0m, pointing -Z into runway)
+        glm::vec3 posFar(0.0f, 1.2f, 5.0f);
+        glm::vec3 dir(0.0f, 0.0f, -1.0f);
+        bool hitFar = mirrorScene.raycast(posFar, dir, 100.0f, hitDistFar, hitPoint, &hitName);
+        check_true(hitFar, "Raycast must hit corridor geometry from far distance");
+
+        cam.setPose(posFar, -90.0f, 0.0f);
+        cam.setLookDistance(hitDistFar);
+        float speedFar = cam.getEffectiveSpeed();
+
+        // Position 2: Mid (Z = 2.0m, pointing -Z)
+        glm::vec3 posMid(0.0f, 1.2f, 2.0f);
+        bool hitMid = mirrorScene.raycast(posMid, dir, 100.0f, hitDistMid, hitPoint, &hitName);
+        check_true(hitMid, "Raycast must hit corridor geometry from mid distance");
+        check_true(hitDistMid < hitDistFar, "Hit distance must decrease as camera moves closer");
+
+        cam.setPose(posMid, -90.0f, 0.0f);
+        cam.setLookDistance(hitDistMid);
+        float speedMid = cam.getEffectiveSpeed();
+        check_true(speedMid < speedFar, "Effective speed must decelerate as camera approaches geometry");
+
+        // Position 3: Close-up (Z = -0.5m, pointing at pedestal/mirror)
+        glm::vec3 posClose(0.0f, 0.7f, -0.5f);
+        bool hitClose = mirrorScene.raycast(posClose, dir, 100.0f, hitDistClose, hitPoint, &hitName);
+        check_true(hitClose, "Raycast must hit close-up geometry");
+        check_true(hitDistClose < hitDistMid, "Close-up hit distance must be smaller than mid distance");
+
+        cam.setPose(posClose, -90.0f, 0.0f);
+        cam.setLookDistance(hitDistClose);
+        float speedClose = cam.getEffectiveSpeed();
+        check_true(speedClose < speedMid, "Effective speed must decelerate further on close inspection");
+        check_true(speedClose >= baseSpeed * 0.15f * 0.99f, "Speed must respect 0.15x minimum safety clamp");
+
+        // 24b. Hardware Instanced Scene (Cyber City)
+        SceneData cityScene = ProceduralScene::createCyberCityScene();
+        check_true(!cityScene.instances.empty(), "Cyber city must contain instances");
+
+        // Probing ground / street level from elevated position
+        glm::vec3 camCityPos(0.0f, 20.0f, 0.0f);
+        glm::vec3 camCityDir(0.0f, -1.0f, 0.0f); // pointing straight down at plaza/road
+        float cityHitDist = 0.0f;
+        bool hitCity = cityScene.raycast(camCityPos, camCityDir, 200.0f, cityHitDist, hitPoint, &hitName);
+        check_true(hitCity, "Raycast must hit instanced plaza/road tile directly below camera");
+        assert_near(cityHitDist, 20.0f, 0.5f, "Hit distance to instanced ground should match elevation (~20m)");
+
+        std::cout << "[PASS] Dynamic scene raycast & distance-adaptive speed scaling verified." << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

@@ -62,19 +62,20 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -120,7 +121,13 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
     LightTreeNode lightNodes[];
 };
 
+#ifndef ENABLE_INLINE_SHADOWS
+#define ENABLE_INLINE_SHADOWS 0
+#endif
+
+#if ENABLE_INLINE_SHADOWS
 #include "wavefront_shadow_inline.glsl"
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -148,7 +155,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint activeCount = queueCounters.currentMaterialCounts[5]; // AlphaMask / Passthrough queue
+    uint activeCount = 0u; // Deprecated - consolidated into Standard
     bool inRange = (idx < activeCount);
     bool survivesToNext = false;
     bool hasShadowRay = false;
@@ -158,7 +165,7 @@ void main() {
     PackedShadowRay shadowCandidate;
 
     if (inRange) {
-        uint rayIdx = materialIndices[5u * pc.maxQueueCapacity + idx];
+        uint rayIdx = materialIndices[0u * pc.maxQueueCapacity + idx];
         RayGeometry geom = inGeoms[rayIdx];
         RayHit hit = inHits[rayIdx];
         RayState state = inStates[rayIdx];
@@ -351,6 +358,7 @@ void main() {
                         if (length(unshadowed) > 1e-5) {
                             if (enableShadows) {
                                 bool occluded = false;
+#if ENABLE_INLINE_SHADOWS
                                 if (enableInlineShadows && pc.useHardwareRT == 1u) {
                                     occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
@@ -368,7 +376,9 @@ void main() {
                                             }
                                         }
                                     }
-                                } else {
+                                } else
+#endif
+                                {
                                     hasShadowRay = true;
                                     shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
                                     shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));

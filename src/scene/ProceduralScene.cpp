@@ -333,6 +333,79 @@ static void addFrustum(std::vector<TriangleGPU>& triangles,
     addQuad(triangles, b0, b1, b2, b3, glm::vec3(0.0f, -1.0f, 0.0f), matId);
 }
 
+static void addTorus(std::vector<TriangleGPU>& triangles,
+                     glm::vec3 center, float majorRadius, float minorRadius, uint32_t matId,
+                     int rings = 36, int sectors = 18,
+                     glm::vec3 normalAxis = glm::vec3(0.0f, 0.0f, 1.0f)) {
+    float const PI = 3.14159265358979323846f;
+    glm::vec3 nAxis = glm::normalize(normalAxis);
+    glm::vec3 uAxis = std::abs(nAxis.y) < 0.99f ? glm::normalize(glm::cross(nAxis, glm::vec3(0.0f, 1.0f, 0.0f)))
+                                                : glm::normalize(glm::cross(nAxis, glm::vec3(1.0f, 0.0f, 0.0f)));
+    glm::vec3 vAxis = glm::normalize(glm::cross(nAxis, uAxis));
+
+    auto getTorusPoint = [&](float u, float v) -> std::pair<glm::vec3, glm::vec3> {
+        float cosU = std::cos(u);
+        float sinU = std::sin(u);
+        float cosV = std::cos(v);
+        float sinV = std::sin(v);
+
+        glm::vec3 ringCenter = center + (uAxis * cosU + vAxis * sinU) * majorRadius;
+        glm::vec3 radialDir = uAxis * cosU + vAxis * sinU;
+        glm::vec3 norm = radialDir * cosV + nAxis * sinV;
+        glm::vec3 pos = ringCenter + norm * minorRadius;
+        return {pos, norm};
+    };
+
+    auto makeTri = [matId](glm::vec3 pA, glm::vec3 nA, glm::vec2 uvA,
+                           glm::vec3 pB, glm::vec3 nB, glm::vec2 uvB,
+                           glm::vec3 pC, glm::vec3 nC, glm::vec2 uvC) {
+        TriangleGPU tri{};
+        glm::vec3 up = std::abs(nA.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v0.position = glm::vec4(pA, uvA.x);
+        tri.v0.normal = glm::vec4(nA, uvA.y);
+        tri.v0.tangent = glm::vec4(glm::normalize(glm::cross(up, nA)), 1.0f);
+
+        up = std::abs(nB.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v1.position = glm::vec4(pB, uvB.x);
+        tri.v1.normal = glm::vec4(nB, uvB.y);
+        tri.v1.tangent = glm::vec4(glm::normalize(glm::cross(up, nB)), 1.0f);
+
+        up = std::abs(nC.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        tri.v2.position = glm::vec4(pC, uvC.x);
+        tri.v2.normal = glm::vec4(nC, uvC.y);
+        tri.v2.tangent = glm::vec4(glm::normalize(glm::cross(up, nC)), 1.0f);
+
+        tri.materialId = matId;
+        return tri;
+    };
+
+    for (int r = 0; r < rings; ++r) {
+        float u0 = (2.0f * PI * r) / static_cast<float>(rings);
+        float u1 = (2.0f * PI * (r + 1)) / static_cast<float>(rings);
+        float uTex0 = static_cast<float>(r) / static_cast<float>(rings);
+        float uTex1 = static_cast<float>(r + 1) / static_cast<float>(rings);
+
+        for (int s = 0; s < sectors; ++s) {
+            float v0 = (2.0f * PI * s) / static_cast<float>(sectors);
+            float v1 = (2.0f * PI * (s + 1)) / static_cast<float>(sectors);
+            float vTex0 = static_cast<float>(s) / static_cast<float>(sectors);
+            float vTex1 = static_cast<float>(s + 1) / static_cast<float>(sectors);
+
+            auto [p00, n00] = getTorusPoint(u0, v0);
+            auto [p10, n10] = getTorusPoint(u1, v0);
+            auto [p01, n01] = getTorusPoint(u0, v1);
+            auto [p11, n11] = getTorusPoint(u1, v1);
+
+            triangles.push_back(makeTri(p00, n00, glm::vec2(uTex0, vTex0),
+                                        p10, n10, glm::vec2(uTex1, vTex0),
+                                        p11, n11, glm::vec2(uTex1, vTex1)));
+            triangles.push_back(makeTri(p00, n00, glm::vec2(uTex0, vTex0),
+                                        p11, n11, glm::vec2(uTex1, vTex1),
+                                        p01, n01, glm::vec2(uTex0, vTex1)));
+        }
+    }
+}
+
 static std::vector<MaterialGPU> createDefaultCornellBoxMaterials() {
     std::vector<MaterialGPU> materials;
 
@@ -2518,6 +2591,314 @@ SceneData ProceduralScene::createCyberCityScene() {
     return scene;
 }
 
+static std::vector<MaterialGPU> createInfinityMirrorMaterials() {
+    std::vector<MaterialGPU> materials;
+
+    // 0: Dark Studio Matte Diffuse Floor
+    MaterialGPU matFloor{};
+    matFloor.albedo = glm::vec4(0.08f, 0.08f, 0.09f, 1.0f);
+    matFloor.roughness = 0.85f;
+    matFloor.metallic = 0.0f;
+    matFloor.type = MATERIAL_DIFFUSE;
+    materials.push_back(matFloor);
+
+    // 1: Portal Frame (Dark anodized metallic)
+    MaterialGPU matFrame{};
+    matFrame.albedo = glm::vec4(0.035f, 0.035f, 0.04f, 1.0f);
+    matFrame.roughness = 0.20f;
+    matFrame.metallic = 0.85f;
+    matFrame.type = MATERIAL_METALLIC;
+    materials.push_back(matFrame);
+
+    // 2: Optical Mirror (Opposing end mirrors, 99.5% reflectance, 0.001 roughness)
+    MaterialGPU matMirror{};
+    matMirror.albedo = glm::vec4(0.995f, 0.995f, 0.995f, 1.0f);
+    matMirror.roughness = 0.001f;
+    matMirror.metallic = 1.0f;
+    matMirror.type = MATERIAL_METALLIC;
+    materials.push_back(matMirror);
+
+    // 3: Chrome Mirror Sphere (Off-axis left)
+    MaterialGPU matChrome{};
+    matChrome.albedo = glm::vec4(0.96f, 0.96f, 0.96f, 1.0f);
+    matChrome.roughness = 0.004f;
+    matChrome.metallic = 1.0f;
+    matChrome.type = MATERIAL_METALLIC;
+    materials.push_back(matChrome);
+
+    // 4: Polished Gold (Tilted accent ring on right)
+    MaterialGPU matGold{};
+    matGold.albedo = glm::vec4(1.0f, 0.82f, 0.32f, 1.0f);
+    matGold.roughness = 0.03f;
+    matGold.metallic = 1.0f;
+    matGold.type = MATERIAL_METALLIC;
+    materials.push_back(matGold);
+
+    // 5: Gloss Red (Bauhaus lacquer)
+    MaterialGPU matRed{};
+    matRed.albedo = glm::vec4(0.88f, 0.04f, 0.04f, 1.0f);
+    matRed.roughness = 0.04f;
+    matRed.metallic = 0.0f;
+    matRed.clearcoat = 1.0f;
+    matRed.clearcoatRoughness = 0.02f;
+    matRed.type = MATERIAL_DIFFUSE;
+    materials.push_back(matRed);
+
+    // 6: Gloss Green (Bauhaus lacquer)
+    MaterialGPU matGreen{};
+    matGreen.albedo = glm::vec4(0.04f, 0.82f, 0.38f, 1.0f);
+    matGreen.roughness = 0.04f;
+    matGreen.metallic = 0.0f;
+    matGreen.clearcoat = 1.0f;
+    matGreen.clearcoatRoughness = 0.02f;
+    matGreen.type = MATERIAL_DIFFUSE;
+    materials.push_back(matGreen);
+
+    // 7: Gloss Yellow (Bauhaus lacquer)
+    MaterialGPU matYellow{};
+    matYellow.albedo = glm::vec4(0.98f, 0.78f, 0.02f, 1.0f);
+    matYellow.roughness = 0.05f;
+    matYellow.metallic = 0.0f;
+    matYellow.clearcoat = 1.0f;
+    matYellow.clearcoatRoughness = 0.02f;
+    matYellow.type = MATERIAL_DIFFUSE;
+    materials.push_back(matYellow);
+
+    // 8: Gloss Blue (Bauhaus lacquer)
+    MaterialGPU matBlue{};
+    matBlue.albedo = glm::vec4(0.02f, 0.22f, 0.92f, 1.0f);
+    matBlue.roughness = 0.04f;
+    matBlue.metallic = 0.0f;
+    matBlue.clearcoat = 1.0f;
+    matBlue.clearcoatRoughness = 0.02f;
+    matBlue.type = MATERIAL_DIFFUSE;
+    materials.push_back(matBlue);
+
+    // 9: Pedestal Matte (Dark pedestal)
+    MaterialGPU matPed{};
+    matPed.albedo = glm::vec4(0.10f, 0.10f, 0.11f, 1.0f);
+    matPed.roughness = 0.80f;
+    matPed.metallic = 0.0f;
+    matPed.type = MATERIAL_DIFFUSE;
+    materials.push_back(matPed);
+
+    // 10: Overhead Linear Light Bar (Warm LED)
+    MaterialGPU matLight{};
+    matLight.albedo = glm::vec4(1.0f, 0.95f, 0.88f, 1.0f);
+    matLight.emissive = glm::vec4(20.0f, 18.8f, 16.0f, 1.0f);
+    matLight.type = MATERIAL_EMISSIVE;
+    materials.push_back(matLight);
+
+    // 11: Dielectric Crown Glass
+    MaterialGPU matGlass{};
+    matGlass.albedo = glm::vec4(0.96f, 1.0f, 0.98f, 1.0f);
+    matGlass.roughness = 0.005f;
+    matGlass.metallic = 0.0f;
+    matGlass.ior = 1.52f;
+    matGlass.transmission = 1.0f;
+    matGlass.thickness = 1.0f;
+    matGlass.type = MATERIAL_DIELECTRIC;
+    materials.push_back(matGlass);
+
+    return materials;
+}
+
+SceneData ProceduralScene::createInfinityMirrorScene() {
+    SceneData scene;
+    scene.materials = createInfinityMirrorMaterials();
+
+    auto recordRange = [&](const std::string& name, uint32_t startTri) {
+        if (scene.triangles.size() <= startTri) return;
+        MeshRange mr{};
+        mr.name = name;
+        mr.firstTriangle = startTri;
+        mr.triangleCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
+        for (uint32_t i = startTri; i < scene.triangles.size(); ++i) {
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
+        }
+        scene.meshRanges.push_back(mr);
+    };
+
+    // 1. Studio diffuse floor (X in [-8.0, 8.0], Z in [-16.0, 16.0])
+    uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
+    addBox(scene.triangles, glm::vec3(0.0f, -0.05f, 0.0f), glm::vec3(16.0f, 0.1f, 32.0f), 0.0f, 0);
+    recordRange("Floor", tStart);
+
+    // 2. Opposing Optical Planar Mirrors
+    // Front Mirror at Z = -13.0 (facing +Z into corridor)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3(-1.9f, 0.0f, -13.0f),
+            glm::vec3( 1.9f, 0.0f, -13.0f),
+            glm::vec3( 1.9f, 3.5f, -13.0f),
+            glm::vec3(-1.9f, 3.5f, -13.0f),
+            glm::vec3(0.0f, 0.0f, 1.0f), 2);
+    recordRange("Mirror_Front", tStart);
+
+    // Rear Mirror at Z = +13.0 (facing -Z into corridor)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addQuad(scene.triangles,
+            glm::vec3( 1.9f, 0.0f, 13.0f),
+            glm::vec3(-1.9f, 0.0f, 13.0f),
+            glm::vec3(-1.9f, 3.5f, 13.0f),
+            glm::vec3( 1.9f, 3.5f, 13.0f),
+            glm::vec3(0.0f, 0.0f, -1.0f), 2);
+    recordRange("Mirror_Back", tStart);
+
+    // 3. Portal Frames along Z
+    const float frameZPositions[] = {
+        -11.0f, -9.0f, -7.0f, -5.0f, -3.0f, -1.0f, 1.0f, 3.0f, 5.0f, 7.0f, 9.0f, 11.0f
+    };
+    const float frameW = 3.6f;
+    const float frameH = 3.4f;
+    const float barThick = 0.10f;
+
+    for (size_t i = 0; i < sizeof(frameZPositions) / sizeof(frameZPositions[0]); ++i) {
+        float z = frameZPositions[i];
+        tStart = static_cast<uint32_t>(scene.triangles.size());
+
+        // Left post
+        addBox(scene.triangles, glm::vec3(-frameW * 0.5f + barThick * 0.5f, frameH * 0.5f, z),
+               glm::vec3(barThick, frameH, barThick), 0.0f, 1);
+
+        // Right post
+        addBox(scene.triangles, glm::vec3(frameW * 0.5f - barThick * 0.5f, frameH * 0.5f, z),
+               glm::vec3(barThick, frameH, barThick), 0.0f, 1);
+
+        // Top beam
+        addBox(scene.triangles, glm::vec3(0.0f, frameH - barThick * 0.5f, z),
+               glm::vec3(frameW, barThick, barThick), 0.0f, 1);
+
+        // Suspended LED luminaire troffer (30cm wide diffuser along Z for soft shadows)
+        float lightHalfW = frameW * 0.85f * 0.5f;
+        float lightDepth = 0.30f; // 30cm total width along Z
+        float lightHalfDepth = lightDepth * 0.5f;
+        float lightY = frameH - barThick - 0.05f;
+
+        // Slim luminaire housing under the top beam
+        addBox(scene.triangles, glm::vec3(0.0f, lightY + 0.025f, z),
+               glm::vec3(2.0f * lightHalfW + 0.04f, 0.05f, lightDepth + 0.04f), 0.0f, 1);
+
+        addQuad(scene.triangles,
+                glm::vec3(-lightHalfW, lightY, z - lightHalfDepth),
+                glm::vec3( lightHalfW, lightY, z - lightHalfDepth),
+                glm::vec3( lightHalfW, lightY, z + lightHalfDepth),
+                glm::vec3(-lightHalfW, lightY, z + lightHalfDepth),
+                glm::vec3(0.0f, -1.0f, 0.0f), 10);
+
+        // Add corresponding analytical LightGPU
+        LightGPU light{};
+        light.position = glm::vec4(-lightHalfW, lightY - 0.01f, z - lightHalfDepth, LIGHT_AREA_QUAD);
+        light.u = glm::vec4(2.0f * lightHalfW, 0.0f, 0.0f, 0.0f);
+        light.v = glm::vec4(0.0f, 0.0f, lightDepth, 0.0f);
+        light.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+        light.emission = glm::vec4(20.0f, 18.8f, 16.0f, (2.0f * lightHalfW) * lightDepth);
+        scene.lights.push_back(light);
+
+        recordRange("Frame_" + std::to_string(i), tStart);
+    }
+
+    // 4. Center Runway Sculptures
+    const float pedR = 0.40f;
+    const float pedH = 0.20f;
+
+    auto addPedestal = [&](float x, float z, const std::string& name) {
+        tStart = static_cast<uint32_t>(scene.triangles.size());
+        addCylinder(scene.triangles, glm::vec3(x, pedH * 0.5f, z), pedR, pedH, 9, 24);
+        recordRange("Pedestal_" + name, tStart);
+    };
+
+    // Item 1: Red Sphere (Z = -6.0)
+    addPedestal(0.0f, -6.0f, "RedSphere_1");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, -6.0f), 0.42f, 5, 32, 32);
+    recordRange("Art_RedSphere_1", tStart);
+
+    // Item 2: Green Torus (Z = -3.5)
+    addPedestal(0.0f, -3.5f, "GreenTorus_1");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f, pedH + 0.45f, -3.5f), 0.40f, 0.13f, 6, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
+    recordRange("Art_GreenTorus_1", tStart);
+
+    // Item 3: Yellow Cube (Z = -1.0)
+    addPedestal(0.0f, -1.0f, "YellowCube_1");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addBox(scene.triangles, glm::vec3(0.0f, pedH + 0.35f, -1.0f), glm::vec3(0.70f, 0.70f, 0.70f), 25.0f, 7);
+    recordRange("Art_YellowCube_1", tStart);
+
+    // Item 4: Blue Cylinder (Z = 1.5)
+    addPedestal(0.0f, 1.5f, "BlueCyl_1");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addCylinder(scene.triangles, glm::vec3(0.0f, pedH + 0.85f * 0.5f, 1.5f), 0.34f, 0.85f, 8, 28);
+    recordRange("Art_BlueCyl_1", tStart);
+
+    // Item 5: Glass Sphere / Crystal (Z = 4.0)
+    addPedestal(0.0f, 4.0f, "GlassSphere");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, 4.0f), 0.42f, 11, 32, 32);
+    recordRange("Art_GlassSphere", tStart);
+
+    // Item 6: Green Torus (Z = 6.5)
+    addPedestal(0.0f, 6.5f, "GreenTorus_2");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f, pedH + 0.45f, 6.5f), 0.40f, 0.13f, 6, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
+    recordRange("Art_GreenTorus_2", tStart);
+
+    // Item 7: Yellow Cube (Z = 9.0)
+    addPedestal(0.0f, 9.0f, "YellowCube_2");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addBox(scene.triangles, glm::vec3(0.0f, pedH + 0.35f, 9.0f), glm::vec3(0.70f, 0.70f, 0.70f), 25.0f, 7);
+    recordRange("Art_YellowCube_2", tStart);
+
+    // 5. Off-Axis Accent Sculptures
+    // Left: Prominent Polished Chrome Mirror Sphere (X = -1.3, Z = -5.5)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, -5.5f), 0.50f, pedH, 9, 28);
+    recordRange("Pedestal_ChromeSphere", tStart);
+
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.5f), 0.70f, 3, 48, 48);
+    recordRange("Art_ChromeSphere", tStart);
+
+    // Right: Tilted Polished Gold Accent Ring (X = 1.3, Z = -2.5)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -2.5f), 0.40f, pedH, 9, 24);
+    recordRange("Pedestal_GoldRing", tStart);
+
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(1.3f, pedH + 0.42f, -2.5f), 0.38f, 0.10f, 4, 36, 18,
+             glm::normalize(glm::vec3(0.35f, 0.88f, 0.25f)));
+    recordRange("Art_GoldRing", tStart);
+
+    // 6. Camera Setup
+    scene.hasCamera = true;
+    scene.cameraPosition = glm::vec3(0.75f, 1.65f, -11.5f);
+    scene.cameraTarget = glm::vec3(-0.15f, 1.25f, 2.0f);
+    scene.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+    scene.cameraFov = 50.0f;
+
+    // Bounds and targets
+    scene.boundsMin = glm::vec3(-3.0f, -0.2f, -14.0f);
+    scene.boundsMax = glm::vec3(3.0f, 4.0f, 14.0f);
+    scene.sceneRadius = 16.0f;
+    scene.focalBoundsMin = glm::vec3(-2.0f, 0.0f, -12.0f);
+    scene.focalBoundsMax = glm::vec3(2.0f, 3.5f, 12.0f);
+    scene.focalRadius = 14.0f;
+    scene.focalDistance = glm::length(scene.cameraTarget - scene.cameraPosition);
+    scene.centralTarget = glm::vec3(0.0f, 1.2f, 0.0f);
+
+    scene.hasDielectrics = true;
+    scene.dielectricBoundsMin = glm::vec3(-0.5f, 0.2f, 3.5f);
+    scene.dielectricBoundsMax = glm::vec3(0.5f, 1.1f, 4.5f);
+
+    return scene;
+}
+
 static inline bool intersectRayAABB(const glm::vec3& orig, const glm::vec3& invDir,
                                     const glm::vec3& bmin, const glm::vec3& bmax,
                                     float& tmin, float& tmax) {
@@ -2605,8 +2986,50 @@ bool SceneData::raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, flo
     }
     glm::vec3 invDir = 1.0f / safeDir;
 
-    // Test mesh ranges if available
-    if (!meshRanges.empty()) {
+    // Test instances if present (e.g. cyber-city)
+    if (!instances.empty()) {
+        for (size_t instIdx = 0; instIdx < instances.size(); ++instIdx) {
+            const auto& inst = instances[instIdx];
+            if (inst.blasIndex >= blasRanges.size()) continue;
+            const auto& range = blasRanges[inst.blasIndex];
+
+            glm::mat4 invTransform = glm::inverse(inst.transform);
+            glm::vec3 localOrig = glm::vec3(invTransform * glm::vec4(rayOrigin, 1.0f));
+            glm::vec3 localDir = glm::vec3(invTransform * glm::vec4(rayDir, 0.0f));
+
+            if (inst.blasIndex < meshRanges.size()) {
+                const auto& mr = meshRanges[inst.blasIndex];
+                glm::vec3 safeLocalDir = localDir;
+                for (int k = 0; k < 3; ++k) {
+                    if (std::abs(safeLocalDir[k]) < 1e-8f) safeLocalDir[k] = (safeLocalDir[k] < 0.0f ? -1e-8f : 1e-8f);
+                }
+                glm::vec3 invLocalDir = 1.0f / safeLocalDir;
+                float tmin, tmax;
+                if (!intersectRayAABB(localOrig, invLocalDir, mr.minBound, mr.maxBound, tmin, tmax) || tmin >= closestT) {
+                    continue;
+                }
+            }
+
+            uint32_t endTri = std::min<uint32_t>(range.firstTriangle + range.triangleCount, static_cast<uint32_t>(triangles.size()));
+            for (uint32_t i = range.firstTriangle; i < endTri; ++i) {
+                float t = 0.0f;
+                if (intersectRayTriangle(localOrig, localDir,
+                                         glm::vec3(triangles[i].v0.position),
+                                         glm::vec3(triangles[i].v1.position),
+                                         glm::vec3(triangles[i].v2.position), t)) {
+                    if (t < closestT) {
+                        closestT = t;
+                        hit = true;
+                        if (inst.blasIndex < meshRanges.size()) {
+                            hitName = meshRanges[inst.blasIndex].name + "_" + std::to_string(instIdx);
+                        } else {
+                            hitName = "Instance_" + std::to_string(instIdx);
+                        }
+                    }
+                }
+            }
+        }
+    } else if (!meshRanges.empty()) {
         for (const auto& mr : meshRanges) {
             float tmin, tmax;
             if (intersectRayAABB(rayOrigin, invDir, mr.minBound, mr.maxBound, tmin, tmax) && tmin < closestT) {
@@ -2650,262 +3073,6 @@ bool SceneData::raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, flo
         return true;
     }
     return false;
-}
-
-SceneData ProceduralScene::createInfinityMirrorScene() {
-    SceneData scene;
-
-    // Materials:
-    // 0: Matte Dark Carbon (Walls, Floor, Ceiling)
-    MaterialGPU matDark{};
-    matDark.albedo = glm::vec4(0.04f, 0.04f, 0.05f, 1.0f);
-    matDark.roughness = 0.6f;
-    matDark.metallic = 0.0f;
-    matDark.type = MATERIAL_DIFFUSE;
-    scene.materials.push_back(matDark);
-
-    // 1: Planar Facing Mirror (Ultra-pure metallic specular conductor)
-    MaterialGPU matMirror{};
-    matMirror.albedo = glm::vec4(0.99f, 0.99f, 0.99f, 1.0f);
-    matMirror.roughness = 0.0005f; // Zero roughness for crystal sharp infinite reflections
-    matMirror.metallic = 1.0f;
-    matMirror.type = MATERIAL_METALLIC;
-    scene.materials.push_back(matMirror);
-
-    // 2: Dielectric Glass (Center sphere)
-    MaterialGPU matGlass{};
-    matGlass.albedo = glm::vec4(1.0f);
-    matGlass.roughness = 0.002f;
-    matGlass.metallic = 0.0f;
-    matGlass.ior = 1.52f;
-    matGlass.transmission = 1.0f;
-    matGlass.thickness = 1.0f;
-    matGlass.type = MATERIAL_DIELECTRIC;
-    scene.materials.push_back(matGlass);
-
-    // 3: Neon Cyan Emissive
-    MaterialGPU matCyan{};
-    matCyan.albedo = glm::vec4(0.0f, 0.9f, 1.0f, 1.0f);
-    matCyan.emissive = glm::vec4(0.0f, 30.0f, 40.0f, 1.0f);
-    matCyan.type = MATERIAL_EMISSIVE;
-    scene.materials.push_back(matCyan);
-
-    // 4: Neon Magenta Emissive
-    MaterialGPU matMagenta{};
-    matMagenta.albedo = glm::vec4(1.0f, 0.0f, 0.7f, 1.0f);
-    matMagenta.emissive = glm::vec4(40.0f, 0.0f, 25.0f, 1.0f);
-    matMagenta.type = MATERIAL_EMISSIVE;
-    scene.materials.push_back(matMagenta);
-
-    // 5: Neon Amber / Gold Emissive
-    MaterialGPU matGoldEmissive{};
-    matGoldEmissive.albedo = glm::vec4(1.0f, 0.7f, 0.1f, 1.0f);
-    matGoldEmissive.emissive = glm::vec4(35.0f, 20.0f, 2.0f, 1.0f);
-    matGoldEmissive.type = MATERIAL_EMISSIVE;
-    scene.materials.push_back(matGoldEmissive);
-
-    // 6: Polished Brass Metallic Sphere
-    MaterialGPU matBrass{};
-    matBrass.albedo = glm::vec4(0.95f, 0.78f, 0.35f, 1.0f);
-    matBrass.roughness = 0.03f;
-    matBrass.metallic = 1.0f;
-    matBrass.type = MATERIAL_METALLIC;
-    scene.materials.push_back(matBrass);
-
-    // 7: Chrome Accent Metallic
-    MaterialGPU matChrome{};
-    matChrome.albedo = glm::vec4(0.95f, 0.95f, 0.98f, 1.0f);
-    matChrome.roughness = 0.05f;
-    matChrome.metallic = 1.0f;
-    matChrome.type = MATERIAL_METALLIC;
-    scene.materials.push_back(matChrome);
-
-    auto recordRange = [&](const std::string& name, uint32_t startTri) {
-        if (scene.triangles.size() <= startTri) return;
-        MeshRange mr{};
-        mr.name = name;
-        mr.firstTriangle = startTri;
-        mr.triangleCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
-        for (uint32_t i = startTri; i < scene.triangles.size(); ++i) {
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
-        }
-        scene.meshRanges.push_back(mr);
-    };
-
-    // Corridor Dimensions:
-    // X in [-1.5, 1.5], Y in [0.0, 2.5], Z in [-3.0, 3.0]
-    float halfW = 1.5f;
-    float height = 2.5f;
-    float halfL = 3.0f;
-
-    // Floor (Y = 0.0)
-    uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3(-halfW, 0.0f,  halfL),
-            glm::vec3( halfW, 0.0f,  halfL),
-            glm::vec3( halfW, 0.0f, -halfL),
-            glm::vec3(-halfW, 0.0f, -halfL),
-            glm::vec3(0.0f, 1.0f, 0.0f), 0);
-    recordRange("Floor", tStart);
-
-    // Ceiling (Y = 2.5)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3(-halfW, height, -halfL),
-            glm::vec3( halfW, height, -halfL),
-            glm::vec3( halfW, height,  halfL),
-            glm::vec3(-halfW, height,  halfL),
-            glm::vec3(0.0f, -1.0f, 0.0f), 0);
-    recordRange("Ceiling", tStart);
-
-    // Left Wall (X = -1.5)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3(-halfW, 0.0f,  halfL),
-            glm::vec3(-halfW, 0.0f, -halfL),
-            glm::vec3(-halfW, height, -halfL),
-            glm::vec3(-halfW, height,  halfL),
-            glm::vec3(1.0f, 0.0f, 0.0f), 0);
-    recordRange("Left Wall", tStart);
-
-    // Right Wall (X = 1.5)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3( halfW, 0.0f, -halfL),
-            glm::vec3( halfW, 0.0f,  halfL),
-            glm::vec3( halfW, height,  halfL),
-            glm::vec3( halfW, height, -halfL),
-            glm::vec3(-1.0f, 0.0f, 0.0f), 0);
-    recordRange("Right Wall", tStart);
-
-    // --- OPPOSING PARALLEL PLANAR MIRRORS ---
-    // Back Mirror (Z = -halfL, facing +Z)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3(-halfW, 0.0f, -halfL),
-            glm::vec3( halfW, 0.0f, -halfL),
-            glm::vec3( halfW, height, -halfL),
-            glm::vec3(-halfW, height, -halfL),
-            glm::vec3(0.0f, 0.0f, 1.0f), 1);
-    recordRange("Back Facing Mirror", tStart);
-
-    // Front Mirror (Z = +halfL, facing -Z)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3( halfW, 0.0f, halfL),
-            glm::vec3(-halfW, 0.0f, halfL),
-            glm::vec3(-halfW, height, halfL),
-            glm::vec3( halfW, height, halfL),
-            glm::vec3(0.0f, 0.0f, -1.0f), 1);
-    recordRange("Front Facing Mirror", tStart);
-
-    // --- NEON FRAMES ALONG THE CORRIDOR ---
-    // 5 Receding Portals along Z: -2.0, -1.0, 0.0, 1.0, 2.0
-    float portalZ[] = { -2.0f, -1.0f, 0.0f, 1.0f, 2.0f };
-    uint32_t portalMats[] = { 3, 4, 5, 3, 4 }; // Cyan, Magenta, Amber, Cyan, Magenta
-    float frameThickness = 0.04f;
-    float frameW = halfW - 0.02f;
-    float frameH = height - 0.02f;
-
-    for (int p = 0; p < 5; ++p) {
-        float z = portalZ[p];
-        uint32_t matId = portalMats[p];
-        std::string pName = "Neon Portal Frame Z=" + std::to_string(static_cast<int>(z));
-        tStart = static_cast<uint32_t>(scene.triangles.size());
-
-        // Top horizontal strip
-        addBox(scene.triangles, glm::vec3(0.0f, frameH - frameThickness * 0.5f, z),
-               glm::vec3(frameW * 2.0f, frameThickness, frameThickness), 0.0f, matId);
-        // Bottom horizontal strip
-        addBox(scene.triangles, glm::vec3(0.0f, frameThickness * 0.5f, z),
-               glm::vec3(frameW * 2.0f, frameThickness, frameThickness), 0.0f, matId);
-        // Left vertical strip
-        addBox(scene.triangles, glm::vec3(-frameW + frameThickness * 0.5f, frameH * 0.5f, z),
-               glm::vec3(frameThickness, frameH, frameThickness), 0.0f, matId);
-        // Right vertical strip
-        addBox(scene.triangles, glm::vec3( frameW - frameThickness * 0.5f, frameH * 0.5f, z),
-               glm::vec3(frameThickness, frameH, frameThickness), 0.0f, matId);
-
-        recordRange(pName, tStart);
-
-        // Add NEE area lights for the top and bottom neon strips
-        LightGPU pLightTop{};
-        pLightTop.position = glm::vec4(-frameW * 0.8f, frameH - 0.05f, z, LIGHT_AREA_QUAD);
-        pLightTop.u = glm::vec4(frameW * 1.6f, 0.0f, 0.0f, 0.0f);
-        pLightTop.v = glm::vec4(0.0f, 0.0f, frameThickness, 0.0f);
-        pLightTop.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
-        glm::vec4 emis = scene.materials[matId].emissive * 0.25f;
-        pLightTop.emission = glm::vec4(emis.r, emis.g, emis.b, frameW * 1.6f * frameThickness);
-        scene.lights.push_back(pLightTop);
-    }
-
-    // --- CEILING DOWNLIGHT FOR SOFT AMBIENT FILL ---
-    float clw = 0.4f;
-    float cll = 1.5f;
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addQuad(scene.triangles,
-            glm::vec3(-clw, height - 0.01f, -cll),
-            glm::vec3( clw, height - 0.01f, -cll),
-            glm::vec3( clw, height - 0.01f,  cll),
-            glm::vec3(-clw, height - 0.01f,  cll),
-            glm::vec3(0.0f, -1.0f, 0.0f), 5); // Warm gold ceiling light
-    recordRange("Ceiling Downlight", tStart);
-
-    LightGPU ceilingLight{};
-    ceilingLight.position = glm::vec4(-clw, height - 0.01f, -cll, LIGHT_AREA_QUAD);
-    ceilingLight.u = glm::vec4(2.0f * clw, 0.0f, 0.0f, 0.0f);
-    ceilingLight.v = glm::vec4(0.0f, 0.0f, 2.0f * cll, 0.0f);
-    ceilingLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
-    ceilingLight.emission = glm::vec4(15.0f, 12.0f, 8.0f, (2.0f * clw) * (2.0f * cll));
-    scene.lights.push_back(ceilingLight);
-
-    // --- CENTRAL PEDESTAL & GLASS SPHERE ---
-    // Pedestal at (0.0, 0.25, 0.0)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addBox(scene.triangles, glm::vec3(0.0f, 0.25f, 0.0f), glm::vec3(0.55f, 0.5f, 0.55f), 15.0f, 7);
-    recordRange("Pedestal", tStart);
-
-    // Center Glass Dielectric Sphere (IOR 1.52)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(0.0f, 0.78f, 0.0f), 0.28f, 2);
-    recordRange("Center Glass Sphere", tStart);
-    scene.hasDielectrics = true;
-    scene.dielectricBoundsMin = glm::vec3(0.0f, 0.78f, 0.0f) - glm::vec3(0.28f);
-    scene.dielectricBoundsMax = glm::vec3(0.0f, 0.78f, 0.0f) + glm::vec3(0.28f);
-
-    // Foreground Polished Brass Sphere at (-0.6, 0.3, 1.2)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(-0.6f, 0.3f, 1.2f), 0.3f, 6);
-    recordRange("Brass Sphere", tStart);
-
-    // Background Chrome Sphere at (0.6, 0.3, -1.2)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(0.6f, 0.3f, -1.2f), 0.3f, 1);
-    recordRange("Mirror Accent Sphere", tStart);
-
-    // --- CAMERA SETUP ---
-    // Position camera inside the corridor looking down toward the back mirror
-    scene.hasCamera = true;
-    scene.cameraPosition = glm::vec3(0.0f, 1.25f, 2.2f);
-    scene.cameraTarget = glm::vec3(0.0f, 1.25f, -3.0f);
-    scene.cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
-    scene.cameraFov = 55.0f;
-
-    scene.boundsMin = glm::vec3(-halfW, 0.0f, -halfL);
-    scene.boundsMax = glm::vec3(halfW, height, halfL);
-    scene.sceneRadius = 4.0f;
-    scene.focalBoundsMin = glm::vec3(-0.5f, 0.5f, -0.5f);
-    scene.focalBoundsMax = glm::vec3(0.5f, 1.2f, 0.5f);
-    scene.focalRadius = 1.0f;
-    scene.focalDistance = glm::length(scene.cameraPosition - glm::vec3(0.0f, 0.78f, 0.0f));
-    scene.centralTarget = glm::vec3(0.0f, 0.78f, 0.0f);
-
-    return scene;
 }
 
 } // namespace pathways

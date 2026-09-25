@@ -64,19 +64,20 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -128,7 +129,13 @@ layout(std430, binding = 32) buffer ReSTIRReservoirsBuffer {
     ReservoirDI restirReservoirs[];
 };
 
+#ifndef ENABLE_INLINE_SHADOWS
+#define ENABLE_INLINE_SHADOWS 0
+#endif
+
+#if ENABLE_INLINE_SHADOWS
 #include "wavefront_shadow_inline.glsl"
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint numTriangles;
@@ -262,7 +269,8 @@ void main() {
                 roughness *= mrSample.g;
                 metallic *= mrSample.b;
             }
-            roughness = clamp(roughness, 0.04, 1.0);
+            bool isDelta = (roughness <= 0.008);
+            roughness = clamp(roughness, 0.001, 1.0);
             metallic = clamp(metallic, 0.0, 1.0);
             float alphaRoughness = roughness * roughness;
 
@@ -303,7 +311,7 @@ void main() {
             f16vec3 secDirectL = f16vec3(0.0);
 
             // Direct Lighting (Stochastic NEE with ReSTIR DI and Alias Table)
-            if (!pathTerminated && enableDirect && enableSpecular && pc.numLights > 0u) {
+            if (!pathTerminated && !isDelta && enableDirect && enableSpecular && pc.numLights > 0u) {
                 bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
                 uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
@@ -511,6 +519,7 @@ void main() {
                     if (length(unshadowed) > float16_t(1e-5)) {
                         if (enableShadows) {
                             bool occluded = false;
+#if ENABLE_INLINE_SHADOWS
                             if (enableInlineShadows && pc.useHardwareRT == 1u) {
                                 occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, selectedLightDir, selectedLightDist,
                                                                 (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
@@ -530,7 +539,9 @@ void main() {
                                         restirReservoirs[pixelIndex].lightIndex_M = 0u;
                                     }
                                 }
-                            } else {
+                            } else
+#endif
+                            {
                                 hasShadowRay = true;
                                 shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
                                 shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, 1.0)));
@@ -549,33 +560,40 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect || !enableSpecular) {
                     pathTerminated = true;
                 } else {
-                    vec3 H;
-                    if (pc.secondarySortMode >= 2u) {
-                    uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
-                    uint frameRot = pc.frameIndex + pc.currentBounce * 3u;
-                    H = isAniso ? sampleAnisotropicGGXCoherent(hitNormal, T, B, ax, ay, seed, clusterK, frameRot)
-                                : sampleGGXCoherent(hitNormal, alphaRoughness, seed, clusterK, frameRot);
-                } else {
-                    H = isAniso ? sampleAnisotropicGGX(hitNormal, T, B, ax, ay, seed)
-                                : sampleGGX(hitNormal, alphaRoughness, seed);
-                }
-                nextDirection = reflect(-V, H);
-                vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
+                    vec3 nextOrigin = hitPoint + hitNormal * EPSILON;
+                    if (isDelta) {
+                        nextDirection = reflect(-V, hitNormal);
+                        float VdotN = clamp(dot(V, hitNormal), 0.0, 1.0);
+                        f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotN), F0);
+                        throughput *= F_sample;
+                    } else {
+                        vec3 H;
+                        if (pc.secondarySortMode >= 2u) {
+                            uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
+                            uint frameRot = pc.frameIndex + pc.currentBounce * 3u;
+                            H = isAniso ? sampleAnisotropicGGXCoherent(hitNormal, T, B, ax, ay, seed, clusterK, frameRot)
+                                        : sampleGGXCoherent(hitNormal, alphaRoughness, seed, clusterK, frameRot);
+                        } else {
+                            H = isAniso ? sampleAnisotropicGGX(hitNormal, T, B, ax, ay, seed)
+                                        : sampleGGX(hitNormal, alphaRoughness, seed);
+                        }
+                        nextDirection = reflect(-V, H);
 
-                float NdotL_next = dot(hitNormal, nextDirection);
-                if (NdotL_next <= 0.0) {
-                    // Grazing rejection fallback: reflect into upper hemisphere along macro normal
-                    nextDirection = reflect(-V, hitNormal);
-                    NdotL_next = clamp(dot(hitNormal, nextDirection), 0.001, 1.0);
-                    H = normalize(V + nextDirection);
-                }
-                float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotH), F0);
-                float G_sample = visibilitySmithGGXCorrelated(NdotL_next, NdotV, alphaRoughness);
+                        float NdotL_next = dot(hitNormal, nextDirection);
+                        if (NdotL_next <= 0.0) {
+                            // Grazing rejection fallback: reflect into upper hemisphere along macro normal
+                            nextDirection = reflect(-V, hitNormal);
+                            NdotL_next = clamp(dot(hitNormal, nextDirection), 0.001, 1.0);
+                            H = normalize(V + nextDirection);
+                        }
+                        float VdotH = clamp(dot(V, H), 0.0, 1.0);
+                        float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
+                        f16vec3 F_sample = fresnelSchlickVec(float16_t(VdotH), F0);
+                        float G_sample = visibilitySmithGGXCorrelated(NdotL_next, NdotV, alphaRoughness);
 
-                // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
-                throughput *= F_sample * float16_t(clamp(4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4), 0.0, 10.0));
+                        // Microfacet reflection weight: (F * G * D * NdotL) / specPdf = 4 * F * G * VdotH * NdotL / NdotH
+                        throughput *= F_sample * float16_t(clamp(4.0 * G_sample * NdotL_next * VdotH / max(NdotH, 1e-4), 0.0, 10.0));
+                    }
 
                     float pathLum = float(dot(throughput * float16_t(max(ubo.spp, 1u)), f16vec3(0.2126, 0.7152, 0.0722)));
                     if (pathLum < 0.001) {

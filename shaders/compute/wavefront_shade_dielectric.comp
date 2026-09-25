@@ -61,19 +61,20 @@ layout(std430, binding = 11) buffer QueueCounters {
     uint shadowRayCount;
     uint retiredWorkgroups;
     uint currentShadowCount;
-    uint diffuseCount;
-    uint dielectricCount;
-    uint conductorCount;
+    uint diffuseCount; // Standard count
     uint complexCount;
+    uint dielectricCount;
     uint emissiveCount;
-    uint alphamaskCount;
+    uint conductorCount; // Reserved
+    uint alphamaskCount; // Reserved
     uint nextDiffuseCount;
-    uint nextDielectricCount;
-    uint nextConductorCount;
     uint nextComplexCount;
+    uint nextDielectricCount;
     uint nextEmissiveCount;
-    uint nextAlphamaskCount;
-    uint currentMaterialCounts[6];
+    uint nextConductorCount; // Reserved
+    uint nextAlphamaskCount; // Reserved
+    uint currentMaterialCounts[4];
+    uint padMat[2];
     uint totalShadeWorkgroups;
     uint octantCounts[8];
     uint currentOctantCounts[8];
@@ -141,7 +142,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint activeCount = queueCounters.currentMaterialCounts[1]; // Dielectric queue
+    uint activeCount = queueCounters.currentMaterialCounts[2]; // Dielectric queue
     bool inRange = (idx < activeCount);
     bool survivesToNext = false;
     vec3 nextDirection = vec3(0.0);
@@ -149,7 +150,7 @@ void main() {
     RayState nextState;
 
     if (inRange) {
-        uint rayIdx = materialIndices[1u * pc.maxQueueCapacity + idx];
+        uint rayIdx = materialIndices[2u * pc.maxQueueCapacity + idx];
         RayGeometry geom = inGeoms[rayIdx];
         RayHit hit = inHits[rayIdx];
         RayState state = inStates[rayIdx];
@@ -207,7 +208,7 @@ void main() {
                 vec3 waveOffset;
                 vec3 waveN = evaluateWaterWaves(hitPoint, time, waveOffset);
                 hitNormal = normalize(mix(hitNormal, waveN, clamp(mat.normalScale, 0.0, 1.0)));
-            } else if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+            } else if (bounce == 0u && hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
@@ -363,10 +364,12 @@ void main() {
     uint waveActiveCount = subgroupBallotBitCount(ballot);
 
     uint waveGlobalOffset = 0u;
-    if (subgroupElect()) {
-        waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+    if (waveActiveCount > 0u) {
+        if (subgroupElect()) {
+            waveGlobalOffset = atomicAdd(queueCounters.nextActiveCount, waveActiveCount);
+        }
+        waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
     }
-    waveGlobalOffset = subgroupBroadcastFirst(waveGlobalOffset);
 
     uint targetIdx = waveGlobalOffset + laneSlot;
     if (survivesToNext) {
@@ -376,7 +379,7 @@ void main() {
         }
     }
 
-    if (pc.secondarySortMode == 1u) {
+    if (pc.secondarySortMode == 1u && waveActiveCount > 0u) {
         // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
