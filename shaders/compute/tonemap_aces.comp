@@ -60,9 +60,9 @@ vec3 LinearToST2084(vec3 L) {
 // - Scales color vector by mapped luminance ratio to preserve chromaticity without color shifts.
 float FilmicHdrLuminance(float x, float paperWhite, float peakNits) {
     if (x <= 1e-6) return 0.0;
-    const float p = 1.25;
+    // Strength reduction: x^1.25 == x * (x^0.5)^0.5 = x * sqrt(sqrt(x)) for non-negative luminance
     float k = max((peakNits / max(paperWhite, 50.0)) - 1.0, 0.1);
-    float xp = pow(x, p);
+    float xp = x * sqrt(sqrt(x));
     return peakNits * (xp / (xp + k));
 }
 

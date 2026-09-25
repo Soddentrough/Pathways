@@ -246,6 +246,9 @@ struct ConfigStatsTally {
             bAvg.activeCount = bt.sumActiveCount / bt.count;
             bAvg.nextCount = bt.sumNextCount / bt.count;
             bAvg.shadowCount = bt.sumShadowCount / bt.count;
+            if (b > 0 && bAvg.activeCount == 0 && bAvg.shadowCount == 0 && bAvg.nextCount == 0) {
+                break;
+            }
             result.push_back(bAvg);
         }
         return result;

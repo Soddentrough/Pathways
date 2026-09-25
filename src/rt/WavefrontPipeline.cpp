@@ -1199,6 +1199,12 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
             bp.diffCount = bp.activeCount;
         }
 
+        // If this bounce has 0 active rays entering it and produces no rays,
+        // the path trace has completely terminated. Stop processing further empty bounces.
+        if (b > 0 && bp.activeCount == 0 && bp.shadowCount == 0 && bp.nextCount == 0) {
+            break;
+        }
+
         // Memory Traffic Estimation:
         // Shade reads Geom(16B) + State(32B) + Hit(16B) = 64B
         // Shade writes Shadow(32B) if shadow ray, NextGeom(16B) + NextState(32B) = 48B if active
@@ -1213,6 +1219,15 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
         data.bounces.push_back(bp);
     }
     if (pMapped) m_indirectArgs[frameSlot]->unmap();
+
+    // If bounces terminated early, adjust totalMs to reflect only the active bounce range
+    if (!data.bounces.empty() && data.bounces.size() < effectiveBounces) {
+        uint32_t lastBounce = static_cast<uint32_t>(data.bounces.size() - 1);
+        uint32_t lastQuery = 3 + lastBounce * 6 + 5;
+        if (lastQuery < numQueries && ts[lastQuery] > ts[0]) {
+            data.totalMs = toMs(ts[lastQuery], ts[0]);
+        }
+    }
 
     // Primary Classify traffic: writes primary active rays (Geom 16B + State 32B + Hit 16B = 64B)
     uint32_t primaryRays = (m_width * m_height);

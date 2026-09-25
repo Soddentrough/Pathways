@@ -365,6 +365,7 @@ private:
 
     // Frame tracking & Quality Governor
     std::unique_ptr<QualityGovernor> m_governor;
+    uint32_t m_dynamicWavefrontBounces = 0;
     uint32_t m_accumulatedSamples = 0;
     bool m_accumulationComplete = false;
     std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;

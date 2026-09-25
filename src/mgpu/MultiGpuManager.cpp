@@ -1635,7 +1635,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.fullHeight = packet.tileHeight;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
-                                             secSppLoop, m_config.max_bounces, wfSceneData);
+                                             secSppLoop, packet.cameraUniform.maxBounces, wfSceneData);
     } else {
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());

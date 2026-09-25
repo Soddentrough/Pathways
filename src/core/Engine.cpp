@@ -268,6 +268,7 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_lastRenderScale = m_config.render_scale;
     m_lastUpscalerMode = m_config.upscaler_mode;
     m_lastTileSize = m_config.tile_size;
+    m_dynamicWavefrontBounces = m_config.max_bounces;
 
     // Initialize Dynamic Quality Governor
     GovernorConfig govCfg{};
@@ -1712,6 +1713,7 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 }
 
 bool Engine::loadScene(const std::string& filepath) {
+    m_dynamicWavefrontBounces = m_config.max_bounces;
     SceneData newScene;
     if (filepath.empty() || filepath == "__procedural_cornell_box__") {
         Logger::info("Loading Procedural Cornell Box...");
@@ -4646,6 +4648,16 @@ void Engine::renderFrame() {
             if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
                 if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
                     m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
+                    if (m_lastWavefrontProfile.valid && !m_lastWavefrontProfile.bounces.empty()) {
+                        uint32_t activeBouncesCount = static_cast<uint32_t>(m_lastWavefrontProfile.bounces.size());
+                        if (m_lastWavefrontProfile.bounces.back().nextCount == 0) {
+                            // All rays terminated at or before the last active bounce
+                            m_dynamicWavefrontBounces = activeBouncesCount;
+                        } else {
+                            // Rays were still alive at cutoff, expand headroom up to max_bounces
+                            m_dynamicWavefrontBounces = std::min(m_config.max_bounces, activeBouncesCount + 4);
+                        }
+                    }
                     static int wfProfCount = 0;
                     bool isBenchmarkMilestone = m_config.benchmark && (++wfProfCount == 10 || (m_config.frame_limit > 0 && m_totalFramesRendered + 1 >= m_config.frame_limit));
                     if (isBenchmarkMilestone || getenv("PATHWAYS_PROFILE_WF")) {
@@ -4884,6 +4896,9 @@ void Engine::renderFrame() {
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
+    if (accumReset || cameraMovedThisFrame) {
+        m_dynamicWavefrontBounces = m_config.max_bounces;
+    }
     if (accumReset && !sceneLoadingActive) {
         m_accumulatedSamples = 0;
         if (m_camera) m_camera->resetMoved();
@@ -4906,10 +4921,13 @@ void Engine::renderFrame() {
     uint32_t activeSpp = m_config.spp;
     float activeFractionalSpp = 0.0f;
     uint32_t activeBounces = m_config.max_bounces;
+    if (m_dynamicWavefrontBounces > 0) {
+        activeBounces = std::min(activeBounces, m_dynamicWavefrontBounces);
+    }
     if (m_governor && (m_config.adaptive_spp || m_config.target_fps > 0) && m_governor->getState().active) {
         activeSpp = m_governor->getState().currentSpp;
         activeFractionalSpp = m_governor->getState().fractionalSpp;
-        activeBounces = m_governor->getState().currentBounces;
+        activeBounces = std::min(activeBounces, m_governor->getState().currentBounces);
     }
     bool accumReachedCutoff = (m_config.progressive_accumulation &&
                                m_config.max_accum_frames > 0 &&
@@ -6640,7 +6658,7 @@ FrameStats Engine::getStats() const {
         stats.dynamic_bounces = m_governor->getState().currentBounces;
     } else {
         stats.dynamic_spp = m_config.spp;
-        stats.dynamic_bounces = m_config.max_bounces;
+        stats.dynamic_bounces = (m_dynamicWavefrontBounces > 0) ? m_dynamicWavefrontBounces : m_config.max_bounces;
     }
 
     if (!m_frameTimesMs.empty()) {
@@ -7542,12 +7560,13 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 0;
 
+        uint32_t activeOfflineBounces = m_config.max_bounces;
         while (remainingSpp > 0) {
             uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
             wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
 
             // ubo with spp = 1 so samples accumulate full unscaled radiance; enable subpixel jitter for ground truth convergence
-            CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, m_config.max_bounces, flags,
+            CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, activeOfflineBounces, flags,
                                                          true, width, height, 0, /*updatePrev=*/false);
             m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
@@ -7558,7 +7577,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            m_wavefrontPipeline->recordFrame(cmd, 0, width, height, batchSpp, m_config.max_bounces, wfSceneData);
+            m_wavefrontPipeline->recordFrame(cmd, 0, width, height, batchSpp, activeOfflineBounces, wfSceneData);
 
             vkEndCommandBuffer(cmd);
 
@@ -7569,6 +7588,16 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
             submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
             vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
             vkQueueWaitIdle(queue);
+
+            auto profData = m_wavefrontPipeline->getProfilingData(0, m_timestampPeriod, activeOfflineBounces);
+            if (profData.valid && !profData.bounces.empty()) {
+                uint32_t usedBounces = static_cast<uint32_t>(profData.bounces.size());
+                if (profData.bounces.back().nextCount == 0) {
+                    activeOfflineBounces = usedBounces;
+                } else {
+                    activeOfflineBounces = std::min(m_config.max_bounces, usedBounces + 4);
+                }
+            }
 
             remainingSpp -= batchSpp;
             currentSppOffset += batchSpp;
