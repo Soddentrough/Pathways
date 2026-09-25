@@ -993,28 +993,28 @@ void main() {
         // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
-        for (uint w = 0u; w < 2u; ++w) {
-            uint activeMask = (w == 0u) ? activeBallot.x : activeBallot.y;
-            while (activeMask != 0u) {
-                uint leaderLane = w * 32u + findLSB(activeMask);
-                uint k = subgroupBroadcast(oct, leaderLane);
-                bool isOct = survivesToNext && (oct == k);
-                uvec4 octBallot = subgroupBallot(isOct);
-                uint octCount = subgroupBallotBitCount(octBallot);
-                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-                uint octBase = 0u;
-                if (gl_SubgroupInvocationID == leaderLane) {
-                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-                }
-                octBase = subgroupBroadcast(octBase, leaderLane);
-                if (isOct) {
-                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                    if (octBase + octSlot < pc.maxQueueCapacity) {
-                        secondaryIndices[dest] = targetIdx;
-                    }
-                }
-                activeMask &= ~((w == 0u) ? octBallot.x : octBallot.y);
+        while (subgroupBallotBitCount(activeBallot) > 0u) {
+            uint leaderLane = subgroupBallotFindLSB(activeBallot);
+            uint k = subgroupBroadcast(oct, leaderLane);
+            bool isOct = survivesToNext && (oct == k);
+            uvec4 octBallot = subgroupBallot(isOct);
+            uint octCount = subgroupBallotBitCount(octBallot);
+            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+            uint octBase = 0u;
+            if (gl_SubgroupInvocationID == leaderLane) {
+                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
             }
+            octBase = subgroupBroadcast(octBase, leaderLane);
+            if (isOct) {
+                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                if (octBase + octSlot < pc.maxQueueCapacity) {
+                    secondaryIndices[dest] = targetIdx;
+                }
+            }
+            activeBallot.x &= ~octBallot.x;
+            activeBallot.y &= ~octBallot.y;
+            activeBallot.z &= ~octBallot.z;
+            activeBallot.w &= ~octBallot.w;
         }
     }
 

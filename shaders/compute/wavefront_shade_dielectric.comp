@@ -331,16 +331,16 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces) {
                     pathTerminated = true;
                 } else {
-                    float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
-                    if (pathLum < 0.001) {
+                    float maxT = max(throughput.r, max(throughput.g, throughput.b));
+                    if (maxT < 0.001) {
                         pathTerminated = true;
-                    } else if (bounce >= 1u) {
-                        float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float maxP = 0.95;
-                        float p = clamp(pathLum, minP, maxP);
-                        if (bounce >= 2u && pathLum >= 0.35) {
-                            p = clamp(pathLum * 0.85, minP, 0.90);
-                        }
+                    } else if (bounce >= 2u) {
+                        // Depth-damped Russian Roulette for specular/dielectric chains
+                        // Early bounces (0-1) are preserved 100% to ensure pristine primary refraction/reflection.
+                        // On bounces 3+, depth damping terminates low-contribution internal reflection loops unbiasedly.
+                        float depthDecay = (bounce >= 4u) ? pow(0.80, float(bounce - 3u)) : 1.0;
+                        float minP = (bounce >= 4u) ? 0.05 : 0.10;
+                        float p = clamp(maxT * depthDecay, minP, 0.95);
                         if (randFloat(seed) > p) {
                             pathTerminated = true;
                         } else {
@@ -383,28 +383,28 @@ void main() {
         // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
         uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
-        for (uint w = 0u; w < 2u; ++w) {
-            uint activeMask = (w == 0u) ? activeBallot.x : activeBallot.y;
-            while (activeMask != 0u) {
-                uint leaderLane = w * 32u + findLSB(activeMask);
-                uint k = subgroupBroadcast(oct, leaderLane);
-                bool isOct = survivesToNext && (oct == k);
-                uvec4 octBallot = subgroupBallot(isOct);
-                uint octCount = subgroupBallotBitCount(octBallot);
-                uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
-                uint octBase = 0u;
-                if (gl_SubgroupInvocationID == leaderLane) {
-                    octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
-                }
-                octBase = subgroupBroadcast(octBase, leaderLane);
-                if (isOct) {
-                    uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
-                    if (octBase + octSlot < pc.maxQueueCapacity) {
-                        secondaryIndices[dest] = targetIdx;
-                    }
-                }
-                activeMask &= ~((w == 0u) ? octBallot.x : octBallot.y);
+        while (subgroupBallotBitCount(activeBallot) > 0u) {
+            uint leaderLane = subgroupBallotFindLSB(activeBallot);
+            uint k = subgroupBroadcast(oct, leaderLane);
+            bool isOct = survivesToNext && (oct == k);
+            uvec4 octBallot = subgroupBallot(isOct);
+            uint octCount = subgroupBallotBitCount(octBallot);
+            uint octSlot = subgroupBallotExclusiveBitCount(octBallot);
+            uint octBase = 0u;
+            if (gl_SubgroupInvocationID == leaderLane) {
+                octBase = atomicAdd(queueCounters.octantCounts[k], octCount);
             }
+            octBase = subgroupBroadcast(octBase, leaderLane);
+            if (isOct) {
+                uint dest = k * pc.maxQueueCapacity + (octBase + octSlot);
+                if (octBase + octSlot < pc.maxQueueCapacity) {
+                    secondaryIndices[dest] = targetIdx;
+                }
+            }
+            activeBallot.x &= ~octBallot.x;
+            activeBallot.y &= ~octBallot.y;
+            activeBallot.z &= ~octBallot.z;
+            activeBallot.w &= ~octBallot.w;
         }
     }
 

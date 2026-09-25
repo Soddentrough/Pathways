@@ -84,7 +84,7 @@ struct WavefrontSceneData {
 class WavefrontPipeline {
 public:
     static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
-    static constexpr uint32_t MAX_WAVEFRONT_TIMESTAMP_QUERIES = 512;
+    static constexpr uint32_t MAX_WAVEFRONT_TIMESTAMP_QUERIES = 1024;
 
     WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                       uint32_t width, uint32_t height,
@@ -151,6 +151,9 @@ public:
         double shadeMs = 0.0;
         double shadowMs = 0.0;
         double intersectMs = 0.0;
+        double gapBeforeShadeMs = 0.0;
+        double gapBeforeShadowMs = 0.0;
+        double gapBeforeIntersectMs = 0.0;
         uint32_t activeCount = 0;
         uint32_t shadowCount = 0;
         uint32_t nextCount = 0;
@@ -165,6 +168,7 @@ public:
     struct WavefrontProfilingData {
         bool valid = false;
         double totalMs = 0.0;
+        double prologueMs = 0.0;
         double classifyMs = 0.0;
         double resolveMs = 0.0;
         std::vector<BounceProfilingData> bounces;
@@ -263,6 +267,7 @@ private:
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };
     std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
+    std::array<uint32_t, 2> m_slotBatches = { 1, 1 };
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;

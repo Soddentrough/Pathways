@@ -104,11 +104,13 @@ void main() {
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
     bool occluded = false;
 
-    
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
     rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, topLevelAS,
-                          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+    uint rayFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT;
+    if (!hasNonOpaque) {
+        rayFlags |= gl_RayFlagsOpaqueEXT;
+    }
+    rayQueryInitializeEXT(rq, topLevelAS, rayFlags,
                           0xFF, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
     while (rayQueryProceedEXT(rq)) {
         if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {

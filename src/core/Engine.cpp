@@ -1893,8 +1893,15 @@ uint32_t Engine::getTargetBatchPixels() const {
         return 1500000u; // 1.5M pixels (~246 MB queue set)
     }
 
-    // Profile C: Pro / Enthusiast dGPU (> 8GB VRAM, e.g. Dual Radeon AI PRO R9700)
-    return 2000000u; // 2.0M pixels (~330 MB queue set)
+    if (totalDeviceVram < 16ULL * 1024 * 1024 * 1024) {
+        // Profile C: High-mid dGPU (8GB - 16GB VRAM)
+        return 2000000u; // 2.0M pixels (~330 MB queue set)
+    }
+
+    // Profile D: Enthusiast / Workstation dGPU (>= 16GB VRAM, e.g. Dual Radeon AI PRO R9700)
+    // Sizing queues for the entire 4K viewport (~1.3 GB) fits comfortably in VRAM, eliminating
+    // inter-batch pipeline flushes, duplicate raygen dispatches, and wave fragmentation.
+    return 0u; // Monolithic full-frame dispatch
 }
 
 uint32_t Engine::getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const {
@@ -4683,7 +4690,7 @@ void Engine::renderFrame() {
                             static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
                         wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                         for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                            wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                            wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.gapBeforeShadeMs, bp.gapBeforeShadowMs, bp.gapBeforeIntersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                         }
                     }
                     recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
@@ -5080,7 +5087,7 @@ void Engine::renderFrame() {
 
         uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, QUERIES_PER_FRAME);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 0);
 
         // GPU-Timeline TLAS Update / Refit (Tier 3)
         if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
@@ -5610,7 +5617,7 @@ void Engine::renderFrame() {
 
         uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, QUERIES_PER_FRAME);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 0);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 0);
 
         // GPU-Timeline TLAS Update / Refit (Tier 3)
         if (m_tlasNeedsGpuUpdate && m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
@@ -6365,7 +6372,7 @@ void Engine::dumpOutputFiles() {
                     static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
                 wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                 for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.gapBeforeShadeMs, bp.gapBeforeShadowMs, bp.gapBeforeIntersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                 }
             }
             recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
@@ -7466,12 +7473,12 @@ void Engine::printExecutionSummary() const {
                 std::string shadowStr = (b.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms", b.shadowMs)
                                       : (inlineShadowsActive ? "Shadow: Inline" : "Shadow: 0.000 ms");
                 if (b.intersectMs > 0.0001) {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, shadowStr, b.intersectMs, b.totalMs,
+                    Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | {} | Gap3: {:.3f}ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.gapBeforeShadeMs, b.shadeMs, b.gapBeforeShadowMs, shadowStr, b.gapBeforeIntersectMs, b.intersectMs, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 } else {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, shadowStr, b.totalMs,
+                    Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.gapBeforeShadeMs, b.shadeMs, b.gapBeforeShadowMs, shadowStr, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 }
             }
