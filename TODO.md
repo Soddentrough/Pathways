@@ -7,26 +7,29 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 ---
 
 ### 1. Direct Buffer Device Address Commands (`VK_KHR_device_address_commands`)
-- [ ] **Status:** Proposed / Pending SDK Upgrade (Ratified in Vulkan 1.4.346)
-- [ ] **Target Component:** `src/rt/DGCManager.cpp`, `src/rt/ReSTIRManager.cpp`, `src/rt/NRCManager.cpp`
-- [ ] **Objective:** Eliminate `VkBuffer` handle indirection across compute and ray tracing passes by switching directly to 64-bit GPU device addresses.
-- [ ] **Tasks:**
-  - [ ] Query and enable `VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR::deviceAddressCommands` during logical device creation in `src/vulkan/VulkanContext.cpp`.
-  - [ ] Replace `vkCmdDispatchIndirect` in `DGCManager::recordIndirectDispatch` fallback path with `vkCmdDispatchIndirect2KHR`, passing `argumentBuffer->getDeviceAddress()` directly.
-  - [ ] Transition utility dispatches in `ReSTIRManager` and `NRCManager` to device address commands.
-  - [ ] Benchmark CPU command recording overhead and dispatch latency.
+- [ ] **Status:** Evaluated / Deprecated / Partially Redundant (Ratified in Vulkan 1.4.346)
+- [ ] **Target Component:** `src/rt/DGCManager.cpp`, `src/rt/WavefrontPipeline.cpp`
+- [ ] **Objective:** Evaluate `vkCmdDispatchIndirect2KHR` across indirect compute dispatch paths.
+- [ ] **Architectural Assessment & Notes (September 2026):**
+  - **DGC Redundancy**: `DGCManager` already uses native 64-bit GPU device addresses (`genInfo.indirectAddress` and `genInfo.preprocessAddress`) via `VK_EXT_device_generated_commands`. DGC does not use `VkBuffer` handles for execution.
+  - **Indirect Fallback**: Replacing `vkCmdDispatchIndirect` with `vkCmdDispatchIndirect2KHR` in the non-DGC fallback path generates byte-for-byte identical hardware PM4 packets on AMD Command Processors; CPU recording savings are negligible (< 0.001 ms).
+  - **ReSTIR / NRC Clarification**: `ReSTIRManager` and `NRCManager` execute direct compute dispatches (`vkCmdDispatch`), not indirect dispatches. Their buffer bindings use descriptor sets (`VkDescriptorBufferInfo`). Eliminating buffer handles in ReSTIR/NRC requires Buffer Device Address (BDA) via Push Constants or `VK_EXT_descriptor_buffer`, not `VK_KHR_device_address_commands`.
+- [ ] **Revised Tasks:**
+  - [ ] If desired for API consistency once SDK > 1.4.346 is installed, swap `vkCmdDispatchIndirect` fallback calls in `DGCManager.cpp` and `WavefrontPipeline.cpp` to `vkCmdDispatchIndirect2KHR`.
 
 ---
 
 ### 2. Compute Latency Hiding via Split Barriers (`VK_EXT_shader_split_barrier`)
-- [ ] **Status:** Proposed / Pending SDK Upgrade (Introduced in Vulkan 1.4.351)
-- [ ] **Target Component:** `shaders/compute/wavefront_classify.comp`, `shaders/compute/wavefront_shadow.comp`
-- [ ] **Objective:** Overlap global memory writes into SoA ray queues with ALU arithmetic to hide memory latency on AMD RDNA 4 (`gfx1201`).
-- [ ] **Tasks:**
-  - [ ] Enable `VK_EXT_shader_split_barrier` device extension and SPIR-V capability.
-  - [ ] Refactor `wavefront_classify.comp` to split barrier arrival (`subgroupMemoryBarrierArrival` / `OpControlBarrierWaitINTEL`) from barrier wait.
-  - [ ] Allow 3D Morton quantization and directional octant ballot calculations to execute while ray queue writes are in flight.
-  - [ ] Measure Wave32 occupancy and memory stall reduction using RGP (Radeon GPU Profiler).
+- [ ] **Status:** Evaluated / Rejected for Wavefront Classify (Introduced in Vulkan 1.4.351)
+- [ ] **Target Component:** Multi-wave compute filters / Denoiser spatial passes with shared LDS
+- [ ] **Objective:** Overlap inter-subgroup synchronization with independent math in multi-subgroup compute workgroups.
+- [ ] **Architectural Assessment & Notes (September 2026):**
+  - **Causal Dataflow Violation in Classify**: In `wavefront_classify.comp`, 2D Morton Z-curve mapping is the input coordinate generator for primary ray direction, BVH query traversal, and hit evaluation. SoA ray queue stores (`outGeoms`, `outHits`, `outStates`) happen after traversal. It is physically impossible to overlap queue writes with Morton ALU because Morton ALU must finish hundreds of cycles before ray traversal can even launch.
+  - **Single-Wave Workgroup (Wave32)**: `wavefront_classify.comp` uses `local_size_x = 8, local_size_y = 4` (32 threads). On AMD RDNA 3.5 / RDNA 4 (`gfx1151`, `gfx1201`), this maps to a single Wave32 wave where all threads execute in SIMD lockstep. There are zero inter-subgroup barriers within the workgroup; all inter-lane sharing uses hardware subgroup intrinsics (`subgroupBallot`, `subgroupShuffle`).
+  - **Control vs. Memory Barriers**: `VK_EXT_shader_split_barrier` splits workgroup control barriers (`OpControlBarrierArriveEXT` / `OpControlBarrierWaitEXT`). It cannot split global memory barriers (`memoryBarrierBuffer()`). Global stores are already non-blocking fire-and-forget instructions handled by hardware L0/L1 write buffers.
+- [ ] **Revised Scope & Tasks:**
+  - [ ] Drop `wavefront_classify.comp` from split barrier optimization.
+  - [ ] Re-evaluate split barriers only if authoring wide multi-wave filter kernels ($\ge 256$ threads per workgroup) utilizing shared memory (LDS).
 
 ---
 
@@ -54,13 +57,16 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 ---
 
 ### 5. Embedded Sampling Tables via Constant Data (`VK_KHR_shader_constant_data`)
-- [ ] **Status:** Proposed / Pending SDK Upgrade (Introduced in Vulkan 1.4.347)
-- [ ] **Target Component:** `shaders/compute/restir_common.glsl`, sampling tables
-- [ ] **Objective:** Free up VGPR registers and descriptor binding slots by embedding static tables directly into shader binaries.
-- [ ] **Tasks:**
-  - [ ] Embed Sobol sampling matrices, Halton sequences, and precomputed GGX distribution tables using `VK_KHR_shader_constant_data`.
-  - [ ] Remove descriptor sets and buffer fetches currently dedicated to static sampling tables.
-  - [ ] Verify VGPR count reductions across wavefront shading kernels.
+- [ ] **Status:** Evaluated / Rejected for Sampling Tables (Introduced in Vulkan 1.4.347)
+- [ ] **Target Component:** `src/vulkan/VulkanContext.cpp` (prerequisite for `VK_KHR_shader_abort`)
+- [ ] **Objective:** Utilize `OpConstantDataKHR` for static diagnostic strings and debug assertions.
+- [ ] **Architectural Assessment & Notes (September 2026):**
+  - **Microarchitectural Inversion (VGPR Bloat)**: Embedding multi-kilobyte constant tables (Sobol matrices, Halton permutations) into shader binaries causes severe VGPR pressure. Because sampling indices vary per pixel and per bounce (divergent across the wave), the compiler cannot keep tables in scalar registers (SGPRs); it must load them into VGPRs or spill to private scratch memory, degrading Wave32 CU occupancy.
+  - **Pathways Baseline is Already Zero-Descriptor & Zero-Memory**: Pathways uses an analytical PCG random number generator (`pcg_hash` in `wavefront_common.glsl`), which requires 0 descriptor slots, 0 bytes of VRAM, and exactly 1 `uint` state register in VGPR. Embedding constant tables would strictly regress performance and register usage.
+  - **QMC Best Practice**: If low-discrepancy sampling (e.g. PMJ02bn or Cranley-Patterson rotated Sobol) is adopted in the future, standard practice is binding a small $64 \times 64$ or $128 \times 128$ tileable blue-noise / scramble texture or compact 32-element direction array via existing bindless textures, utilizing hardware L0/L1 texture caches with high spatial locality.
+- [ ] **Revised Scope & Tasks:**
+  - [ ] Retain `VK_KHR_shader_constant_data` solely as a dependency for `VK_KHR_shader_abort` to embed compile-time assertion messages and diagnostic string tables.
+  - [ ] Do not embed divergent numerical sampling matrices into shader constants.
 
 ---
 
