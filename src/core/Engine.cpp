@@ -488,7 +488,7 @@ void Engine::initVulkan() {
     }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R32G32B32A32_SFLOAT,
+        frameFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -4755,8 +4755,13 @@ void Engine::renderFrame() {
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                 );
             }
+            m_accumImage = std::make_unique<Image>(
+                dev, alloc, m_config.width, m_config.height,
+                frameFmt,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
 
-            // Transition m_frameImages to GENERAL
+            // Transition m_frameImages and m_accumImage to GENERAL
             vkResetCommandBuffer(m_commandBuffers[0], 0);
             VkCommandBufferBeginInfo transBegin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             transBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -4769,6 +4774,12 @@ void Engine::renderFrame() {
                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
                 );
             }
+            m_accumImage->transitionLayout(
+                m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
             vkEndCommandBuffer(m_commandBuffers[0]);
             VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
             cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
@@ -4779,6 +4790,8 @@ void Engine::renderFrame() {
             vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &transSubmit, VK_NULL_HANDLE);
             vkQueueWaitIdle(m_context->getGraphicsQueue());
 
+            updateAccumTonemapDescriptors();
+            updateAccumRunningAvgDescriptors();
             updateAllImageDescriptors();
             if (m_mgpu) {
                 m_mgpu->setFormat(m_config.accum_format);
@@ -6481,7 +6494,10 @@ void Engine::dumpOutputFiles() {
 
     // 2. Dump HDR OpenEXR
     if (!m_config.dump_hdr_path.empty()) {
-        VkDeviceSize bufferSize = m_config.width * m_config.height * 4 * sizeof(float);
+        VkFormat accumFormat = m_accumImage ? m_accumImage->getFormat() : VK_FORMAT_R32G32B32A32_SFLOAT;
+        bool isFp16 = (accumFormat == VK_FORMAT_R16G16B16A16_SFLOAT);
+        VkDeviceSize bytesPerPixel = isFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+        VkDeviceSize bufferSize = m_config.width * m_config.height * bytesPerPixel;
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
@@ -6521,9 +6537,19 @@ void Engine::dumpOutputFiles() {
         vkQueueWaitIdle(queue);
 
         staging.invalidate();
-        const float* floatPixels = static_cast<const float*>(staging.map());
-        ImageDumper::saveEXR(m_config.dump_hdr_path, m_config.width, m_config.height, floatPixels);
-        staging.unmap();
+        if (isFp16) {
+            const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
+            std::vector<float> floatPixels(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t p = 0; p < floatPixels.size(); ++p) {
+                floatPixels[p] = glm::detail::toFloat32(halfPixels[p]);
+            }
+            ImageDumper::saveEXR(m_config.dump_hdr_path, m_config.width, m_config.height, floatPixels.data());
+            staging.unmap();
+        } else {
+            const float* floatPixels = static_cast<const float*>(staging.map());
+            ImageDumper::saveEXR(m_config.dump_hdr_path, m_config.width, m_config.height, floatPixels);
+            staging.unmap();
+        }
     }
 
     // 3. Dump UI Viewport Backbuffer
@@ -7072,7 +7098,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
-        VK_FORMAT_R32G32B32A32_SFLOAT,
+        frameFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
