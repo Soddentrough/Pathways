@@ -96,10 +96,11 @@ struct WavefrontStageSample {
     uint32_t tailMegakernelBounce = 0;
     struct Bounce {
         double shadeMs = 0.0;
-        double s2dBarrierMs = 0.0;
         double shadowMs = 0.0;
         double intersectMs = 0.0;
-        double d2sBarrierMs = 0.0;
+        double gapBeforeShadeMs = 0.0;
+        double gapBeforeShadowMs = 0.0;
+        double gapBeforeIntersectMs = 0.0;
         uint64_t activeCount = 0;
         uint64_t nextCount = 0;
         uint64_t shadowCount = 0;
@@ -110,10 +111,11 @@ struct WavefrontStageSample {
 struct BounceStageAvg {
     uint32_t bounce = 0;
     double shadeMs = 0.0;
-    double s2dBarrierMs = 0.0;
     double shadowMs = 0.0;
     double intersectMs = 0.0;
-    double d2sBarrierMs = 0.0;
+    double gapBeforeShadeMs = 0.0;
+    double gapBeforeShadowMs = 0.0;
+    double gapBeforeIntersectMs = 0.0;
     double totalMs = 0.0;
     uint64_t activeCount = 0;
     uint64_t nextCount = 0;
@@ -166,10 +168,11 @@ struct ConfigStatsTally {
 
     struct BounceTally {
         double sumShadeMs = 0.0;
-        double sumS2dBarrierMs = 0.0;
         double sumShadowMs = 0.0;
         double sumIntersectMs = 0.0;
-        double sumD2sBarrierMs = 0.0;
+        double sumGapBeforeShadeMs = 0.0;
+        double sumGapBeforeShadowMs = 0.0;
+        double sumGapBeforeIntersectMs = 0.0;
         uint64_t sumActiveCount = 0;
         uint64_t sumNextCount = 0;
         uint64_t sumShadowCount = 0;
@@ -206,10 +209,11 @@ struct ConfigStatsTally {
             }
             for (size_t b = 0; b < wfSample->bounces.size(); ++b) {
                 bounceTallies[b].sumShadeMs += wfSample->bounces[b].shadeMs;
-                bounceTallies[b].sumS2dBarrierMs += wfSample->bounces[b].s2dBarrierMs;
                 bounceTallies[b].sumShadowMs += wfSample->bounces[b].shadowMs;
                 bounceTallies[b].sumIntersectMs += wfSample->bounces[b].intersectMs;
-                bounceTallies[b].sumD2sBarrierMs += wfSample->bounces[b].d2sBarrierMs;
+                bounceTallies[b].sumGapBeforeShadeMs += wfSample->bounces[b].gapBeforeShadeMs;
+                bounceTallies[b].sumGapBeforeShadowMs += wfSample->bounces[b].gapBeforeShadowMs;
+                bounceTallies[b].sumGapBeforeIntersectMs += wfSample->bounces[b].gapBeforeIntersectMs;
                 bounceTallies[b].sumActiveCount += wfSample->bounces[b].activeCount;
                 bounceTallies[b].sumNextCount += wfSample->bounces[b].nextCount;
                 bounceTallies[b].sumShadowCount += wfSample->bounces[b].shadowCount;
@@ -266,11 +270,10 @@ struct ConfigStatsTally {
             BounceStageAvg bAvg;
             bAvg.bounce = static_cast<uint32_t>(b);
             bAvg.shadeMs = bt.sumShadeMs / bt.count;
-            bAvg.s2dBarrierMs = bt.sumS2dBarrierMs / bt.count;
-            bAvg.shadowMs = bt.sumShadowMs / bt.count;
-            bAvg.intersectMs = bt.sumIntersectMs / bt.count;
-            bAvg.d2sBarrierMs = bt.sumD2sBarrierMs / bt.count;
-            bAvg.totalMs = bAvg.shadeMs + bAvg.s2dBarrierMs + bAvg.shadowMs + bAvg.intersectMs + bAvg.d2sBarrierMs;
+            bAvg.gapBeforeShadeMs = bt.sumGapBeforeShadeMs / bt.count;
+            bAvg.gapBeforeShadowMs = bt.sumGapBeforeShadowMs / bt.count;
+            bAvg.gapBeforeIntersectMs = bt.sumGapBeforeIntersectMs / bt.count;
+            bAvg.totalMs = bAvg.shadeMs + bAvg.shadowMs + bAvg.intersectMs + bAvg.gapBeforeShadeMs + bAvg.gapBeforeShadowMs + bAvg.gapBeforeIntersectMs;
             bAvg.activeCount = bt.sumActiveCount / bt.count;
             bAvg.nextCount = bt.sumNextCount / bt.count;
             bAvg.shadowCount = bt.sumShadowCount / bt.count;

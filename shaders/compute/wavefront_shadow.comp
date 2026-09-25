@@ -141,6 +141,7 @@ void main() {
                         continue;
                     }
                 }
+
                 if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     Material mat = materials[matId];
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);

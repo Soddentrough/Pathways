@@ -342,8 +342,8 @@ void Config::printUsage(const char* progName) {
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
               << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
-              << "  --no-inline-shadows     Disable hybrid inline hardware shadow queries (default: detached queues)\n"
-              << "  --inline-shadows        Enable hybrid inline hardware shadow queries\n"
+              << "  --no-inline-shadows     Enforce detached shadow queue evaluation (default)\n"
+              << "  --inline-shadows        [Deprecated] Enforces detached queues (wavefront_shadow.comp) for 0 LDS & max wave occupancy\n"
               << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
               << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
               << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
@@ -961,7 +961,8 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--inline-shadows") {
-            cfg.inline_primary_shadows = true;
+            Logger::warn("--inline-shadows is deprecated: Detached shadow queues (wavefront_shadow.comp) are enforced to maintain 0 LDS and maximum wave occupancy for material shaders (Laine et al. 2013).");
+            cfg.inline_primary_shadows = false;
             continue;
         }
         if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {

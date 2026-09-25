@@ -152,10 +152,11 @@ public:
     struct BounceProfilingData {
         uint32_t bounce = 0;
         double shadeMs = 0.0;
-        double s2dBarrierMs = 0.0; // Shade -> Downstream barrier & DGC preprocess
         double shadowMs = 0.0;
         double intersectMs = 0.0;
-        double d2sBarrierMs = 0.0; // Downstream -> Next Shade barrier
+        double gapBeforeShadeMs = 0.0;
+        double gapBeforeShadowMs = 0.0;
+        double gapBeforeIntersectMs = 0.0;
         double bounceTotalMs = 0.0;
         uint32_t activeCount = 0;
         uint32_t shadowCount = 0;
@@ -171,6 +172,7 @@ public:
     struct WavefrontProfilingData {
         bool valid = false;
         double totalMs = 0.0;
+        double prologueMs = 0.0;
         double classifyMs = 0.0;
         double preShadeBarrierMs = 0.0;
         double totalBarriersMs = 0.0;
@@ -277,8 +279,7 @@ private:
     std::array<bool, 2> m_hasRecordedSlot = { false, false };
     std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
     std::array<uint32_t, 2> m_slotTailMegakernelBounce = { 0, 0 };
-    std::array<uint32_t, 2> m_slotNumBatches = { 1, 1 };
-    std::array<uint32_t, 2> m_slotProfiledBatches = { 1, 1 };
+    std::array<uint32_t, 2> m_slotBatches = { 1, 1 };
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;
