@@ -77,3 +77,40 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 - [ ] **Tasks:**
   - [ ] Update frame submission rings to call `vkBeginCommandBuffer` directly from the `RECORDING` state.
   - [ ] Verify compatibility across both dual AMD Radeon AI PRO R9700 devices under ROCm/RADV.
+
+---
+
+## Physical Material System & Light Transport Roadmap
+
+### 7. Subsurface Scattering (BSSRDF & Volumetric Light Transport)
+- [ ] **Status:** Proposed / Architectural Design Phase
+- [ ] **Target Component:** `src/scene/Material.hpp`, `src/rt/WavefrontPipeline.cpp`, `shaders/compute/wavefront_shade_*.comp`, `shaders/compute/wavefront_sss.comp`
+- [ ] **Objective:** Implement physical Subsurface Scattering (SSS) for translucent and organic materials (skin, marble, wax, jade, milk, foliage) beyond current thin-walled diffuse transmission.
+- [ ] **Current State & Existing Foundations:**
+  - **Thin-Walled Diffuse Transmission (`KHR_materials_diffuse_transmission`)**: Already supported in `wavefront_shade_complex.comp` and USD/glTF loaders. Evaluates light transmission across zero-thickness geometry ($\vec{L} \cdot \vec{N} < 0$), ideal for leaves, paper, and thin fabrics.
+  - **Homogeneous Dielectric Volume Absorption (`KHR_materials_volume`)**: Already supported in `wavefront_shade_dielectric.comp` via Beer-Lambert exponential absorption ($\sigma_a = -\ln(C_\text{atten}) / d_\text{atten}$). Handles colored transparent media (glass, water), but internal scattering is zero ($\sigma_s = 0$).
+  - **Gap**: Pathways lacks BSSRDF evaluation where light penetrates a boundary at $x_i$, multiple-scatters within a participating medium, and exits at a distinct position $x_o$.
+- [ ] **Proposed Architectural Approaches:**
+  - **Approach A: Path-Traced Random Walk SSS (Physical Ground Truth)**:
+    - *Mechanism*: When a ray hits an SSS surface, enter the internal volume and trace a random walk using Woodcock delta tracking / null-collision techniques with Henyey-Greenstein phase function sampling until the ray exits the boundary mesh.
+    - *Wavefront Integration*: Create a dedicated `wavefront_sss.comp` microkernel or extend the secondary bounce queues. Rays inside the medium stay in an internal scattering queue, decoupled from surface shading kernels to preserve the 83-VGPR / 100% occupancy target on RDNA 4 (`gfx1201`).
+    - *Hardware Considerations*: Internal ray steps require fast BVH boundary testing (testing distance to mesh exit). Can utilize `rayQueryEXT` with `gl_RayFlagsCullFrontFacingTrianglesEXT` to locate boundary exits, or detached boundary test queues.
+  - **Approach B: Screen-Space / Texture-Space Diffusion Approximation (Real-Time Realism)**:
+    - *Mechanism*: Separable bilateral / Disney normalized diffusion filter applied to primary hit radiance in screen space, guided by depth, geometric normal, and per-pixel mean free path radius.
+    - *Wavefront Integration*: Operates as an independent post-shading compute pass prior to temporal accumulation / upscaling.
+    - *Hardware Considerations*: Minimal VGPR impact on core path tracing loop; predictable latency (~0.3–0.6 ms at 4K on dual R9700), but limited to camera-visible surfaces and subject to screen-edge silhouette artifacts.
+  - **Approach C: Hybrid Burley Normalized Diffusion / Dipole Ray Guiding**:
+    - *Mechanism*: At primary hit point $x_i$, sample an exit location $x_o$ on the surface according to the Burley BSSRDF profile disk, evaluate incoming direct illumination at $x_o$ via the detached shadow queue, and add to outgoing radiance at $x_i$.
+- [ ] **Tasks & Implementation Steps:**
+  - [ ] **Material Definition**:
+    - Extend `MaterialGPU` and `ShadeMaterialGPU` with SSS parameters: `subsurfaceFactor`, `subsurfaceColor`, `subsurfaceRadius` (or mean free path $l_\text{mfp}$ / reduced scattering coefficient $\sigma_s'$), and phase anisotropy $g$.
+    - Map parameters from glTF (`KHR_materials_subsurface` / `KHR_materials_translucency`) and OpenPBR / USD `subsurface` schemas in `UsdLoader.cpp`.
+  - [ ] **Classifier & Queue Routing**:
+    - Update `computeMaterialArchetype` in `Material.hpp` and `wavefront_classify.comp` to identify SSS materials.
+    - Route SSS surfaces to the `COMPLEX` microkernel or an optional dedicated `ARCHETYPE_SSS` queue if multi-step random walk is used.
+  - [ ] **Shader Implementation**:
+    - Phase 1: Implement thin-walled and screen-space Burley normalized diffusion pass for real-time validation.
+    - Phase 2: Implement full volumetric random walk kernel with decoupled queue dispatches for reference ground truth.
+  - [ ] **Regression & Performance Validation**:
+    - Create reference test scene with Stanford Lucy or subsurface sphere/wax model.
+    - Validate energy conservation, multi-GPU split-frame consistency, and ensure zero regression on standard opaque/dielectric pipelines.
