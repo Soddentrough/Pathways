@@ -213,6 +213,14 @@ private:
     void createAccumRunningAvgPipeline();
     void updateAccumRunningAvgDescriptors();
 
+    // Fused Accumulation & Tonemapping Pipeline (Single-Dispatch Pass Fusion)
+    VkDescriptorSetLayout m_accumTonemapDescLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_accumTonemapDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkPipelineLayout m_accumTonemapPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_accumTonemapPipeline = VK_NULL_HANDLE;
+    void createAccumTonemapPipeline();
+    void updateAccumTonemapDescriptors();
+
     // G-Buffer Resources (used by ray tracer, direct lighting, and FSR / Upways)
     std::unique_ptr<Image> m_directLightImage;
     std::unique_ptr<Image> m_normalDepthImage;

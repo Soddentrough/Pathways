@@ -145,6 +145,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/tonemap_aces.comp
     ${SHADER_DIR}/compute/accum_merge.comp
     ${SHADER_DIR}/compute/accum_running_avg.comp
+    ${SHADER_DIR}/compute/accum_tonemap_fused.comp
     ${SHADER_DIR}/compute/wavefront_classify.comp
     ${SHADER_DIR}/compute/wavefront_intersect.comp
     ${SHADER_DIR}/compute/wavefront_shade.comp

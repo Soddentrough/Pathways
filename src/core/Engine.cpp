@@ -325,16 +325,19 @@ Engine::~Engine() {
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_mergePipeline) vkDestroyPipeline(device, m_mergePipeline, nullptr);
     if (m_accumRunningAvgPipeline) vkDestroyPipeline(device, m_accumRunningAvgPipeline, nullptr);
+    if (m_accumTonemapPipeline) vkDestroyPipeline(device, m_accumTonemapPipeline, nullptr);
 
     if (m_rtpPipelineLayout) vkDestroyPipelineLayout(device, m_rtpPipelineLayout, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
     if (m_mergePipelineLayout) vkDestroyPipelineLayout(device, m_mergePipelineLayout, nullptr);
     if (m_accumRunningAvgPipelineLayout) vkDestroyPipelineLayout(device, m_accumRunningAvgPipelineLayout, nullptr);
+    if (m_accumTonemapPipelineLayout) vkDestroyPipelineLayout(device, m_accumTonemapPipelineLayout, nullptr);
 
     if (m_rtDescLayout) vkDestroyDescriptorSetLayout(device, m_rtDescLayout, nullptr);
     if (m_tonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_tonemapDescLayout, nullptr);
     if (m_mergeDescLayout) vkDestroyDescriptorSetLayout(device, m_mergeDescLayout, nullptr);
     if (m_accumRunningAvgDescLayout) vkDestroyDescriptorSetLayout(device, m_accumRunningAvgDescLayout, nullptr);
+    if (m_accumTonemapDescLayout) vkDestroyDescriptorSetLayout(device, m_accumTonemapDescLayout, nullptr);
 
     for (auto& img : m_frameImages) img.reset();
 
@@ -2172,6 +2175,9 @@ void Engine::initPipelines() {
     // 7b. Running Average Accumulation Pipeline (FP16 -> FP32)
     createAccumRunningAvgPipeline();
 
+    // 7c. Fused Accumulation & Tonemapping Pipeline (Pass Fusion)
+    createAccumTonemapPipeline();
+
     // 8. G-Buffer Resources (Direct Light & Surface Normals/Depth)
     createGBufferResources();
 
@@ -2351,6 +2357,7 @@ void Engine::updateAllImageDescriptors() {
     updateFsr3Descriptors();
     updateCausticsDescriptors();
     updateAccumRunningAvgDescriptors();
+    updateAccumTonemapDescriptors();
 }
 
 void Engine::createAccumRunningAvgPipeline() {
@@ -2454,6 +2461,128 @@ void Engine::updateAccumRunningAvgDescriptors() {
         w1.descriptorCount = 1;
         w1.pImageInfo = &historyInfo;
         writes.push_back(w1);
+    }
+
+    if (!writes.empty()) {
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Engine::createAccumTonemapPipeline() {
+    VkDevice device = m_context->getDevice();
+
+    // 1. Descriptor Set Layout (3 bindings: frameIn, historyInOut, outputImage)
+    std::vector<VkDescriptorSetLayoutBinding> bindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_accumTonemapDescLayout);
+
+    // 2. Allocate Descriptor Sets (one per frame in flight)
+    std::array<VkDescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> layouts = {
+        m_accumTonemapDescLayout, m_accumTonemapDescLayout
+    };
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_descriptorPool;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts.data();
+    vkAllocateDescriptorSets(device, &allocInfo, m_accumTonemapDescSets.data());
+
+    updateAccumTonemapDescriptors();
+
+    // 3. Pipeline Layout with Push Constants (40 bytes)
+    VkPushConstantRange pushConstant{};
+    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(uint32_t) * 3 + sizeof(float) * 2 + sizeof(uint32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t); // 40 bytes
+
+    VkPipelineLayoutCreateInfo pipeLayoutInfo{};
+    pipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeLayoutInfo.setLayoutCount = 1;
+    pipeLayoutInfo.pSetLayouts = &m_accumTonemapDescLayout;
+    pipeLayoutInfo.pushConstantRangeCount = 1;
+    pipeLayoutInfo.pPushConstantRanges = &pushConstant;
+    vkCreatePipelineLayout(device, &pipeLayoutInfo, nullptr, &m_accumTonemapPipelineLayout);
+
+    // 4. Compute Pipeline (Wave32)
+    auto shaderCode = loadShaderSPIRV("accum_tonemap_fused.comp.spv");
+    VkShaderModule shaderModule = createShaderModule(shaderCode);
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shaderModule;
+    pipelineInfo.stage.pName = "main";
+    if (m_context->hasSubgroupSizeControl()) {
+        pipelineInfo.stage.pNext = &subgroupSize32;
+    }
+    pipelineInfo.layout = m_accumTonemapPipelineLayout;
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_accumTonemapPipeline);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    Logger::info("Fused Accumulation & ACES Tonemapping compute pipeline (Wave32) created successfully.");
+}
+
+void Engine::updateAccumTonemapDescriptors() {
+    if (!m_accumImage || !m_outputImage) return;
+    VkDevice device = m_context->getDevice();
+
+    VkDescriptorImageInfo historyInfo{};
+    historyInfo.imageView = m_accumImage->getImageView();
+    historyInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo outputInfo{};
+    outputInfo.imageView = m_outputImage->getImageView();
+    outputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    std::array<VkDescriptorImageInfo, MAX_FRAMES_IN_FLIGHT> frameInfos;
+    std::vector<VkWriteDescriptorSet> writes;
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (!m_frameImages[i] || m_accumTonemapDescSets[i] == VK_NULL_HANDLE) continue;
+
+        frameInfos[i].sampler = VK_NULL_HANDLE;
+        frameInfos[i].imageView = m_frameImages[i]->getImageView();
+        frameInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // Binding 0: readonly uCurrentFrame
+        VkWriteDescriptorSet w0{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w0.dstSet = m_accumTonemapDescSets[i];
+        w0.dstBinding = 0;
+        w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w0.descriptorCount = 1;
+        w0.pImageInfo = &frameInfos[i];
+        writes.push_back(w0);
+
+        // Binding 1: uHistoryAccum
+        VkWriteDescriptorSet w1{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w1.dstSet = m_accumTonemapDescSets[i];
+        w1.dstBinding = 1;
+        w1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w1.descriptorCount = 1;
+        w1.pImageInfo = &historyInfo;
+        writes.push_back(w1);
+
+        // Binding 2: writeonly uOutputImage
+        VkWriteDescriptorSet w2{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w2.dstSet = m_accumTonemapDescSets[i];
+        w2.dstBinding = 2;
+        w2.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w2.descriptorCount = 1;
+        w2.pImageInfo = &outputInfo;
+        writes.push_back(w2);
     }
 
     if (!writes.empty()) {
@@ -5069,74 +5198,117 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
-        // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
-        if (!skipRayTracing && m_accumRunningAvgPipeline) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+        bool needUpscaler = (m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.upscaler_mode == UpscalerMode::Upways ||
+                             m_config.upscaler_mode == UpscalerMode::FSR3);
+
+        if (!needUpscaler && m_accumTonemapPipeline && !skipRayTracing) {
+            // Fused Accumulation Running Average + ACES Tonemapping (Zero-Copy Register Pass Fusion)
+            // Eliminates intermediate compute pipeline barrier and 132.7 MB round-trip VRAM read of m_accumImage.
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumTonemapPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumTonemapPipelineLayout, 0, 1, &m_accumTonemapDescSets[m_currentFrame], 0, nullptr);
 
             struct {
                 uint32_t width;
                 uint32_t height;
                 uint32_t sampleCount;
                 float invSpp;
-            } avgPC;
-            avgPC.width = renderW;
-            avgPC.height = renderH;
-            avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
-            avgPC.invSpp = 1.0f;
+                float exposure;
+                uint32_t applyACES;
+                uint32_t displayMode;
+                float peakNits;
+                float paperWhiteNits;
+                uint32_t pad;
+            } fusedPC;
 
-            vkCmdPushConstants(cmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+            fusedPC.width = renderW;
+            fusedPC.height = renderH;
+            fusedPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+            fusedPC.invSpp = 1.0f;
+            fusedPC.exposure = m_config.exposure;
+            fusedPC.applyACES = m_config.aces_tonemap ? 1u : 0u;
+            fusedPC.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+            fusedPC.peakNits = m_config.hdr_peak_nits;
+            fusedPC.paperWhiteNits = m_config.hdr_paper_white_nits;
+            fusedPC.pad = 0;
+
+            vkCmdPushConstants(cmd, m_accumTonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fusedPC), &fusedPC);
             vkCmdDispatch(cmd, (renderW + 15) / 16, (renderH + 15) / 16, 1);
 
-            VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-            VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            avgDep.memoryBarrierCount = 1;
-            avgDep.pMemoryBarriers = &avgBarrier;
-            vkCmdPipelineBarrier2(cmd, &avgDep);
-        }
-
-        // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
-        bool resetTemporal = hardReset || m_temporalResetRequested;
-        m_temporalResetRequested = false;
-        bool upwaysRun = false;
-        if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
-            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
-            upwaysRun = dispatchUpways(cmd, resetTemporal);
-            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
-        }
-
-        // AMD FidelityFX Super Resolution 3.1
-        bool fsr3Run = false;
-        if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
-            fsr3Run = dispatchFsr3(cmd, resetTemporal);
-        }
-
-        // Tonemapping
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         } else {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
+            // Decoupled Path (Used when Upways or FSR3 is active or RT was skipped)
+            // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
+            if (!skipRayTracing && m_accumRunningAvgPipeline) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+
+                struct {
+                    uint32_t width;
+                    uint32_t height;
+                    uint32_t sampleCount;
+                    float invSpp;
+                } avgPC;
+                avgPC.width = renderW;
+                avgPC.height = renderH;
+                avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+                avgPC.invSpp = 1.0f;
+
+                vkCmdPushConstants(cmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+                vkCmdDispatch(cmd, (renderW + 15) / 16, (renderH + 15) / 16, 1);
+
+                VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+                VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                avgDep.memoryBarrierCount = 1;
+                avgDep.pMemoryBarriers = &avgBarrier;
+                vkCmdPipelineBarrier2(cmd, &avgDep);
+            }
+
+            // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
+            bool resetTemporal = hardReset || m_temporalResetRequested;
+            m_temporalResetRequested = false;
+            bool upwaysRun = false;
+            if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
+                upwaysRun = dispatchUpways(cmd, resetTemporal);
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+            }
+
+            // AMD FidelityFX Super Resolution 3.1
+            bool fsr3Run = false;
+            if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+                fsr3Run = dispatchFsr3(cmd, resetTemporal);
+            }
+
+            // Tonemapping
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+            if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
+                tonemapConstants.totalSamples = 1u;
+            } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
+                tonemapConstants.totalSamples = 1u;
+            } else {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+                tonemapConstants.totalSamples = 1u;
+            }
+
+            uint32_t tmGroupsX = (m_config.width + 15) / 16;
+            uint32_t tmGroupsY = (m_config.height + 15) / 16;
+
+            tonemapConstants.visualizeSplit = 0;
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+            vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+            vkCmdDispatch(cmd, tmGroupsX, tmGroupsY, 1);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         }
-
-        uint32_t tmGroupsX = (m_config.width + 15) / 16;
-        uint32_t tmGroupsY = (m_config.height + 15) / 16;
-
-        tonemapConstants.visualizeSplit = 0;
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
-        vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(cmd, tmGroupsX, tmGroupsY, 1);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     } else {
         // --- Multi-GPU Path (Checkerboard Tiling or Sample Parallelism) ---
         useHwRT = 1;
