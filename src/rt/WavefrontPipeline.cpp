@@ -25,7 +25,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadeComplexSecCode,
                                      bool enableDgcPreprocess,
                                      bool supportsSubgroupSizeControl,
-                                     uint32_t maxBatchPixels)
+                                     uint32_t maxBatchPixels,
+                                     const std::vector<char>& tailMegakernelCode)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height),
       m_maxBatchPixels(maxBatchPixels),
       m_supportsExecutionSet(supportsExecutionSet), m_enableDgcPreprocess(enableDgcPreprocess),
@@ -40,7 +41,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     createPipelines(classifyCode, intersectCode, shadeCode, shadowCode,
                     shadeDiffuseCode, shadeDielectricCode, shadeConductorCode, shadeComplexCode,
                     shadeEmissiveCode, shadePassthroughCode,
-                    shadeDiffuseSecCode, shadeComplexSecCode);
+                    shadeDiffuseSecCode, shadeComplexSecCode,
+                    tailMegakernelCode);
 
     VkQueryPoolCreateInfo qpInfo{};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -78,6 +80,7 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadePassthroughPipeline) vkDestroyPipeline(m_device, m_shadePassthroughPipeline, nullptr);
     if (m_shadeDiffuseSecPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecPipeline, nullptr);
     if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
+    if (m_tailMegakernelPipeline) vkDestroyPipeline(m_device, m_tailMegakernelPipeline, nullptr);
 
     if (m_classifyPipeline) vkDestroyPipeline(m_device, m_classifyPipeline, nullptr);
     if (m_intersectPipeline) vkDestroyPipeline(m_device, m_intersectPipeline, nullptr);
@@ -461,7 +464,8 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
                                         const std::vector<char>& shadeEmissiveCode,
                                         const std::vector<char>& shadePassthroughCode,
                                         const std::vector<char>& shadeDiffuseSecCode,
-                                        const std::vector<char>& shadeComplexSecCode) {
+                                        const std::vector<char>& shadeComplexSecCode,
+                                        const std::vector<char>& tailMegakernelCode) {
     // Pipeline Layout (128 bytes push constants for all stages)
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -542,6 +546,9 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     if (!shadeComplexSecCode.empty()) {
         m_shadeComplexSecPipeline = buildComputePipeline(shadeComplexSecCode, "shade_complex_sec");
     }
+    if (!tailMegakernelCode.empty()) {
+        m_tailMegakernelPipeline = buildComputePipeline(tailMegakernelCode, "tail_megakernel");
+    }
 
     // Initialize DGCManager with Execution Set support flag:
     // [0] classify, [1] intersect, [2] shade, [3] shadow
@@ -601,9 +608,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     m_hasRecordedSlot[frameSlot] = true;
     m_slotBounces[frameSlot] = maxBounces;
 
-    uint32_t endQuery = std::min(3u + maxBounces * 6u, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
+    bool useTailMegakernel = sceneData.enableTailMegakernel && (m_tailMegakernelPipeline != VK_NULL_HANDLE) && (maxBounces > sceneData.tailMegakernelBounce);
+    uint32_t cutoffBounce = useTailMegakernel ? std::max(1u, sceneData.tailMegakernelBounce) : maxBounces;
+    m_slotTailMegakernelBounce[frameSlot] = useTailMegakernel ? cutoffBounce : 0u;
+
     vkCmdResetQueryPool(cmd, m_queryPools[frameSlot], 0, MAX_WAVEFRONT_TIMESTAMP_QUERIES);
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 0);
 
     m_sortMode = sceneData.sortMode;
     m_secondarySortMode = sceneData.secondarySortMode;
@@ -663,6 +672,14 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     }
     if (numBatches < 1) numBatches = 1;
 
+    uint32_t totalBatches = spp * numBatches;
+    uint32_t queriesPerBatch = 3u + maxBounces * 6u;
+    uint32_t maxProfiledBatches = (queriesPerBatch > 0) ? (MAX_WAVEFRONT_TIMESTAMP_QUERIES - 2u) / queriesPerBatch : 1u;
+    uint32_t batchesToProfile = std::max(1u, std::min(totalBatches, maxProfiledBatches));
+
+    m_slotNumBatches[frameSlot] = totalBatches;
+    m_slotProfiledBatches[frameSlot] = batchesToProfile;
+
     uint32_t numBatchesX = 1, numBatchesY = 1;
     if (numBatches > 1) {
         float screenAspect = static_cast<float>(width) / static_cast<float>(height);
@@ -692,7 +709,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
         for (uint32_t batch = 0; batch < numBatches; ++batch) {
             uint32_t globalBatchIdx = sampleIdx * numBatches + batch;
-            bool shouldProfile = (globalBatchIdx == 0);
+            bool canProfileBatch = (globalBatchIdx < batchesToProfile);
+            uint32_t batchQueryBase = globalBatchIdx * queriesPerBatch;
 
             uint32_t bx = (numBatches > 1) ? (batch % numBatchesX) : 0u;
             uint32_t by = (numBatches > 1) ? (batch / numBatchesX) : 0u;
@@ -725,6 +743,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 vkCmdPipelineBarrier2(cmd, &clearDep);
             }
 
+            if (canProfileBatch) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], batchQueryBase + 0);
+            }
+
             // 3a. Classify & Primary Ray Generation
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_classifyPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsOdd[frameSlot], 0, nullptr);
@@ -753,9 +775,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.captureMlData
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), classifyPC);
-            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], 1);
             vkCmdDispatch(cmd, (curBatchW + 7) / 8, (curBatchH + 3) / 4, 1);
-            if (shouldProfile) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], 2);
+            if (canProfileBatch) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], batchQueryBase + 1);
 
             // Barrier: Classify -> Bounce 0 Shade (Indirect / DGC dispatch, scoped buffer barriers)
             std::array<VkBufferMemoryBarrier2, 8> c2sBarriers;
@@ -800,11 +821,12 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (sampleIdx == 0 && batch == 0 && m_postClassifyCallback) {
                 m_postClassifyCallback(cmd, frameSlot);
             }
+            if (canProfileBatch) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], batchQueryBase + 2);
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
 
         // 4. Multi-Bounce Loop for this Frame
-        for (uint32_t b = 0; b < maxBounces; ++b) {
+        for (uint32_t b = 0; b < cutoffBounce; ++b) {
             VkDescriptorSet shadeSet = (b % 2 == 0) ? m_descSetsEven[frameSlot] : m_descSetsOdd[frameSlot];
             VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
@@ -834,9 +856,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
-            uint32_t qBase = 3 + b * 6;
-            bool canProfileBounce = shouldProfile && (qBase + 5 < MAX_WAVEFRONT_TIMESTAMP_QUERIES);
-            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 0);
+            uint32_t qBase = batchQueryBase + 3 + b * 6;
+            bool canProfileBounce = canProfileBatch && (qBase + 5 < MAX_WAVEFRONT_TIMESTAMP_QUERIES);
 
             if (useMaterialSort) {
                 bool isSecondary = (b >= 1 && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty());
@@ -860,17 +881,18 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 3 + 0) * 16;
                 m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassMaterial), 1, m_dgcManager->isExplicitPreprocessEnabled());
             }
-            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
+            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 0);
 
             // Determine if shadow and intersect passes are required
             bool hasInlineShadows = sceneData.inlineShadows && (sceneData.useHardwareRT == 1u) && ((sceneData.cameraFlags & (1u << 6)) != 0);
             bool needShadowDispatch = (sceneData.numLights > 0) && !hasInlineShadows;
-            bool needIntersect = (b + 1 < maxBounces);
+            bool needIntersect = (b + 1 < cutoffBounce);
 
-            if (!needShadowDispatch && !needIntersect) {
+            if (!needShadowDispatch && !needIntersect && !useTailMegakernel) {
                 // Terminal bounce with inline shadows: no downstream shadow or intersect pass runs.
                 // Omit s2dBarriers entirely, bypassing an unnecessary pipeline bubble.
                 if (canProfileBounce) {
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 1);
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 2);
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 4);
@@ -884,7 +906,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             Buffer* currentOutState = (b % 2 == 0) ? m_rayStateQueueB[frameSlot].get() : m_rayStateQueueA[frameSlot].get();
 
             std::array<VkBufferMemoryBarrier2, 8> s2dBarriers; uint32_t s2dCount = 0;
-                        s2dBarriers[s2dCount++] = (makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
+            s2dBarriers[s2dCount++] = (makeBufferBarrier2(m_indirectArgs[frameSlot]->getBuffer(),
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
                 VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT));
@@ -898,16 +920,21 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
             }
 
-            // Intersect only runs if b + 1 < maxBounces; on final bounce, omit geom barriers
-            if (needIntersect) {
+            // Intersect only runs if b + 1 < cutoffBounce; on final bounce, omit geom barriers
+            if (needIntersect || (useTailMegakernel && b + 1 == cutoffBounce)) {
                 s2dBarriers[s2dCount++] = (makeBufferBarrier2(currentOutGeom->getBuffer(),
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
-                if (sceneData.secondarySortMode == 1) {
+                if (sceneData.secondarySortMode == 1 && needIntersect) {
                     s2dBarriers[s2dCount++] = (makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
                 }
+            }
+            if (useTailMegakernel && b + 1 == cutoffBounce) {
+                s2dBarriers[s2dCount++] = (makeBufferBarrier2(currentOutState->getBuffer(),
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
             }
 
             VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -938,6 +965,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 }
             }
 
+            if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 1);
+
             // 4b. Shadow microkernel (100% coherent hardware ray queries)
             if (needShadowDispatch) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
@@ -955,19 +984,17 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     sceneData.captureMlData
                 };
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
-                if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 2);
                 m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
-                if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
+                if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 2);
             } else {
                 if (canProfileBounce) {
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 2);
-                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
                 }
             }
 
             // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
             // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
-            if (b + 1 < maxBounces) {
+            if (b + 1 < cutoffBounce) {
                 if (!batchPreprocess && needShadowDispatch && m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                     m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                     m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
@@ -1011,8 +1038,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
 
-                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
-
                     for (uint32_t oct = 0; oct < 8; ++oct) {
                         intersectPC[16] = oct;
                         intersectPC[17] = std::bit_cast<uint32_t>(maxRayDist);
@@ -1021,16 +1046,15 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), octOffset);
                     }
 
-                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
                 } else {
                     // Secondary sort disabled / fallback
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
-                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPools[frameSlot], qBase + 4);
                     m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
-                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                    if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
                 }
 
                 // Barrier: Shadow & Intersect -> Next Bounce Shade (scoped buffer barriers)
@@ -1067,17 +1091,102 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 d2sDep.bufferMemoryBarrierCount = d2sCount;
                 d2sDep.pBufferMemoryBarriers = d2sBarriers.data();
                 vkCmdPipelineBarrier2(cmd, &d2sDep);
+                if (canProfileBounce) {
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 4);
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 5);
+                }
+            } else if (useTailMegakernel && b + 1 == cutoffBounce) {
+                // Terminal wavefront bounce transitioning to Tail Megakernel!
+                if (canProfileBounce) {
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
+                }
+
+                VkMemoryBarrier2 tailMemBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                tailMemBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                tailMemBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                tailMemBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+                tailMemBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
+                VkDependencyInfo tailDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                tailDep.memoryBarrierCount = 1;
+                tailDep.pMemoryBarriers = &tailMemBarrier;
+                vkCmdPipelineBarrier2(cmd, &tailDep);
+
+                VkDescriptorSet tailSet = (cutoffBounce % 2 == 0) ? m_descSetsEven[frameSlot] : m_descSetsOdd[frameSlot];
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tailMegakernelPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &tailSet, 0, nullptr);
+
+                float maxRayDist = 10000.0f;
+                if (sceneData.enableDistanceClamping) {
+                    if (sceneData.maxSecondaryRayDistance > 0.0f) {
+                        maxRayDist = sceneData.maxSecondaryRayDistance;
+                    } else {
+                        glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
+                        float sceneDiameter = glm::length(extent);
+                        if (sceneDiameter > 0.01f) {
+                            maxRayDist = sceneDiameter * 1.25f;
+                        }
+                    }
+                }
+
+                uint32_t tailPC[22] = {
+                    sceneData.numTriangles,
+                    sceneData.numSpheres,
+                    sceneData.numMaterials,
+                    sceneData.numLights,
+                    storeWidth,
+                    fh,
+                    cutoffBounce,
+                    maxBounces,
+                    m_maxCapacity,
+                    sampleIdx,
+                    sceneData.hasEnvMap,
+                    std::bit_cast<uint32_t>(sceneData.envMapIntensity),
+                    sceneData.useHardwareRT,
+                    sceneData.secondarySortMode,
+                    sceneData.enableNrc ? 1u : 0u,
+                    sceneData.nrcBounce,
+                    std::bit_cast<uint32_t>(sceneData.nrcTrainRatio),
+                    sceneData.frameIndex,
+                    sceneData.numOpaqueTriangles,
+                    sceneData.captureMlData,
+                    std::bit_cast<uint32_t>(sceneData.indirectClamp),
+                    std::bit_cast<uint32_t>(maxRayDist)
+                };
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tailPC), tailPC);
+
+                VkDeviceSize tailOffset = useMaterialSort ? static_cast<VkDeviceSize>((cutoffBounce - 1) * 16 + 7) * 16
+                                                         : static_cast<VkDeviceSize>((cutoffBounce - 1) * 3 + 2) * 16;
+                vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), tailOffset);
+
+                if (canProfileBounce) {
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 4);
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
+                }
             } else {
                 if (canProfileBounce) {
+                    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 3);
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 4);
                     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], qBase + 5);
                 }
             }
         } // end multi-bounce loop
+
+        if (canProfileBatch && useTailMegakernel && cutoffBounce < maxBounces) {
+            for (uint32_t bRem = cutoffBounce; bRem < maxBounces; ++bRem) {
+                uint32_t remQBase = batchQueryBase + 3 + bRem * 6;
+                for (uint32_t k = 0; k < 6; ++k) {
+                    if (remQBase + k < MAX_WAVEFRONT_TIMESTAMP_QUERIES) {
+                        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], remQBase + k);
+                    }
+                }
+            }
+        }
         } // end batch loop
     } // end sampleIdx
 
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPools[frameSlot], endQuery);
+    uint32_t endQuery = std::min(batchesToProfile * queriesPerBatch, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], endQuery);
 
     // 5. Final Barrier: Accumulation Image Writes -> Downstream Postprocessing & Tonemapping
     VkMemoryBarrier2 finalBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -1116,10 +1225,13 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     if (frameSlot >= 2 || !m_queryPools[frameSlot] || !m_hasRecordedSlot[frameSlot]) return data;
 
     uint32_t effectiveBounces = (m_slotBounces[frameSlot] > 0) ? m_slotBounces[frameSlot] : maxBounces;
-    std::vector<uint64_t> ts(MAX_WAVEFRONT_TIMESTAMP_QUERIES, 0);
-    uint32_t endQuery = std::min(3u + effectiveBounces * 6u, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
+    uint32_t totalBatches = (m_slotNumBatches[frameSlot] > 0) ? m_slotNumBatches[frameSlot] : 1u;
+    uint32_t batchesToProfile = (m_slotProfiledBatches[frameSlot] > 0) ? m_slotProfiledBatches[frameSlot] : 1u;
+    uint32_t queriesPerBatch = 3u + effectiveBounces * 6u;
+    uint32_t endQuery = std::min(batchesToProfile * queriesPerBatch, MAX_WAVEFRONT_TIMESTAMP_QUERIES - 1u);
     uint32_t numQueries = endQuery + 1;
 
+    std::vector<uint64_t> ts(MAX_WAVEFRONT_TIMESTAMP_QUERIES, 0);
     VkResult res = vkGetQueryPoolResults(m_device, m_queryPools[frameSlot], 0, numQueries,
                                          numQueries * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
                                          VK_QUERY_RESULT_64_BIT);
@@ -1133,11 +1245,80 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
 
     data.valid = true;
     data.totalMs = toMs(ts[endQuery], ts[0]);
-    data.classifyMs = toMs(ts[2], ts[1]);
+    data.numBatches = totalBatches;
+    data.classifyMs = 0.0;
+    data.preShadeBarrierMs = 0.0;
+    data.totalBarriersMs = 0.0;
     data.resolveMs = 0.0;
     data.sortMode = m_sortMode;
     data.secondarySortMode = m_secondarySortMode;
     data.queueMemoryFootprintMb = getQueueMemoryFootprintMb();
+
+    uint32_t tailBounce = m_slotTailMegakernelBounce[frameSlot];
+    data.tailMegakernelBounce = tailBounce;
+    data.tailMegakernelMs = 0.0;
+    uint32_t activeWaveBounces = (tailBounce > 0) ? std::min(tailBounce, effectiveBounces) : effectiveBounces;
+
+    data.bounces.resize(activeWaveBounces);
+    for (uint32_t b = 0; b < activeWaveBounces; ++b) {
+        data.bounces[b].bounce = b;
+    }
+
+    for (uint32_t p = 0; p < batchesToProfile; ++p) {
+        uint32_t batchQueryBase = p * queriesPerBatch;
+        if (batchQueryBase + 2 >= numQueries) break;
+        data.classifyMs += toMs(ts[batchQueryBase + 1], ts[batchQueryBase + 0]);
+        double preShade = toMs(ts[batchQueryBase + 2], ts[batchQueryBase + 1]);
+        data.preShadeBarrierMs += preShade;
+        data.totalBarriersMs += preShade;
+
+        uint64_t prevTs = ts[batchQueryBase + 2];
+        for (uint32_t b = 0; b < activeWaveBounces; ++b) {
+            uint32_t qBase = batchQueryBase + 3 + b * 6;
+            if (qBase + 4 >= numQueries) break;
+            auto& bp = data.bounces[b];
+            double shade = toMs(ts[qBase + 0], prevTs);
+            double s2d = toMs(ts[qBase + 1], ts[qBase + 0]);
+            double shadow = toMs(ts[qBase + 2], ts[qBase + 1]);
+            double intersect = (b + 1 < activeWaveBounces) ? toMs(ts[qBase + 3], ts[qBase + 2]) : 0.0;
+            double d2s = (b + 1 < activeWaveBounces) ? toMs(ts[qBase + 4], ts[qBase + 3]) : 0.0;
+
+            bp.shadeMs += shade;
+            bp.s2dBarrierMs += s2d;
+            bp.shadowMs += shadow;
+            bp.intersectMs += intersect;
+            bp.d2sBarrierMs += d2s;
+            bp.bounceTotalMs += (shade + s2d + shadow + intersect + d2s);
+            data.totalBarriersMs += (s2d + d2s);
+            prevTs = ts[qBase + 4];
+        }
+
+        if (tailBounce > 0 && tailBounce <= effectiveBounces) {
+            uint32_t tailQBase = batchQueryBase + 3 + (tailBounce - 1) * 6;
+            if (tailQBase + 4 < numQueries) {
+                double tailPreBarrier = toMs(ts[tailQBase + 3], ts[tailQBase + 2]);
+                double tailKernel = toMs(ts[tailQBase + 4], ts[tailQBase + 3]);
+                data.tailMegakernelMs += tailKernel;
+                data.totalBarriersMs += tailPreBarrier;
+            }
+        }
+    }
+
+    if (totalBatches > batchesToProfile) {
+        double batchScale = static_cast<double>(totalBatches) / static_cast<double>(batchesToProfile);
+        data.classifyMs *= batchScale;
+        data.preShadeBarrierMs *= batchScale;
+        data.totalBarriersMs *= batchScale;
+        data.tailMegakernelMs *= batchScale;
+        for (auto& bp : data.bounces) {
+            bp.shadeMs *= batchScale;
+            bp.s2dBarrierMs *= batchScale;
+            bp.shadowMs *= batchScale;
+            bp.intersectMs *= batchScale;
+            bp.d2sBarrierMs *= batchScale;
+            bp.bounceTotalMs *= batchScale;
+        }
+    }
 
     struct BounceDispatchCPU {
         uint32_t shadeX, shadeY, shadeZ, activeCount;
@@ -1160,42 +1341,37 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     static_assert(sizeof(BounceMaterialDispatchCPU) == 256, "BounceMaterialDispatchCPU stride must be 256 bytes");
 
     const void* pMapped = m_indirectArgs[frameSlot]->map();
+    m_indirectArgs[frameSlot]->invalidate(0, VK_WHOLE_SIZE);
     const BounceDispatchCPU* dispatches = reinterpret_cast<const BounceDispatchCPU*>(pMapped);
     const BounceMaterialDispatchCPU* matDispatches = reinterpret_cast<const BounceMaterialDispatchCPU*>(pMapped);
     bool isMaterialMode = (m_shadeDiffusePipeline != VK_NULL_HANDLE && m_sortMode != 0);
 
     double totalTrafficBytes = 0.0;
+    uint32_t activeBounceCount = 0;
 
-    for (uint32_t b = 0; b < effectiveBounces; ++b) {
-        uint32_t base = 3 + b * 6;
-        if (base + 5 >= numQueries) break;
-        BounceProfilingData bp{};
-        bp.bounce = b;
-        bp.shadeMs = toMs(ts[base + 1], ts[base + 0]);
-        bp.shadowMs = toMs(ts[base + 3], ts[base + 2]);
-        bp.intersectMs = (b + 1 < effectiveBounces) ? toMs(ts[base + 5], ts[base + 4]) : 0.0;
-
+    for (uint32_t b = 0; b < activeWaveBounces; ++b) {
+        auto& bp = data.bounces[b];
         if (isMaterialMode && matDispatches) {
-            bp.diffCount = matDispatches[b].diffCount;
-            bp.compCount = matDispatches[b].compCount;
-            bp.dielCount = matDispatches[b].dielCount;
-            bp.emisCount = matDispatches[b].emisCount;
+            bp.diffCount = matDispatches[b].diffCount * totalBatches;
+            bp.compCount = matDispatches[b].compCount * totalBatches;
+            bp.dielCount = matDispatches[b].dielCount * totalBatches;
+            bp.emisCount = matDispatches[b].emisCount * totalBatches;
             bp.condCount = 0;
             bp.passCount = 0;
             bp.activeCount = bp.diffCount + bp.compCount + bp.dielCount + bp.emisCount;
-            bp.shadowCount = matDispatches[b].shadowCount;
+            bp.shadowCount = matDispatches[b].shadowCount * totalBatches;
 
             if (m_secondarySortMode == 1) {
                 uint32_t totalOct = 0;
                 for (int k = 0; k < 8; ++k) totalOct += matDispatches[b].octants[k].count;
-                bp.nextCount = totalOct;
+                bp.nextCount = totalOct * totalBatches;
             } else {
-                bp.nextCount = matDispatches[b].nextCount;
+                bp.nextCount = matDispatches[b].nextCount * totalBatches;
             }
         } else if (dispatches) {
-            bp.activeCount = dispatches[b].activeCount;
-            bp.shadowCount = dispatches[b].shadowCount;
-            bp.nextCount = dispatches[b].nextCount;
+            bp.activeCount = dispatches[b].activeCount * totalBatches;
+            bp.shadowCount = dispatches[b].shadowCount * totalBatches;
+            bp.nextCount = dispatches[b].nextCount * totalBatches;
             bp.diffCount = bp.activeCount;
         }
 
@@ -1204,6 +1380,7 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
         if (b > 0 && bp.activeCount == 0 && bp.shadowCount == 0 && bp.nextCount == 0) {
             break;
         }
+        activeBounceCount = b + 1;
 
         // Memory Traffic Estimation:
         // Shade reads Geom(16B) + State(32B) + Hit(16B) = 64B
@@ -1215,19 +1392,11 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
         double shadowRead = bp.shadowCount * 32.0;
         double intersectTraffic = bp.nextCount * 32.0;
         totalTrafficBytes += (shadeRead + shadeWrite + shadowRead + intersectTraffic);
-
-        data.bounces.push_back(bp);
     }
     if (pMapped) m_indirectArgs[frameSlot]->unmap();
 
-    // If bounces terminated early, adjust totalMs to reflect only the active bounce range
-    if (!data.bounces.empty() && data.bounces.size() < effectiveBounces) {
-        uint32_t lastBounce = static_cast<uint32_t>(data.bounces.size() - 1);
-        uint32_t lastQuery = 3 + lastBounce * 6 + 5;
-        if (lastQuery < numQueries && ts[lastQuery] > ts[0]) {
-            data.totalMs = toMs(ts[lastQuery], ts[0]);
-        }
-    }
+    data.bounces.resize(activeBounceCount);
+    data.estimatedVramTrafficMb = totalTrafficBytes * (1.0 / (1024.0 * 1024.0));
 
     // Primary Classify traffic: writes primary active rays (Geom 16B + State 32B + Hit 16B = 64B)
     uint32_t primaryRays = (m_width * m_height);
@@ -1244,23 +1413,28 @@ void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double times
     const char* secSortStr = (data.secondarySortMode == 1) ? "Directional DGC (8-bin)" :
                              (data.secondarySortMode == 2) ? "Direct Coherent (Xiang 2023, K=4)" :
                              (data.secondarySortMode == 3) ? "Direct Coherent (Xiang 2023, K=8)" : "None";
-    Logger::info("    --- Wavefront Sub-Pass GPU Timing Breakdown (Frame Total: {:.3f} ms, Secondary Sort: {}) ---",
-                 data.totalMs, secSortStr);
-    Logger::info("      [Primary] Classify: {:.3f} ms | VRAM Traffic: {:.1f} MB",
-                 data.classifyMs, data.estimatedVramTrafficMb);
+    Logger::info("    --- Wavefront Sub-Pass GPU Timing Breakdown (Frame Total: {:.3f} ms, Barriers/DGC: {:.3f} ms, Batches: {}, Secondary Sort: {}) ---",
+                 data.totalMs, data.totalBarriersMs, data.numBatches, secSortStr);
+    Logger::info("      [Primary] Classify: {:.3f} ms | Pre-Shade Barrier: {:.3f} ms | VRAM Traffic: {:.1f} MB",
+                 data.classifyMs, data.preShadeBarrierMs, data.estimatedVramTrafficMb);
 
     bool isMaterialMode = (m_shadeDiffusePipeline != VK_NULL_HANDLE && m_sortMode != 0);
     for (const auto& bp : data.bounces) {
         std::string shadowStr = (bp.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms ({} rays)", bp.shadowMs, bp.shadowCount)
                                                        : "Shadow: Inline (on-chip)";
         if (isMaterialMode) {
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms (std: {}, comp: {}, diel: {}, emis: {}) | {} | Intersect: {:.3f} ms ({} rays)",
+            Logger::info("      [Bounce {}] Shade: {:.3f} ms (std: {}, comp: {}, diel: {}, emis: {}) | S2D: {:.3f} ms | {} | Intersect: {:.3f} ms ({} rays) | D2S: {:.3f} ms",
                          bp.bounce, bp.shadeMs, bp.diffCount, bp.compCount, bp.dielCount, bp.emisCount,
-                         shadowStr, bp.intersectMs, bp.nextCount);
+                         bp.s2dBarrierMs, shadowStr, bp.intersectMs, bp.nextCount, bp.d2sBarrierMs);
         } else {
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | {} | Intersect: {:.3f} ms ({} rays)",
-                         bp.bounce, bp.shadeMs, bp.activeCount, shadowStr, bp.intersectMs, bp.nextCount);
+            Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | S2D: {:.3f} ms | {} | Intersect: {:.3f} ms ({} rays) | D2S: {:.3f} ms",
+                         bp.bounce, bp.shadeMs, bp.activeCount, bp.s2dBarrierMs, shadowStr, bp.intersectMs, bp.nextCount, bp.d2sBarrierMs);
         }
+    }
+    if (data.tailMegakernelBounce > 0 && data.tailMegakernelMs > 0.0) {
+        Logger::info("      [Tail Megakernel (Bounces {}..{})] GPU Time: {:.3f} ms",
+                     data.tailMegakernelBounce, (maxBounces > 0 ? maxBounces - 1 : data.tailMegakernelBounce),
+                     data.tailMegakernelMs);
     }
 }
 

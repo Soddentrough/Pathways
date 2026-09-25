@@ -174,6 +174,8 @@ struct FrameStats {
         double total_ms = 0.0;
         double classify_ms = 0.0;
         double resolve_ms = 0.0;
+        double tail_megakernel_ms = 0.0;
+        uint32_t tail_megakernel_bounce = 0;
         std::vector<BounceProfile> bounces;
         double queue_memory_footprint_mb = 0.0;
         double estimated_vram_traffic_mb = 0.0;
@@ -200,6 +202,8 @@ struct FrameStats {
         double classify_ms = 0.0;
         uint64_t primary_rays = 0;
         std::vector<StageBounceSummary> bounces;
+        double tail_megakernel_ms = 0.0;
+        uint32_t tail_megakernel_bounce = 0;
         double tonemap_ms = 0.0;
     };
 

@@ -304,14 +304,10 @@ void main() {
                 break;
             }
 
-            // Adaptive depth-attenuated Russian Roulette
+            // Adaptive progressive depth-attenuated Russian Roulette
             if (bounce >= 1u) {
-                float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                float maxP = 0.95;
-                float p = clamp(lum, minP, maxP);
-                if (bounce >= 2u && lum >= 0.35) {
-                    p = clamp(lum * 0.85, minP, 0.90);
-                }
+                float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
+                float p = clamp(lum * depthDecay, 0.05, 0.95);
                 if (randFloat(seed) > p) {
                     break;
                 }

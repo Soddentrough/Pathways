@@ -194,12 +194,29 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     if (!scene.instanceData.empty()) {
         instanceUpload = scene.instanceData;
     } else {
-        InstanceGPU defaultInst{};
-        defaultInst.firstTriangle = 0;
-        defaultInst.numOpaqueTriangles = scene.numOpaqueTriangles;
-        defaultInst.materialOffset = 0;
-        defaultInst.flags = 0;
-        instanceUpload.push_back(defaultInst);
+        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
+        if (scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
+            InstanceGPU instOpaque{};
+            instOpaque.firstTriangle = 0;
+            instOpaque.numOpaqueTriangles = scene.numOpaqueTriangles;
+            instOpaque.materialOffset = 0;
+            instOpaque.flags = 0;
+            instanceUpload.push_back(instOpaque);
+
+            InstanceGPU instNonOpaque{};
+            instNonOpaque.firstTriangle = scene.numOpaqueTriangles;
+            instNonOpaque.numOpaqueTriangles = 0;
+            instNonOpaque.materialOffset = 0;
+            instNonOpaque.flags = 0;
+            instanceUpload.push_back(instNonOpaque);
+        } else {
+            InstanceGPU defaultInst{};
+            defaultInst.firstTriangle = 0;
+            defaultInst.numOpaqueTriangles = scene.numOpaqueTriangles;
+            defaultInst.materialOffset = 0;
+            defaultInst.flags = 0;
+            instanceUpload.push_back(defaultInst);
+        }
     }
 
     VkDeviceSize instanceBufferSize = sizeof(InstanceGPU) * instanceUpload.size();
@@ -265,7 +282,18 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             asInst.blasAddress = secNode.blases[bIdx]->getDeviceAddress();
             asInst.transform = inst.transform;
             asInst.customIndex = inst.customIndex;
-            asInst.mask = 0xFF;
+            if (bIdx < scene.blasRanges.size()) {
+                const auto& range = scene.blasRanges[bIdx];
+                if (range.triangleCount == range.numOpaqueTriangles) {
+                    asInst.mask = 0x01; // Pure opaque
+                } else if (range.numOpaqueTriangles == 0) {
+                    asInst.mask = 0x02; // Pure non-opaque / dielectric
+                } else {
+                    asInst.mask = 0x03; // Mixed
+                }
+            } else {
+                asInst.mask = 0xFF;
+            }
             asInst.hitGroupId = 0;
             asInst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             asInstances.push_back(asInst);
@@ -274,9 +302,12 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
         Logger::info("Secondary GPU Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
                      secNode.blases.size(), asInstances.size());
     } else {
-        // Monolithic single-BLAS path
-        std::vector<ASGeometryInput> geoms;
-        if (scene.numOpaqueTriangles > 0) {
+        // Monolithic scene path
+        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
+        std::vector<ASInstanceInput> asInstances;
+
+        if (scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
+            std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
             geomOpaque.indexBufferAddress = indexBaseAddr;
@@ -285,10 +316,10 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             geomOpaque.vertexStride = sizeof(glm::vec4);
             geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
-        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
-        if (numNonOpaque > 0) {
+            geomsOpaque.push_back(geomOpaque);
+            secNode.blases.push_back(secNode.asManager->buildBLAS(geomsOpaque));
+
+            std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
             geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
             geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles) * 3 * sizeof(uint32_t);
@@ -297,31 +328,76 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             geomNonOpaque.vertexStride = sizeof(glm::vec4);
             geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
-        }
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = indexBaseAddr;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(glm::vec4);
-            dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-        secNode.blas = secNode.asManager->buildBLAS(geoms);
+            geomsNonOpaque.push_back(geomNonOpaque);
+            secNode.blases.push_back(secNode.asManager->buildBLAS(geomsNonOpaque));
 
-        ASInstanceInput inst{};
-        inst.blasAddress = secNode.blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            ASInstanceInput inst0{};
+            inst0.blasAddress = secNode.blases[0]->getDeviceAddress();
+            inst0.transform = glm::mat4(1.0f);
+            inst0.customIndex = 0;
+            inst0.mask = 0x01; // RAY_MASK_OPAQUE
+            inst0.hitGroupId = 0;
+            inst0.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst0);
 
-        secNode.tlas = secNode.asManager->buildTLAS({ inst });
-        Logger::info("Secondary GPU Acceleration Structures initialized successfully (Monolithic BLAS & TLAS).");
+            ASInstanceInput inst1{};
+            inst1.blasAddress = secNode.blases[1]->getDeviceAddress();
+            inst1.transform = glm::mat4(1.0f);
+            inst1.customIndex = 1;
+            inst1.mask = 0x02; // RAY_MASK_NON_OPAQUE
+            inst1.hitGroupId = 0;
+            inst1.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst1);
+        } else {
+            std::vector<ASGeometryInput> geoms;
+            bool isPureOpaque = (scene.numOpaqueTriangles > 0);
+            if (isPureOpaque) {
+                ASGeometryInput geomOpaque{};
+                geomOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomOpaque.indexBufferAddress = indexBaseAddr;
+                geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles;
+                geomOpaque.triangleCount = scene.numOpaqueTriangles;
+                geomOpaque.vertexStride = sizeof(glm::vec4);
+                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.isOpaque = true;
+                geoms.push_back(geomOpaque);
+            } else if (numNonOpaque > 0) {
+                ASGeometryInput geomNonOpaque{};
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomNonOpaque.indexBufferAddress = indexBaseAddr;
+                geomNonOpaque.vertexCount = 3 * numTriangles;
+                geomNonOpaque.triangleCount = numNonOpaque;
+                geomNonOpaque.vertexStride = sizeof(glm::vec4);
+                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.isOpaque = false;
+                geoms.push_back(geomNonOpaque);
+            } else {
+                ASGeometryInput dummyGeom{};
+                dummyGeom.vertexBufferAddress = vertexBaseAddr;
+                dummyGeom.indexBufferAddress = indexBaseAddr;
+                dummyGeom.vertexCount = 3;
+                dummyGeom.triangleCount = 1;
+                dummyGeom.vertexStride = sizeof(glm::vec4);
+                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.isOpaque = true;
+                geoms.push_back(dummyGeom);
+            }
+
+            secNode.blases.push_back(secNode.asManager->buildBLAS(geoms));
+
+            ASInstanceInput inst{};
+            inst.blasAddress = secNode.blases[0]->getDeviceAddress();
+            inst.transform = glm::mat4(1.0f);
+            inst.customIndex = 0;
+            inst.mask = isPureOpaque ? 0x01 : 0x02;
+            inst.hitGroupId = 0;
+            inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst);
+        }
+
+        secNode.tlas = secNode.asManager->buildTLAS(asInstances);
+        Logger::info("Secondary GPU Acceleration Structures initialized successfully (Monolithic {} BLASes & {} TLAS Instances).",
+                     secNode.blases.size(), asInstances.size());
     }
 }
 
@@ -1317,6 +1393,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
             auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
+            auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
 
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,
@@ -1327,7 +1404,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 secNode->context->hasDgcExecutionSet(),
                 wfShadeDiffuseSecCode, wfShadeComplexSecCode,
                 config.dgc_preprocess,
-                secNode->context->hasSubgroupSizeControl()
+                secNode->context->hasSubgroupSizeControl(),
+                0,
+                wfTailMegakernelCode
             );
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
@@ -1629,6 +1708,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
         wfSceneData.indirectClamp = m_config.indirect_clamp;
+        wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
+        wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
         wfSceneData.tileOffsetX = packet.tileOffsetX;
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;

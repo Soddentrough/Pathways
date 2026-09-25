@@ -108,3 +108,5 @@ light_mappings:
     twosided: false
 approximations: ["area_light_emissive_mesh", "dielectric_transmission_ior", "conductor_metallic"]
 losses: ["render_integrator", "render_sampler", "pixel_filter", "film_output"]
+remedies:
+  - "Door hinge clearance gap (2.8 mm) sealed at Z = -4.692387 m against inner jamb to eliminate light bleeding along hinge edge."

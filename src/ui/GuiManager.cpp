@@ -647,6 +647,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                                 formatRayCount(b.rays_left).c_str(), pct);
                         }
                     }
+                    if (c.pipeline_stages.tail_megakernel_ms > 0.0005) {
+                        ImGui::TextDisabled("  Tail Megakernel (Bounces %u..N): %.2f ms",
+                                            c.pipeline_stages.tail_megakernel_bounce,
+                                            c.pipeline_stages.tail_megakernel_ms);
+                    }
                     ImGui::Unindent(15.0f);
                 }
                 ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED" : "EXCEEDED");

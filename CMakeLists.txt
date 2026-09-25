@@ -156,6 +156,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade_emissive.comp
     ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
+    ${SHADER_DIR}/compute/wavefront_tail_megakernel.comp
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp

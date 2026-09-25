@@ -383,6 +383,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
             << std::format("      \"total_wavefront_time_ms\": {:.3f},\n", stats.wavefront_stats.total_ms)
             << std::format("      \"classify_time_ms\": {:.3f},\n", stats.wavefront_stats.classify_ms)
             << std::format("      \"resolve_time_ms\": {:.3f},\n", stats.wavefront_stats.resolve_ms)
+            << std::format("      \"tail_megakernel_ms\": {:.3f},\n", stats.wavefront_stats.tail_megakernel_ms)
+            << std::format("      \"tail_megakernel_bounce\": {},\n", stats.wavefront_stats.tail_megakernel_bounce)
             << std::format("      \"material_sort_mode\": \"{}\",\n", stats.wavefront_stats.sort_mode_str)
             << std::format("      \"secondary_sort_mode\": \"{}\",\n", stats.wavefront_stats.secondary_sort_mode_str)
             << std::format("      \"queue_memory_footprint_mb\": {:.2f},\n", stats.wavefront_stats.queue_memory_footprint_mb)
@@ -483,6 +485,10 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
                     << (b + 1 < c.pipeline_stages.bounces.size() ? "            },\n" : "            }\n");
             }
             out << "          ],\n";
+            if (c.pipeline_stages.tail_megakernel_ms > 0.0005) {
+                out << std::format("          \"tail_megakernel_ms\": {:.3f},\n", c.pipeline_stages.tail_megakernel_ms)
+                    << std::format("          \"tail_megakernel_bounce\": {},\n", c.pipeline_stages.tail_megakernel_bounce);
+            }
             out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
         } else {
             out << std::format("          \"ray_tracing_pass_ms\": {:.3f},\n", c.pipeline_stages.ray_tracing_pass_ms)

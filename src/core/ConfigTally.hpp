@@ -25,6 +25,8 @@ struct ConfigKey {
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
     uint32_t tile_size = 64;
     bool enable_nrc = false;
+    bool enable_tail_megakernel = false;
+    uint32_t tail_bounce = 2;
 
     bool operator==(const ConfigKey& o) const {
         if (scene_name != o.scene_name) return false;
@@ -35,6 +37,8 @@ struct ConfigKey {
         if (upscaler != UpscalerMode::None && std::abs(render_scale - o.render_scale) > 0.001f) return false;
         if (mgpu_mode != MultiGpuMode::Off && upscaler != UpscalerMode::None && mgpu_upscale_mode != o.mgpu_upscale_mode) return false;
         if (enable_nrc != o.enable_nrc) return false;
+        if (enable_tail_megakernel != o.enable_tail_megakernel) return false;
+        if (enable_tail_megakernel && tail_bounce != o.tail_bounce) return false;
         if (width != o.width || height != o.height) return false;
         if (spp != o.spp || max_bounces != o.max_bounces) return false;
         if (accum_format != o.accum_format) return false;
@@ -43,7 +47,9 @@ struct ConfigKey {
     }
 
     std::string getLabel() const {
-        std::string pipeStr = (pipeline_type == PipelineType::Wavefront) ? "Wavefront" : "RTP";
+        std::string tailStr = (pipeline_type == PipelineType::Wavefront && enable_tail_megakernel)
+            ? std::format(" [Tail-MK b>={}]", tail_bounce) : "";
+        std::string pipeStr = (pipeline_type == PipelineType::Wavefront) ? ("Wavefront" + tailStr) : "RTP";
         std::string modeStr;
         switch (mgpu_mode) {
             case MultiGpuMode::Off:
@@ -86,10 +92,14 @@ struct ConfigKey {
 struct WavefrontStageSample {
     double classifyMs = 0.0;
     uint64_t primaryRays = 0;
+    double tailMegakernelMs = 0.0;
+    uint32_t tailMegakernelBounce = 0;
     struct Bounce {
         double shadeMs = 0.0;
+        double s2dBarrierMs = 0.0;
         double shadowMs = 0.0;
         double intersectMs = 0.0;
+        double d2sBarrierMs = 0.0;
         uint64_t activeCount = 0;
         uint64_t nextCount = 0;
         uint64_t shadowCount = 0;
@@ -100,8 +110,10 @@ struct WavefrontStageSample {
 struct BounceStageAvg {
     uint32_t bounce = 0;
     double shadeMs = 0.0;
+    double s2dBarrierMs = 0.0;
     double shadowMs = 0.0;
     double intersectMs = 0.0;
+    double d2sBarrierMs = 0.0;
     double totalMs = 0.0;
     uint64_t activeCount = 0;
     uint64_t nextCount = 0;
@@ -149,11 +161,15 @@ struct ConfigStatsTally {
     uint32_t wavefrontSampleCount = 0;
     double sumClassifyMs = 0.0;
     uint64_t sumPrimaryRays = 0;
+    double sumTailMegakernelMs = 0.0;
+    uint32_t tailMegakernelBounce = 0;
 
     struct BounceTally {
         double sumShadeMs = 0.0;
+        double sumS2dBarrierMs = 0.0;
         double sumShadowMs = 0.0;
         double sumIntersectMs = 0.0;
+        double sumD2sBarrierMs = 0.0;
         uint64_t sumActiveCount = 0;
         uint64_t sumNextCount = 0;
         uint64_t sumShadowCount = 0;
@@ -175,19 +191,25 @@ struct ConfigStatsTally {
         sumSecondaryRtMs += secRtMs;
         sumTonemapMs += tonemapMs;
 
-        if (wfSample && !wfSample->bounces.empty()) {
+        if (wfSample && (!wfSample->bounces.empty() || wfSample->tailMegakernelMs > 0.0)) {
             hasWavefrontStages = true;
             wavefrontSampleCount++;
             sumClassifyMs += wfSample->classifyMs;
             sumPrimaryRays += wfSample->primaryRays;
+            sumTailMegakernelMs += wfSample->tailMegakernelMs;
+            if (wfSample->tailMegakernelBounce > 0) {
+                tailMegakernelBounce = wfSample->tailMegakernelBounce;
+            }
 
             if (bounceTallies.size() < wfSample->bounces.size()) {
                 bounceTallies.resize(wfSample->bounces.size());
             }
             for (size_t b = 0; b < wfSample->bounces.size(); ++b) {
                 bounceTallies[b].sumShadeMs += wfSample->bounces[b].shadeMs;
+                bounceTallies[b].sumS2dBarrierMs += wfSample->bounces[b].s2dBarrierMs;
                 bounceTallies[b].sumShadowMs += wfSample->bounces[b].shadowMs;
                 bounceTallies[b].sumIntersectMs += wfSample->bounces[b].intersectMs;
+                bounceTallies[b].sumD2sBarrierMs += wfSample->bounces[b].d2sBarrierMs;
                 bounceTallies[b].sumActiveCount += wfSample->bounces[b].activeCount;
                 bounceTallies[b].sumNextCount += wfSample->bounces[b].nextCount;
                 bounceTallies[b].sumShadowCount += wfSample->bounces[b].shadowCount;
@@ -221,6 +243,10 @@ struct ConfigStatsTally {
         return wavefrontSampleCount > 0 ? (sumClassifyMs / wavefrontSampleCount) : 0.0;
     }
 
+    double getAvgTailMegakernelMs() const {
+        return wavefrontSampleCount > 0 ? (sumTailMegakernelMs / wavefrontSampleCount) : 0.0;
+    }
+
     uint64_t getAvgPrimaryRays() const {
         if (wavefrontSampleCount > 0 && sumPrimaryRays > 0) {
             return sumPrimaryRays / wavefrontSampleCount;
@@ -240,9 +266,11 @@ struct ConfigStatsTally {
             BounceStageAvg bAvg;
             bAvg.bounce = static_cast<uint32_t>(b);
             bAvg.shadeMs = bt.sumShadeMs / bt.count;
+            bAvg.s2dBarrierMs = bt.sumS2dBarrierMs / bt.count;
             bAvg.shadowMs = bt.sumShadowMs / bt.count;
             bAvg.intersectMs = bt.sumIntersectMs / bt.count;
-            bAvg.totalMs = bAvg.shadeMs + bAvg.shadowMs + bAvg.intersectMs;
+            bAvg.d2sBarrierMs = bt.sumD2sBarrierMs / bt.count;
+            bAvg.totalMs = bAvg.shadeMs + bAvg.s2dBarrierMs + bAvg.shadowMs + bAvg.intersectMs + bAvg.d2sBarrierMs;
             bAvg.activeCount = bt.sumActiveCount / bt.count;
             bAvg.nextCount = bt.sumNextCount / bt.count;
             bAvg.shadowCount = bt.sumShadowCount / bt.count;

@@ -19,6 +19,10 @@
 #define INV_PI 0.31830988618379067154
 #define EPSILON 0.0005
 
+#define RAY_MASK_OPAQUE 0x01
+#define RAY_MASK_NON_OPAQUE 0x02
+#define RAY_MASK_ALL 0xFF
+
 // 128-byte cache-line aligned shading triangle (Option 3 / RDNA 4 vector cache line)
 struct Triangle {
     vec4 normal0_u0; // xyz: normal0, w: uv0.x
@@ -958,6 +962,39 @@ f16vec3 clampIndirectRadiance(f16vec3 rad, float maxLum) {
         return rad * float16_t(maxLum / lum);
     }
     return rad;
+}
+#endif
+
+// Progressive depth-aware Russian Roulette for unbiased path termination
+bool applyRussianRoulette(inout vec3 throughput, float pathLum, uint bounce, inout uint seed) {
+    if (pathLum < 0.001) {
+        return true;
+    }
+    if (bounce >= 1u) {
+        float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
+        float p = clamp(pathLum * depthDecay, 0.05, 0.95);
+        if (randFloat(seed) > p) {
+            return true;
+        }
+        throughput /= p;
+    }
+    return false;
+}
+
+#ifdef GL_EXT_shader_explicit_arithmetic_types_float16
+bool applyRussianRoulette16(inout f16vec3 throughput, float pathLum, uint bounce, inout uint seed) {
+    if (pathLum < 0.001) {
+        return true;
+    }
+    if (bounce >= 1u) {
+        float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
+        float p = clamp(pathLum * depthDecay, 0.05, 0.95);
+        if (randFloat(seed) > p) {
+            return true;
+        }
+        throughput /= float16_t(p);
+    }
+    return false;
 }
 #endif
 

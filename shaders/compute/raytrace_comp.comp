@@ -870,8 +870,13 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         lastBsdfPdf = evalBSDFPdf(V, nextDirection, hitNormal, clearcoatNormal, alphaRoughness, clearcoatAlpha, clearcoatProb, baseSpecProb, clearcoat);
 
         // 4. Russian Roulette Path Termination (after bounce 1)
+        float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
+        if (lum < 0.001) {
+            break;
+        }
         if (bounce >= 1) {
-            float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            float depthDecay = (bounce >= 2) ? pow(0.85, float(bounce - 1)) : 1.0;
+            float p = clamp(lum * depthDecay, 0.05, 0.95);
             if (randFloat(seed) > p) {
                 break;
             }

@@ -360,6 +360,7 @@ private:
     uint32_t m_numMaterials = 0;
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
+    bool m_sceneHasAlphaMask = false;
     void updateSceneTransparencyFlag();
     void partitionSceneGeometry();
 

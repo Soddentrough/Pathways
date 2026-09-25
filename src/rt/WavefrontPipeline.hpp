@@ -55,7 +55,7 @@ struct WavefrontSceneData {
     float envMapIntensity = 1.0f;
     uint32_t useHardwareRT = 1;
     uint32_t frameIndex = 0;
-    uint32_t useMorton = 1;
+    uint32_t useMorton = 0;
     uint32_t accumulateHistory = 1;
     uint32_t sortMode = 0; // 0: None, 1: Archetype, 2: BDA, 3: Dual
     uint32_t numOpaqueTriangles = 0;
@@ -79,12 +79,14 @@ struct WavefrontSceneData {
     uint32_t macroTileSize = 0;           // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
     uint32_t batchCount = 0;              // Coarse batch count (0 = auto-detect, 1 = monolithic, 2, 4, 8...)
     uint32_t batchPixels = 0;             // Coarse batch ray budget in pixels (0 = auto-detect)
+    bool enableTailMegakernel = false;    // Hybrid Wavefront-to-Megakernel transition for late bounces
+    uint32_t tailMegakernelBounce = 2;    // Cutoff bounce to switch to Tail Megakernel (default: 2)
 };
 
 class WavefrontPipeline {
 public:
     static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
-    static constexpr uint32_t MAX_WAVEFRONT_TIMESTAMP_QUERIES = 512;
+    static constexpr uint32_t MAX_WAVEFRONT_TIMESTAMP_QUERIES = 2048;
 
     WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                       uint32_t width, uint32_t height,
@@ -103,7 +105,8 @@ public:
                       const std::vector<char>& shadeComplexSecCode = {},
                       bool enableDgcPreprocess = true,
                       bool supportsSubgroupSizeControl = true,
-                      uint32_t maxBatchPixels = 0);
+                      uint32_t maxBatchPixels = 0,
+                      const std::vector<char>& tailMegakernelCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -149,8 +152,11 @@ public:
     struct BounceProfilingData {
         uint32_t bounce = 0;
         double shadeMs = 0.0;
+        double s2dBarrierMs = 0.0; // Shade -> Downstream barrier & DGC preprocess
         double shadowMs = 0.0;
         double intersectMs = 0.0;
+        double d2sBarrierMs = 0.0; // Downstream -> Next Shade barrier
+        double bounceTotalMs = 0.0;
         uint32_t activeCount = 0;
         uint32_t shadowCount = 0;
         uint32_t nextCount = 0;
@@ -166,12 +172,17 @@ public:
         bool valid = false;
         double totalMs = 0.0;
         double classifyMs = 0.0;
+        double preShadeBarrierMs = 0.0;
+        double totalBarriersMs = 0.0;
         double resolveMs = 0.0;
+        double tailMegakernelMs = 0.0;
+        uint32_t tailMegakernelBounce = 0;
         std::vector<BounceProfilingData> bounces;
         double queueMemoryFootprintMb = 0.0;
         double estimatedVramTrafficMb = 0.0;
         uint32_t sortMode = 0;
         uint32_t secondarySortMode = 0;
+        uint32_t numBatches = 1;
     };
 
     void printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces = 0);
@@ -206,7 +217,8 @@ private:
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadePassthroughCode,
                          const std::vector<char>& shadeDiffuseSecCode = {},
-                         const std::vector<char>& shadeComplexSecCode = {});
+                         const std::vector<char>& shadeComplexSecCode = {},
+                         const std::vector<char>& tailMegakernelCode = {});
 
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -256,6 +268,7 @@ private:
     VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
+    VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;
 
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
@@ -263,6 +276,9 @@ private:
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<bool, 2> m_hasRecordedSlot = { false, false };
     std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
+    std::array<uint32_t, 2> m_slotTailMegakernelBounce = { 0, 0 };
+    std::array<uint32_t, 2> m_slotNumBatches = { 1, 1 };
+    std::array<uint32_t, 2> m_slotProfiledBatches = { 1, 1 };
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;

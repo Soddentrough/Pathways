@@ -304,6 +304,9 @@ void Config::printUsage(const char* progName) {
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
               << "  --indirect-clamp <float> Maximum indirect / secondary bounce radiance luminance (default: 35.0, 0 = disabled)\n"
+              << "  --tail-megakernel       Enable Hybrid Wavefront-to-Megakernel transition for late bounces (eliminates per-bounce barriers/queues) [default: disabled]\n"
+              << "  --tail-bounce <int>     Bounce depth to switch to Tail Megakernel (default: 2, alias: --tail-megakernel-bounce)\n"
+              << "  --no-tail-megakernel    Disable Tail Megakernel (force pure wavefront across all bounces)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
@@ -914,6 +917,24 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--indirect-clamp=") || arg.starts_with("--sec-clamp=")) {
             cfg.indirect_clamp = std::max(0.0f, std::stof(arg.substr(arg.find('=') + 1)));
+            continue;
+        }
+        if (arg == "--tail-megakernel" || arg == "--enable-tail-megakernel" || arg == "--hybrid-tail") {
+            cfg.enable_tail_megakernel = true;
+            continue;
+        }
+        if (arg == "--no-tail-megakernel" || arg == "--disable-tail-megakernel") {
+            cfg.enable_tail_megakernel = false;
+            continue;
+        }
+        if ((arg == "--tail-bounce" || arg == "--tail-megakernel-bounce") && i + 1 < argc) {
+            cfg.tail_megakernel_bounce = std::stoul(argv[++i]);
+            cfg.enable_tail_megakernel = true;
+            continue;
+        }
+        if (arg.starts_with("--tail-bounce=") || arg.starts_with("--tail-megakernel-bounce=")) {
+            cfg.tail_megakernel_bounce = std::stoul(arg.substr(arg.find('=') + 1));
+            cfg.enable_tail_megakernel = true;
             continue;
         }
         if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {

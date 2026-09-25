@@ -765,12 +765,29 @@ void Engine::createAccelerationStructures() {
     if (!m_sceneData.instanceData.empty()) {
         instanceUpload = m_sceneData.instanceData;
     } else {
-        InstanceGPU defaultInst{};
-        defaultInst.firstTriangle = 0;
-        defaultInst.numOpaqueTriangles = m_numOpaqueTriangles;
-        defaultInst.materialOffset = 0;
-        defaultInst.flags = 0;
-        instanceUpload.push_back(defaultInst);
+        uint32_t numNonOpaque = numTriangles - m_numOpaqueTriangles;
+        if (m_numOpaqueTriangles > 0 && numNonOpaque > 0) {
+            InstanceGPU instOpaque{};
+            instOpaque.firstTriangle = 0;
+            instOpaque.numOpaqueTriangles = m_numOpaqueTriangles;
+            instOpaque.materialOffset = 0;
+            instOpaque.flags = 0;
+            instanceUpload.push_back(instOpaque);
+
+            InstanceGPU instNonOpaque{};
+            instNonOpaque.firstTriangle = m_numOpaqueTriangles;
+            instNonOpaque.numOpaqueTriangles = 0;
+            instNonOpaque.materialOffset = 0;
+            instNonOpaque.flags = 0;
+            instanceUpload.push_back(instNonOpaque);
+        } else {
+            InstanceGPU defaultInst{};
+            defaultInst.firstTriangle = 0;
+            defaultInst.numOpaqueTriangles = m_numOpaqueTriangles;
+            defaultInst.materialOffset = 0;
+            defaultInst.flags = 0;
+            instanceUpload.push_back(defaultInst);
+        }
     }
 
     VkDeviceSize instanceBufferSize = sizeof(InstanceGPU) * instanceUpload.size();
@@ -836,7 +853,18 @@ void Engine::createAccelerationStructures() {
             asInst.blasAddress = m_blases[bIdx]->getDeviceAddress();
             asInst.transform = inst.transform;
             asInst.customIndex = inst.customIndex;
-            asInst.mask = 0xFF;
+            if (bIdx < m_sceneData.blasRanges.size()) {
+                const auto& range = m_sceneData.blasRanges[bIdx];
+                if (range.triangleCount == range.numOpaqueTriangles) {
+                    asInst.mask = 0x01; // Pure opaque
+                } else if (range.numOpaqueTriangles == 0) {
+                    asInst.mask = 0x02; // Pure non-opaque / dielectric
+                } else {
+                    asInst.mask = 0x03; // Mixed
+                }
+            } else {
+                asInst.mask = 0xFF;
+            }
             asInst.hitGroupId = 0;
             asInst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             asInstances.push_back(asInst);
@@ -849,9 +877,15 @@ void Engine::createAccelerationStructures() {
         Logger::info("Hardware Ray Tracing Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
                      m_blases.size(), asInstances.size());
     } else {
-        // Monolithic single-BLAS path
-        std::vector<ASGeometryInput> geoms;
-        if (m_numOpaqueTriangles > 0) {
+        // Monolithic scene path
+        uint32_t numNonOpaque = numTriangles - m_numOpaqueTriangles;
+        std::vector<ASInstanceInput> asInstances;
+
+        if (m_numOpaqueTriangles > 0 && numNonOpaque > 0) {
+            // Split into dedicated Opaque BLAS (Instance 0) and Non-Opaque / Dielectric BLAS (Instance 1).
+            // Shadow rays can completely cull dielectric geometry in hardware TLAS traversal
+            // via RAY_MASK_OPAQUE (0x01), bypassing ALU candidate loops entirely.
+            std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
             geomOpaque.indexBufferAddress = indexBaseAddr;
@@ -860,11 +894,10 @@ void Engine::createAccelerationStructures() {
             geomOpaque.vertexStride = sizeof(glm::vec4);
             geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomOpaque.isOpaque = true;
-            geoms.push_back(geomOpaque);
-        }
+            geomsOpaque.push_back(geomOpaque);
+            m_blases.push_back(m_asManager->buildBLAS(geomsOpaque));
 
-        uint32_t numNonOpaque = numTriangles - m_numOpaqueTriangles;
-        if (numNonOpaque > 0) {
+            std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
             geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
             geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(m_numOpaqueTriangles) * 3 * sizeof(uint32_t);
@@ -873,37 +906,80 @@ void Engine::createAccelerationStructures() {
             geomNonOpaque.vertexStride = sizeof(glm::vec4);
             geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomNonOpaque.isOpaque = false;
-            geoms.push_back(geomNonOpaque);
+            geomsNonOpaque.push_back(geomNonOpaque);
+            m_blases.push_back(m_asManager->buildBLAS(geomsNonOpaque));
+
+            ASInstanceInput inst0{};
+            inst0.blasAddress = m_blases[0]->getDeviceAddress();
+            inst0.transform = glm::mat4(1.0f);
+            inst0.customIndex = 0;
+            inst0.mask = 0x01; // RAY_MASK_OPAQUE
+            inst0.hitGroupId = 0;
+            inst0.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst0);
+
+            ASInstanceInput inst1{};
+            inst1.blasAddress = m_blases[1]->getDeviceAddress();
+            inst1.transform = glm::mat4(1.0f);
+            inst1.customIndex = 1;
+            inst1.mask = 0x02; // RAY_MASK_NON_OPAQUE
+            inst1.hitGroupId = 0;
+            inst1.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst1);
+        } else {
+            std::vector<ASGeometryInput> geoms;
+            bool isPureOpaque = (m_numOpaqueTriangles > 0);
+            if (isPureOpaque) {
+                ASGeometryInput geomOpaque{};
+                geomOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomOpaque.indexBufferAddress = indexBaseAddr;
+                geomOpaque.vertexCount = 3 * m_numOpaqueTriangles;
+                geomOpaque.triangleCount = m_numOpaqueTriangles;
+                geomOpaque.vertexStride = sizeof(glm::vec4);
+                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.isOpaque = true;
+                geoms.push_back(geomOpaque);
+            } else if (numNonOpaque > 0) {
+                ASGeometryInput geomNonOpaque{};
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
+                geomNonOpaque.indexBufferAddress = indexBaseAddr;
+                geomNonOpaque.vertexCount = 3 * numTriangles;
+                geomNonOpaque.triangleCount = numNonOpaque;
+                geomNonOpaque.vertexStride = sizeof(glm::vec4);
+                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.isOpaque = false;
+                geoms.push_back(geomNonOpaque);
+            } else {
+                ASGeometryInput dummyGeom{};
+                dummyGeom.vertexBufferAddress = vertexBaseAddr;
+                dummyGeom.indexBufferAddress = indexBaseAddr;
+                dummyGeom.vertexCount = 3;
+                dummyGeom.triangleCount = 1;
+                dummyGeom.vertexStride = sizeof(glm::vec4);
+                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.isOpaque = true;
+                geoms.push_back(dummyGeom);
+            }
+
+            m_blases.push_back(m_asManager->buildBLAS(geoms));
+
+            ASInstanceInput inst{};
+            inst.blasAddress = m_blases[0]->getDeviceAddress();
+            inst.transform = glm::mat4(1.0f);
+            inst.customIndex = 0;
+            inst.mask = isPureOpaque ? 0x01 : 0x02;
+            inst.hitGroupId = 0;
+            inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            asInstances.push_back(inst);
         }
 
-        if (geoms.empty()) {
-            ASGeometryInput dummyGeom{};
-            dummyGeom.vertexBufferAddress = vertexBaseAddr;
-            dummyGeom.indexBufferAddress = indexBaseAddr;
-            dummyGeom.vertexCount = 3;
-            dummyGeom.triangleCount = 1;
-            dummyGeom.vertexStride = sizeof(glm::vec4);
-            dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
-            dummyGeom.isOpaque = true;
-            geoms.push_back(dummyGeom);
-        }
-
-        m_blas = m_asManager->buildBLAS(geoms);
-
-        ASInstanceInput inst{};
-        inst.blasAddress = m_blas->getDeviceAddress();
-        inst.transform = glm::mat4(1.0f);
-        inst.customIndex = 0;
-        inst.mask = 0xFF;
-        inst.hitGroupId = 0;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-
-        m_tlas = m_asManager->buildTLAS({ inst });
+        m_tlas = m_asManager->buildTLAS(asInstances);
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
         }
-        initTlasBuffers(1);
-        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (Monolithic BLAS & TLAS).");
+        initTlasBuffers(static_cast<uint32_t>(asInstances.size()));
+        Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (Monolithic {} BLASes & {} TLAS Instances).",
+                     m_blases.size(), asInstances.size());
     }
     Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
 }
@@ -1746,10 +1822,13 @@ bool Engine::loadScene(const std::string& filepath) {
 
 void Engine::updateSceneTransparencyFlag() {
     m_sceneHasNonOpaque = false;
+    m_sceneHasAlphaMask = false;
     for (const auto& mat : m_sceneData.materials) {
-        if (mat.alphaMode != 0 || mat.transmission > 0.05f || mat.type == 2) {
+        if (mat.alphaMode != 0) {
+            m_sceneHasAlphaMask = true;
             m_sceneHasNonOpaque = true;
-            break;
+        } else if (mat.transmission > 0.05f || mat.type == 2) {
+            m_sceneHasNonOpaque = true;
         }
     }
 }
@@ -2085,6 +2164,7 @@ void Engine::initPipelines() {
     auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
     auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
+    auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
 
     uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
     uint32_t initBatchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, initBatchCount);
@@ -2105,7 +2185,8 @@ void Engine::initPipelines() {
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
         true, // enableDgcPreprocess
         m_context->hasSubgroupSizeControl(),
-        initBatchPixels
+        initBatchPixels,
+        wfTailMegakernelCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 
@@ -4677,16 +4758,18 @@ void Engine::renderFrame() {
                     WavefrontStageSample wfSample;
                     if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                         wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                        wfSample.tailMegakernelMs = m_lastWavefrontProfile.tailMegakernelMs;
+                        wfSample.tailMegakernelBounce = m_lastWavefrontProfile.tailMegakernelBounce;
                         uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
                             static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
                         uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
                             static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
                         wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                         for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                            wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                            wfSample.bounces.push_back({bp.shadeMs, bp.s2dBarrierMs, bp.shadowMs, bp.intersectMs, bp.d2sBarrierMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                         }
                     }
-                    recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
+                    recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, (wfSample.bounces.empty() && wfSample.tailMegakernelMs <= 0.0) ? nullptr : &wfSample);
                 }
             }
         } else if (m_lastActiveRenderFrameTimeMs > 0.01) {
@@ -4964,6 +5047,7 @@ void Engine::renderFrame() {
     if (m_config.enable_refraction)     flags |= (1 << 3);
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
+    if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
@@ -5165,6 +5249,8 @@ void Engine::renderFrame() {
             wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
+            wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
+            wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
             uint32_t activeBatchCount = getEffectiveBatchCount(renderW, renderH);
             uint32_t activeBatchPixels = getEffectiveBatchPixels(renderW, renderH, activeBatchCount);
             if (activeBatchCount != m_currentBatchCount || activeBatchPixels != m_currentBatchPixels) {
@@ -5717,6 +5803,8 @@ void Engine::renderFrame() {
                 wfSceneData.enableDistanceClamping = m_config.distance_clamping;
                 wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
                 wfSceneData.indirectClamp = m_config.indirect_clamp;
+                wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
+                wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
                 wfSceneData.inlineShadows = m_config.inline_primary_shadows;
                 wfSceneData.tileOffsetX = tileOffsetX_prim;
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
@@ -6359,16 +6447,18 @@ void Engine::dumpOutputFiles() {
             WavefrontStageSample wfSample;
             if (m_lastWavefrontProfile.valid && m_config.pipeline_type == PipelineType::Wavefront) {
                 wfSample.classifyMs = m_lastWavefrontProfile.classifyMs;
+                wfSample.tailMegakernelMs = m_lastWavefrontProfile.tailMegakernelMs;
+                wfSample.tailMegakernelBounce = m_lastWavefrontProfile.tailMegakernelBounce;
                 uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
                     static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
                 uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
                     static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
                 wfSample.primaryRays = static_cast<uint64_t>(traceW) * traceH * m_config.spp;
                 for (const auto& bp : m_lastWavefrontProfile.bounces) {
-                    wfSample.bounces.push_back({bp.shadeMs, bp.shadowMs, bp.intersectMs, bp.activeCount, bp.nextCount, bp.shadowCount});
+                    wfSample.bounces.push_back({bp.shadeMs, bp.s2dBarrierMs, bp.shadowMs, bp.intersectMs, bp.d2sBarrierMs, bp.activeCount, bp.nextCount, bp.shadowCount});
                 }
             }
-            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, wfSample.bounces.empty() ? nullptr : &wfSample);
+            recordFrameTally(totalGpuMs, gpuRtMs, secGpuMs, gpuTonemapMs, (wfSample.bounces.empty() && wfSample.tailMegakernelMs <= 0.0) ? nullptr : &wfSample);
         }
     }
 
@@ -6735,6 +6825,8 @@ FrameStats Engine::getStats() const {
             stats.wavefront_stats.total_ms = m_lastWavefrontProfile.totalMs;
             stats.wavefront_stats.classify_ms = m_lastWavefrontProfile.classifyMs;
             stats.wavefront_stats.resolve_ms = m_lastWavefrontProfile.resolveMs;
+            stats.wavefront_stats.tail_megakernel_ms = m_lastWavefrontProfile.tailMegakernelMs;
+            stats.wavefront_stats.tail_megakernel_bounce = m_lastWavefrontProfile.tailMegakernelBounce;
             stats.wavefront_stats.queue_memory_footprint_mb = m_lastWavefrontProfile.queueMemoryFootprintMb;
             stats.wavefront_stats.estimated_vram_traffic_mb = m_lastWavefrontProfile.estimatedVramTrafficMb;
             for (const auto& bp : m_lastWavefrontProfile.bounces) {
@@ -6956,6 +7048,8 @@ FrameStats Engine::getStats() const {
             s.pipeline_stages.is_wavefront = true;
             s.pipeline_stages.classify_ms = tally.getAvgClassifyMs();
             s.pipeline_stages.primary_rays = tally.getAvgPrimaryRays();
+            s.pipeline_stages.tail_megakernel_ms = tally.getAvgTailMegakernelMs();
+            s.pipeline_stages.tail_megakernel_bounce = tally.tailMegakernelBounce;
             s.pipeline_stages.tonemap_ms = tally.getAvgTonemapMs();
             auto bounces = tally.getAvgBounces();
             for (const auto& b : bounces) {
@@ -7319,6 +7413,8 @@ void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtM
     key.upscaler = m_config.upscaler_mode;
     key.mgpu_upscale_mode = m_config.mgpu_upscale_mode;
     key.render_scale = m_config.render_scale;
+    key.enable_tail_megakernel = m_config.enable_tail_megakernel;
+    key.tail_bounce = m_config.tail_megakernel_bounce;
 
     auto updateAsMetrics = [this](ConfigStatsTally& t) {
         if (m_asManager) {
@@ -7466,14 +7562,18 @@ void Engine::printExecutionSummary() const {
                 std::string shadowStr = (b.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms", b.shadowMs)
                                       : (inlineShadowsActive ? "Shadow: Inline" : "Shadow: 0.000 ms");
                 if (b.intersectMs > 0.0001) {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, shadowStr, b.intersectMs, b.totalMs,
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | S2D: {:.3f} ms | {} | Intersect: {:.3f} ms | D2S: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.s2dBarrierMs, shadowStr, b.intersectMs, b.d2sBarrierMs, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 } else {
-                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.shadeMs, shadowStr, b.totalMs,
+                    Logger::info("      - Bounce {}: Shade: {:.3f} ms | S2D: {:.3f} ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
+                                 b.bounce, b.shadeMs, b.s2dBarrierMs, shadowStr, b.totalMs,
                                  formatRayCount(b.nextCount), pct);
                 }
+            }
+            if (tally.getAvgTailMegakernelMs() > 0.0005) {
+                Logger::info("      - Tail Megakernel (Bounces {}..{}): {:.3f} ms",
+                             tally.tailMegakernelBounce, tally.key.max_bounces, tally.getAvgTailMegakernelMs());
             }
             Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
         } else if (tally.key.pipeline_type == PipelineType::RTP) {
@@ -7514,6 +7614,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_config.enable_refraction)      flags |= (1 << 3);
     if (m_config.enable_shadows)         flags |= (1 << 4);
     if (m_sceneHasNonOpaque)             flags |= (1 << 5);
+    if (m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
     if (m_config.enable_restir_di) flags |= (1 << 9);
@@ -7583,6 +7684,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
         wfSceneData.indirectClamp = m_config.indirect_clamp;
+        wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
+        wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
         wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 0;
 
@@ -7750,6 +7853,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
         wfSceneData.indirectClamp = m_config.indirect_clamp;
+        wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
+        wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
         wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 1;
 

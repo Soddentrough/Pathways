@@ -67,6 +67,8 @@ struct Config {
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
     float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
     float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
+    bool enable_tail_megakernel = false;      // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: false, opt-in via --tail-megakernel]
+    uint32_t tail_megakernel_bounce = 2;      // Bounce at which to switch from Wavefront to Tail Megakernel (default: 2)
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI

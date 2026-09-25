@@ -401,21 +401,7 @@ void main() {
                     throughput *= diffuseColor;
 
                     float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
-                    if (pathLum < 0.001) {
-                        pathTerminated = true;
-                    } else if (bounce >= 1u) {
-                        float minP = (bounce >= 2u) ? 0.02 : 0.05;
-                        float maxP = 0.95;
-                        float p = clamp(pathLum, minP, maxP);
-                        if (bounce >= 2u && pathLum >= 0.35) {
-                            p = clamp(pathLum * 0.85, minP, 0.90);
-                        }
-                        if (randFloat(seed) > p) {
-                            pathTerminated = true;
-                        } else {
-                            throughput /= p;
-                        }
-                    }
+                    pathTerminated = applyRussianRoulette(throughput, pathLum, bounce, seed);
 
                     if (!pathTerminated) {
                         survivesToNext = true;
