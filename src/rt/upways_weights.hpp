@@ -1,7 +1,6 @@
 #pragma once
 
 // Auto-generated Upways Wave32 WMMA KPN Reconstructor FP16 Weights Header
-// Target: 32 -> 128 -> 32 Multi-Scale Kernel Prediction Network
 // Matching shaders/compute/neural_reconstruct.comp
 #include <cstdint>
 
@@ -11,7 +10,7 @@ struct KPNWeightsBuffer {
     uint16_t w_l1[32 * 128]; // Offset 0, 8192 bytes
     uint16_t w_l2[128 * 32]; // Offset 8192, 8192 bytes
     uint16_t b_l1[128];      // Offset 16384, 256 bytes
-    uint16_t b_l2[32];       // Offset 16640, 64 bytes
+    uint16_t b_l2[32];      // Offset 16640, 64 bytes
 };
 
 constexpr uint32_t KPN_W_L1_OFFSET = 0;
@@ -36,7 +35,7 @@ struct LayerDescriptor {
     uint32_t stride;
 };
 
-// Layer: fc1 (32 -> 128)
+// Layer: fc1
 inline constexpr LayerDescriptor LAYER_FC1 = {
     .weightOffset = KPN_W_L1_OFFSET,
     .weightSize   = KPN_W_L1_SIZE,
@@ -47,7 +46,7 @@ inline constexpr LayerDescriptor LAYER_FC1 = {
     .stride       = 128
 };
 
-// Layer: fc2 (128 -> 32)
+// Layer: fc2
 inline constexpr LayerDescriptor LAYER_FC2 = {
     .weightOffset = KPN_W_L2_OFFSET,
     .weightSize   = KPN_W_L2_SIZE,

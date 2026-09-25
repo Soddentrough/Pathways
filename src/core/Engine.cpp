@@ -2634,8 +2634,9 @@ void Engine::updateUpwaysDescriptors() {
         ? m_mlAlbedoRoughnessImage->getImageView()
         : (m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE));
     VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : motionView;
-    VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_accumImage->getImageView();
-    VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : m_accumImage->getImageView();
+    bool isMgpuActive = (m_mgpu && m_mgpu->isSecondaryInitialized() && m_config.mgpu_mode != MultiGpuMode::Off);
+    VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_frameImages[0]->getImageView();
+    VkImageView specView = isMgpuActive ? VK_NULL_HANDLE : (m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE);
 
     m_upwaysPipeline->updateDescriptors(
         diffView,
@@ -4614,6 +4615,9 @@ void Engine::renderFrame() {
             clearSubmit.pCommandBufferInfos = &cmdSubmitInfo;
             vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &clearSubmit, VK_NULL_HANDLE);
             vkQueueWaitIdle(m_context->getGraphicsQueue());
+            if (m_upwaysPipeline) {
+                updateUpwaysDescriptors();
+            }
         }
 
         if (m_pendingDoubleBufferChange) {
@@ -5189,7 +5193,9 @@ void Engine::renderFrame() {
             uint32_t numTilesX = (mgpuBaseW + tileSize - 1u) / tileSize;
             uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
             secDispatchWidth = maxTilesPerGpuX * tileSize;
-            bool needFullScreenPrimGbuffer = (m_config.upscaler_mode == UpscalerMode::FSR3 || m_config.denoiser_mode == DenoiserMode::Upways);
+            bool needFullScreenPrimGbuffer = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                                              m_config.upscaler_mode == UpscalerMode::Upways ||
+                                              m_config.denoiser_mode == DenoiserMode::Upways);
             primDispatchWidth = (needFullScreenPrimGbuffer && m_config.pipeline_type == PipelineType::Wavefront) ? mgpuBaseW : secDispatchWidth;
             dispatchWidth = primDispatchWidth;
             dispatchHeight = mgpuBaseH;
@@ -5491,6 +5497,31 @@ void Engine::renderFrame() {
         mergeDep.memoryBarrierCount = 1;
         mergeDep.pMemoryBarriers = &mergeBarrier;
         vkCmdPipelineBarrier2(activeCmd, &mergeDep);
+
+        // In Multi-GPU mode, copy merged FP16 radiance into m_mlDiffuseImage for Upways neural reconstruction
+        if (!skipRayTracing && m_mlDiffuseImage && (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways)) {
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            copyRegion.extent = { mgpuBaseW, mgpuBaseH, 1 };
+            vkCmdCopyImage(activeCmd, m_frameImages[slot]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                           m_mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
+
+            VkImageMemoryBarrier2 diffCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            diffCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            diffCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            diffCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            diffCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            diffCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            diffCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            diffCopyBarrier.image = m_mlDiffuseImage->getImage();
+            diffCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            VkDependencyInfo diffCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            diffCopyDep.imageMemoryBarrierCount = 1;
+            diffCopyDep.pImageMemoryBarriers = &diffCopyBarrier;
+            vkCmdPipelineBarrier2(activeCmd, &diffCopyDep);
+        }
 
         // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
         if (!skipRayTracing && m_accumRunningAvgPipeline) {

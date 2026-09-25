@@ -147,12 +147,48 @@ void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
         m_allocator,
         bufferSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_CPU_TO_GPU
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
+
+    // Pre-tile FC1 (32x128) and FC2 (128x32) into contiguous 16x16 tiles for Wave32 WMMA with stride 16
+    std::vector<uint8_t> tiledBytes(upways::TOTAL_WEIGHT_BUFFER_SIZE, 0);
+    const uint16_t* srcW1 = reinterpret_cast<const uint16_t*>(weightBytes.data() + upways::KPN_W_L1_OFFSET);
+    const uint16_t* srcW2 = reinterpret_cast<const uint16_t*>(weightBytes.data() + upways::KPN_W_L2_OFFSET);
+    uint16_t* dstW1 = reinterpret_cast<uint16_t*>(tiledBytes.data() + upways::KPN_W_L1_OFFSET);
+    uint16_t* dstW2 = reinterpret_cast<uint16_t*>(tiledBytes.data() + upways::KPN_W_L2_OFFSET);
+
+    // FC1: 2 row tiles x 8 col tiles of 16x16
+    for (uint32_t tr = 0; tr < 2; ++tr) {
+        for (uint32_t tc = 0; tc < 8; ++tc) {
+            uint32_t tileIdx = tr * 8 + tc;
+            for (uint32_t r = 0; r < 16; ++r) {
+                for (uint32_t c = 0; c < 16; ++c) {
+                    dstW1[tileIdx * 256 + r * 16 + c] = srcW1[(tr * 16 + r) * 128 + (tc * 16 + c)];
+                }
+            }
+        }
+    }
+
+    // FC2: 8 row tiles x 2 col tiles of 16x16
+    for (uint32_t tr = 0; tr < 8; ++tr) {
+        for (uint32_t tc = 0; tc < 2; ++tc) {
+            uint32_t tileIdx = tr * 2 + tc;
+            for (uint32_t r = 0; r < 16; ++r) {
+                for (uint32_t c = 0; c < 16; ++c) {
+                    dstW2[tileIdx * 256 + r * 16 + c] = srcW2[(tr * 16 + r) * 32 + (tc * 16 + c)];
+                }
+            }
+        }
+    }
+
+    // Biases are 1D arrays; copy verbatim
+    std::memcpy(tiledBytes.data() + upways::KPN_B_L1_OFFSET, weightBytes.data() + upways::KPN_B_L1_OFFSET, upways::KPN_B_L1_SIZE);
+    std::memcpy(tiledBytes.data() + upways::KPN_B_L2_OFFSET, weightBytes.data() + upways::KPN_B_L2_OFFSET, upways::KPN_B_L2_SIZE);
 
     void* mapped = m_weightBuffer->map();
     if (mapped) {
-        std::memcpy(mapped, weightBytes.data(), bufferSize);
+        std::memcpy(mapped, tiledBytes.data(), bufferSize);
         m_weightBuffer->unmap();
     }
 }
@@ -170,6 +206,13 @@ void UpwaysPipeline::initImages() {
         m_inputWidth, m_inputHeight,
         VK_FORMAT_R16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+
+    m_dummyBlackImage = std::make_unique<Image>(
+        m_device, m_allocator,
+        m_inputWidth, m_inputHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
     for (int i = 0; i < 2; ++i) {
@@ -229,6 +272,22 @@ void UpwaysPipeline::transitionInitialLayouts(VkCommandBuffer cmd) {
             cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
+
+    if (m_dummyBlackImage) {
+        m_dummyBlackImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+        VkClearColorValue clearZero = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+        VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, m_dummyBlackImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+        m_dummyBlackImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
 
@@ -356,7 +415,7 @@ void UpwaysPipeline::updateDescriptors(
 ) {
     if (!m_outputImage || !m_weightBuffer) return;
 
-    VkImageView fallbackView = m_outputImage->getImageView();
+    VkImageView fallbackView = m_dummyBlackImage ? m_dummyBlackImage->getImageView() : m_outputImage->getImageView();
     VkImageView dDiffView = (demodDiffuseView != VK_NULL_HANDLE) ? demodDiffuseView : fallbackView;
     VkImageView dSpecView = (demodSpecularView != VK_NULL_HANDLE) ? demodSpecularView : fallbackView;
     VkImageView ndView    = (normalDepthView != VK_NULL_HANDLE) ? normalDepthView : fallbackView;

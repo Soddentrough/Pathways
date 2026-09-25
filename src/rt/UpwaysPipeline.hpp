@@ -153,6 +153,7 @@ private:
     std::unique_ptr<Buffer> m_weightBuffer;
     std::unique_ptr<Image> m_outputImage;
     std::unique_ptr<Image> m_confidenceImage;
+    std::unique_ptr<Image> m_dummyBlackImage;
     std::unique_ptr<Image> m_diffHistoryImages[2];
     std::unique_ptr<Image> m_specHistoryImages[2];
     std::unique_ptr<Image> m_normHistoryImages[2];

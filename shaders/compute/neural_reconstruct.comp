@@ -59,10 +59,10 @@ layout(push_constant) uniform Uniforms {
     uint  u_TotalSamples;      // 252..255
 };
 
-// Neural KPN Weights SSBO (32 -> 128 -> 32)
+// Pre-Tiled Neural KPN Weights SSBO (16 tiles of 16x16 for FC1, 16 tiles of 16x16 for FC2)
 layout(set = 0, binding = 16, std430) readonly buffer WeightsBuffer {
-    float16_t w_l1[32 * 128];
-    float16_t w_l2[128 * 32];
+    float16_t w_l1[16 * 256]; // 16 contiguous tiles of 16x16 (stride 16)
+    float16_t w_l2[16 * 256]; // 16 contiguous tiles of 16x16 (stride 16)
     float16_t b_l1[128];
     float16_t b_l2[32];
 } u_Weights;
@@ -76,17 +76,19 @@ shared uint s_rawLinearDiff_B[HALO_DIM][HALO_DIM];
 shared uint s_rawLinearSpec_RG[HALO_DIM][HALO_DIM];
 shared uint s_rawLinearSpec_B[HALO_DIM][HALO_DIM];
 
-// Halo geometry cache for analytic edge-stopping stencil
+// Halo geometry and motion cache for analytic edge-stopping stencil and MV dilation
 shared float s_haloDepth[HALO_DIM][HALO_DIM];
 shared uint  s_haloNormal_XY[HALO_DIM][HALO_DIM];
 shared uint  s_haloNormal_Z_Unused[HALO_DIM][HALO_DIM];
+shared uint  s_haloSurfaceMV[HALO_DIM][HALO_DIM];
 
 // Flat arrays for cooperative matrix input features and output logits (64 render pixels)
 shared float16_t s_neuralFeaturesFlat[64 * 32];
 shared float16_t s_renderLogitsFlat[64 * 32];
 
-// Partitioned Scratchpad: Subgroup 0 uses [0], Subgroup 1 uses [1] (Zero race condition)
-shared float16_t s_mlpScratch[2][16 * 128];
+
+// Specular confidence factor cache per render pixel
+shared float16_t s_specConf[64];
 
 // --------------------------------------------------------------------------
 // MATHEMATICAL & GEOMETRIC HELPER FUNCTIONS
@@ -103,25 +105,24 @@ float LogCompress(float val) {
     return log(1.0 + 16.0 * max(val, 0.0)) * 0.3529913; // 1.0 / ln(17)
 }
 
-// 3x3 Nearest-Depth Motion Vector Dilation (depth-gated to prevent background velocity corruption)
-vec2 GetDilatedSurfaceMV(ivec2 renderCoord) {
-    float centerDepth = imageLoad(uNormalDepth, renderCoord).w;
-    vec2 centerMV = imageLoad(uSurfaceMV, renderCoord).xy;
+// 3x3 Nearest-Depth Motion Vector Dilation evaluated entirely from LDS
+vec2 GetDilatedSurfaceMV_LDS(int cx, int cy) {
+    float centerDepth = s_haloDepth[cy][cx];
+    vec2 centerMV = unpackFloat2x16(s_haloSurfaceMV[cy][cx]);
     if (centerDepth <= 0.0 || centerDepth >= 10000.0) return centerMV;
 
     float minDepth = centerDepth;
     vec2 bestMV = centerMV;
 
-    [[unroll]]
     for (int dy = -1; dy <= 1; ++dy) {
-        [[unroll]]
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue;
-            ivec2 c = clamp(renderCoord + ivec2(dx, dy), ivec2(0), ivec2(u_RenderRes) - 1);
-            float d = imageLoad(uNormalDepth, c).w;
+            int hy = cy + dy;
+            int hx = cx + dx;
+            float d = s_haloDepth[hy][hx];
             if (d > 0.0 && d < minDepth) {
                 minDepth = d;
-                bestMV = imageLoad(uSurfaceMV, c).xy;
+                bestMV = unpackFloat2x16(s_haloSurfaceMV[hy][hx]);
             }
         }
     }
@@ -129,11 +130,9 @@ vec2 GetDilatedSurfaceMV(ivec2 renderCoord) {
 }
 
 // Physical Virtual-Hit Specular Reprojection with Geometric Curvature
-vec2 CalculatePhysicalSpecularMV(ivec2 renderCoord, float depth, vec3 normalView, float curvature, vec2 surfaceMV, out float specConfidenceFactor) {
+vec2 CalculatePhysicalSpecularMV(ivec2 renderCoord, float depth, vec3 normalView, float curvature, vec2 surfaceMV,
+                                 vec4 specInfo, vec4 meta, float roughness, out float specConfidenceFactor) {
     vec2 uv = (vec2(renderCoord) + 0.5) / vec2(u_RenderRes);
-    vec4 specInfo = imageLoad(uSpecularMV, renderCoord);
-    vec4 meta = imageLoad(uReStirMetadata, renderCoord);
-    float roughness = imageLoad(uAlbedoRoughness, renderCoord).a;
 
     // Fast-path: if ray-traced virtual-hit motion vector is valid (from wavefront classification), prioritize it
     if (abs(specInfo.x) > 1e-6 || abs(specInfo.y) > 1e-6) {
@@ -203,6 +202,7 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
         vec4 normDepth = imageLoad(uNormalDepth, coord);
         float depth = normDepth.w;
         vec3 normal = normDepth.xyz;
+        vec2 surfMV = imageLoad(uSurfaceMV, coord).xy;
 
         s_rawLinearDiff_RG[hy][hx] = packFloat2x16(f16vec2(diff.r, diff.g));
         s_rawLinearDiff_B[hy][hx]  = packFloat2x16(f16vec2(diff.b, 0.0hf));
@@ -212,7 +212,9 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
         s_haloDepth[hy][hx] = depth;
         s_haloNormal_XY[hy][hx] = packFloat2x16(f16vec2(normal.x, normal.y));
         s_haloNormal_Z_Unused[hy][hx] = packFloat2x16(f16vec2(normal.z, 0.0hf));
+        s_haloSurfaceMV[hy][hx] = packFloat2x16(f16vec2(surfMV));
     }
+
     barrier();
 
     // Assemble 32 neural guide features per render pixel
@@ -236,25 +238,27 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
         float geomCurvature = clamp((dndx + dndy) / max(depth * 0.05, 1e-3), 0.0, 50.0);
 
         vec4 albRough = imageLoad(uAlbedoRoughness, coord);
-        vec2 surfMV = GetDilatedSurfaceMV(coord);
+        vec4 specInfo = imageLoad(uSpecularMV, coord);
+        vec4 restir   = imageLoad(uReStirMetadata, coord);
+
+        vec2 surfMV = GetDilatedSurfaceMV_LDS(int(lx) + 1, int(ly) + 1);
         float specConfidenceFactor;
-        vec2 specMV = CalculatePhysicalSpecularMV(coord, depth, normal, geomCurvature, surfMV, specConfidenceFactor);
-        vec4 restir = imageLoad(uReStirMetadata, coord);
+        vec2 specMV = CalculatePhysicalSpecularMV(coord, depth, normal, geomCurvature, surfMV,
+                                                 specInfo, restir, albRough.a, specConfidenceFactor);
+        s_specConf[tid] = float16_t(specConfidenceFactor);
 
         f16vec2 d_rg = unpackFloat2x16(s_rawLinearDiff_RG[ly + 1][lx + 1]);
         float d_b    = unpackFloat2x16(s_rawLinearDiff_B[ly + 1][lx + 1]).x;
         f16vec2 s_rg = unpackFloat2x16(s_rawLinearSpec_RG[ly + 1][lx + 1]);
         float s_b    = unpackFloat2x16(s_rawLinearSpec_B[ly + 1][lx + 1]).x;
 
-        // Compute 3x3 local radiance standard deviation for diffuse and specular (Expert B numerical safety)
+        // Compute 3x3 local radiance standard deviation for diffuse and specular
         vec3 sumDiff = vec3(0.0);
         vec3 sumSqDiff = vec3(0.0);
         vec3 sumSpec = vec3(0.0);
         vec3 sumSqSpec = vec3(0.0);
 
-        [[unroll]]
         for (int vy = -1; vy <= 1; ++vy) {
-            [[unroll]]
             for (int vx = -1; vx <= 1; ++vx) {
                 uint hy = ly + 1u + uint(vy);
                 uint hx = lx + 1u + uint(vx);
@@ -275,17 +279,17 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
         vec3 meanDiff = sumDiff / 9.0;
         vec3 varDiff  = max(sumSqDiff / 9.0 - meanDiff * meanDiff, vec3(0.0));
         float sigmaDiff = sqrt(max((varDiff.r + varDiff.g + varDiff.b) / 3.0, 0.0));
-        float normVarDiff = log(1.0 + sigmaDiff) * 0.3333333; // 1 / 3.0 (Expert B)
+        float normVarDiff = log(1.0 + sigmaDiff) * 0.3333333; // 1 / 3.0
 
         vec3 meanSpec = sumSpec / 9.0;
         vec3 varSpec  = max(sumSqSpec / 9.0 - meanSpec * meanSpec, vec3(0.0));
         float sigmaSpec = sqrt(max((varSpec.r + varSpec.g + varSpec.b) / 3.0, 0.0));
-        float normVarSpec = log(1.0 + sigmaSpec) * 0.3333333; // 1 / 3.0 (Expert B)
+        float normVarSpec = log(1.0 + sigmaSpec) * 0.3333333; // 1 / 3.0
 
         // Disparity: scale-invariant in (0, 1]
         float disparity = 0.1 / max(depth, 0.1);
 
-        // ReSTIR non-linear normalizations with bounded scaling (Expert A)
+        // ReSTIR non-linear normalizations with bounded scaling
         float mNorm = restir.x / (restir.x + 16.0);
         float wNorm = clamp(asinh(max(restir.y, 0.0)) * 0.25, 0.0, 1.0);
 
@@ -337,65 +341,50 @@ void LoadRenderTileLDS(ivec2 renderTileOrigin) {
 // --------------------------------------------------------------------------
 void EvaluateCoopMLPForBlock(uint blockIdx, uint sgIdx) {
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matIn0, matIn1;
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW0, matW1;
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAcc;
-
     uint inOffset = blockIdx * 16u * 32u;
     coopMatLoad(matIn0, s_neuralFeaturesFlat, inOffset + 0u,  32u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(matIn1, s_neuralFeaturesFlat, inOffset + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
 
-    // Layer 1: 32 -> 128
-    [[unroll]]
-    for (uint col = 0; col < 8u; ++col) {
-        matAcc = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopMatLoad(matW0, u_Weights.w_l1, (0u * 128u)  + (col * 16u), 128u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matW1, u_Weights.w_l1, (16u * 128u) + (col * 16u), 128u, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matOut0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matOut1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
-        matAcc = coopMatMulAdd(matIn0, matW0, matAcc);
-        matAcc = coopMatMulAdd(matIn1, matW1, matAcc);
+    // Stream 8 hidden tiles entirely in registers: ZERO LDS, ZERO BARRIERS
+    for (uint k = 0u; k < 8u; ++k) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW1_0, matW1_1;
+        coopMatLoad(matW1_0, u_Weights.w_l1, k * 256u,        16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matW1_1, u_Weights.w_l1, (8u + k) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
 
-        // Store into subgroup-exclusive scratchpad (stride 128)
-        coopMatStore(matAcc, s_mlpScratch[sgIdx], col * 16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matH = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        matH = coopMatMulAdd(matIn0, matW1_0, matH);
+        matH = coopMatMulAdd(matIn1, matW1_1, matH);
+
+        // Apply LeakyReLU directly in registers and chain into MatrixUseA (B1 is zero)
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matH_act;
+        [[unroll]]
+        for (uint i = 0u; i < 8u; ++i) {
+            float16_t v = matH[i];
+            matH_act[i] = (v > 0.0hf) ? v : (v * float16_t(0.1));
+        }
+
+        // Accumulate into Layer 2 outputs (Out0: cols 0..15, Out1: cols 16..31)
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW2_0, matW2_1;
+        coopMatLoad(matW2_0, u_Weights.w_l2, (2u * k + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matW2_1, u_Weights.w_l2, (2u * k + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+        matOut0 = coopMatMulAdd(matH_act, matW2_0, matOut0);
+        matOut1 = coopMatMulAdd(matH_act, matW2_1, matOut1);
     }
-    subgroupBarrier();
 
-    // Bias + LeakyReLU executed in parallel across the subgroup's 32 threads
+    // Store final Layer 2 outputs
+    uint outOffset = blockIdx * 16u * 32u;
+    coopMatStore(matOut0, s_renderLogitsFlat, outOffset + 0u,  32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matOut1, s_renderLogitsFlat, outOffset + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+
+    // Layer 2 Bias addition (512 elements per block: 16 pixels * 32 logits)
     uint sLane = gl_SubgroupInvocationID;
-    if (sLane < 16u) {
-        [[unroll]]
-        for (uint i = 0; i < 128u; ++i) {
-            uint idx = sLane * 128u + i;
-            float16_t val = s_mlpScratch[sgIdx][idx] + u_Weights.b_l1[i];
-            s_mlpScratch[sgIdx][idx] = (val > 0.0hf) ? val : (val * float16_t(0.1));
-        }
-    }
-    subgroupBarrier();
-
-    // Layer 2: 128 -> 32
-    [[unroll]]
-    for (uint col = 0; col < 2u; ++col) {
-        matAcc = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        [[unroll]]
-        for (uint k = 0; k < 8u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matH;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW;
-            coopMatLoad(matH, s_mlpScratch[sgIdx], k * 16u, 128u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(matW, u_Weights.w_l2, (k * 16u * 32u) + (col * 16u), 32u, gl_CooperativeMatrixLayoutRowMajor);
-            matAcc = coopMatMulAdd(matH, matW, matAcc);
-        }
-
-        uint outOffset = blockIdx * 16u * 32u + col * 16u;
-        coopMatStore(matAcc, s_renderLogitsFlat, outOffset, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupBarrier();
-
-    // Bias addition for Layer 2 output
-    if (sLane < 16u) {
-        [[unroll]]
-        for (uint i = 0; i < 32u; ++i) {
-            uint idx = blockIdx * 16u * 32u + sLane * 32u + i;
-            s_renderLogitsFlat[idx] += u_Weights.b_l2[i];
-        }
+    for (uint elem = sLane; elem < 512u; elem += 32u) {
+        uint col = elem % 32u;
+        s_renderLogitsFlat[outOffset + elem] += u_Weights.b_l2[col];
     }
 }
 
@@ -429,6 +418,7 @@ void main() {
             ivec2 outCoord = displayTileOrigin + ivec2(lx_d + dx_sub, ly_d + dy_sub);
             if (any(greaterThanEqual(outCoord, ivec2(u_DisplayRes)))) continue;
 
+
             vec2 displayUV = (vec2(outCoord) + 0.5) / vec2(u_DisplayRes);
 
             // A. Exact Continuous Phase Mapping
@@ -440,6 +430,24 @@ void main() {
             ivec2 localBaseForRadiance = tapBase - renderTileOrigin;
             ivec2 localBaseForLogits   = clamp(localBaseForRadiance, ivec2(0), ivec2(7));
             uint renderIdx = uint(localBaseForLogits.y * 8 + localBaseForLogits.x);
+            uint baseFeat  = renderIdx * 32u;
+
+            // Fetch pre-computed surface MV, specular MV, roughness, spec confidence from LDS (Zero VRAM traffic)
+            vec2 v_surf      = vec2(s_neuralFeaturesFlat[baseFeat + 14u], s_neuralFeaturesFlat[baseFeat + 15u]);
+            vec2 v_spec      = vec2(s_neuralFeaturesFlat[baseFeat + 16u], s_neuralFeaturesFlat[baseFeat + 17u]);
+            float roughAtTap = float(s_neuralFeaturesFlat[baseFeat + 13u]);
+            float specConf   = float(s_specConf[renderIdx]);
+
+            // PREFETCH HISTORY TEXTURES (Overlap memory latency with subsequent VALU math)
+            vec2 prevUV_diff = displayUV - v_surf;
+            vec2 prevUV_spec = displayUV - v_spec;
+
+            bool inBoundsDiff = all(greaterThanEqual(prevUV_diff, vec2(0.0))) && all(lessThanEqual(prevUV_diff, vec2(1.0)));
+            bool inBoundsSpec = all(greaterThanEqual(prevUV_spec, vec2(0.0))) && all(lessThanEqual(prevUV_spec, vec2(1.0)));
+
+            vec4 histDiffSample = inBoundsDiff ? texture(uHistoryLinearDiff, prevUV_diff) : vec4(0.0);
+            vec4 histSpecSample = inBoundsSpec ? texture(uHistoryLinearSpec, prevUV_spec) : vec4(0.0);
+            vec4 histNormSample = inBoundsDiff ? texture(uHistoryWorldNormal, prevUV_diff) : vec4(0.0);
 
             // B. Extract Logits with Center-Tap Structural Prior
             float diffLogits[9];
@@ -449,15 +457,15 @@ void main() {
             [[unroll]]
             for (int k = 0; k < 9; ++k) {
                 float centerBiasAdj = (k == 4) ? -1.8 : 0.0;
-                diffLogits[k] = float(s_renderLogitsFlat[renderIdx * 32u + k]) + centerBiasAdj;
-                specLogits[k] = float(s_renderLogitsFlat[renderIdx * 32u + 9u + k]) + centerBiasAdj;
+                diffLogits[k] = float(s_renderLogitsFlat[baseFeat + k]) + centerBiasAdj;
+                specLogits[k] = float(s_renderLogitsFlat[baseFeat + 9u + k]) + centerBiasAdj;
                 maxL_d = max(maxL_d, diffLogits[k]);
                 maxL_s = max(maxL_s, specLogits[k]);
             }
 
             // Learned Temporal Alpha and Anisotropic Phase Warping Logits
-            float rawAlphaLogit = float(s_renderLogitsFlat[renderIdx * 32u + 18u]);
-            float rawAnisoLogit = float(s_renderLogitsFlat[renderIdx * 32u + 19u]);
+            float rawAlphaLogit = float(s_renderLogitsFlat[baseFeat + 18u]);
+            float rawAnisoLogit = float(s_renderLogitsFlat[baseFeat + 19u]);
             float alphaBase = clamp((1.0 / (1.0 + exp(-rawAlphaLogit))) * 0.12, 0.02, 0.25);
             float kappaAniso = tanh(rawAnisoLogit);
 
@@ -475,17 +483,24 @@ void main() {
             vec2 t2D = (normLen > 1e-4) ? vec2(-norm2D.y, norm2D.x) / normLen : vec2(1.0, 0.0);
             vec2 n2D = (normLen > 1e-4) ? norm2D / normLen : vec2(0.0, 1.0);
             float scaleTangent = exp(-kappaAniso);
-            float scaleNormal  = exp(+kappaAniso);
+            float scaleNormal  = 1.0 / max(scaleTangent, 1e-4);
 
+            // D. Unified Spatial Filtering & Convolution in LINEAR RADIANCE SPACE (Flux-Conserving)
+            vec3 spatialLinearDiff = vec3(0.0);
+            vec3 spatialLinearSpec = vec3(0.0);
+            vec3 centerDiff = vec3(0.0);
+            vec3 centerSpec = vec3(0.0);
+            vec3 minDiff = vec3(1e30);
+            vec3 maxDiff = vec3(0.0);
+            vec3 minSpec = vec3(1e30);
+            vec3 maxSpec = vec3(0.0);
             float sumW_d = 0.0, sumW_s = 0.0;
-            float w_d[9], w_s[9];
             int tapIndex = 0;
 
             [[unroll]]
             for (int ty = -1; ty <= 1; ++ty) {
                 [[unroll]]
                 for (int tx = -1; tx <= 1; ++tx) {
-                    // Exact Displacement from continuous query position r_p warped along edge tangent
                     vec2 tapOffset = vec2(tx, ty) - phase;
                     float dt = dot(tapOffset, t2D) * scaleTangent;
                     float dn = dot(tapOffset, n2D) * scaleNormal;
@@ -501,100 +516,44 @@ void main() {
 
                     // Bilateral edge-stopping: protects geometric silhouettes
                     float depthDiff = abs(tapDepth - centerDepth) / max(centerDepth * 0.10, 1e-3);
-                    float geomWeight = exp(-depthDiff) * pow(max(dot(centerNormal, tapNormal), 0.0), 8.0);
+                    float nd = max(dot(centerNormal, tapNormal), 0.0);
+                    nd *= nd; nd *= nd; nd *= nd; // pow(nd, 8.0) on VALU
 
-                    // Combine Neural Logit + Anisotropic Continuous Phase Attenuation + Bilateral Geometry
-                    float phaseAtten = exp(-distSq * 2.0);
-                    w_d[tapIndex] = exp(diffLogits[tapIndex] - maxL_d) * phaseAtten * geomWeight;
-                    w_s[tapIndex] = exp(specLogits[tapIndex] - maxL_s) * phaseAtten * geomWeight;
-
-                    sumW_d += w_d[tapIndex];
-                    sumW_s += w_s[tapIndex];
-                    tapIndex++;
-                }
-            }
-
-            // Normalize Convex Weights (Sum = 1.0, all w_i >= 0.0) with Underflow Protection
-            if (sumW_d < 1e-5) {
-                [[unroll]] for (int k = 0; k < 9; ++k) w_d[k] = 0.0;
-                w_d[4] = 1.0;
-            } else {
-                float invSum_d = 1.0 / sumW_d;
-                [[unroll]] for (int k = 0; k < 9; ++k) w_d[k] *= invSum_d;
-            }
-            if (sumW_s < 1e-5) {
-                [[unroll]] for (int k = 0; k < 9; ++k) w_s[k] = 0.0;
-                w_s[4] = 1.0;
-            } else {
-                float invSum_s = 1.0 / sumW_s;
-                [[unroll]] for (int k = 0; k < 9; ++k) w_s[k] *= invSum_s;
-            }
-
-            // D. Spatial Convolution in LINEAR RADIANCE SPACE (Flux-Conserving)
-            vec3 spatialLinearDiff = vec3(0.0);
-            vec3 spatialLinearSpec = vec3(0.0);
-            vec3 minDiff = vec3(1e30);
-            vec3 maxDiff = vec3(0.0);
-            vec3 minSpec = vec3(1e30);
-            vec3 maxSpec = vec3(0.0);
-            tapIndex = 0;
-
-            [[unroll]]
-            for (int ty = -1; ty <= 1; ++ty) {
-                [[unroll]]
-                for (int tx = -1; tx <= 1; ++tx) {
-                    int hx = clamp(localBaseForRadiance.x + 1 + tx, 0, int(HALO_DIM) - 1);
-                    int hy = clamp(localBaseForRadiance.y + 1 + ty, 0, int(HALO_DIM) - 1);
+                    // Combined exponential: exp(diffLogits - maxL_d) * exp(-distSq * 2.0) * exp(-depthDiff)
+                    float exp_d = (diffLogits[tapIndex] - maxL_d) - (distSq * 2.0 + depthDiff);
+                    float exp_s = (specLogits[tapIndex] - maxL_s) - (distSq * 2.0 + depthDiff);
+                    float unnorm_w_d = (exp_d < -20.0) ? 0.0 : (exp(exp_d) * nd);
+                    float unnorm_w_s = (exp_s < -20.0) ? 0.0 : (exp(exp_s) * nd);
 
                     f16vec2 rg_d = unpackFloat2x16(s_rawLinearDiff_RG[hy][hx]);
                     float   b_d  = unpackFloat2x16(s_rawLinearDiff_B[hy][hx]).x;
                     f16vec2 rg_s = unpackFloat2x16(s_rawLinearSpec_RG[hy][hx]);
                     float   b_s  = unpackFloat2x16(s_rawLinearSpec_B[hy][hx]).x;
 
-                    vec3 tapDiff = vec3(rg_d.xy, b_d);
-                    vec3 tapSpec = vec3(rg_s.xy, b_s);
+                    vec3 tapDiff = min(vec3(rg_d.xy, b_d), vec3(65000.0));
+                    vec3 tapSpec = min(vec3(rg_s.xy, b_s), vec3(65000.0));
 
-                    // Local spatial firefly clamp: bounds raw sample to maximum FP16 range
-                    tapDiff = min(tapDiff, vec3(65000.0));
-                    tapSpec = min(tapSpec, vec3(65000.0));
+                    if (tx == 0 && ty == 0) {
+                        centerDiff = tapDiff;
+                        centerSpec = tapSpec;
+                    }
 
                     minDiff = min(minDiff, tapDiff);
                     maxDiff = max(maxDiff, tapDiff);
                     minSpec = min(minSpec, tapSpec);
                     maxSpec = max(maxSpec, tapSpec);
 
-                    spatialLinearDiff += w_d[tapIndex] * tapDiff;
-                    spatialLinearSpec += w_s[tapIndex] * tapSpec;
+                    spatialLinearDiff += unnorm_w_d * tapDiff;
+                    spatialLinearSpec += unnorm_w_s * tapSpec;
+                    sumW_d += unnorm_w_d;
+                    sumW_s += unnorm_w_s;
+
                     tapIndex++;
                 }
             }
 
-            // E. Decoupled Display-Resolution Temporal Reprojection
-            ivec2 centerRenderCoord = clamp(tapBase, ivec2(0), ivec2(u_RenderRes) - 1);
-            vec2 v_surf = GetDilatedSurfaceMV(centerRenderCoord);
-
-            // Compute geometric curvature at center tap for specular reprojection
-            f16vec2 n_r_c = unpackFloat2x16(s_haloNormal_XY[hy_base][hx_base + 1]);
-            f16vec2 n_l_c = unpackFloat2x16(s_haloNormal_XY[hy_base][hx_base - 1]);
-            f16vec2 n_t_c = unpackFloat2x16(s_haloNormal_XY[hy_base + 1][hx_base]);
-            f16vec2 n_b_c = unpackFloat2x16(s_haloNormal_XY[hy_base - 1][hx_base]);
-            float dndx_c = length(n_r_c - n_l_c) * 0.5;
-            float dndy_c = length(n_t_c - n_b_c) * 0.5;
-            float centerCurvature = clamp((dndx_c + dndy_c) / max(centerDepth * 0.05, 1e-3), 0.0, 50.0);
-
-            float specConf;
-            vec2 v_spec = CalculatePhysicalSpecularMV(centerRenderCoord,
-                                                    centerDepth, centerNormal, centerCurvature, v_surf, specConf);
-
-            vec2 prevUV_diff = displayUV - v_surf;
-            vec2 prevUV_spec = displayUV - v_spec;
-
-            bool inBoundsDiff = all(greaterThanEqual(prevUV_diff, vec2(0.0))) && all(lessThanEqual(prevUV_diff, vec2(1.0)));
-            bool inBoundsSpec = all(greaterThanEqual(prevUV_spec, vec2(0.0))) && all(lessThanEqual(prevUV_spec, vec2(1.0)));
-
-            vec4 histDiffSample = inBoundsDiff ? texture(uHistoryLinearDiff, prevUV_diff) : vec4(0.0);
-            vec4 histSpecSample = inBoundsSpec ? texture(uHistoryLinearSpec, prevUV_spec) : vec4(0.0);
-            vec4 histNormSample = inBoundsDiff ? texture(uHistoryWorldNormal, prevUV_diff) : vec4(0.0);
+            spatialLinearDiff = (sumW_d < 1e-5) ? centerDiff : (spatialLinearDiff / sumW_d);
+            spatialLinearSpec = (sumW_s < 1e-5) ? centerSpec : (spatialLinearSpec / sumW_s);
 
             // Bounded linear radiance with local neighborhood clamping (suppresses outliers and boiling)
             vec3 boxPadDiff = (maxDiff - minDiff) * 0.80 + vec3(0.06);
@@ -624,31 +583,24 @@ void main() {
             float confDiff = rejectDiff ? 0.0 : (depthConf * normalConf);
             float confSpec = rejectSpec ? 0.0 : (confDiff * specConf);
 
-            // G. Linear Adaptive Blending with Roughness-Dependent Specular Alpha Floor (Expert A & B)
-            float roughAtTap = imageLoad(uAlbedoRoughness, centerRenderCoord).a;
+            // G. Linear Adaptive Blending with Roughness-Dependent Specular Alpha Floor
             float specAlphaFloor = mix(0.10, 0.05, smoothstep(0.0, 0.25, roughAtTap));
             float mvDivDisplay = clamp(length(v_surf - v_spec), 0.0, 1.0);
             specAlphaFloor = max(specAlphaFloor, 0.15 * mvDivDisplay);
 
-            // Under progressive accumulation (stationary camera, multiple samples accumulated),
-            // take the fresh converged sample directly to prevent lag/drift.
             float alphaDiff = (u_TotalSamples > 1u) ? 1.0 : mix(1.0, alphaBase, confDiff);
             float alphaSpec = (u_TotalSamples > 1u) ? 1.0 : mix(1.0, clamp(alphaBase * 2.0 + 0.02, specAlphaFloor, 0.45), confSpec);
 
             vec3 resolvedLinearDiff = mix(histDiff, spatialLinearDiff, alphaDiff);
             vec3 resolvedLinearSpec = mix(histSpec, spatialLinearSpec, alphaSpec);
 
-            // In Pathways, diffuse input is already modulated diffuse radiance (irradiance * albedo)
-            // Combine resolved diffuse and specular components directly (matching KPNReconstructor)
             vec3 finalHDR = resolvedLinearDiff + resolvedLinearSpec;
 
-            // NaN/Inf Guard
             if (any(isnan(finalHDR)) || any(isinf(finalHDR))) {
                 finalHDR = spatialLinearDiff + spatialLinearSpec;
             }
             finalHDR = clamp(finalHDR, vec3(0.0), vec3(65000.0));
 
-            // Cold / disoccluded pixels initialize strictly to Age = 0.0 (Expert A & B consensus)
             float prevAge = histNormSample.a;
             float newAge = rejectDiff ? 0.0 : min(prevAge + 1.0, 64.0);
 
