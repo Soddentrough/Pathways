@@ -890,7 +890,6 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
                      data.dielectricBoundsMax.x, data.dielectricBoundsMax.y, data.dielectricBoundsMax.z);
     }
 
-    glm::vec3 center = (minBound + maxBound) * 0.5f;
     glm::vec3 extent = maxBound - minBound;
     float fullDiag = glm::length(extent);
     float maxDim = std::max({extent.x, extent.y, extent.z});
