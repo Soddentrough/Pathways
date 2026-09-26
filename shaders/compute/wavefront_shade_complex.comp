@@ -147,7 +147,7 @@ layout(std430, binding = 32) buffer ReSTIRReservoirsBuffer {
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
-#define ENABLE_INLINE_SHADOWS 0
+#define ENABLE_INLINE_SHADOWS 1
 #endif
 
 #if ENABLE_INLINE_SHADOWS
@@ -469,40 +469,53 @@ void main() {
                         f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, pc.indirectClamp);
 
                         if (length(unshadowed) > float16_t(1e-5)) {
-                            if (enableShadows) {
-                                vec3 shadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
-#if ENABLE_INLINE_SHADOWS
-                                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
-                                if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                    bool occluded = traceShadowRayInline(shadowOrigin, lightDir, lightDist,
-                                                                         (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                    if (!occluded) {
-                                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
-                                        if (pc.captureMlData != 0u) {
-                                            if (isSpecularPath) {
-                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
-                                            } else {
-                                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
-                                            }
-                                        }
-                                    } else {
-                                        secDirectL = f16vec3(0.0);
-                                    }
-                                } else
-#endif
-                                {
-                                    hasShadowRay = true;
-                                    shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                            bool keepShadow = true;
+                            if (bounce >= 1u) {
+                                float lum = float(dot(unshadowed, f16vec3(0.2126, 0.7152, 0.0722)));
+                                float maxP = (bounce == 1u) ? 0.5 : (bounce == 2u ? 0.125 : 0.03125);
+                                float prob = clamp(lum * 2.0, 0.02, maxP);
+                                if (randFloat(seed) < prob) {
+                                    unshadowed /= float16_t(prob);
+                                } else {
+                                    keepShadow = false;
                                 }
-                            } else {
-                                ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                vec4 prev = imageLoad(uAccumImage, pCoord);
-                                imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                            }
+                            if (keepShadow) {
+                                if (enableShadows) {
+                                    vec3 shadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
+#if ENABLE_INLINE_SHADOWS
+                                    bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
+                                    if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                        bool occluded = traceShadowRayInline(shadowOrigin, lightDir, lightDist,
+                                                                             (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                        if (!occluded) {
+                                            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                            if (pc.captureMlData != 0u) {
+                                                if (isSpecularPath) {
+                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
+                                                } else {
+                                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), 0.0));
+                                                }
+                                            }
+                                        } else {
+                                            secDirectL = f16vec3(0.0);
+                                        }
+                                    } else
+#endif
+                                    {
+                                        hasShadowRay = true;
+                                        shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
+                                        shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                                    }
+                                } else {
+                                    ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                    vec4 prev = imageLoad(uAccumImage, pCoord);
+                                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                }
                             }
                         }
                     }
@@ -512,7 +525,7 @@ void main() {
             // Direct Lighting (Stochastic NEE with ReSTIR DI and Alias Table)
             f16vec3 secDirectL = f16vec3(0.0);
             if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
-                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
                 uint selectedLightIdx = 0u;
@@ -743,53 +756,66 @@ void main() {
                         }
 
                         if (length(unshadowed) > float16_t(1e-5)) {
-                            if (enableShadows) {
-                                vec3 shadowOrigin = selectedIsTrans ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
-#if ENABLE_INLINE_SHADOWS
-                                if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                    bool occluded = traceShadowRayInline(shadowOrigin, selectedLightDir, selectedLightDist,
-                                                                         (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                    if (!occluded) {
-                                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
-                                        if (pc.captureMlData != 0u) {
-                                            f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
-                                            f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
-                                            if (bounce > 0u) {
-                                                diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
-                                                specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
-                                            }
-                                            if (isSpecularPath) {
-                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
-                                            } else {
-                                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), 0.0));
-                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), 0.0));
-                                            }
-                                        }
-                                    } else {
-                                        secDirectL = f16vec3(0.0);
-                                        if (enableRestirDI) {
-                                            restirReservoirs[pixelIndex].wSum = 0.0;
-                                            restirReservoirs[pixelIndex].flags_uv_age = 0u;
-                                            restirReservoirs[pixelIndex].targetPdf = 0.0;
-                                            restirReservoirs[pixelIndex].lightIndex_M = 0u;
-                                        }
-                                    }
-                                } else
-#endif
-                                {
-                                    hasShadowRay = true;
-                                    shadowCandidate.originDist = vec4(shadowOrigin, selectedLightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                            bool keepShadow = true;
+                            if (bounce >= 1u) {
+                                float lum = float(dot(unshadowed, f16vec3(0.2126, 0.7152, 0.0722)));
+                                float maxP = (bounce == 1u) ? 0.5 : (bounce == 2u ? 0.125 : 0.03125);
+                                float prob = clamp(lum * 2.0, 0.02, maxP);
+                                if (randFloat(seed) < prob) {
+                                    unshadowed /= float16_t(prob);
+                                } else {
+                                    keepShadow = false;
                                 }
-                            } else {
-                                ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                vec4 prev = imageLoad(uAccumImage, pCoord);
-                                imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                            }
+                            if (keepShadow) {
+                                if (enableShadows) {
+                                    vec3 shadowOrigin = selectedIsTrans ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
+#if ENABLE_INLINE_SHADOWS
+                                    if (enableInlineShadows && pc.useHardwareRT == 1u) {
+                                        bool occluded = traceShadowRayInline(shadowOrigin, selectedLightDir, selectedLightDist,
+                                                                             (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                        if (!occluded) {
+                                            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                            if (pc.captureMlData != 0u) {
+                                                f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
+                                                f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
+                                                if (bounce > 0u) {
+                                                    diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
+                                                    specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
+                                                }
+                                                if (isSpecularPath) {
+                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
+                                                } else {
+                                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), 0.0));
+                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), 0.0));
+                                                }
+                                            }
+                                        } else {
+                                            secDirectL = f16vec3(0.0);
+                                            if (enableRestirDI) {
+                                                restirReservoirs[pixelIndex].wSum = 0.0;
+                                                restirReservoirs[pixelIndex].flags_uv_age = 0u;
+                                                restirReservoirs[pixelIndex].targetPdf = 0.0;
+                                                restirReservoirs[pixelIndex].lightIndex_M = 0u;
+                                            }
+                                        }
+                                    } else
+#endif
+                                    {
+                                        hasShadowRay = true;
+                                        shadowCandidate.originDist = vec4(shadowOrigin, selectedLightDist);
+                                        shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                                    }
+                                } else {
+                                    ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                    vec4 prev = imageLoad(uAccumImage, pCoord);
+                                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                }
                             }
                         }
                     }

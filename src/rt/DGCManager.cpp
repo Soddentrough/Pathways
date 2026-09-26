@@ -209,6 +209,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
+    genInfo.sequenceCountAddress = sequenceCountAddress;
     pfn_vkCmdPreprocessGeneratedCommandsEXT(cmd, &genInfo, cmd);
 }
 

@@ -61,17 +61,17 @@ for scene_entry in "${SCENES[@]}"; do
             if ${CMD} > "${TMP_OUT}" 2>&1; then
                 cat "${TMP_OUT}" >> "${LOG_FILE}"
                 
-                # Extract key metrics from stdout
-                FRAME_TIME=$(grep -m 1 "Average Frame Time:" "${TMP_OUT}" | awk '{print $4}' || echo "N/A")
-                FPS=$(grep -m 1 "Average Frame Time:" "${TMP_OUT}" | awk -F'(' '{print $2}' | awk '{print $1}' || echo "N/A")
-                THROUGHPUT=$(grep -m 1 "Ray Throughput:" "${TMP_OUT}" | awk '{print $3}' || echo "N/A")
-                PRIMARY=$(grep -m 1 "Classify (Primary RayGen):" "${TMP_OUT}" | awk '{print $4}' || echo "0.0")
-                TONEMAP=$(grep -m 1 "Tonemap / Resolve:" "${TMP_OUT}" | awk '{print $4}' || echo "0.0")
+                # Extract key metrics from STATS_JSON using jq
+                FRAME_TIME=$(jq -r '.performance.avg_frame_time_ms // "N/A"' "${STATS_JSON}")
+                FPS=$(jq -r '.performance.avg_fps // "N/A"' "${STATS_JSON}")
+                THROUGHPUT=$(jq -r '.performance.gigarays_per_second // "N/A"' "${STATS_JSON}")
+                PRIMARY=$(jq -r '.performance.configurations_breakdown[0].pipeline_stages_ms.classify_ms // 0.0' "${STATS_JSON}")
+                TONEMAP=$(jq -r '.performance.configurations_breakdown[0].pipeline_stages_ms.tonemap_ms // 0.0' "${STATS_JSON}")
 
                 # Sum shade, shadow, intersect across all bounces
-                SHADE_SUM=$(awk '/- Bounce [0-9]+:.*Shade:/ { for (i=1; i<=NF; i++) if ($i=="Shade:") print $(i+1) }' "${TMP_OUT}" | awk '{s+=$1} END {printf "%.3f", s}')
-                SHADOW_SUM=$(awk '/- Bounce [0-9]+:.*Shadow:/ { for (i=1; i<=NF; i++) if ($i=="Shadow:") print $(i+1) }' "${TMP_OUT}" | awk '{s+=$1} END {printf "%.3f", s}')
-                INTERSECT_SUM=$(awk '/- Bounce [0-9]+:.*Intersect:/ { for (i=1; i<=NF; i++) if ($i=="Intersect:") print $(i+1) }' "${TMP_OUT}" | awk '{s+=$1} END {printf "%.3f", s}')
+                SHADE_SUM=$(jq -r '[.performance.configurations_breakdown[0].pipeline_stages_ms.bounces[]?.shade_ms] | add // 0.0' "${STATS_JSON}")
+                SHADOW_SUM=$(jq -r '[.performance.configurations_breakdown[0].pipeline_stages_ms.bounces[]?.shadow_ms] | add // 0.0' "${STATS_JSON}")
+                INTERSECT_SUM=$(jq -r '[.performance.configurations_breakdown[0].pipeline_stages_ms.bounces[]?.intersect_ms] | add // 0.0' "${STATS_JSON}")
 
                 echo "${FRAME_TIME} ms (${FPS} FPS, ${THROUGHPUT} GigaRays/s)"
                 echo "${SCENE_NAME},${RES_NAME},${MODE_NAME},${FRAME_TIME},${FPS},${THROUGHPUT},${PRIMARY},${SHADE_SUM},${SHADOW_SUM},${INTERSECT_SUM},${TONEMAP}" >> "${RESULTS_CSV}"

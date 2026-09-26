@@ -415,6 +415,7 @@ GpuDeviceNode::~GpuDeviceNode() {
         if (secSemaphores[i]) vkDestroySemaphore(device, secSemaphores[i], nullptr);
         cameraUBOs[i].reset();
     }
+    if (secTimelineSemaphore) vkDestroySemaphore(device, secTimelineSemaphore, nullptr);
     if (rtDescLayout) vkDestroyDescriptorSetLayout(device, rtDescLayout, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
@@ -481,6 +482,10 @@ MultiGpuManager::~MultiGpuManager() {
                     vkDestroySemaphore(primDevice, m_devices[0]->primImportedSemaphores[i], nullptr);
                     m_devices[0]->primImportedSemaphores[i] = VK_NULL_HANDLE;
                 }
+            }
+            if (m_devices[0]->primImportedTimelineSemaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(primDevice, m_devices[0]->primImportedTimelineSemaphore, nullptr);
+                m_devices[0]->primImportedTimelineSemaphore = VK_NULL_HANDLE;
             }
         }
     }
@@ -1054,11 +1059,49 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secNode->exportedFd[i] = -1;
         secNode->slotFdReady[i] = false;
     }
-    Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd (zero-wait GPU-to-GPU pipelining).");
+    // Permanent Cross-GPU Hardware Timeline Semaphore (VK_KHR_external_semaphore_fd + VK_SEMAPHORE_TYPE_TIMELINE)
+    VkSemaphoreTypeCreateInfo timelineTypeSec{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    timelineTypeSec.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineTypeSec.initialValue = 0;
+
+    VkExportSemaphoreCreateInfo exportTimelineInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+    exportTimelineInfo.pNext = &timelineTypeSec;
+    exportTimelineInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    VkSemaphoreCreateInfo secTimelineSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    secTimelineSemInfo.pNext = &exportTimelineInfo;
+    vkCreateSemaphore(secDevice, &secTimelineSemInfo, nullptr, &secNode->secTimelineSemaphore);
+
+    VkSemaphoreGetFdInfoKHR getTimelineFdInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+    getTimelineFdInfo.semaphore = secNode->secTimelineSemaphore;
+    getTimelineFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    int timelineFd = -1;
+    secNode->context->pfnGetSemaphoreFdKHR(secDevice, &getTimelineFdInfo, &timelineFd);
+
+    VkSemaphoreTypeCreateInfo timelineTypePrim{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    timelineTypePrim.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineTypePrim.initialValue = 0;
+
+    VkSemaphoreCreateInfo primTimelineSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    primTimelineSemInfo.pNext = &timelineTypePrim;
+    vkCreateSemaphore(primDevice, &primTimelineSemInfo, nullptr, &secNode->primImportedTimelineSemaphore);
+
+    if (timelineFd >= 0) {
+        VkImportSemaphoreFdInfoKHR importTimelineFdInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+        importTimelineFdInfo.semaphore = secNode->primImportedTimelineSemaphore;
+        importTimelineFdInfo.flags = 0; // Permanent import on primary device
+        importTimelineFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        importTimelineFdInfo.fd = timelineFd;
+        m_primaryContext->pfnImportSemaphoreFdKHR(primDevice, &importTimelineFdInfo);
+        closeFileDescriptor(timelineFd);
+    }
+
+    Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd & Timeline Semaphores (zero-wait GPU-to-GPU pipelining).");
 
     // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
     uint32_t secWidth = config.width;
-    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
+                           (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
     secNode->accumTarget = std::make_unique<Image>(
         secDevice, secAlloc, secWidth, config.height,
         accumFormat,
@@ -1506,8 +1549,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     m_devices.push_back(std::move(secNode));
     m_active = true;
 
-    // Initialize zero-copy shared external memory host buffer across primary and secondary GPUs (24 bytes/pixel: Radiance + MV + Normal/Depth)
-    uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
+    // Initialize zero-copy shared external memory host buffer across primary and secondary GPUs (Radiance + MV + Normal/Depth)
+    uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 :
+                             (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(config.width) * config.height * bytesPerPixel;
     initSharedHostBuffer(bufferSize);
 }
@@ -1714,6 +1758,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
         wfSceneData.fullHeight = packet.tileHeight;
+        bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                             m_config.upscaler_mode == UpscalerMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.enable_restir_di ||
+                             m_config.enable_caustics);
+        wfSceneData.captureMlData = needGbuffers ? 2u : 0u;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, packet.cameraUniform.maxBounces, wfSceneData);
@@ -1804,7 +1854,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         // Timestamp 1: RT End
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
 
-        bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage);
+        bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                             m_config.upscaler_mode == UpscalerMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Upways);
+        bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage && needGbuffers);
 
         // Batched transition of images to TRANSFER_SRC_OPTIMAL
         std::vector<VkImageMemoryBarrier2> toTransferBarriers;
@@ -1867,7 +1920,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                                targetBuffer, 1, &copyRegion);
 
         if (copyExtraImages) {
-            uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 : 16;
+            uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
+                           (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
             VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
             VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
             VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
@@ -1930,8 +1984,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
     VkSemaphoreSubmitInfo sigInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     if (m_useCrossGpuSync) {
-        sigInfo.semaphore = node->secSemaphores[slot];
-        sigInfo.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        sigInfo.semaphore = node->secTimelineSemaphore;
+        sigInfo.value = packet.timelineValue;
+        sigInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     }
 
     VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
@@ -1942,19 +1997,6 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         submitInfo.pSignalSemaphoreInfos = &sigInfo;
     }
     vkQueueSubmit2(queue, 1, &submitInfo, node->renderFences[slot]);
-
-    // Export semaphore FD from secondary device
-    if (m_useCrossGpuSync) {
-        VkDevice secDev = node->context->getDevice();
-        VkSemaphoreGetFdInfoKHR getFdInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
-        getFdInfo.semaphore = node->secSemaphores[slot];
-        getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-        int fd = -1;
-        VkResult res = node->context->pfnGetSemaphoreFdKHR(secDev, &getFdInfo, &fd);
-        if (res == VK_SUCCESS && fd >= 0) {
-            node->exportedFd[slot] = fd;
-        }
-    }
     node->slotHasExecuted[slot] = true;
 }
 
@@ -2023,18 +2065,12 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.enableSharpening = enableSharpening;
         m_pendingWork.sharpness = sharpness;
         m_pendingWork.totalSamples = totalSamples;
+        m_pendingWork.timelineValue = ++m_currentTimelineValue;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
         m_waitingSlot = slot;
         m_workSubmitted = false;
         m_slotSubmitted[slot] = false;
-        if (m_useCrossGpuSync && !m_devices.empty()) {
-            if (m_devices[0]->exportedFd[slot] >= 0) {
-                closeFileDescriptor(m_devices[0]->exportedFd[slot]);
-                m_devices[0]->exportedFd[slot] = -1;
-            }
-            m_devices[0]->slotFdReady[slot] = false;
-        }
 
         m_workCv.notify_one();
     }
@@ -2043,30 +2079,14 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
 void MultiGpuManager::syncAndTransfer(uint32_t slot, void* dstHostPtr, size_t byteSize) {
     if (!m_active || m_devices.empty()) return;
 
-    uint32_t s = slot % GpuDeviceNode::NUM_IN_FLIGHT;
-
     if (!m_useCrossGpuSync) {
         throw std::runtime_error("MultiGpuManager::syncAndTransfer requires hardware cross-GPU semaphore synchronization under Vulkan 1.4 baseline.");
     }
 
-    // Wait until worker thread has exported the semaphore FD for this slot
-    {
-        std::unique_lock<std::mutex> lock(m_workMutex);
-        m_submitCv.wait(lock, [this, s]() { return m_devices[0]->slotFdReady[s]; });
-    }
-    // Import FD into primary device semaphore on main thread (safe because frame N-2 fence signaled)
-    GpuDeviceNode* node = m_devices[0].get();
-    int fd = node->exportedFd[s];
-    if (fd >= 0) {
-        VkDevice primDev = m_primaryContext->getDevice();
-        VkImportSemaphoreFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
-        importInfo.semaphore = node->primImportedSemaphores[s];
-        importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
-        importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-        importInfo.fd = fd;
-        m_primaryContext->pfnImportSemaphoreFdKHR(primDev, &importInfo);
-        node->exportedFd[s] = -1;
-    }
+    // Zero-wait GPU-to-GPU pipelining:
+    // Synchronization is handled directly on GPU 0 via vkQueueSubmit2 wait on
+    // primImportedTimelineSemaphore with value getCurrentTimelineValue().
+    // No CPU blocking or per-frame FD export/import is required.
 }
 
 void MultiGpuManager::waitSecondarySlot(uint32_t slot) {
@@ -2104,8 +2124,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         VmaAllocator secAlloc = node->context->getAllocator();
         vkDeviceWaitIdle(secDevice);
 
-        uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
-        VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 :
+                                 (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
+        VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
+                               (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
         uint32_t secWidth = width;
         node->accumTarget = std::make_unique<Image>(
             secDevice, secAlloc, secWidth, height,
@@ -2251,7 +2273,7 @@ void MultiGpuManager::setConfig(const Config& config) {
                 try {
                     auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
                     auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
-                    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+                    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
                     secNode->upscaler = std::make_unique<Fsr3Upscaler>(
                         secNode->context->getDevice(),
                         secNode->context->getPhysicalDevice(),

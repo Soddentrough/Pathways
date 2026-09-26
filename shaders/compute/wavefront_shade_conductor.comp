@@ -130,7 +130,7 @@ layout(std430, binding = 32) buffer ReSTIRReservoirsBuffer {
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
-#define ENABLE_INLINE_SHADOWS 0
+#define ENABLE_INLINE_SHADOWS 1
 #endif
 
 #if ENABLE_INLINE_SHADOWS
@@ -312,7 +312,7 @@ void main() {
 
             // Direct Lighting (Stochastic NEE with ReSTIR DI and Alias Table)
             if (!pathTerminated && !isDelta && enableDirect && enableSpecular && pc.numLights > 0u) {
-                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
                 uint selectedLightIdx = 0u;

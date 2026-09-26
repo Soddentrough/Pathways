@@ -122,7 +122,7 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
-#define ENABLE_INLINE_SHADOWS 0
+#define ENABLE_INLINE_SHADOWS 1
 #endif
 
 #if ENABLE_INLINE_SHADOWS
@@ -248,7 +248,7 @@ void main() {
                 bool enableDirect = (ubo.flags & (1 << 0)) != 0;
                 bool enableIndirect = (ubo.flags & (1 << 1)) != 0;
                 bool enableShadows = (ubo.flags & (1 << 4)) != 0;
-                bool enableInlineShadows = (ubo.flags & (1 << 6)) != 0;
+                bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 bool pathTerminated = false;
 
                 // Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)

@@ -1340,11 +1340,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             // Accumulation format selection
             const char* accumFormats[] = {
                 "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
-                "RGBA32_SFLOAT (128-bit Full Float HDR)"
+                "RGBA32_SFLOAT (128-bit Full Float HDR)",
+                "R11G11B10_UFLOAT (32-bit Packed Float HDR) [High-Speed mGPU]"
             };
-            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 : 0;
+            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 :
+                                (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 2 : 0;
             if (ImGui::Combo("Accumulation Format", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
-                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT : AccumFormat::RGBA16_SFLOAT;
+                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT :
+                                             (currentFormat == 2) ? AccumFormat::R11G11B10_UFLOAT : AccumFormat::RGBA16_SFLOAT;
                 if (actions && selectedFormat != config.accum_format) {
                     actions->accumFormatChanged = true;
                     actions->newAccumFormat = selectedFormat;

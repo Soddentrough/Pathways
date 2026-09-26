@@ -478,7 +478,7 @@ void Engine::initVulkan() {
     vkAllocateCommandBuffers(device, &allocInfo, m_postCommandBuffers.data());
 
     // Create Render Target Images
-    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             device, allocator, m_config.width, m_config.height,
@@ -1957,10 +1957,11 @@ uint32_t Engine::getTargetBatchPixels() const {
     VkPhysicalDeviceType devType = m_context->getDeviceProperties().deviceType;
     if (devType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
         // Profile A: UMA / APU (e.g. AMD Strix Halo, Phoenix)
-        // High-end APUs like Strix Halo feature large unified memory (up to 128GB LPDDR5X) and 40 CUs.
-        // A 2.0M pixel budget (~360 MB per queue slot) maintains high CU occupancy across multi-bounce GI
-        // while cutting queue memory footprint by >73% from monolithic 4K.
-        return 2000000u;
+        // High-end APUs like Strix Halo feature a shared 32 MB MALL (L3) cache and 40 CUs.
+        // A 1.0368M pixel budget (960x1080, 8 spatial tiles for 4K) constrains the active working
+        // queue memory footprint to ~24.8 MB, keeping ray state resident within the 32 MB MALL cache
+        // and eliminating excessive LPDDR5X system RAM roundtrips.
+        return 1036800u;
     }
 
     // Query device-local VRAM budget
@@ -1999,9 +2000,11 @@ uint32_t Engine::getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) cons
         return 1u; // Monolithic short-circuit (e.g. 1080p)
     }
     uint32_t count = (totalPixels + targetBatch - 1) / targetBatch;
-    // Cap auto batch count to at most 4 when max_bounces > 2 to prevent secondary ray CU starvation
-    if (m_config.max_bounces > 2 && count > 4u) {
-        count = 4u;
+    // Cap auto batch count: up to 8 on APUs to match MALL L3 budget, at most 4 on dGPUs
+    VkPhysicalDeviceType devType = m_context->getDeviceProperties().deviceType;
+    uint32_t maxAutoBatches = (devType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 8u : 4u;
+    if (m_config.max_bounces > 2 && count > maxAutoBatches) {
+        count = maxAutoBatches;
     }
     return count;
 }
@@ -2268,7 +2271,8 @@ void Engine::initPipelines() {
         { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{};
     mergeLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -2820,7 +2824,7 @@ void Engine::createUpwaysPipelines() {
         if (upwaysCode.empty()) {
             upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
         }
-        VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        VkFormat format = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
         uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
             static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
@@ -3003,7 +3007,7 @@ void Engine::createFsr3Pipelines() {
     try {
         auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
         auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
-        VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        VkFormat format = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         uint32_t renderW = (m_config.render_scale < 1.0f) ?
             static_cast<uint32_t>(m_config.width * m_config.render_scale) :
             m_config.width;
@@ -3137,7 +3141,7 @@ void Engine::createFsr3Resources() {
         }
     }
 
-    VkFormat format = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat format = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
 
     // m_secAccumImage holds the secondary GPU's transferred 4K upscaled frame in Approach 2 (Sample Parallelism)
     if (!m_secAccumImage || m_secAccumImage->getWidth() != m_config.width || m_secAccumImage->getHeight() != m_config.height) {
@@ -4067,7 +4071,8 @@ void Engine::updateMergeDescriptors() {
     VkDevice device = m_context->getDevice();
     VmaAllocator allocator = m_context->getAllocator();
 
-    uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 : 32;
+    uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 :
+                             (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bytesPerPixel;
 
     VkDescriptorImageInfo mvImageInfo{};
@@ -4089,7 +4094,8 @@ void Engine::updateMergeDescriptors() {
     uint32_t dispatchWidth = maxTilesPerGpuX * tileSize;
     uint32_t dispatchHeight = renderH;
 
-    uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 : 16;
+    uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
+                   (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
     VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
     VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
     VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
@@ -4136,7 +4142,8 @@ void Engine::updateMergeDescriptors() {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secMvInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secNdInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secNdInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secBufInfo, nullptr }
         };
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
     }
@@ -4843,7 +4850,7 @@ void Engine::renderFrame() {
             m_config.accum_format = m_newAccumFormat;
             m_pendingAccumFormatChange = false;
 
-            VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+            VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
             for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
                 m_frameImages[i] = std::make_unique<Image>(
                     dev, alloc, m_config.width, m_config.height,
@@ -5261,9 +5268,11 @@ void Engine::renderFrame() {
             wfSceneData.boundsMax = m_sceneData.boundsMax;
             wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
             wfSceneData.enableDistanceClamping = m_config.distance_clamping;
+            wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
             wfSceneData.indirectClamp = m_config.indirect_clamp;
             wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
             wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
+            wfSceneData.inlineShadows = m_config.inline_primary_shadows;
             uint32_t activeBatchCount = getEffectiveBatchCount(renderW, renderH);
             uint32_t activeBatchPixels = getEffectiveBatchPixels(renderW, renderH, activeBatchCount);
             if (activeBatchCount != m_currentBatchCount || activeBatchPixels != m_currentBatchPixels) {
@@ -5276,17 +5285,36 @@ void Engine::renderFrame() {
             wfSceneData.batchCount = activeBatchCount;
             wfSceneData.batchPixels = activeBatchPixels;
             wfSceneData.fullWidth = renderW;
-            wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
-                                        m_config.upscaler_mode == UpscalerMode::Upways ||
-                                        m_config.upways_superres ||
-                                        !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
+            bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                                 m_config.upscaler_mode == UpscalerMode::Upways ||
+                                 m_config.denoiser_mode == DenoiserMode::Upways ||
+                                 m_config.enable_restir_di ||
+                                 m_config.enable_caustics);
+            bool captureMl = (m_config.denoiser_mode == DenoiserMode::Upways ||
+                              m_config.upscaler_mode == UpscalerMode::Upways ||
+                              m_config.upways_superres ||
+                              !m_config.capture_training_data_dir.empty());
+            wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u);
 
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                 dispatchCausticTrace(cmd, m_currentFrame);
             }
 
-            m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, renderW, renderH,
-                                             activeSpp, activeBounces, wfSceneData);
+            if (m_config.diagnostic_half_tiles) {
+                uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+                uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+                uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+                uint32_t halfDispatchWidth = maxTilesPerGpuX * tileSize;
+                wfSceneData.tileOffsetX = 1u;
+                wfSceneData.tileOffsetY = tileSize;
+                wfSceneData.fullWidth = renderW;
+                wfSceneData.fullHeight = renderH;
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, halfDispatchWidth, renderH,
+                                                 activeSpp, activeBounces, wfSceneData);
+            } else {
+                m_wavefrontPipeline->recordFrame(cmd, m_currentFrame, renderW, renderH,
+                                                 activeSpp, activeBounces, wfSceneData);
+            }
 
             if (m_config.enable_nrc && m_nrcManager) {
                 m_nrcManager->recordInference(cmd, renderW, renderH,
@@ -5565,8 +5593,9 @@ void Engine::renderFrame() {
         envIntensity = 1.0f;
         envIntensityBits = std::bit_cast<uint32_t>(envIntensity);
 
-        uint32_t formatMode = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 0u : 1u;
-        uint32_t bytesPerPixel = (formatMode == 0u) ? 8 : 16;
+        uint32_t formatMode = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 0u :
+                              (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1u : 2u;
+        uint32_t bytesPerPixel = (formatMode == 0u) ? 8 : (formatMode == 2u) ? 4 : 16;
         frameBytes = 0;
         dstHost = nullptr;
         if (!m_mgpu->isZeroCopyActive()) {
@@ -5822,10 +5851,17 @@ void Engine::renderFrame() {
                 wfSceneData.tileOffsetX = tileOffsetX_prim;
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
                 wfSceneData.fullWidth = mgpuBaseW;
-                wfSceneData.captureMlData = (m_config.denoiser_mode == DenoiserMode::Upways ||
-                                            m_config.upscaler_mode == UpscalerMode::Upways ||
-                                            m_config.upways_superres ||
-                                            !m_config.capture_training_data_dir.empty()) ? 1u : 0u;
+                wfSceneData.fullHeight = mgpuBaseH;
+                bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                                     m_config.upscaler_mode == UpscalerMode::Upways ||
+                                     m_config.denoiser_mode == DenoiserMode::Upways ||
+                                     m_config.enable_restir_di ||
+                                     m_config.enable_caustics);
+                bool captureMl = (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                  m_config.upscaler_mode == UpscalerMode::Upways ||
+                                  m_config.upways_superres ||
+                                  !m_config.capture_training_data_dir.empty());
+                wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u);
 
                 if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                     dispatchCausticTrace(cmd, m_currentFrame);
@@ -5907,7 +5943,11 @@ void Engine::renderFrame() {
             vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
             vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-            uint32_t mergePC[8] = { mgpuBaseW, mgpuBaseH, secSpp, m_config.tile_size, formatMode, mergeMode, primSpp, secDispatchWidth };
+            bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                                 m_config.upscaler_mode == UpscalerMode::Upways ||
+                                 m_config.denoiser_mode == DenoiserMode::Upways);
+            uint32_t secDispatchArg = (secDispatchWidth & 0x7FFFFFFFu) | (needGbuffers ? 0x80000000u : 0u);
+            uint32_t mergePC[8] = { mgpuBaseW, mgpuBaseH, secSpp, m_config.tile_size, formatMode, mergeMode, primSpp, secDispatchArg };
             vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
             uint32_t mergeGroupsX = (mgpuBaseW + 15) / 16;
@@ -6290,11 +6330,11 @@ void Engine::renderFrame() {
         waitSemaphoreInfos.push_back(waitRt);
 
         if (m_mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
-            uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
-            VkSemaphore secSem = m_mgpu->getImportedSemaphore(slot);
+            VkSemaphore secSem = m_mgpu->getPrimaryImportedTimelineSemaphore();
             if (secSem != VK_NULL_HANDLE) {
                 VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
                 waitSec.semaphore = secSem;
+                waitSec.value = m_mgpu->getCurrentTimelineValue();
                 waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
                 waitSemaphoreInfos.push_back(waitSec);
             }
@@ -7195,7 +7235,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
 
     // 3. Recreate Accumulation & Output Images
-    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             device, allocator, m_config.width, m_config.height,
@@ -7527,8 +7567,9 @@ void Engine::printExecutionSummary() const {
                      tally.tlasGpuUpdateCount, tally.tlasGpuUpdateCount == 1 ? "" : "s");
 
         if (tally.key.mgpu_mode != MultiGpuMode::Off) {
-            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms | Tonemap: {:.3f} ms",
-                         tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), tally.getAvgTonemapMs());
+            double secXferMs = m_mgpu ? m_mgpu->getSecondaryTransferTimeMs() : 0.0;
+            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms (Xfer: {:.3f} ms) | Tonemap: {:.3f} ms",
+                         tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), secXferMs, tally.getAvgTonemapMs());
             // Find single GPU baseline for speedup calculation
             double baselineMs = 0.0;
             for (const auto* other : activeTallies) {

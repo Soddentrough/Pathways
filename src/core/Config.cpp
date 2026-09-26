@@ -342,8 +342,9 @@ void Config::printUsage(const char* progName) {
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
               << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
               << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
-              << "  --no-inline-shadows     Enforce detached shadow queue evaluation (default)\n"
-              << "  --inline-shadows        [Deprecated] Enforces detached queues (wavefront_shadow.comp) for 0 LDS & max wave occupancy\n"
+              << "  --inline-shadows        Enable hybrid inline hardware shadow queries on primary bounce (default: enabled)\n"
+              << "  --no-inline-shadows     Enforce detached shadow queue evaluation\n"
+              << "  --diagnostic-half-tiles Benchmark diagnostic: trace only even 64x64 checkerboard tiles on single GPU\n"
               << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
               << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
               << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
@@ -941,6 +942,8 @@ Config Config::parse(int argc, char* argv[]) {
             std::string fmt = argv[++i];
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
+            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
+                cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
@@ -961,8 +964,7 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--inline-shadows") {
-            Logger::warn("--inline-shadows is deprecated: Detached shadow queues (wavefront_shadow.comp) are enforced to maintain 0 LDS and maximum wave occupancy for material shaders (Laine et al. 2013).");
-            cfg.inline_primary_shadows = false;
+            cfg.inline_primary_shadows = true;
             continue;
         }
         if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
@@ -1183,6 +1185,10 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--visualize-split" || arg == "--show-split") {
             cfg.visualize_mgpu_split = true;
+            continue;
+        }
+        if (arg == "--diagnostic-half-tiles" || arg == "--single-gpu-half-tiles") {
+            cfg.diagnostic_half_tiles = true;
             continue;
         }
         if (arg == "--log-interval") {

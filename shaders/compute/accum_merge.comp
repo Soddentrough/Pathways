@@ -33,16 +33,44 @@ layout(std430, binding = 6) readonly buffer SecondaryNormDepthBuffer {
     uvec2 secondaryNormDepth16[];
 };
 
+// Binding 7: 32-bit packed float (uint = 4 bytes per pixel, 50% PCIe bandwidth vs FP16)
+layout(std430, binding = 7) readonly buffer SecondaryAccumBufferPacked {
+    uint secondaryRadiancePacked[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
     uint secondarySpp;
     uint tileSize;             // Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
-    uint formatMode;           // 0 = RGBA16_SFLOAT (default), 1 = RGBA32_SFLOAT
+    uint formatMode;           // 0 = RGBA16_SFLOAT (default), 1 = RGBA32_SFLOAT, 2 = R11G11B10_UFLOAT
     uint mergeMode;            // 0/1 = CheckerboardTile, 2 = SampleParallel
     uint primarySpp;
     uint pad;
 } pc;
+
+vec3 unpackR11G11B10F(uint val) {
+    uint rBits = val & 0x7FFu;
+    uint gBits = (val >> 11u) & 0x7FFu;
+    uint bBits = (val >> 22u) & 0x3FFu;
+
+    uint rM = rBits & 0x3Fu;
+    uint rE = (rBits >> 6u) & 0x1Fu;
+    float r = (rE == 0u) ? ((rM == 0u) ? 0.0 : (float(rM) / 64.0) * (1.0 / 16384.0))
+                         : uintBitsToFloat(((rE + 112u) << 23u) | (rM << 17u));
+
+    uint gM = gBits & 0x3Fu;
+    uint gE = (gBits >> 6u) & 0x1Fu;
+    float g = (gE == 0u) ? ((gM == 0u) ? 0.0 : (float(gM) / 64.0) * (1.0 / 16384.0))
+                         : uintBitsToFloat(((gE + 112u) << 23u) | (gM << 17u));
+
+    uint bM = bBits & 0x1Fu;
+    uint bE = (bBits >> 5u) & 0x1Fu;
+    float b = (bE == 0u) ? ((bM == 0u) ? 0.0 : (float(bM) / 32.0) * (1.0 / 16384.0))
+                         : uintBitsToFloat(((bE + 112u) << 23u) | (bM << 18u));
+
+    return vec3(r, g, b);
+}
 
 void main() {
     if (pc.mergeMode <= 1u) {
@@ -65,28 +93,34 @@ void main() {
         uint localX = uint(pixelCoord.x) % tileSize;
         uint secX = tx_half * tileSize + localX;
         uint numTilesX = (pc.width + tileSize - 1u) / tileSize;
-        uint secPitch = (pc.pad > 0u) ? pc.pad : (((numTilesX + 1u) / 2u) * tileSize);
+        uint secPitch = ((pc.pad & 0x7FFFFFFFu) > 0u) ? (pc.pad & 0x7FFFFFFFu) : (((numTilesX + 1u) / 2u) * tileSize);
         uint linearIndex = uint(pixelCoord.y) * secPitch + secX;
 
         vec4 secVal;
         if (pc.formatMode == 0u) {
             uvec2 raw = secondaryRadiance16[linearIndex];
             secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
-        } else {
+        } else if (pc.formatMode == 1u) {
             secVal = secondaryRadiance32[linearIndex];
+        } else {
+            uint raw = secondaryRadiancePacked[linearIndex];
+            secVal = vec4(unpackR11G11B10F(raw), 0.0);
         }
 
         imageStore(uPrimaryAccum, pixelCoord, secVal);
 
-        // Merge Motion Vectors (RG16F)
-        uint rawMv = secondaryMv16[linearIndex];
-        vec2 secMv = unpackHalf2x16(rawMv);
-        imageStore(uPrimaryMotionVectors, pixelCoord, vec4(secMv, 0.0, 0.0));
+        bool mergeGbuffers = (pc.pad & 0x80000000u) != 0u;
+        if (mergeGbuffers) {
+            // Merge Motion Vectors (RG16F)
+            uint rawMv = secondaryMv16[linearIndex];
+            vec2 secMv = unpackHalf2x16(rawMv);
+            imageStore(uPrimaryMotionVectors, pixelCoord, vec4(secMv, 0.0, 0.0));
 
-        // Merge Normal & Depth (RGBA16F)
-        uvec2 rawNd = secondaryNormDepth16[linearIndex];
-        vec4 secNd = vec4(unpackHalf2x16(rawNd.x), unpackHalf2x16(rawNd.y));
-        imageStore(uPrimaryNormalDepth, pixelCoord, secNd);
+            // Merge Normal & Depth (RGBA16F)
+            uvec2 rawNd = secondaryNormDepth16[linearIndex];
+            vec4 secNd = vec4(unpackHalf2x16(rawNd.x), unpackHalf2x16(rawNd.y));
+            imageStore(uPrimaryNormalDepth, pixelCoord, secNd);
+        }
     } else {
         // --- Mode 2: Sample Parallelism (Temporal Sample Accumulation) ---
         ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
@@ -100,8 +134,11 @@ void main() {
         if (pc.formatMode == 0u) {
             uvec2 raw = secondaryRadiance16[linearIndex];
             secVal = vec4(unpackHalf2x16(raw.x), unpackHalf2x16(raw.y));
-        } else {
+        } else if (pc.formatMode == 1u) {
             secVal = secondaryRadiance32[linearIndex];
+        } else {
+            uint raw = secondaryRadiancePacked[linearIndex];
+            secVal = vec4(unpackR11G11B10F(raw), 0.0);
         }
 
         vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);

@@ -65,7 +65,8 @@ struct ConfigKey {
                 modeStr = (spp > 1) ? "Dual GPU (Auto: Sample Parallel)" : std::format("Dual GPU (Auto: Checkerboard {}x{})", tile_size, tile_size);
                 break;
         }
-        std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" : "FP32";
+        std::string fmtStr = (accum_format == AccumFormat::RGBA16_SFLOAT) ? "FP16" :
+                             (accum_format == AccumFormat::R11G11B10_UFLOAT) ? "R11G11B10F" : "FP32";
         std::string denoiserStr = "";
         if (denoiser == DenoiserMode::None) {
             denoiserStr = " [Pure MC]";

@@ -40,9 +40,11 @@ struct GpuDeviceNode {
     double lastFrameTimeMs = 0.0;
     double lastTransferTimeMs = 0.0;
 
-    // Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd)
+    // Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd & Timeline Semaphores)
     std::array<VkSemaphore, NUM_IN_FLIGHT> secSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkSemaphore, NUM_IN_FLIGHT> primImportedSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkSemaphore secTimelineSemaphore = VK_NULL_HANDLE;
+    VkSemaphore primImportedTimelineSemaphore = VK_NULL_HANDLE;
     std::array<int, NUM_IN_FLIGHT> exportedFd = { -1, -1 };
     std::array<bool, NUM_IN_FLIGHT> slotFdReady = { false, false };
     std::array<bool, NUM_IN_FLIGHT> slotHasExecuted = { false, false };
@@ -175,6 +177,11 @@ public:
         if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
         return m_devices[0]->primImportedSemaphores[slot % GpuDeviceNode::NUM_IN_FLIGHT];
     }
+    VkSemaphore getPrimaryImportedTimelineSemaphore() const {
+        if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
+        return m_devices[0]->primImportedTimelineSemaphore;
+    }
+    uint64_t getCurrentTimelineValue() const { return m_currentTimelineValue.load(); }
     static constexpr uint32_t NUM_SHARED_BUFFERS = 2;
     VkBuffer getPrimarySharedBuffer(uint32_t slot = 0) const {
         if (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR) {
@@ -225,6 +232,7 @@ private:
         bool enableSharpening = false;
         float sharpness = 0.0f;
         uint32_t totalSamples = 1u;
+        uint64_t timelineValue = 0;
         bool valid = false;
     };
 
@@ -276,6 +284,7 @@ private:
     std::array<VkBuffer, NUM_SHARED_BUFFERS> m_sharedBufferSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     bool m_useZeroCopyHost = false;
     bool m_useCrossGpuSync = false;
+    std::atomic<uint64_t> m_currentTimelineValue{ 0 };
     glm::vec3 m_boundsMin = glm::vec3(-1000.0f);
     glm::vec3 m_boundsMax = glm::vec3(1000.0f);
 };

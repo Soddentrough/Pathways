@@ -880,8 +880,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 1);
 
             // Determine if shadow and intersect passes are required
-            // Detached shadow queue evaluation is the authoritative, occupancy-preserving architecture (Laine et al. 2013)
-            bool needShadowDispatch = (sceneData.numLights > 0);
+            bool hasInlineShadows = sceneData.inlineShadows && (sceneData.useHardwareRT == 1u) && ((sceneData.cameraFlags & (1u << 6)) != 0);
+            bool needShadowDispatch = (sceneData.numLights > 0) && (!hasInlineShadows || b > 0);
             bool needIntersect = (b + 1 < cutoffBounce);
 
             if (!needShadowDispatch && !needIntersect && !useTailMegakernel) {
@@ -943,7 +943,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                                            : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
             uint32_t shadowSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassShadow);
             uint32_t intersectSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassIntersect);
-
             bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
             if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                 if (needShadowDispatch) {
@@ -1051,7 +1050,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
 
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 4);
-                    m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
+                    if (m_dgcManager->isSupported()) {
+                        m_dgcManager->recordExecute(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
+                    } else {
+                        vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), intersectOffset);
+                    }
                     if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 5);
                 }
 
