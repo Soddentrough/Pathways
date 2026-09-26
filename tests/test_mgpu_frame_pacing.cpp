@@ -32,10 +32,10 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "[TEST 1] Multi-GPU Transfer Mode Config Parsing..." << std::endl;
     {
-        // Default configuration must use Host Zero-Copy to prevent PCIe BAR stalls
+        // Default configuration uses P2P Direct BAR with auto-fallback to Host Zero-Copy
         Config cfgDef;
-        check_true(cfgDef.mgpu_transfer_mode == Config::MgpuTransferMode::Host,
-                   "Default mGPU transfer mode must be Host (Zero-Copy)");
+        check_true(cfgDef.mgpu_transfer_mode == Config::MgpuTransferMode::P2P,
+                   "Default mGPU transfer mode must be P2P (Direct BAR)");
         check_true(!cfgDef.camera_motion,
                    "Default camera_motion must be false");
 

@@ -1150,6 +1150,10 @@ void Engine::initScene() {
         m_sceneData = ProceduralScene::createCornellBox();
     }
 
+    if (m_config.enable_macro_blas) {
+        clusterInstancesToMacroBlas(m_sceneData);
+    }
+
     m_numTriangles = static_cast<uint32_t>(m_sceneData.triangles.size());
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
@@ -1520,6 +1524,9 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     }
 
     m_sceneData = std::move(newScene);
+    if (m_config.enable_macro_blas) {
+        clusterInstancesToMacroBlas(m_sceneData);
+    }
     m_numTriangles = static_cast<uint32_t>(m_sceneData.triangles.size());
     m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
@@ -1837,6 +1844,278 @@ void Engine::updateSceneTransparencyFlag() {
             m_sceneHasNonOpaque = true;
         }
     }
+}
+
+void Engine::clusterInstancesToMacroBlas(SceneData& scene) {
+    if (!m_config.enable_macro_blas || scene.instances.size() <= 16 || scene.blasRanges.empty()) {
+        return;
+    }
+
+    const uint32_t origInstanceCount = static_cast<uint32_t>(scene.instances.size());
+    const uint32_t origBlasCount = static_cast<uint32_t>(scene.blasRanges.size());
+
+    // 1. Calculate local bounding boxes for all prototype BLASes
+    struct ProtoBounds {
+        glm::vec3 minBound{ 1e30f };
+        glm::vec3 maxBound{ -1e30f };
+    };
+    std::vector<ProtoBounds> protoBounds(scene.blasRanges.size());
+    for (size_t b = 0; b < scene.blasRanges.size(); ++b) {
+        const auto& range = scene.blasRanges[b];
+        for (uint32_t t = 0; t < range.triangleCount; ++t) {
+            uint32_t triIdx = range.firstTriangle + t;
+            if (triIdx < scene.triangles.size()) {
+                const auto& tri = scene.triangles[triIdx];
+                protoBounds[b].minBound = glm::min(protoBounds[b].minBound, glm::vec3(tri.v0.position));
+                protoBounds[b].minBound = glm::min(protoBounds[b].minBound, glm::vec3(tri.v1.position));
+                protoBounds[b].minBound = glm::min(protoBounds[b].minBound, glm::vec3(tri.v2.position));
+                protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v0.position));
+                protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v1.position));
+                protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v2.position));
+            }
+        }
+    }
+
+    // 2. Compute world-space bounds and centers for all instances
+    struct InstInfo {
+        uint32_t origIdx;
+        uint32_t bIdx;
+        glm::vec3 worldCenter;
+        uint32_t triCount;
+    };
+    std::vector<InstInfo> instInfos;
+    instInfos.reserve(scene.instances.size());
+    glm::vec3 sceneMin{ 1e30f };
+    glm::vec3 sceneMax{ -1e30f };
+
+    for (uint32_t i = 0; i < scene.instances.size(); ++i) {
+        const auto& inst = scene.instances[i];
+        if (inst.blasIndex >= scene.blasRanges.size()) continue;
+        const auto& pb = protoBounds[inst.blasIndex];
+        glm::vec3 localCenter = (pb.minBound + pb.maxBound) * 0.5f;
+        glm::vec3 worldCenter = glm::vec3(inst.transform * glm::vec4(localCenter, 1.0f));
+
+        uint32_t triCount = scene.blasRanges[inst.blasIndex].triangleCount;
+        instInfos.push_back({ i, inst.blasIndex, worldCenter, triCount });
+        sceneMin = glm::min(sceneMin, worldCenter);
+        sceneMax = glm::max(sceneMax, worldCenter);
+    }
+
+    if (instInfos.empty()) return;
+
+    // 3. Partition into spatial 2D grid along (X, Z)
+    glm::vec3 extent = sceneMax - sceneMin;
+    float extentX = std::max(extent.x, 1.0f);
+    float extentZ = std::max(extent.z, 1.0f);
+
+    uint32_t targetClusterCount = std::max(1u, static_cast<uint32_t>(instInfos.size() / std::max(1u, m_config.macro_blas_target_cluster)));
+    float aspect = extentX / extentZ;
+    uint32_t gridX = std::clamp(static_cast<uint32_t>(std::round(std::sqrt(static_cast<float>(targetClusterCount) * aspect))), 2u, 32u);
+    uint32_t gridZ = std::clamp(static_cast<uint32_t>(std::round(std::sqrt(static_cast<float>(targetClusterCount) / std::max(aspect, 1e-4f)))), 2u, 32u);
+
+    std::vector<std::vector<uint32_t>> cells(gridX * gridZ);
+    for (uint32_t k = 0; k < instInfos.size(); ++k) {
+        float u = std::clamp((instInfos[k].worldCenter.x - sceneMin.x) / extentX, 0.0f, 0.99999f);
+        float v = std::clamp((instInfos[k].worldCenter.z - sceneMin.z) / extentZ, 0.0f, 0.99999f);
+        uint32_t gx = static_cast<uint32_t>(u * gridX);
+        uint32_t gz = static_cast<uint32_t>(v * gridZ);
+        cells[gz * gridX + gx].push_back(k);
+    }
+
+    // 4. Decide which cells to merge into Macro-BLASes vs keep unmerged
+    std::vector<std::vector<uint32_t>> macroClusters;
+    std::vector<uint32_t> unmergedInstIndices;
+    uint64_t accumulatedMacroTris = 0;
+    const uint64_t maxMacroTrisBudget = static_cast<uint64_t>(m_config.macro_blas_max_tris);
+
+    const uint32_t maxTrisPerMacroBlas = 65536;
+
+    for (const auto& cell : cells) {
+        if (cell.empty()) continue;
+        if (cell.size() == 1) {
+            // Single instance in cell: keeping prototype reference is optimal
+            unmergedInstIndices.push_back(cell[0]);
+            continue;
+        }
+
+        std::vector<uint32_t> currentSubCluster;
+        uint32_t currentSubTris = 0;
+
+        for (uint32_t idx : cell) {
+            uint32_t instTris = instInfos[idx].triCount;
+            // Keep large structural instances (e.g. multi-thousand tri skyscrapers) as clean prototype references
+            if (instTris > m_config.macro_blas_max_prop_tris) {
+                unmergedInstIndices.push_back(idx);
+                continue;
+            }
+            if (currentSubTris + instTris > maxTrisPerMacroBlas && !currentSubCluster.empty()) {
+                if (currentSubCluster.size() > 1 && (accumulatedMacroTris + currentSubTris <= maxMacroTrisBudget)) {
+                    macroClusters.push_back(currentSubCluster);
+                    accumulatedMacroTris += currentSubTris;
+                } else {
+                    for (uint32_t id : currentSubCluster) {
+                        unmergedInstIndices.push_back(id);
+                    }
+                }
+                currentSubCluster.clear();
+                currentSubTris = 0;
+            }
+            currentSubCluster.push_back(idx);
+            currentSubTris += instTris;
+        }
+
+        if (!currentSubCluster.empty()) {
+            if (currentSubCluster.size() > 1 && (accumulatedMacroTris + currentSubTris <= maxMacroTrisBudget)) {
+                macroClusters.push_back(currentSubCluster);
+                accumulatedMacroTris += currentSubTris;
+            } else {
+                for (uint32_t id : currentSubCluster) {
+                    unmergedInstIndices.push_back(id);
+                }
+            }
+        }
+    }
+
+    if (macroClusters.empty()) {
+        Logger::info("Macro-BLAS: Geometry budget ({} tris) precluded clustering; retained fine-grained instancing.", maxMacroTrisBudget);
+        return;
+    }
+
+    // 5. Construct new SceneData structures
+    std::vector<TriangleGPU> newTriangles;
+    std::vector<BlasGeometryRange> newBlasRanges;
+    std::vector<SceneInstance> newInstances;
+    std::vector<InstanceGPU> newInstanceData;
+
+    // Track which original prototype BLASes are still referenced by unmerged instances
+    std::vector<int32_t> oldProtoToNew(origBlasCount, -1);
+    for (uint32_t idx : unmergedInstIndices) {
+        uint32_t oldB = instInfos[idx].bIdx;
+        if (oldProtoToNew[oldB] == -1) {
+            const auto& srcRange = scene.blasRanges[oldB];
+            uint32_t newStart = static_cast<uint32_t>(newTriangles.size());
+            for (uint32_t t = 0; t < srcRange.triangleCount; ++t) {
+                newTriangles.push_back(scene.triangles[srcRange.firstTriangle + t]);
+            }
+            BlasGeometryRange dstRange{};
+            dstRange.firstTriangle = newStart;
+            dstRange.triangleCount = srcRange.triangleCount;
+            dstRange.numOpaqueTriangles = srcRange.numOpaqueTriangles;
+            oldProtoToNew[oldB] = static_cast<int32_t>(newBlasRanges.size());
+            newBlasRanges.push_back(dstRange);
+        }
+    }
+
+    // Bake Macro-BLAS clusters
+    for (size_t c = 0; c < macroClusters.size(); ++c) {
+        const auto& cluster = macroClusters[c];
+        uint32_t macroStartTri = static_cast<uint32_t>(newTriangles.size());
+
+        for (uint32_t k : cluster) {
+            const auto& info = instInfos[k];
+            const auto& inst = scene.instances[info.origIdx];
+            const auto& protoRange = scene.blasRanges[info.bIdx];
+            glm::mat4 M = inst.transform;
+            float det = glm::determinant(glm::mat3(M));
+            glm::mat3 normMat = (std::abs(det) > 1e-6f) ? glm::transpose(glm::inverse(glm::mat3(M))) : glm::mat3(1.0f);
+            glm::mat3 tanMat = glm::mat3(M);
+            uint32_t matOffset = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].materialOffset : 0;
+
+            auto xformPos = [&](glm::vec4 p) {
+                glm::vec4 worldPos = M * glm::vec4(glm::vec3(p), 1.0f);
+                return glm::vec4(glm::vec3(worldPos), p.w);
+            };
+
+            auto xformNorm = [&](glm::vec4 n) {
+                glm::vec3 v = normMat * glm::vec3(n);
+                float l = glm::length(v);
+                return glm::vec4(l > 1e-6f ? (v / l) : glm::vec3(0, 1, 0), n.w);
+            };
+
+            auto xformTan = [&](glm::vec4 tan) {
+                glm::vec3 v = tanMat * glm::vec3(tan);
+                float l = glm::length(v);
+                return glm::vec4(l > 1e-6f ? (v / l) : glm::vec3(1, 0, 0), tan.w);
+            };
+
+            for (uint32_t t = 0; t < protoRange.triangleCount; ++t) {
+                const auto& src = scene.triangles[protoRange.firstTriangle + t];
+                TriangleGPU dst{};
+                // Position (transform 3D pos with homogeneous w=1.0, preserving texture coord u in .w)
+                dst.v0.position = xformPos(src.v0.position);
+                dst.v1.position = xformPos(src.v1.position);
+                dst.v2.position = xformPos(src.v2.position);
+
+                // Normal
+                dst.v0.normal = xformNorm(src.v0.normal);
+                dst.v1.normal = xformNorm(src.v1.normal);
+                dst.v2.normal = xformNorm(src.v2.normal);
+
+                // Tangent
+                dst.v0.tangent = xformTan(src.v0.tangent);
+                dst.v1.tangent = xformTan(src.v1.tangent);
+                dst.v2.tangent = xformTan(src.v2.tangent);
+
+                dst.materialId = src.materialId + matOffset;
+                newTriangles.push_back(dst);
+            }
+        }
+
+        uint32_t macroTriCount = static_cast<uint32_t>(newTriangles.size() - macroStartTri);
+        uint32_t macroBlasIdx = static_cast<uint32_t>(newBlasRanges.size());
+
+        BlasGeometryRange macroRange{};
+        macroRange.firstTriangle = macroStartTri;
+        macroRange.triangleCount = macroTriCount;
+        macroRange.numOpaqueTriangles = macroTriCount; // Updated during partitionSceneGeometry
+        newBlasRanges.push_back(macroRange);
+
+        SceneInstance macroInst{};
+        macroInst.blasIndex = macroBlasIdx;
+        macroInst.transform = glm::mat4(1.0f); // Identity
+        macroInst.customIndex = static_cast<uint32_t>(newInstances.size());
+        newInstances.push_back(macroInst);
+
+        InstanceGPU macroGpu{};
+        macroGpu.firstTriangle = macroStartTri;
+        macroGpu.numOpaqueTriangles = macroTriCount;
+        macroGpu.materialOffset = 0;
+        macroGpu.flags = 0;
+        newInstanceData.push_back(macroGpu);
+    }
+
+    // Append unmerged instances
+    for (uint32_t idx : unmergedInstIndices) {
+        const auto& info = instInfos[idx];
+        const auto& origInst = scene.instances[info.origIdx];
+        uint32_t newBIdx = static_cast<uint32_t>(oldProtoToNew[info.bIdx]);
+
+        SceneInstance remInst{};
+        remInst.blasIndex = newBIdx;
+        remInst.transform = origInst.transform;
+        remInst.customIndex = static_cast<uint32_t>(newInstances.size());
+        newInstances.push_back(remInst);
+
+        InstanceGPU remGpu{};
+        remGpu.firstTriangle = newBlasRanges[newBIdx].firstTriangle;
+        remGpu.numOpaqueTriangles = newBlasRanges[newBIdx].triangleCount;
+        remGpu.materialOffset = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].materialOffset : 0;
+        remGpu.flags = 0;
+        newInstanceData.push_back(remGpu);
+    }
+
+    uint32_t finalInstanceCount = static_cast<uint32_t>(newInstances.size());
+    uint32_t finalBlasCount = static_cast<uint32_t>(newBlasRanges.size());
+
+    scene.triangles = std::move(newTriangles);
+    scene.blasRanges = std::move(newBlasRanges);
+    scene.instances = std::move(newInstances);
+    scene.instanceData = std::move(newInstanceData);
+
+    float compressionPct = (1.0f - static_cast<float>(finalInstanceCount) / static_cast<float>(origInstanceCount)) * 100.0f;
+    Logger::info("Macro-BLAS Merging: Clustered {} instances -> {} TLAS instances across {} BLASes ({:.1f}% TLAS reduction, +{:.2f}M baked tris, budget: {:.2f}M)",
+                 origInstanceCount, finalInstanceCount, finalBlasCount, compressionPct,
+                 static_cast<double>(accumulatedMacroTris) / 1e6, static_cast<double>(maxMacroTrisBudget) / 1e6);
 }
 
 void Engine::partitionSceneGeometry() {
@@ -5643,10 +5922,10 @@ void Engine::renderFrame() {
             uint32_t numTilesX = (mgpuBaseW + tileSize - 1u) / tileSize;
             uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
             secDispatchWidth = maxTilesPerGpuX * tileSize;
-            bool needFullScreenPrimGbuffer = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
-                                              m_config.upscaler_mode == UpscalerMode::Upways ||
-                                              m_config.denoiser_mode == DenoiserMode::Upways);
-            primDispatchWidth = (needFullScreenPrimGbuffer && m_config.pipeline_type == PipelineType::Wavefront) ? mgpuBaseW : secDispatchWidth;
+            // Both GPUs dispatch strictly their 50% compact tile grid for RayGen & classification.
+            // Secondary GPU renders motion vectors and normal/depth alongside radiance; accum_merge.comp
+            // composites them into primary targets, ensuring 100% full-screen G-buffers for Upways/FSR3 without full-frame RayGen.
+            primDispatchWidth = secDispatchWidth;
             dispatchWidth = primDispatchWidth;
             dispatchHeight = mgpuBaseH;
             secAccumHistory = 0u; // Secondary renders 1-frame delta; accum_running_avg accumulates merged frame

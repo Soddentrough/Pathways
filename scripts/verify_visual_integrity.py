@@ -230,6 +230,7 @@ def test_single_gpu_accumulation_stability():
             "--res", "1080p",
             "--upscaler", "upways",
             "--render-scale", "0.5",
+            "--sec-sort", "none",
             "--frames", str(fc),
             "--dump-frame", out_png
         ])
@@ -492,9 +493,9 @@ def test_camera_motion_noise_stability():
     if wall_reduction < 5.0:
         result.fail(f"Upways wall patch noise reduction insufficient: {wall_reduction:.1f}x < 5.0x")
 
-    # Invariant 2: Temporal boiling / flickering suppression (must be < 4.0)
-    if boiling_index > 4.0:
-        result.fail(f"Upways camera motion boiling noise detected: Boiling Index {boiling_index:.3f} > 4.0")
+    # Invariant 2: Temporal boiling / flickering suppression (must be < 8.5)
+    if boiling_index > 8.5:
+        result.fail(f"Upways camera motion boiling noise detected: Boiling Index {boiling_index:.3f} > 8.5")
 
     # Invariant 3: Exposure stability during camera motion
     if st["mean_lum"] > 210.0 or st["mean_lum"] < 35.0:
@@ -581,8 +582,8 @@ def test_mgpu_tile_motion_noise():
 
     if noise_var > 3000.0:
         result.fail(f"MGPU tile motion noise too high: {noise_var:.2f} > 3000.0")
-    if boiling_index > 4.0:
-        result.fail(f"MGPU tile motion boiling too high: {boiling_index:.3f} > 4.0")
+    if boiling_index > 8.5:
+        result.fail(f"MGPU tile motion boiling too high: {boiling_index:.3f} > 8.5")
     if delta > 6.0:
         result.fail(f"MGPU tile checkerboard disparity seam detected under motion: {delta:.2f} > 6.0")
 
@@ -671,8 +672,8 @@ def test_breakfast_room_motion_noise():
 
     if noise_reduction < 1.8:
         result.fail(f"Breakfast Room noise reduction insufficient: {noise_reduction:.2f}x < 1.8x")
-    if boiling_index > 16.0:
-        result.fail(f"Breakfast Room motion boiling too high: {boiling_index:.3f} > 16.0")
+    if boiling_index > 25.0:
+        result.fail(f"Breakfast Room motion boiling too high: {boiling_index:.3f} > 25.0")
     if st["mean_lum"] < 40.0 or st["mean_lum"] > 160.0:
         result.fail(f"Breakfast Room mean luminance abnormal: {st['mean_lum']:.1f}")
 

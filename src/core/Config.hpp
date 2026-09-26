@@ -63,7 +63,11 @@ struct Config {
     uint32_t macro_tile_size = 0; // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
     uint32_t batch_count = 0;    // Coarse batch count (0 = auto-detect based on GPU profile, 1 = monolithic, 2, 4, 8, etc.)
     uint32_t batch_pixels = 0;   // Coarse batch ray budget in pixels (0 = auto-detect based on GPU profile)
-    SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default]
+    SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default: 100% coalesced SIMD reads]
+    bool enable_macro_blas = false;        // Merge static instance clusters into spatial Macro-BLASes [Default: false on APU to preserve L2 cache locality, opt-in via --macro-blas]
+    uint32_t macro_blas_max_tris = 250000; // Maximum geometry expansion budget for Macro-BLAS merging (250k tris ~ 32 MB VRAM)
+    uint32_t macro_blas_max_prop_tris = 800; // Maximum prototype triangle count to be considered a prop candidate for merging
+    uint32_t macro_blas_target_cluster = 64; // Target instances per spatial cluster cell
     bool streamline_secondary_shading = true; // Streamline secondary bounce shading (1-sample NEE, pure Lambertian BRDF) [Default: true]
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
     float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
@@ -155,10 +159,10 @@ struct Config {
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
     MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge; // Multi-GPU upscaling topology: PostMerge (Final Frame) or SampleBlend (Merged Frames)
     enum class MgpuTransferMode {
-        Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory, high performance default)
-        P2P       // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR)
+        Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory)
+        P2P       // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR, high performance default with host fallback)
     };
-    MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::Host;
+    MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::P2P; // Default: P2P Direct BAR (auto-fallback to Host if unsupported)
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Preserve FP16 bandwidth and performance)
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs

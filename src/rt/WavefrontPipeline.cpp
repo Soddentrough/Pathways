@@ -943,17 +943,18 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                                            : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
             uint32_t shadowSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassShadow);
             uint32_t intersectSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassIntersect);
+            bool needIntersectDgc = needIntersect && !(sceneData.secondarySortMode == 1 && useMaterialSort);
             bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
             if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                 if (needShadowDispatch) {
                     m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1);
-                    if (batchPreprocess && needIntersect) {
+                    if (batchPreprocess && needIntersectDgc) {
                         m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                         m_dgcManager->recordPreprocessBarrier(cmd, shadowSlice, 2);
                     } else {
                         m_dgcManager->recordPreprocessBarrier(cmd, shadowSlice, 1);
                     }
-                } else if (needIntersect) {
+                } else if (needIntersectDgc) {
                     m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                     m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
                 }
@@ -989,7 +990,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
             // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
             if (b + 1 < cutoffBounce) {
-                if (!batchPreprocess && needShadowDispatch && m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
+                if (!batchPreprocess && needShadowDispatch && needIntersectDgc && m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                     m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                     m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
                 }

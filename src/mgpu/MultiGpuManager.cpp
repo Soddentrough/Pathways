@@ -791,13 +791,13 @@ void MultiGpuManager::destroySharedHostBuffer() {
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     destroySharedHostBuffer();
 
-    // Option 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF (Opt-in via --mgpu-transfer p2p)
+    // Option 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF (Default on Linux, auto-fallback to host)
     if (m_config.mgpu_transfer_mode == Config::MgpuTransferMode::P2P) {
         if (initSharedP2PBuffer(bufferSize)) {
-            Logger::warn("Active Inter-GPU Transfer: P2P Direct BAR via Linux DMA-BUF (Warning: Shader loads across PCIe BAR without coherent inter-GPU fabric may degrade interactive frame pacing).");
+            Logger::info("Active Inter-GPU Transfer: P2P Direct BAR via Linux DMA-BUF (Device-local VRAM streaming).");
             return;
         }
-        Logger::warn("P2P Direct BAR initialization failed. Falling back to Zero-Copy Host Memory.");
+        Logger::info("P2P Direct BAR not available or unsupported by platform/hardware topology. Falling back to Zero-Copy Host Memory.");
     }
 
     // Option 2 (Default): High-Performance Zero-Copy Host Memory via VK_EXT_external_memory_host
@@ -1762,7 +1762,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                              m_config.upscaler_mode == UpscalerMode::Upways ||
                              m_config.denoiser_mode == DenoiserMode::Upways ||
                              m_config.enable_restir_di ||
-                             m_config.enable_caustics);
+                             m_config.enable_caustics ||
+                             m_config.upways_superres ||
+                             !m_config.capture_training_data_dir.empty());
         wfSceneData.captureMlData = needGbuffers ? 2u : 0u;
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,

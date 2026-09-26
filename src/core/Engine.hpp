@@ -363,6 +363,7 @@ private:
     bool m_sceneHasAlphaMask = false;
     void updateSceneTransparencyFlag();
     void partitionSceneGeometry();
+    void clusterInstancesToMacroBlas(SceneData& scene);
 
     // Frame tracking & Quality Governor
     std::unique_ptr<QualityGovernor> m_governor;

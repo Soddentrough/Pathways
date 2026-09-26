@@ -292,14 +292,17 @@ void Config::printUsage(const char* progName) {
               << "Multi-GPU Subsystem:\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
-              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'host' (Zero-Copy Host Memory [default]), 'p2p' (Direct BAR)\n"
+              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'p2p' (Direct BAR via Linux DMA-BUF [default with host fallback]), 'host' (Zero-Copy Host Memory)\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
               << "Wavefront Architecture:\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', or 'archetype' (A & B)\n"
               << "  --use-morton            Enable 2D Morton Z-curve mapping for wavefront classification (default: disabled / linear raster)\n"
-              << "  --sec-sort <mode>       Secondary ray coherency mode: 'direct'/'coherent' (Xiang 2023, K=4) [default], 'coherent-k8' (K=8), 'none', or 'directional' (Option 1 DGC)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency mode: 'directional'/'octant' (On-chip 8-bin Directional DGC) [default], 'direct'/'coherent' (Xiang 2023, K=4), 'coherent-k8' (K=8), or 'none'\n"
+              << "  --macro-blas            Merge static instance clusters into spatial Macro-BLASes (cuts 35-50% ray-box tests) [default: enabled]\n"
+              << "  --no-macro-blas         Disable Macro-BLAS merging (retain legacy fine-grained TLAS prototype instancing)\n"
+              << "  --macro-blas-max-tris <N> Maximum geometry expansion budget for Macro-BLAS merging (default: 2000000)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
@@ -600,7 +603,7 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--mgpu-transfer" && i + 1 < argc) {
             std::string tmode = argv[++i];
-            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
+            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf" || tmode == "dmabuf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
                 throw std::runtime_error("CPU staging transfer mode has been eliminated under Vulkan 1.4 baseline. Slower workarounds are not supported.");
@@ -611,7 +614,7 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--mgpu-transfer=")) {
             std::string tmode = arg.substr(16);
-            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf") {
+            if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf" || tmode == "dmabuf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
                 throw std::runtime_error("CPU staging transfer mode has been eliminated under Vulkan 1.4 baseline. Slower workarounds are not supported.");
@@ -894,6 +897,30 @@ Config Config::parse(int argc, char* argv[]) {
             else if (s == "coherent" || s == "direct" || s == "direct-coherent" || s == "xiang" || s == "2") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherent;
             else if (s == "coherent-k8" || s == "direct-k8" || s == "3") cfg.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
             else cfg.secondary_sort_mode = SecondarySortMode::None;
+            continue;
+        }
+        if (arg == "--macro-blas" || arg == "--enable-macro-blas") {
+            cfg.enable_macro_blas = true;
+            continue;
+        }
+        if (arg == "--no-macro-blas" || arg == "--disable-macro-blas") {
+            cfg.enable_macro_blas = false;
+            continue;
+        }
+        if ((arg == "--macro-blas-max-tris" || arg == "--macro-max-tris") && i + 1 < argc) {
+            cfg.macro_blas_max_tris = std::stoul(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--macro-blas-max-tris=") || arg.starts_with("--macro-max-tris=")) {
+            cfg.macro_blas_max_tris = std::stoul(arg.substr(arg.find('=') + 1));
+            continue;
+        }
+        if ((arg == "--macro-blas-max-prop-tris" || arg == "--macro-max-prop-tris") && i + 1 < argc) {
+            cfg.macro_blas_max_prop_tris = std::stoul(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--macro-blas-max-prop-tris=") || arg.starts_with("--macro-max-prop-tris=")) {
+            cfg.macro_blas_max_prop_tris = std::stoul(arg.substr(arg.find('=') + 1));
             continue;
         }
         if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {
