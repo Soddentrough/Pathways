@@ -1413,6 +1413,12 @@ void Engine::initScene() {
     initVideoBillboardDecoder(m_config.scene_path);
 }
 
+static inline bool isProceduralCornellBoxPath(const std::string& path) {
+    return path.empty() || path == "__procedural_cornell_box__" ||
+           path == "cornell-box" || path == "cornell_box" ||
+           path == "procedural:cornell-box" || path == "procedural:cornell_box";
+}
+
 void Engine::requestSceneChange(const std::string& filepath) {
     if (m_isSceneLoading.load()) {
         Logger::warn("Scene loading already in progress; ignoring request for '{}'", filepath);
@@ -1429,7 +1435,7 @@ void Engine::requestSceneChange(const std::string& filepath) {
     }
     if (prettyName.empty()) {
         std::string stem = std::filesystem::path(filepath).stem().string();
-        if (stem.empty() || filepath == "__procedural_cornell_box__") {
+        if (isProceduralCornellBoxPath(filepath) || stem.empty()) {
             prettyName = "Procedural Cornell Box";
         } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
             prettyName = "Procedural Many-Lights";
@@ -1453,7 +1459,7 @@ void Engine::requestSceneChange(const std::string& filepath) {
     usdOptions.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
 
     m_sceneLoadingFuture = std::async(std::launch::async, [filepath, usdOptions]() -> SceneData {
-        if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+        if (isProceduralCornellBoxPath(filepath)) {
             Logger::info("Dynamic Scene Switch: Loading Procedural Cornell Box...");
             return ProceduralScene::createCornellBox();
         } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
@@ -1791,7 +1797,7 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 bool Engine::loadScene(const std::string& filepath) {
     m_dynamicWavefrontBounces = m_config.max_bounces;
     SceneData newScene;
-    if (filepath.empty() || filepath == "__procedural_cornell_box__") {
+    if (isProceduralCornellBoxPath(filepath)) {
         Logger::info("Loading Procedural Cornell Box...");
         newScene = ProceduralScene::createCornellBox();
     } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
@@ -6136,7 +6142,7 @@ void Engine::renderFrame() {
                     }
                 }
                 if (targetLabel.empty()) {
-                    if (guiActions.newScenePath.empty() || guiActions.newScenePath == "__procedural_cornell_box__") {
+                    if (isProceduralCornellBoxPath(guiActions.newScenePath)) {
                         targetLabel = "Procedural Cornell Box";
                     } else if (guiActions.newScenePath == "procedural:many-lights" || guiActions.newScenePath == "many-lights" || guiActions.newScenePath == "many_lights") {
                         targetLabel = "Procedural Many-Lights";
@@ -7396,7 +7402,7 @@ std::string Engine::getActiveSceneName() const {
             return m_availableScenes[m_currentSceneIndex].label;
         }
     }
-    if (m_config.scene_path.empty() || m_config.scene_path == "__procedural_cornell_box__") {
+    if (isProceduralCornellBoxPath(m_config.scene_path)) {
         return "Procedural Cornell Box";
     }
     std::filesystem::path p(m_config.scene_path);
@@ -7546,8 +7552,14 @@ void Engine::printExecutionSummary() const {
                 Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
             }
         } else {
-            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
-                         tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+            bool hasSecGpu = m_mgpu && m_mgpu->isSecondaryInitialized();
+            if (hasSecGpu) {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms | GPU 1: Standby",
+                             tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+            } else {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms (Single GPU)",
+                             tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+            }
         }
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {

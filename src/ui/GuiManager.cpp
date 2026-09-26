@@ -620,8 +620,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("Frames: %u | Avg: %.2f ms (%.1f FPS)", c.frame_count, c.avg_frame_time_ms, c.avg_fps);
                 if (c.secondary_gpu_time_ms > 0.001) {
                     ImGui::BulletText("GPU 0: %.2f ms | GPU 1: %.2f ms | Merge: %.2f ms", c.primary_gpu_time_ms, c.secondary_gpu_time_ms, c.tonemap_time_ms);
-                } else {
+                } else if (!stats.secondary_gpu_name.empty()) {
                     ImGui::BulletText("GPU 0: %.2f ms | Tonemap: %.2f ms | GPU 1: Standby", c.primary_gpu_time_ms, c.tonemap_time_ms);
+                } else {
+                    ImGui::BulletText("GPU 0: %.2f ms | Tonemap: %.2f ms (Single GPU)", c.primary_gpu_time_ms, c.tonemap_time_ms);
                 }
                 if (c.pipeline_stages.is_wavefront && !c.pipeline_stages.bounces.empty()) {
                     ImGui::Indent(15.0f);

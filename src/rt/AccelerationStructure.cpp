@@ -341,13 +341,15 @@ std::unique_ptr<AccelerationStructure> AccelerationStructureManager::buildBLAS(c
     auto result = std::make_unique<AccelerationStructure>(m_device, m_allocator);
     result->setHandle(finalBlasHandle, blasAddr, std::move(finalBlasBuffer));
 
+    double currentUncompactedKb = sizeInfo.accelerationStructureSize / 1024.0;
     if (compacted) {
+        double currentCompactedKb = compactedSize / 1024.0;
         double ratio = (1.0 - (static_cast<double>(compactedSize) / static_cast<double>(sizeInfo.accelerationStructureSize))) * 100.0;
-        Logger::info("Built & Compacted BLAS successfully (uncompacted: {:.2f} KB -> compacted: {:.2f} KB, -{:.1f}%, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
-                     m_uncompactedBlasSizeKb, m_blasSizeKb, ratio, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
+        Logger::info("Built & Compacted BLAS successfully (uncompacted: {:.2f} KB -> compacted: {:.2f} KB, -{:.1f}%, address: 0x{:x}, time: {:.3f} ms, triangles: {}) [Total Scene BLAS: {:.2f} KB]",
+                     currentUncompactedKb, currentCompactedKb, ratio, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles, m_blasSizeKb);
     } else {
-        Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {})",
-                     m_blasSizeKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles);
+        Logger::info("Built BLAS successfully (size: {:.2f} KB, address: 0x{:x}, time: {:.3f} ms, triangles: {}) [Total Scene BLAS: {:.2f} KB]",
+                     currentUncompactedKb, blasAddr, m_lastBlasBuildTimeMs, m_blasTriangles, m_blasSizeKb);
     }
     return result;
 }
