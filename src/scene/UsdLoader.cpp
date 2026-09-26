@@ -1669,8 +1669,19 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
         }
 
         // Scan baked world-space triangles for emissive materials
-        // and convert them to physical area lights for direct MIS sampling
-        std::vector<LightGPU> emissiveMeshLights;
+        // and convert them to physical area lights for direct MIS sampling.
+        // Coplanar adjacent triangle pairs sharing a diagonal are paired into exact LIGHT_AREA_QUADs
+        // to prevent diagonal stretching and phantom light penetration through occluders.
+        struct EmissiveTriInfo {
+            glm::vec3 v0, v1, v2;
+            glm::vec3 geoNormal;
+            glm::vec3 em;
+            uint32_t materialId;
+            float area;
+            bool paired = false;
+        };
+        std::vector<EmissiveTriInfo> candTris;
+
         for (const auto& tri : data.triangles) {
             if (tri.materialId < data.materials.size()) {
                 const auto& mat = data.materials[tri.materialId];
@@ -1681,20 +1692,125 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                     glm::vec3 p0 = glm::vec3(tri.v0.position);
                     glm::vec3 p1 = glm::vec3(tri.v1.position);
                     glm::vec3 p2 = glm::vec3(tri.v2.position);
-                    glm::vec3 u = p1 - p0;
-                    glm::vec3 v = p2 - p0;
-                    glm::vec3 n = glm::cross(u, v);
+                    glm::vec3 n = glm::cross(p1 - p0, p2 - p0);
                     float lenN = glm::length(n);
                     if (lenN > 1e-6f) {
-                        float triArea = 0.5f * lenN;
-                        LightGPU light{};
-                        light.position = glm::vec4(p0, LIGHT_AREA_QUAD);
-                        light.u = glm::vec4(u, 0.0f);
-                        light.v = glm::vec4(v, 0.0f);
-                        light.normal = glm::vec4(n / lenN, 0.0f);
-                        light.emission = glm::vec4(em, triArea);
-                        emissiveMeshLights.push_back(light);
+                        EmissiveTriInfo info{};
+                        info.v0 = p0;
+                        info.v1 = p1;
+                        info.v2 = p2;
+                        info.geoNormal = n / lenN;
+                        info.em = em;
+                        info.materialId = tri.materialId;
+                        info.area = 0.5f * lenN;
+                        info.paired = false;
+                        candTris.push_back(info);
                     }
+                }
+            }
+        }
+
+        std::vector<LightGPU> emissiveMeshLights;
+        auto closePts = [](const glm::vec3& a, const glm::vec3& b) {
+            return glm::dot(a - b, a - b) < 1e-6f;
+        };
+
+        // 1. Pair coplanar adjacent triangles that form planar parallelograms / rectangles
+        for (size_t i = 0; i < candTris.size(); ++i) {
+            if (candTris[i].paired) continue;
+            const auto& t1 = candTris[i];
+            std::array<glm::vec3, 3> v1 = { t1.v0, t1.v1, t1.v2 };
+
+            for (size_t j = i + 1; j < candTris.size(); ++j) {
+                if (candTris[j].paired) continue;
+                const auto& t2 = candTris[j];
+                if (t1.materialId != t2.materialId) continue;
+                if (glm::dot(t1.geoNormal, t2.geoNormal) < 0.999f) continue;
+
+                std::array<glm::vec3, 3> v2 = { t2.v0, t2.v1, t2.v2 };
+                std::vector<glm::vec3> shared;
+                std::vector<glm::vec3> unshared1;
+                for (const auto& a : v1) {
+                    bool matched = false;
+                    for (const auto& b : v2) {
+                        if (closePts(a, b)) {
+                            shared.push_back(a);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) unshared1.push_back(a);
+                }
+
+                if (shared.size() == 2 && unshared1.size() == 1) {
+                    std::vector<glm::vec3> unshared2;
+                    for (const auto& b : v2) {
+                        bool matched = false;
+                        for (const auto& s : shared) {
+                            if (closePts(b, s)) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (!matched) unshared2.push_back(b);
+                    }
+
+                    if (unshared2.size() == 1) {
+                        glm::vec3 e0 = shared[0];
+                        glm::vec3 e1 = shared[1];
+                        glm::vec3 vA = unshared1[0];
+                        glm::vec3 vB = unshared2[0];
+
+                        // Parallelogram diagonal bisection check:
+                        // Diagonals e0-e1 and vA-vB bisect each other <=> e0 + e1 == vA + vB
+                        float diagErr = glm::length((e0 + e1) - (vA + vB));
+                        float scale = std::max({ glm::length(vA - e0), glm::length(vB - e0), glm::length(e1 - e0), 1e-4f });
+
+                        if (diagErr / scale <= 1e-3f) {
+                            glm::vec3 u = vA - e0;
+                            glm::vec3 v = vB - e0;
+                            glm::vec3 quadN = glm::cross(u, v);
+                            float quadArea = glm::length(quadN);
+                            if (quadArea > 1e-6f) {
+                                if (glm::dot(quadN, t1.geoNormal) < 0.0f) {
+                                    std::swap(u, v);
+                                    quadN = -quadN;
+                                }
+                                LightGPU light{};
+                                light.position = glm::vec4(e0, LIGHT_AREA_QUAD);
+                                light.u = glm::vec4(u, 0.0f);
+                                light.v = glm::vec4(v, 0.0f);
+                                light.normal = glm::vec4(quadN / quadArea, 0.0f);
+                                light.emission = glm::vec4(t1.em, quadArea);
+                                emissiveMeshLights.push_back(light);
+
+                                candTris[i].paired = true;
+                                candTris[j].paired = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback for remaining unpaired isolated triangles
+        for (size_t i = 0; i < candTris.size(); ++i) {
+            if (!candTris[i].paired) {
+                const auto& t = candTris[i];
+                glm::vec3 p0 = t.v0;
+                glm::vec3 u = t.v1 - t.v0;
+                glm::vec3 v = t.v2 - t.v0;
+                glm::vec3 n = glm::cross(u, v);
+                float lenN = glm::length(n);
+                if (lenN > 1e-6f) {
+                    LightGPU light{};
+                    light.position = glm::vec4(p0, LIGHT_AREA_QUAD);
+                    light.u = glm::vec4(u, 0.0f);
+                    light.v = glm::vec4(v, 0.0f);
+                    light.normal = glm::vec4(n / lenN, 0.0f);
+                    light.emission = glm::vec4(t.em, t.area);
+                    emissiveMeshLights.push_back(light);
                 }
             }
         }
