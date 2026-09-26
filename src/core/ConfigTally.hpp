@@ -270,6 +270,8 @@ struct ConfigStatsTally {
             BounceStageAvg bAvg;
             bAvg.bounce = static_cast<uint32_t>(b);
             bAvg.shadeMs = bt.sumShadeMs / bt.count;
+            bAvg.shadowMs = bt.sumShadowMs / bt.count;
+            bAvg.intersectMs = bt.sumIntersectMs / bt.count;
             bAvg.gapBeforeShadeMs = bt.sumGapBeforeShadeMs / bt.count;
             bAvg.gapBeforeShadowMs = bt.sumGapBeforeShadowMs / bt.count;
             bAvg.gapBeforeIntersectMs = bt.sumGapBeforeIntersectMs / bt.count;
