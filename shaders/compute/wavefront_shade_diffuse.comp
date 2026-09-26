@@ -498,10 +498,9 @@ void main() {
 
                     if (length(unshadowed) > float16_t(1e-5)) {
                         bool keepShadow = true;
-                        if (bounce >= 1u) {
-                            float lum = float(dot(unshadowed, f16vec3(0.2126, 0.7152, 0.0722)));
-                            float maxP = (bounce == 1u) ? 0.5 : (bounce == 2u ? 0.125 : 0.03125);
-                            float prob = clamp(lum * 2.0, 0.02, maxP);
+                        if (bounce >= 1u && !isSpecularPath) {
+                            float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
+                            float prob = clamp(lum * 1.5, 0.20, 1.0);
                             if (randFloat(seed) < prob) {
                                 unshadowed /= float16_t(prob);
                             } else {
@@ -763,10 +762,9 @@ void main() {
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             bool keepShadow = true;
-                            if (bounce >= 1u) {
-                                float lum = float(dot(unshadowed, f16vec3(0.2126, 0.7152, 0.0722)));
-                                float maxP = (bounce == 1u) ? 0.5 : (bounce == 2u ? 0.125 : 0.03125);
-                                float prob = clamp(lum * 2.0, 0.02, maxP);
+                            if (bounce >= 1u && !isSpecularPath) {
+                                float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
+                                float prob = clamp(lum * 1.5, 0.20, 1.0);
                                 if (randFloat(seed) < prob) {
                                     unshadowed /= float16_t(prob);
                                 } else {
@@ -997,8 +995,8 @@ void main() {
                     if (!validBounce) {
                         pathTerminated = true;
                     } else {
-                        float pathLum = float(dot(throughput * float16_t(max(ubo.spp, 1u)), f16vec3(0.2126, 0.7152, 0.0722)));
-                        pathTerminated = applyRussianRoulette16(throughput, pathLum, bounce, seed);
+                        float maxThresh = float(max(throughput.r, max(throughput.g, throughput.b))) * float(max(ubo.spp, 1u));
+                        pathTerminated = applyRussianRoulette16(throughput, maxThresh, bounce, seed);
 
                         if (!pathTerminated) {
                             survivesToNext = true;

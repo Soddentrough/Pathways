@@ -258,12 +258,19 @@ void main() {
 
                 // KHR_materials_dispersion: Spectral wavelength sampling
                 if (mat.dispersion > 0.001) {
-                    uint channel = uint(randFloat(seed) * 3.0);
-                    channel = min(channel, 2u);
+                    bool alreadyDispersed = (throughput.r > 0.0 && throughput.g == 0.0 && throughput.b == 0.0) ||
+                                            (throughput.g > 0.0 && throughput.r == 0.0 && throughput.b == 0.0) ||
+                                            (throughput.b > 0.0 && throughput.r == 0.0 && throughput.g == 0.0);
+                    uint channel;
+                    if (alreadyDispersed) {
+                        channel = (throughput.r > 0.0) ? 0u : ((throughput.g > 0.0) ? 1u : 2u);
+                    } else {
+                        channel = min(uint(randFloat(seed) * 3.0), 2u);
+                        vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                        throughput *= mask;
+                    }
                     float dispDelta = (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
                     iorVal += dispDelta;
-                    vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
-                    throughput *= mask;
                 }
 
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
@@ -331,8 +338,12 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces) {
                     pathTerminated = true;
                 } else {
-                    float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
-                    pathTerminated = applyRussianRoulette(throughput, pathLum, bounce, seed);
+                    float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
+                    if (maxThresh < 0.001) {
+                        pathTerminated = true;
+                    } else if (bounce >= 2u) {
+                        pathTerminated = applyRussianRoulette(throughput, maxThresh, bounce, seed);
+                    }
 
                     if (!pathTerminated) {
                         survivesToNext = true;
