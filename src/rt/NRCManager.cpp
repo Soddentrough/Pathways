@@ -17,7 +17,7 @@ NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height)
 {
     initBuffers();
-    initWeightsAndHashTable();
+    initWeights();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     createPipelines(inferSpv, trainSpv, resolveSpv);
@@ -64,22 +64,17 @@ void NRCManager::initBuffers() {
     m_counters = std::make_unique<Buffer>(m_allocator, 256, queueUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                                           VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-    // 4. Hash Table: 12 levels * 262144 entries * 4 bytes = 12,582,912 bytes (~12.58 MB)
-    VkDeviceSize hashTableSize = 12ull * 262144ull * sizeof(uint32_t);
-    m_hashTable = std::make_unique<Buffer>(m_allocator, hashTableSize, queueUsage,
-                                           VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-
-    // 5. Weights buffer: 9360 * 2 bytes = 18,720 bytes (aligned to 19,200 bytes)
+    // 4. Weights buffer: 9360 * 2 bytes = 18,720 bytes (aligned to 19,200 bytes)
     VkDeviceSize weightsSize = 19200;
     m_weights = std::make_unique<Buffer>(m_allocator, weightsSize, queueUsage,
                                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-    // 6. Adam Momentum buffer: 2 * 9360 * sizeof(float) = 74,880 bytes
+    // 5. Adam Momentum buffer: 2 * 9360 * sizeof(float) = 74,880 bytes
     VkDeviceSize momentumSize = 2ull * 9360ull * sizeof(float);
     m_weightMomentum = std::make_unique<Buffer>(m_allocator, momentumSize, queueUsage,
                                                 VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-    // 7. Atomic Accumulation Buffer: 3 channels * width * height * sizeof(uint32_t) bytes (CRIT-05)
+    // 6. Atomic Accumulation Buffer: 3 channels * width * height * sizeof(uint32_t) bytes (CRIT-05)
     VkDeviceSize atomicAccumSize = static_cast<VkDeviceSize>(m_width) * m_height * 3ull * sizeof(uint32_t);
     m_atomicAccumBuffer = std::make_unique<Buffer>(m_allocator, atomicAccumSize, queueUsage,
                                                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
@@ -91,23 +86,9 @@ void NRCManager::initBuffers() {
     }
 }
 
-void NRCManager::initWeightsAndHashTable() {
+void NRCManager::initWeights() {
     std::mt19937 rng(42);
     std::normal_distribution<float> weightDist(0.0f, std::sqrt(2.0f / 64.0f)); // Kaiming He normal
-    std::uniform_real_distribution<float> featDist(-0.01f, 0.01f);
-
-    // Initialize Hash Table
-    uint32_t* pHash = static_cast<uint32_t*>(m_hashTable->map());
-    if (pHash) {
-        size_t totalEntries = 12ull * 262144ull;
-        for (size_t i = 0; i < totalEntries; ++i) {
-            float f0 = featDist(rng);
-            float f1 = featDist(rng);
-            pHash[i] = glm::packHalf2x16(glm::vec2(f0, f1));
-        }
-        m_hashTable->flush();
-        m_hashTable->unmap();
-    }
 
     // Initialize Weights
     uint16_t* pWeights = static_cast<uint16_t*>(m_weights->map());
@@ -158,13 +139,12 @@ void NRCManager::initWeightsAndHashTable() {
 }
 
 void NRCManager::createDescriptorSetLayouts() {
-    // Inference Layout: AtomicBuffer(0), QueryQueue(1), HashTable(2), Weights(3), Counters(4) (CRIT-05)
+    // Inference Layout: AtomicBuffer(0), QueryQueue(1), Weights(2), Counters(3)
     std::vector<VkDescriptorSetLayoutBinding> inferBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo inferLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     inferLayoutInfo.bindingCount = static_cast<uint32_t>(inferBindings.size());
@@ -173,13 +153,12 @@ void NRCManager::createDescriptorSetLayouts() {
         throw std::runtime_error("NRCManager: Failed to create inference descriptor set layout!");
     }
 
-    // Training Layout: TrainQueue(0), HashTable(1), Weights(2), Momentum(3), Counters(4)
+    // Training Layout: TrainQueue(0), Weights(1), Momentum(2), Counters(3)
     std::vector<VkDescriptorSetLayoutBinding> trainBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo trainLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     trainLayoutInfo.bindingCount = static_cast<uint32_t>(trainBindings.size());
@@ -241,16 +220,14 @@ void NRCManager::allocateDescriptorSets() {
     // Write persistent buffer bindings for inference descriptor set (0: AtomicBuffer)
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo hashInfo{ m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> inferWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(inferWrites.size()), inferWrites.data(), 0, nullptr);
 
@@ -260,10 +237,9 @@ void NRCManager::allocateDescriptorSets() {
 
     std::vector<VkWriteDescriptorSet> trainWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(trainWrites.size()), trainWrites.data(), 0, nullptr);
 
@@ -395,12 +371,11 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
     initBuffers();
-    initWeightsAndHashTable();
+    initWeights();
 
     // Re-bind updated buffer handles to persistent descriptor sets
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo hashInfo{ m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo trainQueueInfo{ m_trainQueue->getBuffer(), 0, VK_WHOLE_SIZE };
@@ -409,15 +384,13 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
 
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
 
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
     };
@@ -597,31 +570,24 @@ void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
 
     vkCmdPushConstants(cmd, m_trainPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    uint32_t dispatchCount = (batchSize + 31u) / 32u;
+    // nrc_train.comp executes weight updates from Workgroup 0 (processing up to 32 samples).
+    // Launching only 1 workgroup avoids launching idle workgroups that discard their gradients.
+    uint32_t dispatchCount = (batchSize > 0u && m_maxTrainRecords > 0u) ? 1u : 0u;
     if (dispatchCount > 0) {
         vkCmdDispatch(cmd, dispatchCount, 1, 1);
     }
 
-    // Barrier: Training updates weights and hash table -> next frame inference reads weights
-    std::array<VkBufferMemoryBarrier2, 2> outBarriers = {
-        VkBufferMemoryBarrier2{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_hashTable->getBuffer(), 0, VK_WHOLE_SIZE
-        },
-        VkBufferMemoryBarrier2{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_weights->getBuffer(), 0, VK_WHOLE_SIZE
-        }
+    // Barrier: Training updates weights -> next frame inference reads weights
+    VkBufferMemoryBarrier2 weightBarrier{
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        m_weights->getBuffer(), 0, VK_WHOLE_SIZE
     };
     VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    outDep.bufferMemoryBarrierCount = static_cast<uint32_t>(outBarriers.size());
-    outDep.pBufferMemoryBarriers = outBarriers.data();
+    outDep.bufferMemoryBarrierCount = 1;
+    outDep.pBufferMemoryBarriers = &weightBarrier;
     vkCmdPipelineBarrier2(cmd, &outDep);
 }
 

@@ -25,15 +25,11 @@ layout(std430, set = 0, binding = 1) readonly buffer InQueryQueue {
     NRCQuery queries[];
 };
 
-layout(std430, set = 0, binding = 2) readonly buffer InHashTable {
-    uint packedFeatures[];
-};
-
-layout(std430, set = 0, binding = 3) readonly buffer InWeights {
+layout(std430, set = 0, binding = 2) readonly buffer InWeights {
     float16_t weights[];
 };
 
-layout(std430, set = 0, binding = 4) readonly buffer InCounters {
+layout(std430, set = 0, binding = 3) readonly buffer InCounters {
     NRCCountersBuffer counters;
 };
 
@@ -191,8 +187,8 @@ void main() {
         if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
         if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
         if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
-        vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(50.0));
-        vec3 radiance = clamp(s_throughput[tid] * predRadiance, vec3(0.0), vec3(50.0));
+        vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(250.0));
+        vec3 radiance = clamp(s_throughput[tid] * predRadiance, vec3(0.0), vec3(250.0));
 
         if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
         if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;

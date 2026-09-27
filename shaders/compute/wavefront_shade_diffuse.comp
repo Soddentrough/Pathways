@@ -856,7 +856,7 @@ void main() {
             if (!pathTerminated) {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                     pathTerminated = true;
-                } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce) {
+                } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && roughness >= 0.05 && metallic < 0.9) {
                     bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
                     if (isTrain) {
                         uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);

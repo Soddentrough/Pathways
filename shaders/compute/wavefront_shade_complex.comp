@@ -851,45 +851,6 @@ void main() {
 
             if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                 pathTerminated = true;
-            } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce) {
-                bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
-                if (isTrain) {
-                    uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
-                    if (trainIdx < pc.maxQueueCapacity) {
-                        vec3 targetRad = vec3(secDirectL);
-#if !IS_SECONDARY_BOUNCE && ENABLE_INLINE_SHADOWS
-                        if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
-                            vec3 sOrigin = shadowCandidate.originDist.xyz;
-                            float sDist = shadowCandidate.originDist.w;
-                            vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
-                            bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
-                                                                 (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                            if (occluded) {
-                                targetRad = vec3(0.0);
-                            }
-                        }
-#endif
-                        nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
-                        nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
-                        nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                        nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
-                        nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput), 0.0);
-                        nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad, 0.0);
-                    }
-                } else {
-                    uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
-                    if (qIdx < pc.maxQueueCapacity) {
-                        nrcQueries[qIdx].pos_roughness = vec4(hitPoint, roughness);
-                        nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
-                        nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                        nrcQueries[qIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
-                        nrcQueries[qIdx].throughput = vec4(vec3(throughput), 0.0);
-                        pathTerminated = true;
-                    } else {
-                        // Queue capacity exceeded: do NOT drop ray silently (CRIT-04). Continue standard bounce.
-                        pathTerminated = false;
-                    }
-                }
             } else if (enableRefraction && (transmission > 0.001 || mat.type == 2u)) {
                 sampledSpecularLobe = true;
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
@@ -913,6 +874,49 @@ void main() {
                     }
                 }
             } else {
+                // Check if NRC should evaluate this rough diffuse surface
+                if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && roughness >= 0.05 && metallic < 0.9) {
+                    bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
+                    if (isTrain) {
+                        uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
+                        if (trainIdx < pc.maxQueueCapacity) {
+                            vec3 targetRad = vec3(secDirectL);
+#if !IS_SECONDARY_BOUNCE && ENABLE_INLINE_SHADOWS
+                            if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
+                                vec3 sOrigin = shadowCandidate.originDist.xyz;
+                                float sDist = shadowCandidate.originDist.w;
+                                vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
+                                bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
+                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                if (occluded) {
+                                    targetRad = vec3(0.0);
+                                }
+                            }
+#endif
+                            nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, roughness);
+                            nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
+                            nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                            nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
+                            nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput), 0.0);
+                            nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad, 0.0);
+                        }
+                    } else {
+                        uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
+                        if (qIdx < pc.maxQueueCapacity) {
+                            nrcQueries[qIdx].pos_roughness = vec4(hitPoint, roughness);
+                            nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
+                            nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                            nrcQueries[qIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
+                            nrcQueries[qIdx].throughput = vec4(vec3(throughput), 0.0);
+                            pathTerminated = true;
+                        } else {
+                            // Queue capacity exceeded: do NOT drop ray silently (CRIT-04). Continue standard bounce.
+                            pathTerminated = false;
+                        }
+                    }
+                }
+
+                if (!pathTerminated) {
                 float lobeSelect = randFloat(seed);
                 if (lobeSelect < clearcoatProb) {
                     sampledSpecularLobe = true;
@@ -964,6 +968,7 @@ void main() {
                     }
                     float scale = (1.0 - Fc) / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
                     throughput *= (f16vec3(1.0) - F_diff) * diffFactor * float16_t(scale);
+                }
                 }
             }
 

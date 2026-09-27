@@ -18,20 +18,16 @@ layout(std430, set = 0, binding = 0) readonly buffer InTrainQueue {
     NRCTrainingRecord records[];
 };
 
-layout(std430, set = 0, binding = 1) buffer InOutHashTable {
-    uint packedFeatures[];
-};
-
-layout(std430, set = 0, binding = 2) buffer InOutWeights {
+layout(std430, set = 0, binding = 1) buffer InOutWeights {
     float16_t weights[];
 };
 
-layout(std430, set = 0, binding = 3) buffer InOutWeightMomentum {
+layout(std430, set = 0, binding = 2) buffer InOutWeightMomentum {
     float weightM[NRC_TOTAL_WEIGHTS];
     float weightV[NRC_TOTAL_WEIGHTS];
 };
 
-layout(std430, set = 0, binding = 4) readonly buffer InCounters {
+layout(std430, set = 0, binding = 3) readonly buffer InCounters {
     NRCCountersBuffer counters;
 };
 
@@ -122,10 +118,10 @@ void main() {
         pred.z += h1_val * float(weights[NRC_W2_OFFSET + i * 16u + 2u]);
     }
 
-    // 3. Loss & Output Gradient: Relative L1 Loss
+    // 3. Loss & Output Gradient: Target-Relative L1 Loss (Müller et al.)
     pred = max(vec3(0.0), pred);
     vec3 diff = pred - L_target;
-    vec3 denom = pred + vec3(0.01);
+    vec3 denom = L_target + vec3(0.01);
     vec3 dL_dy = valid ? (sign(diff) / denom) : vec3(0.0);
 
     s_delta[lane * 64u + 0u] = float16_t(dL_dy.x);

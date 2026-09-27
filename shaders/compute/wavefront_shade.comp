@@ -542,7 +542,7 @@ void main() {
                     // 3. Sample BSDF for Secondary Bounce
                     if (bounce + 1u >= pc.maxBounces || (!enableIndirect && bounce > 0u)) {
                         pathTerminated = true;
-                    } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce) {
+                    } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && (transmission <= 0.01 && mat.type != 2u) && roughness >= 0.05 && metallic < 0.9) {
                         bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
                         if (isTrain) {
                             uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);

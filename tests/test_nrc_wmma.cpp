@@ -62,8 +62,8 @@ int main() {
     check_true(offsetof(NRCCountersBuffer, dispatchX) == 8, "dispatchX must be at byte 8");
     std::cout << "  -> NRCCountersBuffer layout verified (16B std430 aligned)." << std::endl;
 
-    // 2. Verify Hash Grid Feature Resolution & Coordinate Parity
-    std::cout << "[TEST 2] Hash Grid Parameters & Bounded Table Lookup..." << std::endl;
+    // 2. Verify Spatial Hash Coordinate Parity (Legacy Hash Grid Math)
+    std::cout << "[TEST 2] Spatial Hash Math & Bounded Index Verification..." << std::endl;
     const float GRID_SCALES[12] = {
         16.0f, 23.36f, 34.12f, 49.83f, 72.78f, 106.28f,
         155.23f, 226.70f, 331.09f, 483.54f, 706.18f, 1031.33f

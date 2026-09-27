@@ -62,7 +62,6 @@ public:
     Buffer* getQueryQueue() const { return m_queryQueue.get(); }
     Buffer* getTrainQueue() const { return m_trainQueue.get(); }
     Buffer* getCounters() const { return m_counters.get(); }
-    Buffer* getHashTable() const { return m_hashTable.get(); }
     Buffer* getWeights() const { return m_weights.get(); }
     Buffer* getAtomicAccumBuffer() const { return m_atomicAccumBuffer.get(); }
 
@@ -73,7 +72,7 @@ public:
 
 private:
     void initBuffers();
-    void initWeightsAndHashTable();
+    void initWeights();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
     void createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv, const std::vector<char>& resolveSpv);
@@ -88,7 +87,6 @@ private:
     bool m_initialized = false;
 
     // GPU Buffers
-    std::unique_ptr<Buffer> m_hashTable;
     std::unique_ptr<Buffer> m_weights;
     std::unique_ptr<Buffer> m_weightMomentum;
     std::unique_ptr<Buffer> m_queryQueue;
