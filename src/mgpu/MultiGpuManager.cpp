@@ -233,8 +233,10 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     VkDeviceAddress indexBaseAddr = secNode.asIndexBuffer->getDeviceAddress(secDevice);
 
     if (!scene.blasRanges.empty()) {
-        // Multi-BLAS path
+        // Multi-BLAS path: Batch all BLAS builds into a single GPU dispatch & compaction pass
         secNode.asManager->resetStats();
+        std::vector<std::vector<ASGeometryInput>> allBlasGeoms;
+        allBlasGeoms.reserve(scene.blasRanges.size());
         for (const auto& range : scene.blasRanges) {
             std::vector<ASGeometryInput> geoms;
             if (range.numOpaqueTriangles > 0) {
@@ -271,8 +273,9 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }
-            secNode.blases.push_back(secNode.asManager->buildBLAS(geoms));
+            allBlasGeoms.push_back(std::move(geoms));
         }
+        secNode.blases = secNode.asManager->buildBLASBatch(allBlasGeoms);
 
         std::vector<ASInstanceInput> asInstances;
         asInstances.reserve(scene.instances.size());
@@ -317,7 +320,6 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomOpaque.isOpaque = true;
             geomsOpaque.push_back(geomOpaque);
-            secNode.blases.push_back(secNode.asManager->buildBLAS(geomsOpaque));
 
             std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
@@ -329,7 +331,8 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomNonOpaque.isOpaque = false;
             geomsNonOpaque.push_back(geomNonOpaque);
-            secNode.blases.push_back(secNode.asManager->buildBLAS(geomsNonOpaque));
+
+            secNode.blases = secNode.asManager->buildBLASBatch({ geomsOpaque, geomsNonOpaque });
 
             ASInstanceInput inst0{};
             inst0.blasAddress = secNode.blases[0]->getDeviceAddress();

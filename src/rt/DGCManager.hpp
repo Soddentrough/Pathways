@@ -15,6 +15,14 @@ struct DGCCommand {
     uint32_t groupCountZ;
 };
 
+struct DGCDispatchCommand {
+    uint32_t groupCountX;   // Dispatch token
+    uint32_t groupCountY;
+    uint32_t groupCountZ;
+    uint32_t pad;           // 16-byte stride matching std430 struct DispatchCommand / BounceDispatch
+};
+
+
 class DGCManager {
 public:
     enum DGCPassType : uint32_t {

@@ -9,8 +9,15 @@
 
 #define TINYEXR_USE_MINIZ 0
 #include <zlib.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
 #define TINYEXR_IMPLEMENTATION
 #include "tinyexr.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <fstream>
 #include <filesystem>

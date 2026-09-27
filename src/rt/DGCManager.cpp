@@ -43,7 +43,7 @@ DGCManager::DGCManager(VkDevice device, VmaAllocator allocator, VkPipelineLayout
         (VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT |
          VK_INDIRECT_COMMANDS_LAYOUT_USAGE_EXPLICIT_PREPROCESS_BIT_EXT) : 0;
     createInfo.shaderStages = VK_SHADER_STAGE_COMPUTE_BIT;
-    createInfo.indirectStride = sizeof(VkDispatchIndirectCommand); // 12 bytes
+    createInfo.indirectStride = sizeof(DGCDispatchCommand); // 16 bytes (std430 aligned)
     createInfo.pipelineLayout = m_pipelineLayout;
     createInfo.tokenCount = 1;
     createInfo.pTokens = &token;
@@ -205,7 +205,7 @@ void DGCManager::recordPreprocess(VkCommandBuffer cmd, VkPipeline pipeline, Buff
     genInfo.indirectExecutionSet = VK_NULL_HANDLE;
     genInfo.indirectCommandsLayout = m_indirectLayout;
     genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
-    genInfo.indirectAddressSize = sizeof(VkDispatchIndirectCommand) * maxSequenceCount;
+    genInfo.indirectAddressSize = sizeof(DGCDispatchCommand) * maxSequenceCount;
     genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
     genInfo.preprocessSize = m_sliceSize;
     genInfo.maxSequenceCount = maxSequenceCount;
@@ -290,7 +290,7 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
     genInfo.indirectExecutionSet = VK_NULL_HANDLE;
     genInfo.indirectCommandsLayout = m_indirectLayout;
     genInfo.indirectAddress = argumentBuffer->getDeviceAddress(m_device) + argumentOffset;
-    genInfo.indirectAddressSize = sizeof(VkDispatchIndirectCommand) * maxSequenceCount;
+    genInfo.indirectAddressSize = sizeof(DGCDispatchCommand) * maxSequenceCount;
     if (m_preprocessBuffer) {
         genInfo.preprocessAddress = m_preprocessBuffer->getDeviceAddress(m_device) + sliceOffset;
         genInfo.preprocessSize = m_sliceSize;

@@ -73,6 +73,7 @@ public:
     ~AccelerationStructureManager();
 
     std::unique_ptr<AccelerationStructure> buildBLAS(const std::vector<ASGeometryInput>& geometries);
+    std::vector<std::unique_ptr<AccelerationStructure>> buildBLASBatch(const std::vector<std::vector<ASGeometryInput>>& geometriesList);
     std::unique_ptr<AccelerationStructure> buildTLAS(const std::vector<ASInstanceInput>& instances);
 
     // GPU-timeline TLAS sizing, allocation, and build / update (refit)

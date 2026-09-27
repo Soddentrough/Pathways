@@ -834,8 +834,10 @@ void Engine::createAccelerationStructures() {
     VkDeviceAddress indexBaseAddr = m_asIndexBuffer->getDeviceAddress(device);
 
     if (!m_sceneData.blasRanges.empty()) {
-        // Multi-BLAS path
+        // Multi-BLAS path: Batch all BLAS builds into a single GPU dispatch & compaction pass
         m_asManager->resetStats();
+        std::vector<std::vector<ASGeometryInput>> allBlasGeoms;
+        allBlasGeoms.reserve(m_sceneData.blasRanges.size());
         for (const auto& range : m_sceneData.blasRanges) {
             std::vector<ASGeometryInput> geoms;
             if (range.numOpaqueTriangles > 0) {
@@ -872,8 +874,9 @@ void Engine::createAccelerationStructures() {
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }
-            m_blases.push_back(m_asManager->buildBLAS(geoms));
+            allBlasGeoms.push_back(std::move(geoms));
         }
+        m_blases = m_asManager->buildBLASBatch(allBlasGeoms);
 
         std::vector<ASInstanceInput> asInstances;
         asInstances.reserve(m_sceneData.instances.size());
@@ -925,7 +928,6 @@ void Engine::createAccelerationStructures() {
             geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomOpaque.isOpaque = true;
             geomsOpaque.push_back(geomOpaque);
-            m_blases.push_back(m_asManager->buildBLAS(geomsOpaque));
 
             std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
@@ -937,7 +939,8 @@ void Engine::createAccelerationStructures() {
             geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
             geomNonOpaque.isOpaque = false;
             geomsNonOpaque.push_back(geomNonOpaque);
-            m_blases.push_back(m_asManager->buildBLAS(geomsNonOpaque));
+
+            m_blases = m_asManager->buildBLASBatch({ geomsOpaque, geomsNonOpaque });
 
             ASInstanceInput inst0{};
             inst0.blasAddress = m_blases[0]->getDeviceAddress();

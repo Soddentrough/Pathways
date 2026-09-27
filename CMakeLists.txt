@@ -34,9 +34,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wno-missing-field-initializers # Required for Vulkan 1.4 C-struct aggregate zero-initialization
     )
 
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-        add_compile_options(-Wno-stringop-overflow)
-    endif()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_compile_options(
@@ -582,6 +579,37 @@ target_include_directories(test_dgc_async_queue PRIVATE
 )
 target_link_libraries(test_dgc_async_queue PRIVATE Vulkan::Vulkan)
 add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue)
+
+# DGC Stream Compaction GPU Unit Test Target
+add_executable(test_dgc_compact
+    tests/test_dgc_compact.cpp
+)
+target_include_directories(test_dgc_compact PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_dgc_compact PRIVATE Vulkan::Vulkan)
+add_test(NAME DgcCompact COMMAND test_dgc_compact)
+
+# Batched BLAS Builds & Compaction Unit Test Target
+add_executable(test_blas_batch
+    tests/test_blas_batch.cpp
+    src/rt/AccelerationStructure.cpp
+    src/vulkan/VulkanContext.cpp
+    src/vulkan/Buffer.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_blas_batch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+    ${THIRD_PARTY_DIR}/vma
+)
+target_link_libraries(test_blas_batch PRIVATE Vulkan::Vulkan Threads::Threads)
+if(UNIX)
+    target_link_libraries(test_blas_batch PRIVATE m)
+endif()
+add_test(NAME BlasBatch COMMAND test_blas_batch)
 
 add_executable(test_light_tree
     tests/test_light_tree.cpp

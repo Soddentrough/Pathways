@@ -29,6 +29,15 @@ int main() {
     check_true(offsetof(DGCCommand, groupCountZ) == 12, "groupCountZ must start at byte 12");
     std::cout << "  -> DGCCommand layout verified (16B, execution set index + 3D dispatch)." << std::endl;
 
+    // 1b. Verify DGCDispatchCommand struct layout & 16-byte alignment
+    std::cout << "[TEST 1b] DGCDispatchCommand Layout & Alignment Verification..." << std::endl;
+    check_true(sizeof(DGCDispatchCommand) == 16, "DGCDispatchCommand must be exactly 16 bytes");
+    check_true(offsetof(DGCDispatchCommand, groupCountX) == 0, "groupCountX must start at byte 0");
+    check_true(offsetof(DGCDispatchCommand, groupCountY) == 4, "groupCountY must start at byte 4");
+    check_true(offsetof(DGCDispatchCommand, groupCountZ) == 8, "groupCountZ must start at byte 8");
+    check_true(offsetof(DGCDispatchCommand, pad) == 12, "pad must start at byte 12");
+    std::cout << "  -> DGCDispatchCommand layout verified (16B, std430 DispatchCommand compatibility)." << std::endl;
+
     // 2. Verify VkDispatchIndirectCommand layout compatibility
     std::cout << "[TEST 2] VkDispatchIndirectCommand Standard Layout..." << std::endl;
     check_true(sizeof(VkDispatchIndirectCommand) == 12, "VkDispatchIndirectCommand must be 12 bytes");
@@ -79,6 +88,27 @@ int main() {
     check_true((expectedFlags & VK_INDIRECT_COMMANDS_LAYOUT_USAGE_UNORDERED_SEQUENCES_BIT_EXT) != 0,
                "UNORDERED_SEQUENCES_BIT_EXT must be active");
     std::cout << "  -> DGC layout usage flags (0x3) verified." << std::endl;
+
+    // 5b. Verify Multi-Sequence Indirect Stride & Address Size Invariants
+    std::cout << "[TEST 5b] Multi-Sequence DGC Indirect Stride Invariants..." << std::endl;
+    const uint32_t stride = sizeof(DGCDispatchCommand); // 16 bytes
+    check_true(stride == 16, "DGC dispatch stride must be 16 bytes");
+    check_true(stride % 4 == 0, "indirectStride must be a multiple of 4 per Vulkan spec");
+    check_true(stride >= sizeof(VkDispatchIndirectCommand), "indirectStride must fit VkDispatchIndirectCommand");
+
+    // Check sequence offset alignment across multiple sequences
+    for (uint32_t seq = 0; seq < 16; ++seq) {
+        VkDeviceSize seqOffset = static_cast<VkDeviceSize>(seq) * stride;
+        check_true(seqOffset == seq * 16, "Sequence offset must be strictly 16-byte aligned");
+
+        // Vulkan Valid Usage: indirectAddressSize >= (maxSequenceCount - 1) * indirectStride + tokenSize
+        uint32_t maxSeq = seq + 1;
+        VkDeviceSize minRequiredAddressSize = static_cast<VkDeviceSize>(maxSeq - 1) * stride + sizeof(VkDispatchIndirectCommand);
+        VkDeviceSize actualAllocatedAddressSize = static_cast<VkDeviceSize>(stride) * maxSeq;
+        check_true(actualAllocatedAddressSize >= minRequiredAddressSize,
+                   "indirectAddressSize must satisfy VUID-VkGeneratedCommandsInfoEXT-indirectAddressSize");
+    }
+    std::cout << "  -> Multi-sequence DGC indirect stride (16B) and valid usage invariants verified." << std::endl;
 
     // 6. Verify DGCPassType and Slice Orthogonality
     std::cout << "[TEST 6] DGCPassType Slicing Orthogonality Across Passes & Bounces..." << std::endl;
