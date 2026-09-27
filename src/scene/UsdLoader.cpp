@@ -12,6 +12,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <array>
 #include <cstdlib>
 #include <mutex>
 

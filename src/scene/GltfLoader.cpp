@@ -6,6 +6,7 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <array>
 #include <glm/gtc/type_ptr.hpp>
 #include <filesystem>
 #include <cstring>
