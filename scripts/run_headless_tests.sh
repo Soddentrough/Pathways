@@ -371,7 +371,7 @@ python3 tests/test_image_quality.py
 # 11. Test Suite 8: Automated Before/After Visual Regression Verification
 echo ""
 echo "[8/9] Running Test Suite 8: Visual Regression Verification against Golden References..."
-python3 scripts/visual_regression_test.py --strict
+python3 scripts/visual_regression_test.py --binary "${PATHWAYS_BIN}" --strict
 
 # 12. Test Suite 9: Visual Integrity, Accumulation Exposure Stability & Multi-GPU Seams
 echo ""

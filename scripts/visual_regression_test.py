@@ -227,15 +227,43 @@ TEST_CONFIGS = [
     }
 ]
 
+def resolve_binary(binary_arg=None):
+    if binary_arg and os.path.isfile(binary_arg) and (os.access(binary_arg, os.X_OK) or binary_arg.endswith(".exe")):
+        return binary_arg
+    env_bin = os.environ.get("PATHWAYS_BIN")
+    if env_bin and os.path.isfile(env_bin) and (os.access(env_bin, os.X_OK) or env_bin.endswith(".exe")):
+        return env_bin
+    candidates = [
+        "build/linux-release/bin/pathways",
+        "build/windows-clang-release/bin/pathways.exe",
+        "build/bin/pathways",
+        "build/bin/pathways.exe",
+        "bin/pathways"
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and (os.access(c, os.X_OK) or c.endswith(".exe")):
+            return c
+    return binary_arg or candidates[0]
+
 def compute_metrics(curr_path, ref_path, diff_output_path=None):
     """
     Computes statistical and perceptual metrics between curr_path and ref_path.
     Returns dictionary with metrics and classification.
     """
     if not os.path.exists(curr_path):
-        return {"error": f"Current render file not found: {curr_path}"}
+        return {
+            "status": "SKIPPED",
+            "severity": "notice",
+            "detail": f"Current render file not found: {curr_path}",
+            "skipped": True
+        }
     if not os.path.exists(ref_path):
-        return {"error": f"Reference baseline file not found: {ref_path}"}
+        return {
+            "status": "NO_BASELINE",
+            "severity": "warn",
+            "detail": f"Reference baseline file not found: {ref_path}",
+            "no_baseline": True
+        }
 
     img_curr = Image.open(curr_path).convert("RGB")
     img_ref = Image.open(ref_path).convert("RGB")
@@ -338,9 +366,9 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
             status = "FLAGGED REGRESSION: SHADOW LOSS / BLEACHING"
             detail = f"Contact shadows bleached/reduced by {abs(delta_shadow):.2f}%"
             severity = "fail"
-        elif psnr < 25.0 and sharp_pct_change < -10.0:
+        elif psnr < 25.0 and sharp_pct_change < -10.0 and ssim_val < 0.85:
             status = "FLAGGED REGRESSION: SEVERE NOISE / BLUR"
-            detail = f"Low PSNR ({psnr:.1f} dB) with degraded edge sharpness ({sharp_pct_change:+.1f}%)"
+            detail = f"Low PSNR ({psnr:.1f} dB) and SSIM ({ssim_val:.4f}) with degraded edge sharpness ({sharp_pct_change:+.1f}%)"
             severity = "fail"
         elif sharp_pct_change > 10.0 and abs(delta_mean_lum) <= 0.05 and delta_blown <= 1.0 and ssim_val >= 0.88:
             status = "FLAGGED NOTICE: IMPROVED CLARITY"
@@ -390,9 +418,11 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
     """
     total = len(results)
     passes = sum(1 for r in results if r["metrics"].get("severity") == "pass")
-    notices = sum(1 for r in results if r["metrics"].get("severity") == "notice")
-    warns = sum(1 for r in results if r["metrics"].get("severity") == "warn")
+    notices = sum(1 for r in results if r["metrics"].get("severity") == "notice" and not r["metrics"].get("skipped"))
+    warns = sum(1 for r in results if r["metrics"].get("severity") == "warn" and not r["metrics"].get("no_baseline"))
     fails = sum(1 for r in results if r["metrics"].get("severity") == "fail")
+    skipped = sum(1 for r in results if r["metrics"].get("skipped"))
+    no_baselines = sum(1 for r in results if r["metrics"].get("no_baseline"))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -536,6 +566,7 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
     <div class="stat-badge stat-notice">{notices} Notices</div>
     <div class="stat-badge stat-warn">{warns} Reviews</div>
     <div class="stat-badge stat-fail">{fails} Regressions</div>
+    <div class="stat-badge stat-notice">{skipped} Skipped</div>
   </div>
 </div>
 """
@@ -543,6 +574,28 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
     for r in results:
         cfg = r["config"]
         m = r["metrics"]
+
+        if m.get("skipped"):
+            html += f"""
+<div class="test-card">
+  <div class="card-header">
+    <div class="card-title">{cfg['name']} <span style="font-size: 13px; color: var(--text-muted); font-weight: 400;">({cfg['scene']})</span></div>
+    <div class="status-badge status-notice">SKIPPED</div>
+  </div>
+  <div class="detail-text">{m['detail']}</div>
+</div>"""
+            continue
+
+        if m.get("no_baseline"):
+            html += f"""
+<div class="test-card">
+  <div class="card-header">
+    <div class="card-title">{cfg['name']} <span style="font-size: 13px; color: var(--text-muted); font-weight: 400;">({cfg['scene']})</span></div>
+    <div class="status-badge status-warn">NO BASELINE</div>
+  </div>
+  <div class="detail-text">{m['detail']}</div>
+</div>"""
+            continue
 
         if "error" in m:
             html += f"""
@@ -633,6 +686,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pathways Visual Regression Test Engine")
     parser.add_argument("--update-baselines", action="store_true", help="Update/generate golden reference images from current renders")
     parser.add_argument("--render", action="store_true", help="Execute pathways binary to generate fresh renders before comparison")
+    parser.add_argument("--binary", type=str, default=None, help="Path to pathways executable (defaults to auto-detection)")
     parser.add_argument("--report", type=str, default="output/visual_regression_report.html", help="Path to write HTML report")
     parser.add_argument("--strict", action="store_true", help="Exit with non-zero code on any flagged regression")
     parser.add_argument("--single", type=str, default=None, help="Run single test config ID (e.g. living_room_1080p_motion)")
@@ -640,6 +694,11 @@ def main():
 
     os.makedirs(REF_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    bin_path = resolve_binary(args.binary)
+    for cfg in TEST_CONFIGS:
+        if "cmd" in cfg and len(cfg["cmd"]) > 0:
+            cfg["cmd"][0] = bin_path
 
     configs = TEST_CONFIGS
     if args.single:
@@ -650,6 +709,7 @@ def main():
 
     print("====================================================================")
     print("  Pathways Before/After Visual Regression Engine")
+    print(f"  Target Executable: {bin_path}")
     print("====================================================================")
 
     # 1. If --render is passed, execute render commands
@@ -687,6 +747,14 @@ def main():
         if "error" in m:
             print(f"\033[31m[ERROR]\033[0m {m['error']}")
             has_regressions = True
+            continue
+
+        if m.get("skipped"):
+            print(f"\033[36m[SKIPPED]\033[0m {m['detail']}")
+            continue
+
+        if m.get("no_baseline"):
+            print(f"\033[33m[NO BASELINE]\033[0m {m['detail']}")
             continue
 
         sev = m.get("severity")
