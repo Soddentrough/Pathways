@@ -125,7 +125,7 @@ struct Config {
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation via hardware rayQueryEXT (Default: true)
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
-    bool enable_delta_unroll = true;     // Collapse dielectric double-bounce via inline rayQuery delta unrolling [Default: true]
+    bool enable_delta_unroll = false;    // Collapse dielectric double-bounce via inline rayQuery delta unrolling (experimental) [Default: false]
     uint32_t max_delta_events = 2;       // Maximum internal delta events to unroll per dielectric vertex (default: 2)
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)
