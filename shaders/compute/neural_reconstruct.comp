@@ -469,10 +469,20 @@ void main() {
                 maxL_s = max(maxL_s, specLogits[k]);
             }
 
+            // Scale-Aware Temporal Accumulation: N_target(S) = k * S^2
+            float areaScale = max(u_ScaleFactor.x * u_ScaleFactor.y, 1.0);
+            float n_target = clamp(areaScale * 4.0, 4.0, 128.0);
+            float alphaMin = clamp(0.06 / areaScale, 0.015, 0.06);
+
+            // Prior accumulation sample age
+            float prevAge = histNormSample.a;
+            float alphaTarget = max(alphaMin, 1.0 / (1.0 + prevAge / max(n_target, 1.0)));
+
             // Learned Temporal Alpha and Anisotropic Phase Warping Logits
             float rawAlphaLogit = float(s_renderLogitsFlat[baseFeat + 18u]);
             float rawAnisoLogit = float(s_renderLogitsFlat[baseFeat + 19u]);
-            float alphaBase = clamp((1.0 / (1.0 + exp(-rawAlphaLogit))) * 0.12, 0.02, 0.25);
+            float alphaLearned = 1.0 / (1.0 + exp(-rawAlphaLogit));
+            float alphaBase = clamp(alphaTarget * mix(0.8, 1.2, alphaLearned), alphaMin, 0.35);
             float kappaAniso = tanh(rawAnisoLogit);
 
             // C. Analytic Bilateral Edge-Stopping Weights & Anisotropic Phase Metric
@@ -485,7 +495,7 @@ void main() {
 
             // Native display-resolution geometry guide override
             vec4 dispNormDepth = imageLoad(uDisplayNormals, outCoord);
-            if (dispNormDepth.w > 0.0 && !isnan(dispNormDepth.w) && !isinf(dispNormDepth.w)) {
+            if (dispNormDepth.w > 0.0) {
                 centerDepth = dispNormDepth.w;
             }
             if (dot(dispNormDepth.xyz, dispNormDepth.xyz) > 1e-4) {
@@ -573,8 +583,8 @@ void main() {
             // Bounded linear radiance with local neighborhood clamping (suppresses outliers and boiling)
             vec3 boxPadDiff = (maxDiff - minDiff) * 0.80 + vec3(0.06);
             vec3 boxPadSpec = (maxSpec - minSpec) * 0.80 + vec3(0.06);
-            vec3 histDiff = clamp(max(histDiffSample.rgb, vec3(0.0)), max(minDiff - boxPadDiff, vec3(0.0)), maxDiff + boxPadDiff);
-            vec3 histSpec = clamp(max(histSpecSample.rgb, vec3(0.0)), max(minSpec - boxPadSpec, vec3(0.0)), maxSpec + boxPadSpec);
+            vec3 clampedDiff = clamp(max(histDiffSample.rgb, vec3(0.0)), max(minDiff - boxPadDiff, vec3(0.0)), maxDiff + boxPadDiff);
+            vec3 clampedSpec = clamp(max(histSpecSample.rgb, vec3(0.0)), max(minSpec - boxPadSpec, vec3(0.0)), maxSpec + boxPadSpec);
 
             // F. Planar Depth World-Space Expected Disocclusion Validation
             vec3 X_view = UnprojectToView(displayUV, centerDepth);
@@ -597,6 +607,11 @@ void main() {
             float normalConf = smoothstep(0.50, 0.85, worldNormalDot);
             float confDiff = rejectDiff ? 0.0 : (depthConf * normalConf);
             float confSpec = rejectSpec ? 0.0 : (confDiff * specConf);
+
+            // Neural history confidence weighting: high confidence preserves high-frequency subpixel detail;
+            // low confidence smoothly falls back to the locally clamped radiance
+            vec3 histDiff = mix(clampedDiff, histDiffSample.rgb, confDiff);
+            vec3 histSpec = mix(clampedSpec, histSpecSample.rgb, confSpec);
 
             // G. Linear Adaptive Blending with Roughness-Dependent Specular Alpha Floor
             float specAlphaFloor = mix(0.10, 0.05, smoothstep(0.0, 0.25, roughAtTap));
@@ -625,10 +640,11 @@ void main() {
             }
             finalHDR = clamp(finalHDR, vec3(0.0), vec3(65000.0));
 
-            float prevAge = histNormSample.a;
-            float newAge = rejectDiff ? 0.0 : min(prevAge + 1.0, 64.0);
+            float prevAgeHist = histNormSample.a;
+            float newAge = rejectDiff ? 0.0 : min(prevAgeHist + 1.0, 128.0);
+            float uncertainty = clamp(1.0 - confDiff, 0.0, 1.0);
 
-            imageStore(uFinalOutput, outCoord, vec4(finalHDR, 1.0));
+            imageStore(uFinalOutput, outCoord, vec4(finalHDR, uncertainty));
             imageStore(uOutHistoryDiff, outCoord, vec4(resolvedLinearDiff, centerDepth));
             imageStore(uOutHistorySpec, outCoord, vec4(resolvedLinearSpec, centerDepth));
             imageStore(uOutHistoryNormal, outCoord, vec4(N_curr_world, newAge));
