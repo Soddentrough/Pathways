@@ -36,6 +36,8 @@ int main() {
         Config cfgDef;
         check_true(cfgDef.mgpu_transfer_mode == Config::MgpuTransferMode::P2P,
                    "Default mGPU transfer mode must be P2P (Direct BAR)");
+        check_true(!cfgDef.mgpu_transfer_explicit,
+                   "Default mgpu_transfer_explicit must be false");
         check_true(!cfgDef.camera_motion,
                    "Default camera_motion must be false");
 
@@ -45,12 +47,16 @@ int main() {
         check_true(cHost.mgpu_mode != MultiGpuMode::Off, "--mgpu enables mGPU");
         check_true(cHost.mgpu_transfer_mode == Config::MgpuTransferMode::Host,
                    "--mgpu-transfer host sets MgpuTransferMode::Host");
+        check_true(cHost.mgpu_transfer_explicit,
+                   "--mgpu-transfer host sets mgpu_transfer_explicit = true");
 
         // Explicit --mgpu-transfer p2p
         const char* argvP2P[] = { "pathways", "--mgpu", "--mgpu-transfer", "p2p" };
         Config cP2P = Config::parse(4, const_cast<char**>(argvP2P));
         check_true(cP2P.mgpu_transfer_mode == Config::MgpuTransferMode::P2P,
                    "--mgpu-transfer p2p sets MgpuTransferMode::P2P");
+        check_true(cP2P.mgpu_transfer_explicit,
+                   "--mgpu-transfer p2p sets mgpu_transfer_explicit = true");
 
         // Explicit --mgpu-transfer staging rejected under Vulkan 1.4 baseline
         bool caughtStagingError = false;

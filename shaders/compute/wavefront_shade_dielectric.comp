@@ -140,6 +140,7 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint captureMlData;
     float indirectClamp;
+    uint deltaUnroll;
 } pc;
 
 void main() {
@@ -169,7 +170,8 @@ void main() {
         f16vec3 throughputHalf;
         uint seed, pixelIndex;
         bool isSpecularPath, causticApplied;
-        unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+        uint dispersionChannel = 0u;
+        unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
 
@@ -317,7 +319,16 @@ void main() {
                         nextDirection = rayDir;
                         nextOrigin = hitPoint + rayDir * (EPSILON * 2.0);
                     } else {
-                        // Snell's law refraction
+                        // Snell's law refraction: entering dispersive medium for the first time
+                        if (mat.dispersion > 0.001 && dispersionChannel == 0u) {
+                            uint channel = min(uint(randFloat(seed) * 3.0), 2u);
+                            dispersionChannel = channel + 1u;
+                            vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                            throughput *= mask;
+                            float dispDelta = (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+                            iorVal += dispDelta;
+                            eta = frontFace ? (1.0 / iorVal) : iorVal;
+                        }
                         nextDirection = normalize(refract(rayDir, hitNormal, eta));
                         nextOrigin = hitPoint - hitNormal * EPSILON;
                     }
@@ -443,7 +454,201 @@ void main() {
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied);
+                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+
+                        // Delta-Chain Unrolling: Unroll consecutive smooth dielectric events on-chip
+                        if (pc.deltaUnroll > 0u && pc.useHardwareRT == 1u && (bounce + 1u < pc.maxBounces)) {
+                            uint maxDelta = pc.deltaUnroll;
+                            vec3 currOrigin = nextOrigin;
+                            vec3 currDirection = nextDirection;
+                            uint currBounce = bounce + 1u;
+                            uint deltaEvents = 1u;
+
+                            while (survivesToNext && deltaEvents < maxDelta && currBounce < pc.maxBounces) {
+                                float closestT = 10000.0;
+                                int closestTri = -1;
+                                vec2 closestBary = vec2(0.0);
+                                int closestSphere = -1;
+                                mat4x3 hitW2o = mat4x3(1.0);
+                                mat4x3 hitO2w = mat4x3(1.0);
+                                uint hitInstMatOffset = 0u;
+
+                                rayQueryEXT rq;
+                                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, currOrigin, EPSILON, currDirection, closestT);
+                                rayQueryProceedEXT(rq);
+
+                                if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                                    closestT = rayQueryGetIntersectionTEXT(rq, true);
+                                    uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+                                    uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+                                    uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+                                    InstanceGPU inst = instances[instIdx];
+                                    closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
+                                    closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                                    hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+                                    hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+                                    hitInstMatOffset = inst.materialOffset;
+                                }
+
+                                if (pc.numSpheres > 0u) {
+                                    for (uint s = 0u; s < pc.numSpheres; ++s) {
+                                        float spT;
+                                        vec3 spNorm;
+                                        if (intersectSphere(currOrigin, currDirection, spheres[s], EPSILON, closestT, spT, spNorm)) {
+                                            closestT = spT;
+                                            closestSphere = int(s);
+                                            closestTri = -1;
+                                        }
+                                    }
+                                }
+
+                                // Miss: ray escaped out of glass into sky / environment
+                                if (closestTri < 0 && closestSphere < 0) {
+                                    vec3 skyColor;
+                                    if (pc.hasEnvMap == 1u) {
+                                        vec2 envUv = directionToEquirectangular(currDirection);
+                                        skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+                                    } else {
+                                        float t = 0.5 * (currDirection.y + 1.0);
+                                        skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+                                    }
+                                    vec3 skyContrib = clampIndirectRadiance(throughput * skyColor, pc.indirectClamp);
+                                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+                                    if (pc.captureMlData != 0u) {
+                                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                                    }
+                                    survivesToNext = false;
+                                    break;
+                                }
+
+                                // Hit surface: examine material
+                                vec3 dHitNormal;
+                                vec2 dHitUv = vec2(0.0);
+                                uint dMatId = 0u;
+
+                                if (closestTri >= 0) {
+                                    Triangle tri = triangles[closestTri];
+                                    vec3 localNormal = getTriangleNormal(tri, closestBary);
+                                    dHitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
+                                    dHitUv = getTriangleUV(tri, closestBary);
+                                    dMatId = tri.materialId + hitInstMatOffset;
+                                } else {
+                                    dHitNormal = (currOrigin + closestT * currDirection - spheres[closestSphere].centerRadius.xyz) / spheres[closestSphere].centerRadius.w;
+                                    dMatId = spheres[closestSphere].materialId;
+                                }
+
+                                uint dArchetype = (dMatId < pc.numMaterials) ? materialArchetypes[dMatId] : MATERIAL_ARCHETYPE_DIFFUSE;
+                                if (dArchetype != MATERIAL_ARCHETYPE_DIELECTRIC) {
+                                    nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                    nextDirection = currDirection;
+                                    survivesToNext = true;
+                                    break;
+                                }
+
+                                Material dMat = materials[dMatId];
+                                bool isWaterD = ((dMat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (dMat.normalTex == 0xFFFFFF03u);
+
+                                // If non-dielectric, rough, textured, or emissive, emit ray for specialized downstream microkernels
+                                if (dMat.roughness > 0.05 || 
+                                    dMat.albedoTex > 0u || dMat.normalTex > 0u || dMat.emissiveTex > 0u ||
+                                    length(dMat.emissive.rgb) > 1e-3 || dMat.iridescence > 0.001 || isWaterD) {
+                                    nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                    nextDirection = currDirection;
+                                    survivesToNext = true;
+                                    break;
+                                }
+
+                                // Pure Smooth Dielectric: evaluate interface in fast registers
+                                deltaEvents++;
+                                vec3 dHitPoint = currOrigin + closestT * currDirection;
+                                bool dFrontFace = dot(currDirection, dHitNormal) < 0.0;
+                                dHitNormal = dFrontFace ? dHitNormal : -dHitNormal;
+
+                                float dIor = dMat.ior > 0.0 ? dMat.ior : 1.5;
+                                if (dMat.dispersion > 0.001 && dispersionChannel != 0u) {
+                                    uint channel = dispersionChannel - 1u;
+                                    float dispDelta = (float(channel) - 1.0) * (dMat.dispersion * 0.03 * dIor);
+                                    dIor += dispDelta;
+                                }
+
+                                float dEta = dFrontFace ? (1.0 / dIor) : dIor;
+                                vec3 dV = -currDirection;
+                                float dCosTheta = min(dot(dV, dHitNormal), 1.0);
+                                float dSinTheta = sqrt(max(0.0, 1.0 - dCosTheta * dCosTheta));
+
+                                bool dCannotRefract = dEta * dSinTheta > 1.0;
+                                float dReflectProb = fresnelDielectric(dCosTheta, dEta);
+
+                                bool isThinWalledD = (dMat.thickness <= 0.001);
+                                if (isThinWalledD) {
+                                    if (!dFrontFace) {
+                                        dReflectProb = 0.0;
+                                        dCannotRefract = false;
+                                    } else {
+                                        dReflectProb = (2.0 * dReflectProb) / (1.0 + dReflectProb);
+                                    }
+                                }
+
+                                float rFlipD = randFloat(seed);
+                                if (dCannotRefract || rFlipD < dReflectProb) {
+                                    currDirection = reflect(currDirection, dHitNormal);
+                                    currOrigin = dHitPoint + dHitNormal * EPSILON;
+                                } else {
+                                    if (isThinWalledD) {
+                                        currOrigin = dHitPoint + currDirection * (EPSILON * 2.0);
+                                    } else {
+                                        if (dMat.dispersion > 0.001 && dispersionChannel == 0u) {
+                                            uint channel = min(uint(randFloat(seed) * 3.0), 2u);
+                                            dispersionChannel = channel + 1u;
+                                            vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                                            throughput *= mask;
+                                            float dispDelta = (float(channel) - 1.0) * (dMat.dispersion * 0.03 * dIor);
+                                            dIor += dispDelta;
+                                            dEta = dFrontFace ? (1.0 / dIor) : dIor;
+                                        }
+                                        currDirection = normalize(refract(currDirection, dHitNormal, dEta));
+                                        currOrigin = dHitPoint - dHitNormal * EPSILON;
+                                    }
+                                    throughput *= dMat.albedo.rgb;
+                                }
+
+                                // Volumetric Beer-Lambert absorption
+                                if (!isThinWalledD) {
+                                    float mediumDist = !dFrontFace ? closestT : 0.0;
+                                    vec4 atten = dMat.attenuationColor;
+                                    if (atten.w > 0.0 && mediumDist > 0.0) {
+                                        vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
+                                        throughput *= exp(-sigma_a * mediumDist);
+                                    }
+                                }
+
+                                currBounce++;
+                                if (currBounce >= pc.maxBounces) {
+                                    survivesToNext = false;
+                                    break;
+                                }
+
+                                float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
+                                if (maxThresh < 0.001) {
+                                    survivesToNext = false;
+                                    break;
+                                }
+                                if (currBounce >= 2u && applyRussianRoulette(throughput, maxThresh, currBounce, seed)) {
+                                    survivesToNext = false;
+                                    break;
+                                }
+
+                                nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+                                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                nextDirection = currDirection;
+                                survivesToNext = true;
+                            }
+                        }
                     }
                 }
             }

@@ -420,7 +420,9 @@ GpuDeviceNode::~GpuDeviceNode() {
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
 
-    accumTarget.reset();
+    for (uint32_t i = 0; i < NUM_IN_FLIGHT; ++i) {
+        accumTargets[i].reset();
+    }
     triangleBuffer.reset();
     sphereBuffer.reset();
     materialBuffer.reset();
@@ -573,16 +575,6 @@ void MultiGpuManager::destroySharedP2PBuffer() {
     VkDevice dev1 = (!m_devices.empty() && m_devices[0]->context) ? m_devices[0]->context->getDevice() : VK_NULL_HANDLE;
 
     for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
-        if (dev0 != VK_NULL_HANDLE) {
-            if (m_p2pBufferPrimary[slot] != VK_NULL_HANDLE) {
-                vkDestroyBuffer(dev0, m_p2pBufferPrimary[slot], nullptr);
-                m_p2pBufferPrimary[slot] = VK_NULL_HANDLE;
-            }
-            if (m_p2pMemPrimary[slot] != VK_NULL_HANDLE) {
-                vkFreeMemory(dev0, m_p2pMemPrimary[slot], nullptr);
-                m_p2pMemPrimary[slot] = VK_NULL_HANDLE;
-            }
-        }
         if (dev1 != VK_NULL_HANDLE) {
             if (m_p2pBufferSecondary[slot] != VK_NULL_HANDLE) {
                 vkDestroyBuffer(dev1, m_p2pBufferSecondary[slot], nullptr);
@@ -591,6 +583,16 @@ void MultiGpuManager::destroySharedP2PBuffer() {
             if (m_p2pMemSecondary[slot] != VK_NULL_HANDLE) {
                 vkFreeMemory(dev1, m_p2pMemSecondary[slot], nullptr);
                 m_p2pMemSecondary[slot] = VK_NULL_HANDLE;
+            }
+        }
+        if (dev0 != VK_NULL_HANDLE) {
+            if (m_p2pBufferPrimary[slot] != VK_NULL_HANDLE) {
+                vkDestroyBuffer(dev0, m_p2pBufferPrimary[slot], nullptr);
+                m_p2pBufferPrimary[slot] = VK_NULL_HANDLE;
+            }
+            if (m_p2pMemPrimary[slot] != VK_NULL_HANDLE) {
+                vkFreeMemory(dev0, m_p2pMemPrimary[slot], nullptr);
+                m_p2pMemPrimary[slot] = VK_NULL_HANDLE;
             }
         }
     }
@@ -604,9 +606,9 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
         return false;
     }
 
-    auto pfnGetFd = m_devices[0]->context->pfnGetMemoryFdKHR;
-    auto pfnGetFdProps = m_primaryContext->pfnGetMemoryFdPropertiesKHR;
-    if (!pfnGetFd || !pfnGetFdProps) {
+    auto pfnGetFd0 = m_primaryContext->pfnGetMemoryFdKHR;
+    auto pfnGetFdProps1 = m_devices[0]->context->pfnGetMemoryFdPropertiesKHR;
+    if (!pfnGetFd0 || !pfnGetFdProps1) {
         return false;
     }
 
@@ -619,24 +621,140 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
     vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
     vkGetPhysicalDeviceMemoryProperties(phys1, &memProps1);
 
-    // Find Device-Local memory type on Device 1
-    uint32_t devLocalIdx1 = UINT32_MAX;
-    for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
-        if (memProps1.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-            devLocalIdx1 = i;
+    // Find Device-Local memory type on Device 0
+    uint32_t devLocalIdx0 = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+        if (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            devLocalIdx0 = i;
             break;
         }
     }
-    if (devLocalIdx1 == UINT32_MAX) return false;
+    if (devLocalIdx0 == UINT32_MAX) return false;
+
+    // Detect BAR aperture size: inspect heaps mapped to HOST_VISIBLE | DEVICE_LOCAL
+    VkDeviceSize barVisibleVramSize0 = 0;
+    for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+        const auto& type = memProps0.memoryTypes[i];
+        if ((type.propertyFlags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+            (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            barVisibleVramSize0 = std::max(barVisibleVramSize0, memProps0.memoryHeaps[type.heapIndex].size);
+        }
+    }
 
     // Align buffer size to 64KB (standard PCI page alignment)
     VkDeviceSize alignment = 65536;
     VkDeviceSize alignedSize = (bufferSize + alignment - 1) & ~(alignment - 1);
     auto handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 
+    bool isSmallBar = (barVisibleVramSize0 > 0 && barVisibleVramSize0 <= 256 * 1024 * 1024);
+    if (isSmallBar) {
+        Logger::info("Inter-GPU P2P: Small-BAR topology detected ({:.0f} MB BAR0). Budgeted 2x {:.2f} MB in BAR-visible VRAM.",
+                     static_cast<double>(barVisibleVramSize0) / (1024.0 * 1024.0),
+                     static_cast<double>(alignedSize) / (1024.0 * 1024.0));
+    } else if (barVisibleVramSize0 > 256 * 1024 * 1024) {
+        Logger::info("Inter-GPU P2P: Resizable BAR detected ({:.2f} GB BAR0). Allocating 2x {:.2f} MB in VRAM.",
+                     static_cast<double>(barVisibleVramSize0) / (1024.0 * 1024.0 * 1024.0),
+                     static_cast<double>(alignedSize) / (1024.0 * 1024.0));
+    }
+
     bool allSucceeded = true;
     for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
-        // 1. Create buffer on Device 1 (GPU 1 VRAM)
+        // 1. Create buffer on Device 0 (GPU 0 VRAM)
+        VkExternalMemoryBufferCreateInfo extBufInfo0{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+        extBufInfo0.handleTypes = handleType;
+
+        std::vector<uint32_t> dev0QueueFamilies;
+        dev0QueueFamilies.push_back(m_primaryContext->getGraphicsQueueFamily());
+        if (m_primaryContext->hasDedicatedAsyncCompute() &&
+            m_primaryContext->getAsyncComputeQueueFamily() != m_primaryContext->getGraphicsQueueFamily()) {
+            dev0QueueFamilies.push_back(m_primaryContext->getAsyncComputeQueueFamily());
+        }
+
+        VkBufferCreateInfo bufInfo0{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufInfo0.pNext = &extBufInfo0;
+        bufInfo0.size = alignedSize;
+        bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (dev0QueueFamilies.size() > 1) {
+            bufInfo0.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            bufInfo0.queueFamilyIndexCount = static_cast<uint32_t>(dev0QueueFamilies.size());
+            bufInfo0.pQueueFamilyIndices = dev0QueueFamilies.data();
+        } else {
+            bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
+
+        VkResult res = vkCreateBuffer(dev0, &bufInfo0, nullptr, &m_p2pBufferPrimary[slot]);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        VkBufferMemoryRequirementsInfo2 reqInfo0{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+        reqInfo0.buffer = m_p2pBufferPrimary[slot];
+        VkMemoryRequirements2 memReq2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        vkGetBufferMemoryRequirements2(dev0, &reqInfo0, &memReq2);
+        VkMemoryRequirements memReq0 = memReq2.memoryRequirements;
+
+        // 2. Allocate exportable Device-Local memory on Device 0
+        VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
+        exportAllocInfo.handleTypes = handleType;
+
+        VkMemoryAllocateInfo allocInfo0{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo0.pNext = &exportAllocInfo;
+        allocInfo0.allocationSize = memReq0.size;
+        allocInfo0.memoryTypeIndex = devLocalIdx0;
+
+        res = vkAllocateMemory(dev0, &allocInfo0, nullptr, &m_p2pMemPrimary[slot]);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        res = vkBindBufferMemory(dev0, m_p2pBufferPrimary[slot], m_p2pMemPrimary[slot], 0);
+        if (res != VK_SUCCESS) { allSucceeded = false; break; }
+
+        // 3. Export FD from Device 0
+        VkMemoryGetFdInfoKHR getFdInfo{ VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
+        getFdInfo.memory = m_p2pMemPrimary[slot];
+        getFdInfo.handleType = handleType;
+
+        int memFd = -1;
+        res = pfnGetFd0(dev0, &getFdInfo, &memFd);
+        if (res != VK_SUCCESS || memFd < 0) { allSucceeded = false; break; }
+
+        // 4. Query FD memory type on Device 1
+        VkMemoryFdPropertiesKHR fdProps{ VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
+        res = pfnGetFdProps1(dev1, handleType, memFd, &fdProps);
+        if (res != VK_SUCCESS) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        uint32_t memIdx1 = UINT32_MAX;
+        for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+            if (fdProps.memoryTypeBits & (1 << i)) {
+                memIdx1 = i;
+                break;
+            }
+        }
+        if (memIdx1 == UINT32_MAX) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        // 5. Import FD into Device 1
+        VkImportMemoryFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+        importInfo.handleType = handleType;
+        importInfo.fd = memFd;
+
+        VkMemoryAllocateInfo allocInfo1{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo1.pNext = &importInfo;
+        allocInfo1.allocationSize = memReq0.size;
+        allocInfo1.memoryTypeIndex = memIdx1;
+
+        res = vkAllocateMemory(dev1, &allocInfo1, nullptr, &m_p2pMemSecondary[slot]);
+        if (res != VK_SUCCESS) {
+            closeFileDescriptor(memFd);
+            allSucceeded = false;
+            break;
+        }
+
+        // 6. Create buffer on Device 1 and bind imported memory
         VkExternalMemoryBufferCreateInfo extBufInfo1{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
         extBufInfo1.handleTypes = handleType;
 
@@ -646,100 +764,18 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
         bufInfo1.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bufInfo1.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        VkResult res = vkCreateBuffer(dev1, &bufInfo1, nullptr, &m_p2pBufferSecondary[slot]);
-        if (res != VK_SUCCESS) { allSucceeded = false; break; }
-
-        VkBufferMemoryRequirementsInfo2 reqInfo1{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
-        reqInfo1.buffer = m_p2pBufferSecondary[slot];
-        VkMemoryRequirements2 memReq2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-        vkGetBufferMemoryRequirements2(dev1, &reqInfo1, &memReq2);
-        VkMemoryRequirements memReq1 = memReq2.memoryRequirements;
-
-        // 2. Allocate exportable Device-Local memory on Device 1
-        VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
-        exportAllocInfo.handleTypes = handleType;
-
-        VkMemoryAllocateInfo allocInfo1{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        allocInfo1.pNext = &exportAllocInfo;
-        allocInfo1.allocationSize = memReq1.size;
-        allocInfo1.memoryTypeIndex = devLocalIdx1;
-
-        res = vkAllocateMemory(dev1, &allocInfo1, nullptr, &m_p2pMemSecondary[slot]);
+        res = vkCreateBuffer(dev1, &bufInfo1, nullptr, &m_p2pBufferSecondary[slot]);
         if (res != VK_SUCCESS) { allSucceeded = false; break; }
 
         res = vkBindBufferMemory(dev1, m_p2pBufferSecondary[slot], m_p2pMemSecondary[slot], 0);
-        if (res != VK_SUCCESS) { allSucceeded = false; break; }
-
-        // 3. Export FD from Device 1
-        VkMemoryGetFdInfoKHR getFdInfo{ VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
-        getFdInfo.memory = m_p2pMemSecondary[slot];
-        getFdInfo.handleType = handleType;
-
-        int memFd = -1;
-        res = pfnGetFd(dev1, &getFdInfo, &memFd);
-        if (res != VK_SUCCESS || memFd < 0) { allSucceeded = false; break; }
-
-        // 4. Query FD memory type on Device 0
-        VkMemoryFdPropertiesKHR fdProps{ VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
-        res = pfnGetFdProps(dev0, handleType, memFd, &fdProps);
-        if (res != VK_SUCCESS) {
-            closeFileDescriptor(memFd);
-            allSucceeded = false;
-            break;
-        }
-
-        uint32_t memIdx0 = UINT32_MAX;
-        for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
-            if (fdProps.memoryTypeBits & (1 << i)) {
-                memIdx0 = i;
-                break;
-            }
-        }
-        if (memIdx0 == UINT32_MAX) {
-            closeFileDescriptor(memFd);
-            allSucceeded = false;
-            break;
-        }
-
-        // 5. Import FD into Device 0
-        VkImportMemoryFdInfoKHR importInfo{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
-        importInfo.handleType = handleType;
-        importInfo.fd = memFd;
-
-        VkMemoryAllocateInfo allocInfo0{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        allocInfo0.pNext = &importInfo;
-        allocInfo0.allocationSize = memReq1.size;
-        allocInfo0.memoryTypeIndex = memIdx0;
-
-        res = vkAllocateMemory(dev0, &allocInfo0, nullptr, &m_p2pMemPrimary[slot]);
-        if (res != VK_SUCCESS) {
-            closeFileDescriptor(memFd);
-            allSucceeded = false;
-            break;
-        }
-
-        // 6. Create buffer on Device 0 and bind imported memory
-        VkExternalMemoryBufferCreateInfo extBufInfo0{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
-        extBufInfo0.handleTypes = handleType;
-
-        VkBufferCreateInfo bufInfo0{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bufInfo0.pNext = &extBufInfo0;
-        bufInfo0.size = alignedSize;
-        bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        res = vkCreateBuffer(dev0, &bufInfo0, nullptr, &m_p2pBufferPrimary[slot]);
-        if (res != VK_SUCCESS) { allSucceeded = false; break; }
-
-        res = vkBindBufferMemory(dev0, m_p2pBufferPrimary[slot], m_p2pMemPrimary[slot], 0);
         if (res != VK_SUCCESS) { allSucceeded = false; break; }
     }
 
     if (allSucceeded) {
         m_sharedBufferSize = alignedSize;
         m_transferMode = InterGpuTransferMode::P2P_Direct_BAR;
-        m_useZeroCopyHost = true;
-        Logger::info("Inter-GPU: Activated P2P Direct BAR Transfer via Linux DMA-BUF (2x {:.2f} MB).",
+        m_useZeroCopyHost = false;
+        Logger::info("Inter-GPU: Activated P2P Direct BAR Transfer via Linux DMA-BUF (2x {:.2f} MB, zero host copies).",
                      static_cast<double>(alignedSize) / (1024.0 * 1024.0));
         return true;
     }
@@ -791,8 +827,41 @@ void MultiGpuManager::destroySharedHostBuffer() {
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     destroySharedHostBuffer();
 
-    // Option 1: Direct P2P Device-Local BAR Transfer via Linux DMA-BUF (Default on Linux, auto-fallback to host)
-    if (m_config.mgpu_transfer_mode == Config::MgpuTransferMode::P2P) {
+    // Query BAR-visible VRAM size on Primary Device (Dev 0)
+    VkPhysicalDevice phys0 = m_primaryContext ? m_primaryContext->getPhysicalDevice() : VK_NULL_HANDLE;
+    VkDeviceSize barVisibleVramSize0 = 0;
+    if (phys0 != VK_NULL_HANDLE) {
+        VkPhysicalDeviceMemoryProperties memProps0;
+        vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
+        for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+            const auto& type = memProps0.memoryTypes[i];
+            if ((type.propertyFlags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                barVisibleVramSize0 = std::max(barVisibleVramSize0, memProps0.memoryHeaps[type.heapIndex].size);
+            }
+        }
+    }
+    bool isSmallBar = (barVisibleVramSize0 > 0 && barVisibleVramSize0 <= 256 * 1024 * 1024);
+
+    bool attemptP2P = false;
+    if (m_config.mgpu_transfer_explicit) {
+        attemptP2P = (m_config.mgpu_transfer_mode == Config::MgpuTransferMode::P2P);
+    } else {
+        // Automatic selection policy:
+        // When Resizable BAR is available (>256 MB BAR0), use P2P Direct BAR by default.
+        // Under Small-BAR topologies (<=256 MB BAR0, Above 4G Decoding disabled), direct P2P MMIO across
+        // separate PCIe root complexes incurs crossbar arbitration overhead; auto-fallback to Zero-Copy
+        // Host Memory which achieves full 2.0x+ scaling via independent PCIe 4.0 host streaming.
+        if (!isSmallBar) {
+            attemptP2P = true;
+        } else {
+            Logger::info("Inter-GPU: Small-BAR topology detected ({:.0f} MB BAR0, Above 4G Decoding disabled). Auto-falling back to Zero-Copy Host Memory (2.0x scaling). Use --mgpu-transfer p2p to force direct BAR.",
+                         static_cast<double>(barVisibleVramSize0) / (1024.0 * 1024.0));
+            attemptP2P = false;
+        }
+    }
+
+    if (attemptP2P) {
         if (initSharedP2PBuffer(bufferSize)) {
             Logger::info("Active Inter-GPU Transfer: P2P Direct BAR via Linux DMA-BUF (Device-local VRAM streaming).");
             return;
@@ -807,7 +876,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     }
 
     VkDevice dev0 = m_primaryContext->getDevice();
-    VkPhysicalDevice phys0 = m_primaryContext->getPhysicalDevice();
+    phys0 = m_primaryContext->getPhysicalDevice();
     VkDevice dev1 = m_devices[0]->context->getDevice();
     VkPhysicalDevice phys1 = m_devices[0]->context->getPhysicalDevice();
 
@@ -914,11 +983,24 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         VkExternalMemoryBufferCreateInfo extBufInfo0{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         extBufInfo0.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
 
+        std::vector<uint32_t> dev0QueueFamilies;
+        dev0QueueFamilies.push_back(m_primaryContext->getGraphicsQueueFamily());
+        if (m_primaryContext->hasDedicatedAsyncCompute() &&
+            m_primaryContext->getAsyncComputeQueueFamily() != m_primaryContext->getGraphicsQueueFamily()) {
+            dev0QueueFamilies.push_back(m_primaryContext->getAsyncComputeQueueFamily());
+        }
+
         VkBufferCreateInfo bufInfo0{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufInfo0.pNext = &extBufInfo0;
         bufInfo0.size = m_sharedBufferSize;
         bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (dev0QueueFamilies.size() > 1) {
+            bufInfo0.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            bufInfo0.queueFamilyIndexCount = static_cast<uint32_t>(dev0QueueFamilies.size());
+            bufInfo0.pQueueFamilyIndices = dev0QueueFamilies.data();
+        } else {
+            bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
 
         VkResult resBuf0 = vkCreateBuffer(dev0, &bufInfo0, nullptr, &m_sharedBufferPrimary[slot]);
         VkResult resBind0 = vkBindBufferMemory(dev0, m_sharedBufferPrimary[slot], m_sharedMemPrimary[slot], 0);
@@ -964,6 +1046,40 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         destroySharedHostBuffer();
         throw std::runtime_error("Failed to bind zero-copy host buffers on both GPUs. Slower CPU staging workarounds are not supported under Vulkan 1.4 baseline.");
     }
+}
+
+VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t height) const {
+    if (m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend && m_config.upscaler_mode == UpscalerMode::FSR3) {
+        VkDeviceSize displaySize = static_cast<VkDeviceSize>(width) * height * 8;
+        return (displaySize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    }
+
+    uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(width * m_config.render_scale) : width;
+    uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+        static_cast<uint32_t>(height * m_config.render_scale) : height;
+
+    uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+    uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+    uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+    bool isCheckerboard = (m_config.mgpu_mode == MultiGpuMode::CheckerboardTile || m_config.mgpu_mode == MultiGpuMode::Auto);
+    uint32_t dispatchWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
+    uint32_t dispatchHeight = renderH;
+
+    uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
+                   (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
+    VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
+    VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+
+    if (!isCheckerboard) {
+        // SampleParallel mode only transfers radiance
+        return radOffsetAligned;
+    }
+
+    VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
+    VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    VkDeviceSize ndSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F
+    return mvOffsetAligned + ndSize;
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
@@ -1102,11 +1218,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     uint32_t secWidth = config.width;
     VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
                            (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
-    secNode->accumTarget = std::make_unique<Image>(
-        secDevice, secAlloc, secWidth, config.height,
-        accumFormat,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    );
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        secNode->accumTargets[i] = std::make_unique<Image>(
+            secDevice, secAlloc, secWidth, config.height,
+            accumFormat,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
 
     // 4. Scene Buffers on secondary device (pure DEVICE_LOCAL VRAM with staging upload, 16-byte aligned)
     size_t numTris = scene.triangles.size();
@@ -1341,10 +1459,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    VkDescriptorImageInfo accumImageInfo{};
-    accumImageInfo.imageView = secNode->accumTarget->getImageView();
-    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
     VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -1373,6 +1487,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        VkDescriptorImageInfo accumImageInfo{};
+        accumImageInfo.imageView = secNode->accumTargets[slot]->getImageView();
+        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
         VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
         std::vector<VkWriteDescriptorSet> writes = {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
@@ -1513,11 +1631,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkImageSubresourceRange clearRng{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdClearColorImage(secNode->commandBuffers[0], secNode->causticImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &blackClr, 1, &clearRng);
 
-    secNode->accumTarget->transitionLayout(
-        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        secNode->accumTargets[i]->transitionLayout(
+            secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
     secNode->directLightImage->transitionLayout(
         secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
@@ -1531,8 +1651,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCmdClearColorImage(secNode->commandBuffers[0], secNode->accumTarget->getImage(),
-                         VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        vkCmdClearColorImage(secNode->commandBuffers[0], secNode->accumTargets[i]->getImage(),
+                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+    }
 
     vkEndCommandBuffer(secNode->commandBuffers[0]);
 
@@ -1549,15 +1671,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     m_devices.push_back(std::move(secNode));
     m_active = true;
 
-    // Initialize zero-copy shared external memory host buffer across primary and secondary GPUs (Radiance + MV + Normal/Depth)
-    uint32_t bytesPerPixel = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 :
-                             (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
-    VkDeviceSize bufferSize = static_cast<VkDeviceSize>(config.width) * config.height * bytesPerPixel;
+    // Initialize shared inter-GPU buffer across primary and secondary GPUs (Radiance + MV + Normal/Depth)
+    m_config = config;
+    VkDeviceSize bufferSize = calculateSharedBufferSize(config.width, config.height);
     initSharedHostBuffer(bufferSize);
 }
 
 void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
-    if (!secNode || !secNode->wavefrontPipeline || !secNode->accumTarget || !secNode->triangleBuffer) return;
+    if (!secNode || !secNode->wavefrontPipeline || !secNode->accumTargets[0] || !secNode->triangleBuffer) return;
 
     VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
     VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
@@ -1575,7 +1696,7 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
         if (!secNode->cameraUBOs[slot]) continue;
         secNode->wavefrontPipeline->updateSceneDescriptors(
             slot,
-            secNode->accumTarget->getImageView(),
+            secNode->accumTargets[slot]->getImageView(),
             secNode->cameraUBOs[slot]->getBuffer(),
             secNode->triangleBuffer->getBuffer(), secNode->triangleBuffer->getSize(),
             secNode->sphereBuffer->getBuffer(), secNode->sphereBuffer->getSize(),
@@ -1648,10 +1769,19 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         uint64_t slotTimestamps[4] = {0, 0, 0, 0};
         if (vkGetQueryPoolResults(device, node->queryPools[slot], 0, 4, sizeof(slotTimestamps), slotTimestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             if (slotTimestamps[1] > slotTimestamps[0]) {
-                node->lastFrameTimeMs = (slotTimestamps[1] - slotTimestamps[0]) * node->timestampPeriod * 1e-6;
+                double rtMs = (slotTimestamps[1] - slotTimestamps[0]) * node->timestampPeriod * 1e-6;
+                node->lastFrameTimeMs = rtMs;
             }
             if (slotTimestamps[3] > slotTimestamps[2]) {
-                node->lastTransferTimeMs = (slotTimestamps[3] - slotTimestamps[2]) * node->timestampPeriod * 1e-6;
+                double copyMs = (slotTimestamps[3] - slotTimestamps[2]) * node->timestampPeriod * 1e-6;
+                node->lastTransferTimeMs = copyMs;
+            }
+        }
+        if (node->wavefrontPipeline && (getenv("PATHWAYS_PROFILE_WF") || m_config.benchmark)) {
+            static int secProfCount = 0;
+            if (++secProfCount == 10) {
+                Logger::info("--- SECONDARY GPU (GPU 1) WAVEFRONT PROFILE ---");
+                node->wavefrontPipeline->printProfilingBreakdown(slot, node->timestampPeriod, m_config.max_bounces);
             }
         }
     }
@@ -1674,7 +1804,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
     vkCmdResetQueryPool(cmd, node->queryPools[slot], 0, 4);
     // Timestamp 0: RT Start
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, node->queryPools[slot], 0);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 0);
 
     uint32_t envBits = std::bit_cast<uint32_t>(packet.envMapIntensity);
     uint32_t fracBits = std::bit_cast<uint32_t>(packet.fractionalSpp);
@@ -1712,7 +1842,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         if (packet.accumulateHistory == 0u) {
             VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
             VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCmdClearColorImage(cmd, node->accumTarget->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+            vkCmdClearColorImage(cmd, node->accumTargets[slot]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
 
             VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
@@ -1721,7 +1851,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            clearBarrier.image = node->accumTarget->getImage();
+            clearBarrier.image = node->accumTargets[slot]->getImage();
             clearBarrier.subresourceRange = clearRange;
 
             VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -1754,6 +1884,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.indirectClamp = m_config.indirect_clamp;
         wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
         wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
+        wfSceneData.deltaUnroll = m_config.delta_unroll;
+        wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.tileOffsetX = packet.tileOffsetX;
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
@@ -1794,7 +1926,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         UpscalerDispatchDesc descSec{};
         descSec.cmd = cmd;
-        descSec.colorIn = node->accumTarget->getImageView();
+        descSec.colorIn = node->accumTargets[slot]->getImageView();
         descSec.depthIn = node->normalDepthImage ? node->normalDepthImage->getImageView() : VK_NULL_HANDLE;
         descSec.motionVectorsIn = node->motionVectorImage ? node->motionVectorImage->getImageView() : VK_NULL_HANDLE;
         descSec.colorOut = node->upscaler->getOutputImage()->getImageView();
@@ -1887,7 +2019,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             return b;
         };
 
-        toTransferBarriers.push_back(makeToTransferBarrier(node->accumTarget->getImage()));
+        toTransferBarriers.push_back(makeToTransferBarrier(node->accumTargets[slot]->getImage()));
         if (copyExtraImages) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->motionVectorImage->getImage()));
             toTransferBarriers.push_back(makeToTransferBarrier(node->normalDepthImage->getImage()));
@@ -1917,7 +2049,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             ? m_p2pBufferSecondary[sharedSlot]
             : m_sharedBufferSecondary[sharedSlot];
 
-        vkCmdCopyImageToBuffer(cmd, node->accumTarget->getImage(),
+        vkCmdCopyImageToBuffer(cmd, node->accumTargets[slot]->getImage(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                targetBuffer, 1, &copyRegion);
 
@@ -1966,7 +2098,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             return b;
         };
 
-        toGeneralBarriers.push_back(makeToGeneralBarrier(node->accumTarget->getImage()));
+        toGeneralBarriers.push_back(makeToGeneralBarrier(node->accumTargets[slot]->getImage()));
         if (copyExtraImages) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->motionVectorImage->getImage()));
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->normalDepthImage->getImage()));
@@ -2126,16 +2258,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         VmaAllocator secAlloc = node->context->getAllocator();
         vkDeviceWaitIdle(secDevice);
 
-        uint32_t bytesPerPixel = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 24 :
-                                 (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
         VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
                                (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
         uint32_t secWidth = width;
-        node->accumTarget = std::make_unique<Image>(
-            secDevice, secAlloc, secWidth, height,
-            accumFormat,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-        );
+        for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+            node->accumTargets[i] = std::make_unique<Image>(
+                secDevice, secAlloc, secWidth, height,
+                accumFormat,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+        }
 
         // Recreate secondary G-Buffer resources
         node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
@@ -2161,12 +2293,14 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(node->commandBuffers[0], &beginInfo);
 
-        node->accumTarget->transitionLayout(
-            node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
+        for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+            node->accumTargets[i]->transitionLayout(
+                node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
 
         node->directLightImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -2190,8 +2324,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCmdClearColorImage(node->commandBuffers[0], node->accumTarget->getImage(),
-                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+        for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+            vkCmdClearColorImage(node->commandBuffers[0], node->accumTargets[i]->getImage(),
+                                 VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
+        }
 
         node->causticImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -2213,18 +2349,18 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         vkQueueSubmit2(node->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
         vkQueueWaitIdle(node->context->getGraphicsQueue());
 
-        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(width) * height * bytesPerPixel;
+        VkDeviceSize bufferSize = calculateSharedBufferSize(width, height);
         initSharedHostBuffer(bufferSize);
-
-        VkDescriptorImageInfo accumImageInfo{};
-        accumImageInfo.imageView = node->accumTarget->getImageView();
-        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, node->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+            VkDescriptorImageInfo accumImageInfo{};
+            accumImageInfo.imageView = node->accumTargets[slot]->getImageView();
+            accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
             std::vector<VkWriteDescriptorSet> writes = {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
@@ -2467,10 +2603,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     );
 
     // 4. Update secondary descriptors
-    VkDescriptorImageInfo accumImageInfo{};
-    accumImageInfo.imageView = secNode->accumTarget->getImageView();
-    accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
     VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
@@ -2502,6 +2634,10 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     VkDescriptorImageInfo blueNoiseInfo = secNode->blueNoiseTexture ? secNode->blueNoiseTexture->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
 
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        VkDescriptorImageInfo accumImageInfo{};
+        accumImageInfo.imageView = secNode->accumTargets[slot]->getImageView();
+        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
         VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
         std::vector<VkWriteDescriptorSet> writes = {
             VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },

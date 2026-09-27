@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include "vk_mem_alloc.h"
 #include <cstdint>
+#include <vector>
 
 namespace pathways {
 
@@ -10,7 +11,7 @@ class Buffer {
 public:
     Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage,
            VmaMemoryUsage memoryUsage, VmaAllocationCreateFlags flags = 0, VkDeviceSize minAlignment = 0,
-           VkBufferUsageFlags2 usage2 = 0);
+           VkBufferUsageFlags2 usage2 = 0, const std::vector<uint32_t>& queueFamilyIndices = {});
     ~Buffer();
 
     Buffer(const Buffer&) = delete;

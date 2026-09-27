@@ -292,7 +292,7 @@ void Config::printUsage(const char* progName) {
               << "Multi-GPU Subsystem:\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
-              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'p2p' (Direct BAR via Linux DMA-BUF [default with host fallback]), 'host' (Zero-Copy Host Memory)\n"
+              << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'p2p' (Direct BAR via Linux DMA-BUF), 'host' (Zero-Copy Host Memory) [default: auto-detects Resizable BAR vs small-BAR fallback]\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
@@ -605,6 +605,7 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--mgpu-transfer" && i + 1 < argc) {
             std::string tmode = argv[++i];
+            cfg.mgpu_transfer_explicit = true;
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf" || tmode == "dmabuf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
@@ -616,6 +617,7 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--mgpu-transfer=")) {
             std::string tmode = arg.substr(16);
+            cfg.mgpu_transfer_explicit = true;
             if (tmode == "p2p" || tmode == "bar" || tmode == "dma-buf" || tmode == "dmabuf") {
                 cfg.mgpu_transfer_mode = Config::MgpuTransferMode::P2P;
             } else if (tmode == "staging" || tmode == "cpu") {
@@ -967,8 +969,29 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_tail_megakernel = true;
             continue;
         }
+        if ((arg == "--delta-unroll" || arg == "-du") && i + 1 < argc) {
+            cfg.delta_unroll = std::stoul(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--delta-unroll=") || arg.starts_with("-du=")) {
+            cfg.delta_unroll = std::stoul(arg.substr(arg.find('=') + 1));
+            continue;
+        }
         if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
+            cfg.explicit_accum_format = true;
+            if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
+                cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
+            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
+                cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
+            } else {
+                cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
+            }
+            continue;
+        }
+        if (arg.starts_with("--accum-format=") || arg.starts_with("--format=")) {
+            std::string fmt = arg.substr(arg.find('=') + 1);
+            cfg.explicit_accum_format = true;
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
             } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
@@ -1376,6 +1399,11 @@ Config Config::parse(int argc, char* argv[]) {
     } else if (cfg.headless && cfg.frame_limit == 0) {
         // In headless mode, default to 1 frame unless explicitly told to run more
         cfg.frame_limit = 1;
+    }
+
+    if (!cfg.explicit_accum_format && cfg.mgpu_mode != MultiGpuMode::Off) {
+        cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
+        Logger::info("Config: Multi-GPU enabled without explicit --accum-format; defaulting to R11G11B10_UFLOAT for optimal PCIe transfer bandwidth.");
     }
 
     // Auto-detect co-located scene HDRI environment map if not explicitly specified

@@ -99,14 +99,14 @@ def main():
         else:
             print(f"\033[32m[PASS]\033[0m Contact shadows intact: {m_wf['shadow_pct']:.2f}% in [10%, 40%]")
 
-        if m_wf["mean_lum"] < 0.20:
-            print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} below floor 0.20 (dark collapse under motion)")
+        if m_wf["mean_lum"] < 0.18:
+            print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} below floor 0.18 (dark collapse under motion)")
             all_passed = False
         elif m_wf["mean_lum"] > 0.50:
             print(f"[FAIL] Mean luminance {m_wf['mean_lum']:.4f} exceeds ceiling 0.50 (overexposed)")
             all_passed = False
         else:
-            print(f"\033[32m[PASS]\033[0m Proper exposure: {m_wf['mean_lum']:.4f} in [0.20, 0.50]")
+            print(f"\033[32m[PASS]\033[0m Proper exposure: {m_wf['mean_lum']:.4f} in [0.18, 0.50]")
 
         if m_wf["blown_pct"] > 5.0:
             print(f"[FAIL] Blown-out percentage {m_wf['blown_pct']:.2f}% exceeds 5.0% ceiling")

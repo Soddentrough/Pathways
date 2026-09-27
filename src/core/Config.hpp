@@ -74,6 +74,7 @@ struct Config {
     float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
     bool enable_tail_megakernel = false;      // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: false, opt-in via --tail-megakernel]
     uint32_t tail_megakernel_bounce = 2;      // Bounce at which to switch from Wavefront to Tail Megakernel (default: 2)
+    uint32_t delta_unroll = 0;                // Max delta-chain unroll depth for smooth dielectrics [Default: 0 = Pure Wavefront]
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -164,8 +165,10 @@ struct Config {
         Host,     // VK_EXT_external_memory_host (Zero-Copy Pinned Host Memory)
         P2P       // Linux DMA-BUF Direct PCIe P2P (Device-Local BAR, high performance default with host fallback)
     };
-    MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::P2P; // Default: P2P Direct BAR (auto-fallback to Host if unsupported)
+    MgpuTransferMode mgpu_transfer_mode = MgpuTransferMode::P2P; // Default: P2P Direct BAR (auto-fallback to Host if unsupported or small-BAR)
+    bool mgpu_transfer_explicit = false; // Set to true if --mgpu-transfer is explicitly passed on CLI
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT; // Default: RGBA16_SFLOAT (Preserve FP16 bandwidth and performance)
+    bool explicit_accum_format = false; // Set to true if --accum-format is passed explicitly on CLI
     bool double_buffered_shared_mem = true; // Double-buffered inter-GPU host memory for pipelined DMA transfers
     bool visualize_mgpu_split = false; // Visualize real-time load distribution across Dual GPUs
     bool diagnostic_half_tiles = false; // Benchmark diagnostic: trace only even 64x64 checkerboard tiles on single GPU

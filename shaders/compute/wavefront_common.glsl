@@ -372,17 +372,21 @@ struct RayState {
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
 #define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
 
-RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel) {
     RayState s;
     s.stateData.x = packHalf2x16(vec2(throughput.rg));
-    uint flags = (isSpecularPath ? 1u : 0u) | (causticApplied ? 2u : 0u);
+    uint flags = (isSpecularPath ? 1u : 0u) | (causticApplied ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
     s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u);
     s.stateData.z = seed;
     s.stateData.w = (pixelIndex & PIXEL_INDEX_MASK) | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u) | (causticApplied ? CAUSTIC_APPLIED_BIT : 0u);
     return s;
 }
 
-void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u);
+}
+
+void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied, out uint dispersionChannel) {
     vec2 rg = unpackHalf2x16(s.stateData.x);
     vec2 bz = unpackHalf2x16(s.stateData.y & 0xFFFFu);
     throughput = f16vec3(rg.x, rg.y, bz.x);
@@ -391,6 +395,13 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     pixelIndex = rawPixel & PIXEL_INDEX_MASK;
     isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
     causticApplied = (rawPixel & CAUSTIC_APPLIED_BIT) != 0u;
+    uint flags = s.stateData.y >> 16u;
+    dispersionChannel = (flags >> 2u) & 3u;
+}
+
+void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
+    uint dummyDisp;
+    unpackRayState(s, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dummyDisp);
 }
 
 #define MATERIAL_ARCHETYPE_STANDARD   0u

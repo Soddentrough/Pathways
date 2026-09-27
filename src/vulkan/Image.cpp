@@ -5,7 +5,8 @@
 namespace pathways {
 
 Image::Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t height,
-             VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags)
+             VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags,
+             const std::vector<uint32_t>& queueFamilyIndices)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height),
       m_format(format), m_aspectFlags(aspectFlags) {
 
@@ -22,7 +23,13 @@ Image::Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t h
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     imageInfo.usage = usage;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (queueFamilyIndices.size() > 1) {
+        imageInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        imageInfo.queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size());
+        imageInfo.pQueueFamilyIndices = queueFamilyIndices.data();
+    } else {
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    }
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;

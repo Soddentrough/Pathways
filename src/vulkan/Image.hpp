@@ -3,13 +3,15 @@
 #include <vulkan/vulkan.h>
 #include "vk_mem_alloc.h"
 #include <cstdint>
+#include <vector>
 
 namespace pathways {
 
 class Image {
 public:
     Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t height,
-          VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT);
+          VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT,
+          const std::vector<uint32_t>& queueFamilyIndices = {});
     ~Image();
 
     Image(const Image&) = delete;

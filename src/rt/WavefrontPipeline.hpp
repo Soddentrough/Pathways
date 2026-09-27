@@ -81,6 +81,7 @@ struct WavefrontSceneData {
     uint32_t batchPixels = 0;             // Coarse batch ray budget in pixels (0 = auto-detect)
     bool enableTailMegakernel = false;    // Hybrid Wavefront-to-Megakernel transition for late bounces
     uint32_t tailMegakernelBounce = 2;    // Cutoff bounce to switch to Tail Megakernel (default: 2)
+    uint32_t deltaUnroll = 0;             // Max delta-chain unroll depth for smooth dielectrics (default: 0 = Pure Wavefront)
 };
 
 class WavefrontPipeline {

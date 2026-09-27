@@ -309,8 +309,10 @@ Engine::~Engine() {
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_inFlightFences[i]) vkDestroyFence(device, m_inFlightFences[i], nullptr);
         if (m_rtCompleteSemaphores[i]) vkDestroySemaphore(device, m_rtCompleteSemaphores[i], nullptr);
+        if (m_mergeCompleteSemaphores[i]) vkDestroySemaphore(device, m_mergeCompleteSemaphores[i], nullptr);
     }
     if (m_commandPool) vkDestroyCommandPool(device, m_commandPool, nullptr);
+    if (m_asyncComputeCommandPool) vkDestroyCommandPool(device, m_asyncComputeCommandPool, nullptr);
 
     if (m_queryPool) vkDestroyQueryPool(device, m_queryPool, nullptr);
 
@@ -477,19 +479,41 @@ void Engine::initVulkan() {
     vkAllocateCommandBuffers(device, &allocInfo, m_commandBuffers.data());
     vkAllocateCommandBuffers(device, &allocInfo, m_postCommandBuffers.data());
 
+    if (m_context->hasDedicatedAsyncCompute()) {
+        VkCommandPoolCreateInfo asyncPoolInfo{};
+        asyncPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        asyncPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        asyncPoolInfo.queueFamilyIndex = m_context->getAsyncComputeQueueFamily();
+        vkCreateCommandPool(device, &asyncPoolInfo, nullptr, &m_asyncComputeCommandPool);
+
+        VkCommandBufferAllocateInfo asyncAllocInfo{};
+        asyncAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        asyncAllocInfo.commandPool = m_asyncComputeCommandPool;
+        asyncAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        asyncAllocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+        vkAllocateCommandBuffers(device, &asyncAllocInfo, m_mergeCommandBuffers.data());
+        Logger::info("Async Compute Merge initialized (Family: {})", m_context->getAsyncComputeQueueFamily());
+    }
+
+    auto concurrentQueues = getConcurrentQueueFamilies();
+
     // Create Render Target Images
     VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             device, allocator, m_config.width, m_config.height,
             frameFmt,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            concurrentQueues
         );
     }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         frameFmt,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     // Internal post-process and tonemapping target is strictly 10-bit (or 16-bit float for scRGB HDR).
@@ -501,13 +525,17 @@ void Engine::initVulkan() {
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         outputFmt,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     m_motionVectorImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     // G-Buffer Albedo & Roughness (Required for ML / Upways passes)
@@ -525,7 +553,9 @@ void Engine::initVulkan() {
     m_mlDiffuseImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
     m_mlSpecularImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
@@ -3024,6 +3054,8 @@ void Engine::createGBufferResources() {
     uint32_t w = m_config.width;
     uint32_t h = m_config.height;
 
+    auto concurrentQueues = getConcurrentQueueFamilies();
+
     // Allocate Image Resources
     m_directLightImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -3031,7 +3063,9 @@ void Engine::createGBufferResources() {
 
     m_normalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues);
 
     m_prevNormalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -3494,7 +3528,7 @@ bool Engine::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory) {
     }
 
     VkBuffer secBuffer = VK_NULL_HANDLE;
-    if (m_mgpu && m_mgpu->isZeroCopyActive()) {
+    if (m_mgpu && (m_mgpu->isZeroCopyActive() || m_mgpu->isP2PDirectBarActive())) {
         uint32_t slot = m_config.double_buffered_shared_mem ? (m_currentFrame % 2) : 0;
         secBuffer = m_mgpu->getPrimarySharedBuffer(slot);
     } else if (m_secTransferBuffer) {
@@ -4342,6 +4376,13 @@ void Engine::updateWavefrontSceneDescriptors() {
     }
 }
 
+std::vector<uint32_t> Engine::getConcurrentQueueFamilies() const {
+    if (m_context && m_context->hasDedicatedAsyncCompute()) {
+        return { m_context->getGraphicsQueueFamily(), m_context->getAsyncComputeQueueFamily() };
+    }
+    return {};
+}
+
 void Engine::updateMergeDescriptors() {
     if (!m_accumImage || !m_motionVectorImage || !m_normalDepthImage) {
         return;
@@ -4370,7 +4411,8 @@ void Engine::updateMergeDescriptors() {
     uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
     uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
     uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
-    uint32_t dispatchWidth = maxTilesPerGpuX * tileSize;
+    bool isCheckerboard = (m_config.mgpu_mode == MultiGpuMode::CheckerboardTile || m_config.mgpu_mode == MultiGpuMode::Auto);
+    uint32_t dispatchWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
     uint32_t dispatchHeight = renderH;
 
     uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
@@ -4396,7 +4438,9 @@ void Engine::updateMergeDescriptors() {
                     allocator, bufferSize,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     VMA_MEMORY_USAGE_AUTO,
-                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                    0, 0,
+                    getConcurrentQueueFamilies()
                 );
             }
             secBuffer = m_secTransferBuffer->getBuffer();
@@ -4404,8 +4448,13 @@ void Engine::updateMergeDescriptors() {
         }
 
         VkDescriptorBufferInfo secBufInfo{ secBuffer, 0, curSize };
-        VkDescriptorBufferInfo secMvInfo{ secBuffer, radOffsetAligned, curSize > radOffsetAligned ? (curSize - radOffsetAligned) : VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo secNdInfo{ secBuffer, mvOffsetAligned, curSize > mvOffsetAligned ? (curSize - mvOffsetAligned) : VK_WHOLE_SIZE };
+        VkDeviceSize mvOffset = (curSize > radOffsetAligned) ? radOffsetAligned : 0;
+        VkDeviceSize mvRange = (curSize > radOffsetAligned) ? (curSize - radOffsetAligned) : curSize;
+        VkDescriptorBufferInfo secMvInfo{ secBuffer, mvOffset, mvRange };
+
+        VkDeviceSize ndOffset = (curSize > mvOffsetAligned) ? mvOffsetAligned : 0;
+        VkDeviceSize ndRange = (curSize > mvOffsetAligned) ? (curSize - mvOffsetAligned) : curSize;
+        VkDescriptorBufferInfo secNdInfo{ secBuffer, ndOffset, ndRange };
 
         VkDescriptorImageInfo frameInfo{};
         if (m_frameImages[slot]) {
@@ -4653,6 +4702,7 @@ void Engine::initSyncObjects() {
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         vkCreateSemaphore(device, &semInfo, nullptr, &m_rtCompleteSemaphores[i]);
+        vkCreateSemaphore(device, &semInfo, nullptr, &m_mergeCompleteSemaphores[i]);
     }
 
     m_imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
@@ -4987,6 +5037,7 @@ void Engine::renderFrame() {
         }
     }
 
+
     // Read back GPU query timestamps from slot m_currentFrame's completed frame
     if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
         uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
@@ -5007,6 +5058,7 @@ void Engine::renderFrame() {
         if (gpuRtMs > 10000.0) gpuRtMs = 0.0;
         if (gpuTonemapMs > 10000.0) gpuTonemapMs = 0.0;
         if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
+
 
         double secGpuMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
@@ -5030,13 +5082,7 @@ void Engine::renderFrame() {
                     m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                     if (m_lastWavefrontProfile.valid && !m_lastWavefrontProfile.bounces.empty()) {
                         uint32_t activeBouncesCount = static_cast<uint32_t>(m_lastWavefrontProfile.bounces.size());
-                        if (m_lastWavefrontProfile.bounces.back().nextCount == 0) {
-                            // All rays terminated at or before the last active bounce
-                            m_dynamicWavefrontBounces = activeBouncesCount;
-                        } else {
-                            // Rays were still alive at cutoff, expand headroom up to max_bounces
-                            m_dynamicWavefrontBounces = std::min(m_config.max_bounces, activeBouncesCount + 4);
-                        }
+                        m_dynamicWavefrontBounces = activeBouncesCount;
                     }
                     static int wfProfCount = 0;
                     bool isBenchmarkMilestone = m_config.benchmark && (++wfProfCount == 10 || (m_config.frame_limit > 0 && m_totalFramesRendered + 1 >= m_config.frame_limit));
@@ -5130,17 +5176,22 @@ void Engine::renderFrame() {
             m_pendingAccumFormatChange = false;
 
             VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+            auto concurrentQueues = getConcurrentQueueFamilies();
             for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
                 m_frameImages[i] = std::make_unique<Image>(
                     dev, alloc, m_config.width, m_config.height,
                     frameFmt,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT,
+                    concurrentQueues
                 );
             }
             m_accumImage = std::make_unique<Image>(
                 dev, alloc, m_config.width, m_config.height,
                 frameFmt,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                concurrentQueues
             );
 
             // Transition m_frameImages and m_accumImage to GENERAL
@@ -5316,8 +5367,8 @@ void Engine::renderFrame() {
     uint32_t activeSpp = m_config.spp;
     float activeFractionalSpp = 0.0f;
     uint32_t activeBounces = m_config.max_bounces;
-    if (m_dynamicWavefrontBounces > 0) {
-        activeBounces = std::min(activeBounces, m_dynamicWavefrontBounces);
+    if (m_config.pipeline_type == PipelineType::Wavefront && m_dynamicWavefrontBounces > 0 && m_totalFramesRendered >= m_config.warmup_frames) {
+        activeBounces = std::clamp(m_dynamicWavefrontBounces + 1u, std::min(1u, m_config.max_bounces), m_config.max_bounces);
     }
     if (m_governor && (m_config.adaptive_spp || m_config.target_fps > 0) && m_governor->getState().active) {
         activeSpp = m_governor->getState().currentSpp;
@@ -5419,6 +5470,10 @@ void Engine::renderFrame() {
     tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
 
     bool isMgpu = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
+    bool useAsyncComputeMerge = false;
+    bool asyncPost = false;
+    bool hasPostSubmission = true;
+
 
     VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
     VkCommandBuffer activeCmd = cmd;
@@ -5552,6 +5607,7 @@ void Engine::renderFrame() {
             wfSceneData.indirectClamp = m_config.indirect_clamp;
             wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
             wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
+            wfSceneData.deltaUnroll = m_config.delta_unroll;
             wfSceneData.inlineShadows = m_config.inline_primary_shadows;
             uint32_t activeBatchCount = getEffectiveBatchCount(renderW, renderH);
             uint32_t activeBatchPixels = getEffectiveBatchPixels(renderW, renderH, activeBatchCount);
@@ -5762,7 +5818,7 @@ void Engine::renderFrame() {
         if (!needUpscaler && m_accumTonemapPipeline && !skipRayTracing) {
             // Fused Accumulation Running Average + ACES Tonemapping (Zero-Copy Register Pass Fusion)
             // Eliminates intermediate compute pipeline barrier and 132.7 MB round-trip VRAM read of m_accumImage.
-            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumTonemapPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumTonemapPipelineLayout, 0, 1, &m_accumTonemapDescSets[m_currentFrame], 0, nullptr);
@@ -5833,7 +5889,7 @@ void Engine::renderFrame() {
             m_temporalResetRequested = false;
             bool upwaysRun = false;
             if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
                 upwaysRun = dispatchUpways(cmd, resetTemporal);
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
@@ -5861,7 +5917,7 @@ void Engine::renderFrame() {
             uint32_t tmGroupsY = (m_config.height + 15) / 16;
 
             tonemapConstants.visualizeSplit = 0;
-            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
             vkCmdPushConstants(cmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
             vkCmdDispatch(cmd, tmGroupsX, tmGroupsY, 1);
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
@@ -5878,7 +5934,7 @@ void Engine::renderFrame() {
         uint32_t bytesPerPixel = (formatMode == 0u) ? 8 : (formatMode == 2u) ? 4 : 16;
         frameBytes = 0;
         dstHost = nullptr;
-        if (!m_mgpu->isZeroCopyActive()) {
+        if (!m_mgpu->isZeroCopyActive() && !m_mgpu->isP2PDirectBarActive()) {
             frameBytes = static_cast<size_t>(m_config.width) * m_config.height * bytesPerPixel;
             dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
         }
@@ -5984,7 +6040,7 @@ void Engine::renderFrame() {
             m_mgpu->setConfig(m_config);
         }
 
-        if (!m_mgpu->isZeroCopyActive()) {
+        if (!m_mgpu->isZeroCopyActive() && !m_mgpu->isP2PDirectBarActive()) {
             frameBytes = static_cast<size_t>(secDispatchWidth) * dispatchHeight * bytesPerPixel;
             dstHost = m_secTransferBuffer ? m_secTransferBuffer->map() : nullptr;
         }
@@ -6127,6 +6183,7 @@ void Engine::renderFrame() {
                 wfSceneData.indirectClamp = m_config.indirect_clamp;
                 wfSceneData.enableTailMegakernel = m_config.enable_tail_megakernel;
                 wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
+                wfSceneData.deltaUnroll = m_config.delta_unroll;
                 wfSceneData.inlineShadows = m_config.inline_primary_shadows;
                 wfSceneData.tileOffsetX = tileOffsetX_prim;
                 wfSceneData.tileOffsetY = tileOffsetY_prim;
@@ -6197,165 +6254,350 @@ void Engine::renderFrame() {
         rtSubmit.pSignalSemaphoreInfos = &signalInfo;
         vkQueueSubmit2(queue, 1, &rtSubmit, VK_NULL_HANDLE);
 
-        // 3. Concurrently record Merge & Tonemapping commands on primary GPU into postCmd
-        activeCmd = m_postCommandBuffers[m_currentFrame];
-        vkResetCommandBuffer(activeCmd, 0);
-        VkCommandBufferBeginInfo postBeginInfo{};
-        postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(activeCmd, &postBeginInfo);
+        useAsyncComputeMerge = false; // Synchronous merge on graphics queue eliminates async compute thrashing and frame collision
+        asyncPost = false;
+        hasPostSubmission = true;
 
-        // Barrier: Ensure primary RT writes to m_accumImage and secondary DMA host writes are visible before merge compute reads/writes
-        VkMemoryBarrier2 rtToMergeBarrier{};
-        rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
-        rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
-        rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        if (useAsyncComputeMerge) {
+            VkCommandBuffer mergeCmd = m_mergeCommandBuffers[m_currentFrame];
+            vkResetCommandBuffer(mergeCmd, 0);
+            VkCommandBufferBeginInfo mergeBeginInfo{};
+            mergeBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(mergeCmd, &mergeBeginInfo);
 
-        VkDependencyInfo rtToMergeDep{};
-        rtToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        rtToMergeDep.memoryBarrierCount = 1;
-        rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
-        vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
+            VkMemoryBarrier2 rtToMergeBarrier{};
+            rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+            rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+            rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
-        // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
-        if (!skipRayTracing && !isSampleBlendFsr3) {
-            vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
+            VkDependencyInfo rtToMergeDep{};
+            rtToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            rtToMergeDep.memoryBarrierCount = 1;
+            rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
+            vkCmdPipelineBarrier2(mergeCmd, &rtToMergeDep);
+
+            vkCmdBindPipeline(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+            vkCmdBindDescriptorSets(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
             bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                                  m_config.upscaler_mode == UpscalerMode::Upways ||
                                  m_config.denoiser_mode == DenoiserMode::Upways);
             uint32_t secDispatchArg = (secDispatchWidth & 0x7FFFFFFFu) | (needGbuffers ? 0x80000000u : 0u);
             uint32_t mergePC[8] = { mgpuBaseW, mgpuBaseH, secSpp, m_config.tile_size, formatMode, mergeMode, primSpp, secDispatchArg };
-            vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
+            vkCmdPushConstants(mergeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
             uint32_t mergeGroupsX = (mgpuBaseW + 15) / 16;
             uint32_t mergeGroupsY = (mergeMode == 0u) ? (((mgpuBaseH + 1) / 2 + 15) / 16) : ((mgpuBaseH + 15) / 16);
-            vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+            vkCmdDispatch(mergeCmd, mergeGroupsX, mergeGroupsY, 1);
+
+            VkMemoryBarrier2 mergeBarrier{};
+            mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            mergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+            mergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+
+            VkDependencyInfo mergeDep{};
+            mergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            mergeDep.memoryBarrierCount = 1;
+            mergeDep.pMemoryBarriers = &mergeBarrier;
+            vkCmdPipelineBarrier2(mergeCmd, &mergeDep);
+
+            if (asyncPost) {
+                // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
+                if (m_accumRunningAvgPipeline) {
+                    vkCmdBindPipeline(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
+                    vkCmdBindDescriptorSets(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+
+                    struct {
+                        uint32_t width;
+                        uint32_t height;
+                        uint32_t sampleCount;
+                        float invSpp;
+                    } avgPC;
+                    avgPC.width = mgpuBaseW;
+                    avgPC.height = mgpuBaseH;
+                    avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+                    avgPC.invSpp = 1.0f;
+
+                    vkCmdPushConstants(mergeCmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+                    vkCmdDispatch(mergeCmd, (mgpuBaseW + 15) / 16, (mgpuBaseH + 15) / 16, 1);
+
+                    VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+                    VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    avgDep.memoryBarrierCount = 1;
+                    avgDep.pMemoryBarriers = &avgBarrier;
+                    vkCmdPipelineBarrier2(mergeCmd, &avgDep);
+                }
+
+                // Tonemapping Pass directly on Async Compute Queue
+                vkCmdBindPipeline(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+                vkCmdBindDescriptorSets(mergeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+                tonemapConstants.totalSamples = 1u;
+
+                uint32_t mgpuTmGroupsX = (m_config.width + 15) / 16;
+                uint32_t mgpuTmGroupsY = (m_config.height + 15) / 16;
+
+                bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
+                if (isCheckerboard) {
+                    MultiGpuMode effectiveMode = m_config.mgpu_mode;
+                    if (effectiveMode == MultiGpuMode::Auto) {
+                        effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+                    }
+                    if (effectiveMode == MultiGpuMode::SampleParallel) {
+                        isCheckerboard = false;
+                    }
+                }
+                tonemapConstants.visualizeSplit = (m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u;
+                tonemapConstants.tileSize = m_config.tile_size;
+                tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+                tonemapConstants.peakNits = m_config.hdr_peak_nits;
+                tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
+
+                vkCmdWriteTimestamp2(mergeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
+                vkCmdPushConstants(mergeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+                vkCmdDispatch(mergeCmd, mgpuTmGroupsX, mgpuTmGroupsY, 1);
+                vkCmdWriteTimestamp2(mergeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
+            }
+
+            vkEndCommandBuffer(mergeCmd);
+
+            // Submit merge commands to async compute queue
+            VkCommandBufferSubmitInfo mergeCmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            mergeCmdInfo.commandBuffer = mergeCmd;
+
+            std::vector<VkSemaphoreSubmitInfo> mergeWaitInfos;
+            VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            waitRt.semaphore = m_rtCompleteSemaphores[m_currentFrame];
+            waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mergeWaitInfos.push_back(waitRt);
+
+            if (m_mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
+                VkSemaphore secSem = m_mgpu->getPrimaryImportedTimelineSemaphore();
+                if (secSem != VK_NULL_HANDLE) {
+                    VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                    waitSec.semaphore = secSem;
+                    waitSec.value = m_mgpu->getCurrentTimelineValue();
+                    waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    mergeWaitInfos.push_back(waitSec);
+                }
+            }
+
+            std::vector<VkSemaphoreSubmitInfo> mergeSigInfos;
+            if (hasPostSubmission) {
+                VkSemaphoreSubmitInfo mergeSigInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                mergeSigInfo.semaphore = m_mergeCompleteSemaphores[m_currentFrame];
+                mergeSigInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mergeSigInfos.push_back(mergeSigInfo);
+            }
+
+            VkSubmitInfo2 mergeSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            mergeSubmit.commandBufferInfoCount = 1;
+            mergeSubmit.pCommandBufferInfos = &mergeCmdInfo;
+            mergeSubmit.waitSemaphoreInfoCount = static_cast<uint32_t>(mergeWaitInfos.size());
+            mergeSubmit.pWaitSemaphoreInfos = mergeWaitInfos.data();
+            mergeSubmit.signalSemaphoreInfoCount = static_cast<uint32_t>(mergeSigInfos.size());
+            mergeSubmit.pSignalSemaphoreInfos = mergeSigInfos.data();
+
+            VkFence mergeFence = VK_NULL_HANDLE;
+            if (!hasPostSubmission) {
+                vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
+                mergeFence = m_inFlightFences[m_currentFrame];
+            }
+
+            vkQueueSubmit2(m_context->getAsyncComputeQueue(), 1, &mergeSubmit, mergeFence);
         }
 
-        VkMemoryBarrier2 mergeBarrier{};
-        mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-        mergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        mergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        mergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        mergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        // 3. Concurrently record Merge & Tonemapping commands on primary GPU into postCmd
+        if (hasPostSubmission) {
+            activeCmd = m_postCommandBuffers[m_currentFrame];
+            vkResetCommandBuffer(activeCmd, 0);
+            VkCommandBufferBeginInfo postBeginInfo{};
+            postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(activeCmd, &postBeginInfo);
 
-        VkDependencyInfo mergeDep{};
-        mergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        mergeDep.memoryBarrierCount = 1;
-        mergeDep.pMemoryBarriers = &mergeBarrier;
-        vkCmdPipelineBarrier2(activeCmd, &mergeDep);
+            if (!useAsyncComputeMerge) {
+                // Barrier: Ensure primary RT writes to m_accumImage and secondary DMA host writes are visible before merge compute reads/writes
+                VkMemoryBarrier2 rtToMergeBarrier{};
+                rtToMergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+                rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+                rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
-        // In Multi-GPU mode, copy merged FP16 radiance into m_mlDiffuseImage for Upways neural reconstruction
-        if (!skipRayTracing && m_mlDiffuseImage && (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways)) {
-            VkImageCopy copyRegion{};
-            copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { mgpuBaseW, mgpuBaseH, 1 };
-            vkCmdCopyImage(activeCmd, m_frameImages[slot]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                           m_mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
+                VkDependencyInfo rtToMergeDep{};
+                rtToMergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                rtToMergeDep.memoryBarrierCount = 1;
+                rtToMergeDep.pMemoryBarriers = &rtToMergeBarrier;
+                vkCmdPipelineBarrier2(activeCmd, &rtToMergeDep);
 
-            VkImageMemoryBarrier2 diffCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            diffCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            diffCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            diffCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            diffCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-            diffCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            diffCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            diffCopyBarrier.image = m_mlDiffuseImage->getImage();
-            diffCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
+                if (!skipRayTracing && !isSampleBlendFsr3) {
+                    vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
+                    vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
 
-            VkDependencyInfo diffCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            diffCopyDep.imageMemoryBarrierCount = 1;
-            diffCopyDep.pImageMemoryBarriers = &diffCopyBarrier;
-            vkCmdPipelineBarrier2(activeCmd, &diffCopyDep);
-        }
+                    bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
+                                         m_config.upscaler_mode == UpscalerMode::Upways ||
+                                         m_config.denoiser_mode == DenoiserMode::Upways);
+                    uint32_t secDispatchArg = (secDispatchWidth & 0x7FFFFFFFu) | (needGbuffers ? 0x80000000u : 0u);
+                    uint32_t mergePC[8] = { mgpuBaseW, mgpuBaseH, secSpp, m_config.tile_size, formatMode, mergeMode, primSpp, secDispatchArg };
+                    vkCmdPushConstants(activeCmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mergePC), mergePC);
 
-        // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
-        if (!skipRayTracing && m_accumRunningAvgPipeline) {
-            vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+                    uint32_t mergeGroupsX = (mgpuBaseW + 15) / 16;
+                    uint32_t mergeGroupsY = (mergeMode == 0u) ? (((mgpuBaseH + 1) / 2 + 15) / 16) : ((mgpuBaseH + 15) / 16);
+                    vkCmdDispatch(activeCmd, mergeGroupsX, mergeGroupsY, 1);
+                }
 
-            struct {
-                uint32_t width;
-                uint32_t height;
-                uint32_t sampleCount;
-                float invSpp;
-            } avgPC;
-            avgPC.width = mgpuBaseW;
-            avgPC.height = mgpuBaseH;
-            avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
-            avgPC.invSpp = 1.0f;
+                VkMemoryBarrier2 mergeBarrier{};
+                mergeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                mergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
-            vkCmdPushConstants(activeCmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
-            vkCmdDispatch(activeCmd, (mgpuBaseW + 15) / 16, (mgpuBaseH + 15) / 16, 1);
+                VkDependencyInfo mergeDep{};
+                mergeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                mergeDep.memoryBarrierCount = 1;
+                mergeDep.pMemoryBarriers = &mergeBarrier;
+                vkCmdPipelineBarrier2(activeCmd, &mergeDep);
+            } else {
+                // Memory barrier on graphics queue ensuring async compute merge writes are visible to subsequent post passes
+                VkMemoryBarrier2 mergeToPostBarrier{};
+                mergeToPostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mergeToPostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mergeToPostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                mergeToPostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+                mergeToPostBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
 
-            VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-            avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo mergeToPostDep{};
+                mergeToPostDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                mergeToPostDep.memoryBarrierCount = 1;
+                mergeToPostDep.pMemoryBarriers = &mergeToPostBarrier;
+                vkCmdPipelineBarrier2(activeCmd, &mergeToPostDep);
+            }
 
-            VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            avgDep.memoryBarrierCount = 1;
-            avgDep.pMemoryBarriers = &avgBarrier;
-            vkCmdPipelineBarrier2(activeCmd, &avgDep);
-        }
+            if (!asyncPost) {
+                // In Multi-GPU mode, copy merged FP16 radiance into m_mlDiffuseImage for Upways neural reconstruction
+                if (!skipRayTracing && m_mlDiffuseImage && (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways)) {
+                    VkImageCopy copyRegion{};
+                    copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    copyRegion.extent = { mgpuBaseW, mgpuBaseH, 1 };
+                    vkCmdCopyImage(activeCmd, m_frameImages[slot]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                                   m_mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
 
-        // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
-        bool resetTemporal = hardReset || m_temporalResetRequested;
-        m_temporalResetRequested = false;
-        bool upwaysRun = false;
-        if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 4);
-            upwaysRun = dispatchUpways(activeCmd, resetTemporal);
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
-        }
+                    VkImageMemoryBarrier2 diffCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                    diffCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    diffCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    diffCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    diffCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                    diffCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    diffCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    diffCopyBarrier.image = m_mlDiffuseImage->getImage();
+                    diffCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-        // AMD FidelityFX Super Resolution 3.1
-        bool fsr3Run = false;
-        if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
-            fsr3Run = dispatchFsr3(activeCmd, resetTemporal);
-        }
+                    VkDependencyInfo diffCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    diffCopyDep.imageMemoryBarrierCount = 1;
+                    diffCopyDep.pImageMemoryBarriers = &diffCopyBarrier;
+                    vkCmdPipelineBarrier2(activeCmd, &diffCopyDep);
+                }
 
-        // Tonemapping
-        vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
-        if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
+                // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
+                if (!skipRayTracing && m_accumRunningAvgPipeline) {
+                    vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipeline);
+                    vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_accumRunningAvgPipelineLayout, 0, 1, &m_accumRunningAvgDescSets[m_currentFrame], 0, nullptr);
+
+                    struct {
+                        uint32_t width;
+                        uint32_t height;
+                        uint32_t sampleCount;
+                        float invSpp;
+                    } avgPC;
+                    avgPC.width = mgpuBaseW;
+                    avgPC.height = mgpuBaseH;
+                    avgPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+                    avgPC.invSpp = 1.0f;
+
+                    vkCmdPushConstants(activeCmd, m_accumRunningAvgPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(avgPC), &avgPC);
+                    vkCmdDispatch(activeCmd, (mgpuBaseW + 15) / 16, (mgpuBaseH + 15) / 16, 1);
+
+                    VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+                    VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    avgDep.memoryBarrierCount = 1;
+                    avgDep.pMemoryBarriers = &avgBarrier;
+                    vkCmdPipelineBarrier2(activeCmd, &avgDep);
+                }
+
+                // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
+                bool resetTemporal = hardReset || m_temporalResetRequested;
+                m_temporalResetRequested = false;
+                bool upwaysRun = false;
+                if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+                    vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+                    upwaysRun = dispatchUpways(activeCmd, resetTemporal);
+                    vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+                }
+
+                // AMD FidelityFX Super Resolution 3.1
+                bool fsr3Run = false;
+                if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+                    fsr3Run = dispatchFsr3(activeCmd, resetTemporal);
+                }
+
+                // Tonemapping
+                vkCmdBindPipeline(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipeline);
+                if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_fsr3Upscaler)) {
+                    vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapFsr3DescSet, 0, nullptr);
+                    tonemapConstants.totalSamples = 1u;
+                } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_upwaysPipeline)) {
+                    vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapUpwaysDescSet, 0, nullptr);
+                    tonemapConstants.totalSamples = 1u;
+                } else {
+                    vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
+                    tonemapConstants.totalSamples = 1u;
+                }
+
+                uint32_t mgpuTmGroupsX = (m_config.width + 15) / 16;
+                uint32_t mgpuTmGroupsY = (m_config.height + 15) / 16;
+
+                bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
+                if (isCheckerboard) {
+                    MultiGpuMode effectiveMode = m_config.mgpu_mode;
+                    if (effectiveMode == MultiGpuMode::Auto) {
+                        effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+                    }
+                    if (effectiveMode == MultiGpuMode::SampleParallel) {
+                        isCheckerboard = false;
+                    }
+                }
+                tonemapConstants.visualizeSplit = (m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u;
+                tonemapConstants.tileSize = m_config.tile_size;
+                tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
+                tonemapConstants.peakNits = m_config.hdr_peak_nits;
+                tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
+                vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
+                vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
+                vkCmdDispatch(activeCmd, mgpuTmGroupsX, mgpuTmGroupsY, 1);
+
+                vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
+            }
         } else {
-            vkCmdBindDescriptorSets(activeCmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tonemapPipelineLayout, 0, 1, &m_tonemapDescSet, 0, nullptr);
-            tonemapConstants.totalSamples = 1u;
-        }
-
-        uint32_t mgpuTmGroupsX = (m_config.width + 15) / 16;
-        uint32_t mgpuTmGroupsY = (m_config.height + 15) / 16;
-
-        bool isCheckerboard = (m_mgpu && m_mgpu->isMultiGpuActive() && m_config.mgpu_mode != MultiGpuMode::Off);
-        if (isCheckerboard) {
-            MultiGpuMode effectiveMode = m_config.mgpu_mode;
-            if (effectiveMode == MultiGpuMode::Auto) {
-                effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
-            }
-            if (effectiveMode == MultiGpuMode::SampleParallel) {
-                isCheckerboard = false;
+            if (m_temporalResetRequested) {
+                m_temporalResetRequested = false;
             }
         }
-        tonemapConstants.visualizeSplit = (m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u;
-        tonemapConstants.tileSize = m_config.tile_size;
-        tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
-        tonemapConstants.peakNits = m_config.hdr_peak_nits;
-        tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
-        vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_queryPool, qBase + 2);
-        vkCmdPushConstants(activeCmd, m_tonemapPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapConstants), &tonemapConstants);
-        vkCmdDispatch(activeCmd, mgpuTmGroupsX, mgpuTmGroupsY, 1);
-
-        vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay
@@ -6588,7 +6830,9 @@ void Engine::renderFrame() {
         }
     }
 
-    vkEndCommandBuffer(activeCmd);
+    if (hasPostSubmission) {
+        vkEndCommandBuffer(activeCmd);
+    }
 
     // Wait for secondary GPU completion of slot and PCIe transfer (if MGPU)
     if (isMgpu && !skipRayTracing) {
@@ -6596,53 +6840,63 @@ void Engine::renderFrame() {
         m_mgpu->syncAndTransfer(slot, dstHost, frameBytes);
     }
 
-    // Submit Work
-    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-    cmdSubmitInfo.commandBuffer = activeCmd;
+    if (hasPostSubmission) {
+        // Submit Work
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = activeCmd;
 
-    std::vector<VkSemaphoreSubmitInfo> waitSemaphoreInfos;
-    std::vector<VkSemaphoreSubmitInfo> signalSemaphoreInfos;
+        std::vector<VkSemaphoreSubmitInfo> waitSemaphoreInfos;
+        std::vector<VkSemaphoreSubmitInfo> signalSemaphoreInfos;
 
-    if (isMgpu) {
-        VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-        waitRt.semaphore = m_rtCompleteSemaphores[m_currentFrame];
-        waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        waitSemaphoreInfos.push_back(waitRt);
+        if (isMgpu) {
+            if (useAsyncComputeMerge) {
+                VkSemaphoreSubmitInfo waitMerge{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                waitMerge.semaphore = m_mergeCompleteSemaphores[m_currentFrame];
+                waitMerge.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+                waitSemaphoreInfos.push_back(waitMerge);
+            } else {
+                VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                waitRt.semaphore = m_rtCompleteSemaphores[m_currentFrame];
+                waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                waitSemaphoreInfos.push_back(waitRt);
 
-        if (m_mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
-            VkSemaphore secSem = m_mgpu->getPrimaryImportedTimelineSemaphore();
-            if (secSem != VK_NULL_HANDLE) {
-                VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-                waitSec.semaphore = secSem;
-                waitSec.value = m_mgpu->getCurrentTimelineValue();
-                waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                waitSemaphoreInfos.push_back(waitSec);
+                if (m_mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
+                    VkSemaphore secSem = m_mgpu->getPrimaryImportedTimelineSemaphore();
+                    if (secSem != VK_NULL_HANDLE) {
+                        VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                        waitSec.semaphore = secSem;
+                        waitSec.value = m_mgpu->getCurrentTimelineValue();
+                        waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                        waitSemaphoreInfos.push_back(waitSec);
+                    }
+                }
             }
         }
+
+        if (!m_config.headless && m_swapchain) {
+            VkSemaphoreSubmitInfo waitImg{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            waitImg.semaphore = m_imageAvailableSemaphores[m_currentFrame];
+            waitImg.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            waitSemaphoreInfos.push_back(waitImg);
+
+            VkSemaphoreSubmitInfo sigRender{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            sigRender.semaphore = m_renderFinishedSemaphores[imageIndex];
+            sigRender.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            signalSemaphoreInfos.push_back(sigRender);
+        }
+
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        submitInfo.waitSemaphoreInfoCount = static_cast<uint32_t>(waitSemaphoreInfos.size());
+        submitInfo.pWaitSemaphoreInfos = waitSemaphoreInfos.data();
+        submitInfo.signalSemaphoreInfoCount = static_cast<uint32_t>(signalSemaphoreInfos.size());
+        submitInfo.pSignalSemaphoreInfos = signalSemaphoreInfos.data();
+
+        vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
+        vkQueueSubmit2(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
     }
 
-    if (!m_config.headless && m_swapchain) {
-        VkSemaphoreSubmitInfo waitImg{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-        waitImg.semaphore = m_imageAvailableSemaphores[m_currentFrame];
-        waitImg.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        waitSemaphoreInfos.push_back(waitImg);
-
-        VkSemaphoreSubmitInfo sigRender{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-        sigRender.semaphore = m_renderFinishedSemaphores[imageIndex];
-        sigRender.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        signalSemaphoreInfos.push_back(sigRender);
-    }
-
-    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-    submitInfo.waitSemaphoreInfoCount = static_cast<uint32_t>(waitSemaphoreInfos.size());
-    submitInfo.pWaitSemaphoreInfos = waitSemaphoreInfos.data();
-    submitInfo.signalSemaphoreInfoCount = static_cast<uint32_t>(signalSemaphoreInfos.size());
-    submitInfo.pSignalSemaphoreInfos = signalSemaphoreInfos.data();
-
-    vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
-    vkQueueSubmit2(queue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
 
     if (!m_config.headless && m_swapchain) {
         VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
@@ -7514,19 +7768,25 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_renderFinishedSemaphores.push_back(sem);
     }
 
+    auto concurrentQueues = getConcurrentQueueFamilies();
+
     // 3. Recreate Accumulation & Output Images
     VkFormat frameFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             device, allocator, m_config.width, m_config.height,
             frameFmt,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            concurrentQueues
         );
     }
     m_accumImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         frameFmt,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     // Internal post-process and tonemapping target is strictly 10-bit (or 16-bit float for scRGB HDR).
@@ -7539,13 +7799,17 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_outputImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         outputFmt,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     m_motionVectorImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     m_mlAlbedoRoughnessImage = std::make_unique<Image>(
@@ -7562,7 +7826,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     m_mlDiffuseImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
     m_mlSpecularImage = std::make_unique<Image>(
         device, allocator, m_config.width, m_config.height,

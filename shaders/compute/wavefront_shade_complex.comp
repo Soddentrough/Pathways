@@ -207,7 +207,8 @@ void main() {
         f16vec3 throughput;
         uint seed, pixelIndex;
         bool isSpecularPath, causticApplied;
-        unpackRayState(state, throughput, seed, pixelIndex, isSpecularPath, causticApplied);
+        uint dispersionChannel = 0u;
+        unpackRayState(state, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         uint bounce = pc.currentBounce;
         bool sampledSpecularLobe = false;
 
@@ -973,7 +974,7 @@ void main() {
             if (!pathTerminated) {
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied);
+                nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel);
             }
         }
     }

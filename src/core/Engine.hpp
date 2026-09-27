@@ -198,6 +198,10 @@ private:
     float m_timestampPeriod = 1.0f; // ns per tick
 
     // Multi-GPU Transfer & Merge Resources
+    VkCommandPool m_asyncComputeCommandPool = VK_NULL_HANDLE;
+    std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_mergeCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_mergeCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::vector<uint32_t> getConcurrentQueueFamilies() const;
     std::unique_ptr<Buffer> m_secTransferBuffer;
     VkDescriptorSetLayout m_mergeDescLayout = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, 2> m_mergeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };

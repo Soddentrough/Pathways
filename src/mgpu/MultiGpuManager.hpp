@@ -27,9 +27,9 @@ struct GpuDeviceNode {
     uint32_t deviceIndex = 0;
     std::string deviceName;
     std::unique_ptr<VulkanContext> context;
-    std::unique_ptr<Image> accumTarget;
-
     static constexpr uint32_t NUM_IN_FLIGHT = 2;
+    std::array<std::unique_ptr<Image>, NUM_IN_FLIGHT> accumTargets;
+
 
     // Commands & Sync (Double-buffered)
     VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -172,6 +172,7 @@ public:
     }
     bool isP2PDirectBarActive() const { return m_active && (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR); }
     bool isZeroCopyActive() const { return m_active && (m_transferMode == InterGpuTransferMode::ZeroCopy_HostMemory); }
+    bool isInterGpuActive() const { return m_active && (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR || m_transferMode == InterGpuTransferMode::ZeroCopy_HostMemory); }
     bool isCrossGpuSyncActive() const { return m_active && m_useCrossGpuSync; }
     VkSemaphore getImportedSemaphore(uint32_t slot = 0) const {
         if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
@@ -180,6 +181,10 @@ public:
     VkSemaphore getPrimaryImportedTimelineSemaphore() const {
         if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
         return m_devices[0]->primImportedTimelineSemaphore;
+    }
+    VkSemaphore getSecondaryTimelineSemaphore() const {
+        if (!m_useCrossGpuSync || m_devices.empty()) return VK_NULL_HANDLE;
+        return m_devices[0]->secTimelineSemaphore;
     }
     uint64_t getCurrentTimelineValue() const { return m_currentTimelineValue.load(); }
     static constexpr uint32_t NUM_SHARED_BUFFERS = 2;
@@ -246,6 +251,7 @@ private:
     void destroySharedP2PBuffer();
     void initSharedHostBuffer(VkDeviceSize bufferSize);
     void destroySharedHostBuffer();
+    VkDeviceSize calculateSharedBufferSize(uint32_t width, uint32_t height) const;
     std::vector<char> loadShaderSPIRV(const std::string& filename);
     VkShaderModule createShaderModule(VkDevice device, const std::vector<char>& code);
 
