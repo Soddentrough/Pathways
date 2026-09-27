@@ -262,6 +262,8 @@ private:
     // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
     std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
     VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    std::unique_ptr<Image> m_displayAlbedoImage;
+    std::unique_ptr<Image> m_displayNormalsImage;
 
     void createUpwaysPipelines();
     void createUpwaysResources();

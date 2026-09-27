@@ -3062,7 +3062,7 @@ void Engine::createGBufferResources() {
     // Allocate Image Resources
     m_directLightImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     m_normalDepthImage = std::make_unique<Image>(device, allocator, w, h,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -3179,6 +3179,7 @@ void Engine::destroyUpwaysPipelines() {
 
 void Engine::createUpwaysResources() {
     VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
 
     if (m_postProcessDescPool && m_tonemapDescLayout && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -3191,12 +3192,42 @@ void Engine::createUpwaysResources() {
         }
     }
 
+    uint32_t outW = m_config.width;
+    uint32_t outH = m_config.height;
+    m_displayAlbedoImage = std::make_unique<Image>(
+        device, allocator, outW, outH,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    );
+    m_displayNormalsImage = std::make_unique<Image>(
+        device, allocator, outW, outH,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    );
+
     if (m_upwaysPipeline) {
         VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
 
         m_upwaysPipeline->transitionInitialLayouts(m_commandBuffers[0]);
+
+        if (m_displayAlbedoImage) {
+            m_displayAlbedoImage->transitionLayout(
+                m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT
+            );
+        }
+        if (m_displayNormalsImage) {
+            m_displayNormalsImage->transitionLayout(
+                m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT
+            );
+        }
 
         vkEndCommandBuffer(m_commandBuffers[0]);
 
@@ -3214,6 +3245,8 @@ void Engine::createUpwaysResources() {
 }
 
 void Engine::destroyUpwaysResources() {
+    m_displayAlbedoImage.reset();
+    m_displayNormalsImage.reset();
     // Note: Descriptor set m_tonemapUpwaysDescSet persists across resizes; reset occurs in destroyUpwaysPipelines().
 }
 
@@ -3222,15 +3255,26 @@ void Engine::updateUpwaysDescriptors() {
         return;
     }
 
+    bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
+    uint32_t inW = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+        static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+    uint32_t inH = (m_config.render_scale < 1.0f && (m_config.upscaler_mode != UpscalerMode::None || m_config.upways_superres)) ?
+        static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+    uint32_t outW = m_config.width;
+    uint32_t outH = m_config.height;
+    isSuperRes = (inW < outW || inH < outH || isSuperRes);
+
     VkImageView normDepthView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
     VkImageView motionView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
     VkImageView albedoView = (m_config.pipeline_type == PipelineType::Wavefront && m_mlAlbedoRoughnessImage)
         ? m_mlAlbedoRoughnessImage->getImageView()
         : (m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE));
     VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : motionView;
-    bool isMgpuActive = (m_mgpu && m_mgpu->isSecondaryInitialized() && m_config.mgpu_mode != MultiGpuMode::Off);
     VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_frameImages[0]->getImageView();
-    VkImageView specView = isMgpuActive ? VK_NULL_HANDLE : (m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE);
+    VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView displayAlbedoView = (isSuperRes && m_displayAlbedoImage) ? m_displayAlbedoImage->getImageView() : albedoView;
+    VkImageView displayNormalsView = (isSuperRes && m_displayNormalsImage) ? m_displayNormalsImage->getImageView() : normDepthView;
+    VkImageView restirMetadataView = VK_NULL_HANDLE;
 
     m_upwaysPipeline->updateDescriptors(
         diffView,
@@ -3239,9 +3283,9 @@ void Engine::updateUpwaysDescriptors() {
         albedoView,
         motionView,
         specMotionView,
-        specMotionView,
-        albedoView,
-        normDepthView
+        restirMetadataView,
+        displayAlbedoView,
+        displayNormalsView
     );
 
     if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage()) {
@@ -3270,12 +3314,101 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
     uint32_t outH = m_config.height;
     isSuperRes = (inW < outW || inH < outH || isSuperRes);
 
+    if (isSuperRes) {
+        if (!m_displayAlbedoImage || !m_displayNormalsImage ||
+            m_displayAlbedoImage->getWidth() != outW || m_displayAlbedoImage->getHeight() != outH ||
+            m_displayNormalsImage->getWidth() != outW || m_displayNormalsImage->getHeight() != outH) {
+            vkDeviceWaitIdle(m_context->getDevice());
+            destroyUpwaysResources();
+            createUpwaysResources();
+        }
+    }
+
     if (m_upwaysPipeline->getInputWidth() != inW || m_upwaysPipeline->getInputHeight() != inH ||
         m_upwaysPipeline->getOutputWidth() != outW || m_upwaysPipeline->getOutputHeight() != outH ||
         m_upwaysPipeline->isSuperResEnabled() != isSuperRes) {
         vkDeviceWaitIdle(m_context->getDevice());
         m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
         updateUpwaysDescriptors();
+    }
+
+    if (isSuperRes && m_displayAlbedoImage && m_displayNormalsImage) {
+        Image* srcAlbedo = (m_config.pipeline_type == PipelineType::Wavefront && m_mlAlbedoRoughnessImage)
+            ? m_mlAlbedoRoughnessImage.get()
+            : (m_directLightImage ? m_directLightImage.get() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage.get() : nullptr));
+        Image* srcNormDepth = m_normalDepthImage ? m_normalDepthImage.get() : nullptr;
+
+        if (srcAlbedo && srcNormDepth) {
+            std::vector<VkImageMemoryBarrier2> preBlitBarriers;
+            auto addPreBlitBarrier = [&](Image* img, VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
+                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                b.srcAccessMask = srcAccess;
+                b.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+                b.dstAccessMask = dstAccess;
+                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = img->getImage();
+                b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                preBlitBarriers.push_back(b);
+            };
+
+            addPreBlitBarrier(srcAlbedo, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            addPreBlitBarrier(srcNormDepth, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            addPreBlitBarrier(m_displayAlbedoImage.get(), VK_ACCESS_2_NONE, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            addPreBlitBarrier(m_displayNormalsImage.get(), VK_ACCESS_2_NONE, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+            VkDependencyInfo preBlitDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            preBlitDep.imageMemoryBarrierCount = static_cast<uint32_t>(preBlitBarriers.size());
+            preBlitDep.pImageMemoryBarriers = preBlitBarriers.data();
+            vkCmdPipelineBarrier2(cmd, &preBlitDep);
+
+            VkImageBlit blitAlbedo{};
+            blitAlbedo.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitAlbedo.srcOffsets[0] = { 0, 0, 0 };
+            blitAlbedo.srcOffsets[1] = { static_cast<int32_t>(inW), static_cast<int32_t>(inH), 1 };
+            blitAlbedo.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitAlbedo.dstOffsets[0] = { 0, 0, 0 };
+            blitAlbedo.dstOffsets[1] = { static_cast<int32_t>(outW), static_cast<int32_t>(outH), 1 };
+            vkCmdBlitImage(cmd, srcAlbedo->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitAlbedo, VK_FILTER_LINEAR);
+
+            VkImageBlit blitNormals{};
+            blitNormals.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitNormals.srcOffsets[0] = { 0, 0, 0 };
+            blitNormals.srcOffsets[1] = { static_cast<int32_t>(inW), static_cast<int32_t>(inH), 1 };
+            blitNormals.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            blitNormals.dstOffsets[0] = { 0, 0, 0 };
+            blitNormals.dstOffsets[1] = { static_cast<int32_t>(outW), static_cast<int32_t>(outH), 1 };
+            vkCmdBlitImage(cmd, srcNormDepth->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayNormalsImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitNormals, VK_FILTER_LINEAR);
+
+            std::vector<VkImageMemoryBarrier2> postBlitBarriers;
+            auto addPostBlitBarrier = [&](Image* img, VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
+                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                b.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+                b.srcAccessMask = srcAccess;
+                b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                b.dstAccessMask = dstAccess;
+                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = img->getImage();
+                b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                postBlitBarriers.push_back(b);
+            };
+
+            addPostBlitBarrier(m_displayAlbedoImage.get(), VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            addPostBlitBarrier(m_displayNormalsImage.get(), VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            addPostBlitBarrier(srcAlbedo, VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            addPostBlitBarrier(srcNormDepth, VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+            VkDependencyInfo postBlitDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            postBlitDep.imageMemoryBarrierCount = static_cast<uint32_t>(postBlitBarriers.size());
+            postBlitDep.pImageMemoryBarriers = postBlitBarriers.data();
+            vkCmdPipelineBarrier2(cmd, &postBlitDep);
+        }
     }
 
     glm::mat4 currInvView(1.0f);

@@ -83,7 +83,7 @@ public:
             albedoRoughnessImageView,
             motionVectorImageView,
             specularMotionImageView ? specularMotionImageView : motionVectorImageView,
-            specularMotionImageView ? specularMotionImageView : normalDepthImageView,
+            VK_NULL_HANDLE,
             albedoRoughnessImageView,
             normalDepthImageView
         );

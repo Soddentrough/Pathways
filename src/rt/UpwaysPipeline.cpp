@@ -422,7 +422,7 @@ void UpwaysPipeline::updateDescriptors(
     VkImageView arView    = (albedoRoughnessView != VK_NULL_HANDLE) ? albedoRoughnessView : fallbackView;
     VkImageView smView    = (surfaceMotionView != VK_NULL_HANDLE) ? surfaceMotionView : fallbackView;
     VkImageView specMView = (specularMotionView != VK_NULL_HANDLE) ? specularMotionView : smView;
-    VkImageView restirView = (restirMetadataView != VK_NULL_HANDLE) ? restirMetadataView : specMView;
+    VkImageView restirView = (restirMetadataView != VK_NULL_HANDLE) ? restirMetadataView : fallbackView;
     VkImageView dispAlbView = (displayAlbedoView != VK_NULL_HANDLE) ? displayAlbedoView : arView;
     VkImageView dispNormView = (displayNormalsView != VK_NULL_HANDLE) ? displayNormalsView : ndView;
 

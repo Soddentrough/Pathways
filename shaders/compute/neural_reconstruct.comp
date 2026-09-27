@@ -483,6 +483,15 @@ void main() {
             float   c_norm_z  = unpackFloat2x16(s_haloNormal_Z_Unused[hy_base][hx_base]).x;
             vec3 centerNormal = vec3(c_norm_xy, c_norm_z);
 
+            // Native display-resolution geometry guide override
+            vec4 dispNormDepth = imageLoad(uDisplayNormals, outCoord);
+            if (dispNormDepth.w > 0.0 && !isnan(dispNormDepth.w) && !isinf(dispNormDepth.w)) {
+                centerDepth = dispNormDepth.w;
+            }
+            if (dot(dispNormDepth.xyz, dispNormDepth.xyz) > 1e-4) {
+                centerNormal = normalize(dispNormDepth.xyz);
+            }
+
             // 2D Edge Tangent and Normal in Image Plane for Anisotropic Phase Warping
             vec2 norm2D = centerNormal.xy;
             float normLen = length(norm2D);
@@ -600,10 +609,19 @@ void main() {
             vec3 resolvedLinearDiff = mix(histDiff, spatialLinearDiff, alphaDiff);
             vec3 resolvedLinearSpec = mix(histSpec, spatialLinearSpec, alphaSpec);
 
-            vec3 finalHDR = resolvedLinearDiff + resolvedLinearSpec;
+            // Remodulate diffuse irradiance by native display albedo on valid surfaces;
+            // preserve unmodulated radiance for sky / background void.
+            vec4 dispAlbedo = imageLoad(uDisplayAlbedo, outCoord);
+            bool isSurface = (centerDepth > 0.0 && centerDepth < 10000.0);
+            vec3 remodDiff = isSurface ? (resolvedLinearDiff * dispAlbedo.rgb) : resolvedLinearDiff;
+            vec3 finalHDR = remodDiff + resolvedLinearSpec;
 
             if (any(isnan(finalHDR)) || any(isinf(finalHDR))) {
-                finalHDR = spatialLinearDiff + spatialLinearSpec;
+                vec3 fallbackDiff = isSurface ? (spatialLinearDiff * dispAlbedo.rgb) : spatialLinearDiff;
+                finalHDR = fallbackDiff + spatialLinearSpec;
+                if (any(isnan(finalHDR)) || any(isinf(finalHDR))) {
+                    finalHDR = vec3(0.0);
+                }
             }
             finalHDR = clamp(finalHDR, vec3(0.0), vec3(65000.0));
 
