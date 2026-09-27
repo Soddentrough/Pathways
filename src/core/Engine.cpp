@@ -5351,6 +5351,7 @@ void Engine::renderFrame() {
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
     if (m_config.enable_restir_di) flags |= (1 << 9);
+    if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
     }
@@ -7957,6 +7958,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
     if (m_config.enable_restir_di) flags |= (1 << 9);
+    if (m_config.enable_delta_unroll) flags |= (1 << 11);
 
     VkClearColorValue clearZero{};
     clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;

@@ -43,6 +43,8 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -332,6 +334,99 @@ void main() {
                     if (atten.w > 0.0 && mediumDist > 0.0) {
                         vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
                         throughput *= exp(-sigma_a * mediumDist);
+                    }
+                }
+
+                bool entersMedium = frontFace && !isThinWalled && (!cannotRefract && rFlip >= reflectProb);
+
+                // Delta-Chain Unrolling: Collapse internal volume transmission and exit interface
+                // Strictly restricted to primary camera rays (bounce == 0u) where Wave32 lanes maintain
+                // maximal spatial and directional coherence, avoiding divergent inline BVH thrashing.
+                if (bounce == 0u && entersMedium && (ubo.flags & (1u << 11)) != 0u && bounce + 1u < pc.maxBounces) {
+                    vec3 curOrigin = nextOrigin;
+                    vec3 curDir = nextDirection;
+
+                    rayQueryEXT rq;
+                    rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, curOrigin, EPSILON, curDir, 10000.0);
+                    rayQueryProceedEXT(rq);
+
+                    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                        // Escaped mesh boundary directly to sky/environment
+                        vec3 skyColor;
+                        if (pc.hasEnvMap == 1u) {
+                            vec2 envUv = directionToEquirectangular(curDir);
+                            skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+                        } else {
+                            float t = 0.5 * (curDir.y + 1.0);
+                            skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+                        }
+                        vec3 skyContrib = throughput * skyColor;
+                        if (bounce > 0u) {
+                            skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
+                        }
+                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
+                        if (pc.captureMlData != 0u) {
+                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                        }
+                        pathTerminated = true;
+                    } else {
+                        // Committed hit on internal mesh boundary
+                        float intHitT = rayQueryGetIntersectionTEXT(rq, true);
+                        uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+                        uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
+                        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+                        InstanceGPU inst = instances[instIdx];
+                        uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+                        uint hitMatId = triangles[triIdx].materialId + inst.materialOffset;
+                        uint arch = (hitMatId < pc.numMaterials) ? materialArchetypes[hitMatId] : 2u;
+
+                        // Only unroll delta chain if ray hits the backface of the SAME dielectric material (clean exit back to exterior/air).
+                        // If it strikes a nested dielectric (e.g. glass-to-water) or an opaque interior object, abort unroll and let
+                        // wavefront bounce queue handle the interface transition with accurate relative IOR and BRDF evaluation.
+                        if (hitMatId == matId && arch == 2u) {
+                            // Volumetric Beer-Lambert absorption for internal segment
+                            vec4 atten = mat.attenuationColor;
+                            if (isWater && atten.w <= 0.0) {
+                                atten = vec4(0.3, 0.7, 0.9, 4.0);
+                            }
+                            if (atten.w > 0.0 && intHitT > 0.0) {
+                                vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
+                                throughput *= exp(-sigma_a * intHitT);
+                            }
+
+                            Triangle exitTri = triangles[triIdx];
+                            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                            mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+                            vec3 localNorm = getTriangleNormal(exitTri, bary);
+                            vec3 intNormal = normalize(transpose(mat3(w2o)) * localNorm);
+
+                            // Ray is inside medium hitting back face: orient normal to oppose ray direction
+                            if (dot(curDir, intNormal) > 0.0) {
+                                intNormal = -intNormal;
+                            }
+
+                            vec3 intHitPoint = curOrigin + intHitT * curDir;
+                            float exitEta = iorVal; // glass -> air: eta = n_glass / n_air = iorVal
+                            float exitCosTheta = clamp(dot(-curDir, intNormal), 0.0, 1.0);
+                            float exitReflectProb = fresnelDielectric(exitCosTheta, exitEta);
+
+                            float rExit = randFloat(seed);
+                            if (exitReflectProb >= 1.0 || rExit < exitReflectProb) {
+                                // Total Internal Reflection (TIR) inside medium: reflect and emit for next bounce
+                                nextDirection = reflect(curDir, intNormal);
+                                nextOrigin = intHitPoint + intNormal * 0.0005;
+                                bounce += 1u;
+                            } else {
+                                // Refract OUT of the glass into air!
+                                vec3 exitDir = normalize(refract(curDir, intNormal, exitEta));
+                                nextDirection = exitDir;
+                                nextOrigin = intHitPoint - intNormal * 0.0005;
+                                bounce += 1u;
+                            }
+                        }
                     }
                 }
 

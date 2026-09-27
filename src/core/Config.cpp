@@ -310,6 +310,8 @@ void Config::printUsage(const char* progName) {
               << "  --tail-megakernel       Enable Hybrid Wavefront-to-Megakernel transition for late bounces (eliminates per-bounce barriers/queues) [default: disabled]\n"
               << "  --tail-bounce <int>     Bounce depth to switch to Tail Megakernel (default: 2, alias: --tail-megakernel-bounce)\n"
               << "  --no-tail-megakernel    Disable Tail Megakernel (force pure wavefront across all bounces)\n"
+              << "  --delta-unroll          Enable inline rayQuery delta-chain unrolling for dielectric double-bounce [default: enabled]\n"
+              << "  --no-delta-unroll       Disable inline rayQuery delta-chain unrolling (enforce discrete wavefront queues for all bounces)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
@@ -974,6 +976,14 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
+            continue;
+        }
+        if (arg == "--delta-unroll") {
+            cfg.enable_delta_unroll = true;
+            continue;
+        }
+        if (arg == "--no-delta-unroll") {
+            cfg.enable_delta_unroll = false;
             continue;
         }
         if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {
