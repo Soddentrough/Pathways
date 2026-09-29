@@ -572,6 +572,15 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     requireFeat(featDGC.deviceGeneratedCommands, "DGC: deviceGeneratedCommands");
     requireFeat(featDGC.dynamicGeneratedPipelineLayout, "DGC: dynamicGeneratedPipelineLayout");
 
+    if (!m_hasDGC || !featDGC.deviceGeneratedCommands || !featDGC.dynamicGeneratedPipelineLayout) {
+        Logger::error("================================================================================");
+        Logger::error("  [FATAL] Hardware Device Generated Commands (DGC) is unsupported on '{}'", m_deviceName);
+        Logger::error("  Pathways requires an autonomous GPU command processor with VK_EXT_device_generated_commands");
+        Logger::error("  and hardware dynamicGeneratedPipelineLayout support under the pure Vulkan 1.4 baseline.");
+        Logger::error("  Execution cannot proceed on this device without required hardware DGC capabilities.");
+        Logger::error("================================================================================");
+    }
+
     if (!missingRequirements.empty()) {
         std::string err = std::format("GPU '{}' lacks required Vulkan 1.4 baseline capability/feature(s):\n", m_deviceName);
         for (const auto& item : missingRequirements) {

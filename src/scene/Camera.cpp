@@ -209,6 +209,27 @@ void Camera::lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up) {
     m_hasPrevViewProj = false;
 }
 
+void Camera::setAnimatedPose(const glm::vec3& position, const glm::vec3& target, const glm::vec3& up, float fov) {
+    m_position = position;
+    m_worldUp = up;
+    m_velocity = glm::vec3(0.0f);
+    glm::vec3 direction = glm::normalize(target - position);
+    m_pitch = glm::degrees(std::asin(std::clamp(direction.y, -0.999f, 0.999f)));
+    m_yaw = glm::degrees(std::atan2(direction.z, direction.x));
+    float dist = glm::length(target - position);
+    if (dist > 0.05f) {
+        m_focalDistance = dist;
+    }
+    m_centralTarget = target;
+    if (fov > 1.0f && fov < 170.0f) {
+        m_fov = fov;
+    }
+    updateVectors();
+    m_moved = true;
+    // NOTE: Intentionally do NOT clear m_hasPrevViewProj!
+    // Preserves m_prevViewProj from previous frame for exact non-zero motion vectors.
+}
+
 void Camera::updateVectors() {
     glm::vec3 front;
     front.x = std::cos(glm::radians(m_yaw)) * std::cos(glm::radians(m_pitch));

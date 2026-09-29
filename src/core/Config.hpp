@@ -176,6 +176,9 @@ struct Config {
     uint32_t tile_size = 64;
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
+    std::string camera_path = "";  // Path to camera trajectory JSON file (waypoints, Catmull-Rom, Bézier)
+    bool camera_path_loop = false; // Loop camera path indefinitely
+    float camera_path_speed = 1.0f; // Speed multiplier for camera path playback
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
     bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

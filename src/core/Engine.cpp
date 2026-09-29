@@ -5,6 +5,7 @@
 #include "scene/GltfLoader.hpp"
 #include "scene/UsdLoader.hpp"
 #include "scene/LightTree.hpp"
+#include "scene/Material.hpp"
 #include "video/VideoDecoder.hpp"
 #include <glm/detail/type_half.hpp>
 #include <glm/gtc/packing.hpp>
@@ -226,6 +227,23 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     initVulkan();
     initScene();
+
+
+    if (!m_config.camera_path.empty()) {
+        m_cameraPath = CameraPath::loadFromFile(m_config.camera_path);
+        if (m_cameraPath && m_cameraPath->isValid()) {
+            Logger::info("Initialized CameraPath trajectory: '{}' ({} keyframes, {:.2f}s duration, loop: {})",
+                         m_cameraPath->getName(), m_cameraPath->getKeyframeCount(),
+                         m_cameraPath->getDuration(), (m_config.camera_path_loop || m_cameraPath->isLoop()));
+            CameraSample initSample = m_cameraPath->evaluate(0.0f, m_config.camera_path_loop);
+            m_camera->lookAt(initSample.position, initSample.target, initSample.up);
+            if (initSample.fov > 1.0f && initSample.fov < 170.0f) {
+                m_camera->setFov(initSample.fov);
+            }
+        } else {
+            Logger::error("Failed to load valid CameraPath from: {}", m_config.camera_path);
+        }
+    }
     auto physicalDevices = VulkanContext::enumeratePhysicalDevices(m_context->getInstance());
     uint32_t hwDeviceCount = 0;
     for (auto pd : physicalDevices) {
@@ -1832,6 +1850,8 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 
     initVideoBillboardDecoder(filepath);
 
+
+
     Logger::info("Scene successfully switched to: {} (Index: {})", filepath, m_currentSceneIndex);
     return true;
 }
@@ -3329,9 +3349,7 @@ void Engine::updateUpwaysDescriptors() {
 
     VkImageView normDepthView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
     VkImageView motionView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
-    VkImageView albedoView = (m_config.pipeline_type == PipelineType::Wavefront && m_mlAlbedoRoughnessImage)
-        ? m_mlAlbedoRoughnessImage->getImageView()
-        : (m_directLightImage ? m_directLightImage->getImageView() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE));
+    VkImageView albedoView = m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
     VkImageView specMotionView = m_mlSpecularMotionImage ? m_mlSpecularMotionImage->getImageView() : motionView;
     VkImageView diffView = m_mlDiffuseImage ? m_mlDiffuseImage->getImageView() : m_frameImages[0]->getImageView();
     VkImageView specView = m_mlSpecularImage ? m_mlSpecularImage->getImageView() : VK_NULL_HANDLE;
@@ -3396,9 +3414,7 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
     }
 
     if (isSuperRes && m_displayAlbedoImage && m_displayNormalsImage) {
-        Image* srcAlbedo = (m_config.pipeline_type == PipelineType::Wavefront && m_mlAlbedoRoughnessImage)
-            ? m_mlAlbedoRoughnessImage.get()
-            : (m_directLightImage ? m_directLightImage.get() : (m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage.get() : nullptr));
+        Image* srcAlbedo = m_mlAlbedoRoughnessImage ? m_mlAlbedoRoughnessImage.get() : nullptr;
         Image* srcNormDepth = m_normalDepthImage ? m_normalDepthImage.get() : nullptr;
 
         if (srcAlbedo && srcNormDepth) {
@@ -5518,12 +5534,31 @@ void Engine::renderFrame() {
 
     bool sceneLoadingActive = m_isSceneLoading.load() || m_pendingSceneChange;
 
-    // Update smooth continuous FPS keyboard navigation
+    // Update smooth continuous FPS keyboard navigation or camera trajectory
+    bool pathActive = (m_cameraPath && m_cameraPath->isValid());
+    bool pathMoving = false;
     if (!sceneLoadingActive) {
-        updateInput();
+        if (pathActive && m_camera) {
+            float dt = 1.0f / (m_config.target_fps > 0 ? static_cast<float>(m_config.target_fps) : 60.0f);
+            if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
+                dt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
+            }
+            m_cameraPathTime += dt * m_config.camera_path_speed;
+            float simTime = m_config.headless ? (static_cast<float>(m_totalFramesRendered) * dt * m_config.camera_path_speed) : m_cameraPathTime;
+            CameraSample sample = m_cameraPath->evaluate(simTime, m_config.camera_path_loop);
+            m_camera->setAnimatedPose(sample.position, sample.target, sample.up, sample.fov);
+            if (sample.isStationary) {
+                m_camera->resetMoved();
+                pathMoving = false;
+            } else {
+                pathMoving = true;
+            }
+        } else {
+            updateInput();
 
-        if (m_config.camera_motion && m_camera) {
-            m_camera->processMouseMovement(2.0f, 0.0f);
+            if (m_config.camera_motion && m_camera) {
+                m_camera->processMouseMovement(2.0f, 0.0f);
+            }
         }
     }
 
@@ -5537,7 +5572,7 @@ void Engine::renderFrame() {
     }
 
     // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
-    bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion);
+    bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion || pathMoving);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
@@ -5635,7 +5670,8 @@ void Engine::renderFrame() {
     }
 
     bool isStationaryAccum = m_config.progressive_accumulation && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
-    bool enableJitter = ((m_config.upscaler_mode == UpscalerMode::FSR3) || (m_config.upscaler_mode == UpscalerMode::Upways)) && !isStationaryAccum;
+    bool isUpscalerActive = (m_config.upscaler_mode == UpscalerMode::FSR3) || (m_config.upscaler_mode == UpscalerMode::Upways) || m_config.upways_superres;
+    bool enableJitter = isUpscalerActive;
     uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
         static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
     uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?

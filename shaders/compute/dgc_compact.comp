@@ -41,7 +41,7 @@ void main() {
         isActive = (ray.origin.w > 0.5);
     }
 
-    // Subgroup balloting for wave compaction
+    // Subgroup balloting for wave compaction (maps directly to native 1-cycle v_mbcnt on RDNA)
     uvec4 ballot = subgroupBallot(isActive);
     uint localIndex = subgroupBallotExclusiveBitCount(ballot);
     uint waveActiveCount = subgroupBallotBitCount(ballot);

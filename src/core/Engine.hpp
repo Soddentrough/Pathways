@@ -8,6 +8,7 @@
 #include "vulkan/Image.hpp"
 #include "vulkan/Swapchain.hpp"
 #include "scene/Camera.hpp"
+#include "scene/CameraPath.hpp"
 #include "scene/ProceduralScene.hpp"
 #include "utils/ImageDumper.hpp"
 #include "rt/AccelerationStructure.hpp"
@@ -94,6 +95,8 @@ private:
     std::unique_ptr<VulkanContext> m_context;
     std::unique_ptr<Swapchain> m_swapchain;
     std::unique_ptr<Camera> m_camera;
+    std::unique_ptr<CameraPath> m_cameraPath;
+    float m_cameraPathTime = 0.0f;
     std::unique_ptr<class GuiManager> m_gui;
     std::unique_ptr<class MultiGpuManager> m_mgpu;
 

@@ -563,15 +563,6 @@ SceneData ProceduralScene::createCornellBox() {
     areaLight.emission = glm::vec4(18.0f, 18.0f, 15.0f, (2.0f * lw) * (2.0f * lw));
     scene.lights.push_back(areaLight);
 
-    // Add a Spot Light for directional accent and soft shadows
-    LightGPU spotLight{};
-    spotLight.position = glm::vec4(0.4f, 1.8f, 0.5f, LIGHT_SPOT);
-    spotLight.normal = glm::vec4(glm::normalize(glm::vec3(-0.4f, -1.4f, -0.7f)), 0.0f);
-    spotLight.emission = glm::vec4(25.0f, 22.0f, 18.0f, 1.0f);
-    spotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(25.0f))); // inner angle cos
-    spotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(35.0f))); // outer angle cos
-    scene.lights.push_back(spotLight);
-
     // Interior objects:
     // 1. Tall diffuse blue box on the right
     tStart = static_cast<uint32_t>(scene.triangles.size());

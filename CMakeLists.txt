@@ -445,6 +445,24 @@ endif()
 
 add_test(NAME CameraControls COMMAND test_camera_controls)
 
+# Camera Paths & Trajectories Unit Test Target
+add_executable(test_camera_paths
+    tests/test_camera_paths.cpp
+    src/scene/CameraPath.cpp
+    src/scene/Camera.cpp
+    src/scene/ProceduralScene.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+)
+target_include_directories(test_camera_paths PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_camera_paths PRIVATE m)
+endif()
+add_test(NAME CameraPaths COMMAND test_camera_paths)
+
 
 # GUI Mouse Wheel & Scroll Indicator Unit Test Target
 add_executable(test_gui_scroll

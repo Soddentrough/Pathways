@@ -49,6 +49,7 @@ public:
     float getAspect() const { return m_aspect; }
     void setPose(const glm::vec3& position, float yaw, float pitch);
     void lookAt(glm::vec3 position, glm::vec3 target, glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f));
+    void setAnimatedPose(const glm::vec3& position, const glm::vec3& target, const glm::vec3& up = glm::vec3(0.0f, 1.0f, 0.0f), float fov = 0.0f);
     void update(float deltaTime);
 
     // Movement controls

@@ -95,9 +95,9 @@ int main() {
     std::cout << "  Verifying Cross-Workgroup Atomic Retirement on Device   " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 1. Initialize Vulkan 1.3+ Instance
+    // 1. Initialize Vulkan 1.4+ Instance
     VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    appInfo.apiVersion = VK_API_VERSION_1_3;
+    appInfo.apiVersion = VK_API_VERSION_1_4;
 
     VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     instInfo.pApplicationInfo = &appInfo;
@@ -149,7 +149,11 @@ int main() {
     queueCreateInfo.queueCount = 1;
     queueCreateInfo.pQueuePriorities = &queuePriority;
 
+    VkPhysicalDeviceVulkan14Features feat14{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES };
+    feat14.shaderSubgroupRotate = VK_TRUE;
+
     VkPhysicalDeviceVulkan13Features feat13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    feat13.pNext = &feat14;
     feat13.synchronization2 = VK_TRUE;
 
     VkDeviceCreateInfo deviceCreateInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };

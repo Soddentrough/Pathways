@@ -876,7 +876,12 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                 VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 3 + 0) * 16;
-                m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassMaterial), 1, m_dgcManager->isExplicitPreprocessEnabled());
+                uint32_t shadeSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassMaterial);
+                if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
+                    m_dgcManager->recordPreprocess(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, shadeSlice, 1);
+                    m_dgcManager->recordPreprocessBarrier(cmd, shadeSlice, 1);
+                }
+                m_dgcManager->recordExecute(cmd, m_shadePipeline, m_indirectArgs[frameSlot].get(), shadeOffset, shadeSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
             }
             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 1);
 
@@ -1022,6 +1027,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
+
                 if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 2);
                 m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
                 if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 3);
