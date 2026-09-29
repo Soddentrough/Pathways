@@ -864,7 +864,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                 uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                 uint32_t sliceIdx = DGCManager::getSliceIndex(frameSlot, b);
-                VkDeviceAddress seqCountAddr = 0;
+                VkDeviceAddress seqCountAddr = m_queueCounters[frameSlot]->getDeviceAddress(m_device) + offsetof(QueueCountersBuffer, activeMaterialSequenceCount);
                 if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
                     m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
                     m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
@@ -946,16 +946,72 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             uint32_t intersectSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassIntersect);
             bool needIntersectDgc = needIntersect && !(sceneData.secondarySortMode == 1 && useMaterialSort);
             bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
+
+            uint32_t shadowPC[10] = {
+                sceneData.numTriangles,
+                sceneData.numSpheres,
+                sceneData.numMaterials,
+                sceneData.numLights,
+                storeWidth,
+                fh,
+                sceneData.frameIndex,
+                sampleIdx,
+                sceneData.numOpaqueTriangles,
+                sceneData.captureMlData
+            };
+
+            float maxRayDist = 10000.0f;
+            if (sceneData.enableDistanceClamping) {
+                if (sceneData.maxSecondaryRayDistance > 0.0f) {
+                    maxRayDist = sceneData.maxSecondaryRayDistance;
+                } else {
+                    glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
+                    float sceneDiameter = glm::length(extent);
+                    if (sceneDiameter > 0.01f) {
+                        maxRayDist = sceneDiameter * 1.25f;
+                    }
+                }
+            }
+
+            uint32_t intersectPC[18] = {
+                sceneData.numTriangles,
+                sceneData.numSpheres,
+                sceneData.numMaterials,
+                sceneData.numLights,
+                storeWidth,
+                fh,
+                b,
+                maxBounces,
+                m_maxCapacity,
+                sampleIdx,
+                sceneData.hasEnvMap,
+                std::bit_cast<uint32_t>(sceneData.envMapIntensity),
+                sceneData.useHardwareRT,
+                sceneData.sortMode,
+                sceneData.numOpaqueTriangles,
+                sceneData.secondarySortMode,
+                0, // octantBin
+                std::bit_cast<uint32_t>(maxRayDist)
+            };
+
             if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
                 if (needShadowDispatch) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
+                    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
                     m_dgcManager->recordPreprocess(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1);
                     if (batchPreprocess && needIntersectDgc) {
+                        // VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048: bind intersectSet & intersectPC before preprocess
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
+                        vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                         m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                         m_dgcManager->recordPreprocessBarrier(cmd, shadowSlice, 2);
                     } else {
                         m_dgcManager->recordPreprocessBarrier(cmd, shadowSlice, 1);
                     }
                 } else if (needIntersectDgc) {
+                    // VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048: bind intersectSet & intersectPC before preprocess
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
+                    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                     m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                     m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
                 }
@@ -965,18 +1021,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (needShadowDispatch) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
-                uint32_t shadowPC[10] = {
-                    sceneData.numTriangles,
-                    sceneData.numSpheres,
-                    sceneData.numMaterials,
-                    sceneData.numLights,
-                    storeWidth,
-                    fh,
-                    sceneData.frameIndex,
-                    sampleIdx,
-                    sceneData.numOpaqueTriangles,
-                    sceneData.captureMlData
-                };
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), shadowPC);
                 if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 2);
                 m_dgcManager->recordExecute(cmd, m_shadowPipeline, m_indirectArgs[frameSlot].get(), shadowOffset, shadowSlice, 1, m_dgcManager->isExplicitPreprocessEnabled());
@@ -992,42 +1036,12 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
             if (b + 1 < cutoffBounce) {
                 if (!batchPreprocess && needShadowDispatch && needIntersectDgc && m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
+                    // VUID-vkCmdExecuteGeneratedCommandsEXT-isPreprocessed-11048: bind intersectSet & intersectPC before preprocess
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &intersectSet, 0, nullptr);
+                    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                     m_dgcManager->recordPreprocess(cmd, m_intersectPipeline, m_indirectArgs[frameSlot].get(), intersectOffset, intersectSlice, 1);
                     m_dgcManager->recordPreprocessBarrier(cmd, intersectSlice, 1);
                 }
-                float maxRayDist = 10000.0f;
-                if (sceneData.enableDistanceClamping) {
-                    if (sceneData.maxSecondaryRayDistance > 0.0f) {
-                        maxRayDist = sceneData.maxSecondaryRayDistance;
-                    } else {
-                        glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
-                        float sceneDiameter = glm::length(extent);
-                        if (sceneDiameter > 0.01f) {
-                            maxRayDist = sceneDiameter * 1.25f;
-                        }
-                    }
-                }
-
-                uint32_t intersectPC[18] = {
-                    sceneData.numTriangles,
-                    sceneData.numSpheres,
-                    sceneData.numMaterials,
-                    sceneData.numLights,
-                    storeWidth,
-                    fh,
-                    b,
-                    maxBounces,
-                    m_maxCapacity,
-                    sampleIdx,
-                    sceneData.hasEnvMap,
-                    std::bit_cast<uint32_t>(sceneData.envMapIntensity),
-                    sceneData.useHardwareRT,
-                    sceneData.sortMode,
-                    sceneData.numOpaqueTriangles,
-                    sceneData.secondarySortMode,
-                    0, // octantBin
-                    std::bit_cast<uint32_t>(maxRayDist)
-                };
 
                 if (sceneData.secondarySortMode == 1 && useMaterialSort) {
                     // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
