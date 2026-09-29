@@ -32,9 +32,10 @@ enum class PipelineType {
 };
 
 enum class WavefrontSortMode {
-    None,      // Monolithic shade kernel, no material partitioning
-    Archetype, // Multi-queue wave-ballot partitioning with DGC Execution Sets
-    Dual       // 3D Spatial-Morton intra-wave sort + Archetype dual-binning (Default)
+    None = 0,      // Monolithic shade kernel, no material partitioning
+    Archetype = 1, // Multi-queue wave-ballot partitioning with DGC Execution Sets
+    Dual = 2,      // 3D Spatial-Morton intra-wave sort + Archetype dual-binning
+    Auto = 3       // Scene & hardware adaptive sorting mode (Default)
 };
 
 enum class SecondarySortMode {
@@ -58,7 +59,7 @@ enum class UpscalerMode {
 
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
-    WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Dual; // Default: Technique D (3D Spatial-Morton + Material Dual-Binning)
+    WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Auto; // Default: Scene & hardware adaptive sorting
     bool use_morton = false; // 2D Morton Z-curve mapping for wavefront classification (default: false / linear raster)
     uint32_t macro_tile_size = 0; // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
     uint32_t batch_count = 0;    // Coarse batch count (0 = auto-detect based on GPU profile, 1 = monolithic, 2, 4, 8, etc.)

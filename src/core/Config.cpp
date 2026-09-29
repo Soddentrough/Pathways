@@ -293,11 +293,12 @@ void Config::printUsage(const char* progName) {
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
               << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'p2p' (Direct BAR via Linux DMA-BUF), 'host' (Zero-Copy Host Memory) [default: auto-detects Resizable BAR vs small-BAR fallback]\n"
+              << "  --accum-format <fmt>    Accumulation & inter-GPU transfer precision: 'fp16' [default], 'fp32', or 'r11g11b10' (bandwidth-optimized packed float)\n"
               << "  --tile-size <int>       Tile size for tile mode: 16, 32, 64, or 128 (default: 64)\n"
               << "  --no-double-buffer      Disable double-buffering for inter-GPU shared host memory\n"
               << "  --visualize-split       Visualize real-time workload split between Dual GPUs (overlay)\n\n"
               << "Wavefront Architecture:\n"
-              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'dual' (D) [default], 'none', or 'archetype' (A & B)\n"
+              << "  --wavefront-sort <mode> Wavefront material sorting mode: 'auto' [default], 'dual' (D), 'none', or 'archetype' (A & B)\n"
               << "  --use-morton            Enable 2D Morton Z-curve mapping for wavefront classification (default: disabled / linear raster)\n"
               << "  --sec-sort <mode>       Secondary ray coherency mode: 'directional'/'octant' (On-chip 8-bin Directional DGC) [default], 'direct'/'coherent' (Xiang 2023, K=4), 'coherent-k8' (K=8), or 'none'\n"
               << "  --macro-blas            Merge static instance clusters into spatial Macro-BLASes (cuts 35-50% ray-box tests) [default: enabled]\n"
@@ -871,14 +872,16 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if ((arg == "--wavefront-sort" || arg == "--wf-sort" || arg == "--material-sort") && i + 1 < argc) {
             std::string s = argv[++i];
-            if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
+            if (s == "auto" || s == "adaptive" || s == "default") cfg.wavefront_sort_mode = WavefrontSortMode::Auto;
+            else if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
             continue;
         }
         if (arg.starts_with("--wavefront-sort=") || arg.starts_with("--wf-sort=") || arg.starts_with("--material-sort=")) {
             std::string s = arg.substr(arg.find('=') + 1);
-            if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
+            if (s == "auto" || s == "adaptive" || s == "default") cfg.wavefront_sort_mode = WavefrontSortMode::Auto;
+            else if (s == "archetype" || s == "a" || s == "b" || s == "ab") cfg.wavefront_sort_mode = WavefrontSortMode::Archetype;
             else if (s == "dual" || s == "d") cfg.wavefront_sort_mode = WavefrontSortMode::Dual;
             else cfg.wavefront_sort_mode = WavefrontSortMode::None;
             continue;
@@ -1401,10 +1404,8 @@ Config Config::parse(int argc, char* argv[]) {
         cfg.frame_limit = 1;
     }
 
-    if (!cfg.explicit_accum_format && cfg.mgpu_mode != MultiGpuMode::Off) {
-        cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
-        Logger::info("Config: Multi-GPU enabled without explicit --accum-format; defaulting to R11G11B10_UFLOAT for optimal PCIe transfer bandwidth.");
-    }
+    // Multi-GPU accumulation format defaults to RGBA16_SFLOAT (FP16) for seamless precision across devices.
+    // R11G11B10_UFLOAT can be explicitly selected via --accum-format r11g11b10 if maximum PCIe bandwidth efficiency is required.
 
     // Auto-detect co-located scene HDRI environment map if not explicitly specified
     if (cfg.hdri_path.empty() && !cfg.scene_path.empty()) {

@@ -462,28 +462,55 @@ void main() {
     }
 
     if (pc.sortMode > 0u) {
-        // Material Index Queue Partitioning (4-byte indirection)
-        for (uint k = 0u; k < 4u; ++k) {
-            bool isMatch = (isActive && archetype == k);
-            uvec4 matBallot = subgroupBallot(isMatch);
-            uint matchCount = subgroupBallotBitCount(matBallot);
+        uvec4 activeBallot = subgroupBallot(isActive);
+        uint activeCountInWave = subgroupBallotBitCount(activeBallot);
+        uint firstActiveLane = (activeCountInWave > 0u) ? subgroupBallotFindLSB(activeBallot) : 0u;
+        uint leaderArchetype = subgroupShuffle(archetype, firstActiveLane);
+        uvec4 matchLeaderBallot = subgroupBallot(isActive && archetype == leaderArchetype);
+        bool isUniformWave = (activeCountInWave == 0u) || (subgroupBallotBitCount(matchLeaderBallot) == activeCountInWave);
 
-            if (matchCount > 0u) {
-                uint matLaneSlot = subgroupBallotExclusiveBitCount(matBallot);
-                uint leader = subgroupBallotFindLSB(matBallot);
-                uint waveQueueBase = 0u;
-                if (gl_SubgroupInvocationID == leader) {
-                    if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
-                    else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
-                    else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
-                    else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
+        if (isUniformWave && activeCountInWave > 0u) {
+            // Fast-path: All active lanes in the wave hit the same material archetype
+            uint matLaneSlot = subgroupBallotExclusiveBitCount(activeBallot);
+            uint waveQueueBase = 0u;
+            if (gl_SubgroupInvocationID == firstActiveLane) {
+                if (leaderArchetype == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, activeCountInWave);
+                else if (leaderArchetype == 1u) waveQueueBase = atomicAdd(queueCounters.complexCount, activeCountInWave);
+                else if (leaderArchetype == 2u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, activeCountInWave);
+                else if (leaderArchetype == 3u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, activeCountInWave);
+            }
+            waveQueueBase = subgroupShuffle(waveQueueBase, firstActiveLane);
+
+            if (isActive) {
+                uint slot = waveQueueBase + matLaneSlot;
+                if (slot < pc.maxQueueCapacity) {
+                    materialIndices[leaderArchetype * pc.maxQueueCapacity + slot] = rayIdx;
                 }
-                waveQueueBase = subgroupShuffle(waveQueueBase, leader);
+            }
+        } else if (!isUniformWave) {
+            // Material Index Queue Partitioning (4-byte indirection)
+            for (uint k = 0u; k < 4u; ++k) {
+                bool isMatch = (isActive && archetype == k);
+                uvec4 matBallot = subgroupBallot(isMatch);
+                uint matchCount = subgroupBallotBitCount(matBallot);
 
-                if (isMatch) {
-                    uint slot = waveQueueBase + matLaneSlot;
-                    if (slot < pc.maxQueueCapacity) {
-                        materialIndices[k * pc.maxQueueCapacity + slot] = rayIdx;
+                if (matchCount > 0u) {
+                    uint matLaneSlot = subgroupBallotExclusiveBitCount(matBallot);
+                    uint leader = subgroupBallotFindLSB(matBallot);
+                    uint waveQueueBase = 0u;
+                    if (gl_SubgroupInvocationID == leader) {
+                        if (k == 0u) waveQueueBase = atomicAdd(queueCounters.diffuseCount, matchCount);
+                        else if (k == 1u) waveQueueBase = atomicAdd(queueCounters.complexCount, matchCount);
+                        else if (k == 2u) waveQueueBase = atomicAdd(queueCounters.dielectricCount, matchCount);
+                        else if (k == 3u) waveQueueBase = atomicAdd(queueCounters.emissiveCount, matchCount);
+                    }
+                    waveQueueBase = subgroupShuffle(waveQueueBase, leader);
+
+                    if (isMatch) {
+                        uint slot = waveQueueBase + matLaneSlot;
+                        if (slot < pc.maxQueueCapacity) {
+                            materialIndices[k * pc.maxQueueCapacity + slot] = rayIdx;
+                        }
                     }
                 }
             }
@@ -536,29 +563,49 @@ void main() {
                 indirect.commands[4].x = 0u;
                 indirect.commands[5].x = 0u;
 
-                dgcStream.commands[0].pipelineIndex = 0u; // Standard
-                dgcStream.commands[0].x = stdGroups;
-                dgcStream.commands[0].y = 1u;
-                dgcStream.commands[0].z = 1u;
+                uint activeSeq = 0u;
+                if (stdGroups > 0u) {
+                    dgcStream.commands[activeSeq].pipelineIndex = 0u; // Standard
+                    dgcStream.commands[activeSeq].x = stdGroups;
+                    dgcStream.commands[activeSeq].y = 1u;
+                    dgcStream.commands[activeSeq].z = 1u;
+                    activeSeq++;
+                }
 
-                dgcStream.commands[1].pipelineIndex = 1u; // Complex
-                dgcStream.commands[1].x = compGroups;
-                dgcStream.commands[1].y = 1u;
-                dgcStream.commands[1].z = 1u;
+                if (compGroups > 0u) {
+                    dgcStream.commands[activeSeq].pipelineIndex = 1u; // Complex
+                    dgcStream.commands[activeSeq].x = compGroups;
+                    dgcStream.commands[activeSeq].y = 1u;
+                    dgcStream.commands[activeSeq].z = 1u;
+                    activeSeq++;
+                }
 
-                dgcStream.commands[2].pipelineIndex = 2u; // Dielectric
-                dgcStream.commands[2].x = dielGroups;
-                dgcStream.commands[2].y = 1u;
-                dgcStream.commands[2].z = 1u;
+                if (dielGroups > 0u) {
+                    dgcStream.commands[activeSeq].pipelineIndex = 2u; // Dielectric
+                    dgcStream.commands[activeSeq].x = dielGroups;
+                    dgcStream.commands[activeSeq].y = 1u;
+                    dgcStream.commands[activeSeq].z = 1u;
+                    activeSeq++;
+                }
 
-                dgcStream.commands[3].pipelineIndex = 3u; // Emissive
-                dgcStream.commands[3].x = emisGroups;
-                dgcStream.commands[3].y = 1u;
-                dgcStream.commands[3].z = 1u;
+                if (emisGroups > 0u) {
+                    dgcStream.commands[activeSeq].pipelineIndex = 3u; // Emissive
+                    dgcStream.commands[activeSeq].x = emisGroups;
+                    dgcStream.commands[activeSeq].y = 1u;
+                    dgcStream.commands[activeSeq].z = 1u;
+                    activeSeq++;
+                }
+
+                for (uint c = activeSeq; c < 4u; ++c) {
+                    dgcStream.commands[c].pipelineIndex = 0u;
+                    dgcStream.commands[c].x = 0u;
+                    dgcStream.commands[c].y = 1u;
+                    dgcStream.commands[c].z = 1u;
+                }
 
                 uint totalShadeWgs = stdGroups + compGroups + dielGroups + emisGroups;
                 queueCounters.totalShadeWorkgroups = totalShadeWgs;
-                queueCounters.activeMaterialSequenceCount = (totalShadeWgs > 0u) ? 4u : 0u;
+                queueCounters.activeMaterialSequenceCount = activeSeq;
 
                 if (totalShadeWgs == 0u) {
                     indirect.commands[6].x = 0u;

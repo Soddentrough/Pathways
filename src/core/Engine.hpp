@@ -168,6 +168,9 @@ private:
     uint32_t getTargetBatchPixels() const;
     uint32_t getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const;
     uint32_t getEffectiveBatchPixels(uint32_t renderW, uint32_t renderH, uint32_t batchCount) const;
+    mutable float m_cachedDivergentAreaRatio = -1.0f;
+    float getDivergentAreaRatio() const;
+    WavefrontSortMode getEffectiveWavefrontSortMode() const;
 
     // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
     VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;

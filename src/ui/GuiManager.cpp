@@ -535,9 +535,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
             ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Ray Queues & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
             if (config.pipeline_type == PipelineType::Wavefront) {
-                const char* wfSortStr = "Dual (Spatial-Morton + Material)";
+                const char* wfSortStr = "Auto (Adaptive)";
                 if (config.wavefront_sort_mode == WavefrontSortMode::None) wfSortStr = "None (Monolithic)";
                 else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) wfSortStr = "Archetype (BSDF Buckets)";
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) wfSortStr = "Dual (Spatial-Morton + Material)";
 
                 const char* secSortStr = "None (Linear Queue)";
                 if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) secSortStr = "Directional DGC (Producer-Side Binning)";
@@ -1138,19 +1139,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Wavefront Material Sorting:");
                 const char* sortModes[] = {
+                    "Auto (Scene & Architecture Adaptive)",
                     "None (Monolithic Shading Kernel)",
                     "Archetype (BSDF Buckets via Wave-Ballot)",
                     "Dual (3D Spatial-Morton + Material Dual-Binning)"
                 };
-                int currentSort = 2;
-                if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 0;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 1;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 2;
+                int currentSort = 0;
+                if (config.wavefront_sort_mode == WavefrontSortMode::Auto) currentSort = 0;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 1;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 2;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 3;
 
                 if (ImGui::Combo("Material Sort Mode##WfSort", &currentSort, sortModes, IM_ARRAYSIZE(sortModes))) {
-                    if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::None;
-                    else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
-                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::Dual;
+                    if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::Auto;
+                    else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::None;
+                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
+                    else if (currentSort == 3) config.wavefront_sort_mode = WavefrontSortMode::Dual;
                     settingsChanged = true;
                 }
 

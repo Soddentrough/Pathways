@@ -235,7 +235,7 @@ Engine::Engine(const Config& config) : m_config(config) {
             hwDeviceCount++;
         }
     }
-    if (hwDeviceCount >= 2) {
+    if (hwDeviceCount >= 2 && m_config.mgpu_mode != MultiGpuMode::Off) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
     // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
@@ -1182,6 +1182,7 @@ void Engine::initScene() {
         Logger::warn("Loaded scene contains no renderable geometry! Falling back to procedural Cornell Box.");
         m_sceneData = ProceduralScene::createCornellBox();
     }
+    m_cachedDivergentAreaRatio = -1.0f;
 
     if (m_config.enable_macro_blas) {
         clusterInstancesToMacroBlas(m_sceneData);
@@ -1557,6 +1558,7 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     }
 
     m_sceneData = std::move(newScene);
+    m_cachedDivergentAreaRatio = -1.0f;
     if (m_config.enable_macro_blas) {
         clusterInstancesToMacroBlas(m_sceneData);
     }
@@ -2343,6 +2345,67 @@ uint32_t Engine::getEffectiveBatchPixels(uint32_t renderW, uint32_t renderH, uin
     return maxW * maxH;
 }
 
+float Engine::getDivergentAreaRatio() const {
+    if (m_cachedDivergentAreaRatio >= 0.0f) {
+        return m_cachedDivergentAreaRatio;
+    }
+    if (m_sceneData.triangles.empty() || m_sceneData.materials.empty()) {
+        m_cachedDivergentAreaRatio = 0.0f;
+        return 0.0f;
+    }
+    double totalArea = 0.0;
+    double divergentArea = 0.0;
+    const size_t numMats = m_sceneData.materials.size();
+    std::vector<uint8_t> isDivergent(numMats, 0);
+    for (size_t i = 0; i < numMats; ++i) {
+        uint32_t arch = computeMaterialArchetype(m_sceneData.materials[i]);
+        if (arch == MATERIAL_ARCHETYPE_COMPLEX || arch == MATERIAL_ARCHETYPE_DIELECTRIC) {
+            isDivergent[i] = 1;
+        }
+    }
+    for (const auto& tri : m_sceneData.triangles) {
+        glm::vec3 e1 = glm::vec3(tri.v1.position - tri.v0.position);
+        glm::vec3 e2 = glm::vec3(tri.v2.position - tri.v0.position);
+        double area = 0.5 * glm::length(glm::cross(e1, e2));
+        totalArea += area;
+        if (tri.materialId < numMats && isDivergent[tri.materialId]) {
+            divergentArea += area;
+        }
+    }
+    m_cachedDivergentAreaRatio = (totalArea > 1e-6) ? static_cast<float>(divergentArea / totalArea) : 0.0f;
+    return m_cachedDivergentAreaRatio;
+}
+
+WavefrontSortMode Engine::getEffectiveWavefrontSortMode() const {
+    if (m_config.wavefront_sort_mode != WavefrontSortMode::Auto) {
+        return m_config.wavefront_sort_mode;
+    }
+
+    if (m_sceneData.materials.empty()) {
+        return WavefrontSortMode::None;
+    }
+
+    float divergentRatio = getDivergentAreaRatio();
+    // If the scene has zero divergent surface area (< 0.001f), monolithic execution is always optimal
+    if (divergentRatio < 0.001f) {
+        return WavefrontSortMode::None;
+    }
+
+    VkPhysicalDeviceType devType = m_context ? m_context->getDeviceProperties().deviceType : VK_PHYSICAL_DEVICE_TYPE_OTHER;
+    if (devType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        // On integrated APU / UMA (e.g. Strix Halo gfx1151 with shared 256-bit LPDDR5X bus),
+        // memory bandwidth is the primary hardware ceiling (60.98% memory stall rate).
+        // If divergent geometry covers < 12% of surface area (e.g. Cornell Box at ~6.2% divergent area),
+        // monolithic execution avoids the 1.0 ms sorting/indirection tax.
+        if (divergentRatio < 0.12f) {
+            return WavefrontSortMode::None;
+        }
+    }
+
+    // High-divergence workloads (e.g. Dragon Dispersion) benefit massively from Dual sorting (+28% speedup)
+    return WavefrontSortMode::Dual;
+}
+
 void Engine::initPipelines() {
     VkDevice device = m_context->getDevice();
 
@@ -2511,7 +2574,7 @@ void Engine::initPipelines() {
         wfShadeEmissiveCode, wfShadePassthroughCode,
         m_context->hasDgcExecutionSet(),
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-        true, // enableDgcPreprocess
+        m_config.dgc_preprocess && !m_context->isRDNA4(), // enableDgcPreprocess (bypass on RDNA4/GFX1201 due to RADV illegal opcode bug)
         m_context->hasSubgroupSizeControl(),
         initBatchPixels,
         wfTailMegakernelCode
@@ -5728,7 +5791,7 @@ void Engine::renderFrame() {
             wfSceneData.frameIndex = m_frameIndex;
             wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
             wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
-            wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+            wfSceneData.sortMode = static_cast<uint32_t>(getEffectiveWavefrontSortMode());
             wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
             wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
             wfSceneData.cameraFlags = flags;
@@ -6300,7 +6363,7 @@ void Engine::renderFrame() {
                 wfSceneData.frameIndex = m_frameIndex;
                 wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
                 wfSceneData.accumulateHistory = (m_config.progressive_accumulation && !accumReset) ? 1u : 0u;
-                wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+                wfSceneData.sortMode = static_cast<uint32_t>(getEffectiveWavefrontSortMode());
                 wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
                 wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
                 wfSceneData.cameraFlags = flags;
@@ -7532,10 +7595,15 @@ FrameStats Engine::getStats() const {
     stats.pipeline_type_str = (m_config.pipeline_type == PipelineType::Wavefront) ? "wavefront" : "rtp";
 
     if (m_config.pipeline_type == PipelineType::Wavefront) {
+        WavefrontSortMode effectiveSort = getEffectiveWavefrontSortMode();
         switch (m_config.wavefront_sort_mode) {
             case WavefrontSortMode::Archetype: stats.wavefront_stats.sort_mode_str = "archetype"; break;
             case WavefrontSortMode::Dual: stats.wavefront_stats.sort_mode_str = "dual"; break;
-            default: stats.wavefront_stats.sort_mode_str = "none"; break;
+            case WavefrontSortMode::None: stats.wavefront_stats.sort_mode_str = "none"; break;
+            case WavefrontSortMode::Auto:
+                stats.wavefront_stats.sort_mode_str = (effectiveSort == WavefrontSortMode::Dual) ? "auto (dual)" :
+                                                      (effectiveSort == WavefrontSortMode::Archetype) ? "auto (archetype)" : "auto (none)";
+                break;
         }
         switch (m_config.secondary_sort_mode) {
             case SecondarySortMode::DirectionalDGC: stats.wavefront_stats.secondary_sort_mode_str = "directional"; break;
@@ -8417,7 +8485,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.useHardwareRT = 1u;
         wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 1u;
-        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.sortMode = static_cast<uint32_t>(getEffectiveWavefrontSortMode());
         wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = flags;
@@ -8586,7 +8654,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         wfSceneData.frameIndex = frameIdx;
         wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 0u;
-        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.sortMode = static_cast<uint32_t>(getEffectiveWavefrontSortMode());
         wfSceneData.numOpaqueTriangles = m_numOpaqueTriangles;
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = flags;

@@ -37,7 +37,7 @@ int main() {
         // Default pipeline configuration
         Config cfgDef;
         check_true(cfgDef.pipeline_type == PipelineType::Wavefront, "Default pipeline is Wavefront");
-        check_true(cfgDef.wavefront_sort_mode == WavefrontSortMode::Dual, "Default sort mode is Dual");
+        check_true(cfgDef.wavefront_sort_mode == WavefrontSortMode::Auto, "Default sort mode is Auto");
 
         // Explicit --pipeline rtp
         const char* argv1[] = { "pathways", "--pipeline", "rtp" };
@@ -49,7 +49,11 @@ int main() {
         Config c2 = Config::parse(3, const_cast<char**>(argv2));
         check_true(c2.pipeline_type == PipelineType::Wavefront, "--pipeline wavefront sets Wavefront");
 
-        // Wavefront sort modes: none, archetype, dual
+        // Wavefront sort modes: auto, none, archetype, dual
+        const char* argvSortAuto[] = { "pathways", "--pipeline", "wavefront", "--wavefront-sort", "auto" };
+        Config cSortAuto = Config::parse(5, const_cast<char**>(argvSortAuto));
+        check_true(cSortAuto.wavefront_sort_mode == WavefrontSortMode::Auto, "Sort mode Auto parsed correctly");
+
         const char* argvSortNone[] = { "pathways", "--pipeline", "wavefront", "--wavefront-sort", "none" };
         Config cSortNone = Config::parse(5, const_cast<char**>(argvSortNone));
         check_true(cSortNone.wavefront_sort_mode == WavefrontSortMode::None, "Sort mode None parsed correctly");
