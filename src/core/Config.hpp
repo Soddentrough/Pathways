@@ -176,6 +176,8 @@ struct Config {
     uint32_t tile_size = 64;
     float log_interval_sec = 0.0f; // 0.0 = disabled by default (no console spam); >0.0 logs every N seconds
     bool camera_motion = false;    // Simulate continuous camera motion (e.g. for testing interactive motion artifacts)
+    bool animate_objects = true;   // Animate dynamic scene objects (e.g. rotating torus in mirror scene)
+    float animation_speed = 1.0f;  // Global animation playback speed multiplier
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
     bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

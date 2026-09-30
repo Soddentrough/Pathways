@@ -2707,21 +2707,9 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     SceneData scene;
     scene.materials = createInfinityMirrorMaterials();
 
-    auto recordRange = [&](const std::string& name, uint32_t startTri) {
-        if (scene.triangles.size() <= startTri) return;
-        MeshRange mr{};
-        mr.name = name;
-        mr.firstTriangle = startTri;
-        mr.triangleCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
-        for (uint32_t i = startTri; i < scene.triangles.size(); ++i) {
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
-            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
-            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
-        }
-        scene.meshRanges.push_back(mr);
+    auto recordRange = [&](const std::string& /*name*/, uint32_t /*startTri*/) {
+        // Individual sub-ranges are not added to meshRanges because meshRanges in an instanced scene
+        // indexes BLAS prototypes 1:1 with blasRanges. BLAS prototypes are recorded via recordBlasPrototype.
     };
 
     // 1. Studio diffuse floor (X in [-8.0, 8.0], Z in [-16.0, 16.0])
@@ -2819,11 +2807,8 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, -6.0f), 0.42f, 5, 32, 32);
     recordRange("Art_RedSphere_1", tStart);
 
-    // Item 2: Green Torus (Z = -3.5)
-    addPedestal(0.0f, -3.5f, "GreenTorus_1");
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addTorus(scene.triangles, glm::vec3(0.0f, pedH + 0.45f, -3.5f), 0.40f, 0.13f, 6, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
-    recordRange("Art_GreenTorus_1", tStart);
+    // Item 2: Pedestal for Rotating Reflective Torus (Z = -3.5)
+    addPedestal(0.0f, -3.5f, "ReflectiveTorus_1");
 
     // Item 3: Yellow Cube (Z = -1.0)
     addPedestal(0.0f, -1.0f, "YellowCube_1");
@@ -2875,7 +2860,84 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
              glm::normalize(glm::vec3(0.35f, 0.88f, 0.25f)));
     recordRange("Art_GoldRing", tStart);
 
-    // 6. Camera Setup
+    // =========================================================================
+    // 6. BLAS Geometry Prototypes & Hardware TLAS Instancing
+    // =========================================================================
+
+    auto recordBlasPrototype = [&](const std::string& name, uint32_t startTri) {
+        uint32_t triCount = static_cast<uint32_t>(scene.triangles.size() - startTri);
+        BlasGeometryRange range{};
+        range.firstTriangle = startTri;
+        range.triangleCount = triCount;
+        range.numOpaqueTriangles = 0; // populated during Engine::partitionSceneGeometry
+        scene.blasRanges.push_back(range);
+
+        MeshRange mr{};
+        mr.name = name;
+        mr.firstTriangle = startTri;
+        mr.triangleCount = triCount;
+        for (uint32_t i = startTri; i < scene.triangles.size(); ++i) {
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.minBound = glm::min(mr.minBound, glm::vec3(scene.triangles[i].v2.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v0.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v1.position));
+            mr.maxBound = glm::max(mr.maxBound, glm::vec3(scene.triangles[i].v2.position));
+        }
+        scene.meshRanges.push_back(mr);
+    };
+
+    // Record BLAS 0: Static Room Environment
+    recordBlasPrototype("StaticRoom", 0);
+
+    // Record BLAS 1: Dynamic Reflective Torus Prototype (Centered at origin in local space)
+    uint32_t torusStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), 0.40f, 0.13f, 3 /* matChrome */, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
+    recordBlasPrototype("Prototype_ReflectiveTorus", torusStart);
+
+    // Hardware TLAS Instances
+    // Instance 0: Static Room
+    SceneInstance instStatic{};
+    instStatic.blasIndex = 0;
+    instStatic.transform = glm::mat4(1.0f);
+    instStatic.customIndex = 0;
+    scene.instances.push_back(instStatic);
+
+    InstanceGPU instStaticGPU{};
+    instStaticGPU.firstTriangle = scene.blasRanges[0].firstTriangle;
+    instStaticGPU.numOpaqueTriangles = scene.blasRanges[0].numOpaqueTriangles;
+    instStaticGPU.materialOffset = 0;
+    instStaticGPU.flags = 0;
+    scene.instanceData.push_back(instStaticGPU);
+
+    // Instance 1: Reflective Torus atop Pedestal (Z = -3.5) with 20-degree tilt
+    glm::vec3 torusPos(0.0f, pedH + 0.45f, -3.5f);
+    glm::mat4 baseTilt = glm::rotate(glm::mat4(1.0f), glm::radians(20.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    glm::mat4 initialTransform = glm::translate(glm::mat4(1.0f), torusPos) * baseTilt;
+
+    SceneInstance instTorus{};
+    instTorus.blasIndex = 1;
+    instTorus.transform = initialTransform;
+    instTorus.customIndex = 1;
+    scene.instances.push_back(instTorus);
+
+    InstanceGPU instTorusGPU{};
+    instTorusGPU.firstTriangle = scene.blasRanges[1].firstTriangle;
+    instTorusGPU.numOpaqueTriangles = scene.blasRanges[1].numOpaqueTriangles;
+    instTorusGPU.materialOffset = 0;
+    instTorusGPU.flags = 0;
+    scene.instanceData.push_back(instTorusGPU);
+
+    // Register Dynamic Kinematic Animator for Instance 1
+    AnimatedInstance animTorus{};
+    animTorus.instanceIndex = 1;
+    animTorus.basePosition = torusPos;
+    animTorus.rotationAxis = glm::vec3(0.0f, 1.0f, 0.0f); // Spin about vertical Y axis
+    animTorus.rotationSpeed = 0.8f;                         // ~45 deg/second (smooth, majestic spin)
+    animTorus.baseTransform = baseTilt;
+    scene.animatedInstances.push_back(animTorus);
+
+    // 7. Camera Setup
     scene.hasCamera = true;
     scene.cameraPosition = glm::vec3(0.75f, 1.65f, -11.5f);
     scene.cameraTarget = glm::vec3(-0.15f, 1.25f, 2.0f);

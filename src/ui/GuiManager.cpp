@@ -1668,6 +1668,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation
             }
+
+            ImGui::Separator();
+            if (ImGui::Checkbox("Animate Objects", &config.animate_objects)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Enable or pause dynamic kinematic object animations (e.g. rotating reflective torus in mirror scene). Pausing enables progressive convergence.");
+            }
+            if (config.animate_objects) {
+                ImGui::Indent();
+                ImGui::SliderFloat("Animation Speed", &config.animation_speed, 0.0f, 5.0f, "%.2fx");
+                ImGui::Unindent();
+            }
         }
 
         // 6. Diagnostics & Console Logging

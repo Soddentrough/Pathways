@@ -48,25 +48,17 @@ void main() {
     mat4 worldMat = inInstances[idx].transform;
     mat4 T = transpose(worldMat);
 
-    if (pc.updateMode == 1u) {
-        // Refit / dynamic transform update mode: update transform rows only
-        outInstances[idx].transformRow0 = T[0];
-        outInstances[idx].transformRow1 = T[1];
-        outInstances[idx].transformRow2 = T[2];
-    } else {
-        // Full initialization mode: write transform + packed customIndex/mask + flags + BLAS address
-        outInstances[idx].transformRow0 = T[0];
-        outInstances[idx].transformRow1 = T[1];
-        outInstances[idx].transformRow2 = T[2];
+    outInstances[idx].transformRow0 = T[0];
+    outInstances[idx].transformRow1 = T[1];
+    outInstances[idx].transformRow2 = T[2];
 
-        uint customIndex = inInstances[idx].customIndex & 0x00FFFFFFu;
-        uint mask = (inInstances[idx].mask & 0xFFu) << 24u;
-        outInstances[idx].instanceCustomIndexAndMask = customIndex | mask;
+    uint customIndex = inInstances[idx].customIndex & 0x00FFFFFFu;
+    uint mask = (inInstances[idx].mask & 0xFFu) << 24u;
+    outInstances[idx].instanceCustomIndexAndMask = customIndex | mask;
 
-        uint sbtOffset = inInstances[idx].hitGroupId & 0x00FFFFFFu;
-        uint flags = (inInstances[idx].flags & 0xFFu) << 24u;
-        outInstances[idx].instanceShaderBindingTableRecordOffsetAndFlags = sbtOffset | flags;
+    uint sbtOffset = inInstances[idx].hitGroupId & 0x00FFFFFFu;
+    uint flags = (inInstances[idx].flags & 0xFFu) << 24u;
+    outInstances[idx].instanceShaderBindingTableRecordOffsetAndFlags = sbtOffset | flags;
 
-        outInstances[idx].accelerationStructureReference = inInstances[idx].blasAddress;
-    }
+    outInstances[idx].accelerationStructureReference = inInstances[idx].blasAddress;
 }
