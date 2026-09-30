@@ -408,7 +408,7 @@ void main() {
             bool enableShadows = (ubo.flags & (1 << 4)) != 0;
 
             bool pathTerminated = false;
-            if (matType == 3u /* MATERIAL_EMISSIVE */) {
+            if ((matType & MATERIAL_TYPE_MASK) == 3u /* MATERIAL_EMISSIVE */) {
                 pathTerminated = true;
             }
 

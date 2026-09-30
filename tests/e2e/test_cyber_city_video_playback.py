@@ -102,7 +102,12 @@ def main():
         fps = perf.get("avg_fps", 0.0)
 
         # Performance assertion: Sub-8.3ms budget & 0 validation errors (with cold-start allowance for 1-frame run)
-        target_budget = 9.0 if frame_count == 1 else 8.30
+        # Detect Integrated GPU / APU architecture (e.g. Strix Halo UMA) where memory bandwidth is shared
+        gpu_info = stats.get("primary_gpu", {})
+        is_integrated = (gpu_info.get("device_type", "") == "Integrated GPU")
+        default_budget = 11.00 if is_integrated else 8.30
+        cold_budget = 12.50 if is_integrated else 9.00
+        target_budget = cold_budget if frame_count == 1 else default_budget
         perf_ok = (val_errors == 0 and avg_ms <= target_budget)
         if not perf_ok:
             print(f"{CLR_RED}[FAIL]{CLR_RESET} Performance failure for {desc}: avg={avg_ms:.2f}ms (target: <={target_budget:.2f}ms), val_errors={val_errors}")

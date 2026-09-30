@@ -369,7 +369,7 @@ void main() {
                         roughnessVal *= mrSample.g;
                         metallicVal *= mrSample.b;
                     }
-                    if (mat.type == 1u /* MATERIAL_METALLIC */) {
+                    if ((mat.type & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
                         metallicVal = max(metallicVal, 1.0);
                     }
                 }

@@ -257,7 +257,45 @@ void main() {
             } else {
                 // Emissive radiance evaluation
                 vec3 emissive = mat.emissive.rgb;
-                if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+                if ((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+                    // High-End Cyberpunk Volumetric Hologram Shading:
+                    vec3 vidSample = SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
+                    float time = float(ubo.frameIndex) * 0.01666667;
+
+                    // 1. Dual-Frequency Holographic Scanlines & Phosphor Raster:
+                    float sweep = sin(hitPoint.y * 24.0 - time * 4.0) * 0.5 + 0.5;
+                    float scanMod = 0.94 + 0.06 * sweep;
+
+                    // 2. Peripheral Chromatic Dispersion Fringe (concentrated at outer perimeter):
+                    float edgeDist = length(hitUv - vec2(0.5)) * 2.0;
+                    float fringeFactor = pow(clamp((edgeDist - 0.5) * 2.0, 0.0, 1.0), 2.5) * 0.06;
+                    vec3 chromaDisp = vec3(0.0);
+                    if (fringeFactor > 1e-4) {
+                        float phase = hitPoint.y * 48.0 - time * 5.0;
+                        chromaDisp = vec3(sin(phase), sin(phase + 1.2), sin(phase + 2.4)) * fringeFactor;
+                    }
+
+                    // 3. Balanced Video Dynamic Range (rich contrast, safe within luminance bounds):
+                    vec3 baseColor = vidSample * (0.65 * scanMod) + chromaDisp;
+                    vec3 tonemappedVid = baseColor / (vec3(1.0) + 0.20 * max(baseColor - vec3(0.40), vec3(0.0)));
+
+                    // 4. Subtle Ambient Holographic Plasma Pedestal (inky blacks, vibrant emission):
+                    float lum = dot(vidSample, vec3(0.2126, 0.7152, 0.0722));
+                    vec3 holoPedestal = vec3(0.008, 0.025, 0.045) * (0.7 + 0.3 * sweep) * (1.0 - smoothstep(0.0, 0.40, lum));
+
+                    // 5. Grazing Fresnel Luminescence (sleek neon edge glint on front-facing display geometry only):
+                    vec3 rimGlow = vec3(0.0);
+                    if (frontFace) {
+                        float cosTheta = clamp(abs(dot(hitNormal, -rayDir)), 0.0, 1.0);
+                        float fres = pow(1.0 - cosTheta, 3.0);
+                        rimGlow = mix(vec3(0.02, 0.25, 0.70), vec3(0.05, 0.85, 0.95), fres) * (fres * 0.18);
+                    }
+
+                    // 6. Dynamic Cybernetic Signal Glitch Pulse (rare, crisp horizontal interference):
+                    float glitchPulse = smoothstep(0.986, 0.990, sin(time * 19.0 + hitPoint.y * 23.0)) * 0.08;
+
+                    emissive = tonemappedVid * (1.0 + glitchPulse) + holoPedestal + rimGlow;
+                } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                     emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
                 }
                 if (length(emissive) > 1e-3) {
@@ -267,7 +305,9 @@ void main() {
                     }
                     ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                     vec4 prev = imageLoad(uAccumImage, pCoord);
-                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                    bool dynamicVideoBypass = (ubo.flags & (1u << 12)) != 0u;
+                    float isDynamicVideo = (bounce == 0u && dynamicVideoBypass && (mat.emissiveTex == 1u || (mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u)) ? 1.0 : prev.a;
+                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), isDynamicVideo));
                     if (pc.captureMlData != 0u) {
                         if (isSpecularPath) {
                             vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
@@ -280,7 +320,7 @@ void main() {
                 }
 
                 bool pathTerminated = false;
-                if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
+                if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* MATERIAL_EMISSIVE */) {
                     pathTerminated = true;
                 } else {
                     float roughness = mat.roughness;
@@ -351,7 +391,7 @@ void main() {
 
                     // 2. Direct Lighting (Stochastic NEE with Local 1-Pass RIS and Alias Table)
                     vec3 secDirectL = vec3(0.0);
-                    if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
+                    if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
                         bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                         uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
@@ -542,7 +582,7 @@ void main() {
                     // 3. Sample BSDF for Secondary Bounce
                     if (bounce + 1u >= pc.maxBounces || (!enableIndirect && bounce > 0u)) {
                         pathTerminated = true;
-                    } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && (transmission <= 0.01 && mat.type != 2u) && roughness >= 0.05 && metallic < 0.9) {
+                    } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && (transmission <= 0.01 && (mat.type & MATERIAL_TYPE_MASK) != 2u) && roughness >= 0.05 && metallic < 0.9) {
                         bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
                         if (isTrain) {
                             uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
@@ -575,7 +615,7 @@ void main() {
                     bool isDelta = false;
 
                     if (!pathTerminated) {
-                        if (transmission > 0.01 || mat.type == 2u /* DIELECTRIC / REFRACTION */) {
+                        if (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u /* DIELECTRIC / REFRACTION */) {
                             isDelta = true;
                             sampledSpecularLobe = true;
                             if (!enableRefraction) {

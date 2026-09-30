@@ -5637,6 +5637,9 @@ void Engine::renderFrame() {
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
     if (m_config.enable_restir_di) flags |= (1 << 9);
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
+    if (m_videoDecoder && m_videoDecoder->hasNewFrame()) {
+        flags |= (1 << 12); // Dynamic video bypass flag
+    }
     if (accumReset || m_cameraMovedLastFrame) {
         flags |= (1 << 23); // Camera motion / history reset flag
     }

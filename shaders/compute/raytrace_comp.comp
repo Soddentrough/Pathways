@@ -373,7 +373,7 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
             uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             Material mat = materials[triangles[triIdx].materialId];
-            if (mat.type == 3 /* EMISSIVE */) {
+            if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* EMISSIVE */) {
                 continue;
             }
             if (mat.alphaMode == 1u /* MASK */) {
@@ -397,13 +397,13 @@ bool isShadowOccluded(Ray ray, float tMin, float tMax) {
         uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
         uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
         uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
-        if (materials[triangles[triIdx].materialId].type != 3) {
+        if ((materials[triangles[triIdx].materialId].type & MATERIAL_TYPE_MASK) != 3u) {
             return true;
         }
     }
 
     for (uint i = 0; i < pc.numSpheres; ++i) {
-        if (materials[spheres[i].materialId].type == 3) continue;
+        if ((materials[spheres[i].materialId].type & MATERIAL_TYPE_MASK) == 3u) continue;
         HitInfo tempHit;
         if (intersectSphere(ray, spheres[i], tMin, tMax, tempHit)) {
             return true;
@@ -590,7 +590,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
                         float cosLight = dot(-currentRay.direction, light.normal.xyz);
                         if (cosLight > 0.0) {
                             float area = light.emission.w;
-                            if (area > 0.0 && (mat.type == 3u || dot(hitNormal, light.normal.xyz) > 0.9)) {
+                            if (area > 0.0 && ((mat.type & MATERIAL_TYPE_MASK) == 3u || dot(hitNormal, light.normal.xyz) > 0.9)) {
                                 lightPdf = (hit.t * hit.t) / (area * cosLight);
                                 break;
                             }
@@ -604,10 +604,10 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
             if (bounce == 0 || enableIndirect) {
                 radiance += throughput * emissive * misWeight;
             }
-            if (mat.type == 3 /* Pure EMISSIVE light source */) {
+            if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* Pure EMISSIVE light source */) {
                 break;
             }
-        } else if (mat.type == 3) {
+        } else if ((mat.type & MATERIAL_TYPE_MASK) == 3u) {
             break;
         }
 
@@ -655,7 +655,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
         // 2. Next Event Estimation (Direct Lighting with Cook-Torrance GGX Microfacet Model + MIS)
-        if (enableDirect && transmission < 0.1 && mat.type != 2) {
+        if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u) {
             for (uint l = 0; l < pc.numLights; ++l) {
                 Light light = lights[l];
                 vec3 lightPoint;
@@ -758,7 +758,7 @@ vec3 tracePath(Ray primaryRay, inout uint seed) {
         // 3. BSDF Sampling for Next Bounce
         vec3 nextDirection;
 
-        if (transmission > 0.01 || mat.type == 2 /* DIELECTRIC / REFRACTION */) {
+        if (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u /* DIELECTRIC / REFRACTION */) {
             if (!enableRefraction) {
                 nextDirection = sampleCosineHemisphere(hitNormal, seed);
                 throughput *= baseColor.rgb;

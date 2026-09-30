@@ -66,8 +66,8 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
         for (uint i = 0; i < numSpheres; ++i) {
             uint sMatId = spheres[i].materialId;
             Material sMat = materials[sMatId];
-            bool isDielectric = (sMat.type == 2u || sMat.transmission > 0.05);
-            if (sMat.type == 3u || (!enableCaustics && isDielectric)) continue;
+            bool isDielectric = ((sMat.type & MATERIAL_TYPE_MASK) == 2u || sMat.transmission > 0.05);
+            if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
             if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
             float spT;
             vec3 spNorm;

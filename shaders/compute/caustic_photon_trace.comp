@@ -173,7 +173,7 @@ void main() {
         vec3 localNormal = getTriangleNormal(tri, bary);
         vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
 
-        bool isDielectric = (mat.type == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);
+        bool isDielectric = ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);
 
         if (isDielectric) {
             hasHitDielectric = true;
@@ -208,7 +208,7 @@ void main() {
             }
         } else {
             // Hit a non-dielectric (receiver surface!)
-            if (hasHitDielectric && mat.type != 3u /* Not emissive light */) {
+            if (hasHitDielectric && (mat.type & 0xFFu) != 3u /* Not emissive light */) {
                 // Successfully formed a caustic path (L -> S+ -> D)!
                 vec3 finalFlux = photonFlux * throughput;
                 float fluxLum = dot(finalFlux, vec3(0.2126, 0.7152, 0.0722));

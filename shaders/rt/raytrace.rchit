@@ -7,6 +7,7 @@
 #define TWO_PI 6.28318530717958647692
 #define INV_PI 0.31830988618379067154
 #define EPSILON 0.001
+#define MATERIAL_TYPE_MASK 0x000000FFu
 
 struct HitPayload {
     vec3 diffuseRadiance;         // 12 bytes: direct diffuse
@@ -253,7 +254,7 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
             return true;
         }
         for (uint i = 0; i < pc.numSpheres; ++i) {
-            if (materials[spheres[i].materialId].type == 3u) continue;
+            if ((materials[spheres[i].materialId].type & MATERIAL_TYPE_MASK) == 3u) continue;
             float spT;
             vec3 spNorm;
             if (intersectSphere(origin, dir, spheres[i], tMin, tMax, spT, spNorm)) {
@@ -273,8 +274,8 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
             uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
             uint matId = triangles[triIdx].materialId;
             Material mat = materials[matId];
-            bool isDielectric = (mat.type == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
-            if (mat.type == 3u /* Skip EMISSIVE */ || (!enableCaustics && isDielectric)) {
+            bool isDielectric = ((mat.type & MATERIAL_TYPE_MASK) == 2u /* DIELECTRIC */ || mat.transmission > 0.05);
+            if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* Skip EMISSIVE */ || (!enableCaustics && isDielectric)) {
                 continue;
             }
             if (enableCaustics && isDielectric && mat.thickness <= 0.001) {
@@ -302,12 +303,12 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
         uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
         uint triIdx = (geomIdx == 0u) ? primIdx : (primIdx + pc.numOpaqueTriangles);
         Material m = materials[triangles[triIdx].materialId];
-        if (m.type != 3u && m.type != 2u && m.transmission <= 0.05) {
+        if ((m.type & MATERIAL_TYPE_MASK) != 3u && (m.type & MATERIAL_TYPE_MASK) != 2u && m.transmission <= 0.05) {
             return true;
         }
     }
     for (uint i = 0; i < pc.numSpheres; ++i) {
-        if (materials[spheres[i].materialId].type == 3u) continue;
+        if ((materials[spheres[i].materialId].type & MATERIAL_TYPE_MASK) == 3u) continue;
         float spT;
         vec3 spNorm;
         if (intersectSphere(origin, dir, spheres[i], tMin, tMax, spT, spNorm)) {
@@ -502,21 +503,43 @@ void main() {
 
     vec3 emissive = mat.emissive.rgb;
     if ((mat.type & (1u << 14)) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-        // Upright 3D Voxel Hologram Shading:
+        // High-End Cyberpunk Volumetric Hologram Shading:
         vec3 vidSample = texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
-
-        // Animated subtle holographic scanlines
         float time = float(ubo.frameIndex) * 0.01666667;
-        float scanline = sin(hitPoint.y * 48.0 - time * 6.0) * 0.5 + 0.5;
 
-        // Subtle Fresnel edge rim glow on 3D voxel bevels
-        float fres = pow(1.0 - abs(dot(hitNormal, -gl_WorldRayDirectionEXT)), 3.0);
-        vec3 rimColor = vec3(0.15, 0.75, 1.0) * (fres * 0.30);
+        // 1. Dual-Frequency Holographic Scanlines & Phosphor Raster:
+        float sweep = sin(hitPoint.y * 24.0 - time * 4.0) * 0.5 + 0.5;
+        float scanMod = 0.94 + 0.06 * sweep;
 
-        // Preserve true video colors and sharp facial features with scanline modulation
-        vec3 holoColor = vidSample * (0.92 + 0.16 * scanline);
+        // 2. Peripheral Chromatic Dispersion Fringe (concentrated at outer perimeter):
+        float edgeDist = length(hitUv - vec2(0.5)) * 2.0;
+        float fringeFactor = pow(clamp((edgeDist - 0.5) * 2.0, 0.0, 1.0), 2.5) * 0.06;
+        vec3 chromaDisp = vec3(0.0);
+        if (fringeFactor > 1e-4) {
+            float phase = hitPoint.y * 48.0 - time * 5.0;
+            chromaDisp = vec3(sin(phase), sin(phase + 1.2), sin(phase + 2.4)) * fringeFactor;
+        }
 
-        emissive = holoColor + rimColor;
+        // 3. Balanced Video Dynamic Range (rich contrast, safe within luminance bounds):
+        vec3 baseColor = vidSample * (0.65 * scanMod) + chromaDisp;
+        vec3 tonemappedVid = baseColor / (vec3(1.0) + 0.20 * max(baseColor - vec3(0.40), vec3(0.0)));
+
+        // 4. Subtle Ambient Holographic Plasma Pedestal (inky blacks, vibrant emission):
+        float lum = dot(vidSample, vec3(0.2126, 0.7152, 0.0722));
+        vec3 holoPedestal = vec3(0.008, 0.025, 0.045) * (0.7 + 0.3 * sweep) * (1.0 - smoothstep(0.0, 0.40, lum));
+
+        // 5. Grazing Fresnel Luminescence (sleek neon edge glint on front-facing display geometry only):
+        vec3 rimGlow = vec3(0.0);
+        if (frontFace) {
+            float cosTheta = clamp(abs(dot(hitNormal, -gl_WorldRayDirectionEXT)), 0.0, 1.0);
+            float fres = pow(1.0 - cosTheta, 3.0);
+            rimGlow = mix(vec3(0.02, 0.25, 0.70), vec3(0.05, 0.85, 0.95), fres) * (fres * 0.18);
+        }
+
+        // 6. Dynamic Cybernetic Signal Glitch Pulse (rare, crisp horizontal interference):
+        float glitchPulse = smoothstep(0.986, 0.990, sin(time * 19.0 + hitPoint.y * 23.0)) * 0.08;
+
+        emissive = tonemappedVid * (1.0 + glitchPulse) + holoPedestal + rimGlow;
     } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
         emissive *= texture(sceneTextures[nonuniformEXT(mat.emissiveTex - 1u)], hitUv).rgb;
     }
@@ -546,7 +569,7 @@ void main() {
                     float cosLight = dot(-gl_WorldRayDirectionEXT, light.normal.xyz);
                     if (cosLight > 0.0) {
                         float lightArea = light.emission.w;
-                        if (lightArea > 0.0 && (mat.type == 3u || dot(hitNormal, light.normal.xyz) > 0.9)) {
+                        if (lightArea > 0.0 && ((mat.type & MATERIAL_TYPE_MASK) == 3u || dot(hitNormal, light.normal.xyz) > 0.9)) {
                             lightPdf = (gl_HitTEXT * gl_HitTEXT) / (cosLight * lightArea * float(pc.numLights));
                             break;
                         }
@@ -559,7 +582,7 @@ void main() {
         }
         accumRadiance = emissive * misWeight;
         accumSpecular = emissive * misWeight;
-        if (mat.type == 3u /* Emissive */) {
+        if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* Emissive */) {
             bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
             if (isPrimary) {
                 int currentPx = int(prd.pad % pc.tileWidth);
@@ -646,7 +669,7 @@ void main() {
     float hitDepth = max(dot(hitPoint - ubo.position.xyz, camForward), 0.0);
     vec3 viewNormal = normalize(transpose(mat3(ubo.viewInverse)) * hitNormal);
 
-    if (enableDirect && pc.numLights > 0u && mat.type != 3u && transmission < 0.1 && mat.type != 2u) {
+    if (enableDirect && pc.numLights > 0u && (mat.type & MATERIAL_TYPE_MASK) != 3u && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u) {
         // Standard Uniform Light Picking NEE with MIS
         uint lightIdx = uint(randFloat(prd.seed) * float(pc.numLights)) % pc.numLights;
         Light light = lights[lightIdx];
@@ -742,7 +765,7 @@ void main() {
     }
 
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-    if (enableCaustics && mat.type != 3u && transmission < 0.1 && mat.type != 2u && metallic < 0.2) {
+    if (enableCaustics && (mat.type & MATERIAL_TYPE_MASK) != 3u && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && metallic < 0.2) {
         int currentPx = int(prd.pad % pc.tileWidth);
         int currentPy = int(prd.pad / pc.tileWidth);
         ivec2 baseCoord = ivec2(currentPx, currentPy);
@@ -763,7 +786,7 @@ void main() {
     vec3 throughputFactor;
     bool sampleSpecular = false;
 
-    if (transmission > 0.01 || mat.type == 2u) {
+    if (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u) {
         vec3 unitDir = normalize(gl_WorldRayDirectionEXT);
         vec3 throughputMod = baseColor.rgb;
 

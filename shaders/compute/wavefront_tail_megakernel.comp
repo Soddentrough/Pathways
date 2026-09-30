@@ -272,7 +272,7 @@ void main() {
                 else accumMlDiffuse += emissiveContrib;
             }
         }
-        if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
+        if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* MATERIAL_EMISSIVE */) {
             break;
         }
 
@@ -343,7 +343,7 @@ void main() {
         float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
         // Direct Lighting (Streamlined 1-Sample NEE for secondary bounces)
-        if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
+        if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
             uint M = 1u;
 
             uint selectedLightIdx = 0u;
@@ -520,7 +520,7 @@ void main() {
         vec3 nextOrigin;
         bool sampledSpecularLobe = false;
 
-        if (transmission > 0.01 || mat.type == 2u /* DIELECTRIC / REFRACTION */) {
+        if (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u /* DIELECTRIC / REFRACTION */) {
             sampledSpecularLobe = true;
             if (!enableRefraction) {
                 nextDirection = sampleCosineHemisphere(hitNormal, seed);

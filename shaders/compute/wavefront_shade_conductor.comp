@@ -259,7 +259,7 @@ void main() {
             }
 
             bool pathTerminated = false;
-            if (mat.type == 3u /* MATERIAL_EMISSIVE */) {
+            if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* MATERIAL_EMISSIVE */) {
                 pathTerminated = true;
             }
 

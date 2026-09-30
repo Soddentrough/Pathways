@@ -373,7 +373,7 @@ void main() {
             float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
 
             bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-            if (enableCaustics && transmission < 0.1 && mat.type != 2u && metallic < 0.2) {
+            if (enableCaustics && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && metallic < 0.2) {
                 bool alreadyApplied = causticApplied;
                 if (!alreadyApplied) {
                     ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -397,7 +397,7 @@ void main() {
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Base Lobe BRDF) ---
             f16vec3 secDirectL = f16vec3(0.0);
-            if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
+            if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
                 if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
@@ -524,7 +524,7 @@ void main() {
 #else
             // Direct Lighting (Stochastic NEE with ReSTIR DI and Alias Table)
             f16vec3 secDirectL = f16vec3(0.0);
-            if (enableDirect && transmission < 0.1 && mat.type != 2u && pc.numLights > 0u) {
+            if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
@@ -851,7 +851,7 @@ void main() {
 
             if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                 pathTerminated = true;
-            } else if (enableRefraction && (transmission > 0.001 || mat.type == 2u)) {
+            } else if (enableRefraction && (transmission > 0.001 || (mat.type & MATERIAL_TYPE_MASK) == 2u)) {
                 sampledSpecularLobe = true;
                 float eta = frontFace ? (1.0 / iorVal) : iorVal;
                 float cosTheta = clamp(dot(V, hitNormal), 0.0, 1.0);

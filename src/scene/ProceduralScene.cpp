@@ -81,90 +81,45 @@ static void addBox(std::vector<TriangleGPU>& triangles,
     addQuad(triangles, p[5], p[1], p[2], p[6], rot(glm::vec3(1, 0, 0)), matId);
 }
 
-static void addVoxelBox(std::vector<TriangleGPU>& triangles,
-                        glm::vec3 center, glm::vec3 size, uint32_t matId,
-                        glm::vec2 uvMin, glm::vec2 uvMax) {
-    glm::vec3 h = size * 0.5f;
-    float x0 = center.x - h.x;
-    float x1 = center.x + h.x;
-    float y0 = center.y - h.y;
-    float y1 = center.y + h.y;
-    float z0 = center.z - h.z;
-    float z1 = center.z + h.z;
+static void addBeam(std::vector<TriangleGPU>& triangles,
+                    glm::vec3 pA, glm::vec3 pB, float width, float thickness, uint32_t matId) {
+    glm::vec3 dir = pB - pA;
+    float len = glm::length(dir);
+    if (len < 1e-4f) return;
+    dir /= len;
 
-    // 1. Front Face (+Z normal) - facing front (+Z)
-    // p0: bottom-left, p1: bottom-right, p2: top-right, p3: top-left
-    addQuad(triangles,
-            glm::vec3(x0, y0, z1),
-            glm::vec3(x1, y0, z1),
-            glm::vec3(x1, y1, z1),
-            glm::vec3(x0, y1, z1),
-            glm::vec3(0.0f, 0.0f, 1.0f), matId,
-            glm::vec2(uvMin.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMin.y),
-            glm::vec2(uvMin.x, uvMin.y));
+    glm::vec3 up = std::abs(dir.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+    glm::vec3 u = glm::normalize(glm::cross(dir, up));
+    glm::vec3 v = glm::cross(u, dir);
 
-    // 2. Back Face (-Z normal) - facing back (-Z)
-    addQuad(triangles,
-            glm::vec3(x1, y0, z0),
-            glm::vec3(x0, y0, z0),
-            glm::vec3(x0, y1, z0),
-            glm::vec3(x1, y1, z0),
-            glm::vec3(0.0f, 0.0f, -1.0f), matId,
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMin.x, uvMax.y),
-            glm::vec2(uvMin.x, uvMin.y),
-            glm::vec2(uvMax.x, uvMin.y));
+    float hw = width * 0.5f;
+    float ht = thickness * 0.5f;
 
-    // 3. Right Face (+X normal)
-    addQuad(triangles,
-            glm::vec3(x1, y0, z1),
-            glm::vec3(x1, y0, z0),
-            glm::vec3(x1, y1, z0),
-            glm::vec3(x1, y1, z1),
-            glm::vec3(1.0f, 0.0f, 0.0f), matId,
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMin.y),
-            glm::vec2(uvMax.x, uvMin.y));
+    glm::vec3 p0 = pA - u * hw - v * ht;
+    glm::vec3 p1 = pA + u * hw - v * ht;
+    glm::vec3 p2 = pA + u * hw + v * ht;
+    glm::vec3 p3 = pA - u * hw + v * ht;
 
-    // 4. Left Face (-X normal)
-    addQuad(triangles,
-            glm::vec3(x0, y0, z0),
-            glm::vec3(x0, y0, z1),
-            glm::vec3(x0, y1, z1),
-            glm::vec3(x0, y1, z0),
-            glm::vec3(-1.0f, 0.0f, 0.0f), matId,
-            glm::vec2(uvMin.x, uvMax.y),
-            glm::vec2(uvMin.x, uvMax.y),
-            glm::vec2(uvMin.x, uvMin.y),
-            glm::vec2(uvMin.x, uvMin.y));
+    glm::vec3 p4 = pB - u * hw - v * ht;
+    glm::vec3 p5 = pB + u * hw - v * ht;
+    glm::vec3 p6 = pB + u * hw + v * ht;
+    glm::vec3 p7 = pB - u * hw + v * ht;
 
-    // 5. Top Face (+Y normal)
-    addQuad(triangles,
-            glm::vec3(x0, y1, z1),
-            glm::vec3(x1, y1, z1),
-            glm::vec3(x1, y1, z0),
-            glm::vec3(x0, y1, z0),
-            glm::vec3(0.0f, 1.0f, 0.0f), matId,
-            glm::vec2(uvMin.x, uvMin.y),
-            glm::vec2(uvMax.x, uvMin.y),
-            glm::vec2(uvMax.x, uvMin.y),
-            glm::vec2(uvMin.x, uvMin.y));
-
-    // 6. Bottom Face (-Y normal)
-    addQuad(triangles,
-            glm::vec3(x0, y0, z0),
-            glm::vec3(x1, y0, z0),
-            glm::vec3(x1, y0, z1),
-            glm::vec3(x0, y0, z1),
-            glm::vec3(0.0f, -1.0f, 0.0f), matId,
-            glm::vec2(uvMin.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMax.x, uvMax.y),
-            glm::vec2(uvMin.x, uvMax.y));
+    // Bottom cap at pA (-dir)
+    addQuad(triangles, p0, p3, p2, p1, -dir, matId);
+    // Top cap at pB (+dir)
+    addQuad(triangles, p4, p5, p6, p7, dir, matId);
+    // Side 1 (-u)
+    addQuad(triangles, p0, p4, p7, p3, -u, matId);
+    // Side 2 (+u)
+    addQuad(triangles, p1, p2, p6, p5, u, matId);
+    // Side 3 (-v)
+    addQuad(triangles, p0, p1, p5, p4, -v, matId);
+    // Side 4 (+v)
+    addQuad(triangles, p3, p7, p6, p2, v, matId);
 }
+
+
 
 static void addSphere(std::vector<TriangleGPU>& triangles,
                       glm::vec3 center, float radius, uint32_t matId,
@@ -1981,78 +1936,207 @@ SceneData ProceduralScene::createCyberCityScene() {
     // Prototype 19: 3D Voxel Hologram Projector (CYBER_BLAS_HOLO_PROJECTOR)
     {
         uint32_t tStart = static_cast<uint32_t>(scene.triangles.size());
-        // 1. Heavy gunmetal base skid (Mat 19: Gunmetal Alloy Armor)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.2f, 0.0f), glm::vec3(5.6f, 0.4f, 5.6f), 0.0f, 19);
-        // 2. Stepped titanium collar (Mat 2: Titanium Chrome)
-        addBox(scene.triangles, glm::vec3(0.0f, 0.45f, 0.0f), glm::vec3(4.6f, 0.15f, 4.6f), 0.0f, 2);
-        // 3. Circular receiver plate & glowing turquoise concentric neon border ring (Mat 17 Brushed Platinum, Mat 45 Electric Turquoise)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 0.55f, 0.0f), 2.2f, 0.08f, 17, 24);
-        addCylinder(scene.triangles, glm::vec3(0.0f, 0.60f, 0.0f), 2.0f, 0.03f, 45, 24);
-        addCylinder(scene.triangles, glm::vec3(0.0f, 0.64f, 0.0f), 1.8f, 0.04f, 19, 24);
-        // 4. Central optical projector lens / concave dish (Mat 30: Cyan Emitter)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 0.70f, 0.0f), 1.68f, 0.04f, 30, 24);
-
-        // 5. Overhead Projector Gantry Rig & Housing (sdProjector from reference shader)
-        for (float fx : {-1.85f, 1.85f}) {
-            for (float fz : {-1.85f, 1.85f}) {
-                // Vertical gunmetal base post
-                addBox(scene.triangles, glm::vec3(fx, 0.95f, fz), glm::vec3(0.24f, 0.80f, 0.24f), 0.0f, 19);
-                // Glowing turquoise collar ring
-                addBox(scene.triangles, glm::vec3(fx, 1.38f, fz), glm::vec3(0.30f, 0.06f, 0.30f), 0.0f, 45);
-                // Angled titanium upper truss strut reaching to overhead collar (fx*0.28, 4.25, fz*0.28)
-                glm::vec3 pBot(fx, 1.40f, fz);
-                glm::vec3 pTop(fx * 0.28f, 4.25f, fz * 0.28f);
-                glm::vec3 pMid = (pBot + pTop) * 0.5f;
-                addBox(scene.triangles, pMid, glm::vec3(0.12f, 2.90f, 0.12f), (fx * fz > 0.0f ? 28.0f : -28.0f), 2);
-                // Collimation guide laser filament connecting overhead lens to corner post
-                addBox(scene.triangles, (glm::vec3(0.0f, 4.10f, 0.0f) + pBot) * 0.5f, glm::vec3(0.02f, 2.80f, 0.02f), (fx * fz > 0.0f ? 26.0f : -26.0f), 45);
+        // 1. Heavy Industrial Base Platform & Chassis (Mat 19 Gunmetal, Mat 1 Carbon Steel, Mat 2 Titanium)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.16f, 0.0f), glm::vec3(5.8f, 0.32f, 5.8f), 0.0f, 19);
+        // Heavy structural corner footpads / armor shoes
+        for (float sx : {-2.35f, 2.35f}) {
+            for (float sz : {-2.35f, 2.35f}) {
+                addBox(scene.triangles, glm::vec3(sx, 0.18f, sz), glm::vec3(1.10f, 0.36f, 1.10f), 0.0f, 1);
             }
         }
-        // Overhead projector mount gantry ring (Mat 2 Titanium)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 4.25f, 0.0f), 0.90f, 0.08f, 2, 24);
-        // Projector main housing body (sdProjector body box, Mat 19 Gunmetal)
-        addBox(scene.triangles, glm::vec3(0.0f, 4.45f, 0.0f), glm::vec3(0.80f, 0.32f, 0.80f), 0.0f, 19);
-        // Projector optical snout (sdProjector snout box, Mat 2 Titanium)
-        addBox(scene.triangles, glm::vec3(0.0f, 4.25f, 0.0f), glm::vec3(0.46f, 0.14f, 0.46f), 0.0f, 2);
-        // Downward-pointing emitter lens (sdProjector spherical lens, Mat 30 Cyan Emitter)
-        addSphere(scene.triangles, glm::vec3(0.0f, 4.10f, 0.0f), 0.24f, 30, 16, 16);
-        // Concentric neon emitter focus ring around lens (Mat 45 Electric Turquoise)
-        addCylinder(scene.triangles, glm::vec3(0.0f, 4.14f, 0.0f), 0.36f, 0.03f, 45, 24);
+        // Stepped titanium collar plate
+        addBox(scene.triangles, glm::vec3(0.0f, 0.38f, 0.0f), glm::vec3(4.9f, 0.14f, 4.9f), 0.0f, 2);
 
-        // 6. Upright 3D Voxel Hologram Display: Full 16:9 Widescreen Matrix (32x18 = 576 voxels)
-        // Full video coverage (u in [0,1], v in [0,1]) - zero missing content across entire video timeline!
+        // Perimeter copper heatsink cooling louvres around chassis
+        for (int ang = 0; ang < 360; ang += 45) {
+            float rad = glm::radians(static_cast<float>(ang));
+            float hx = 2.35f * std::cos(rad);
+            float hz = 2.35f * std::sin(rad);
+            addBox(scene.triangles, glm::vec3(hx, 0.36f, hz), glm::vec3(0.24f, 0.12f, 0.24f), 0.0f, 10);
+        }
+
+        // Telemetry status LED banks on front & rear chassis faces (Mat 45 Turquoise, Mat 35 Gold)
+        addBox(scene.triangles, glm::vec3(0.0f, 0.26f,  2.91f), glm::vec3(2.4f, 0.06f, 0.02f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.18f,  2.91f), glm::vec3(1.6f, 0.04f, 0.02f), 0.0f, 35);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.26f, -2.91f), glm::vec3(2.4f, 0.06f, 0.02f), 0.0f, 45);
+        addBox(scene.triangles, glm::vec3(0.0f, 0.18f, -2.91f), glm::vec3(1.6f, 0.04f, 0.02f), 0.0f, 35);
+
+        // 2. Precision Recessed Optical Emitter Basin (Matte gunmetal basin with segmented neon ring and central lens)
+        // Outer titanium containment collar (Mat 2)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.48f, 0.0f), 2.30f, 0.08f, 2, 24);
+        // Recessed gunmetal projector basin well (Mat 19)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.52f, 0.0f), 2.10f, 0.08f, 19, 24);
+
+        // Hollow segmented concentric neon ring (Mat 45 Electric Turquoise) - crisp circular accent, zero interior fill glare
+        for (int i = 0; i < 24; ++i) {
+            float deg = static_cast<float>(i) * 15.0f;
+            float rad = glm::radians(deg);
+            float rx = 1.80f * std::cos(rad);
+            float rz = 1.80f * std::sin(rad);
+            addBox(scene.triangles, glm::vec3(rx, 0.55f, rz), glm::vec3(0.48f, 0.025f, 0.05f), -deg, 45);
+        }
+
+        // Radial titanium aperture vanes around well (Mat 2 Titanium)
+        for (int ang = 0; ang < 360; ang += 45) {
+            float rad = glm::radians(static_cast<float>(ang));
+            float px = 1.45f * std::cos(rad);
+            float pz = 1.45f * std::sin(rad);
+            addBox(scene.triangles, glm::vec3(px, 0.54f, pz), glm::vec3(0.42f, 0.03f, 0.08f), static_cast<float>(-ang), 2);
+        }
+
+        // Central optical projector emitter lens (Mat 30 Cyan Emitter) & laser iris core (Mat 45)
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.56f, 0.0f), 0.65f, 0.06f, 30, 24);
+        addCylinder(scene.triangles, glm::vec3(0.0f, 0.59f, 0.0f), 0.28f, 0.03f, 45, 24);
+
+        // 8 Radial magnetic emitter pods / beam focus coils around perimeter well
+        for (int ang = 0; ang < 360; ang += 45) {
+            float rad = glm::radians(static_cast<float>(ang));
+            float px = 2.15f * std::cos(rad);
+            float pz = 2.15f * std::sin(rad);
+            addBox(scene.triangles, glm::vec3(px, 0.56f, pz), glm::vec3(0.18f, 0.08f, 0.18f), 0.0f, 2);
+            addBox(scene.triangles, glm::vec3(px * 0.94f, 0.58f, pz * 0.94f), glm::vec3(0.08f, 0.06f, 0.08f), 0.0f, 45);
+        }
+
+        // 3. Cantilevered Overhead Suspension Gantry (Unobstructed Frontal Viewing!)
+        const float gimbalY = 3.55f;
+        const float overheadLensY = 3.32f;
+
+        // Rear Structural Gantry Masts at fz = -2.35f
+        for (float fx : {-2.35f, 2.35f}) {
+            // Heavy gunmetal pylon base footing on top of corner armor footpad
+            addBox(scene.triangles, glm::vec3(fx, 0.55f, -2.35f), glm::vec3(0.50f, 0.28f, 0.50f), 0.0f, 19);
+            // Main vertical channeled pylon column
+            addBox(scene.triangles, glm::vec3(fx, 1.40f, -2.35f), glm::vec3(0.34f, 1.45f, 0.34f), 0.0f, 19);
+            // Waveguide neon accent strip
+            addBox(scene.triangles, glm::vec3(fx * 0.95f, 1.40f, -2.35f), glm::vec3(0.08f, 1.40f, 0.08f), 0.0f, 45);
+            // Articulated titanium gantry collar node
+            addBox(scene.triangles, glm::vec3(fx, 2.20f, -2.35f), glm::vec3(0.42f, 0.18f, 0.42f), 0.0f, 2);
+            addBox(scene.triangles, glm::vec3(fx, 2.20f, -2.35f), glm::vec3(0.46f, 0.06f, 0.46f), 0.0f, 45);
+
+            // Cantilever boom truss reaching from rear mast node up and forward to overhead gimbal
+            glm::vec3 pBot(fx, 2.20f, -2.35f);
+            glm::vec3 pTop(fx * 0.28f, gimbalY, -0.25f);
+            addBeam(scene.triangles, pBot, pTop, 0.15f, 0.15f, 2);
+
+            // Secondary cantilever gusset truss
+            glm::vec3 pGussetBot(fx, 1.65f, -2.35f);
+            glm::vec3 pGussetTop(fx * 0.58f, 2.85f, -1.25f);
+            addBeam(scene.triangles, pGussetBot, pGussetTop, 0.10f, 0.10f, 19);
+        }
+
+        // Heavy rear cross-member connecting rear masts (Mat 1 Carbon Steel)
+        addBeam(scene.triangles, glm::vec3(-2.35f, 2.20f, -2.35f), glm::vec3(2.35f, 2.20f, -2.35f), 0.14f, 0.14f, 1);
+        // Central K-truss strut from cross-member to overhead gimbal
+        addBeam(scene.triangles, glm::vec3(0.0f, 2.20f, -2.35f), glm::vec3(0.0f, gimbalY, -0.45f), 0.12f, 0.12f, 2);
+
+        // Front Field-Containment & Telemetry Pedestals at fz = +2.35f (Low profile, wide clearance, zero screen obstruction)
+        for (float fx : {-2.35f, 2.35f}) {
+            addBox(scene.triangles, glm::vec3(fx, 0.55f, 2.35f), glm::vec3(0.46f, 0.28f, 0.46f), 0.0f, 19);
+            addBox(scene.triangles, glm::vec3(fx, 0.95f, 2.35f), glm::vec3(0.28f, 0.55f, 0.28f), 0.0f, 19);
+            addBox(scene.triangles, glm::vec3(fx, 1.25f, 2.35f), glm::vec3(0.36f, 0.10f, 0.36f), 0.0f, 2);
+            addBox(scene.triangles, glm::vec3(fx, 1.32f, 2.35f), glm::vec3(0.16f, 0.06f, 0.16f), 0.0f, 45);
+
+            // Lateral perimeter side handrails (along x = +/-2.35f, completely outside display frustum)
+            addBeam(scene.triangles, glm::vec3(fx, 1.25f, -2.35f), glm::vec3(fx, 1.25f, 2.35f), 0.07f, 0.07f, 2);
+            // Lateral diagonal stabilizing brace along side plane
+            addBeam(scene.triangles, glm::vec3(fx, 1.25f, 1.20f), glm::vec3(fx, 2.20f, -1.20f), 0.08f, 0.08f, 19);
+        }
+
+        // Overhead projector suspension gimbal (Mat 2 Titanium)
+        addCylinder(scene.triangles, glm::vec3(0.0f, gimbalY, 0.0f), 1.05f, 0.08f, 2, 24);
+        // Inner magnetic containment ring (Mat 45 Electric Turquoise)
+        addCylinder(scene.triangles, glm::vec3(0.0f, gimbalY - 0.02f, 0.0f), 0.88f, 0.04f, 45, 24);
+        // Projector housing body (Mat 19 Gunmetal)
+        addBox(scene.triangles, glm::vec3(0.0f, gimbalY + 0.18f, 0.0f), glm::vec3(0.85f, 0.28f, 0.85f), 0.0f, 19);
+        // Heatsink cooling ribs on top of projector housing (Mat 27 Steel)
+        addBox(scene.triangles, glm::vec3(0.0f, gimbalY + 0.35f, 0.0f), glm::vec3(0.70f, 0.06f, 0.70f), 0.0f, 27);
+        // Multi-stage optical snout (Mat 2 Titanium)
+        addCylinder(scene.triangles, glm::vec3(0.0f, gimbalY - 0.10f, 0.0f), 0.48f, 0.14f, 2, 24);
+        // Downward compound emitter lens (Mat 30 Cyan Emitter)
+        addSphere(scene.triangles, glm::vec3(0.0f, overheadLensY, 0.0f), 0.25f, 30, 16, 16);
+        // Concentric neon focus ring around lens (Mat 45 Electric Turquoise)
+        addCylinder(scene.triangles, glm::vec3(0.0f, overheadLensY + 0.03f, 0.0f), 0.38f, 0.03f, 45, 24);
+
+        // 4. Upright 3D Curved Hologram Display: Full 16:9 Widescreen Continuous Parametric Mesh (32x18 quads = 1152 triangles)
+        // Watertight parametric curved quad mesh with shared vertex positions and continuous (u, v) coordinates.
         const uint32_t NX = 32;
         const uint32_t NY = 18;
         const float W = 3.20f;
         const float H = 1.80f;
         const float yBase = 0.95f;
-        const float dx = W / static_cast<float>(NX);
-        const float dy = H / static_cast<float>(NY);
-        const float boxW = dx * 0.88f; // tactile seam gap (12% margin)
-        const float boxH = dy * 0.88f; // tactile seam gap (12% margin)
-        const float zThick = 0.05f;    // 5cm physical 3D box thickness
 
-        for (uint32_t iy = 0; iy < NY; ++iy) {
-            float normY = (static_cast<float>(iy) + 0.5f) / static_cast<float>(NY);
-            float cy = yBase + normY * H;
-            float v0 = 1.0f - static_cast<float>(iy + 1) / static_cast<float>(NY);
-            float v1 = 1.0f - static_cast<float>(iy) / static_cast<float>(NY);
+        struct DisplayVertex {
+            glm::vec3 pos;
+            glm::vec3 normal;
+            glm::vec4 tangent;
+            glm::vec2 uv;
+        };
 
-            for (uint32_t ix = 0; ix < NX; ++ix) {
-                float normX = (static_cast<float>(ix) + 0.5f) / static_cast<float>(NX);
-                float cx = -W * 0.5f + normX * W;
-                float u0 = static_cast<float>(ix) / static_cast<float>(NX);
-                float u1 = static_cast<float>(ix + 1) / static_cast<float>(NX);
+        std::vector<std::vector<DisplayVertex>> grid(NY + 1, std::vector<DisplayVertex>(NX + 1));
+        for (uint32_t j = 0; j <= NY; ++j) {
+            float normY = static_cast<float>(j) / static_cast<float>(NY);
+            float y = yBase + normY * H;
+            float v = 1.0f - normY;
+
+            for (uint32_t i = 0; i <= NX; ++i) {
+                float normX = static_cast<float>(i) / static_cast<float>(NX);
+                float x = -W * 0.5f + normX * W;
+                float u = normX;
 
                 // Gentle cylindrical concave curvature facing the terrace viewer
-                float xRel = cx / (W * 0.5f);
-                float cz = -0.15f * (1.0f - xRel * xRel);
+                float xRel = x / (W * 0.5f);
+                float z = -0.16f * (1.0f - xRel * xRel);
 
-                glm::vec3 center(cx, cy, cz);
-                glm::vec3 size(boxW, boxH, zThick);
-                addVoxelBox(scene.triangles, center, size, 36, glm::vec2(u0, v0), glm::vec2(u1, v1));
+                // Tangent along +X / +U, normal facing +Z
+                // dz/dx = 0.20 * xRel
+                glm::vec3 tanDir = glm::normalize(glm::vec3(1.0f, 0.0f, 0.20f * xRel));
+                glm::vec3 normal = glm::normalize(glm::vec3(-0.20f * xRel, 0.0f, 1.0f));
+
+                grid[j][i] = {
+                    glm::vec3(x, y, z),
+                    normal,
+                    glm::vec4(tanDir, 1.0f),
+                    glm::vec2(u, v)
+                };
             }
         }
+
+        for (uint32_t iy = 0; iy < NY; ++iy) {
+            for (uint32_t ix = 0; ix < NX; ++ix) {
+                const auto& v00 = grid[iy][ix];         // bottom-left
+                const auto& v10 = grid[iy][ix + 1];     // bottom-right
+                const auto& v11 = grid[iy + 1][ix + 1]; // top-right
+                const auto& v01 = grid[iy + 1][ix];     // top-left
+
+                TriangleGPU t1{};
+                t1.v0.position = glm::vec4(v00.pos, v00.uv.x);
+                t1.v0.normal   = glm::vec4(v00.normal, v00.uv.y);
+                t1.v0.tangent  = v00.tangent;
+                t1.v1.position = glm::vec4(v10.pos, v10.uv.x);
+                t1.v1.normal   = glm::vec4(v10.normal, v10.uv.y);
+                t1.v1.tangent  = v10.tangent;
+                t1.v2.position = glm::vec4(v11.pos, v11.uv.x);
+                t1.v2.normal   = glm::vec4(v11.normal, v11.uv.y);
+                t1.v2.tangent  = v11.tangent;
+                t1.materialId  = 36;
+
+                TriangleGPU t2{};
+                t2.v0.position = glm::vec4(v00.pos, v00.uv.x);
+                t2.v0.normal   = glm::vec4(v00.normal, v00.uv.y);
+                t2.v0.tangent  = v00.tangent;
+                t2.v1.position = glm::vec4(v11.pos, v11.uv.x);
+                t2.v1.normal   = glm::vec4(v11.normal, v11.uv.y);
+                t2.v1.tangent  = v11.tangent;
+                t2.v2.position = glm::vec4(v01.pos, v01.uv.x);
+                t2.v2.normal   = glm::vec4(v01.normal, v01.uv.y);
+                t2.v2.tangent  = v01.tangent;
+                t2.materialId  = 36;
+
+                scene.triangles.push_back(t1);
+                scene.triangles.push_back(t2);
+            }
+        }
+
         recordBlasPrototype("Hologram Projector", tStart);
     }
 
