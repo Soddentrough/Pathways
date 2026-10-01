@@ -2775,6 +2775,13 @@ static std::vector<MaterialGPU> createInfinityMirrorMaterials() {
     matGlass.type = MATERIAL_DIELECTRIC;
     materials.push_back(matGlass);
 
+    // 12: Gold Pedestal Area Light (Warm amber/golden LED luminaire)
+    MaterialGPU matGoldLight{};
+    matGoldLight.albedo = glm::vec4(1.0f, 0.85f, 0.55f, 1.0f);
+    matGoldLight.emissive = glm::vec4(28.0f, 22.0f, 12.0f, 1.0f);
+    matGoldLight.type = MATERIAL_EMISSIVE;
+    materials.push_back(matGoldLight);
+
     return materials;
 }
 
@@ -2925,15 +2932,32 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.5f), 0.70f, 3, 48, 48);
     recordRange("Art_ChromeSphere", tStart);
 
-    // Right: Tilted Polished Gold Accent Ring (X = 1.3, Z = -2.5)
+    // Right: Pedestal & Emissive Area Light for Gold Accent Ring (X = 1.3, Z = -2.5)
     tStart = static_cast<uint32_t>(scene.triangles.size());
+    // Glowing base plinth at floor level
+    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -2.5f), 0.44f, 0.03f, 12 /* matGoldLight */, 28);
+    // Dark pedestal column
     addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -2.5f), 0.40f, pedH, 9, 24);
-    recordRange("Pedestal_GoldRing", tStart);
+    // Luminaire fixture bezel atop platform
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -2.5f), 0.34f, 0.01f, 1 /* matFrame */, 24);
+    // Emissive area light pad directly underneath the gold torus (facing +Y upwards)
+    const float goldLightPadW = 0.22f; // 44cm x 44cm square area emitter
+    addQuad(scene.triangles,
+            glm::vec3(1.3f - goldLightPadW, pedH + 0.011f, -2.5f - goldLightPadW),
+            glm::vec3(1.3f + goldLightPadW, pedH + 0.011f, -2.5f - goldLightPadW),
+            glm::vec3(1.3f + goldLightPadW, pedH + 0.011f, -2.5f + goldLightPadW),
+            glm::vec3(1.3f - goldLightPadW, pedH + 0.011f, -2.5f + goldLightPadW),
+            glm::vec3(0.0f, 1.0f, 0.0f), 12 /* matGoldLight */);
 
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addTorus(scene.triangles, glm::vec3(1.3f, pedH + 0.42f, -2.5f), 0.38f, 0.10f, 4, 36, 18,
-             glm::normalize(glm::vec3(0.35f, 0.88f, 0.25f)));
-    recordRange("Art_GoldRing", tStart);
+    // Analytical LightGPU: Upward-facing warm amber/golden area light quad illuminating the gold torus
+    LightGPU goldLight{};
+    goldLight.position = glm::vec4(1.3f - goldLightPadW, pedH + 0.012f, -2.5f - goldLightPadW, LIGHT_AREA_QUAD);
+    goldLight.u = glm::vec4(2.0f * goldLightPadW, 0.0f, 0.0f, 0.0f);
+    goldLight.v = glm::vec4(0.0f, 0.0f, 2.0f * goldLightPadW, 0.0f);
+    goldLight.normal = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
+    goldLight.emission = glm::vec4(28.0f, 22.0f, 12.0f, (2.0f * goldLightPadW) * (2.0f * goldLightPadW));
+    scene.lights.push_back(goldLight);
+    recordRange("Pedestal_GoldRing", tStart);
 
     // =========================================================================
     // 6. BLAS Geometry Prototypes & Hardware TLAS Instancing
@@ -2969,6 +2993,12 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     uint32_t torusStart = static_cast<uint32_t>(scene.triangles.size());
     addTorus(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), 0.40f, 0.13f, 3 /* matChrome */, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
     recordBlasPrototype("Prototype_ReflectiveTorus", torusStart);
+
+    // Record BLAS 2: Dynamic Gold Torus Prototype (Centered at origin in local space)
+    uint32_t goldTorusStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), 0.38f, 0.10f, 4 /* matGold */, 36, 18,
+             glm::normalize(glm::vec3(0.35f, 0.88f, 0.25f)));
+    recordBlasPrototype("Prototype_GoldTorus", goldTorusStart);
 
     // Hardware TLAS Instances
     // Instance 0: Static Room
@@ -3011,6 +3041,32 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animTorus.rotationSpeed = 0.8f;                         // ~45 deg/second (smooth, majestic spin)
     animTorus.baseTransform = baseTilt;
     scene.animatedInstances.push_back(animTorus);
+
+    // Instance 2: Gold Torus atop Pedestal (X = 1.3, Z = -2.5)
+    glm::vec3 goldTorusPos(1.3f, pedH + 0.42f, -2.5f);
+    glm::mat4 goldInitialTransform = glm::translate(glm::mat4(1.0f), goldTorusPos);
+
+    SceneInstance instGoldTorus{};
+    instGoldTorus.blasIndex = 2;
+    instGoldTorus.transform = goldInitialTransform;
+    instGoldTorus.customIndex = 2;
+    scene.instances.push_back(instGoldTorus);
+
+    InstanceGPU instGoldTorusGPU{};
+    instGoldTorusGPU.firstTriangle = scene.blasRanges[2].firstTriangle;
+    instGoldTorusGPU.numOpaqueTriangles = scene.blasRanges[2].numOpaqueTriangles;
+    instGoldTorusGPU.materialOffset = 0;
+    instGoldTorusGPU.flags = 0;
+    scene.instanceData.push_back(instGoldTorusGPU);
+
+    // Register Dynamic Kinematic Animator for Instance 2
+    AnimatedInstance animGoldTorus{};
+    animGoldTorus.instanceIndex = 2;
+    animGoldTorus.basePosition = goldTorusPos;
+    animGoldTorus.rotationAxis = glm::vec3(0.0f, 1.0f, 0.0f); // Spin about vertical Y axis
+    animGoldTorus.rotationSpeed = -0.6f;                       // Counter-rotation to chrome torus (~-34.4 deg/s)
+    animGoldTorus.baseTransform = glm::mat4(1.0f);
+    scene.animatedInstances.push_back(animGoldTorus);
 
     // 7. Camera Setup
     scene.hasCamera = true;
