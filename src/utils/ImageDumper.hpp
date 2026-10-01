@@ -144,6 +144,7 @@ struct FrameStats {
     bool target_achieved = false; // true if avg_frame_time_ms < target_frame_time_ms
     bool accumulation_complete = false;
     uint32_t max_accum_frames = 2048;
+    bool is_animating = false;
 
     // GPU Timestamp Profiler Breakdown
     double primary_gpu_time_ms = 0.0;

@@ -86,6 +86,7 @@ private:
     bool m_cameraMode = false;
     bool m_resetAccumulation = false;
     bool m_cameraMovedLastFrame = false;
+    bool m_instanceMovedLastFrame = false;
     bool m_pendingToggleFullscreen = false;
     uint32_t m_pendingResizeW = 0;
     uint32_t m_pendingResizeH = 0;

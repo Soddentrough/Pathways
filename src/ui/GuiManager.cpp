@@ -43,11 +43,18 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     io.IniFilename = nullptr; // Ensure dynamic responsive docking without stale ini overrides
     ImGui::StyleColorsDark();
 
-    // Dark style customization
+    // Dark style customization with modern translucent glass aesthetic:
+    // Mild transparency (~0.76 alpha) reveals the real-time path-traced scene behind the HUD and controls.
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
     style.FrameRounding = 4.0f;
     style.GrabRounding = 4.0f;
+    style.Colors[ImGuiCol_WindowBg]         = ImVec4(0.06f, 0.08f, 0.12f, 0.76f);
+    style.Colors[ImGuiCol_TitleBg]          = ImVec4(0.04f, 0.06f, 0.09f, 0.82f);
+    style.Colors[ImGuiCol_TitleBgActive]    = ImVec4(0.08f, 0.14f, 0.22f, 0.88f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.04f, 0.06f, 0.09f, 0.60f);
+    style.Colors[ImGuiCol_PopupBg]          = ImVec4(0.07f, 0.09f, 0.13f, 0.88f);
+    style.Colors[ImGuiCol_Border]           = ImVec4(0.25f, 0.35f, 0.45f, 0.55f);
 
     // High-DPI font initialization:
     // When fractional display scaling is active (e.g. 1.25x on 5120x2160),
@@ -331,6 +338,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
 
     ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar;
+    ImGui::SetNextWindowBgAlpha(0.76f);
     if (ImGui::Begin(hudTitle, nullptr, panelFlags)) {
         if (stats.mgpu_mode_str != "off" && stats.secondary_gpu_time_ms > 0.001) {
             ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "Dual %s Pure Vulkan 1.4 Path Tracer", stats.arch_name.c_str());
@@ -352,7 +360,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 0. Prominent Obvious FPS Hero Display Card
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.90f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.55f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
         if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
@@ -465,7 +473,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::Separator();
 
         // 3. Multi-GPU Subsystem Telemetry
-        if (ImGui::CollapsingHeader("Multi-GPU Subsystem Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Multi-GPU Subsystem Telemetry", (stats.is_mgpu_active || !stats.secondary_gpu_name.empty()) ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None)) {
             ImGui::Text("Active Topology: %s", stats.topology_name.c_str());
             ImGui::Text("Multi-GPU Mode:  %s", stats.mgpu_mode_str.c_str());
 
@@ -525,7 +533,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
 
         // 4. Hardware Pipeline & Architecture Telemetry
-        if (ImGui::CollapsingHeader("Hardware Architecture & Execution Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Hardware Architecture & Execution Mode", ImGuiTreeNodeFlags_None)) {
             ImGui::Text("Subgroup Execution: Native Wave32 SIMD (%s)", stats.short_arch.c_str());
             ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "RT Pipeline: Hardware BVH Accelerated");
             ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.0f), "  Active Pipeline Extensions:");
@@ -555,7 +563,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
 
         // 5. Scene Complexity Telemetry
-        if (ImGui::CollapsingHeader("Scene Complexity", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Scene Complexity", ImGuiTreeNodeFlags_None)) {
             if (stats.num_instanced_triangles > stats.num_triangles) {
                 ImGui::Text("Geometry:     %u Base Tris (%s Instanced across %u Instances), %u Spheres",
                             stats.num_triangles, formatInstCount(stats.num_instanced_triangles).c_str(),
@@ -579,15 +587,18 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
-                if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                if (stats.is_animating) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                        "Mode: Real-Time Interactive (Objects Animating | %u SPP)", activeSpp);
+                } else if (stats.accumulation_complete && config.max_accum_frames > 0) {
                     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
-                        "Accumulation: Complete (%u / %u Frames | Paused)", stats.total_samples, config.max_accum_frames);
+                        "Mode: Progressive Reference (Converged: %u Frames)", stats.total_samples);
                 } else if (config.max_accum_frames > 0) {
-                    ImGui::Text("Accumulation: Frame %u / %u (%u samples accumulated)",
+                    ImGui::Text("Mode: Progressive Reference (Frame %u / %u | %u Samples)",
                         stats.total_samples, config.max_accum_frames, stats.total_samples * activeSpp);
                 } else {
-                    ImGui::Text("Accumulation: Frame %u (%u samples accumulated | Unlimited)",
-                        stats.total_samples, stats.total_samples * activeSpp);
+                    ImGui::Text("Mode: Progressive Reference (Frame %u | Unlimited)",
+                        stats.total_samples);
                 }
             } else {
                 ImGui::Text("Accumulation: Disabled (Real-Time 1 SPP)");
@@ -595,7 +606,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
 
         // 6. Offline Telemetry Export
-        if (ImGui::CollapsingHeader("Offline Telemetry Comparison", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Offline Telemetry Comparison", ImGuiTreeNodeFlags_None)) {
             ImGui::TextDisabled("Save hardware, driver, support & performance data:");
             if (ImGui::Button("Export Telemetry Data (.json)", ImVec2(hudW - 40.0f, 28.0f))) {
                 std::string path = ImageDumper::generateDefaultTelemetryPath();
@@ -612,7 +623,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
 
         // 7. Session Configuration Tallies
-        if (!stats.configurations_breakdown.empty() && ImGui::CollapsingHeader("Session Configurations Tested", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (!stats.configurations_breakdown.empty() && ImGui::CollapsingHeader("Session Configurations Tested", ImGuiTreeNodeFlags_None)) {
             ImGui::TextDisabled("Tallied performance across %zu unique configuration(s):", stats.configurations_breakdown.size());
             for (size_t i = 0; i < stats.configurations_breakdown.size(); ++i) {
                 const auto& c = stats.configurations_breakdown[i];
@@ -640,15 +651,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                             ? (100.0 * static_cast<double>(b.rays_left) / c.pipeline_stages.primary_rays)
                             : 0.0;
                         std::string shadowStr = (b.shadow_ms > 0.0005f) ? std::format("Shadow: {:.2f} ms", b.shadow_ms) : "Shadow: Inline";
-                        if (b.intersect_ms > 0.0001) {
-                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | %s | Intersect: %.2f ms | %s rays left (%.1f%%)",
-                                                b.bounce, b.shade_ms, shadowStr.c_str(), b.intersect_ms,
-                                                formatRayCount(b.rays_left).c_str(), pct);
-                        } else {
-                            ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | %s | %s rays left (%.1f%%)",
-                                                b.bounce, b.shade_ms, shadowStr.c_str(),
-                                                formatRayCount(b.rays_left).c_str(), pct);
-                        }
+                        std::string intersectStr = (b.intersect_ms > 0.0001f) ? std::format("Intersect: {:.2f} ms", b.intersect_ms) : "Intersect: None";
+                        ImGui::TextDisabled("  Bounce %u: Shade: %.2f ms | %s | %s | %s rays left (%.1f%%)",
+                                            b.bounce, b.shade_ms, shadowStr.c_str(), intersectStr.c_str(),
+                                            formatRayCount(b.rays_left).c_str(), pct);
                     }
                     if (c.pipeline_stages.tail_megakernel_ms > 0.0005) {
                         ImGui::TextDisabled("  Tail Megakernel (Bounces %u..N): %.2f ms",
@@ -669,30 +675,265 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     // =========================================================================
     ImGui::SetNextWindowPos(ImVec2(ctrlX, ctrlY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(ctrlW, ctrlH), layoutCond);
+    ImGui::SetNextWindowBgAlpha(0.76f);
 
     if (ImGui::Begin("Pathways Control Panel", nullptr, panelFlags)) {
         ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Real-Time Pipeline Configuration");
 
         ImGui::Separator();
 
-        // Mode Toggle Banner & Quick Action
+        // Mode Toggle Banner & Quick Action Bar
+        float topBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
         if (cameraMode) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.22f, 0.22f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            if (ImGui::Button("FPS SCENE NAVIGATION ACTIVE\n[Click or press TAB to release mouse]", ImVec2(-1, 38.0f))) {
+            if (ImGui::Button("FPS NAVIGATION ACTIVE\n[Click or TAB to release]", ImVec2(topBtnW, 38.0f))) {
                 cameraMode = false;
             }
             ImGui::PopStyleColor(2);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.28f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.68f, 0.35f, 1.0f));
-            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click or press TAB to capture mouse]", ImVec2(-1, 38.0f))) {
+            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click or TAB to capture]", ImVec2(topBtnW, 38.0f))) {
                 cameraMode = true;
             }
             ImGui::PopStyleColor(2);
         }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.30f, 0.50f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.42f, 0.68f, 1.0f));
+        if (ImGui::Button("RESET ACCUMULATION\n[Purge temporal frames]", ImVec2(topBtnW, 38.0f))) {
+            settingsChanged = true;
+            if (actions) actions->resetAccumulation = true;
+        }
+        ImGui::PopStyleColor(2);
 
-        // 0. Active 3D Scene Selection & Asset Library
+        // 1. PRIMARY RAY BUDGET & PROGRESSIVE ACCUMULATION (ZERO-SCROLL PRIORITY)
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.32f, 0.24f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.44f, 0.32f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.26f, 0.54f, 0.40f, 1.0f));
+        bool qualityHeaderOpen = ImGui::CollapsingHeader("PRIMARY RAY BUDGET & ACCUMULATION", ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor(3);
+
+        if (qualityHeaderOpen) {
+            // Samples Per Pixel (SPP)
+            int spp = static_cast<int>(config.spp);
+            if (ImGui::SliderInt("Samples/Pixel (SPP)", &spp, 1, 64)) {
+                config.spp = static_cast<uint32_t>(spp);
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Primary ray sample count per pixel per frame. Higher values increase visual fidelity and reduce noise.");
+            }
+
+            // Quick SPP presets
+            ImGui::PushID("QuickSPP");
+            ImGui::TextDisabled("Quick SPP:");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("-##SppDec") && config.spp > 1) {
+                config.spp--;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement SPP by 1 (supports any integer / odd numbers)");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+##SppInc") && config.spp < 64) {
+                config.spp++;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment SPP by 1 (supports any integer / odd numbers)");
+            ImGui::SameLine();
+            auto drawSppPreset = [&](uint32_t val, const char* label) {
+                bool isCurrent = (config.spp == val);
+                if (isCurrent) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                if (ImGui::SmallButton(label)) {
+                    config.spp = val;
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (isCurrent) ImGui::PopStyleColor();
+                ImGui::SameLine();
+            };
+            drawSppPreset(1, "1 (RT)");
+            drawSppPreset(2, "2");
+            drawSppPreset(4, "4");
+            drawSppPreset(8, "8");
+            drawSppPreset(16, "16");
+            drawSppPreset(32, "32");
+            drawSppPreset(64, "64");
+            ImGui::PopID();
+            ImGui::NewLine();
+
+            ImGui::Spacing();
+
+            // Ray Bounces
+            int bounces = static_cast<int>(config.max_bounces);
+            if (ImGui::SliderInt("Max Ray Bounces", &bounces, 1, 16)) {
+                config.max_bounces = static_cast<uint32_t>(bounces);
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Maximum path tracing indirect bounce depth (1 = Direct only, 4 = Default, 16 = Deep caustics/dielectrics).");
+            }
+
+            // Quick Bounce presets
+            ImGui::PushID("QuickBNC");
+            ImGui::TextDisabled("Quick Bounces:");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("-##BncDec") && config.max_bounces > 1) {
+                config.max_bounces--;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement bounce depth by 1");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+##BncInc") && config.max_bounces < 16) {
+                config.max_bounces++;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Increment bounce depth by 1");
+            ImGui::SameLine();
+            auto drawBncPreset = [&](uint32_t val, const char* label) {
+                bool isCurrent = (config.max_bounces == val);
+                if (isCurrent) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                if (ImGui::SmallButton(label)) {
+                    config.max_bounces = val;
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (isCurrent) ImGui::PopStyleColor();
+                ImGui::SameLine();
+            };
+            drawBncPreset(1, "1 (Direct)");
+            drawBncPreset(2, "2");
+            drawBncPreset(4, "4 (Default)");
+            drawBncPreset(8, "8");
+            drawBncPreset(16, "16 (Max)");
+            ImGui::PopID();
+            ImGui::NewLine();
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Stationary Frame Accumulation");
+
+            if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time 1-SPP noise.");
+            }
+
+            if (config.progressive_accumulation) {
+                ImGui::Indent();
+                int cutoff = static_cast<int>(config.max_accum_frames);
+                const char* cutoffFmt = (cutoff == 0) ? "Cutoff: Unlimited" : "Cutoff: %d Frames";
+                if (ImGui::SliderInt("Accumulation Cutoff", &cutoff, 0, 4096, cutoffFmt)) {
+                    config.max_accum_frames = static_cast<uint32_t>(std::max(0, cutoff));
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Maximum frames to accumulate while camera is stationary (0 = Unlimited, default: 2048). Once reached, rendering freezes to conserve GPU power.");
+                }
+
+                uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
+                if (stats.is_animating) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                        "Status: Real-Time Interactive (Objects Animating | %u SPP)", activeSpp);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Dynamic animation mode: rendering real-time frames with zero temporal ghosting or reflection lag.\n"
+                                          "Pause animation or stop camera to enable unbounded progressive reference convergence.");
+                    }
+                } else if (stats.accumulation_complete && config.max_accum_frames > 0) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                        "Status: Progressive Reference (Converged: %u Frames)", stats.total_samples);
+                } else if (config.max_accum_frames > 0) {
+                    ImGui::TextDisabled("Status: Progressive Reference (Frame %u / %u | %u Samples)",
+                        stats.total_samples, config.max_accum_frames, stats.total_samples * activeSpp);
+                } else {
+                    ImGui::TextDisabled("Status: Progressive Reference (Frame %u | Unlimited)",
+                        stats.total_samples);
+                }
+                ImGui::Unindent();
+            }
+
+            // Adaptive Framerate Governor (Auto-Pacing) sub-fold
+            ImGui::Spacing();
+            if (ImGui::TreeNode("Adaptive Framerate Governor (Auto-Pacing)")) {
+                if (ImGui::Checkbox("Enable Quality Governor", &config.adaptive_spp)) {
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Autonomously adjusts sample count (SPP) and bounce depth to maximize quality within target framerate.");
+                }
+
+                const char* targetFpsLabels[] = { "Uncapped", "30 FPS (33.3 ms)", "60 FPS (16.7 ms)", "90 FPS (11.1 ms)", "120 FPS (8.3 ms)", "144 FPS (6.9 ms)", "240 FPS (4.2 ms)" };
+                const uint32_t targetFpsValues[] = { 0, 30, 60, 90, 120, 144, 240 };
+                int currentTargetIdx = 0;
+                for (int idx = 0; idx < 7; ++idx) {
+                    if (config.target_fps == targetFpsValues[idx]) {
+                        currentTargetIdx = idx;
+                        break;
+                    }
+                }
+                if (ImGui::Combo("Target Frame Rate", &currentTargetIdx, targetFpsLabels, 7)) {
+                    config.target_fps = targetFpsValues[currentTargetIdx];
+                    if (config.target_fps > 0) config.adaptive_spp = true;
+                    settingsChanged = true;
+                }
+
+                if (config.adaptive_spp && config.target_fps > 0) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                        "[Governor ACTIVE | Dynamic: %u SPP, %u Bounces]",
+                        stats.dynamic_spp, stats.dynamic_bounces);
+                    ImGui::TextDisabled("Target Budget: %.2f ms | Current RT: %.2f ms",
+                        1000.0f / config.target_fps, stats.primary_gpu_time_ms);
+
+                    uint32_t activeSppVal = stats.dynamic_spp > 0 ? stats.dynamic_spp : config.spp;
+                    float sppFraction = (config.max_spp > config.min_spp) ?
+                        static_cast<float>(activeSppVal - config.min_spp) / static_cast<float>(config.max_spp - config.min_spp) : 1.0f;
+                    char sppBuf[64];
+                    std::snprintf(sppBuf, sizeof(sppBuf), "Active Dynamic SPP: %u (Range: %u..%u)", activeSppVal, config.min_spp, config.max_spp);
+                    ImGui::ProgressBar(std::clamp(sppFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f), sppBuf);
+
+                    int minSpp = static_cast<int>(config.min_spp);
+                    if (ImGui::SliderInt("Min SPP Floor", &minSpp, 1, static_cast<int>(config.max_spp))) {
+                        config.min_spp = static_cast<uint32_t>(minSpp);
+                        settingsChanged = true;
+                    }
+                    int maxSpp = static_cast<int>(config.max_spp);
+                    if (ImGui::SliderInt("Max SPP Ceiling", &maxSpp, static_cast<int>(config.min_spp), 32)) {
+                        config.max_spp = static_cast<uint32_t>(maxSpp);
+                        settingsChanged = true;
+                    }
+
+                    uint32_t activeBouncesVal = stats.dynamic_bounces > 0 ? stats.dynamic_bounces : config.max_bounces;
+                    float bounceFraction = (config.max_dynamic_bounces > config.min_bounces) ?
+                        static_cast<float>(activeBouncesVal - config.min_bounces) / static_cast<float>(config.max_dynamic_bounces - config.min_bounces) : 1.0f;
+                    char bncBuf[64];
+                    std::snprintf(bncBuf, sizeof(bncBuf), "Active Dynamic Bounces: %u (Range: %u..%u)", activeBouncesVal, config.min_bounces, config.max_dynamic_bounces);
+                    ImGui::ProgressBar(std::clamp(bounceFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f), bncBuf);
+
+                    int minB = static_cast<int>(config.min_bounces);
+                    if (ImGui::SliderInt("Min Bounces Floor", &minB, 1, static_cast<int>(config.max_dynamic_bounces))) {
+                        config.min_bounces = static_cast<uint32_t>(minB);
+                        settingsChanged = true;
+                    }
+                    int maxB = static_cast<int>(config.max_dynamic_bounces);
+                    if (ImGui::SliderInt("Max Bounces Ceiling", &maxB, static_cast<int>(config.min_bounces), 16)) {
+                        config.max_dynamic_bounces = static_cast<uint32_t>(maxB);
+                        settingsChanged = true;
+                    }
+                }
+                ImGui::TreePop();
+            }
+        }
+        ImGui::Separator();
+
+        // 2. Active 3D Scene Selection & Asset Library
         if (!availableScenes.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.12f, 0.28f, 0.48f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.18f, 0.38f, 0.62f, 1.0f));
@@ -848,7 +1089,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 // Prominent Activity Banner when Scene Loading is in Progress
                 if (stats.is_scene_loading) {
                     ImGui::Spacing();
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.10f, 0.04f, 0.90f));
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.10f, 0.04f, 0.70f));
                     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.78f, 0.25f, 0.90f));
                     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
@@ -865,622 +1106,29 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PopStyleColor(2);
                 }
 
-                // Active Scene Information Card
-                if (currentSceneIndex >= 0 && currentSceneIndex < static_cast<int>(availableScenes.size())) {
-                    const auto& cur = availableScenes[currentSceneIndex];
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.18f, 0.85f));
-                    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.45f, 0.70f, 0.6f));
-                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
-                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
-
-                    if (ImGui::BeginChild("##ActiveSceneCard", ImVec2(0, 94.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
-                        ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "ACTIVE SCENE: %s", cur.label.c_str());
-                        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70.0f);
-                        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.28f, 1.0f), "[%s]", cur.group.c_str());
-
-                        ImGui::Text("  > Geometry: ");
-                        ImGui::SameLine();
-                        uint32_t activeTris = (stats.num_triangles > 0) ? stats.num_triangles : static_cast<uint32_t>(cur.triangleCount);
-                        if (stats.num_instanced_triangles > activeTris) {
-                            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%u Base Tris (%s Instanced across %u instances)",
-                                               activeTris, formatInstCount(stats.num_instanced_triangles).c_str(), stats.num_instances);
-                        } else {
-                            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "%u Triangles (%s)", activeTris, cur.formatTriangles().c_str());
-                        }
-                        if (stats.num_spheres > 0) {
-                            ImGui::SameLine();
-                            ImGui::Text("(%u Spheres)", stats.num_spheres);
-                        }
-
-                        uint32_t activeMats = (stats.num_materials > 0) ? stats.num_materials : cur.materialCount;
-                        ImGui::Text("  > Materials: %u PBR | Lights: %u Area", activeMats, stats.num_lights);
-                        if (camera) {
-                            ImGui::SameLine();
-                            ImGui::Text("| Radius: %.2f m", camera->getSceneScale());
-                        }
-
-                        if (!cur.filepath.empty()) {
-                            ImGui::TextDisabled("  > File: %s", cur.filepath.c_str());
-                            if (cur.fileSizeBytes > 0) {
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("(%s)", cur.formatFileSize().c_str());
-                            }
-                        } else {
-                            ImGui::TextDisabled("  > Built-in procedural geometry");
-                        }
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleVar(2);
-                    ImGui::PopStyleColor(2);
-                }
+                // Scene Dynamic Animation Controls (placed right with the scene)
                 ImGui::Spacing();
-            }
-            ImGui::Separator();
-        }
-
-        // 1. Display & Viewport Configuration (Fullscreen, Resolution Presets, Adaptive FOV)
-        if (displayInfo && ImGui::CollapsingHeader("Display & Viewport Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextDisabled("Physical Display:");
-            ImGui::BulletText("Device:   %s", displayInfo->displayName.c_str());
-            ImGui::BulletText("Native:   %u x %u @ %.2f Hz", displayInfo->nativeWidth, displayInfo->nativeHeight, displayInfo->refreshRate);
-            ImGui::BulletText("Usable:   %u x %u (Scale: %.2f)", displayInfo->usableWidth, displayInfo->usableHeight, displayInfo->contentScale);
-            ImGui::BulletText("Aspect:   %.3f (%s)", displayInfo->displayAspect, displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : (displayInfo->isUltraWide ? "Ultrawide (21:9 / 32:9)" : "Landscape (16:9 / 16:10)"));
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("Active Viewport:");
-            ImGui::BulletText("Resolution: %u x %u (Aspect: %.3f)", width, height, aspect);
-            ImGui::BulletText("Layout:     %s", isPortrait ? "Vertical Stacked (Scene Left Unobstructed)" : "Landscape Edge-Docked");
-
-            if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f, 26.0f))) {
-                if (actions) actions->toggleFullscreen = true;
-            }
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("Resolution Presets:");
-            float presetBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-
-            // Row 1: Native Full Display | DualUp (1280x2048)
-            std::string nativeBtnLabel = std::format("Native ({}x{})", displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : 3840,
-                                                                         displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : 2160);
-            if (ImGui::Button(nativeBtnLabel.c_str(), ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : displayInfo->usableWidth;
-                    actions->requestedHeight = displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : displayInfo->usableHeight;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("DualUp (1280x2048)", ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = 1280;
-                    actions->requestedHeight = 2048;
-                }
-            }
-
-            // Row 2: 1:1 Square (1440x1440) | FHD (1920x1080)
-            if (ImGui::Button("1:1 (1440x1440)", ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = 1440;
-                    actions->requestedHeight = 1440;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("FHD (1920x1080)", ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = 1920;
-                    actions->requestedHeight = 1080;
-                }
-            }
-
-            // Row 3: QHD (2560x1440) | 4K UHD (3840x2160)
-            if (ImGui::Button("QHD (2560x1440)", ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = 2560;
-                    actions->requestedHeight = 1440;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("4K (3840x2160)", ImVec2(presetBtnW, 26.0f))) {
-                if (actions) {
-                    actions->requestedWidth = 3840;
-                    actions->requestedHeight = 2160;
-                }
-            }
-
-            if (camera) {
-                bool adaptive = camera->isAdaptiveFov();
-                if (ImGui::Checkbox("Adaptive Aspect FOV (Auto-frame scene)", &adaptive)) {
-                    camera->setAdaptiveFov(adaptive);
-                    camera->adaptFovForAspect(aspect);
+                if (ImGui::Checkbox("Animate Scene Objects", &config.animate_objects)) {
                     settingsChanged = true;
-                }
-                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(180.0f, 26.0f))) {
-                    camera->adaptFovForAspect(aspect);
-                    settingsChanged = true;
-                }
-            }
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("Color Space & HDR Pipeline:");
-            ImGui::BulletText("Color Space: %s", stats.swapchain_color_space_str.c_str());
-            ImGui::BulletText("Swap Format: %s", stats.swapchain_format_str.c_str());
-            ImGui::BulletText("HDR Mode:    %s", stats.hdr_mode_str.c_str());
-            if (stats.is_hdr_display) {
-                if (ImGui::SliderFloat("Peak Luminance", &config.hdr_peak_nits, 400.0f, 4000.0f, "%.0f nits")) {
-                    settingsChanged = true;
-                }
-                if (ImGui::SliderFloat("Paper White", &config.hdr_paper_white_nits, 80.0f, 500.0f, "%.0f nits")) {
-                    settingsChanged = true;
-                }
-            }
-            ImGui::Separator();
-        }
-
-        // 0. Camera & Scene Navigation
-        if (ImGui::CollapsingHeader("Camera & Scene Navigation", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (camera) {
-                float speed = camera->getSpeed();
-                if (ImGui::SliderFloat("Move Speed", &speed, camera->getMinSpeed(), camera->getMaxSpeed(), "%.2f m/s", ImGuiSliderFlags_Logarithmic)) {
-                    camera->setSpeed(speed);
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Reset Speed")) {
-                    camera->setSpeed(camera->getBaseSpeed());
-                }
-
-                ImGui::Text("Speed Presets:");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("0.25x (Fine)")) camera->setSpeed(camera->getBaseSpeed() * 0.25f);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("0.5x"))        camera->setSpeed(camera->getBaseSpeed() * 0.50f);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("1.0x (Default)")) camera->setSpeed(camera->getBaseSpeed());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("2.0x (Fast)")) camera->setSpeed(camera->getBaseSpeed() * 2.0f);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("4.0x (Turbo)")) camera->setSpeed(camera->getBaseSpeed() * 4.0f);
-
-                bool dynScaling = camera->isDynamicScaling();
-                if (ImGui::Checkbox("Distance-Adaptive Speed (Smooth Approach to Focus)", &dynScaling)) {
-                    camera->setDynamicScaling(dynScaling);
-                }
-
-                ImGui::TextDisabled("Focal scale: %.2f m | Target dist: %.2f m | Base speed: %.2f m/s",
-                                    camera->getSceneScale(), camera->getCurrentTargetDistance(), camera->getBaseSpeed());
-
-                float sens = camera->getSensitivity();
-                if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.02f, 0.5f, "%.2f")) {
-                    camera->setSensitivity(sens);
-                }
-
-                if (ImGui::SliderFloat("Gamepad Deadzone", &config.gamepad_deadzone, 0.02f, 0.40f, "%.2f")) {
-                    config.gamepad_deadzone = std::clamp(config.gamepad_deadzone, 0.01f, 0.50f);
-                }
-
-                float fov = camera->getFov();
-                if (ImGui::SliderFloat("Field of View", &fov, 20.0f, 100.0f, "%.1f deg")) {
-                    camera->setFov(fov);
-                    settingsChanged = true;
-                }
-
-                glm::vec3 pos = camera->getPosition();
-                ImGui::Text("Position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
-                ImGui::Text("Look Angles: Yaw: %.1f deg, Pitch: %.1f deg", camera->getYaw(), camera->getPitch());
-
-                if (ImGui::Button("Focus on Center (F)", ImVec2(180.0f, 26.0f))) {
-                    camera->focusOnTarget(camera->getCentralTarget());
-                    settingsChanged = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Reset Camera", ImVec2(140.0f, 26.0f))) {
-                    camera->resetToDefault();
-                    settingsChanged = true;
-                }
-            }
-            ImGui::Spacing();
-            ImGui::TextDisabled("FPS Navigation Reference:");
-            ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
-            ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
-            ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
-            ImGui::BulletText("Ctrl (Hold): Arc-Strafe / Turntable Orbit around Targeted Object");
-            ImGui::BulletText("  -> A / D: Arc-Strafe Left / Right around Target");
-            ImGui::BulletText("  -> W / S: Dolly In / Out along Line of Sight");
-            ImGui::BulletText("  -> Space / C (or E / Q): Elevate Up / Down in Arc");
-            ImGui::BulletText("  -> Mouse: Turntable Orbit around Target");
-            ImGui::BulletText("Alt (Hold): Precision Crawl (0.25x Speed for Object Centering)");
-            ImGui::BulletText("Shift (Hold): Sprint Boost (3.0x Speed for Fast Relocation)");
-            ImGui::BulletText("F Key: Focus on Central Object");
-            ImGui::BulletText("Mouse Wheel: Continuously Scale Camera Speed");
-            ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
-            ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
-        }
-
-        // 1. Hardware Acceleration Pipeline Extensions
-        if (ImGui::CollapsingHeader("Hardware Acceleration & Ray Tracing Pipeline", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextColored(ImVec4(0.25f, 0.95f, 0.45f, 1.0f), "[ACTIVE] HARDWARE ACCELERATED (%s)", stats.ray_accelerator_name.c_str());
-            ImGui::Spacing();
-
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Vulkan Pipeline Extensions in Use:");
-            ImGui::BulletText("VK_KHR_ray_query");
-            ImGui::SameLine();
-            ImGui::TextDisabled("-> In-shader ray queries (rayQueryEXT)");
-
-            ImGui::BulletText("VK_KHR_acceleration_structure");
-            ImGui::SameLine();
-            ImGui::TextDisabled("-> Hardware BVH (BLAS + TLAS)");
-
-            ImGui::BulletText("VK_KHR_buffer_device_address");
-            ImGui::SameLine();
-            ImGui::TextDisabled("-> 64-bit BDA vertex/index & AS pointers");
-
-            ImGui::BulletText("VK_KHR_deferred_host_operations");
-            ImGui::SameLine();
-            ImGui::TextDisabled("-> Driver host AS build threads");
-
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "SPIR-V / Shading Extension:");
-            ImGui::BulletText("GL_EXT_ray_query / SPV_KHR_ray_query");
-            ImGui::SameLine();
-            ImGui::TextDisabled("-> Native Wave32 SIMD");
-
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
-            int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
-            if (ImGui::RadioButton("Wavefront Path Tracing (Ray Queues & DGC)", &pipeType, 0)) {
-                config.pipeline_type = PipelineType::Wavefront;
-                settingsChanged = true;
-            }
-            if (ImGui::RadioButton("Dedicated RTP (VK_KHR_ray_tracing_pipeline)", &pipeType, 1)) {
-                config.pipeline_type = PipelineType::RTP;
-                settingsChanged = true;
-            }
-            ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
-
-            if (config.pipeline_type == PipelineType::Wavefront) {
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Wavefront Material Sorting:");
-                const char* sortModes[] = {
-                    "Auto (Scene & Architecture Adaptive)",
-                    "None (Monolithic Shading Kernel)",
-                    "Archetype (BSDF Buckets via Wave-Ballot)",
-                    "Dual (3D Spatial-Morton + Material Dual-Binning)"
-                };
-                int currentSort = 0;
-                if (config.wavefront_sort_mode == WavefrontSortMode::Auto) currentSort = 0;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 1;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 2;
-                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 3;
-
-                if (ImGui::Combo("Material Sort Mode##WfSort", &currentSort, sortModes, IM_ARRAYSIZE(sortModes))) {
-                    if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::Auto;
-                    else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::None;
-                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
-                    else if (currentSort == 3) config.wavefront_sort_mode = WavefrontSortMode::Dual;
-                    settingsChanged = true;
-                }
-
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Secondary Ray Coherency Sort:");
-                const char* secSortModes[] = {
-                    "None (Linear Unsorted Queue)",
-                    "Directional DGC (Producer-Side Binning, 8 Bins)",
-                    "Direct Coherent (Xiang 2023, 4-Lane Cluster)",
-                    "Direct Coherent (Xiang 2023, 8-Lane Cluster)"
-                };
-                int currentSecSort = 0;
-                if (config.secondary_sort_mode == SecondarySortMode::None) currentSecSort = 0;
-                else if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) currentSecSort = 1;
-                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent) currentSecSort = 2;
-                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) currentSecSort = 3;
-
-                if (ImGui::Combo("Secondary Ray Sort##SecSort", &currentSecSort, secSortModes, IM_ARRAYSIZE(secSortModes))) {
-                    if (currentSecSort == 0) config.secondary_sort_mode = SecondarySortMode::None;
-                    else if (currentSecSort == 1) config.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
-                    else if (currentSecSort == 2) config.secondary_sort_mode = SecondarySortMode::DirectCoherent;
-                    else if (currentSecSort == 3) config.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
-                    settingsChanged = true;
-                }
-
-                if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 8 Dedicated Octant Sub-Queues (Zero Indirection Buffer, Contiguous)");
-                } else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent || config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> On-Chip Subgroup Tangent-Space Coherent Sampling (0 VRAM sorting overhead)");
-                } else {
-                    ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
-                }
-
-                if (ImGui::Checkbox("Streamline Secondary Shading##SecShade", &config.streamline_secondary_shading)) {
-                    settingsChanged = true;
-                }
-                if (config.streamline_secondary_shading) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 1-Sample NEE + Lambertian (Bounces >= 1, -17%% ISA footprint)");
-                } else {
-                    ImGui::TextDisabled("  -> Full 4-candidate RIS & microfacet GGX on all bounces");
-                }
-
-                if (ImGui::Checkbox("Scene-Scale Distance Clamping##DistClamp", &config.distance_clamping)) {
-                    settingsChanged = true;
-                }
-                if (config.distance_clamping) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Clamped to D_scene * 1.25 (Unit-invariant BVH early-out)");
-                } else {
-                    ImGui::TextDisabled("  -> Default static bound (10,000m)");
-                }
-            }
-
-            ImGui::Spacing();
-            if (ImGui::SliderFloat("Secondary Ray Clamping##IndClamp", &config.indirect_clamp, 0.0f, 200.0f, config.indirect_clamp <= 0.0f ? "Disabled (Unclamped)" : "%.1f cd/m²")) {
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (config.indirect_clamp > 0.0f) {
-                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Indirect luminance clamped to %.1f cd/m² (Firefly suppression)", config.indirect_clamp);
-            } else {
-                ImGui::TextDisabled("  -> Unclamped indirect radiance (Pure Monte Carlo)");
-            }
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Coarse Batch Partitioning:");
-            const char* batchModes[] = {
-                "Auto (Device Adaptive)",
-                "Monolithic (1 Batch - Full Screen)",
-                "2 Batches (2x1 Grid)",
-                "4 Batches (2x2 Grid - Optimal for 4K)",
-                "8 Batches (4x2 Grid - Bounded VRAM)",
-                "16 Batches (4x4 Grid - Ultra High-Res)"
-            };
-            int currentBatchMode = 0;
-            if (config.batch_count == 0) currentBatchMode = 0;
-            else if (config.batch_count == 1) currentBatchMode = 1;
-            else if (config.batch_count == 2) currentBatchMode = 2;
-            else if (config.batch_count == 4) currentBatchMode = 3;
-            else if (config.batch_count == 8) currentBatchMode = 4;
-            else if (config.batch_count == 16) currentBatchMode = 5;
-            else currentBatchMode = 0;
-
-            if (ImGui::Combo("Batching Mode##WfBatch", &currentBatchMode, batchModes, IM_ARRAYSIZE(batchModes))) {
-                if (currentBatchMode == 0) config.batch_count = 0;
-                else if (currentBatchMode == 1) config.batch_count = 1;
-                else if (currentBatchMode == 2) config.batch_count = 2;
-                else if (currentBatchMode == 3) config.batch_count = 4;
-                else if (currentBatchMode == 4) config.batch_count = 8;
-                else if (currentBatchMode == 5) config.batch_count = 16;
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-
-            if (config.batch_count == 0) {
-                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Adaptive: Programmatically sized based on GPU VRAM, CUs & cache profile");
-            } else if (config.batch_count == 1) {
-                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "  -> Monolithic: 1 batch (full-frame queues, max occupancy on small resolutions)");
-            } else {
-                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Partitioned: %u coarse 2D batches (bounded VRAM, 2D spatial cache locality)", config.batch_count);
-            }
-
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Acceleration Structure Telemetry:");
-            ImGui::BulletText("Primary BLAS: %.3f ms (%.2f KB, %u Triangles)", stats.blas_build_time_ms, stats.blas_size_kb, stats.blas_triangles);
-            ImGui::BulletText("Primary TLAS: %.3f ms (%.2f KB, %u Instance%s)", stats.tlas_build_time_ms, stats.tlas_size_kb, stats.tlas_instances, stats.tlas_instances == 1 ? "" : "s");
-            if (stats.is_mgpu_active && stats.sec_blas_build_time_ms > 0.0) {
-                ImGui::BulletText("Secondary BLAS: %.3f ms (%.2f KB)", stats.sec_blas_build_time_ms, stats.sec_blas_size_kb);
-                ImGui::BulletText("Secondary TLAS: %.3f ms (%.2f KB)", stats.sec_tlas_build_time_ms, stats.sec_tlas_size_kb);
-            }
-            ImGui::BulletText("GPU TLAS Updates: %u", stats.tlas_gpu_updates);
-            ImGui::Separator();
-        }
-
-        // 2. Multi-GPU Scalability Mode
-        if (ImGui::CollapsingHeader("Multi-GPU Architecture", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const char* mgpuModes[] = {
-                "Single GPU (Secondary Standby)",
-                "Checkerboard Tiling (Optimal RDNA4, default)",
-                "Sample Parallelism (Temporal Sample Splitting)",
-                "Auto (SPP Adaptive)"
-            };
-            int currentMode = 0;
-            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) currentMode = 1;
-            else if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 2;
-            else if (config.mgpu_mode == MultiGpuMode::Auto) currentMode = 3;
-
-            if (ImGui::Combo("Execution Mode", &currentMode, mgpuModes, IM_ARRAYSIZE(mgpuModes))) {
-                MultiGpuMode selectedMode = MultiGpuMode::Off;
-                if (currentMode == 1) selectedMode = MultiGpuMode::CheckerboardTile;
-                else if (currentMode == 2) selectedMode = MultiGpuMode::SampleParallel;
-                else if (currentMode == 3) selectedMode = MultiGpuMode::Auto;
-
-                if (actions && selectedMode != config.mgpu_mode) {
-                    actions->mgpuModeChanged = true;
-                    actions->newMgpuMode = selectedMode;
-                    actions->resetAccumulation = true;
-                }
-                config.mgpu_mode = selectedMode;
-                settingsChanged = true;
-            }
-
-            if (config.mgpu_mode == MultiGpuMode::Auto) {
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  -> Active Policy: Checkerboard Tiling (Optimal RDNA4)");
-            }
-
-            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || config.mgpu_mode == MultiGpuMode::Auto) {
-                const char* tileSizes[] = {
-                    "16x16 (Finest Interleaving)",
-                    "32x32 (Balanced Cache)",
-                    "64x64 (Optimal RDNA4 Default)",
-                    "128x128 (Maximum Ray Coherence)"
-                };
-                int currentTileIdx = 2; // default 64
-                if (config.tile_size == 16) currentTileIdx = 0;
-                else if (config.tile_size == 32) currentTileIdx = 1;
-                else if (config.tile_size == 64) currentTileIdx = 2;
-                else if (config.tile_size == 128) currentTileIdx = 3;
-
-                if (ImGui::Combo("Tile Size", &currentTileIdx, tileSizes, IM_ARRAYSIZE(tileSizes))) {
-                    uint32_t chosenSize = 64;
-                    if (currentTileIdx == 0) chosenSize = 16;
-                    else if (currentTileIdx == 1) chosenSize = 32;
-                    else if (currentTileIdx == 2) chosenSize = 64;
-                    else if (currentTileIdx == 3) chosenSize = 128;
-
-                    if (actions && chosenSize != config.tile_size) {
-                        actions->tileSizeChanged = true;
-                        actions->newTileSize = chosenSize;
-                        actions->resetAccumulation = true;
-                    }
-                    config.tile_size = chosenSize;
-                    settingsChanged = true;
-                }
-            } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-                uint32_t currentTotalSpp = config.spp;
-                uint32_t primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
-                uint32_t secSpp = std::max(1u, currentTotalSpp / 2);
-                ImGui::TextDisabled("  Sample Split: GPU 0 = %u SPP, GPU 1 = %u SPP", primSpp, secSpp);
-            }
-            if (config.mgpu_mode != MultiGpuMode::Off && config.upscaler_mode != UpscalerMode::None) {
-                if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) {
-                    ImGui::TextDisabled("  Topology: PostMerge (64x64 tiles merged on GPU0, then upscaled to 4K)");
-                } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-                    ImGui::TextDisabled("  Topology: SampleBlend (dual passes upscaled independently, averaged on GPU0)");
-                }
-            }
-
-            // Accumulation format selection
-            const char* accumFormats[] = {
-                "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
-                "RGBA32_SFLOAT (128-bit Full Float HDR)",
-                "R11G11B10_UFLOAT (32-bit Packed Float HDR) [High-Speed mGPU]"
-            };
-            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 :
-                                (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 2 : 0;
-            if (ImGui::Combo("Accumulation Format", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
-                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT :
-                                             (currentFormat == 2) ? AccumFormat::R11G11B10_UFLOAT : AccumFormat::RGBA16_SFLOAT;
-                if (actions && selectedFormat != config.accum_format) {
-                    actions->accumFormatChanged = true;
-                    actions->newAccumFormat = selectedFormat;
-                }
-                config.accum_format = selectedFormat;
-                settingsChanged = true;
-            }
-
-            // Double buffering toggle
-            if (ImGui::Checkbox("Double-Buffered Shared Memory", &config.double_buffered_shared_mem)) {
-                if (actions) {
-                    actions->doubleBufferChanged = true;
-                    actions->newDoubleBuffer = config.double_buffered_shared_mem;
-                }
-                settingsChanged = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Pipelined zero-copy DMA buffers to overlap Secondary GPU execution with Primary GPU present.");
-            }
-
-            if (config.mgpu_mode != MultiGpuMode::Off) {
-                if (ImGui::Checkbox("Visualize GPU Load Split", &config.visualize_mgpu_split)) {
-                    // Changing visualization immediately updates shader push constants
+                    if (actions) actions->resetAccumulation = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) to visually display work distribution.");
+                    ImGui::SetTooltip("Enable or pause dynamic kinematic object animations (e.g. rotating reflective gold torus in mirror scene). Pausing enables progressive convergence.");
                 }
+                if (config.animate_objects) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(140.0f);
+                    if (ImGui::SliderFloat("Speed##AnimSpeed", &config.animation_speed, 0.0f, 5.0f, "%.2fx")) {
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                }
+                ImGui::Spacing();
             }
+            ImGui::Separator();
         }
 
-        // 3. Path Tracer Core Settings
-        if (ImGui::CollapsingHeader("Path Tracer Core", ImGuiTreeNodeFlags_DefaultOpen)) {
-            // Dynamic Sample Rate & Frame Rate Governor
-            if (ImGui::Checkbox("Adaptive Dynamic SPP (Governor)", &config.adaptive_spp)) {
-                settingsChanged = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Autonomously adjusts sample count (SPP) and bounce depth to maximize quality within target framerate.");
-            }
-
-            const char* targetFpsLabels[] = { "Uncapped", "30 FPS (33.3 ms)", "60 FPS (16.7 ms)", "90 FPS (11.1 ms)", "120 FPS (8.3 ms)", "144 FPS (6.9 ms)", "240 FPS (4.2 ms)" };
-            const uint32_t targetFpsValues[] = { 0, 30, 60, 90, 120, 144, 240 };
-            int currentTargetIdx = 0;
-            for (int idx = 0; idx < 7; ++idx) {
-                if (config.target_fps == targetFpsValues[idx]) {
-                    currentTargetIdx = idx;
-                    break;
-                }
-            }
-            if (ImGui::Combo("Target Frame Rate", &currentTargetIdx, targetFpsLabels, 7)) {
-                config.target_fps = targetFpsValues[currentTargetIdx];
-                if (config.target_fps > 0) config.adaptive_spp = true;
-                settingsChanged = true;
-            }
-
-            if (config.adaptive_spp && config.target_fps > 0) {
-                ImGui::Indent();
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
-                    "[Governor: ACTIVE | Dynamic: %u SPP, %u Bounces]",
-                    stats.dynamic_spp, stats.dynamic_bounces);
-                ImGui::Text("Target Budget: %.2f ms (Current RT: %.2f ms)",
-                    1000.0f / config.target_fps, stats.primary_gpu_time_ms);
-                ImGui::Unindent();
-
-                ImGui::Spacing();
-                ImGui::SeparatorText("Samples Per Pixel (SPP)");
-
-                // Current dynamically applied SPP display
-                uint32_t activeSppVal = stats.dynamic_spp > 0 ? stats.dynamic_spp : config.spp;
-                int curSpp = static_cast<int>(activeSppVal);
-                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.45f, 1.0f), "Current Applied SPP: %u SPP", activeSppVal);
-                ImGui::BeginDisabled();
-                ImGui::SliderInt("##CurrentAppliedSPP", &curSpp, static_cast<int>(config.min_spp), static_cast<int>(config.max_spp), "%d SPP (Active Dynamic)");
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("Current sample count per pixel dynamically applied by the Quality Governor.");
-                }
-
-                int minSpp = static_cast<int>(config.min_spp);
-                if (ImGui::SliderInt("Min SPP Floor", &minSpp, 1, static_cast<int>(config.max_spp))) {
-                    config.min_spp = static_cast<uint32_t>(minSpp);
-                    settingsChanged = true;
-                }
-                int maxSpp = static_cast<int>(config.max_spp);
-                if (ImGui::SliderInt("Max SPP Ceiling", &maxSpp, static_cast<int>(config.min_spp), 32)) {
-                    config.max_spp = static_cast<uint32_t>(maxSpp);
-                    settingsChanged = true;
-                }
-
-                ImGui::Spacing();
-                ImGui::SeparatorText("Ray Bounces");
-
-                // Current dynamically applied Bounces display
-                uint32_t activeBouncesVal = stats.dynamic_bounces > 0 ? stats.dynamic_bounces : config.max_bounces;
-                int curBounces = static_cast<int>(activeBouncesVal);
-                ImGui::TextColored(ImVec4(0.2f, 0.95f, 0.45f, 1.0f), "Current Applied Bounces: %u Bounces", activeBouncesVal);
-                ImGui::BeginDisabled();
-                ImGui::SliderInt("##CurrentAppliedBounces", &curBounces, static_cast<int>(config.min_bounces), static_cast<int>(config.max_dynamic_bounces), "%d Bounces (Active Dynamic)");
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("Current ray bounce depth dynamically applied by the Quality Governor (locked at 4 until SPP reaches 16).");
-                }
-
-                int minB = static_cast<int>(config.min_bounces);
-                if (ImGui::SliderInt("Min Bounces Floor", &minB, 1, static_cast<int>(config.max_dynamic_bounces))) {
-                    config.min_bounces = static_cast<uint32_t>(minB);
-                    settingsChanged = true;
-                }
-                int maxB = static_cast<int>(config.max_dynamic_bounces);
-                if (ImGui::SliderInt("Max Bounces Ceiling", &maxB, static_cast<int>(config.min_bounces), 16)) {
-                    config.max_dynamic_bounces = static_cast<uint32_t>(maxB);
-                    settingsChanged = true;
-                }
-            } else {
-                int spp = static_cast<int>(config.spp);
-                if (ImGui::SliderInt("Samples/Pixel (SPP)", &spp, 1, 64)) {
-                    config.spp = static_cast<uint32_t>(spp);
-                    settingsChanged = true;
-                }
-
-                int bounces = static_cast<int>(config.max_bounces);
-                if (ImGui::SliderInt("Max Ray Bounces", &bounces, 1, 16)) {
-                    config.max_bounces = static_cast<uint32_t>(bounces);
-                    settingsChanged = true;
-                }
-            }
-        }
-
-        // 4. Lighting & Shading Subsystems
+        // 3. Lighting & Shading Components
         if (ImGui::CollapsingHeader("Lighting & Shading Components", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Checkbox("Direct Lighting (Area Lights)", &config.enable_direct_light)) {
                 settingsChanged = true;
@@ -1568,43 +1216,64 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 5. Post-Processing & Reconstruction
-        if (ImGui::CollapsingHeader("Post-Processing & Reconstruction", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const char* upscalerModes[] = {
-                "Off (1:1 Native Presentation)",
-                "AMD FidelityFX Super Resolution 3.1 (FSR 3.1)",
-                "Upways Neural Super-Resolution (Wave32 WMMA)",
+        // 4. Post-Processing & Reconstruction
+        if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
+            // Unified Reconstruction / Super-Resolution Mode
+            const char* reconModes[] = {
+                "Off (1:1 Pure Monte Carlo - Unbiased Reference)",
+                "Upways Neural Reconstruction (1:1 Native Denoising)",
+                "Upways Neural Super-Resolution (2x Upscale - Wave32 WMMA)",
+                "AMD FidelityFX Super Resolution 3.1 (Temporal FSR 3.1)",
                 "AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)"
             };
-            int currentUpscaler = 0;
-            if (config.upscaler_mode == UpscalerMode::FSR3) currentUpscaler = 1;
-            else if (config.upscaler_mode == UpscalerMode::Upways) currentUpscaler = 2;
-            else if (config.upscaler_mode == UpscalerMode::FSR1) currentUpscaler = 3;
-            else currentUpscaler = 0;
+            int curRecon = 0;
+            if (config.upscaler_mode == UpscalerMode::FSR3) {
+                curRecon = 3;
+            } else if (config.upscaler_mode == UpscalerMode::FSR1) {
+                curRecon = 4;
+            } else if (config.upscaler_mode == UpscalerMode::Upways || config.upways_superres) {
+                curRecon = 2;
+            } else if (config.denoiser_mode == DenoiserMode::Upways) {
+                curRecon = 1;
+            } else {
+                curRecon = 0;
+            }
 
-            if (ImGui::Combo("Super-Res Upscaler", &currentUpscaler, upscalerModes, IM_ARRAYSIZE(upscalerModes))) {
-                if (currentUpscaler == 1) {
-                    config.upscaler_mode = UpscalerMode::FSR3;
-                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else if (currentUpscaler == 2) {
+            if (ImGui::Combo("Reconstruction Mode", &curRecon, reconModes, IM_ARRAYSIZE(reconModes))) {
+                if (curRecon == 1) { // Upways Denoising 1:1
+                    config.denoiser_mode = DenoiserMode::Upways;
+                    config.upscaler_mode = UpscalerMode::None;
+                    config.upways_superres = false;
+                    config.render_scale = 1.0f;
+                } else if (curRecon == 2) { // Upways Super-Res 2x
+                    config.denoiser_mode = DenoiserMode::Upways;
                     config.upscaler_mode = UpscalerMode::Upways;
                     config.upways_superres = true;
                     if (config.render_scale >= 1.0f) config.render_scale = 0.5000f;
-                } else if (currentUpscaler == 3) {
-                    config.upscaler_mode = UpscalerMode::FSR1;
+                } else if (curRecon == 3) { // FSR 3.1
+                    config.denoiser_mode = DenoiserMode::None;
+                    config.upscaler_mode = UpscalerMode::FSR3;
+                    config.upways_superres = false;
                     if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else {
+                } else if (curRecon == 4) { // FSR 1.0
+                    config.denoiser_mode = DenoiserMode::None;
+                    config.upscaler_mode = UpscalerMode::FSR1;
+                    config.upways_superres = false;
+                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
+                } else { // Pure Monte Carlo
+                    config.denoiser_mode = DenoiserMode::None;
                     config.upscaler_mode = UpscalerMode::None;
+                    config.upways_superres = false;
                     config.render_scale = 1.0f;
                 }
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Super-resolution reconstruction upscalers: Temporal FSR 3.1, Upways Neural Reconstruction (Wave32 WMMA), or Spatial FSR 1.0.");
+                ImGui::SetTooltip("Real-time reconstruction and super-resolution upscalers: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or AMD FidelityFX.");
             }
 
-            if (config.upscaler_mode != UpscalerMode::None) {
+            if (config.upscaler_mode != UpscalerMode::None || config.upways_superres) {
                 ImGui::Indent();
                 const char* qualityPresets[] = {
                     "Custom Scale",
@@ -1643,48 +1312,412 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Unindent();
             }
 
-            if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Continuously accumulate static frames for ground-truth convergence. Uncheck to evaluate real-time 1-SPP noise.");
-            }
-
-            if (config.progressive_accumulation) {
-                ImGui::Indent();
-                int cutoff = static_cast<int>(config.max_accum_frames);
-                const char* cutoffFmt = (cutoff == 0) ? "Cutoff: Unlimited" : "Cutoff: %d Frames";
-                if (ImGui::SliderInt("Accumulation Cutoff", &cutoff, 0, 4096, cutoffFmt)) {
-                    config.max_accum_frames = static_cast<uint32_t>(std::max(0, cutoff));
-                    settingsChanged = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Maximum frames to accumulate while camera is stationary (0 = Unlimited, default: 2048). Once reached, rendering freezes to conserve GPU power and avoid FP16 mantissa absorption.");
-                }
-                ImGui::Unindent();
-            }
-
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation
             }
+        }
 
-            ImGui::Separator();
-            if (ImGui::Checkbox("Animate Objects", &config.animate_objects)) {
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
+        // 5. Camera & Scene Navigation
+        if (ImGui::CollapsingHeader("Camera & Scene Navigation")) {
+            if (camera) {
+                float speed = camera->getSpeed();
+                if (ImGui::SliderFloat("Move Speed", &speed, camera->getMinSpeed(), camera->getMaxSpeed(), "%.2f m/s", ImGuiSliderFlags_Logarithmic)) {
+                    camera->setSpeed(speed);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset Speed")) {
+                    camera->setSpeed(camera->getBaseSpeed());
+                }
+
+                ImGui::Text("Speed Presets:");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0.25x (Fine)")) camera->setSpeed(camera->getBaseSpeed() * 0.25f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0.5x"))        camera->setSpeed(camera->getBaseSpeed() * 0.50f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("1.0x (Default)")) camera->setSpeed(camera->getBaseSpeed());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("2.0x (Fast)")) camera->setSpeed(camera->getBaseSpeed() * 2.0f);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("4.0x (Turbo)")) camera->setSpeed(camera->getBaseSpeed() * 4.0f);
+
+                bool dynScaling = camera->isDynamicScaling();
+                if (ImGui::Checkbox("Distance-Adaptive Speed (Smooth Approach to Focus)", &dynScaling)) {
+                    camera->setDynamicScaling(dynScaling);
+                }
+
+                ImGui::TextDisabled("Focal scale: %.2f m | Target dist: %.2f m | Base speed: %.2f m/s",
+                                    camera->getSceneScale(), camera->getCurrentTargetDistance(), camera->getBaseSpeed());
+
+                float sens = camera->getSensitivity();
+                if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.02f, 0.5f, "%.2f")) {
+                    camera->setSensitivity(sens);
+                }
+
+                if (ImGui::SliderFloat("Gamepad Deadzone", &config.gamepad_deadzone, 0.02f, 0.40f, "%.2f")) {
+                    config.gamepad_deadzone = std::clamp(config.gamepad_deadzone, 0.01f, 0.50f);
+                }
+
+                float fov = camera->getFov();
+                if (ImGui::SliderFloat("Field of View", &fov, 20.0f, 100.0f, "%.1f deg")) {
+                    camera->setFov(fov);
+                    settingsChanged = true;
+                }
+
+                glm::vec3 pos = camera->getPosition();
+                ImGui::Text("Position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+                ImGui::Text("Look Angles: Yaw: %.1f deg, Pitch: %.1f deg", camera->getYaw(), camera->getPitch());
+
+                if (ImGui::Button("Focus on Center (F)", ImVec2(180.0f, 26.0f))) {
+                    camera->focusOnTarget(camera->getCentralTarget());
+                    settingsChanged = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset Camera", ImVec2(140.0f, 26.0f))) {
+                    camera->resetToDefault();
+                    settingsChanged = true;
+                }
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Enable or pause dynamic kinematic object animations (e.g. rotating reflective torus in mirror scene). Pausing enables progressive convergence.");
-            }
-            if (config.animate_objects) {
-                ImGui::Indent();
-                ImGui::SliderFloat("Animation Speed", &config.animation_speed, 0.0f, 5.0f, "%.2fx");
-                ImGui::Unindent();
+            ImGui::Spacing();
+            if (ImGui::TreeNode("Navigation Keybindings Reference")) {
+                ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
+                ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
+                ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
+                ImGui::BulletText("Ctrl (Hold): Arc-Strafe / Turntable Orbit around Target");
+                ImGui::BulletText("  -> A / D: Arc-Strafe Left / Right around Target");
+                ImGui::BulletText("  -> W / S: Dolly In / Out along Line of Sight");
+                ImGui::BulletText("  -> Space / C (or E / Q): Elevate Up / Down in Arc");
+                ImGui::BulletText("  -> Mouse: Turntable Orbit around Target");
+                ImGui::BulletText("Alt (Hold): Precision Crawl (0.25x Speed for Object Centering)");
+                ImGui::BulletText("Shift (Hold): Sprint Boost (3.0x Speed for Fast Relocation)");
+                ImGui::BulletText("F Key: Focus on Central Object");
+                ImGui::BulletText("Mouse Wheel: Continuously Scale Camera Speed");
+                ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
+                ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
+                ImGui::TreePop();
             }
         }
 
-        // 6. Diagnostics & Console Logging
+        // 6. Display & Viewport Setup
+        if (displayInfo && ImGui::CollapsingHeader("Display & Viewport Setup")) {
+            if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f, 26.0f))) {
+                if (actions) actions->toggleFullscreen = true;
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("Resolution Presets:");
+            float presetBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+            // Row 1: Native Full Display | DualUp (1280x2048)
+            std::string nativeBtnLabel = std::format("Native ({}x{})", displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : 3840,
+                                                                         displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : 2160);
+            if (ImGui::Button(nativeBtnLabel.c_str(), ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : displayInfo->usableWidth;
+                    actions->requestedHeight = displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : displayInfo->usableHeight;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("DualUp (1280x2048)", ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = 1280;
+                    actions->requestedHeight = 2048;
+                }
+            }
+
+            // Row 2: 1:1 Square (1440x1440) | FHD (1920x1080)
+            if (ImGui::Button("1:1 (1440x1440)", ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = 1440;
+                    actions->requestedHeight = 1440;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("FHD (1920x1080)", ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = 1920;
+                    actions->requestedHeight = 1080;
+                }
+            }
+
+            // Row 3: QHD (2560x1440) | 4K UHD (3840x2160)
+            if (ImGui::Button("QHD (2560x1440)", ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = 2560;
+                    actions->requestedHeight = 1440;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("4K (3840x2160)", ImVec2(presetBtnW, 26.0f))) {
+                if (actions) {
+                    actions->requestedWidth = 3840;
+                    actions->requestedHeight = 2160;
+                }
+            }
+
+            if (camera) {
+                bool adaptive = camera->isAdaptiveFov();
+                if (ImGui::Checkbox("Adaptive Aspect FOV (Auto-frame scene)", &adaptive)) {
+                    camera->setAdaptiveFov(adaptive);
+                    camera->adaptFovForAspect(aspect);
+                    settingsChanged = true;
+                }
+                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(180.0f, 26.0f))) {
+                    camera->adaptFovForAspect(aspect);
+                    settingsChanged = true;
+                }
+            }
+
+            if (stats.is_hdr_display) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("HDR Calibration:");
+                if (ImGui::SliderFloat("Peak Luminance", &config.hdr_peak_nits, 400.0f, 4000.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+                if (ImGui::SliderFloat("Paper White", &config.hdr_paper_white_nits, 80.0f, 500.0f, "%.0f nits")) {
+                    settingsChanged = true;
+                }
+            }
+
+            if (ImGui::TreeNode("Physical Display Hardware Info")) {
+                ImGui::BulletText("Device:   %s", displayInfo->displayName.c_str());
+                ImGui::BulletText("Native:   %u x %u @ %.2f Hz", displayInfo->nativeWidth, displayInfo->nativeHeight, displayInfo->refreshRate);
+                ImGui::BulletText("Usable:   %u x %u (Scale: %.2f)", displayInfo->usableWidth, displayInfo->usableHeight, displayInfo->contentScale);
+                ImGui::BulletText("Aspect:   %.3f (%s)", displayInfo->displayAspect, displayInfo->isPortrait ? "Portrait (DualUp 16:18)" : (displayInfo->isUltraWide ? "Ultrawide (21:9 / 32:9)" : "Landscape (16:9 / 16:10)"));
+                ImGui::BulletText("Color Space: %s", stats.swapchain_color_space_str.c_str());
+                ImGui::BulletText("Swap Format: %s", stats.swapchain_format_str.c_str());
+                ImGui::BulletText("HDR Mode:    %s", stats.hdr_mode_str.c_str());
+                ImGui::TreePop();
+            }
+        }
+
+        // 7. Wavefront Engine & Multi-GPU Architecture
+        if (ImGui::CollapsingHeader("Wavefront Engine & Multi-GPU Architecture")) {
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
+            int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
+            if (ImGui::RadioButton("Wavefront Path Tracing (Ray Queues & DGC)", &pipeType, 0)) {
+                config.pipeline_type = PipelineType::Wavefront;
+                settingsChanged = true;
+            }
+            if (ImGui::RadioButton("Dedicated RTP (VK_KHR_ray_tracing_pipeline) [Legacy / Benchmark]", &pipeType, 1)) {
+                config.pipeline_type = PipelineType::RTP;
+                settingsChanged = true;
+            }
+            ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
+
+            if (config.pipeline_type == PipelineType::Wavefront) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Wavefront Material Sorting:");
+                const char* sortModes[] = {
+                    "Auto (Scene & Architecture Adaptive)",
+                    "None (Monolithic Shading Kernel)",
+                    "Archetype (BSDF Buckets via Wave-Ballot)",
+                    "Dual (3D Spatial-Morton + Material Dual-Binning)"
+                };
+                int currentSort = 0;
+                if (config.wavefront_sort_mode == WavefrontSortMode::Auto) currentSort = 0;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::None) currentSort = 1;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) currentSort = 2;
+                else if (config.wavefront_sort_mode == WavefrontSortMode::Dual) currentSort = 3;
+
+                if (ImGui::Combo("Material Sort Mode##WfSort", &currentSort, sortModes, IM_ARRAYSIZE(sortModes))) {
+                    if (currentSort == 0) config.wavefront_sort_mode = WavefrontSortMode::Auto;
+                    else if (currentSort == 1) config.wavefront_sort_mode = WavefrontSortMode::None;
+                    else if (currentSort == 2) config.wavefront_sort_mode = WavefrontSortMode::Archetype;
+                    else if (currentSort == 3) config.wavefront_sort_mode = WavefrontSortMode::Dual;
+                    settingsChanged = true;
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Secondary Ray Coherency Sort:");
+                const char* secSortModes[] = {
+                    "None (Linear Unsorted Queue)",
+                    "Directional DGC (Producer-Side Binning, 8 Bins)",
+                    "Direct Coherent (Xiang 2023, 4-Lane Cluster)",
+                    "Direct Coherent (Xiang 2023, 8-Lane Cluster)"
+                };
+                int currentSecSort = 0;
+                if (config.secondary_sort_mode == SecondarySortMode::None) currentSecSort = 0;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) currentSecSort = 1;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent) currentSecSort = 2;
+                else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) currentSecSort = 3;
+
+                if (ImGui::Combo("Secondary Ray Sort##SecSort", &currentSecSort, secSortModes, IM_ARRAYSIZE(secSortModes))) {
+                    if (currentSecSort == 0) config.secondary_sort_mode = SecondarySortMode::None;
+                    else if (currentSecSort == 1) config.secondary_sort_mode = SecondarySortMode::DirectionalDGC;
+                    else if (currentSecSort == 2) config.secondary_sort_mode = SecondarySortMode::DirectCoherent;
+                    else if (currentSecSort == 3) config.secondary_sort_mode = SecondarySortMode::DirectCoherentK8;
+                    settingsChanged = true;
+                }
+
+                if (config.secondary_sort_mode == SecondarySortMode::DirectionalDGC) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 8 Dedicated Octant Sub-Queues (Zero Indirection Buffer, Contiguous)");
+                } else if (config.secondary_sort_mode == SecondarySortMode::DirectCoherent || config.secondary_sort_mode == SecondarySortMode::DirectCoherentK8) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> On-Chip Subgroup Tangent-Space Coherent Sampling (0 VRAM sorting overhead)");
+                } else {
+                    ImGui::TextDisabled("  -> Standard in-flight ray order (no sorting overhead)");
+                }
+
+                if (ImGui::Checkbox("Streamline Secondary Shading##SecShade", &config.streamline_secondary_shading)) {
+                    settingsChanged = true;
+                }
+                if (config.streamline_secondary_shading) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> 1-Sample NEE + Lambertian (Bounces >= 1, -17%% ISA footprint)");
+                } else {
+                    ImGui::TextDisabled("  -> Full 4-candidate RIS & microfacet GGX on all bounces");
+                }
+
+                if (ImGui::Checkbox("Scene-Scale Distance Clamping##DistClamp", &config.distance_clamping)) {
+                    settingsChanged = true;
+                }
+                if (config.distance_clamping) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "  -> Clamped to D_scene * 1.25 (Unit-invariant BVH early-out)");
+                } else {
+                    ImGui::TextDisabled("  -> Default static bound (10,000m)");
+                }
+            }
+
+            ImGui::Spacing();
+            if (ImGui::SliderFloat("Secondary Ray Clamping##IndClamp", &config.indirect_clamp, 0.0f, 200.0f, config.indirect_clamp <= 0.0f ? "Disabled (Unclamped)" : "%.1f cd/m²")) {
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Coarse Batch Partitioning:");
+            const char* batchModes[] = {
+                "Auto (Device Adaptive)",
+                "Monolithic (1 Batch - Full Screen)",
+                "2 Batches (2x1 Grid)",
+                "4 Batches (2x2 Grid - Optimal for 4K)",
+                "8 Batches (4x2 Grid - Bounded VRAM)",
+                "16 Batches (4x4 Grid - Ultra High-Res)"
+            };
+            int currentBatchMode = 0;
+            if (config.batch_count == 0) currentBatchMode = 0;
+            else if (config.batch_count == 1) currentBatchMode = 1;
+            else if (config.batch_count == 2) currentBatchMode = 2;
+            else if (config.batch_count == 4) currentBatchMode = 3;
+            else if (config.batch_count == 8) currentBatchMode = 4;
+            else if (config.batch_count == 16) currentBatchMode = 5;
+            else currentBatchMode = 0;
+
+            if (ImGui::Combo("Batching Mode##WfBatch", &currentBatchMode, batchModes, IM_ARRAYSIZE(batchModes))) {
+                if (currentBatchMode == 0) config.batch_count = 0;
+                else if (currentBatchMode == 1) config.batch_count = 1;
+                else if (currentBatchMode == 2) config.batch_count = 2;
+                else if (currentBatchMode == 3) config.batch_count = 4;
+                else if (currentBatchMode == 4) config.batch_count = 8;
+                else if (currentBatchMode == 5) config.batch_count = 16;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Multi-GPU Scalability Subsystem:");
+            const char* mgpuModes[] = {
+                "Single GPU (Secondary Standby)",
+                "Checkerboard Tiling (Optimal RDNA4, default)",
+                "Sample Parallelism (Temporal Sample Splitting)",
+                "Auto (SPP Adaptive)"
+            };
+            int currentMode = 0;
+            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) currentMode = 1;
+            else if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 2;
+            else if (config.mgpu_mode == MultiGpuMode::Auto) currentMode = 3;
+
+            if (ImGui::Combo("Execution Mode##MgpuMode", &currentMode, mgpuModes, IM_ARRAYSIZE(mgpuModes))) {
+                MultiGpuMode selectedMode = MultiGpuMode::Off;
+                if (currentMode == 1) selectedMode = MultiGpuMode::CheckerboardTile;
+                else if (currentMode == 2) selectedMode = MultiGpuMode::SampleParallel;
+                else if (currentMode == 3) selectedMode = MultiGpuMode::Auto;
+
+                if (actions && selectedMode != config.mgpu_mode) {
+                    actions->mgpuModeChanged = true;
+                    actions->newMgpuMode = selectedMode;
+                    actions->resetAccumulation = true;
+                }
+                config.mgpu_mode = selectedMode;
+                settingsChanged = true;
+            }
+
+            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || config.mgpu_mode == MultiGpuMode::Auto) {
+                const char* tileSizes[] = {
+                    "16x16 (Finest Interleaving)",
+                    "32x32 (Balanced Cache)",
+                    "64x64 (Optimal RDNA4 Default)",
+                    "128x128 (Maximum Ray Coherence)"
+                };
+                int currentTileIdx = 2; // default 64
+                if (config.tile_size == 16) currentTileIdx = 0;
+                else if (config.tile_size == 32) currentTileIdx = 1;
+                else if (config.tile_size == 64) currentTileIdx = 2;
+                else if (config.tile_size == 128) currentTileIdx = 3;
+
+                if (ImGui::Combo("Tile Size##MgpuTile", &currentTileIdx, tileSizes, IM_ARRAYSIZE(tileSizes))) {
+                    uint32_t chosenSize = 64;
+                    if (currentTileIdx == 0) chosenSize = 16;
+                    else if (currentTileIdx == 1) chosenSize = 32;
+                    else if (currentTileIdx == 2) chosenSize = 64;
+                    else if (currentTileIdx == 3) chosenSize = 128;
+
+                    if (actions && chosenSize != config.tile_size) {
+                        actions->tileSizeChanged = true;
+                        actions->newTileSize = chosenSize;
+                        actions->resetAccumulation = true;
+                    }
+                    config.tile_size = chosenSize;
+                    settingsChanged = true;
+                }
+            } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
+                uint32_t currentTotalSpp = config.spp;
+                uint32_t primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
+                uint32_t secSpp = std::max(1u, currentTotalSpp / 2);
+                ImGui::TextDisabled("  Sample Split: GPU 0 = %u SPP, GPU 1 = %u SPP", primSpp, secSpp);
+            }
+
+            // Accumulation format selection
+            const char* accumFormats[] = {
+                "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
+                "RGBA32_SFLOAT (128-bit Full Float HDR)",
+                "R11G11B10_UFLOAT (32-bit Packed Float HDR) [High-Speed mGPU]"
+            };
+            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 :
+                                (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 2 : 0;
+            if (ImGui::Combo("Accumulation Format##MgpuFormat", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
+                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT :
+                                             (currentFormat == 2) ? AccumFormat::R11G11B10_UFLOAT : AccumFormat::RGBA16_SFLOAT;
+                if (actions && selectedFormat != config.accum_format) {
+                    actions->accumFormatChanged = true;
+                    actions->newAccumFormat = selectedFormat;
+                }
+                config.accum_format = selectedFormat;
+                settingsChanged = true;
+            }
+
+            // Double buffering toggle
+            if (ImGui::Checkbox("Double-Buffered Shared Memory", &config.double_buffered_shared_mem)) {
+                if (actions) {
+                    actions->doubleBufferChanged = true;
+                    actions->newDoubleBuffer = config.double_buffered_shared_mem;
+                }
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Pipelined zero-copy DMA buffers to overlap Secondary GPU execution with Primary GPU present.");
+            }
+
+            if (config.mgpu_mode != MultiGpuMode::Off) {
+                if (ImGui::Checkbox("Visualize GPU Load Split", &config.visualize_mgpu_split)) {
+                    // Changing visualization immediately updates shader push constants
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) to visually display work distribution.");
+                }
+            }
+        }
+
+        // 8. Diagnostics & Console Logging
         if (ImGui::CollapsingHeader("Diagnostics & Logging")) {
             bool loggingEnabled = (config.log_interval_sec > 0.0f);
             if (ImGui::Checkbox("Console Telemetry Output", &loggingEnabled)) {
@@ -1697,12 +1730,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 7. Interactive Actions
-        ImGui::Separator();
-        if (ImGui::Button("Reset Accumulation", ImVec2(160.0f, 30.0f))) {
-            settingsChanged = true;
-            if (actions) actions->resetAccumulation = true;
-        }
         renderMoreDataBelowIndicator("ControlPanel");
     }
     ImGui::End();

@@ -2155,7 +2155,7 @@ void Engine::clusterInstancesToMacroBlas(SceneData& scene) {
         remGpu.firstTriangle = newBlasRanges[newBIdx].firstTriangle;
         remGpu.numOpaqueTriangles = newBlasRanges[newBIdx].triangleCount;
         remGpu.materialOffset = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].materialOffset : 0;
-        remGpu.flags = 0;
+        remGpu.flags = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].flags : 0;
         newInstanceData.push_back(remGpu);
     }
 
@@ -4938,7 +4938,7 @@ void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform)
 }
 
 void Engine::updateAnimatedInstances(float frameDelta) {
-    if (!m_config.animate_objects || m_sceneData.animatedInstances.empty()) {
+    if (!m_config.animate_objects || m_config.animation_speed <= 0.0001f || m_sceneData.animatedInstances.empty()) {
         return;
     }
 
@@ -5638,15 +5638,18 @@ void Engine::renderFrame() {
     if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
         animDt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
     }
-    bool wasAnimating = m_config.animate_objects && !m_sceneData.animatedInstances.empty();
-    updateAnimatedInstances(animDt);
-    bool instanceMovedThisFrame = wasAnimating && (m_totalFramesRendered > 0);
+    bool isAnimating = m_config.animate_objects && (m_config.animation_speed > 0.0001f) && !m_sceneData.animatedInstances.empty();
+    if (isAnimating) {
+        updateAnimatedInstances(animDt);
+    }
+    bool instanceMovedThisFrame = isAnimating && (m_totalFramesRendered > 0);
+    bool instanceJustStopped = (!isAnimating && m_instanceMovedLastFrame);
 
-    // Reset accumulation if camera moved, camera just came to a stop, instance moved, or UI settings changed
+    // Reset accumulation if camera moved, camera just came to a stop, dynamic instances moved/stopped, or UI settings changed
     bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion || pathMoving);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
-    bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || hardReset;
+    bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || instanceJustStopped || hardReset;
     if (accumReset || cameraMovedThisFrame) {
         m_dynamicWavefrontBounces = m_config.max_bounces;
     }
@@ -5657,6 +5660,7 @@ void Engine::renderFrame() {
     }
     if (!sceneLoadingActive) {
         m_cameraMovedLastFrame = cameraMovedThisFrame;
+        m_instanceMovedLastFrame = isAnimating;
     }
 
     if (m_governor) {
@@ -5681,14 +5685,17 @@ void Engine::renderFrame() {
         activeBounces = std::min(activeBounces, m_governor->getState().currentBounces);
     }
     bool accumReachedCutoff = (m_config.progressive_accumulation &&
+                               !isAnimating &&
                                m_config.max_accum_frames > 0 &&
                                m_accumulatedSamples >= m_config.max_accum_frames);
     bool skipRayTracing = accumReachedCutoff || sceneLoadingActive;
     m_accumulationComplete = accumReachedCutoff;
     m_slotSkippedRayTracing[m_currentFrame] = skipRayTracing;
-    if (m_config.progressive_accumulation) {
+    if (m_config.progressive_accumulation && !isAnimating) {
         if (!skipRayTracing) {
-            m_accumulatedSamples++;
+            if (m_config.max_accum_frames == 0 || m_accumulatedSamples < m_config.max_accum_frames) {
+                m_accumulatedSamples++;
+            }
         }
     } else {
         m_accumulatedSamples = 1;
@@ -7640,6 +7647,7 @@ FrameStats Engine::getStats() const {
     stats.total_samples = m_accumulatedSamples;
     stats.max_accum_frames = m_config.max_accum_frames;
     stats.accumulation_complete = m_accumulationComplete;
+    stats.is_animating = m_config.animate_objects && (m_config.animation_speed > 0.0001f) && !m_sceneData.animatedInstances.empty();
     stats.validation_errors = m_context->getValidationErrors();
 
     stats.is_scene_loading = m_isSceneLoading.load() || m_pendingSceneChange;
@@ -8480,16 +8488,13 @@ void Engine::printExecutionSummary() const {
             for (const auto& b : bounces) {
                 double pct = (primaryRays > 0) ? (100.0 * static_cast<double>(b.nextCount) / primaryRays) : 0.0;
                 std::string shadowStr = (b.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms", b.shadowMs)
-                                      : (inlineShadowsActive ? "Shadow: Inline" : "Shadow: 0.000 ms");
-                if (b.intersectMs > 0.0001) {
-                    Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | {} | Gap3: {:.3f}ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.gapBeforeShadeMs, b.shadeMs, b.gapBeforeShadowMs, shadowStr, b.gapBeforeIntersectMs, b.intersectMs, b.totalMs,
-                                 formatRayCount(b.nextCount), pct);
-                } else {
-                    Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | {} (Total: {:.3f} ms) | {} rays left ({:.1f}%)",
-                                 b.bounce, b.gapBeforeShadeMs, b.shadeMs, b.gapBeforeShadowMs, shadowStr, b.totalMs,
-                                 formatRayCount(b.nextCount), pct);
-                }
+                                      : (inlineShadowsActive ? "Shadow: Inline  " : "Shadow: 0.000 ms");
+                std::string intersectStr = (b.intersectMs > 0.0001) ? std::format("Intersect: {:.3f} ms", b.intersectMs)
+                                                                    : "Intersect:   None  ";
+                Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | {} | Gap3: {:.3f}ms | {} (Total: {:.3f} ms) | {:>10} rays left ({:4.1f}%)",
+                             b.bounce, b.gapBeforeShadeMs, b.shadeMs, b.gapBeforeShadowMs, shadowStr,
+                             b.gapBeforeIntersectMs, intersectStr, b.totalMs,
+                             formatRayCount(b.nextCount), pct);
             }
             if (tally.getAvgTailMegakernelMs() > 0.0005) {
                 Logger::info("      - Tail Megakernel (Bounces {}..{}): {:.3f} ms",
