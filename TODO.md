@@ -114,3 +114,34 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
   - [ ] **Regression & Performance Validation**:
     - Create reference test scene with Stanford Lucy or subsurface sphere/wax model.
     - Validate energy conservation, multi-GPU split-frame consistency, and ensure zero regression on standard opaque/dielectric pipelines.
+
+---
+
+## Interactive Dynamics & Physics Simulation Roadmap
+
+### 8. Rigid-Body Physics Engine Integration (Box3D) & Dynamic Bouncing Balls Showcase
+- [ ] **Status:** Proposed / Architectural Design Phase
+- [ ] **Target Component:** `src/physics/` (new), `src/core/Engine.cpp`, `src/scene/ProceduralScene.cpp`, CMake build system
+- [ ] **Objective:** Integrate Erin Catto's **Box3D** (C17 3D rigid-body engine) to drive dynamic physical simulations in real-time, showcasing hardware ray-traced reflections, caustics, and shadows across hundreds of colliding rigid bodies.
+- [ ] **Showcase Scene Concept ("Cornell Box Physics Sandbox"):**
+  - An empty Cornell box enclosure featuring a transparent fourth wall (smooth dielectric glass panel, IOR ~1.5) facing the camera.
+  - A dynamic bucket / hopper mechanism or initial cluster that dumps dozens/hundreds of reflective/dielectric bouncing spheres into the box.
+  - Real-time simulation of rigid-body gravity, ball-to-ball and ball-to-boundary collisions, restitution, rolling friction, and resting contact.
+- [ ] **Architectural Assessment & Integration Requirements:**
+  - **Decoupled Fixed-Timestep Loop:**
+    - Drive Box3D using a deterministic fixed sub-stepping loop (`FIXED_TIMESTEP = 1.0f / 60.0f` or `120.0f`) with a wall-clock accumulator (`timeAccumulator += frameDelta`) in `Engine::renderFrame()`, avoiding simulation instability across variable path-tracing frame rates.
+    - Interpolate body transforms ($X_{\text{render}} = \text{lerp}(X_{\text{prev}}, X_{\text{curr}}, \alpha)$) for smooth rendering.
+  - **TLAS Refit & Instancing Pipeline:**
+    - Leverage Pathways' existing Tier-3 GPU-timeline TLAS refit infrastructure (`m_tlasInputInstancesBuffer`, `update_tlas_instances.comp`, and `recordBuildTLAS(..., updateMode=true)`).
+    - Map rigid body positions/orientations directly into `ASInstanceGPUData::transform` each frame without reallocating or rebuilding BLAS geometry.
+    - BLAS Prototype: Single shared unit-sphere BLAS (or procedural `SphereGPU` primitives) instanced $N$ times across the TLAS.
+  - **Light Transport & Temporal Denoising with Dense Dynamic Objects:**
+    - Real-time accumulation policy: Reset accumulation or evaluate 1-SPP real-time mode with Upways / FSR 3.1 neural reconstruction.
+    - Caustics & Specular Reflections: Dynamic caustic photon tracing (`caustic_photon_trace.comp`) and high-specular bounces inside the transparent enclosure.
+- [ ] **Tasks & Implementation Steps:**
+  - [ ] Add `box3d` as a submodule or third-party C17 library in `third_party/box3d`.
+  - [ ] Implement `PhysicsWorld` wrapper encapsulating Box3D world initialization, rigid bodies, shapes (sphere, box, plane), and simulation stepping.
+  - [ ] Implement `createPhysicsCornellBoxScene()` in `ProceduralScene.cpp` with glass fourth wall and sphere prototype instances.
+  - [ ] Wire fixed-timestep update in `Engine::renderFrame()` to sync Box3D body transforms into `Engine::updateInstanceTransform()`.
+  - [ ] Add ImGui controls in `GuiManager` for physics reset, ball spawn rate, gravity, and restitution.
+

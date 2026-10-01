@@ -338,6 +338,9 @@ void Config::printUsage(const char* progName) {
               << "  --camera-path <file>    Follow space/time camera trajectory JSON (waypoints/Catmull-Rom/Bezier)\n"
               << "  --camera-path-loop      Loop camera trajectory continuously\n"
               << "  --camera-path-speed <float> Speed multiplier for camera path playback (default: 1.0)\n"
+              << "  --animate               Enable dynamic scene object animations [default: enabled]\n"
+              << "  --no-animate            Disable scene object animations (freeze pose)\n"
+              << "  --anim-speed <float>    Animation playback speed multiplier (default: 1.0)\n"
               << "  --gamepad-deadzone <float> Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)\n"
               << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
               << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
@@ -1070,6 +1073,22 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--camera-path-speed=")) {
             cfg.camera_path_speed = std::max(std::stof(arg.substr(arg.find('=') + 1)), 0.01f);
+            continue;
+        }
+        if (arg == "--animate") {
+            cfg.animate_objects = true;
+            continue;
+        }
+        if (arg == "--no-animate") {
+            cfg.animate_objects = false;
+            continue;
+        }
+        if ((arg == "--anim-speed" || arg == "--animation-speed") && i + 1 < argc) {
+            cfg.animation_speed = std::max(0.0f, std::stof(argv[++i]));
+            continue;
+        }
+        if (arg.starts_with("--anim-speed=") || arg.starts_with("--animation-speed=")) {
+            cfg.animation_speed = std::max(0.0f, std::stof(arg.substr(arg.find('=') + 1)));
             continue;
         }
         if (arg == "--adaptive-speed" || arg == "--distance-adaptive-speed") {

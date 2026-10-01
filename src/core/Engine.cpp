@@ -924,7 +924,7 @@ void Engine::createAccelerationStructures() {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing Multi-BLAS TLAS build failed.");
         }
-        initTlasBuffers(static_cast<uint32_t>(asInstances.size()));
+        initTlasBuffers(asInstances);
         Logger::info("Hardware Ray Tracing Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
                      m_blases.size(), asInstances.size());
     } else {
@@ -1028,7 +1028,7 @@ void Engine::createAccelerationStructures() {
         if (!m_tlas) {
             throw std::runtime_error("Hardware Ray Tracing TLAS build failed.");
         }
-        initTlasBuffers(static_cast<uint32_t>(asInstances.size()));
+        initTlasBuffers(asInstances);
         Logger::info("Hardware Ray Tracing Acceleration Structures initialized successfully (Monolithic {} BLASes & {} TLAS Instances).",
                      m_blases.size(), asInstances.size());
     }
@@ -4692,8 +4692,9 @@ void Engine::updateMergeDescriptors() {
     }
 }
 
-void Engine::initTlasBuffers(uint32_t instanceCount) {
-    if (!m_asManager || instanceCount == 0) return;
+void Engine::initTlasBuffers(const std::vector<ASInstanceInput>& asInstances) {
+    if (!m_asManager || asInstances.empty()) return;
+    uint32_t instanceCount = static_cast<uint32_t>(asInstances.size());
     m_tlasInstanceCount = instanceCount;
     VmaAllocator allocator = m_context->getAllocator();
     VkDevice device = m_context->getDevice();
@@ -4705,7 +4706,9 @@ void Engine::initTlasBuffers(uint32_t instanceCount) {
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        64
     );
 
     // 2. Host-visible GPU Instance Data Buffer (96 bytes per ASInstanceGPUData)
@@ -4733,19 +4736,39 @@ void Engine::initTlasBuffers(uint32_t instanceCount) {
         );
     }
 
-    // 4. Initialize instance 0 with default transform and BLAS address
-    VkDeviceAddress defaultBlasAddr = !m_blases.empty() ? m_blases[0]->getDeviceAddress() : (m_blas ? m_blas->getDeviceAddress() : 0);
-    if (defaultBlasAddr != 0 && m_tlasInputInstancesBuffer) {
-        ASInstanceGPUData initData{};
-        initData.transform = glm::mat4(1.0f);
-        initData.customIndex = 0;
-        initData.mask = 0xFF;
-        initData.hitGroupId = 0;
-        initData.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        initData.blasAddress = defaultBlasAddr;
-        initData.pad0 = 0;
-        initData.pad1 = 0;
-        m_tlasInputInstancesBuffer->copyFrom(&initData, sizeof(ASInstanceGPUData));
+    // 4. Initialize both instance buffers with their exact transforms, BLAS addresses, and metadata
+    if (m_tlasInputInstancesBuffer) {
+        std::vector<ASInstanceGPUData> initData(instanceCount);
+        for (uint32_t i = 0; i < instanceCount; ++i) {
+            initData[i].transform = asInstances[i].transform;
+            initData[i].customIndex = asInstances[i].customIndex;
+            initData[i].mask = asInstances[i].mask;
+            initData[i].hitGroupId = asInstances[i].hitGroupId;
+            initData[i].flags = asInstances[i].flags;
+            initData[i].blasAddress = asInstances[i].blasAddress;
+            initData[i].pad0 = 0;
+            initData[i].pad1 = 0;
+        }
+        m_tlasInputInstancesBuffer->copyFrom(initData.data(), sizeof(ASInstanceGPUData) * instanceCount);
+    }
+
+    if (m_tlasInstanceBuffer) {
+        std::vector<VkAccelerationStructureInstanceKHR> vkInstances(instanceCount);
+        for (uint32_t i = 0; i < instanceCount; ++i) {
+            VkTransformMatrixKHR vkTransform{};
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    vkTransform.matrix[r][c] = asInstances[i].transform[c][r];
+                }
+            }
+            vkInstances[i].transform = vkTransform;
+            vkInstances[i].instanceCustomIndex = asInstances[i].customIndex;
+            vkInstances[i].mask = asInstances[i].mask;
+            vkInstances[i].instanceShaderBindingTableRecordOffset = asInstances[i].hitGroupId;
+            vkInstances[i].flags = asInstances[i].flags;
+            vkInstances[i].accelerationStructureReference = asInstances[i].blasAddress;
+        }
+        m_tlasInstanceBuffer->copyFrom(vkInstances.data(), instanceBufferSize);
     }
 
     // 5. Update descriptor set if already created
@@ -4770,6 +4793,17 @@ void Engine::initTlasBuffers(uint32_t instanceCount) {
 
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
+}
+
+void Engine::initTlasBuffers(uint32_t instanceCount) {
+    std::vector<ASInstanceInput> dummy(instanceCount);
+    VkDeviceAddress defaultBlasAddr = !m_blases.empty() ? m_blases[0]->getDeviceAddress() : (m_blas ? m_blas->getDeviceAddress() : 0);
+    for (uint32_t i = 0; i < instanceCount; ++i) {
+        dummy[i].blasAddress = defaultBlasAddr;
+        dummy[i].transform = glm::mat4(1.0f);
+        dummy[i].customIndex = i;
+    }
+    initTlasBuffers(dummy);
 }
 
 void Engine::initTlasUpdatePipeline() {
@@ -4888,6 +4922,9 @@ void Engine::recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode) {
 }
 
 void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform) {
+    if (index < m_sceneData.instances.size()) {
+        m_sceneData.instances[index].transform = transform;
+    }
     if (!m_tlasInputInstancesBuffer || index >= m_tlasInstanceCount) {
         return;
     }
@@ -4897,6 +4934,31 @@ void Engine::updateInstanceTransform(uint32_t index, const glm::mat4& transform)
         std::memcpy(static_cast<char*>(mapped) + offset, &transform, sizeof(glm::mat4));
         vmaFlushAllocation(m_context->getAllocator(), m_tlasInputInstancesBuffer->getAllocation(), offset, sizeof(glm::mat4));
         m_tlasNeedsGpuUpdate = true;
+    }
+}
+
+void Engine::updateAnimatedInstances(float frameDelta) {
+    if (!m_config.animate_objects || m_sceneData.animatedInstances.empty()) {
+        return;
+    }
+
+    // Fixed timestep accumulator (Fix-Your-Timestep decoupled from display rate)
+    float effectiveDelta = std::min(frameDelta, 0.1f) * m_config.animation_speed;
+    m_simAccumulator += effectiveDelta;
+    while (m_simAccumulator >= SIMULATION_FIXED_TIMESTEP) {
+        m_simTime += SIMULATION_FIXED_TIMESTEP;
+        m_simAccumulator -= SIMULATION_FIXED_TIMESTEP;
+    }
+
+    float alpha = m_simAccumulator / SIMULATION_FIXED_TIMESTEP;
+    float renderTime = m_simTime + alpha * SIMULATION_FIXED_TIMESTEP;
+
+    for (const auto& anim : m_sceneData.animatedInstances) {
+        if (anim.instanceIndex >= m_tlasInstanceCount) continue;
+        float angle = renderTime * anim.rotationSpeed;
+        glm::mat4 rotation = glm::rotate(glm::mat4(1.0f), angle, anim.rotationAxis);
+        glm::mat4 transform = glm::translate(glm::mat4(1.0f), anim.basePosition) * rotation * anim.baseTransform;
+        updateInstanceTransform(anim.instanceIndex, transform);
     }
 }
 
@@ -5571,11 +5633,20 @@ void Engine::renderFrame() {
         m_videoDecoder->update(dt);
     }
 
-    // Reset accumulation if camera moved, camera just came to a stop, or UI settings changed
+    // Advance dynamic kinematic object animations
+    float animDt = 1.0f / 60.0f;
+    if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
+        animDt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
+    }
+    bool wasAnimating = m_config.animate_objects && !m_sceneData.animatedInstances.empty();
+    updateAnimatedInstances(animDt);
+    bool instanceMovedThisFrame = wasAnimating && (m_totalFramesRendered > 0);
+
+    // Reset accumulation if camera moved, camera just came to a stop, instance moved, or UI settings changed
     bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion || pathMoving);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
-    bool accumReset = cameraMovedThisFrame || cameraJustStopped || hardReset;
+    bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || hardReset;
     if (accumReset || cameraMovedThisFrame) {
         m_dynamicWavefrontBounces = m_config.max_bounces;
     }

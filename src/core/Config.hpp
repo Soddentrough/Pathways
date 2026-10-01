@@ -179,6 +179,8 @@ struct Config {
     std::string camera_path = "";  // Path to camera trajectory JSON file (waypoints, Catmull-Rom, Bézier)
     bool camera_path_loop = false; // Loop camera path indefinitely
     float camera_path_speed = 1.0f; // Speed multiplier for camera path playback
+    bool animate_objects = true;   // Animate dynamic scene objects (e.g. rotating torus in mirror scene)
+    float animation_speed = 1.0f;  // Global animation playback speed multiplier
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
     bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test

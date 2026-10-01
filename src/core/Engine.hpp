@@ -181,11 +181,18 @@ private:
     VkDescriptorSet m_updateTlasDescSet = VK_NULL_HANDLE;
     VkPipelineLayout m_updateTlasPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_updateTlasPipeline = VK_NULL_HANDLE;
+    void initTlasBuffers(const std::vector<ASInstanceInput>& asInstances);
     void initTlasBuffers(uint32_t instanceCount);
     void initTlasUpdatePipeline();
     void recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode = true);
     void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
     void markTlasDirty() { m_tlasNeedsGpuUpdate = true; }
+
+    // Decoupled Simulation & Animation Timing (Fix-Your-Timestep)
+    static constexpr float SIMULATION_FIXED_TIMESTEP = 1.0f / 60.0f; // 60 Hz fixed tick
+    float m_simAccumulator = 0.0f;
+    float m_simTime = 0.0f;
+    void updateAnimatedInstances(float frameDelta);
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;

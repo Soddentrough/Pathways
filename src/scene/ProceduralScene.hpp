@@ -82,6 +82,14 @@ struct SceneInstance {
     uint32_t customIndex = 0;
 };
 
+struct AnimatedInstance {
+    uint32_t instanceIndex = 0;
+    glm::vec3 basePosition = glm::vec3(0.0f);
+    glm::vec3 rotationAxis = glm::vec3(0.0f, 1.0f, 0.0f);
+    float rotationSpeed = 0.8f; // radians per second
+    glm::mat4 baseTransform = glm::mat4(1.0f);
+};
+
 struct SceneData {
     std::vector<TriangleGPU> triangles;
     std::vector<SphereGPU> spheres;
@@ -96,6 +104,7 @@ struct SceneData {
     std::vector<BlasGeometryRange> blasRanges; // If empty, monolithic single-BLAS is used
     std::vector<SceneInstance> instances;      // If empty, 1 identity instance is generated
     std::vector<InstanceGPU> instanceData;     // Uploaded to InstancesBuffer (binding 30)
+    std::vector<AnimatedInstance> animatedInstances; // Dynamic kinematic animators
 
     bool hasCamera = false;
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);
