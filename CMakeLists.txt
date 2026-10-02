@@ -307,7 +307,7 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
             endif()
         endif()
         if(TARGET usd_m)
-            set_target_properties(usd_m PROPERTIES INTERFACE_LINK_LIBRARIES "TBB::tbb")
+            set_target_properties(usd_m PROPERTIES INTERFACE_LINK_LIBRARIES "")
             get_target_property(_usd_dirs usd_m INTERFACE_INCLUDE_DIRECTORIES)
             if(_usd_dirs)
                 list(FILTER _usd_dirs EXCLUDE REGEX "rav1e|svt-av1|libvmaf")
