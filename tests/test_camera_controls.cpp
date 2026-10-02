@@ -634,11 +634,11 @@ int main() {
         assert_near(cfgSensEq.gamepad_sensitivity, 2.50f, 0.001f, "Config parses --gamepad-sensitivity=");
         check_true(!cfgSensEq.gamepad_invert_y, "Config parses --no-gamepad-invert-y");
 
-        constexpr float BASE_GAMEPAD_YAW_SPEED = 540.0f;   // 3x faster turning rate
-        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // smooth vertical look rate
+        constexpr float BASE_GAMEPAD_YAW_SPEED = 400.0f;   // direct turning rate (deg/s)
+        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // smooth vertical look rate (deg/s)
         float scaledYawSpeed = BASE_GAMEPAD_YAW_SPEED * std::clamp(cfgSens.gamepad_sensitivity, 0.10f, 5.00f);
         float scaledPitchSpeed = BASE_GAMEPAD_PITCH_SPEED * std::clamp(cfgSens.gamepad_sensitivity, 0.10f, 5.00f);
-        assert_near(scaledYawSpeed, 540.0f * 1.75f, 0.01f, "Sensitivity 1.75 scales 540 deg/s yaw to 945 deg/s");
+        assert_near(scaledYawSpeed, 400.0f * 1.75f, 0.01f, "Sensitivity 1.75 scales 400 deg/s yaw to 700 deg/s");
         assert_near(scaledPitchSpeed, 240.0f * 1.75f, 0.01f, "Sensitivity 1.75 scales 240 deg/s pitch to 420 deg/s");
 
         float pitchDirInverted = cfgSens.gamepad_invert_y ? -1.0f : 1.0f;
@@ -646,6 +646,16 @@ int main() {
 
         float pitchDirStandard = cfgSensEq.gamepad_invert_y ? -1.0f : 1.0f;
         assert_near(pitchDirStandard, 1.0f, 0.0001f, "Standard Y yields positive pitch factor (stick UP = look UP)");
+
+        // 23e. Direct processGamepadLook unit verification (degrees independent of mouse sensitivity)
+        Camera gamepadCam(glm::vec3(0.0f, 1.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        float yawBefore = gamepadCam.getYaw();
+        gamepadCam.processGamepadLook(90.0f, 0.0f);
+        assert_near(gamepadCam.getYaw(), yawBefore + 90.0f, 0.01f, "processGamepadLook rotates yaw by exactly 90 degrees");
+
+        float pitchBefore = gamepadCam.getPitch();
+        gamepadCam.processGamepadLook(0.0f, -45.0f);
+        assert_near(gamepadCam.getPitch(), pitchBefore + 45.0f, 0.01f, "processGamepadLook elevates pitch by exactly +45 degrees");
 
         // 23e. Gamepad bumper vertical elevation simulation
         Camera bumperCam(glm::vec3(0.0f, 10.0f, 0.0f), glm::vec3(0.0f, 10.0f, -1.0f), 45.0f, 16.0f / 9.0f);

@@ -57,6 +57,7 @@ public:
     void processKeyboard(char direction, float deltaTime);
     void processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl = false, bool arcStrafe = false, bool applyDynamicScaling = true, float analogSpeedScale = 1.0f);
     void processMouseMovement(float xoffset, float yoffset, bool orbit = false);
+    void processGamepadLook(float yawDegrees, float pitchDegrees, bool orbit = false);
 
     // Arc-strafe / Orbit controls
     void startOrbit(glm::vec3 pivot);

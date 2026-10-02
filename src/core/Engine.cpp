@@ -5421,13 +5421,18 @@ void Engine::updateInput() {
     bool applyDynamicScaling = kbdMoving;
 
     if (std::abs(m_gamepadRightX) > 0.05f || std::abs(m_gamepadRightY) > 0.05f) {
-        constexpr float BASE_GAMEPAD_YAW_SPEED = 540.0f; // degrees per second (~3x faster turning)
-        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // degrees per second
+        constexpr float BASE_GAMEPAD_YAW_SPEED = 400.0f; // degrees per second direct rate
+        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // degrees per second direct rate
         float sensitivity = std::clamp(m_config.gamepad_sensitivity, 0.10f, 5.00f);
         float yawSpeed = BASE_GAMEPAD_YAW_SPEED * sensitivity;
         float pitchSpeed = BASE_GAMEPAD_PITCH_SPEED * sensitivity;
         float pitchDir = m_config.gamepad_invert_y ? -1.0f : 1.0f;
-        m_camera->processMouseMovement(m_gamepadRightX * yawSpeed * dt, pitchDir * m_gamepadRightY * pitchSpeed * dt, ctrl);
+
+        // Smooth ergonomic response curve: slight exponent for fine center control + fast turn at edge
+        float rx = std::copysign(std::pow(std::abs(m_gamepadRightX), 1.25f), m_gamepadRightX);
+        float ry = std::copysign(std::pow(std::abs(m_gamepadRightY), 1.25f), m_gamepadRightY);
+
+        m_camera->processGamepadLook(rx * yawSpeed * dt, pitchDir * ry * pitchSpeed * dt, ctrl);
     }
 
     m_camera->processFpsInput(forward, strafe, vertical, dt, sprint, crawl, ctrl, applyDynamicScaling, analogSpeedScale);

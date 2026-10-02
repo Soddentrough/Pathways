@@ -403,6 +403,51 @@ void Camera::processMouseMovement(float xoffset, float yoffset, bool orbit) {
     m_moved = true;
 }
 
+void Camera::processGamepadLook(float yawDegrees, float pitchDegrees, bool orbit) {
+    if (std::abs(yawDegrees) < 0.0001f && std::abs(pitchDegrees) < 0.0001f) {
+        return;
+    }
+
+    if (orbit && m_orbiting) {
+        glm::vec3 r = m_position - m_orbitPivot;
+        float currentDist = glm::length(r);
+        if (currentDist < 0.01f) {
+            r = -m_front * std::max(m_orbitRadius, 0.5f);
+        }
+
+        // Orbit horizontally
+        float angleH = -glm::radians(yawDegrees);
+        glm::mat4 rotY = glm::rotate(glm::mat4(1.0f), angleH, m_worldUp);
+        r = glm::vec3(rotY * glm::vec4(r, 0.0f));
+
+        // Orbit vertically
+        float angleV = glm::radians(pitchDegrees);
+        glm::mat4 rotRight = glm::rotate(glm::mat4(1.0f), angleV, m_right);
+        glm::vec3 candidateR = glm::vec3(rotRight * glm::vec4(r, 0.0f));
+
+        glm::vec3 candDir = glm::normalize(candidateR);
+        float pitchRad = std::asin(std::clamp(candDir.y, -0.996f, 0.996f));
+        if (std::abs(glm::degrees(pitchRad)) <= 85.0f) {
+            r = candidateR;
+        }
+
+        m_position = m_orbitPivot + r;
+        glm::vec3 dir = glm::normalize(m_orbitPivot - m_position);
+        m_pitch = glm::degrees(std::asin(std::clamp(dir.y, -0.999f, 0.999f)));
+        m_yaw = glm::degrees(std::atan2(dir.z, dir.x));
+        updateVectors();
+        m_moved = true;
+        return;
+    }
+
+    m_yaw += yawDegrees;
+    m_pitch -= pitchDegrees;
+
+    m_pitch = std::clamp(m_pitch, -89.0f, 89.0f);
+    updateVectors();
+    m_moved = true;
+}
+
 glm::mat4 Camera::getViewMatrix() const {
     return glm::lookAt(m_position, m_position + m_front, m_up);
 }
