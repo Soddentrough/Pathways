@@ -388,45 +388,13 @@ void main() {
             imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
             imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, 0.0, 0.0));
 
-            // Extended ML / FSR 3.1 Specular Virtual Motion & Disparity
-            // Strictly gated to active ML upscaling or capture passes (pc.captureMlData != 0)
-            // to avoid tracing a redundant secondary hardware ray query across all primary pixels.
+            // Extended ML / FSR 3.1 Specular Virtual Motion & Disparity Baseline
+            // Secondary specular reflections are asynchronously captured during wavefront Bounce 1
+            // without blocking primary classification on synchronous inline ray queries.
             if (pc.captureMlData != 0u) {
-                vec2 vSpecular = vSurface;
-                float dHit = 10000.0;
-
-                if (closestTri >= 0 || closestSphere >= 0) {
-                    vec3 primaryHitPoint = origin + direction * closestT;
-                    vec3 reflDir = reflect(direction, hitNormal);
-
-                    rayQueryEXT rqSpec;
-                    rayQueryInitializeEXT(rqSpec, topLevelAS,
-                                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                                          0xFF, primaryHitPoint + hitNormal * EPSILON, EPSILON, reflDir, 10000.0);
-                    rayQueryProceedEXT(rqSpec);
-                    if (rayQueryGetIntersectionTypeEXT(rqSpec, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-                        float specT = rayQueryGetIntersectionTEXT(rqSpec, true);
-                        vec3 specHitPt = primaryHitPoint + reflDir * specT;
-                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specHitPt, 1.0);
-                        vec4 specPrevClip = ubo.prevViewProj * vec4(specHitPt, 1.0);
-                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                        }
-                        dHit = specT;
-                    } else {
-                        vec3 specSkyPt = primaryHitPoint + reflDir * 1000.0;
-                        vec4 specCurrClip = ubo.unjitteredViewProj * vec4(specSkyPt, 1.0);
-                        vec4 specPrevClip = ubo.prevViewProj * vec4(specSkyPt, 1.0);
-                        if (specCurrClip.w > 1e-4 && specPrevClip.w > 1e-4) {
-                            vSpecular = (specCurrClip.xy / specCurrClip.w - specPrevClip.xy / specPrevClip.w) * 0.5;
-                        }
-                        dHit = 10000.0;
-                    }
-                }
-
-                float dSpec = 1.0 / (1.0 + max(dHit, 0.0));
+                float dSpec = 1.0 / (1.0 + max(primaryDepth, 0.0));
                 imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, roughnessVal));
-                imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSpecular, dSpec, 0.0));
+                imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, dSpec, 0.0));
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
                 imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, metallicVal));
             }

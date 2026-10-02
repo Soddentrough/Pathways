@@ -415,7 +415,7 @@ glm::mat4 Camera::getProjectionMatrix() const {
 
 CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags,
                                      bool enableTaa, uint32_t width, uint32_t height, uint32_t phaseOffset,
-                                     bool updatePrev) const {
+                                     bool updatePrev, uint32_t jitterSequenceLength) const {
     CameraUniform ubo{};
     glm::mat4 view = getViewMatrix();
     glm::mat4 proj = getProjectionMatrix();
@@ -426,7 +426,7 @@ CameraUniform Camera::getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t
     glm::vec2 ndcJitter(0.0f);
     if (enableTaa && width > 0 && height > 0) {
         flags |= (1u << 21); // bit 21: TAA active flag
-        pixelJitter = getHaltonJitter(frameIndex + phaseOffset);
+        pixelJitter = getHaltonJitter(frameIndex + phaseOffset, jitterSequenceLength);
         ndcJitter.x = (2.0f * pixelJitter.x) / static_cast<float>(width);
         ndcJitter.y = (2.0f * pixelJitter.y) / static_cast<float>(height);
 

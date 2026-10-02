@@ -399,6 +399,24 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     dispersionChannel = (flags >> 2u) & 3u;
 }
 
+// Record First-Bounce Specular Virtual Motion Vector & Disparity (VMV)
+// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage for NRD/Upways.
+#define RECORD_SPECULAR_VMV(pixelIdx, pt, hitDist, isMiss) \
+    do { \
+        if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
+            ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
+            vec3 pt_ = (pt); \
+            vec4 cClip_ = ubo.unjitteredViewProj * vec4(pt_, 1.0); \
+            vec4 pClip_ = ubo.prevViewProj * vec4(pt_, 1.0); \
+            vec2 vS_ = vec2(0.0); \
+            if (cClip_.w > 1e-4 && pClip_.w > 1e-4) { \
+                vS_ = (cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5; \
+            } \
+            float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + max(float(hitDist), 0.0))); \
+            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, 0.0)); \
+        } \
+    } while(false)
+
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
     uint dummyDisp;
     unpackRayState(s, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dummyDisp);

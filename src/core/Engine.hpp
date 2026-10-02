@@ -259,6 +259,7 @@ private:
     void runTrainingDataCapture();
     void captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp);
     void updateGamingChoreography(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName);
+    void updateCaptureCamera(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName);
 
     bool m_choreoInitialized = false;
     glm::vec3 m_choreoInitialPos{0.0f};
@@ -341,6 +342,9 @@ private:
     std::unique_ptr<ReSTIRManager> m_restirManager;
     void createReSTIRResources();
     void destroyReSTIRResources();
+    [[nodiscard]] bool isRestirActive() const noexcept {
+        return m_config.enable_restir_di && (m_numLights >= m_config.restir_min_lights);
+    }
 
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;

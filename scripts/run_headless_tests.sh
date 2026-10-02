@@ -375,8 +375,13 @@ python3 scripts/visual_regression_test.py --binary "${PATHWAYS_BIN}" --strict
 
 # 12. Test Suite 9: Visual Integrity, Accumulation Exposure Stability & Multi-GPU Seams
 echo ""
-echo "[9/9] Running Test Suite 9: Visual Integrity & Exposure Stability..."
+echo "[9/10] Running Test Suite 9: Visual Integrity & Exposure Stability..."
 python3 scripts/verify_visual_integrity.py
+
+# 13. Test Suite 10: 21-Scene 1080p/4K Single & Dual-GPU Performance Regression Matrix
+echo ""
+echo "[10/10] Running Test Suite 10: 21-Scene Performance Regression Matrix..."
+python3 scripts/verify_performance_matrix.py
 
 echo ""
 echo "=========================================================="

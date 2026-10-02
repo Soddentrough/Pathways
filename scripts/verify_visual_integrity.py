@@ -679,6 +679,204 @@ def test_breakfast_room_motion_noise():
 
     return result
 
+def test_restir_many_lights_variance_and_gating():
+    result = TestResult("ReSTIR Resampling Variance Reduction & Dynamic Light Gating")
+    print(f"\n--- Running: {result.name} ---")
+
+    # 1. Test ReSTIR Light-Gating Bypass:
+    # Scene has 64 lights. If restir_min_lights=100, ReSTIR must be bypassed and direct NEE used.
+    out_bypassed = os.path.join(OUTPUT_DIR, "many_lights_restir_bypassed.png")
+    rc, stdout, stderr = run_pathways([
+        "--scene", "many-lights",
+        "--restir",
+        "--restir-min-lights", "100",
+        "--res", "1080p",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "5",
+        "--dump-frame", out_bypassed
+    ])
+    if rc != 0:
+        result.fail(f"ReSTIR bypass run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_bypassed = cv2.imread(out_bypassed)
+    if img_bypassed is None:
+        result.fail("Failed to load output image for ReSTIR bypass test")
+        return result
+
+    st_bypassed = compute_image_stats(img_bypassed)
+    if st_bypassed["has_nan"] or st_bypassed["has_inf"]:
+        result.fail("NaN or Inf detected in ReSTIR bypass output")
+    if st_bypassed["mean_lum"] < 30.0 or st_bypassed["mean_lum"] > 200.0:
+        result.fail(f"Abnormal mean luminance in ReSTIR bypass: {st_bypassed['mean_lum']:.1f}")
+
+    print(f"  ReSTIR Bypassed (Threshold 100 > 64 Lights): MeanLum={st_bypassed['mean_lum']:.1f}, MaxLum={st_bypassed['max_lum']:.1f} (OK)")
+
+    # 2. Pure 1-SPP Analytical NEE Baseline
+    out_nee = os.path.join(OUTPUT_DIR, "many_lights_analytical_nee.png")
+    rc, stdout, stderr = run_pathways([
+        "--scene", "many-lights",
+        "--res", "1080p",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "5",
+        "--dump-frame", out_nee
+    ])
+    if rc != 0:
+        result.fail(f"Analytical NEE baseline failed with code {rc}")
+        return result
+
+    img_nee = cv2.imread(out_nee)
+    st_nee = compute_image_stats(img_nee)
+
+    # 3. Active ReSTIR DI Resampling (Wave32 LDS / Register Shuffling)
+    out_active = os.path.join(OUTPUT_DIR, "many_lights_restir_active.png")
+    rc, stdout, stderr = run_pathways([
+        "--scene", "many-lights",
+        "--restir",
+        "--restir-min-lights", "8",
+        "--res", "1080p",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "5",
+        "--dump-frame", out_active
+    ])
+    if rc != 0:
+        result.fail(f"ReSTIR active run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_active = cv2.imread(out_active)
+    if img_active is None:
+        result.fail("Failed to load output image for ReSTIR active test")
+        return result
+
+    st_active = compute_image_stats(img_active)
+
+    # Noise variance evaluation: compare Laplacian variance on direct diffuse patches (wall & floor)
+    # Patch regions avoid the 64 bright ceiling light geometric mesh edges
+    gray_nee = cv2.cvtColor(img_nee, cv2.COLOR_BGR2GRAY)
+    gray_active = cv2.cvtColor(img_active, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray_nee.shape
+    # Upper diffuse back wall (unoccluded by interior boxes): y in [0.18*h, 0.26*h], x in [0.52*w, 0.68*w]
+    patch_wall_nee = gray_nee[int(0.18*h):int(0.26*h), int(0.52*w):int(0.68*w)]
+    patch_wall_active = gray_active[int(0.18*h):int(0.26*h), int(0.52*w):int(0.68*w)]
+    patch_floor_nee = gray_nee[int(0.82*h):int(0.92*h), int(0.20*w):int(0.40*w)]
+    patch_floor_active = gray_active[int(0.82*h):int(0.92*h), int(0.20*w):int(0.40*w)]
+
+    var_wall_nee = float(np.var(cv2.Laplacian(patch_wall_nee, cv2.CV_64F)))
+    var_wall_active = float(np.var(cv2.Laplacian(patch_wall_active, cv2.CV_64F)))
+    var_floor_nee = float(np.var(cv2.Laplacian(patch_floor_nee, cv2.CV_64F)))
+    var_floor_active = float(np.var(cv2.Laplacian(patch_floor_active, cv2.CV_64F)))
+
+    noise_red_wall = var_wall_nee / max(var_wall_active, 1e-4)
+    noise_red_floor = var_floor_nee / max(var_floor_active, 1e-4)
+    best_noise_red = max(noise_red_wall, noise_red_floor)
+
+    result.record("wall_nee_var", var_wall_nee)
+    result.record("wall_restir_var", var_wall_active)
+    result.record("wall_noise_reduction", noise_red_wall)
+    result.record("floor_noise_reduction", noise_red_floor)
+
+    print(f"  Wall Patch Noise:   NEE={var_wall_nee:.2f}, ReSTIR={var_wall_active:.2f} ({noise_red_wall:.2f}x reduction)")
+    print(f"  Floor Patch Noise:  NEE={var_floor_nee:.2f}, ReSTIR={var_floor_active:.2f} ({noise_red_floor:.2f}x reduction)")
+    print(f"  ReSTIR MeanLum={st_active['mean_lum']:.1f}, MaxLum={st_active['max_lum']:.1f}, Clipped={st_active['clipped_pct']:.2f}%")
+
+    if st_active["has_nan"] or st_active["has_inf"]:
+        result.fail("Invalid output: NaN or Inf detected in ReSTIR active output")
+    if best_noise_red < 1.15:
+        result.fail(f"ReSTIR noise reduction insufficient: {best_noise_red:.2f}x < 1.15x")
+    if st_active["clipped_pct"] > 10.0:
+        result.fail(f"ReSTIR firefly blowout: Clipped highlight pixels {st_active['clipped_pct']:.2f}% > 10.0%")
+
+    return result
+
+def test_specular_vmv_integrity():
+    result = TestResult("First-Bounce Specular VMV & Secondary Reprojection Integrity")
+    print(f"\n--- Running: {result.name} ---")
+
+    vmv_dir = os.path.join(OUTPUT_DIR, "vmv_capture")
+    os.makedirs(vmv_dir, exist_ok=True)
+
+    # Run camera motion with capture-channels=23 to record specular motion vector and hit distance channels
+    rc, stdout, stderr = run_pathways([
+        "--scene", "cornell-box",
+        "--capture-training-data-dir", vmv_dir,
+        "--capture-frames", "2",
+        "--capture-reference-spp", "1",
+        "--capture-channels", "23",
+        "--capture-camera-mode", "rotate",
+        "--res", "1080p",
+        "--spp", "1"
+    ])
+    if rc != 0:
+        result.fail(f"Camera motion VMV capture failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    bin_file = os.path.join(vmv_dir, "frame_00001_input.bin")
+    if not os.path.exists(bin_file):
+        bin_file = os.path.join(vmv_dir, "frame_00000_input.bin")
+    if not os.path.exists(bin_file):
+        result.fail(f"PTTD tensor capture file not found in {vmv_dir}")
+        return result
+
+    file_size = os.path.getsize(bin_file)
+    if file_size < 64:
+        result.fail(f"PTTD file too small ({file_size} bytes)")
+        return result
+
+    import struct
+    with open(bin_file, "rb") as f:
+        header_data = f.read(64)
+        magic, ver, w, h, ch, dt, f_idx, spp, p_bytes = struct.unpack("<4sIIIIIIIQ", header_data[:40])
+
+        if magic != b"PTTD":
+            result.fail(f"Invalid PTTD magic signature: {magic}")
+            return result
+
+        raw_payload = f.read(p_bytes)
+
+    payload = np.frombuffer(raw_payload, dtype=np.float16).astype(np.float32)
+    expected_elems = w * h * ch
+    if len(payload) != expected_elems:
+        result.fail(f"Payload element count mismatch: expected {expected_elems}, got {len(payload)}")
+        return result
+
+    tensor = payload.reshape((h, w, ch))
+
+    # Channels: 12..13 surface motion, 14..15 specular motion, 19 specular hit dist
+    surf_mv_x = tensor[:, :, 12]
+    surf_mv_y = tensor[:, :, 13]
+    spec_mv_x = tensor[:, :, 14]
+    spec_mv_y = tensor[:, :, 15]
+    spec_hit_dist = tensor[:, :, 19]
+
+    # Mirror sphere region in Cornell Box: x in [0.50*w, 0.62*w], y in [0.70*h, 0.88*h]
+    mirror_region_spec_mv_x = spec_mv_x[int(0.70*h):int(0.88*h), int(0.50*w):int(0.62*w)]
+    mirror_region_spec_mv_y = spec_mv_y[int(0.70*h):int(0.88*h), int(0.50*w):int(0.62*w)]
+    mirror_region_hit_dist = spec_hit_dist[int(0.70*h):int(0.88*h), int(0.50*w):int(0.62*w)]
+
+    mean_hit_dist = float(np.mean(mirror_region_hit_dist))
+    max_hit_dist = float(np.max(mirror_region_hit_dist))
+    spec_mv_mag = float(np.mean(np.sqrt(mirror_region_spec_mv_x**2 + mirror_region_spec_mv_y**2)))
+
+    result.record("mirror_mean_hit_dist", mean_hit_dist)
+    result.record("mirror_max_hit_dist", max_hit_dist)
+    result.record("mirror_spec_mv_mag", spec_mv_mag)
+
+    print(f"  Mirror Region Specular Hit Dist: Mean={mean_hit_dist:.3f}, Max={max_hit_dist:.3f}")
+    print(f"  Mirror Region Specular Motion Mag: {spec_mv_mag:.5f}")
+
+    if np.isnan(tensor).any():
+        result.fail("NaN detected in VMV tensor payload")
+    if np.isinf(tensor).any():
+        result.fail("Inf detected in VMV tensor payload")
+    if mean_hit_dist <= 0.0:
+        result.fail(f"Specular hit distance missing / non-positive on mirror reflector: {mean_hit_dist:.3f}")
+
+    return result
+
 def main():
     print("================================================================")
     print("  Pathways Visual Integrity & Exposure Stability Test Suite     ")
@@ -703,7 +901,9 @@ def main():
         test_mgpu_tile_stability_and_seams,
         test_camera_motion_noise_stability,
         test_mgpu_tile_motion_noise,
-        test_breakfast_room_motion_noise
+        test_breakfast_room_motion_noise,
+        test_restir_many_lights_variance_and_gating,
+        test_specular_vmv_integrity
     ]
 
     all_passed = True

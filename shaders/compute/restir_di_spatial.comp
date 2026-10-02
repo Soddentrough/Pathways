@@ -115,76 +115,82 @@ void main() {
     f16vec3 diffuseAlbedo = f16vec3(mat.albedo.rgb);
     float roughness = mat.roughness;
 
-    // --- RING 0: Reciprocal / Paired Neighbor Reuse (ReSTIR PT Enhanced 2026) ---
-    // Horizontal pair within local 2x1 grid: partner is lane ^ 1
-    uint partnerLane = gl_SubgroupInvocationID ^ 1u;
-    ivec2 partnerOffset = ((gl_SubgroupInvocationID & 1u) == 0u) ? ivec2(1, 0) : ivec2(-1, 0);
-    ivec2 partnerCoord = clamp(pixelCoord + partnerOffset, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
-    uint partnerPixelIdx = uint(partnerCoord.y * int(pc.width) + partnerCoord.x);
+    // --- PHASE 1: Wave32 Subgroup-Intrinsic Spatial Reuse (Zero VRAM Traffic) ---
+    // In a 16x16 workgroup, each 32-thread wave spans a contiguous 16x2 tile.
+    // We exchange 4 adjacent orthogonal & diagonal neighbors using zero-latency register shuffles.
+    uint lane = gl_SubgroupInvocationID;
+    uint partnerLanes[4] = uint[](lane ^ 1u, lane ^ 16u, lane ^ 17u, lane ^ 2u);
+    ivec2 partnerOffsets[4] = ivec2[](
+        ivec2(((lane & 1u) == 0u) ? 1 : -1, 0),
+        ivec2(0, (lane < 16u) ? 1 : -1),
+        ivec2(((lane & 1u) == 0u) ? 1 : -1, (lane < 16u) ? 1 : -1),
+        ivec2(((lane & 2u) == 0u) ? 2 : -2, 0)
+    );
 
-    UnifiedReservoirPT rPartner = inTemporalReservoirs[partnerPixelIdx];
-    if (isValidReservoir(rPartner.flags_uv_age)) {
-        vec4 partnerNormDepth = imageLoad(uNormalDepthImage, partnerCoord);
-        vec3 partnerNorm = partnerNormDepth.xyz;
-        float partnerDepth = partnerNormDepth.w;
+    uint validSubgroupNeighbors = 0u;
+    for (int k = 0; k < 4; ++k) {
+        uint pLane = partnerLanes[k];
+        ivec2 pCoord = pixelCoord + partnerOffsets[k];
+        if (pCoord.x >= 0 && pCoord.x < int(pc.width) && pCoord.y >= 0 && pCoord.y < int(pc.height)) {
+            vec3 pNorm;
+            pNorm.x = subgroupShuffle(centerNormal.x, pLane);
+            pNorm.y = subgroupShuffle(centerNormal.y, pLane);
+            pNorm.z = subgroupShuffle(centerNormal.z, pLane);
+            float pDepth = subgroupShuffle(centerDepth, pLane);
 
-        float pNormDot = dot(centerNormal, partnerNorm);
-        float pDepthDiff = abs(centerDepth - partnerDepth) / max(centerDepth, 1e-3);
+            float pNormDot = dot(centerNormal, pNorm);
+            float pDepthDiff = abs(centerDepth - pDepth) / max(centerDepth, 1e-3);
 
-        if (pNormDot >= 0.80 && pDepthDiff <= 0.10) {
-            uint partnerPathLen = getPathLength(rPartner.flags_uv_age);
-            if (partnerPathLen == 1u /* DI */) {
-                uint pLightIdx = getLightIndex(rPartner.lightIndex_M);
-                if (pLightIdx < pc.numLights) {
-                    Light light = lights[pLightIdx];
-                    vec2 pUV = unpackUV(rPartner.flags_uv_age);
-                    float p_hat_partner = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, pUV);
-                    combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
+            if (pNormDot >= 0.80 && pDepthDiff <= 0.10) {
+                UnifiedReservoirPT rPartner;
+                rPartner.lightIndex_M = subgroupShuffle(rCenter.lightIndex_M, pLane);
+                rPartner.wSum         = subgroupShuffle(rCenter.wSum, pLane);
+                rPartner.flags_uv_age = subgroupShuffle(rCenter.flags_uv_age, pLane);
+                rPartner.targetPdf    = subgroupShuffle(rCenter.targetPdf, pLane);
+
+                if (isValidReservoir(rPartner.flags_uv_age)) {
+                    uint pPathLen = getPathLength(rPartner.flags_uv_age);
+                    if (pPathLen == 1u /* DI */) {
+                        uint pLightIdx = getLightIndex(rPartner.lightIndex_M);
+                        if (pLightIdx < pc.numLights) {
+                            Light light = lights[pLightIdx];
+                            vec2 pUV = unpackUV(rPartner.flags_uv_age);
+                            float p_hat_partner = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, pUV);
+                            combineReservoirsDI(rCenter, rPartner, p_hat_partner, seed);
+                            validSubgroupNeighbors++;
+                        }
+                    }
                 }
             }
         }
     }
 
-    // --- RINGS 1..3: Multi-Scale Concentric Ring Spatial Sampling with Compatibility Guidance ---
-    // Ring 1: Medium local neighbor (radius 2.5..8.0 px)
-    // Ring 2: Wide surface neighbor (radius 8.0..16.0 px)
-    // Ring 3: Far diffusion neighbor (radius 16.0..24.0 px)
-    // Confidence gating: when Upways neural reconstruction confidence is high (> 0.95), skip outer rings
-    // to prevent over-blurring and retain contact shadows.
-    float reconstructConfidence = imageLoad(uConfidenceImage, pixelCoord).r;
-    int maxRings = (reconstructConfidence > 0.95) ? 1 : 3;
-
-    const float RING_MIN[3] = float[](2.5,  8.0, 16.0);
-    const float RING_MAX[3] = float[](8.0, 16.0, 24.0);
-
-    for (int i = 0; i < maxRings; ++i) {
+    // --- PHASE 2: Local Fallback Spatial Sampling (Boundary & Edge Discontinuity) ---
+    // Only fetch from VRAM if fewer than 2 subgroup neighbors passed bilateral edge testing.
+    if (validSubgroupNeighbors < 2u) {
         float angle = randFloat(seed) * 6.2831853;
-        float radius = RING_MIN[i] + randFloat(seed) * (RING_MAX[i] - RING_MIN[i]);
+        float radius = 1.5 + randFloat(seed) * 2.0; // tight radius <= 3.5px for cache-line locality
         ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
         ivec2 nCoord = clamp(pixelCoord + offset, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
 
         uint nPixelIdx = uint(nCoord.y * int(pc.width) + nCoord.x);
         UnifiedReservoirPT rNeighbor = inTemporalReservoirs[nPixelIdx];
-        if (!isValidReservoir(rNeighbor.flags_uv_age)) continue;
-
-        vec4 nNormDepth = imageLoad(uNormalDepthImage, nCoord);
-        vec3 nNormal = nNormDepth.xyz;
-        float nDepth = nNormDepth.w;
-
-        // Compatibility Guidance (HPG 2026): bilateral edge-stopping
-        float normDot = dot(centerNormal, nNormal);
-        float depthDiff = abs(centerDepth - nDepth) / max(centerDepth, 1e-3);
-        if (normDot < 0.80 || depthDiff > 0.10) continue;
-
-        uint nPathLen = getPathLength(rNeighbor.flags_uv_age);
-        if (nPathLen == 1u /* DI */) {
-            uint neighborLightIdx = getLightIndex(rNeighbor.lightIndex_M);
-            if (neighborLightIdx >= pc.numLights) continue;
-
-            Light light = lights[neighborLightIdx];
-            vec2 nLuv = unpackUV(rNeighbor.flags_uv_age);
-            float p_hat_at_center = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, nLuv);
-            combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
+        if (isValidReservoir(rNeighbor.flags_uv_age)) {
+            vec4 nNormDepth = imageLoad(uNormalDepthImage, nCoord);
+            float normDot = dot(centerNormal, nNormDepth.xyz);
+            float depthDiff = abs(centerDepth - nNormDepth.w) / max(centerDepth, 1e-3);
+            if (normDot >= 0.80 && depthDiff <= 0.10) {
+                uint nPathLen = getPathLength(rNeighbor.flags_uv_age);
+                if (nPathLen == 1u /* DI */) {
+                    uint neighborLightIdx = getLightIndex(rNeighbor.lightIndex_M);
+                    if (neighborLightIdx < pc.numLights) {
+                        Light light = lights[neighborLightIdx];
+                        vec2 nLuv = unpackUV(rNeighbor.flags_uv_age);
+                        float p_hat_at_center = evalUnshadowedTargetDI(hitPoint, hitNormal, diffuseAlbedo, light, nLuv);
+                        combineReservoirsDI(rCenter, rNeighbor, p_hat_at_center, seed);
+                    }
+                }
+            }
         }
     }
 

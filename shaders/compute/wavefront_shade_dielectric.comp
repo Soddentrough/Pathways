@@ -12,6 +12,7 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 
@@ -25,6 +26,8 @@ layout(binding = 1) uniform CameraUBO {
     uint spp;
     uint maxBounces;
     uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
 } ubo;
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
@@ -196,8 +199,10 @@ void main() {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
             }
+            RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
+            RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             hitNormal = frontFace ? hitNormal : -hitNormal;
             vec2 effHitUv = hitUv;

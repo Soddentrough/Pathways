@@ -31,9 +31,10 @@ inline float halton(uint32_t index, uint32_t base) {
     return r;
 }
 
-// 8-phase Halton(2, 3) offset centered at 0
-inline glm::vec2 getHaltonJitter(uint32_t phaseIndex) {
-    uint32_t idx = (phaseIndex % 8) + 1; // 1-indexed to avoid (0, 0)
+// Halton(2, 3) offset centered at 0 with configurable sequence length
+inline glm::vec2 getHaltonJitter(uint32_t phaseIndex, uint32_t sequenceLength = 32) {
+    uint32_t seqLen = std::max(1u, sequenceLength);
+    uint32_t idx = (phaseIndex % seqLen) + 1; // 1-indexed to avoid (0, 0)
     return glm::vec2(halton(idx, 2) - 0.5f, halton(idx, 3) - 0.5f);
 }
 
@@ -112,7 +113,7 @@ public:
 
     CameraUniform getUniformData(uint32_t frameIndex, uint32_t spp, uint32_t maxBounces, uint32_t flags,
                                  bool enableTaa = false, uint32_t width = 0, uint32_t height = 0, uint32_t phaseOffset = 0,
-                                 bool updatePrev = false) const;
+                                 bool updatePrev = false, uint32_t jitterSequenceLength = 32) const;
 
     void advanceFrame();
     void updatePrevMatrices() { advanceFrame(); }

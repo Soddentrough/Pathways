@@ -57,6 +57,14 @@ enum class UpscalerMode {
     FSR1    // AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)
 };
 
+enum class CaptureCameraMode {
+    Gaming,   // Full 6-DOF multi-phase trajectory (walk, sprint, jump, twitch flick, ADS zoom, tactical scan) [Default]
+    Static,   // Camera position, orientation, and FOV completely stationary (v_cam = 0)
+    Rotate,   // Position fixed; continuous pan/tilt/roll angular view shifting
+    Translate,// Orientation fixed; continuous linear forward/lateral translation
+    Orbit     // Spherical orbit around scene bounding center
+};
+
 struct Config {
     PipelineType pipeline_type = PipelineType::Wavefront; // Default: Wavefront Path Tracing
     WavefrontSortMode wavefront_sort_mode = WavefrontSortMode::Auto; // Default: Scene & hardware adaptive sorting
@@ -158,6 +166,7 @@ struct Config {
     // ReSTIR Spatio-Temporal Reservoir Resampling
     bool enable_restir_di = false;        // Spatio-temporal reservoir resampling [Default: false, opt-in via --restir]
     uint32_t restir_di_m_cap = 30;        // Temporal history M-cap for ReSTIR (default: 30)
+    uint32_t restir_min_lights = 8;       // Minimum dynamic scene lights required to engage ReSTIR (default: 8; below this, direct NEE is mathematically superior)
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)
@@ -208,6 +217,12 @@ struct Config {
     uint32_t capture_reference_spp = 256;
     bool capture_normals = true;
     uint32_t capture_channels = 20; // 16, 19, 20, or 23 (PTTD v3 default)
+    CaptureCameraMode capture_camera_mode = CaptureCameraMode::Gaming;
+    uint32_t capture_input_width = 0;   // 0 = inherit config.width * render_scale
+    uint32_t capture_input_height = 0;  // 0 = inherit config.height * render_scale
+    uint32_t capture_ref_width = 0;     // 0 = inherit config.width
+    uint32_t capture_ref_height = 0;    // 0 = inherit config.height
+    uint32_t capture_halton_length = 32; // Halton jitter phase cycle length
 
     // Asset Ingestion & Point Instancing
     float instance_density = 1.0f; // Scale factor for point instancing (0.0 to 1.0, default: 1.0)

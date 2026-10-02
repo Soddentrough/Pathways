@@ -1037,6 +1037,12 @@ void Engine::createAccelerationStructures() {
     Logger::info("Hardware Ray Tracing Pipeline Active. Extensions in use: VK_KHR_ray_query, VK_KHR_acceleration_structure, VK_KHR_buffer_device_address, VK_KHR_deferred_host_operations (SPIR-V: GL_EXT_ray_query)");
 }
 
+static inline bool isProceduralCornellBoxPath(const std::string& path) {
+    return path.empty() || path == "__procedural_cornell_box__" ||
+           path == "cornell-box" || path == "cornell_box" ||
+           path == "procedural:cornell-box" || path == "procedural:cornell_box";
+}
+
 void Engine::initScene() {
     VmaAllocator allocator = m_context->getAllocator();
 
@@ -1089,7 +1095,11 @@ void Engine::initScene() {
     m_currentSceneIndex = 0;
 
     if (!m_config.scene_path.empty()) {
-        if (m_config.scene_path == "many-lights" || m_config.scene_path == "many_lights" || m_config.scene_path == "procedural:many-lights") {
+        if (isProceduralCornellBoxPath(m_config.scene_path)) {
+            Logger::info("Loading Procedural Cornell Box...");
+            m_sceneData = ProceduralScene::createCornellBox();
+            m_currentSceneIndex = 0;
+        } else if (m_config.scene_path == "many-lights" || m_config.scene_path == "many_lights" || m_config.scene_path == "procedural:many-lights") {
             Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
             m_sceneData = ProceduralScene::createManyLightsScene();
             m_currentSceneIndex = 1;
@@ -1469,12 +1479,6 @@ void Engine::initScene() {
     }
     Logger::info("Scene textures loaded: {} texture(s).", m_sceneTextures.size());
     initVideoBillboardDecoder(m_config.scene_path);
-}
-
-static inline bool isProceduralCornellBoxPath(const std::string& path) {
-    return path.empty() || path == "__procedural_cornell_box__" ||
-           path == "cornell-box" || path == "cornell_box" ||
-           path == "procedural:cornell-box" || path == "procedural:cornell_box";
 }
 
 void Engine::requestSceneChange(const std::string& filepath) {
@@ -2750,7 +2754,7 @@ void Engine::initPipelines() {
             if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
                 dispatchCausticSplatAndFilter(cmd, frameSlot);
             }
-            if (m_config.enable_restir_di && m_restirManager) {
+            if (isRestirActive() && m_restirManager) {
                 uint32_t rw = m_config.width;
                 uint32_t rh = m_config.height;
                 Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(frameSlot);
@@ -5862,9 +5866,9 @@ void Engine::renderFrame() {
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
+    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && isRestirActive())) flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
-    if (m_config.enable_restir_di) flags |= (1 << 9);
+    if (isRestirActive()) flags |= (1 << 9);
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_videoDecoder && m_videoDecoder->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
@@ -6091,7 +6095,7 @@ void Engine::renderFrame() {
             bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                                  m_config.upscaler_mode == UpscalerMode::Upways ||
                                  m_config.denoiser_mode == DenoiserMode::Upways ||
-                                 m_config.enable_restir_di ||
+                                 isRestirActive() ||
                                  m_config.enable_caustics);
             bool captureMl = (m_config.denoiser_mode == DenoiserMode::Upways ||
                               m_config.upscaler_mode == UpscalerMode::Upways ||
@@ -6127,7 +6131,7 @@ void Engine::renderFrame() {
                                              1e-3f, 1024);
             }
 
-            if (m_config.enable_restir_di && m_normalDepthImage && m_prevNormalDepthImage) {
+            if (isRestirActive() && m_normalDepthImage && m_prevNormalDepthImage) {
                 VkImageCopy copyRegion{};
                 copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
                 copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -6659,7 +6663,7 @@ void Engine::renderFrame() {
                 bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                                      m_config.upscaler_mode == UpscalerMode::Upways ||
                                      m_config.denoiser_mode == DenoiserMode::Upways ||
-                                     m_config.enable_restir_di ||
+                                     isRestirActive() ||
                                      m_config.enable_caustics);
                 bool captureMl = (m_config.denoiser_mode == DenoiserMode::Upways ||
                                   m_config.upscaler_mode == UpscalerMode::Upways ||
@@ -8692,8 +8696,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
     if (m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && m_config.enable_restir_di)) flags |= (1 << 7);
-    if (m_config.enable_restir_di) flags |= (1 << 9);
+    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && isRestirActive())) flags |= (1 << 7);
+    if (isRestirActive()) flags |= (1 << 9);
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
 
     VkClearColorValue clearZero{};
@@ -8773,7 +8777,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
 
             // ubo with spp = 1 so samples accumulate full unscaled radiance; enable subpixel jitter for ground truth convergence
             CameraUniform ubo = m_camera->getUniformData(wfSceneData.frameIndex, 1, activeOfflineBounces, flags,
-                                                         true, width, height, 0, /*updatePrev=*/false);
+                                                         true, width, height, 0, /*updatePrev=*/false,
+                                                         m_config.capture_halton_length);
             m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
             VkCommandBuffer cmd = m_commandBuffers[0];
@@ -8905,7 +8910,8 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
 
         // 2. Set camera UBO (advances m_prevViewProj to track true velocity)
         CameraUniform ubo = m_camera->getUniformData(frameIdx, 1, m_config.max_bounces, flags,
-                                                     false, width, height, 0, /*updatePrev=*/true);
+                                                     false, width, height, 0, /*updatePrev=*/true,
+                                                     m_config.capture_halton_length);
         m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
         // 3. Dispatch 1-SPP with captureMlData = 1
@@ -8937,7 +8943,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
 
         m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_config.max_bounces, wfSceneData);
 
-        if (m_config.capture_channels >= 23 && m_restirManager && m_numLights > 0) {
+        if (m_config.capture_channels >= 23 && m_restirManager && isRestirActive()) {
             Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(0);
             Buffer* rayHit = m_wavefrontPipeline->getRayHitQueue(0);
             Buffer* pixelToRay = m_wavefrontPipeline->getPixelToRayQueue(0);
@@ -8980,7 +8986,7 @@ void Engine::captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t 
         VkDeviceSize offsetRes = 0;
         VkDeviceSize resSize = 0;
         Buffer* resBuffer = nullptr;
-        if (outChannels >= 23 && m_restirManager) {
+        if (outChannels >= 23 && m_restirManager && isRestirActive()) {
             resBuffer = m_restirManager->getSpatialReservoirBuffer(0);
             if (resBuffer) {
                 offsetRes = totalInputStagingSize;
@@ -9344,6 +9350,83 @@ void Engine::updateGamingChoreography(Camera* camera, uint32_t frameIdx, uint32_
     camera->setFov(fov);
 }
 
+void Engine::updateCaptureCamera(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName) {
+    if (!camera) return;
+
+    if (!m_choreoInitialized) {
+        m_choreoInitialPos = camera->getPosition();
+        m_choreoInitialYaw = camera->getYaw();
+        m_choreoInitialPitch = camera->getPitch();
+        m_choreoInitialFov = camera->getFov();
+        m_choreoInitialized = true;
+        Logger::info("[Capture Camera] Initialized baseline camera at pos=({:.2f}, {:.2f}, {:.2f}), yaw={:.1f}°, pitch={:.1f}°, fov={:.1f}° for {} (Mode: {})",
+                     m_choreoInitialPos.x, m_choreoInitialPos.y, m_choreoInitialPos.z,
+                     m_choreoInitialYaw, m_choreoInitialPitch, m_choreoInitialFov, sceneName,
+                     static_cast<int>(m_config.capture_camera_mode));
+    }
+
+    if (totalFrames <= 1) return;
+
+    constexpr float PI = 3.14159265358979323846f;
+    float t = static_cast<float>(frameIdx) / static_cast<float>(totalFrames);
+
+    switch (m_config.capture_camera_mode) {
+        case CaptureCameraMode::Static: {
+            // Completely stationary camera: zero position change, zero rotation change, zero FOV change
+            camera->setPose(m_choreoInitialPos, m_choreoInitialYaw, m_choreoInitialPitch);
+            camera->setFov(m_choreoInitialFov);
+            break;
+        }
+        case CaptureCameraMode::Rotate: {
+            // Pure rotation / angular view shift: fixed position, pan yaw + tilt pitch
+            float degPerFrame = 360.0f / std::max(totalFrames, 120u);
+            float sweepYaw = degPerFrame * static_cast<float>(frameIdx);
+            float nodPitch = 5.0f * std::sin(2.0f * PI * (static_cast<float>(frameIdx) / std::max(totalFrames, 60u)));
+            camera->setPose(m_choreoInitialPos, m_choreoInitialYaw + sweepYaw, m_choreoInitialPitch + nodPitch);
+            camera->setFov(m_choreoInitialFov);
+            break;
+        }
+        case CaptureCameraMode::Translate: {
+            // Pure spatial translation: fixed orientation, forward dolly + lateral strafe
+            float radYaw = glm::radians(m_choreoInitialYaw);
+            float radPitch = glm::radians(m_choreoInitialPitch);
+            glm::vec3 forward0(
+                std::cos(radYaw) * std::cos(radPitch),
+                std::sin(radPitch),
+                std::sin(radYaw) * std::cos(radPitch)
+            );
+            forward0 = glm::normalize(forward0);
+            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+            glm::vec3 right0 = glm::normalize(glm::cross(forward0, worldUp));
+            glm::vec3 groundForward0 = glm::normalize(glm::cross(worldUp, right0));
+
+            float forwardDist = 1.8f * t;
+            float strafeDist = 0.45f * std::sin(2.0f * PI * t);
+            glm::vec3 newPos = m_choreoInitialPos + groundForward0 * forwardDist + right0 * strafeDist;
+            camera->setPose(newPos, m_choreoInitialYaw, m_choreoInitialPitch);
+            camera->setFov(m_choreoInitialFov);
+            break;
+        }
+        case CaptureCameraMode::Orbit: {
+            // Spherical orbit around scene focus / default target
+            glm::vec3 center = m_sceneData.boundsMin + (m_sceneData.boundsMax - m_sceneData.boundsMin) * 0.5f;
+            float radius = glm::length(m_choreoInitialPos - center);
+            if (radius < 0.1f) radius = 3.5f;
+            float angle = 2.0f * PI * t;
+            float camY = m_choreoInitialPos.y + 0.3f * std::sin(PI * t);
+            glm::vec3 orbitPos = center + glm::vec3(radius * std::sin(angle), camY - center.y, radius * std::cos(angle));
+            camera->lookAt(orbitPos, center);
+            camera->setFov(m_choreoInitialFov);
+            break;
+        }
+        case CaptureCameraMode::Gaming:
+        default: {
+            updateGamingChoreography(camera, frameIdx, totalFrames, sceneName);
+            break;
+        }
+    }
+}
+
 void Engine::runTrainingDataCapture() {
     Logger::info("========================================================================================");
     Logger::info("  Pathways -> Upways Training Data Capture Pipeline (DGC Wavefront / Wave32)");
@@ -9353,6 +9436,13 @@ void Engine::runTrainingDataCapture() {
     Logger::info("  Capture Channels : {} (PTTD v{})", m_config.capture_channels,
                  m_config.capture_channels >= 23 ? 3 : (m_config.capture_channels == 20 ? 2 : 1));
     Logger::info("  Capture Normals  : {}", m_config.capture_normals ? "YES" : "NO");
+    Logger::info("  Camera Mode      : {}",
+                 m_config.capture_camera_mode == CaptureCameraMode::Static ? "Static (Stationary)" :
+                 (m_config.capture_camera_mode == CaptureCameraMode::Rotate ? "Rotate (Pure Angular)" :
+                 (m_config.capture_camera_mode == CaptureCameraMode::Translate ? "Translate (Pure Spatial)" :
+                 (m_config.capture_camera_mode == CaptureCameraMode::Orbit ? "Orbit (Spherical)" : "Gaming (6-DOF)"))));
+    Logger::info("  Animated Objects : {}", m_config.animate_objects ? "YES" : "NO");
+    Logger::info("  Halton Phasing   : {} phases", m_config.capture_halton_length);
     Logger::info("========================================================================================");
 
     std::filesystem::create_directories(m_config.capture_training_data_dir);
@@ -9366,15 +9456,40 @@ void Engine::runTrainingDataCapture() {
     for (uint32_t f = 0; f < m_config.capture_frames; ++f) {
         Logger::info("--- Capturing Training Frame [{}/{}] ---", f + 1, m_config.capture_frames);
 
-        // Update 6-DOF procedural choreography for frame f
+        // Update camera for frame f according to capture_camera_mode
         if (m_camera) {
-            updateGamingChoreography(m_camera.get(), f, m_config.capture_frames, m_config.scene_path);
+            updateCaptureCamera(m_camera.get(), f, m_config.capture_frames, m_config.scene_path);
+        }
+
+        // Step dynamic object animations for frame f if enabled
+        if (m_config.animate_objects && !m_sceneData.animatedInstances.empty()) {
+            float animDt = (1.0f / 60.0f) * m_config.animation_speed;
+            updateAnimatedInstances(animDt);
+            // Record GPU TLAS update/refit
+            if (m_updateTlasPipeline && m_tlasInstanceBuffer && m_tlasScratchBuffer && m_tlas) {
+                VkCommandBuffer cmd = m_commandBuffers[0];
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+                recordGpuTlasUpdate(cmd, true);
+                vkEndCommandBuffer(cmd);
+
+                VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                cmdSubmitInfo.commandBuffer = cmd;
+                VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                submitInfo.commandBufferInfoCount = 1;
+                submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+                vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+                vkQueueWaitIdle(m_context->getGraphicsQueue());
+                m_tlasNeedsGpuUpdate = false;
+            }
         }
 
         // 1. Render 1-SPP Noisy Input Frame FIRST (evaluates true inter-frame motion vectors from f-1 to f)
         captureTrainingFrame(f, /*isReference=*/false, 1);
 
-        // 2. Render Ground Truth Reference Frame SECOND (same camera pose)
+        // 2. Render Ground Truth Reference Frame SECOND (same instantaneous animation and camera pose)
         captureTrainingFrame(f, /*isReference=*/true, m_config.capture_reference_spp);
     }
 

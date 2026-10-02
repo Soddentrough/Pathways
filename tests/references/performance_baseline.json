@@ -1,0 +1,422 @@
+{
+  "cornell_box_1080p_single": {
+    "avg_frame_time_ms": 1.99,
+    "avg_fps": 502.6,
+    "gigarays_per_second": 4.169
+  },
+  "cornell_box_1080p_mgpu": {
+    "avg_frame_time_ms": 1.161,
+    "avg_fps": 861.1,
+    "gigarays_per_second": 7.142
+  },
+  "cornell_box_4k_single": {
+    "avg_frame_time_ms": 7.536,
+    "avg_fps": 132.7,
+    "gigarays_per_second": 4.403
+  },
+  "cornell_box_4k_mgpu": {
+    "avg_frame_time_ms": 4.098,
+    "avg_fps": 244.1,
+    "gigarays_per_second": 8.097
+  },
+  "many_lights_1080p_single": {
+    "avg_frame_time_ms": 2.306,
+    "avg_fps": 433.6,
+    "gigarays_per_second": 3.596
+  },
+  "many_lights_1080p_mgpu": {
+    "avg_frame_time_ms": 1.511,
+    "avg_fps": 661.6,
+    "gigarays_per_second": 5.488
+  },
+  "many_lights_4k_single": {
+    "avg_frame_time_ms": 9.098,
+    "avg_fps": 109.9,
+    "gigarays_per_second": 3.647
+  },
+  "many_lights_4k_mgpu": {
+    "avg_frame_time_ms": 4.855,
+    "avg_fps": 206.0,
+    "gigarays_per_second": 6.833
+  },
+  "cyber_city_1080p_single": {
+    "avg_frame_time_ms": 4.479,
+    "avg_fps": 223.3,
+    "gigarays_per_second": 1.852
+  },
+  "cyber_city_1080p_mgpu": {
+    "avg_frame_time_ms": 2.481,
+    "avg_fps": 403.1,
+    "gigarays_per_second": 3.343
+  },
+  "cyber_city_4k_single": {
+    "avg_frame_time_ms": 14.102,
+    "avg_fps": 70.9,
+    "gigarays_per_second": 2.353
+  },
+  "cyber_city_4k_mgpu": {
+    "avg_frame_time_ms": 8.011,
+    "avg_fps": 124.8,
+    "gigarays_per_second": 4.142
+  },
+  "infinity_mirror_1080p_single": {
+    "avg_frame_time_ms": 2.167,
+    "avg_fps": 461.6,
+    "gigarays_per_second": 7.657
+  },
+  "infinity_mirror_1080p_mgpu": {
+    "avg_frame_time_ms": 1.398,
+    "avg_fps": 715.3,
+    "gigarays_per_second": 11.866
+  },
+  "infinity_mirror_4k_single": {
+    "avg_frame_time_ms": 6.806,
+    "avg_fps": 146.9,
+    "gigarays_per_second": 9.75
+  },
+  "infinity_mirror_4k_mgpu": {
+    "avg_frame_time_ms": 4.252,
+    "avg_fps": 235.2,
+    "gigarays_per_second": 15.607
+  },
+  "damaged_helmet_1080p_single": {
+    "avg_frame_time_ms": 0.993,
+    "avg_fps": 1006.9,
+    "gigarays_per_second": 8.352
+  },
+  "damaged_helmet_1080p_mgpu": {
+    "avg_frame_time_ms": 0.617,
+    "avg_fps": 1621.5,
+    "gigarays_per_second": 13.45
+  },
+  "damaged_helmet_4k_single": {
+    "avg_frame_time_ms": 2.727,
+    "avg_fps": 366.6,
+    "gigarays_per_second": 12.164
+  },
+  "damaged_helmet_4k_mgpu": {
+    "avg_frame_time_ms": 1.793,
+    "avg_fps": 557.7,
+    "gigarays_per_second": 18.505
+  },
+  "dragon_attenuation_1080p_single": {
+    "avg_frame_time_ms": 2.156,
+    "avg_fps": 463.8,
+    "gigarays_per_second": 3.847
+  },
+  "dragon_attenuation_1080p_mgpu": {
+    "avg_frame_time_ms": 1.425,
+    "avg_fps": 701.7,
+    "gigarays_per_second": 5.82
+  },
+  "dragon_attenuation_4k_single": {
+    "avg_frame_time_ms": 7.255,
+    "avg_fps": 137.8,
+    "gigarays_per_second": 4.573
+  },
+  "dragon_attenuation_4k_mgpu": {
+    "avg_frame_time_ms": 4.671,
+    "avg_fps": 214.1,
+    "gigarays_per_second": 7.103
+  },
+  "dragon_dispersion_1080p_single": {
+    "avg_frame_time_ms": 1.908,
+    "avg_fps": 524.0,
+    "gigarays_per_second": 4.347
+  },
+  "dragon_dispersion_1080p_mgpu": {
+    "avg_frame_time_ms": 1.264,
+    "avg_fps": 791.3,
+    "gigarays_per_second": 6.563
+  },
+  "dragon_dispersion_4k_single": {
+    "avg_frame_time_ms": 6.327,
+    "avg_fps": 158.1,
+    "gigarays_per_second": 5.244
+  },
+  "dragon_dispersion_4k_mgpu": {
+    "avg_frame_time_ms": 3.687,
+    "avg_fps": 271.2,
+    "gigarays_per_second": 8.999
+  },
+  "bmw_m6_1080p_single": {
+    "avg_frame_time_ms": 2.639,
+    "avg_fps": 378.9,
+    "gigarays_per_second": 3.143
+  },
+  "bmw_m6_1080p_mgpu": {
+    "avg_frame_time_ms": 1.596,
+    "avg_fps": 626.6,
+    "gigarays_per_second": 5.197
+  },
+  "bmw_m6_4k_single": {
+    "avg_frame_time_ms": 8.502,
+    "avg_fps": 117.6,
+    "gigarays_per_second": 3.902
+  },
+  "bmw_m6_4k_mgpu": {
+    "avg_frame_time_ms": 5.051,
+    "avg_fps": 198.0,
+    "gigarays_per_second": 6.569
+  },
+  "breakfast_room_1080p_single": {
+    "avg_frame_time_ms": 6.513,
+    "avg_fps": 153.5,
+    "gigarays_per_second": 1.274
+  },
+  "breakfast_room_1080p_mgpu": {
+    "avg_frame_time_ms": 4.247,
+    "avg_fps": 235.4,
+    "gigarays_per_second": 1.953
+  },
+  "breakfast_room_4k_single": {
+    "avg_frame_time_ms": 21.07,
+    "avg_fps": 47.5,
+    "gigarays_per_second": 1.575
+  },
+  "breakfast_room_4k_mgpu": {
+    "avg_frame_time_ms": 12.118,
+    "avg_fps": 82.5,
+    "gigarays_per_second": 2.738
+  },
+  "classroom_1080p_single": {
+    "avg_frame_time_ms": 3.758,
+    "avg_fps": 266.1,
+    "gigarays_per_second": 2.207
+  },
+  "classroom_1080p_mgpu": {
+    "avg_frame_time_ms": 2.141,
+    "avg_fps": 467.0,
+    "gigarays_per_second": 3.873
+  },
+  "classroom_4k_single": {
+    "avg_frame_time_ms": 14.09,
+    "avg_fps": 71.0,
+    "gigarays_per_second": 2.355
+  },
+  "classroom_4k_mgpu": {
+    "avg_frame_time_ms": 7.641,
+    "avg_fps": 130.9,
+    "gigarays_per_second": 4.342
+  },
+  "cornell_caustic_1080p_single": {
+    "avg_frame_time_ms": 1.998,
+    "avg_fps": 500.4,
+    "gigarays_per_second": 4.151
+  },
+  "cornell_caustic_1080p_mgpu": {
+    "avg_frame_time_ms": 1.17,
+    "avg_fps": 854.4,
+    "gigarays_per_second": 7.086
+  },
+  "cornell_caustic_4k_single": {
+    "avg_frame_time_ms": 7.379,
+    "avg_fps": 135.5,
+    "gigarays_per_second": 4.496
+  },
+  "cornell_caustic_4k_mgpu": {
+    "avg_frame_time_ms": 4.228,
+    "avg_fps": 236.5,
+    "gigarays_per_second": 7.848
+  },
+  "glass_of_water_1080p_single": {
+    "avg_frame_time_ms": 2.316,
+    "avg_fps": 431.8,
+    "gigarays_per_second": 3.581
+  },
+  "glass_of_water_1080p_mgpu": {
+    "avg_frame_time_ms": 1.84,
+    "avg_fps": 543.6,
+    "gigarays_per_second": 4.509
+  },
+  "glass_of_water_4k_single": {
+    "avg_frame_time_ms": 8.32,
+    "avg_fps": 120.2,
+    "gigarays_per_second": 3.988
+  },
+  "glass_of_water_4k_mgpu": {
+    "avg_frame_time_ms": 4.814,
+    "avg_fps": 207.7,
+    "gigarays_per_second": 6.892
+  },
+  "living_room_1080p_single": {
+    "avg_frame_time_ms": 3.062,
+    "avg_fps": 326.6,
+    "gigarays_per_second": 2.709
+  },
+  "living_room_1080p_mgpu": {
+    "avg_frame_time_ms": 1.806,
+    "avg_fps": 553.8,
+    "gigarays_per_second": 4.593
+  },
+  "living_room_4k_single": {
+    "avg_frame_time_ms": 10.615,
+    "avg_fps": 94.2,
+    "gigarays_per_second": 3.125
+  },
+  "living_room_4k_mgpu": {
+    "avg_frame_time_ms": 6.298,
+    "avg_fps": 158.8,
+    "gigarays_per_second": 5.268
+  },
+  "modern_hall_1080p_single": {
+    "avg_frame_time_ms": 3.725,
+    "avg_fps": 268.5,
+    "gigarays_per_second": 2.227
+  },
+  "modern_hall_1080p_mgpu": {
+    "avg_frame_time_ms": 2.127,
+    "avg_fps": 470.1,
+    "gigarays_per_second": 3.899
+  },
+  "modern_hall_4k_single": {
+    "avg_frame_time_ms": 13.401,
+    "avg_fps": 74.6,
+    "gigarays_per_second": 2.476
+  },
+  "modern_hall_4k_mgpu": {
+    "avg_frame_time_ms": 7.745,
+    "avg_fps": 129.1,
+    "gigarays_per_second": 4.284
+  },
+  "veach_ajar_1080p_single": {
+    "avg_frame_time_ms": 2.709,
+    "avg_fps": 369.2,
+    "gigarays_per_second": 3.062
+  },
+  "veach_ajar_1080p_mgpu": {
+    "avg_frame_time_ms": 1.642,
+    "avg_fps": 609.1,
+    "gigarays_per_second": 5.052
+  },
+  "veach_ajar_4k_single": {
+    "avg_frame_time_ms": 9.388,
+    "avg_fps": 106.5,
+    "gigarays_per_second": 3.534
+  },
+  "veach_ajar_4k_mgpu": {
+    "avg_frame_time_ms": 5.474,
+    "avg_fps": 182.7,
+    "gigarays_per_second": 6.061
+  },
+  "buick_riviera_1080p_single": {
+    "avg_frame_time_ms": 3.625,
+    "avg_fps": 275.9,
+    "gigarays_per_second": 2.288
+  },
+  "buick_riviera_1080p_mgpu": {
+    "avg_frame_time_ms": 2.235,
+    "avg_fps": 447.4,
+    "gigarays_per_second": 3.711
+  },
+  "buick_riviera_4k_single": {
+    "avg_frame_time_ms": 12.275,
+    "avg_fps": 81.5,
+    "gigarays_per_second": 2.703
+  },
+  "buick_riviera_4k_mgpu": {
+    "avg_frame_time_ms": 7.164,
+    "avg_fps": 139.6,
+    "gigarays_per_second": 4.631
+  },
+  "coffee_maker_1080p_single": {
+    "avg_frame_time_ms": 2.724,
+    "avg_fps": 367.1,
+    "gigarays_per_second": 3.045
+  },
+  "coffee_maker_1080p_mgpu": {
+    "avg_frame_time_ms": 1.75,
+    "avg_fps": 571.4,
+    "gigarays_per_second": 4.74
+  },
+  "coffee_maker_4k_single": {
+    "avg_frame_time_ms": 8.753,
+    "avg_fps": 114.2,
+    "gigarays_per_second": 3.79
+  },
+  "coffee_maker_4k_mgpu": {
+    "avg_frame_time_ms": 5.045,
+    "avg_fps": 198.2,
+    "gigarays_per_second": 6.576
+  },
+  "kitchen_set_1080p_single": {
+    "avg_frame_time_ms": 1.515,
+    "avg_fps": 660.0,
+    "gigarays_per_second": 5.474
+  },
+  "kitchen_set_1080p_mgpu": {
+    "avg_frame_time_ms": 1.374,
+    "avg_fps": 727.9,
+    "gigarays_per_second": 6.038
+  },
+  "kitchen_set_4k_single": {
+    "avg_frame_time_ms": 3.816,
+    "avg_fps": 262.1,
+    "gigarays_per_second": 8.695
+  },
+  "kitchen_set_4k_mgpu": {
+    "avg_frame_time_ms": 2.9,
+    "avg_fps": 344.8,
+    "gigarays_per_second": 11.44
+  },
+  "med_city_1080p_single": {
+    "avg_frame_time_ms": 3.93,
+    "avg_fps": 254.4,
+    "gigarays_per_second": 2.11
+  },
+  "med_city_1080p_mgpu": {
+    "avg_frame_time_ms": 2.467,
+    "avg_fps": 405.3,
+    "gigarays_per_second": 3.362
+  },
+  "med_city_4k_single": {
+    "avg_frame_time_ms": 14.574,
+    "avg_fps": 68.6,
+    "gigarays_per_second": 2.276
+  },
+  "med_city_4k_mgpu": {
+    "avg_frame_time_ms": 8.576,
+    "avg_fps": 116.6,
+    "gigarays_per_second": 3.869
+  },
+  "bistro_exterior_1080p_single": {
+    "avg_frame_time_ms": 11.257,
+    "avg_fps": 88.8,
+    "gigarays_per_second": 0.737
+  },
+  "bistro_exterior_1080p_mgpu": {
+    "avg_frame_time_ms": 5.922,
+    "avg_fps": 168.9,
+    "gigarays_per_second": 1.401
+  },
+  "bistro_exterior_4k_single": {
+    "avg_frame_time_ms": 38.819,
+    "avg_fps": 25.8,
+    "gigarays_per_second": 0.855
+  },
+  "bistro_exterior_4k_mgpu": {
+    "avg_frame_time_ms": 19.634,
+    "avg_fps": 50.9,
+    "gigarays_per_second": 1.69
+  },
+  "bistro_interior_1080p_single": {
+    "avg_frame_time_ms": 9.886,
+    "avg_fps": 101.2,
+    "gigarays_per_second": 0.839
+  },
+  "bistro_interior_1080p_mgpu": {
+    "avg_frame_time_ms": 5.783,
+    "avg_fps": 172.9,
+    "gigarays_per_second": 1.434
+  },
+  "bistro_interior_4k_single": {
+    "avg_frame_time_ms": 31.713,
+    "avg_fps": 31.5,
+    "gigarays_per_second": 1.046
+  },
+  "bistro_interior_4k_mgpu": {
+    "avg_frame_time_ms": 17.59,
+    "avg_fps": 56.8,
+    "gigarays_per_second": 1.886
+  }
+}

@@ -584,6 +584,7 @@ target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
 add_dependencies(test_upways_pipeline package_upways_weights)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
 add_test(NAME VisualIntegrity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_visual_integrity.py)
+add_test(NAME PerformanceMatrix COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_performance_matrix.py --quick)
 
 
 

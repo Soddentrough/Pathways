@@ -280,7 +280,8 @@ void Config::printUsage(const char* progName) {
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
               << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
               << "  --restir                Enable ReSTIR spatio-temporal reservoir resampling [default: disabled]\n"
-              << "  --restir-m-cap <int>    Temporal history M-cap for ReSTIR (default: 30)\n\n"
+              << "  --restir-m-cap <int>    Temporal history M-cap for ReSTIR (default: 30)\n"
+              << "  --restir-min-lights <int> Minimum dynamic scene lights required to engage ReSTIR (default: 8)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -505,7 +506,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.dump_stats_path = argv[++i];
             continue;
         }
-        if ((arg == "--capture-training-data" || arg == "--capture-data") && i + 1 < argc) {
+        if ((arg == "--capture-training-data" || arg == "--capture-training-data-dir" || arg == "--capture-data") && i + 1 < argc) {
             cfg.capture_training_data_dir = argv[++i];
             continue;
         }
@@ -525,6 +526,54 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--no-capture-normals") {
             cfg.capture_normals = false;
             cfg.capture_channels = 16;
+            continue;
+        }
+        if (arg == "--capture-camera-mode" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+            if (mode == "static") cfg.capture_camera_mode = CaptureCameraMode::Static;
+            else if (mode == "rotate" || mode == "rotation" || mode == "pan") cfg.capture_camera_mode = CaptureCameraMode::Rotate;
+            else if (mode == "translate" || mode == "translation" || mode == "dolly") cfg.capture_camera_mode = CaptureCameraMode::Translate;
+            else if (mode == "orbit") cfg.capture_camera_mode = CaptureCameraMode::Orbit;
+            else cfg.capture_camera_mode = CaptureCameraMode::Gaming;
+            continue;
+        }
+        if (arg == "--capture-halton-length" && i + 1 < argc) {
+            cfg.capture_halton_length = static_cast<uint32_t>(std::stoul(argv[++i]));
+            continue;
+        }
+        if ((arg == "--capture-input-res" || arg == "--input-res") && i + 1 < argc) {
+            std::string resStr = argv[++i];
+            auto xPos = resStr.find('x');
+            if (xPos != std::string::npos) {
+                cfg.capture_input_width = static_cast<uint32_t>(std::stoul(resStr.substr(0, xPos)));
+                cfg.capture_input_height = static_cast<uint32_t>(std::stoul(resStr.substr(xPos + 1)));
+            } else if (resStr == "540" || resStr == "540p") {
+                cfg.capture_input_width = 960; cfg.capture_input_height = 540;
+            } else if (resStr == "720" || resStr == "720p") {
+                cfg.capture_input_width = 1280; cfg.capture_input_height = 720;
+            } else if (resStr == "1080" || resStr == "1080p") {
+                cfg.capture_input_width = 1920; cfg.capture_input_height = 1080;
+            } else if (resStr == "1440" || resStr == "1440p") {
+                cfg.capture_input_width = 2560; cfg.capture_input_height = 1440;
+            } else if (resStr == "4k" || resStr == "2160" || resStr == "2160p") {
+                cfg.capture_input_width = 3840; cfg.capture_input_height = 2160;
+            }
+            continue;
+        }
+        if ((arg == "--capture-ref-res" || arg == "--ref-res") && i + 1 < argc) {
+            std::string resStr = argv[++i];
+            auto xPos = resStr.find('x');
+            if (xPos != std::string::npos) {
+                cfg.capture_ref_width = static_cast<uint32_t>(std::stoul(resStr.substr(0, xPos)));
+                cfg.capture_ref_height = static_cast<uint32_t>(std::stoul(resStr.substr(xPos + 1)));
+            } else if (resStr == "1080" || resStr == "1080p") {
+                cfg.capture_ref_width = 1920; cfg.capture_ref_height = 1080;
+            } else if (resStr == "1440" || resStr == "1440p") {
+                cfg.capture_ref_width = 2560; cfg.capture_ref_height = 1440;
+            } else if (resStr == "4k" || resStr == "2160" || resStr == "2160p") {
+                cfg.capture_ref_width = 3840; cfg.capture_ref_height = 2160;
+            }
             continue;
         }
         if (arg == "--gpu" && i + 1 < argc) {
@@ -867,6 +916,14 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--restir-m-cap=")) {
             cfg.restir_di_m_cap = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+            continue;
+        }
+        if (arg == "--restir-min-lights" && i + 1 < argc) {
+            cfg.restir_min_lights = static_cast<uint32_t>(std::stoul(argv[++i]));
+            continue;
+        }
+        if (arg.starts_with("--restir-min-lights=")) {
+            cfg.restir_min_lights = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
             continue;
         }
         if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
