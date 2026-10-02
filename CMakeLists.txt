@@ -276,7 +276,7 @@ target_compile_definitions(pathways PRIVATE
 
 # OpenUSD (Pixar USD) Support
 set(USD_FALLBACK_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/usd_deps")
-if(EXISTS "${USD_FALLBACK_DEPS}/include/tbb/concurrent_queue.h")
+if(EXISTS "${USD_FALLBACK_DEPS}/include/tbb/concurrent_queue.h" OR EXISTS "/usr/include/tbb/concurrent_queue.h")
     set(PXR_FIND_TBB_IN_CONFIG OFF)
     if(EXISTS "/usr/lib64/libXt.so.6" AND NOT DEFINED X11_Xt_LIB)
         set(X11_Xt_LIB "/usr/lib64/libXt.so.6" CACHE FILEPATH "Path to Xt library")
@@ -299,8 +299,12 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
         endif()
         if(TARGET TBB::tbb)
             get_target_property(_tbb_loc TBB::tbb IMPORTED_LOCATION)
-            if(NOT _tbb_loc AND EXISTS "/usr/lib64/libtbb.so.12")
-                set_target_properties(TBB::tbb PROPERTIES IMPORTED_LOCATION "/usr/lib64/libtbb.so.12")
+            if(NOT _tbb_loc)
+                if(EXISTS "/usr/lib64/libtbb.so.2")
+                    set_target_properties(TBB::tbb PROPERTIES IMPORTED_LOCATION "/usr/lib64/libtbb.so.2")
+                elseif(EXISTS "/usr/lib64/libtbb.so.12")
+                    set_target_properties(TBB::tbb PROPERTIES IMPORTED_LOCATION "/usr/lib64/libtbb.so.12")
+                endif()
             endif()
             if(EXISTS "${USD_FALLBACK_DEPS}/include")
                 set_property(TARGET TBB::tbb APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${USD_FALLBACK_DEPS}/include")
