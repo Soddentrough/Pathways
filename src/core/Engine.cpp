@@ -279,6 +279,8 @@ Engine::Engine(const Config& config) : m_config(config) {
         m_window->setEventCallback([this](const SDL_Event& e) -> bool {
             return handleEvent(e);
         });
+
+        initGamepad();
     }
 
     startHwMonThread();
@@ -5006,6 +5008,45 @@ void Engine::initQueryPool() {
     Logger::info("GPU Timestamp Profiler initialized (period: {:.2f} ns/tick, {} queries/frame)", m_timestampPeriod, QUERIES_PER_FRAME);
 }
 
+void Engine::initGamepad() {
+    if (m_gamepad) return;
+    int count = 0;
+    SDL_JoystickID* gamepads = SDL_GetGamepads(&count);
+    if (gamepads && count > 0) {
+        m_gamepad = SDL_OpenGamepad(gamepads[0]);
+        if (m_gamepad) {
+            m_gamepadIsPs5 = (SDL_GetGamepadType(m_gamepad) == SDL_GAMEPAD_TYPE_PS5);
+            Logger::info("Gamepad connected (at startup): {} ({})",
+                         SDL_GetGamepadName(m_gamepad),
+                         m_gamepadIsPs5 ? "PS5 DualSense" : "Standard Gamepad");
+            updateGamepadLed();
+        }
+    }
+    SDL_free(gamepads);
+}
+
+void Engine::updateGamepadLed() {
+    if (!m_gamepad) return;
+    if (m_cameraMode) {
+        if (m_gamepadBtnOrbit || (m_camera && m_camera->isOrbiting())) {
+            // Amber / Orange in Target Orbit mode
+            SDL_SetGamepadLED(m_gamepad, 255, 140, 0);
+        } else {
+            // Emerald Cyan in 3D Scene Navigation mode
+            SDL_SetGamepadLED(m_gamepad, 0, 220, 180);
+        }
+    } else {
+        // Royal Blue in UI Control Panel mode
+        SDL_SetGamepadLED(m_gamepad, 30, 80, 255);
+    }
+}
+
+void Engine::rumbleGamepad(uint16_t low, uint16_t high, uint32_t durationMs) {
+    if (m_gamepad) {
+        SDL_RumbleGamepad(m_gamepad, low, high, durationMs);
+    }
+}
+
 void Engine::setCameraMode(bool active) {
     if (m_cameraMode == active) return;
     m_cameraMode = active;
@@ -5018,9 +5059,18 @@ void Engine::setCameraMode(bool active) {
         m_gamepadRightTrigger = 0.0f;
         m_gamepadBtnA = false;
         m_gamepadBtnB = false;
+        m_gamepadBtnOrbit = false;
+        m_gamepadBtnBumperUp = false;
+        m_gamepadBtnBumperDown = false;
     }
     if (m_window) {
         m_window->setRelativeMouseMode(m_cameraMode);
+    }
+    updateGamepadLed();
+    if (m_cameraMode) {
+        rumbleGamepad(0x3500, 0x6000, 90); // Crisp confirmation haptic pulse on entering 3D flight
+    } else {
+        rumbleGamepad(0x2000, 0x2000, 70); // Gentle confirmation pulse on returning to UI
     }
     Logger::info("Interaction Mode: {}", m_cameraMode ? "FPS Scene Navigation (Mouse grabbed, WASD active)" : "UI Control Panel (Mouse released)");
 }
@@ -5086,7 +5136,56 @@ bool Engine::handleEvent(const SDL_Event& e) {
         return false; // Let Window close application
     }
 
-    // 4. In Camera Mode (FPS navigation)
+    // 6. Gamepad Hotplug Events (Universal across UI and Camera modes)
+    if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+        if (!m_gamepad) {
+            m_gamepad = SDL_OpenGamepad(e.gdevice.which);
+            if (m_gamepad) {
+                m_gamepadIsPs5 = (SDL_GetGamepadType(m_gamepad) == SDL_GAMEPAD_TYPE_PS5);
+                Logger::info("Gamepad connected: {} ({})",
+                             SDL_GetGamepadName(m_gamepad),
+                             m_gamepadIsPs5 ? "PS5 DualSense" : "Standard Gamepad");
+                updateGamepadLed();
+            }
+        }
+        if (m_gui) {
+            m_gui->processEvent(e);
+        }
+        return true;
+    }
+    if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        if (m_gamepad && e.gdevice.which == SDL_GetGamepadID(m_gamepad)) {
+            Logger::info("Gamepad disconnected.");
+            SDL_CloseGamepad(m_gamepad);
+            m_gamepad = nullptr;
+            m_gamepadIsPs5 = false;
+            m_gamepadLeftX = 0.0f;
+            m_gamepadLeftY = 0.0f;
+            m_gamepadRightX = 0.0f;
+            m_gamepadRightY = 0.0f;
+            m_gamepadLeftTrigger = 0.0f;
+            m_gamepadRightTrigger = 0.0f;
+            m_gamepadBtnA = false;
+            m_gamepadBtnB = false;
+            m_gamepadBtnOrbit = false;
+        }
+        if (m_gui) {
+            m_gui->processEvent(e);
+        }
+        return true;
+    }
+
+    // 7. Universal Mode Toggle Gamepad Buttons (Start / Options / Touchpad / Back)
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START ||
+            e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK ||
+            e.gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+            setCameraMode(!m_cameraMode);
+            return true;
+        }
+    }
+
+    // 8. In Camera Mode (FPS navigation)
     if (m_cameraMode) {
         if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F) {
             if (m_camera) {
@@ -5112,67 +5211,88 @@ bool Engine::handleEvent(const SDL_Event& e) {
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             return true;
         }
+
+        // Gamepad Axis Motion (Analog Sticks & Triggers)
+        if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+            float deadzone = std::clamp(m_config.gamepad_deadzone, 0.01f, 0.50f);
+            float rawVal = static_cast<float>(e.gaxis.value) / 32767.0f;
+            float val = 0.0f;
+            if (std::abs(rawVal) >= deadzone) {
+                val = std::copysign((std::abs(rawVal) - deadzone) / (1.0f - deadzone), rawVal);
+            }
+
+            if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) m_gamepadLeftX = val;
+            else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) m_gamepadLeftY = -val;
+            else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX) m_gamepadRightX = val;
+            else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) m_gamepadRightY = val;
+            else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) m_gamepadLeftTrigger = std::max(0.0f, val);
+            else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) m_gamepadRightTrigger = std::max(0.0f, val);
+            return true;
+        }
+
+        // Gamepad Buttons in Camera Mode
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
+                m_gamepadBtnA = true;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) {
+                m_gamepadBtnB = true;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_WEST) {
+                m_gamepadBtnOrbit = true;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK) {
+                m_gamepadBtnOrbit = !m_gamepadBtnOrbit;
+                rumbleGamepad(0x3000, 0x4000, 80);
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
+                if (m_camera) {
+                    m_camera->focusOnTarget(m_sceneData.centralTarget, m_sceneData.focalRadius);
+                    rumbleGamepad(0x4000, 0x6000, 100);
+                }
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1 ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2) {
+                m_gamepadBtnBumperUp = true;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_PADDLE1 ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_PADDLE2) {
+                m_gamepadBtnBumperDown = true;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP) {
+                if (m_camera) {
+                    m_camera->adjustSpeedByWheel(1.0f);
+                    rumbleGamepad(0x1500, 0x2500, 40);
+                }
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_DOWN) {
+                if (m_camera) {
+                    m_camera->adjustSpeedByWheel(-1.0f);
+                    rumbleGamepad(0x1500, 0x2500, 40);
+                }
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) {
+                if (m_camera) {
+                    m_camera->setPose(m_camera->getPosition(), 0.0f, m_camera->getYaw());
+                    rumbleGamepad(0x2000, 0x3000, 60);
+                }
+            }
+            return true;
+        }
+
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) m_gamepadBtnA = false;
+            else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) m_gamepadBtnB = false;
+            else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_WEST) m_gamepadBtnOrbit = false;
+            else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER ||
+                     e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1 ||
+                     e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2) {
+                m_gamepadBtnBumperUp = false;
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_PADDLE1 ||
+                       e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_PADDLE2) {
+                m_gamepadBtnBumperDown = false;
+            }
+            return true;
+        }
+
         return false;
     }
 
-    // 6. Gamepad Hotplug & Dual-Analog Navigation Events (FEAT-01)
-    if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
-        if (!m_gamepad) {
-            m_gamepad = SDL_OpenGamepad(e.gdevice.which);
-            if (m_gamepad) {
-                Logger::info("Gamepad connected: {}", SDL_GetGamepadName(m_gamepad));
-            }
-        }
-        return true;
-    }
-    if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
-        if (m_gamepad && e.gdevice.which == SDL_GetGamepadID(m_gamepad)) {
-            Logger::info("Gamepad disconnected.");
-            SDL_CloseGamepad(m_gamepad);
-            m_gamepad = nullptr;
-            m_gamepadLeftX = 0.0f;
-            m_gamepadLeftY = 0.0f;
-            m_gamepadRightX = 0.0f;
-            m_gamepadRightY = 0.0f;
-            m_gamepadLeftTrigger = 0.0f;
-            m_gamepadRightTrigger = 0.0f;
-            m_gamepadBtnA = false;
-            m_gamepadBtnB = false;
-        }
-        return true;
-    }
-    if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-        float deadzone = std::clamp(m_config.gamepad_deadzone, 0.01f, 0.50f);
-        float rawVal = static_cast<float>(e.gaxis.value) / 32767.0f;
-        float val = 0.0f;
-        if (std::abs(rawVal) >= deadzone) {
-            val = std::copysign((std::abs(rawVal) - deadzone) / (1.0f - deadzone), rawVal);
-        }
-
-        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) m_gamepadLeftX = val;
-        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) m_gamepadLeftY = -val;
-        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX) m_gamepadRightX = val;
-        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) m_gamepadRightY = val;
-        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) m_gamepadLeftTrigger = std::max(0.0f, val);
-        else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) m_gamepadRightTrigger = std::max(0.0f, val);
-        return true;
-    }
-    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
-            setCameraMode(!m_cameraMode);
-            return true;
-        }
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) m_gamepadBtnA = true;
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) m_gamepadBtnB = true;
-        return true;
-    }
-    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) m_gamepadBtnA = false;
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) m_gamepadBtnB = false;
-        return true;
-    }
-
-    // 5. In UI Mode: route events to ImGui
+    // 9. In UI Mode: route events to ImGui
     if (m_gui) {
         // If mouse wheel happened outside ImGui windows, adjust camera speed
         if (e.type == SDL_EVENT_MOUSE_WHEEL && !m_gui->wantCaptureMouse()) {
@@ -5186,9 +5306,18 @@ bool Engine::handleEvent(const SDL_Event& e) {
         if (handled) {
             return true;
         }
+
         // If left click happened outside ImGui windows, capture mouse for FPS navigation
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
             if (!m_gui->wantCaptureMouse()) {
+                setCameraMode(true);
+                return true;
+            }
+        }
+
+        // If South (Cross/A) pressed outside ImGui windows/controls, enter FPS navigation
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
+            if (!m_gui->wantCaptureMouse() && !m_gui->wantCaptureKeyboard()) {
                 setCameraMode(true);
                 return true;
             }
@@ -5229,20 +5358,21 @@ void Engine::updateInput() {
         m_camera->setLookDistance(fallbackDist);
     }
 
-    float forward = 0.0f;
-    float strafe = 0.0f;
-    float vertical = 0.0f;
+    float kbdForward = 0.0f;
+    float kbdStrafe = 0.0f;
+    float kbdVertical = 0.0f;
 
-    if (keyState[SDL_SCANCODE_W]) forward += 1.0f;
-    if (keyState[SDL_SCANCODE_S]) forward -= 1.0f;
-    if (keyState[SDL_SCANCODE_D]) strafe += 1.0f;
-    if (keyState[SDL_SCANCODE_A]) strafe -= 1.0f;
-    if (keyState[SDL_SCANCODE_SPACE] || keyState[SDL_SCANCODE_E]) vertical += 1.0f;
-    if (keyState[SDL_SCANCODE_C] || keyState[SDL_SCANCODE_Q]) vertical -= 1.0f;
+    if (keyState[SDL_SCANCODE_W]) kbdForward += 1.0f;
+    if (keyState[SDL_SCANCODE_S]) kbdForward -= 1.0f;
+    if (keyState[SDL_SCANCODE_D]) kbdStrafe += 1.0f;
+    if (keyState[SDL_SCANCODE_A]) kbdStrafe -= 1.0f;
+    if (keyState[SDL_SCANCODE_SPACE] || keyState[SDL_SCANCODE_E]) kbdVertical += 1.0f;
+    if (keyState[SDL_SCANCODE_C] || keyState[SDL_SCANCODE_Q]) kbdVertical -= 1.0f;
 
+    bool kbdMoving = (std::abs(kbdForward) > 0.001f || std::abs(kbdStrafe) > 0.001f || std::abs(kbdVertical) > 0.001f);
     bool sprint = keyState[SDL_SCANCODE_LSHIFT] || keyState[SDL_SCANCODE_RSHIFT];
     bool crawl = keyState[SDL_SCANCODE_LALT] || keyState[SDL_SCANCODE_RALT];
-    bool ctrl = keyState[SDL_SCANCODE_LCTRL] || keyState[SDL_SCANCODE_RCTRL];
+    bool ctrl = keyState[SDL_SCANCODE_LCTRL] || keyState[SDL_SCANCODE_RCTRL] || m_gamepadBtnOrbit;
 
     if (ctrl) {
         if (!m_camera->isOrbiting()) {
@@ -5255,27 +5385,48 @@ void Engine::updateInput() {
                 float dist = (proj > 0.1f) ? proj : m_camera->getFocalDistance();
                 m_camera->startOrbit(camPos + camFront * dist);
             }
+            updateGamepadLed();
         }
     } else {
         if (m_camera->isOrbiting()) {
             m_camera->endOrbit();
+            updateGamepadLed();
         }
     }
 
-    // Incorporate analog gamepad sticks & triggers (FEAT-01)
-    forward += m_gamepadLeftY;
-    strafe += m_gamepadLeftX;
-    if (m_gamepadBtnA) vertical += 1.0f;
-    if (m_gamepadBtnB) vertical -= 1.0f;
-    if (m_gamepadRightTrigger > 0.1f) sprint = true;
-    if (m_gamepadLeftTrigger > 0.1f) crawl = true;
+    // Incorporate analog gamepad sticks & buttons (FEAT-01)
+    float forward = kbdForward + m_gamepadLeftY;
+    float strafe = kbdStrafe + m_gamepadLeftX;
+    float vertical = kbdVertical;
+    if (m_gamepadBtnA || m_gamepadBtnBumperUp) vertical += 1.0f;
+    if (m_gamepadBtnB || m_gamepadBtnBumperDown) vertical -= 1.0f;
 
-    if (std::abs(m_gamepadRightX) > 0.05f || std::abs(m_gamepadRightY) > 0.05f) {
-        constexpr float GAMEPAD_ROT_SPEED = 180.0f; // degrees per second
-        m_camera->processMouseMovement(m_gamepadRightX * GAMEPAD_ROT_SPEED * dt, -m_gamepadRightY * GAMEPAD_ROT_SPEED * dt, ctrl);
+    // Analog trigger progressive gear multiplier:
+    // Right trigger (RT / R2) progressively sprints from 1.0x up to 3.0x speed
+    // Left trigger (LT / L2) progressively crawls from 1.0x down to 0.25x precision speed
+    float analogSpeedScale = 1.0f;
+    if (m_gamepadRightTrigger > 0.01f) {
+        analogSpeedScale *= (1.0f + 2.0f * m_gamepadRightTrigger);
+    }
+    if (m_gamepadLeftTrigger > 0.01f) {
+        analogSpeedScale *= (1.0f - 0.75f * m_gamepadLeftTrigger);
     }
 
-    m_camera->processFpsInput(forward, strafe, vertical, dt, sprint, crawl, ctrl);
+    // Dynamic distance-adaptive speed is reserved for binary keyboard inputs.
+    // For gamepad analog inputs, speed maps strictly and proportionally to stick deflection and trigger depth.
+    bool applyDynamicScaling = kbdMoving;
+
+    if (std::abs(m_gamepadRightX) > 0.05f || std::abs(m_gamepadRightY) > 0.05f) {
+        constexpr float BASE_GAMEPAD_YAW_SPEED = 540.0f; // degrees per second (~3x faster turning)
+        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // degrees per second
+        float sensitivity = std::clamp(m_config.gamepad_sensitivity, 0.10f, 5.00f);
+        float yawSpeed = BASE_GAMEPAD_YAW_SPEED * sensitivity;
+        float pitchSpeed = BASE_GAMEPAD_PITCH_SPEED * sensitivity;
+        float pitchDir = m_config.gamepad_invert_y ? -1.0f : 1.0f;
+        m_camera->processMouseMovement(m_gamepadRightX * yawSpeed * dt, pitchDir * m_gamepadRightY * pitchSpeed * dt, ctrl);
+    }
+
+    m_camera->processFpsInput(forward, strafe, vertical, dt, sprint, crawl, ctrl, applyDynamicScaling, analogSpeedScale);
     m_camera->update(dt);
 }
 

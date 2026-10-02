@@ -40,6 +40,7 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename = nullptr; // Ensure dynamic responsive docking without stale ini overrides
     ImGui::StyleColorsDark();
 
@@ -354,7 +355,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[MODE] FPS Navigation (Speed: %.2f m/s | Target Dist: %.2f m | Ctrl: Orbit | Alt: Crawl | Shift: Sprint)", camSpeed, targetDist);
             }
         } else {
-            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "[MODE] UI Control Panel Active (Click Viewport or TAB for FPS)");
+            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "[MODE] UI Control Panel Active (Click Viewport, TAB, or Controller Start for FPS)");
         }
         ImGui::Separator();
 
@@ -687,14 +688,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (cameraMode) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.22f, 0.22f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            if (ImGui::Button("FPS NAVIGATION ACTIVE\n[Click or TAB to release]", ImVec2(topBtnW, 38.0f))) {
+            if (ImGui::Button("FPS NAVIGATION ACTIVE\n[Click, TAB, or Start to release]", ImVec2(topBtnW, 38.0f))) {
                 cameraMode = false;
             }
             ImGui::PopStyleColor(2);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.28f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.68f, 0.35f, 1.0f));
-            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click or TAB to capture]", ImVec2(topBtnW, 38.0f))) {
+            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click, TAB, or Start to capture]", ImVec2(topBtnW, 38.0f))) {
                 cameraMode = true;
             }
             ImGui::PopStyleColor(2);
@@ -1358,6 +1359,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     config.gamepad_deadzone = std::clamp(config.gamepad_deadzone, 0.01f, 0.50f);
                 }
 
+                if (ImGui::SliderFloat("Gamepad Sensitivity", &config.gamepad_sensitivity, 0.20f, 3.00f, "%.2fx")) {
+                    config.gamepad_sensitivity = std::clamp(config.gamepad_sensitivity, 0.10f, 5.00f);
+                }
+
+                ImGui::Checkbox("Gamepad Invert Y-Axis", &config.gamepad_invert_y);
+
                 float fov = camera->getFov();
                 if (ImGui::SliderFloat("Field of View", &fov, 20.0f, 100.0f, "%.1f deg")) {
                     camera->setFov(fov);
@@ -1394,6 +1401,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("Mouse Wheel: Continuously Scale Camera Speed");
                 ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
                 ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
+                ImGui::TreePop();
+            }
+            if (ImGui::TreeNode("Gamepad Controls Reference")) {
+                ImGui::BulletText("Start / Options (or Touchpad): Toggle UI / Scene Navigation");
+                ImGui::BulletText("Left Stick: Fly Forward / Backward, Strafe Left / Right");
+                ImGui::BulletText("Right Stick: Look / Turn Freelook Camera (3x Yaw Speed)");
+                ImGui::BulletText("Right Trigger (RT / R2): Sprint Boost (3.0x speed)");
+                ImGui::BulletText("Left Trigger (LT / L2): Precision Crawl (0.25x speed)");
+                ImGui::BulletText("Cross / A or Right Bumper (RB / R1 / R4): Fly Up (or Enter Flight Mode from UI)");
+                ImGui::BulletText("Circle / B or Left Bumper (LB / L1 / L4): Fly Down (or Cancel in UI)");
+                ImGui::BulletText("Right Stick Click (R3): Focus on Targeted Object");
+                ImGui::BulletText("Left Stick Click (L3) / Square / X: Hold to Orbit around Target");
+                ImGui::BulletText("D-Pad Up: Increase Camera Fly Speed");
+                ImGui::BulletText("D-Pad Down: Decrease Camera Fly Speed");
+                ImGui::BulletText("Triangle / Y: Level Horizon / Camera Pitch");
+                ImGui::BulletText("D-Pad / Left Stick (in UI): Navigate Controls & Menus");
                 ImGui::TreePop();
             }
         }

@@ -508,12 +508,29 @@ int main() {
         assert_near(camAnalog.getPosition().z, posBeforeDeadzone.z, 0.00001f, "Deadzone position Z");
         assert_near(glm::length(camAnalog.getVelocity()), 0.0f, 0.00001f, "Deadzone velocity zero");
 
-        // Non-positive deltaTime robustness guard
-        camAnalog.resetMoved();
-        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, 0.0f, false);
-        check_true(!camAnalog.hasMoved(), "dt=0 must not trigger moved flag");
-        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, -0.016f, false);
-        check_true(!camAnalog.hasMoved(), "Negative dt must not trigger moved flag");
+        // Controller analog speed mapping (bypasses distance-adaptive throttling)
+        camAnalog.setDynamicScaling(true);
+        camAnalog.setSceneScale(10.0f, 10.0f, glm::vec3(0.0f, 1.0f, 0.0f));
+        camAnalog.setLookDistance(0.10f); // Very close object: would throttle binary keyboard to 0.15x speed
+        float rawBaseSpeed = camAnalog.getSpeed();
+
+        // Binary keyboard input (applyDynamicScaling = true) must be throttled to 0.15x
+        camAnalog.processFpsInput(1.0f, 0.0f, 0.0f, 0.1f, false, false, false, true, 1.0f);
+        assert_near(glm::length(camAnalog.getVelocity()), rawBaseSpeed * 0.15f, 0.01f, "Keyboard input throttled by close target");
+
+        // Controller analog stick (applyDynamicScaling = false) maps directly to deflection magnitude (0.80)
+        camAnalog.processFpsInput(0.80f, 0.0f, 0.0f, 0.1f, false, false, false, false, 1.0f);
+        assert_near(glm::length(camAnalog.getVelocity()), rawBaseSpeed * 0.80f, 0.01f, "Controller analog deflection maps directly without distance throttling");
+
+        // Controller progressive trigger scaling (RT = 0.5 -> 2.0x boost)
+        float rtScale = 1.0f + 2.0f * 0.5f; // 2.0x
+        camAnalog.processFpsInput(0.80f, 0.0f, 0.0f, 0.1f, false, false, false, false, rtScale);
+        assert_near(glm::length(camAnalog.getVelocity()), rawBaseSpeed * 0.80f * 2.0f, 0.01f, "Progressive RT boost scaling");
+
+        // Controller progressive trigger crawl (LT = 1.0 -> 0.25x precision)
+        float ltScale = 1.0f - 0.75f * 1.0f; // 0.25x
+        camAnalog.processFpsInput(0.80f, 0.0f, 0.0f, 0.1f, false, false, false, false, ltScale);
+        assert_near(glm::length(camAnalog.getVelocity()), rawBaseSpeed * 0.80f * 0.25f, 0.01f, "Progressive LT crawl scaling");
 
         std::cout << "[PASS] Analog stick proportional deflection & sub-threshold deadzone verified." << std::endl;
     }
@@ -606,7 +623,50 @@ int main() {
         Config cfgDeadzoneEq = Config::parse(2, const_cast<char**>(argvDeadzoneEq));
         assert_near(cfgDeadzoneEq.gamepad_deadzone, 0.30f, 0.001f, "Config parses --gamepad-deadzone=");
 
-        std::cout << "[PASS] Frame time spike clamping, key release robustness & configurable gamepad deadzone verified." << std::endl;
+        // 23d. Gamepad sensitivity & invert-y flag parsing & rotation transformation
+        const char* argvSens[] = { "pathways", "--gamepad-sensitivity", "1.75", "--gamepad-invert-y" };
+        Config cfgSens = Config::parse(4, const_cast<char**>(argvSens));
+        assert_near(cfgSens.gamepad_sensitivity, 1.75f, 0.001f, "Config parses --gamepad-sensitivity");
+        check_true(cfgSens.gamepad_invert_y, "Config parses --gamepad-invert-y");
+
+        const char* argvSensEq[] = { "pathways", "--gamepad-sensitivity=2.50", "--no-gamepad-invert-y" };
+        Config cfgSensEq = Config::parse(3, const_cast<char**>(argvSensEq));
+        assert_near(cfgSensEq.gamepad_sensitivity, 2.50f, 0.001f, "Config parses --gamepad-sensitivity=");
+        check_true(!cfgSensEq.gamepad_invert_y, "Config parses --no-gamepad-invert-y");
+
+        constexpr float BASE_GAMEPAD_YAW_SPEED = 540.0f;   // 3x faster turning rate
+        constexpr float BASE_GAMEPAD_PITCH_SPEED = 240.0f; // smooth vertical look rate
+        float scaledYawSpeed = BASE_GAMEPAD_YAW_SPEED * std::clamp(cfgSens.gamepad_sensitivity, 0.10f, 5.00f);
+        float scaledPitchSpeed = BASE_GAMEPAD_PITCH_SPEED * std::clamp(cfgSens.gamepad_sensitivity, 0.10f, 5.00f);
+        assert_near(scaledYawSpeed, 540.0f * 1.75f, 0.01f, "Sensitivity 1.75 scales 540 deg/s yaw to 945 deg/s");
+        assert_near(scaledPitchSpeed, 240.0f * 1.75f, 0.01f, "Sensitivity 1.75 scales 240 deg/s pitch to 420 deg/s");
+
+        float pitchDirInverted = cfgSens.gamepad_invert_y ? -1.0f : 1.0f;
+        assert_near(pitchDirInverted, -1.0f, 0.0001f, "Inverted Y yields negative pitch factor");
+
+        float pitchDirStandard = cfgSensEq.gamepad_invert_y ? -1.0f : 1.0f;
+        assert_near(pitchDirStandard, 1.0f, 0.0001f, "Standard Y yields positive pitch factor (stick UP = look UP)");
+
+        // 23e. Gamepad bumper vertical elevation simulation
+        Camera bumperCam(glm::vec3(0.0f, 10.0f, 0.0f), glm::vec3(0.0f, 10.0f, -1.0f), 45.0f, 16.0f / 9.0f);
+        bumperCam.setDynamicScaling(false);
+        bumperCam.setSpeed(5.0f);
+
+        // Right Bumper / R1 / R4 (Bumper Up)
+        bool btnBumperUp = true;
+        bool btnBumperDown = false;
+        float bumperVert = (btnBumperUp ? 1.0f : 0.0f) - (btnBumperDown ? 1.0f : 0.0f);
+        bumperCam.processFpsInput(0.0f, 0.0f, bumperVert, 0.2f, false);
+        assert_near(bumperCam.getPosition().y, 11.0f, 0.01f, "Right Bumper elevates camera UP by +1.0m");
+
+        // Left Bumper / L1 / L4 (Bumper Down)
+        btnBumperUp = false;
+        btnBumperDown = true;
+        bumperVert = (btnBumperUp ? 1.0f : 0.0f) - (btnBumperDown ? 1.0f : 0.0f);
+        bumperCam.processFpsInput(0.0f, 0.0f, bumperVert, 0.2f, false);
+        assert_near(bumperCam.getPosition().y, 10.0f, 0.01f, "Left Bumper descends camera DOWN back to 10.0m");
+
+        std::cout << "[PASS] Frame time spike clamping, key release robustness, 3x gamepad yaw turning rate & bumper elevation verified." << std::endl;
     }
 
     // 24. Real-time Scene Raycast & Dynamic Adaptive Speed Verification

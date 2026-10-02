@@ -433,7 +433,7 @@ private:
     bool m_isMinimized = false;
     std::thread m_telemetryWorker;
 
-    // Gamepad Navigation Support (FEAT-01)
+    // Gamepad Navigation & PS5 DualSense Support (FEAT-01)
     SDL_Gamepad* m_gamepad = nullptr;
     float m_gamepadLeftX = 0.0f;
     float m_gamepadLeftY = 0.0f;
@@ -443,6 +443,14 @@ private:
     float m_gamepadRightTrigger = 0.0f;
     bool m_gamepadBtnA = false;
     bool m_gamepadBtnB = false;
+    bool m_gamepadBtnOrbit = false;
+    bool m_gamepadBtnBumperUp = false;
+    bool m_gamepadBtnBumperDown = false;
+    bool m_gamepadIsPs5 = false;
+
+    void initGamepad();
+    void updateGamepadLed();
+    void rumbleGamepad(uint16_t low, uint16_t high, uint32_t durationMs);
 
     // Video billboard decoder & dynamic staging buffers
     std::unique_ptr<VideoDecoder> m_videoDecoder;

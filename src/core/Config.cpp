@@ -342,6 +342,9 @@ void Config::printUsage(const char* progName) {
               << "  --no-animate            Disable scene object animations (freeze pose)\n"
               << "  --anim-speed <float>    Animation playback speed multiplier (default: 1.0)\n"
               << "  --gamepad-deadzone <float> Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)\n"
+              << "  --gamepad-sensitivity <float> Analog look sensitivity multiplier [0.1 - 5.0] (default: 1.0)\n"
+              << "  --gamepad-invert-y      Invert vertical look axis for gamepad\n"
+              << "  --no-gamepad-invert-y   Do not invert vertical look axis for gamepad (default)\n"
               << "  --camera <px,py,pz,tx,ty,tz[,fov]> Set camera position, target look-at, and optional FOV\n"
               << "  --camera-pos <x,y,z>    Set camera position (or --cam-pos, space or comma separated)\n"
               << "  --camera-target <x,y,z> Set camera target look-at point (or --cam-target)\n"
@@ -1105,6 +1108,22 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--gamepad-deadzone=")) {
             cfg.gamepad_deadzone = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.01f, 0.50f);
+            continue;
+        }
+        if (arg == "--gamepad-sensitivity" && i + 1 < argc) {
+            cfg.gamepad_sensitivity = std::clamp(std::stof(argv[++i]), 0.1f, 5.0f);
+            continue;
+        }
+        if (arg.starts_with("--gamepad-sensitivity=")) {
+            cfg.gamepad_sensitivity = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.1f, 5.0f);
+            continue;
+        }
+        if (arg == "--gamepad-invert-y") {
+            cfg.gamepad_invert_y = true;
+            continue;
+        }
+        if (arg == "--no-gamepad-invert-y") {
+            cfg.gamepad_invert_y = false;
             continue;
         }
         if ((arg == "--camera" || arg == "-c") && i + 1 < argc) {

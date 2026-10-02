@@ -105,10 +105,13 @@ float Camera::getCurrentTargetDistance() const {
     return std::max(dist, minD);
 }
 
-float Camera::getEffectiveSpeed(bool sprint, bool crawl) const {
-    float currentDist = getCurrentTargetDistance();
-    float distRatio = (m_focalDistance > 0.01f) ? (currentDist / m_focalDistance) : 1.0f;
-    float distFactor = m_dynamicScaling ? std::clamp(distRatio, 0.15f, 5.0f) : 1.0f;
+float Camera::getEffectiveSpeed(bool sprint, bool crawl, bool applyDynamicScaling) const {
+    float distFactor = 1.0f;
+    if (applyDynamicScaling && m_dynamicScaling) {
+        float currentDist = getCurrentTargetDistance();
+        float distRatio = (m_focalDistance > 0.01f) ? (currentDist / m_focalDistance) : 1.0f;
+        distFactor = std::clamp(distRatio, 0.15f, 5.0f);
+    }
 
     float gearMultiplier = 1.0f;
     if (crawl) {
@@ -252,7 +255,7 @@ void Camera::endOrbit() {
     m_orbiting = false;
 }
 
-void Camera::processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl, bool arcStrafe) {
+void Camera::processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl, bool arcStrafe, bool applyDynamicScaling, float analogSpeedScale) {
     if (deltaTime <= 0.0f) {
         return;
     }
@@ -272,7 +275,7 @@ void Camera::processFpsInput(float forward, float strafe, float vertical, float 
             currentDist = glm::length(r);
         }
 
-        float speed = getEffectiveSpeed(sprint, crawl);
+        float speed = getEffectiveSpeed(sprint, crawl, applyDynamicScaling) * analogSpeedScale;
         float angularSpeed = speed / currentDist; // Constant angular rate from half-distance law
 
         // 1. Horizontal arc strafe (A / D) around world up
@@ -322,7 +325,7 @@ void Camera::processFpsInput(float forward, float strafe, float vertical, float 
     if (moveLen > 0.001f) {
         float inputMag = std::min(moveLen, 1.0f);
         glm::vec3 dir = moveDir / moveLen;
-        float currentSpeed = getEffectiveSpeed(sprint, crawl) * inputMag;
+        float currentSpeed = getEffectiveSpeed(sprint, crawl, applyDynamicScaling) * inputMag * analogSpeedScale;
         m_velocity = dir * currentSpeed;
         m_position += dir * (currentSpeed * deltaTime);
         m_moved = true;

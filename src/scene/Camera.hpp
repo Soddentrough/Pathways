@@ -54,7 +54,7 @@ public:
 
     // Movement controls
     void processKeyboard(char direction, float deltaTime);
-    void processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl = false, bool arcStrafe = false);
+    void processFpsInput(float forward, float strafe, float vertical, float deltaTime, bool sprint, bool crawl = false, bool arcStrafe = false, bool applyDynamicScaling = true, float analogSpeedScale = 1.0f);
     void processMouseMovement(float xoffset, float yoffset, bool orbit = false);
 
     // Arc-strafe / Orbit controls
@@ -72,7 +72,7 @@ public:
     float getFocalDistance() const { return m_focalDistance; }
     glm::vec3 getCentralTarget() const { return m_centralTarget; }
     float getCurrentTargetDistance() const;
-    float getEffectiveSpeed(bool sprint = false, bool crawl = false) const;
+    float getEffectiveSpeed(bool sprint = false, bool crawl = false, bool applyDynamicScaling = true) const;
     float getBaseSpeed() const { return m_baseSpeed; }
     float getMinSpeed() const { return m_minSpeed; }
     float getMaxSpeed() const { return m_maxSpeed; }

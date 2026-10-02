@@ -182,6 +182,8 @@ struct Config {
     bool animate_objects = true;   // Animate dynamic scene objects (e.g. rotating torus in mirror scene) [Default: true]
     float animation_speed = 1.0f;  // Global animation playback speed multiplier
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)
+    float gamepad_sensitivity = 1.0f; // Analog look sensitivity multiplier [0.1 - 5.0] (default: 1.0)
+    bool gamepad_invert_y = false;  // Invert vertical (pitch) look axis for gamepads (default: false)
     bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
 

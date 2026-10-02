@@ -147,18 +147,20 @@ Load any OpenUSD stage (`.usd`, `.usdc`, `.usda`), glTF 2.0 model (`.glb`, `.glt
 
 | Control | Action |
 | :--- | :--- |
-| **TAB** | Toggle between UI Control Panel and FPS Camera Navigation |
-| **Mouse Move** | Look / rotate camera (in FPS mode) |
-| **W / A / S / D** | Fly forward / left / backward / right |
-| **E / Q** or **Space / C** | Fly up / fly down |
-| **Shift** (hold) | Sprint speed multiplier (3.0x) |
-| **Alt** (hold) | Precision crawl speed multiplier (0.25x) |
-| **Ctrl** (hold) + **Mouse Move** | Orbit camera around targeted surface point |
-| **Mouse Wheel** | Adjust fly camera movement speed |
-| **F** | Focus and center camera on target object |
+| **TAB** / **Start (Options)** / **Touchpad** | Toggle between UI Control Panel and FPS Camera Navigation |
+| **Mouse Move** / **Right Stick** | Look / rotate freelook camera (in FPS mode) |
+| **W / A / S / D** / **Left Stick** | Fly forward / left / backward / right |
+| **E / Q** or **Space / C** / **Cross / Circle (A / B)** / **RB / LB (R1 / L1 / Paddles)** | Fly up / fly down |
+| **Shift** (hold) / **Right Trigger (RT / R2)** | Sprint speed multiplier (3.0x) |
+| **Alt** (hold) / **Left Trigger (LT / L2)** | Precision crawl speed multiplier (0.25x) |
+| **Ctrl** (hold) / **L3 / Square ◻** + Look | Orbit camera around targeted surface point |
+| **Mouse Wheel** / **D-Pad Up / Down** | Adjust fly camera movement speed |
+| **F** / **Right Stick Click (R3)** | Focus and center camera on target object |
+| **Triangle △ / Y** | Level camera pitch to horizon |
+| **D-Pad / Left Stick** (UI Mode) | Navigate Dear ImGui menu controls and sliders |
+| **Cross ✕ / A** (UI Mode) | Activate UI widget / Enter 3D scene navigation if clicked on viewport |
 | **F11** | Toggle Fullscreen |
 | **ESC** | Return to UI mode from FPS camera navigation (or exit if in UI) |
-| **Gamepad** | Dual-analog flight navigation (Left Stick: Fly/Strafe, Right Stick: Look, RT/LT: Sprint/Crawl, A/B: Up/Down) : (Experimental; unverified) |
 | **Alt+F4 / ESC** | Exit Pathways |
 
 ---
@@ -467,4 +469,4 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - [AMD RDNA4 Instruction Set Architecture (ISA)](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture)
 - [AMD RDNA Performance Guide](https://gpuopen.com/learn/rdna-performance-guide/)
 - [Improving Ray Tracing Performance with RRA](https://gpuopen.com/learn/improving-rt-perf-with-rra/)
-
+- https://www.mysimulator.uk/content/articles/realtime-denoising.html
