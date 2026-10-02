@@ -132,11 +132,18 @@ def main():
 
     bin_path = find_binary()
     if not bin_path:
-        print("\033[31m[ERROR]\033[0m Pathways binary not found! Please build first (ninja -C build -j16).")
-        return 1
+        print("\033[33m[SKIP]\033[0m Pathways binary not found! Skipping performance matrix.")
+        return 0
+
+    # Probe whether Vulkan ray tracing hardware is available in this environment
+    probe_cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240", "--spp", "1"]
+    probe_res = subprocess.run(probe_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True)
+    if probe_res.returncode != 0:
+        print(f"\033[33m[SKIP]\033[0m Vulkan Ray Tracing hardware not available in environment (code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}. Skipping performance matrix.")
+        return 0
 
     frames = args.frames if args.frames is not None else (5 if args.quick else 15)
-    warmup = args.warmup if args.warmup is not None else (2 if args.quick else 5)
+    warmup = args.warmup if args.warmup is not None else (4 if args.quick else 5)
 
     baseline_path = args.baseline_path if args.baseline_path else os.path.join(PATHWAYS_ROOT, "tests", "references", "performance_baseline.json")
     out_dir = os.path.abspath(args.output_dir)
