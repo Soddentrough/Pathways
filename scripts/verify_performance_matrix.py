@@ -135,11 +135,26 @@ def main():
         print("\033[33m[SKIP]\033[0m Pathways binary not found! Skipping performance matrix.")
         return 0
 
+    # In CI environments (GitHub Actions) without dedicated hardware benchmarking GPUs, skip regression matrix
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+        print("\033[33m[SKIP]\033[0m Detected CI environment without dedicated benchmarking hardware. Skipping performance matrix.")
+        return 0
+
     # Probe whether Vulkan ray tracing hardware is available in this environment
     probe_cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240", "--spp", "1"]
-    probe_res = subprocess.run(probe_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True)
+    try:
+        probe_res = subprocess.run(probe_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        print("\033[33m[SKIP]\033[0m Hardware probe timed out after 10s (software emulation). Skipping performance matrix.")
+        return 0
+
     if probe_res.returncode != 0:
         print(f"\033[33m[SKIP]\033[0m Vulkan Ray Tracing hardware not available in environment (code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}. Skipping performance matrix.")
+        return 0
+
+    combined_output = (probe_res.stdout + probe_res.stderr).lower()
+    if any(sw in combined_output for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
+        print("\033[33m[SKIP]\033[0m Software/CPU Vulkan renderer detected. Skipping performance matrix.")
         return 0
 
     frames = args.frames if args.frames is not None else (5 if args.quick else 15)
