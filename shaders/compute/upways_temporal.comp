@@ -1,0 +1,177 @@
+#version 460 core
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "upways_common_v3.glsl"
+
+// Workgroup: 8x8 = 64 threads = 2x Wave32 wavefronts on AMD RDNA 4 (gfx1201)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// =========================================================================
+// Descriptors: Consolidated 4-Texture G-Buffer Inputs (Render Resolution 540p)
+// =========================================================================
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uTex0_LogRadianceRoughness;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uTex1_AlbedoSpecDisparity;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uTex2_NormalDepth;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uTex3_MotionVectors;
+
+// History State Samplers (Ping-pong Read)
+layout(set = 0, binding = 4) uniform sampler2D uHistoryLatentDiff;
+layout(set = 0, binding = 5) uniform sampler2D uHistoryLatentSpec;
+layout(set = 0, binding = 6) uniform sampler2D uHistoryPosWorld;
+
+// Output Targets (Render Resolution 540p)
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uTemporalLatentDiff;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D uTemporalLatentSpec;
+layout(set = 0, binding = 9, r16f)    uniform writeonly image2D uReliabilityMap;
+
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D uOutHistoryLatentDiff;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D uOutHistoryLatentSpec;
+layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D uOutHistoryPosWorld;
+
+// Push Constants: Exact 256-byte Uniforms Block matching Pathways host
+layout(push_constant) uniform Uniforms {
+    mat4  u_CurrInvView;       // 0..63: View to World
+    mat4  u_PrevViewProj;      // 64..127: World to Previous Clip
+    mat4  u_InvProj;           // 128..191: Clip to View
+    vec4  u_PrevViewZ;         // 192..207: Row 2 of PrevView for axial depth
+    vec2  u_JitterOffset;      // 208..215: Subpixel camera jitter in render pixels
+    uvec2 u_RenderRes;         // 216..223: Render resolution (e.g. 960, 540)
+    uvec2 u_DisplayRes;        // 224..231: Display resolution (e.g. 1920, 1080)
+    vec2  u_ScaleFactor;       // 232..239: DisplayRes / RenderRes (e.g. 2.0, 2.0)
+    uint  u_ResetHistory;      // 240..243: History reset flag
+    uint  u_FrameIndex;        // 244..247: Temporal frame index
+    float u_InvTotalSamples;   // 248..251: 1.0 / totalSamples
+    uint  u_TotalSamples;      // 252..255: SPP count
+};
+
+// LDS Shared Memory for 8x8 Tile staging (2,560 bytes total)
+shared vec4  s_posWorld[8][8];
+shared vec3  s_normalWorld[8][8];
+shared float s_viewDepth[8][8];
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 localId = gl_LocalInvocationID.xy;
+    if (coord.x >= int(u_RenderRes.x) || coord.y >= int(u_RenderRes.y)) {
+        return;
+    }
+
+    // 1. Ingest Consolidated 4-Texture G-Buffers
+    vec4 tex0 = imageLoad(uTex0_LogRadianceRoughness, coord);
+    vec4 tex1 = imageLoad(uTex1_AlbedoSpecDisparity, coord);
+    vec4 tex2 = imageLoad(uTex2_NormalDepth, coord);
+    vec4 tex3 = imageLoad(uTex3_MotionVectors, coord);
+
+    vec3 logRadiance = tex0.rgb;
+    float roughness = clamp(tex0.a, 0.0, 1.0);
+
+    vec3 albedo = clamp(tex1.rgb, vec3(0.0), vec3(1.0));
+    float specDisparity = clamp(tex1.a, 0.0, 1.0);
+    float dHit = (specDisparity > 0.001) ? (1.0 / specDisparity - 1.0) : 0.0;
+
+    vec3 viewNormal = normalize(tex2.xyz);
+    float viewDepth = tex2.w;
+
+    vec2 vSurface = tex3.xy;
+    vec2 vSpecular = tex3.zw;
+
+    // 2. Physical Radiance Demodulation
+    vec3 linearRadiance = upwaysInverseLogTransform(logRadiance);
+    vec3 diffIrradiance = linearRadiance / max(albedo, vec3(1e-3));
+    vec3 specRadiance = max(linearRadiance - diffIrradiance * albedo, vec3(0.0));
+
+    // 3. Exact 3D Euclidean Kinematic Reprojection
+    vec2 uv_curr = (vec2(coord) + 0.5) / vec2(u_RenderRes);
+    vec4 clipPoint = vec4(uv_curr * 2.0 - 1.0, 0.5, 1.0);
+    vec4 h = u_InvProj * clipPoint;
+    vec3 rayDirView = h.xyz / h.w;
+    vec3 posView = rayDirView * (viewDepth / max(-rayDirView.z, 1e-4));
+    vec3 posWorld = (u_CurrInvView * vec4(posView, 1.0)).xyz;
+    vec3 normalWorld = normalize(mat3(u_CurrInvView) * viewNormal);
+
+    s_posWorld[localId.y][localId.x] = vec4(posWorld, 1.0);
+    s_normalWorld[localId.y][localId.x] = normalWorld;
+    s_viewDepth[localId.y][localId.x] = viewDepth;
+    barrier();
+
+    // Primary screen reprojection
+    vec2 uv_prev = uv_curr - vSurface;
+    bool clipValid = (uv_prev.x >= 0.0 && uv_prev.x <= 1.0 && uv_prev.y >= 0.0 && uv_prev.y <= 1.0);
+
+    // 4. Virtual Secondary-Hit Mirror Reprojection
+    vec3 camPosWorld = u_CurrInvView[3].xyz;
+    vec3 viewDirWorld = normalize(posWorld - camPosWorld);
+    vec3 reflDirWorld = reflect(viewDirWorld, normalWorld);
+    vec3 x2_curr = posWorld + reflDirWorld * max(dHit, 0.01);
+
+    // Virtual mirror reflection across primary tangent plane
+    vec3 hitDiff = x2_curr - posWorld;
+    vec3 xVirtual = x2_curr - 2.0 * normalWorld * dot(normalWorld, hitDiff);
+    vec4 specClip = u_PrevViewProj * vec4(xVirtual, 1.0);
+    vec2 uv_spec_proj = (specClip.xy / max(specClip.w, 1e-4)) * 0.5 + 0.5;
+    vec2 uv_spec_prev = (dot(vSpecular, vSpecular) > 0.0) ? (uv_curr - vSpecular) : uv_spec_proj;
+
+    bool specClipValid = (uv_spec_prev.x >= 0.0 && uv_spec_prev.x <= 1.0 && uv_spec_prev.y >= 0.0 && uv_spec_prev.y <= 1.0);
+    float specReliability = clamp(1.0 - roughness * roughness, 0.0, 1.0) * float(specClipValid);
+
+    // 5. Physical Kinematic Rates (Parallax Shear & Perspective Expansion)
+    vec3 vRelView = vec3(vSurface * viewDepth, 0.0);
+    float kappaTrans = length(vRelView.xy) / max(viewDepth, 0.1);
+    float kappaExp = abs(vRelView.z) / max(viewDepth, 0.1);
+
+    // 6. 3D Tangent-Plane Consistency Invariant
+    vec4 histPosSample = texture(uHistoryPosWorld, uv_prev);
+    vec3 prevPosWarped = histPosSample.xyz;
+    float planeDist = abs(dot(normalWorld, posWorld - prevPosWarped));
+    float planeConf = exp(-planeDist / 0.05);
+    float geomConfidence = float(clipValid) * planeConf;
+
+    if (u_ResetHistory != 0u || u_FrameIndex == 0u) {
+        geomConfidence = 1.0;
+        specReliability = 1.0;
+    }
+
+    // 7. Decoupled Feature Encoders (Diffuse 13-ch & Specular 14-ch)
+    vec4 currLatentDiff = vec4(diffIrradiance, geomConfidence);
+    vec4 currLatentSpec = vec4(specRadiance, specReliability);
+
+    // 8. Recurrent Temporal Latent Blending
+    vec4 histDiff = texture(uHistoryLatentDiff, uv_prev);
+    vec4 histSpec = texture(uHistoryLatentSpec, uv_spec_prev);
+
+    float alphaBase = 0.08;
+    float scaleFactorLaw = max(1.0 / u_ScaleFactor.x, 0.25);
+    float zExpBoost = clamp(kappaExp * 0.5, 0.0, 1.0);
+
+    float alphaDiff = clamp(alphaBase * scaleFactorLaw + zExpBoost, 0.01, 1.0);
+    float alphaSpec = clamp(alphaBase * scaleFactorLaw + zExpBoost, 0.05, 1.0);
+
+    // Instantaneous disocclusion flush
+    if (geomConfidence < 0.5) alphaDiff = 1.0;
+    if (geomConfidence < 0.5 || specReliability < 0.1) alphaSpec = 1.0;
+    if (u_ResetHistory != 0u || u_FrameIndex == 0u) {
+        alphaDiff = 1.0;
+        alphaSpec = 1.0;
+    }
+
+    vec4 blendedDiff = mix(histDiff, currLatentDiff, alphaDiff);
+    vec4 blendedSpec = mix(histSpec, currLatentSpec, alphaSpec);
+
+    // 9. Reliability Map Export
+    float variance = 0.0;
+    float reliability = clamp(geomConfidence * exp(-kappaTrans - abs(kappaExp) - variance), 0.0, 1.0);
+
+    // 10. Write All Output Images & Ping-Pong History
+    imageStore(uTemporalLatentDiff, coord, blendedDiff);
+    imageStore(uTemporalLatentSpec, coord, blendedSpec);
+    imageStore(uReliabilityMap, coord, vec4(reliability, 0.0, 0.0, 0.0));
+
+    imageStore(uOutHistoryLatentDiff, coord, blendedDiff);
+    imageStore(uOutHistoryLatentSpec, coord, blendedSpec);
+    imageStore(uOutHistoryPosWorld, coord, vec4(posWorld, viewDepth));
+}

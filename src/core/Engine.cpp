@@ -3225,9 +3225,13 @@ void Engine::createUpwaysPipelines() {
     VmaAllocator allocator = m_context->getAllocator();
 
     try {
-        auto upwaysCode = loadShaderSPIRV("neural_reconstruct.comp.spv");
+        auto temporalCode = loadShaderSPIRV("upways_temporal.comp.spv");
+        auto upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
         if (upwaysCode.empty()) {
-            upwaysCode = loadShaderSPIRV("upways_reconstruct.comp.spv");
+            upwaysCode = loadShaderSPIRV("neural_reconstruct.comp.spv");
+        }
+        if (temporalCode.empty()) {
+            temporalCode = upwaysCode;
         }
         VkFormat format = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         bool isSuperRes = m_config.upways_superres || (m_config.upscaler_mode == UpscalerMode::Upways);
@@ -3247,6 +3251,7 @@ void Engine::createUpwaysPipelines() {
             inH,
             outW,
             outH,
+            temporalCode,
             upwaysCode,
             m_config.upways_weights_path,
             isSuperRes,
@@ -4588,7 +4593,8 @@ void Engine::updateWavefrontSceneDescriptors() {
             m_materialArchetypeBuffer ? m_materialArchetypeBuffer->getBuffer() : VK_NULL_HANDLE,
             m_materialArchetypeBuffer ? m_materialArchetypeBuffer->getSize() : 0,
             m_shadeMaterialBuffer ? m_shadeMaterialBuffer->getBuffer() : VK_NULL_HANDLE,
-            m_shadeMaterialBuffer ? m_shadeMaterialBuffer->getSize() : 0
+            m_shadeMaterialBuffer ? m_shadeMaterialBuffer->getSize() : 0,
+            (m_upwaysPipeline && m_upwaysPipeline->getConfidenceImage()) ? m_upwaysPipeline->getConfidenceImage()->getImageView() : VK_NULL_HANDLE
         );
     }
 
@@ -5809,12 +5815,18 @@ void Engine::renderFrame() {
     bool cameraMovedThisFrame = !sceneLoadingActive && ((m_camera && m_camera->hasMoved() && m_totalFramesRendered > 0) || m_config.camera_motion || pathMoving);
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
-    bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || instanceJustStopped || hardReset;
+
+    if (cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || instanceJustStopped || hardReset) {
+        m_sceneGeneration++;
+    }
+    bool accumReset = (m_sceneGeneration != m_lastAccumulatedSceneGeneration);
+
     if (accumReset || cameraMovedThisFrame) {
         m_dynamicWavefrontBounces = m_config.max_bounces;
     }
     if (accumReset && !sceneLoadingActive) {
         m_accumulatedSamples = 0;
+        m_lastAccumulatedSceneGeneration = m_sceneGeneration;
         if (m_camera) m_camera->resetMoved();
         m_resetAccumulation = false;
     }

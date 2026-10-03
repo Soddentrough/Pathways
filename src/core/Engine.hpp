@@ -394,6 +394,10 @@ private:
     uint32_t m_dynamicWavefrontBounces = 0;
     uint32_t m_accumulatedSamples = 0;
     bool m_accumulationComplete = false;
+    uint64_t m_sceneGeneration = 0;
+    uint64_t m_lastAccumulatedSceneGeneration = 0;
+    void bumpSceneGeneration() { m_sceneGeneration++; }
+    uint64_t getSceneGeneration() const { return m_sceneGeneration; }
     std::chrono::high_resolution_clock::time_point m_currentFrameStartTime;
     std::chrono::high_resolution_clock::time_point m_lastWallFrameStartTime;
     double m_lastPresentationTimeMs = 0.0;

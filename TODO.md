@@ -145,3 +145,51 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
   - [ ] Wire fixed-timestep update in `Engine::renderFrame()` to sync Box3D body transforms into `Engine::updateInstanceTransform()`.
   - [ ] Add ImGui controls in `GuiManager` for physics reset, ball spawn rate, gravity, and restitution.
 
+---
+
+## Material Authoring & Procedural Shader Architecture Roadmap
+
+### 9. Native Procedural Shader Node Editor & Live Pipeline Engine
+- [ ] **Status:** Proposed / Architectural Design Phase
+- [ ] **Target Component:** `src/ui/GuiManager.cpp`, `src/ui/ShaderEditor/` (new), `src/rt/WavefrontPipeline.cpp`, `src/scene/Material.hpp`, `shaders/compute/procedural_noise.glsl`, `shaders/compute/wavefront_shade_*.comp`
+- [ ] **Objective:** Design and implement a high-performance, node-based procedural shader authoring engine natively within Pathways (paired with an optional Blender live-link bridge), enabling interactive procedural material authoring with instant path-traced viewport feedback, automated GLSL/Slang code generation, and strict RDNA 4 (`gfx1201`) Wave32 VGPR occupancy budgeting.
+- [ ] **Architectural Motivation & Strategic Comparison:**
+  - **In-Engine Native Editor vs. DCC Transpilation (Strategy A)**:
+    - *Native In-Engine Editor*: Eliminates the "preview disconnect" between Blender Cycles/EEVEE and Pathways' true path-traced multi-bounce lighting, ReSTIR GI, and Upways NRC denoising. Provides instant WYSIWYG iteration directly inside the Vulkan viewport.
+    - *Performance-First Principle*: Rather than generic interpretation or unconstrained graph explosion, the node compiler generates clean, specialized GLSL/Slang microkernels with dead-code elimination, constant folding, and direct mapping into Pathways' DGC material archetypes (`DIFFUSE`, `CONDUCTOR`, `DIELECTRIC`, `COMPLEX`).
+    - *Blender Live-Link Hybrid*: In addition to the native ImGui node canvas, expose a localhost IPC/socket bridge enabling artists to author graphs in Blender's mature Shader Editor while Pathways hot-reloads the transpiled GLSL in real-time (< 50ms).
+- [ ] **Core Architectural Pillars & Engine Integration:**
+  - **1. Node Graph Representation & DAG Compiler:**
+    - Lightweight, cycle-free Directed Acyclic Graph (DAG) data model (`NodeGraph`, `Node`, `Pin`, `Link`).
+    - Topological sort and dead-code elimination: only nodes connected to the terminal `MaterialOutput` (Base Color, Metallic, Roughness, Normal, Transmission, Emission) are emitted.
+    - Compile-time constant propagation: static inputs (scale, tint, bias) are baked as GLSL constants rather than dynamic uniform registers.
+  - **2. Procedural Math & Wavefront Microkernel Library:**
+    - Build upon Pathways' existing `shaders/compute/procedural_noise.glsl`:
+      - Analytical 3D Simplex noise with simultaneous gradients (`simplex3D_grad`) for zero-memory, tangentless normal perturbation without finite-difference texture taps.
+      - Low-register 2D/3D Voronoi (`voronoi2D`, Chebyshev/Manhattan metrics, distance-to-edge).
+      - Multi-scale Fractal Brownian Motion (`fbm3D_grad`) with domain rotation.
+      - ColorRamp evaluation via piecewise `mix()` / smoothstep or compact 64-entry FP16 LUTs.
+  - **3. RDNA 4 (`gfx1201`) Wave32 Occupancy & VGPR Guardrails:**
+    - Strict register budgeting: target $\le 40$ VGPRs for 100% Wave32 occupancy on R9700.
+    - Automated background RGA profiling: during compilation, invoke `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/rga` against `gfx1201` to display real-time ISA statistics, VGPR counts, and wave occupancy directly in the editor UI.
+    - Automated Archetype Sorting: analyze graph outputs to automatically assign the material to the lightest possible DGC microkernel (`wavefront_shade_diffuse.comp` vs. `wavefront_shade_complex.comp`).
+  - **4. Asynchronous Vulkan 1.4 Pipeline Hot-Reloading:**
+    - Non-blocking background worker thread compiles generated GLSL to SPIR-V via `libshaderc` / `glslc`.
+    - Creates new `VkPipeline` and swaps handles on a safe frame boundary without stalling GPU execution rings or dropping frames.
+    - Resets progressive path-trace accumulation (`frameIndex = 0`) on material parameter mutation.
+- [ ] **Tasks & Implementation Steps:**
+  - [ ] **Phase 1: DAG Data Model & Code Generator**:
+    - Implement `ShaderGraph` data structures in C++20 with serialization (JSON / USD UsdShade).
+    - Implement topological code generator emitting GLSL snippets targeting `wavefront_common.glsl`.
+    - Unit tests for arithmetic simplification, vector swizzling, and dead-branch pruning.
+  - [ ] **Phase 2: Vulkan Runtime Hot-Reloading Infrastructure**:
+    - Add asynchronous `PipelineCompiler` in `src/vulkan/` using `glslc` / `shaderc`.
+    - Implement seamless `VkPipeline` handle swap in `WavefrontPipeline::recordShade()`.
+    - Integrate RGA CLI invocation to parse `analysis.csv` and report VGPR / SGPR / LDS telemetry.
+  - [ ] **Phase 3: Native ImGui Node Editor Canvas**:
+    - Integrate `imgui-node-editor` (or lightweight canvas) into `src/ui/GuiManager.cpp`.
+    - Implement core node catalog: Coordinates (`Generated`, `Object`, `UV`, `WorldNormal`), Math / VectorMath, Mapping, SimplexNoise, Voronoi, ColorRamp, PrincipledBSDF Output.
+    - Add real-time RGA occupancy badge (Green $<40$ VGPRs, Yellow $41-64$, Red $>64$).
+  - [ ] **Phase 4: Blender Live-Link Companion Addon**:
+    - Write lightweight Blender Python export script (`addons/pathways_livelink.py`) watching `depsgraph_update_post`.
+    - Stream generated shader snippets or JSON DAG over local IPC/TCP socket into Pathways for dual-monitor authoring.
