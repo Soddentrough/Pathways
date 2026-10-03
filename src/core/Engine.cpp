@@ -3466,7 +3466,7 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
             blitNormals.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             blitNormals.dstOffsets[0] = { 0, 0, 0 };
             blitNormals.dstOffsets[1] = { static_cast<int32_t>(outW), static_cast<int32_t>(outH), 1 };
-            vkCmdBlitImage(cmd, srcNormDepth->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayNormalsImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitNormals, VK_FILTER_LINEAR);
+            vkCmdBlitImage(cmd, srcNormDepth->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayNormalsImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitNormals, VK_FILTER_NEAREST);
 
             std::vector<VkImageMemoryBarrier2> postBlitBarriers;
             auto addPostBlitBarrier = [&](Image* img, VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
@@ -3518,7 +3518,7 @@ bool Engine::dispatchUpways(VkCommandBuffer cmd, bool resetHistory) {
         jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
     }
 
-    uint32_t totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0) ? m_accumulatedSamples : 1u;
+    uint32_t totalSamples = (m_config.progressive_accumulation && m_accumulatedSamples > 0 && !isSuperRes) ? m_accumulatedSamples : 1u;
 
     m_upwaysPipeline->recordFrame(
         cmd, m_frameIndex, resetHistory, m_cameraMovedLastFrame,
@@ -6019,8 +6019,9 @@ void Engine::renderFrame() {
                 vkCmdClearColorImage(cmd, m_frameImages[m_currentFrame]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
 
                 bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-                if (needAccumReset) {
-                    if (m_accumImage) {
+                bool isUpwaysSuperResActive = (m_config.upscaler_mode == UpscalerMode::Upways || m_config.upways_superres);
+                if (needAccumReset || isUpwaysSuperResActive) {
+                    if (needAccumReset && m_accumImage) {
                         vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
                     }
                     if (m_mlDiffuseImage) {
@@ -6591,8 +6592,9 @@ void Engine::renderFrame() {
                 vkCmdClearColorImage(cmd, m_frameImages[m_currentFrame]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
 
                 bool needAccumReset = accumReset || !m_config.progressive_accumulation;
-                if (needAccumReset) {
-                    if (m_accumImage) {
+                bool isUpwaysSuperResActive = (m_config.upscaler_mode == UpscalerMode::Upways || m_config.upways_superres);
+                if (needAccumReset || isUpwaysSuperResActive) {
+                    if (needAccumReset && m_accumImage) {
                         vkCmdClearColorImage(cmd, m_accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
                     }
                     if (m_mlDiffuseImage) {

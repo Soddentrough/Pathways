@@ -13,7 +13,7 @@ import shutil
 import argparse
 import json
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import cv2
 from skimage.metrics import structural_similarity as ssim
 
@@ -224,6 +224,82 @@ TEST_CONFIGS = [
         "render_path": f"{OUTPUT_DIR}/test_cyber_city_terrace.png",
         "ref_path": f"{REF_DIR}/cyber_city_terrace.png",
         "diff_path": f"{OUTPUT_DIR}/diff_cyber_city_terrace.png"
+    },
+    {
+        "id": "infinity_1spp_raw",
+        "name": "Infinity Mirror 1080p (1 SPP Pure Monte Carlo Raw)",
+        "scene": "infinity-mirror",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "infinity-mirror",
+            "--width", "1920", "--height", "1080",
+            "--denoiser", "none",
+            "--no-animate",
+            "--frames", "1",
+            "--dump-frame", f"{OUTPUT_DIR}/test_infinity_1spp_raw.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_infinity_1spp_raw.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_infinity_1spp_raw.png",
+        "ref_path": f"{REF_DIR}/infinity_mirror_converged_1080p.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_infinity_1spp_raw.png",
+        "comparison_path": f"{OUTPUT_DIR}/visual_comparisons/infinity_1spp_raw_comparison.png"
+    },
+    {
+        "id": "upways_infinity_1080p",
+        "name": "Upways Neural Reconstruction 1080p (Infinity Mirror)",
+        "scene": "infinity-mirror",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "infinity-mirror",
+            "--width", "1920", "--height", "1080",
+            "--denoiser", "upways",
+            "--no-animate",
+            "--frames", "30",
+            "--dump-frame", f"{OUTPUT_DIR}/test_upways_infinity_1080p.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_upways_infinity_1080p.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_upways_infinity_1080p.png",
+        "raw_path": f"{OUTPUT_DIR}/test_infinity_1spp_raw.png",
+        "ref_path": f"{REF_DIR}/infinity_mirror_converged_1080p.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_upways_infinity_1080p.png",
+        "comparison_path": f"{OUTPUT_DIR}/visual_comparisons/upways_infinity_1080p_comparison.png"
+    },
+    {
+        "id": "cornell_upways_1080p",
+        "name": "Cornell Box 1080p (Upways Neural Denoiser)",
+        "scene": "Procedural Cornell Box",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--width", "1920", "--height", "1080",
+            "--denoiser", "upways",
+            "--frames", "30",
+            "--dump-frame", f"{OUTPUT_DIR}/test_cornell_upways_1080p.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_cornell_upways_1080p.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_cornell_upways_1080p.png",
+        "ref_path": f"{REF_DIR}/cornell_upways_1080p.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_cornell_upways_1080p.png",
+        "comparison_path": f"{OUTPUT_DIR}/visual_comparisons/cornell_upways_1080p_comparison.png"
+    },
+    {
+        "id": "upways_2x_infinity_1080p",
+        "name": "Upways Neural 2x Super-Resolution 1080p (Infinity Mirror)",
+        "scene": "infinity-mirror",
+        "cmd": [
+            "./build/bin/pathways", "--headless",
+            "--scene", "infinity-mirror",
+            "--width", "1920", "--height", "1080",
+            "--scaler", "upways",
+            "--no-animate",
+            "--frames", "30",
+            "--dump-frame", f"{OUTPUT_DIR}/test_upways_2x_infinity_1080p.png",
+            "--dump-stats", f"{OUTPUT_DIR}/stats_upways_2x_infinity_1080p.json"
+        ],
+        "render_path": f"{OUTPUT_DIR}/test_upways_2x_infinity_1080p.png",
+        "raw_path": f"{OUTPUT_DIR}/test_infinity_1spp_raw.png",
+        "ref_path": f"{REF_DIR}/infinity_mirror_converged_1080p.png",
+        "diff_path": f"{OUTPUT_DIR}/diff_upways_2x_infinity_1080p.png",
+        "comparison_path": f"{OUTPUT_DIR}/visual_comparisons/upways_2x_infinity_1080p_comparison.png"
     }
 ]
 
@@ -245,7 +321,100 @@ def resolve_binary(binary_arg=None):
             return c
     return binary_arg or candidates[0]
 
-def compute_metrics(curr_path, ref_path, diff_output_path=None):
+def create_side_by_side_comparison(
+    img_curr_path,
+    img_ref_path,
+    diff_path=None,
+    raw_path=None,
+    output_path=None,
+    metrics=None
+):
+    """
+    Creates a multi-panel visual comparison collage:
+    If raw_path exists:
+      [ Raw 1-SPP Input | Denoised Current Render | Converged Baseline Reference | Difference Heatmap ]
+    Else:
+      [ Converged Baseline Reference | Denoised Current Render | Difference Heatmap ]
+    Includes clear title bars, resolution, and metric annotations.
+    """
+    if not output_path or not os.path.exists(img_curr_path) or not os.path.exists(img_ref_path):
+        return None
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    img_curr = Image.open(img_curr_path).convert("RGB")
+    img_ref = Image.open(img_ref_path).convert("RGB")
+    w, h = img_curr.size
+    if img_ref.size != (w, h):
+        img_ref = img_ref.resize((w, h), Image.Resampling.LANCZOS)
+
+    img_diff = None
+    if diff_path and os.path.exists(diff_path):
+        img_diff = Image.open(diff_path).convert("RGB")
+        if img_diff.size != (w, h):
+            img_diff = img_diff.resize((w, h), Image.Resampling.LANCZOS)
+
+    img_raw = None
+    if raw_path and os.path.exists(raw_path):
+        img_raw = Image.open(raw_path).convert("RGB")
+        if img_raw.size != (w, h):
+            img_raw = img_raw.resize((w, h), Image.Resampling.LANCZOS)
+
+    # Panels configuration
+    panels = []
+    if img_raw is not None:
+        panels.append(("1. RAW 1-SPP INPUT (Monte Carlo)", img_raw, (255, 130, 130)))
+        panels.append(("2. CURRENT RENDER (Denoised)", img_curr, (100, 220, 255)))
+        panels.append(("3. CONVERGED BASELINE (GT Reference)", img_ref, (120, 255, 160)))
+        if img_diff is not None:
+            panels.append(("4. DIFFERENCE HEATMAP (Turbo 3.5x)", img_diff, (255, 215, 0)))
+    else:
+        panels.append(("1. CONVERGED BASELINE (Reference)", img_ref, (120, 255, 160)))
+        panels.append(("2. CURRENT RENDER", img_curr, (100, 220, 255)))
+        if img_diff is not None:
+            panels.append(("3. DIFFERENCE HEATMAP (Turbo 3.5x)", img_diff, (255, 215, 0)))
+
+    num_panels = len(panels)
+    thumb_w = 960
+    thumb_h = int(h * (thumb_w / w))
+    gap = 12
+    header_h = 44
+    footer_h = 36 if metrics else 0
+    total_w = thumb_w * num_panels + gap * (num_panels - 1)
+    total_h = thumb_h + header_h + footer_h
+
+    collage = Image.new("RGB", (total_w, total_h), color=(18, 20, 26))
+    draw = ImageDraw.Draw(collage)
+
+    try:
+        from PIL import ImageFont
+        font_header = ImageFont.truetype("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf", 20)
+        font_sub = ImageFont.truetype("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", 14)
+    except Exception:
+        font_header = None
+        font_sub = None
+
+    for idx, (title, img, color) in enumerate(panels):
+        x = idx * (thumb_w + gap)
+        if font_header:
+            draw.text((x + 12, 12), title, fill=color, font=font_header)
+        else:
+            draw.text((x + 12, 14), title, fill=color)
+
+        resized = img.resize((thumb_w, thumb_h), Image.Resampling.BILINEAR)
+        collage.paste(resized, (x, header_h))
+
+    if metrics:
+        metric_str = f"Metrics: SSIM: {metrics.get('ssim', 0):.4f} | PSNR: {metrics.get('psnr', 0):.2f} dB | MAE: {metrics.get('mae', 0):.4f} | Sharpness Δ: {metrics.get('sharp_pct_change', 0):+.1f}% | Unique Colors: {metrics.get('unique_colors_curr', 0):,} | Clumping Ratio: {metrics.get('clumping_ratio', 0):.2f}"
+        if font_sub:
+            draw.text((16, total_h - 26), metric_str, fill=(200, 210, 225), font=font_sub)
+        else:
+            draw.text((16, total_h - 24), metric_str, fill=(200, 210, 225))
+
+    collage.save(output_path, quality=95)
+    return output_path
+
+def compute_metrics(curr_path, ref_path, diff_output_path=None, raw_path=None, comparison_output_path=None):
     """
     Computes statistical and perceptual metrics between curr_path and ref_path.
     Returns dictionary with metrics and classification.
@@ -329,6 +498,27 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
     blue_ratio_ref = mean_rgb_ref[2] / max(max(mean_rgb_ref[0], mean_rgb_ref[1]), 1e-4)
     blue_ratio_drop = blue_ratio_ref - blue_ratio_curr
 
+    # 4c. Anti-Posterization Metric (Color Diversity & Quantization Detection)
+    u8_curr = (np.clip(arr_curr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    u8_ref = (np.clip(arr_ref, 0.0, 1.0) * 255.0).astype(np.uint8)
+    step = max(1, (w_curr * h_curr) // 150000)
+    flat_curr = u8_curr.reshape(-1, 3)[::step]
+    flat_ref = u8_ref.reshape(-1, 3)[::step]
+    unique_colors_curr = int(len(np.unique(flat_curr, axis=0)))
+    unique_colors_ref = int(len(np.unique(flat_ref, axis=0)))
+    unique_ratio = unique_colors_curr / max(unique_colors_ref, 1)
+
+    # 4d. Anti-Clumping Metric (Spatial Frequency & Coarse Blotchiness)
+    diff_lum = np.abs(lum_curr - lum_ref)
+    f_shift = np.fft.fftshift(np.fft.fft2(diff_lum))
+    mag = np.abs(f_shift)
+    cy, cx = h_curr // 2, w_curr // 2
+    y_g, x_g = np.ogrid[:h_curr, :w_curr]
+    dist = np.sqrt((x_g - cx)**2 + (y_g - cy)**2)
+    low_freq_energy = float(np.sum(mag[dist < 30]))
+    high_freq_energy = float(np.sum(mag[dist >= 30])) + 1e-6
+    clumping_ratio = float(low_freq_energy / high_freq_energy)
+
     # 5. Difference Heatmap Generation
     if diff_output_path:
         os.makedirs(os.path.dirname(diff_output_path) or ".", exist_ok=True)
@@ -338,6 +528,25 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
         diff_color = cv2.applyColorMap(diff_u8, cv2.COLORMAP_TURBO)
         diff_color_rgb = cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB)
         Image.fromarray(diff_color_rgb).save(diff_output_path)
+
+    # 5b. Side-by-Side Visual Comparison Collage
+    comparison_saved = None
+    if comparison_output_path:
+        comparison_saved = create_side_by_side_comparison(
+            curr_path, ref_path,
+            diff_path=diff_output_path,
+            raw_path=raw_path,
+            output_path=comparison_output_path,
+            metrics={
+                "ssim": ssim_val,
+                "psnr": psnr,
+                "mae": mae,
+                "delta_mean_lum": delta_mean_lum,
+                "sharp_pct_change": sharp_pct_change,
+                "unique_colors_curr": unique_colors_curr,
+                "clumping_ratio": clumping_ratio,
+            }
+        )
 
     # 6. Classification Engine (Regressions vs Improvements vs Matches)
     status = "MATCH"
@@ -350,7 +559,15 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
         severity = "pass"
     else:
         # Significant difference detected. Classify root cause:
-        if chroma_drift > 0.035 or (blue_ratio_drop > 0.20 and blue_ratio_curr < 0.70):
+        if unique_ratio < 0.15 or unique_colors_curr < 1500:
+            status = "FLAGGED REGRESSION: POSTERIZATION / FLAT BLOCKS"
+            detail = f"Color depth collapsed into flat blocks: unique colors={unique_colors_curr} (ref={unique_colors_ref}, ratio={unique_ratio:.2f})"
+            severity = "fail"
+        elif clumping_ratio > 4.5 and mae > 0.035:
+            status = "FLAGGED REGRESSION: NOISE CLUMPING / COARSE BLOTCHINESS"
+            detail = f"High-frequency noise smeared into coarse blotches (clumping_ratio={clumping_ratio:.2f})"
+            severity = "fail"
+        elif chroma_drift > 0.035 or (blue_ratio_drop > 0.20 and blue_ratio_curr < 0.70):
             status = "FLAGGED REGRESSION: COLOR CAST / CHROMATIC DRIFT"
             detail = f"Color tint shift: chroma_drift={chroma_drift:.4f}, delta_RGB=[{delta_r:+.3f}, {delta_g:+.3f}, {delta_b:+.3f}], Blue ratio={blue_ratio_curr:.2f} (ref={blue_ratio_ref:.2f})"
             severity = "fail"
@@ -408,6 +625,11 @@ def compute_metrics(curr_path, ref_path, diff_output_path=None):
         "sharp_curr": sharp_curr,
         "sharp_ref": sharp_ref,
         "sharp_pct_change": sharp_pct_change,
+        "unique_colors_curr": unique_colors_curr,
+        "unique_colors_ref": unique_colors_ref,
+        "unique_ratio": unique_ratio,
+        "clumping_ratio": clumping_ratio,
+        "comparison_path": comparison_saved,
         "resolution": f"{w_curr}x{h_curr}"
     }
 
@@ -655,6 +877,14 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
       <div class="metric-label">Color Drift</div>
       <div class="metric-val">{m.get('chroma_drift', 0.0):.4f}</div>
     </div>
+    <div class="metric-box">
+      <div class="metric-label">Unique Colors</div>
+      <div class="metric-val">{m.get('unique_colors_curr', 0):,}</div>
+    </div>
+    <div class="metric-box">
+      <div class="metric-label">Clumping Ratio</div>
+      <div class="metric-val">{m.get('clumping_ratio', 0.0):.2f}</div>
+    </div>
   </div>
 
   <div class="comparison-container">
@@ -670,7 +900,20 @@ def generate_html_report(results, report_path="output/visual_regression_report.h
       <div class="img-panel-title"><span>DIFFERENCE HEATMAP (Turbo 3.5x)</span><span>Per-pixel max error</span></div>
       <img src="{rel_diff}" alt="Difference Heatmap" loading="lazy">
     </div>
-  </div>
+  </div>"""
+
+        comp_path = cfg.get("comparison_path") or m.get("comparison_path")
+        if comp_path and os.path.exists(comp_path):
+            rel_comp = os.path.relpath(comp_path, os.path.dirname(report_path))
+            html += f"""
+  <div class="comparison-collage" style="margin-top: 24px;">
+    <div class="img-panel-title"><span>AUTOMATED VISUAL COMPARISON COLLAGE</span><span>Direct side-by-side verification</span></div>
+    <a href="{rel_comp}" target="_blank">
+      <img src="{rel_comp}" alt="Visual Comparison Collage" style="width: 100%; border-radius: 6px; border: 1px solid var(--border); margin-top: 8px;" loading="lazy">
+    </a>
+  </div>"""
+
+        html += """
 </div>"""
 
     html += """
@@ -694,6 +937,7 @@ def main():
 
     os.makedirs(REF_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(f"{OUTPUT_DIR}/visual_comparisons", exist_ok=True)
 
     bin_path = resolve_binary(args.binary)
     for cfg in TEST_CONFIGS:
@@ -741,7 +985,15 @@ def main():
 
     for cfg in configs:
         print(f"\n--- Checking {cfg['name']} ---")
-        m = compute_metrics(cfg["render_path"], cfg["ref_path"], cfg["diff_path"])
+        comparison_path = cfg.get("comparison_path") or f"{OUTPUT_DIR}/visual_comparisons/{cfg['id']}_comparison.png"
+        raw_path = cfg.get("raw_path")
+        m = compute_metrics(
+            cfg["render_path"],
+            cfg["ref_path"],
+            cfg["diff_path"],
+            raw_path=raw_path,
+            comparison_output_path=comparison_path
+        )
         results.append({"config": cfg, "metrics": m})
 
         if "error" in m:
@@ -756,6 +1008,9 @@ def main():
         if m.get("no_baseline"):
             print(f"\033[33m[NO BASELINE]\033[0m {m['detail']}")
             continue
+
+        if os.path.exists(comparison_path):
+            print(f"  \033[36m[VISUAL COMPARISON]\033[0m Collage: {comparison_path}")
 
         sev = m.get("severity")
         if sev == "pass":

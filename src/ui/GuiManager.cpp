@@ -1240,44 +1240,42 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 4. Post-Processing & Reconstruction
         if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
-            // Unified Reconstruction / Super-Resolution Mode
-            const char* reconModes[] = {
-                "Off (1:1 Pure Monte Carlo - Unbiased Reference)",
-                "Upways Neural Reconstruction (1:1 Native Denoising)",
-                "Upways Neural Super-Resolution (2x Upscale - Wave32 WMMA)",
+            // Unified Reconstruction Method
+            const char* reconMethods[] = {
+                "Off (Pure Monte Carlo - Unbiased Reference)",
+                "Upways Neural Reconstruction (Wave32 WMMA)",
                 "AMD FidelityFX Super Resolution 3.1 (Temporal FSR 3.1)",
                 "AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)"
             };
-            int curRecon = 0;
+            int curMethod = 0;
             if (config.upscaler_mode == UpscalerMode::FSR3) {
-                curRecon = 3;
+                curMethod = 2;
             } else if (config.upscaler_mode == UpscalerMode::FSR1) {
-                curRecon = 4;
-            } else if (config.upscaler_mode == UpscalerMode::Upways || config.upways_superres) {
-                curRecon = 2;
-            } else if (config.denoiser_mode == DenoiserMode::Upways) {
-                curRecon = 1;
+                curMethod = 3;
+            } else if (config.denoiser_mode == DenoiserMode::Upways || config.upscaler_mode == UpscalerMode::Upways || config.upways_superres) {
+                curMethod = 1;
             } else {
-                curRecon = 0;
+                curMethod = 0;
             }
 
-            if (ImGui::Combo("Reconstruction Mode", &curRecon, reconModes, IM_ARRAYSIZE(reconModes))) {
-                if (curRecon == 1) { // Upways Denoising 1:1
+            if (ImGui::Combo("Reconstruction Method", &curMethod, reconMethods, IM_ARRAYSIZE(reconMethods))) {
+                if (curMethod == 1) { // Upways Neural Reconstruction
                     config.denoiser_mode = DenoiserMode::Upways;
-                    config.upscaler_mode = UpscalerMode::None;
-                    config.upways_superres = false;
-                    config.render_scale = 1.0f;
-                } else if (curRecon == 2) { // Upways Super-Res 2x
-                    config.denoiser_mode = DenoiserMode::Upways;
-                    config.upscaler_mode = UpscalerMode::Upways;
-                    config.upways_superres = true;
-                    if (config.render_scale >= 1.0f) config.render_scale = 0.5000f;
-                } else if (curRecon == 3) { // FSR 3.1
+                    if (config.upways_superres || config.upscaler_mode == UpscalerMode::Upways) {
+                        config.upscaler_mode = UpscalerMode::Upways;
+                        config.upways_superres = true;
+                        if (config.render_scale >= 1.0f) config.render_scale = 0.5000f;
+                    } else {
+                        config.upscaler_mode = UpscalerMode::None;
+                        config.upways_superres = false;
+                        config.render_scale = 1.0f;
+                    }
+                } else if (curMethod == 2) { // FSR 3.1
                     config.denoiser_mode = DenoiserMode::None;
                     config.upscaler_mode = UpscalerMode::FSR3;
                     config.upways_superres = false;
                     if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else if (curRecon == 4) { // FSR 1.0
+                } else if (curMethod == 3) { // FSR 1.0
                     config.denoiser_mode = DenoiserMode::None;
                     config.upscaler_mode = UpscalerMode::FSR1;
                     config.upways_superres = false;
@@ -1292,10 +1290,53 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Real-time reconstruction and super-resolution upscalers: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or AMD FidelityFX.");
+                ImGui::SetTooltip("Select the primary reconstruction or super-resolution method: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or AMD FidelityFX.");
             }
 
-            if (config.upscaler_mode != UpscalerMode::None || config.upways_superres) {
+            // Setting Dropdown (Nested under selected method)
+            if (curMethod == 1) { // Upways Settings
+                ImGui::Indent();
+                const char* upwaysSettings[] = {
+                    "Native Denoising (1:1 - Full Ray Tracing)",
+                    "Super-Resolution (2x Upscale - Half Resolution)"
+                };
+                int curSetting = (config.upways_superres || config.upscaler_mode == UpscalerMode::Upways) ? 1 : 0;
+                if (ImGui::Combo("Setting", &curSetting, upwaysSettings, IM_ARRAYSIZE(upwaysSettings))) {
+                    if (curSetting == 0) {
+                        config.upscaler_mode = UpscalerMode::None;
+                        config.upways_superres = false;
+                        config.render_scale = 1.0f;
+                    } else {
+                        config.upscaler_mode = UpscalerMode::Upways;
+                        config.upways_superres = true;
+                        config.render_scale = 0.5000f;
+                    }
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Choose between 1:1 full-resolution denoising or 2x neural super-resolution upscale from 1/4 ray count.");
+                }
+
+                if (curSetting == 1) {
+                    ImGui::BulletText("Internal Ray Tracing: %ux%u (0.50x Scale, 1/4 Rays)", config.getRenderWidth(), config.getRenderHeight());
+                    ImGui::BulletText("Reconstructed Output: %ux%u (Target Viewport)", config.width, config.height);
+                    ImGui::TextDisabled("Window size is preserved; internal rays are halved to accelerate performance.");
+                    if (ImGui::Checkbox("Enable Sharpening (RCAS)", &config.upscaler_sharpening)) {
+                        settingsChanged = true;
+                    }
+                    if (config.upscaler_sharpening) {
+                        if (ImGui::SliderFloat("Sharpness", &config.upscaler_sharpness, 0.0f, 1.0f, "%.2f")) {
+                            settingsChanged = true;
+                        }
+                    }
+                } else {
+                    ImGui::BulletText("Internal Ray Tracing: %ux%u (Full Resolution)", config.width, config.height);
+                    ImGui::BulletText("Reconstructed Output: %ux%u (Native 1:1)", config.width, config.height);
+                    ImGui::TextDisabled("Full ray budget with Wave32 WMMA cooperative matrix denoising.");
+                }
+                ImGui::Unindent();
+            } else if (curMethod == 2 || curMethod == 3) { // FSR Settings
                 ImGui::Indent();
                 const char* qualityPresets[] = {
                     "Custom Scale",
@@ -1310,7 +1351,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 else if (std::abs(config.render_scale - 0.5000f) < 0.01f) currentPreset = 3;
                 else if (std::abs(config.render_scale - 0.3333f) < 0.01f) currentPreset = 4;
 
-                if (ImGui::Combo("Quality Preset", &currentPreset, qualityPresets, IM_ARRAYSIZE(qualityPresets))) {
+                if (ImGui::Combo("Setting", &currentPreset, qualityPresets, IM_ARRAYSIZE(qualityPresets))) {
                     if (currentPreset == 1) config.render_scale = 0.6667f;
                     else if (currentPreset == 2) config.render_scale = 0.5882f;
                     else if (currentPreset == 3) config.render_scale = 0.5000f;
@@ -1469,12 +1510,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
             }
 
-            // Row 2: 1:1 Square (1440x1440) | FHD (1920x1080)
-            if (ImGui::Button("1:1 (1440x1440)", ImVec2(presetBtnW, 26.0f))) {
+            // Row 2: Square Aspect (1440x1440) | FHD (1920x1080)
+            if (ImGui::Button("Square Aspect (1440x1440)", ImVec2(presetBtnW, 26.0f))) {
                 if (actions) {
                     actions->requestedWidth = 1440;
                     actions->requestedHeight = 1440;
                 }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Sets window viewport to a 1440x1440 1:1 square aspect ratio (e.g. for DualUp monitors).");
             }
             ImGui::SameLine();
             if (ImGui::Button("FHD (1920x1080)", ImVec2(presetBtnW, 26.0f))) {

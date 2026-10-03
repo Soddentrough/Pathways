@@ -462,7 +462,7 @@ void main() {
 
             [[unroll]]
             for (int k = 0; k < 9; ++k) {
-                float centerBiasAdj = (k == 4) ? -1.8 : 0.0;
+                float centerBiasAdj = (k == 4) ? (isNative ? -1.8 : 0.0) : 0.0;
                 diffLogits[k] = float(s_renderLogitsFlat[baseFeat + k]) + centerBiasAdj;
                 specLogits[k] = float(s_renderLogitsFlat[baseFeat + 9u + k]) + centerBiasAdj;
                 maxL_d = max(maxL_d, diffLogits[k]);
@@ -618,8 +618,8 @@ void main() {
             float mvDivDisplay = clamp(length(v_surf - v_spec), 0.0, 1.0);
             specAlphaFloor = max(specAlphaFloor, 0.15 * mvDivDisplay);
 
-            float alphaDiff = (u_TotalSamples > 1u) ? 1.0 : mix(1.0, alphaBase, confDiff);
-            float alphaSpec = (u_TotalSamples > 1u) ? 1.0 : mix(1.0, clamp(alphaBase * 2.0 + 0.02, specAlphaFloor, 0.45), confSpec);
+            float alphaDiff = (isNative && u_TotalSamples > 16u) ? 1.0 : mix(1.0, alphaBase, confDiff);
+            float alphaSpec = (isNative && u_TotalSamples > 16u) ? 1.0 : mix(1.0, clamp(alphaBase * 2.0 + 0.02, specAlphaFloor, 0.45), confSpec);
 
             vec3 resolvedLinearDiff = mix(histDiff, spatialLinearDiff, alphaDiff);
             vec3 resolvedLinearSpec = mix(histSpec, spatialLinearSpec, alphaSpec);
