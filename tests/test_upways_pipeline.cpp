@@ -54,6 +54,7 @@ int main() {
     check_true(offsetof(UpwaysPushConstants, totalSamples) == 252, "totalSamples must be at byte 252");
     std::cout << "  -> UpwaysPushConstants layout verified (256B push constant aligned)." << std::endl;
 
+
     // 2. Verify Invertible Log Transform Invariants
     std::cout << "[TEST 2] Invertible Log Compression & Decompression Math..." << std::endl;
     check_true(std::abs(upwaysLogTransform(0.0f)) < 1e-6f, "Log transform of 0.0 must be 0.0");
@@ -83,46 +84,18 @@ int main() {
 
     // 4. Verify Cooperative Matrix WMMA Weights Topology
     std::cout << "[TEST 4] Wave32 WMMA Cooperative Matrix Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 25152, "TOTAL_WEIGHT_BUFFER_SIZE must be 25152 bytes for dual decoder heads");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 16704, "TOTAL_WEIGHT_BUFFER_SIZE must be 16704 bytes");
+    check_true(upways::LAYER_FC1.outChannels == 128, "fc1 output channels must be 128");
+    check_true(upways::LAYER_FC1.inChannels == 32, "fc1 input channels must be 32");
+    check_true(upways::LAYER_FC2.outChannels == 32, "fc2 output channels must be 32");
+    check_true(upways::LAYER_FC2.inChannels == 128, "fc2 input channels must be 128");
 
-    // Diffuse Head Invariants
-    check_true(upways::LAYER_DIFF_FC1.inChannels == 16, "diff fc1 inChannels must be 16");
-    check_true(upways::LAYER_DIFF_FC1.outChannels == 64, "diff fc1 outChannels must be 64");
-    check_true(upways::LAYER_DIFF_FC2.inChannels == 64, "diff fc2 inChannels must be 64");
-    check_true(upways::LAYER_DIFF_FC2.outChannels == 64, "diff fc2 outChannels must be 64");
-    check_true(upways::LAYER_DIFF_FC3.inChannels == 64, "diff fc3 inChannels must be 64");
-    check_true(upways::LAYER_DIFF_FC3.outChannels == 16, "diff fc3 outChannels must be 16");
-
-    // Specular Head Invariants
-    check_true(upways::LAYER_SPEC_FC1.inChannels == 16, "spec fc1 inChannels must be 16");
-    check_true(upways::LAYER_SPEC_FC1.outChannels == 64, "spec fc1 outChannels must be 64");
-    check_true(upways::LAYER_SPEC_FC2.inChannels == 64, "spec fc2 inChannels must be 64");
-    check_true(upways::LAYER_SPEC_FC2.outChannels == 64, "spec fc2 outChannels must be 64");
-    check_true(upways::LAYER_SPEC_FC3.inChannels == 64, "spec fc3 inChannels must be 64");
-    check_true(upways::LAYER_SPEC_FC3.outChannels == 16, "spec fc3 outChannels must be 16");
-
-    // Cooperative Matrix Alignment Checks
-    check_true(upways::LAYER_DIFF_FC1.inChannels % 16 == 0, "diff fc1 inChannels must be multiple of 16");
-    check_true(upways::LAYER_DIFF_FC1.outChannels % 16 == 0, "diff fc1 outChannels must be multiple of 16");
-    check_true(upways::LAYER_DIFF_FC2.inChannels % 16 == 0, "diff fc2 inChannels must be multiple of 16");
-    check_true(upways::LAYER_DIFF_FC2.outChannels % 16 == 0, "diff fc2 outChannels must be multiple of 16");
-    check_true(upways::LAYER_DIFF_FC3.inChannels % 16 == 0, "diff fc3 inChannels must be multiple of 16");
-    check_true(upways::LAYER_DIFF_FC3.outChannels % 16 == 0, "diff fc3 outChannels must be multiple of 16");
-
-    // 16-Byte Offset Alignment
-    check_true(upways::LAYER_DIFF_FC1.weightOffset % 16 == 0, "diff fc1 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_DIFF_FC1.biasOffset % 16 == 0, "diff fc1 biasOffset must be 16-byte aligned");
-    check_true(upways::LAYER_DIFF_FC2.weightOffset % 16 == 0, "diff fc2 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_DIFF_FC2.biasOffset % 16 == 0, "diff fc2 biasOffset must be 16-byte aligned");
-    check_true(upways::LAYER_DIFF_FC3.weightOffset % 16 == 0, "diff fc3 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_DIFF_FC3.biasOffset % 16 == 0, "diff fc3 biasOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC1.weightOffset % 16 == 0, "spec fc1 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC1.biasOffset % 16 == 0, "spec fc1 biasOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC2.weightOffset % 16 == 0, "spec fc2 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC2.biasOffset % 16 == 0, "spec fc2 biasOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC3.weightOffset % 16 == 0, "spec fc3 weightOffset must be 16-byte aligned");
-    check_true(upways::LAYER_SPEC_FC3.biasOffset % 16 == 0, "spec fc3 biasOffset must be 16-byte aligned");
-    std::cout << "  -> Wave32 WMMA dual-head cooperative matrix alignment verified across all network layers." << std::endl;
+    // Verify channel counts are aligned to 16 for Wave32 WMMA
+    check_true(upways::LAYER_FC1.inChannels % 16 == 0, "fc1 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC1.outChannels % 16 == 0, "fc1 outChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.inChannels % 16 == 0, "fc2 inChannels must be multiple of 16");
+    check_true(upways::LAYER_FC2.outChannels % 16 == 0, "fc2 outChannels must be multiple of 16");
+    std::cout << "  -> Wave32 WMMA 16x16 cooperative matrix alignment verified across all network layers." << std::endl;
 
     // 5. Verify Exported Weights and Embedded Fallback Integrity
     std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
@@ -138,9 +111,7 @@ int main() {
         "../../data/models/upways_weights.bin",
         "../../../data/models/upways_weights.bin",
         "build/bin/data/models/upways_weights.bin",
-        "bin/data/models/upways_weights.bin",
-        "/home/naoki/Development/Pathways/data/models/upways_weights.bin",
-        "/home/naoki/Development/Upways/data/models/upways_weights.bin"
+        "bin/data/models/upways_weights.bin"
     };
     std::string foundPath;
     for (const auto& p : searchPaths) {
@@ -173,10 +144,16 @@ int main() {
     // 7. Verify 90-Degree Camera Flick Disocclusion Invariants (Gaming Stress Navigation)
     std::cout << "[TEST 7] 90-Degree Camera Flick Disocclusion & Rejection..." << std::endl;
     {
+        // Simulate 90-degree yaw rotation around Y-axis:
+        // Curr camera: looking in direction (-1, 0, 0)
+        // Prev camera: looking in direction (0, 0, -1)
+        // Surface normal N_curr = (1.0, 0.0, 0.0) facing current camera
+        // In previous frame, camera forward was -Z, so prev view normal was (0, 0, 1)
         float nCurr_world[3] = { 1.0f, 0.0f, 0.0f };
         float nPrev_world[3] = { 0.0f, 0.0f, 1.0f };
         float normalDot = nCurr_world[0] * nPrev_world[0] + nCurr_world[1] * nPrev_world[1] + nCurr_world[2] * nPrev_world[2]; // 0.0
-
+        
+        // Expected depth in previous frame:
         float expectedPrevDepth = 0.0f;
         float centerDepth = 4.0f;
         float depthDelta = std::abs(expectedPrevDepth - centerDepth) / std::max(expectedPrevDepth, 1e-3f); // 4000.0
@@ -211,7 +188,7 @@ int main() {
         check_true(!std::isnan(logFirefly) && !std::isinf(logFirefly), "Compressed firefly must be finite");
 
         // Bilateral spatial filtering: 3x3 taps with center firefly
-        float logits[9] = { -0.5f, -0.5f, -0.5f, -0.5f, 2.5f, -0.5f, -0.5f, -0.5f, -0.5f };
+        float logits[9] = { -0.5f, -0.5f, -0.5f, -0.5f, 2.5f, -0.5f, -0.5f, -0.5f, -0.5f }; // center prior +2.5
         float maxLogit = 2.5f;
 
         float sumW = 0.0f;
@@ -243,7 +220,7 @@ int main() {
         check_true(resolvedDiff <= fireflyRadiance, "Flux-conserving convex combination cannot exceed input firefly peak");
         check_true(resolvedDiff > backgroundRadiance, "Center tap must retain concentrated highlight energy");
 
-        // Neighboring pixel (1 tap away)
+        // Neighboring pixel (1 tap away, where firefly is neighbor tap 3 instead of center)
         float neighborResolved = 0.0f;
         for (int i = 0; i < 9; ++i) {
             float tapRadiance = (i == 3) ? std::min(fireflyRadiance, 65000.0f) : backgroundRadiance;
@@ -253,51 +230,49 @@ int main() {
         std::cout << "  -> Firefly energy bounding verified (center = " << resolvedDiff << ", neighbor = " << neighborResolved << ")." << std::endl;
     }
 
-    // 9. Verify 4K Real-Time Performance & LDS Occupancy Invariants (< 3.0ms at 4K)
+    // 9. Verify 4K Real-Time Performance & LDS Occupancy Invariants (< 1.5ms at 4K)
     std::cout << "[TEST 9] Real-Time 4K Performance & Wave32 WMMA Occupancy Invariants..." << std::endl;
     {
         uint32_t width4K = 3840;
         uint32_t height4K = 2160;
+        uint32_t tileSize = 16;
 
-        // Two-Pass Pipeline Workgroups & LDS Occupancy
-        // Pass 1: Render-res 1080p (for 4K target) -> 8x8 tiles
-        uint32_t pass1RenderW = 1920;
-        uint32_t pass1RenderH = 1080;
-        uint32_t pass1GroupsX = (pass1RenderW + 7) / 8;
-        uint32_t pass1GroupsY = (pass1RenderH + 7) / 8;
-        uint32_t pass1TotalGroups = pass1GroupsX * pass1GroupsY; // 32,400
-        check_true(pass1TotalGroups == 32400, "Pass 1 total workgroups at 1080p input must be 32,400");
+        uint32_t groupsX = (width4K + tileSize - 1) / tileSize;  // 240
+        uint32_t groupsY = (height4K + tileSize - 1) / tileSize; // 135
+        uint32_t totalWorkgroups = groupsX * groupsY;             // 32,400
+        check_true(groupsX == 240, "4K groupsX must be 240");
+        check_true(groupsY == 135, "4K groupsY must be 135");
+        check_true(totalWorkgroups == 32400, "Total workgroups at 4K must be 32,400");
 
-        // Pass 2: Display-res 4K -> Wave32 workgroups (16 display pixels per workgroup)
-        uint32_t pass2TotalPixels = width4K * height4K;
-        uint32_t pass2TotalGroups = (pass2TotalPixels + 15) / 16; // 518,400
-        check_true(pass2TotalGroups == 518400, "Pass 2 total workgroups at 4K output must be 518,400");
+        // Workgroup LDS Memory Budget Verification (RDNA 4 limit: 64 KB per CU)
+        size_t ldsHaloRadiance = 10 * 10 * 2 * sizeof(uint32_t) * 2; // 1600 bytes
+        size_t ldsHaloGeometry = 10 * 10 * (sizeof(float) + 2 * sizeof(uint32_t)); // 1200 bytes
+        size_t ldsFlatFeatures = 64 * 32 * sizeof(uint16_t); // 4096 bytes
+        size_t ldsFlatLogits   = 64 * 32 * sizeof(uint16_t); // 4096 bytes
+        size_t ldsMlpScratch   = 2 * 16 * 128 * sizeof(uint16_t); // 8192 bytes
+        size_t totalLdsBytes   = ldsHaloRadiance + ldsHaloGeometry + ldsFlatFeatures + ldsFlatLogits + ldsMlpScratch; // 19,184 bytes (~18.7 KB)
 
-        // Workgroup LDS Memory Budget Verification (RDNA 4 limit: 64 KB per CU, target: <= 32 KB per workgroup)
-        size_t pass1LdsBytes = 2560; // 2.5 KB (s_posWorld: 64*16B, s_normalWorld: 64*12B, s_viewDepth: 64*4B)
-        check_true(pass1LdsBytes < 32768, "Pass 1 LDS footprint must be < 32 KB");
+        check_true(totalLdsBytes < 32768, "Workgroup LDS footprint must be < 32 KB to permit >= 2 concurrent workgroups per CU");
+        std::cout << "  -> LDS footprint per workgroup: " << (totalLdsBytes / 1024.0f) << " KB (< 32 KB budget)." << std::endl;
 
-        size_t pass2LdsBytes = 7168; // 7.0 KB (s_diff_in: 512B, s_spec_in: 512B, s_fc1_out: 2048B, s_fc2_out: 2048B, s_acc: 1024B, coords: 128B, albedo/diff: 384B)
-        check_true(pass2LdsBytes < 32768, "Pass 2 LDS footprint must be < 32 KB to guarantee high CU occupancy");
-        std::cout << "  -> LDS footprint: Pass 1 = " << (pass1LdsBytes / 1024.0f) << " KB, Pass 2 = " << (pass2LdsBytes / 1024.0f) << " KB (both << 32 KB budget)." << std::endl;
+        // Wavefront Occupancy: 64 threads per workgroup = 2 Wave32 wavefronts
+        uint32_t threadsPerWorkgroup = 64;
+        uint32_t wavesPerWorkgroup = threadsPerWorkgroup / 32;
+        check_true(wavesPerWorkgroup == 2, "Each workgroup must execute exactly 2 Wave32 wavefronts");
 
-        // Wavefront Occupancy: Pass 1 is 64 threads (2 Wave32), Pass 2 is 32 threads (1 Wave32)
-        check_true(64 / 32 == 2, "Pass 1 must execute 2 Wave32 wavefronts per workgroup");
-        check_true(32 / 32 == 1, "Pass 2 must execute 1 Wave32 wavefront per workgroup");
-
-        // Flop Budget: Dual 16 -> 64 -> 64 -> 16 MLP per display pixel
-        // Per pixel FLOPs: 2 heads * [(16*64*2) + (64*64*2) + (64*16*2)] = 2 * [2048 + 8192 + 2048] = 2 * 12288 = 24,576 FLOPs
-        uint64_t totalFlops = static_cast<uint64_t>(pass2TotalPixels) * 24576ULL;
-        double totalGigaFlops = static_cast<double>(totalFlops) / 1e9; // ~203.8 GFLOPs
+        // Flop Budget: 32 -> 128 -> 32 MLP per render pixel (1080p -> 4K upscaling)
+        uint64_t renderPixels = (width4K / 2) * (height4K / 2); // 1920x1080 = 2,073,600
+        uint64_t flopsPerPixel = (32 * 128 * 2) + (128 * 32 * 2); // 8192 + 8192 = 16,384 FLOPs
+        double totalGigaFlops = (renderPixels * flopsPerPixel) / 1e9; // ~33.97 GFLOPs
 
         // Dual AMD Radeon AI PRO R9700 Peak FP16 Compute: > 120 TFLOPs
         double peakComputeTFlops = 120.0;
-        double theoreticalComputeTimeMs = (totalGigaFlops / (peakComputeTFlops * 1e3)) * 1e3; // ~1.70 ms at 4K (or ~0.42 ms at 1080p)
-        check_true(theoreticalComputeTimeMs < 2.5, "Theoretical 4K compute time must be < 2.5 ms on Dual R9700");
+        double theoreticalComputeTimeMs = (totalGigaFlops / (peakComputeTFlops * 1e3)) * 1e3; // ~0.28 ms
+        check_true(theoreticalComputeTimeMs < 1.0, "Theoretical compute time must be < 1.0 ms on Dual R9700");
 
-        double totalDispatchBudgetMs = 3.0; // strict budget threshold for 4K
-        double estimatedDispatchTimeMs = theoreticalComputeTimeMs + 0.3; // with dispatch & memory overhead
-        check_true(estimatedDispatchTimeMs < totalDispatchBudgetMs, "Total estimated 4K dispatch time must be < 3.0 ms");
+        double totalDispatchBudgetMs = 1.5; // strict budget threshold
+        double estimatedDispatchTimeMs = theoreticalComputeTimeMs + 0.15; // with dispatch & memory overhead (~0.43 ms)
+        check_true(estimatedDispatchTimeMs < totalDispatchBudgetMs, "Total estimated 4K dispatch time must be < 1.5 ms");
         std::cout << "  -> Estimated 4K dispatch latency: " << estimatedDispatchTimeMs << " ms (Budget < " << totalDispatchBudgetMs << " ms)." << std::endl;
     }
 

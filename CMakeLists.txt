@@ -160,7 +160,6 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/nrc_resolve.comp
     ${SHADER_DIR}/compute/dgc_compact.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
-    ${SHADER_DIR}/compute/upways_temporal.comp
     ${SHADER_DIR}/compute/upways_reconstruct.comp
     ${SHADER_DIR}/compute/neural_reconstruct.comp
     ${SHADER_DIR}/compute/fsr3_upscale.comp

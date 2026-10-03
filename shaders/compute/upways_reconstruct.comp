@@ -1,161 +1,328 @@
-#version 460 core
-
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#version 460
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_GOOGLE_include_directive : enable
 
-#include "upways_common_v3.glsl"
+#include "upways_common.glsl"
 
-// Workgroup: Exactly 32 threads = 1x Wave32 wavefront on AMD RDNA 4 (gfx1201)
+// Pure Vulkan 1.4 Wave32 WMMA Neural Reconstructor and Continuous Upscaler
+// Target Architecture: AMD RDNA 4 (gfx1201) v_wmma_f32_16x16x16_f16
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-const uint TILE_M = 16u; // 16 display pixels processed per Wave32 workgroup
+const uint TILE_M = 16u;
 
 // =========================================================================
-// Descriptors: Pass 1 Latents & Display-Resolution Guides
+// Descriptors: Consolidated 4-Texture G-Buffer Inputs & History State
 // =========================================================================
-layout(set = 0, binding = 0) uniform sampler2D uTemporalLatentDiff;
-layout(set = 0, binding = 1) uniform sampler2D uTemporalLatentSpec;
-layout(set = 0, binding = 2, r16f) uniform readonly image2D uReliabilityMap;
+// Tex 0: Invertible log composite radiance RGB + surface roughness alpha
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uAccumImage;
 
-layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uDisplayAlbedo;
-layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D uOutputImage;
+// Tex 2: View-space surface normal XYZ + planar linear view depth
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uNormalDepthImage;
 
-layout(set = 0, binding = 5, std430) readonly buffer WeightsBuffer {
+// Tex 3: Surface motion vector XY (RG16F)
+layout(set = 0, binding = 2, rg16f) readonly uniform image2D uMotionVectorImage;
+
+// Tex 1: Base color albedo RGB + specular disparity D_spec = 1 / (1 + d_hit)
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughnessImage;
+
+// Additional stream bindings for engine descriptor compatibility
+layout(set = 0, binding = 4, rgba16f) readonly uniform image2D uSpecularMotionImage;
+layout(set = 0, binding = 5, rgba16f) readonly uniform image2D uDiffuseImage;
+layout(set = 0, binding = 6, rgba16f) readonly uniform image2D uSpecularImage;
+
+// Dual-stream history buffers
+layout(set = 0, binding = 7, rgba16f) readonly uniform image2D uDiffHistoryImage;
+layout(set = 0, binding = 8, rgba16f) readonly uniform image2D uSpecHistoryImage;
+
+// Output reconstructed HDR radiance and history outputs
+layout(set = 0, binding = 9, rgba16f) writeonly uniform image2D uOutputImage;
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D uDiffHistoryOutputImage;
+layout(set = 0, binding = 11, rgba16f) writeonly uniform image2D uSpecHistoryOutputImage;
+
+// Serialized PyTorch Weights Buffer (Transposed C_in, C_out Row-Major FP16 SSBO)
+layout(std430, set = 0, binding = 12) readonly buffer WeightBuffer {
     float16_t weights[];
-} u_Weights;
-
-// Push Constants: Exact 256-byte Uniforms Block
-layout(push_constant) uniform Uniforms {
-    mat4  u_CurrInvView;       // 0..63: View to World
-    mat4  u_PrevViewProj;      // 64..127: World to Previous Clip
-    mat4  u_InvProj;           // 128..191: Clip to View
-    vec4  u_PrevViewZ;         // 192..207: Row 2 of PrevView for axial depth
-    vec2  u_JitterOffset;      // 208..215: Subpixel camera jitter in render pixels
-    uvec2 u_RenderRes;         // 216..223: Render resolution (e.g. 960, 540)
-    uvec2 u_DisplayRes;        // 224..231: Display resolution (e.g. 1920, 1080)
-    vec2  u_ScaleFactor;       // 232..239: DisplayRes / RenderRes (e.g. 2.0, 2.0)
-    uint  u_ResetHistory;      // 240..243: History reset flag
-    uint  u_FrameIndex;        // 244..247: Temporal frame index
-    float u_InvTotalSamples;   // 248..251: 1.0 / totalSamples
-    uint  u_TotalSamples;      // 252..255: SPP count
 };
 
-// =========================================================================
-// Dual MLP Head Layer Offsets (Elements in weights[])
-// Layout: Diffuse Head (FC1, FC2, FC3) -> Specular Head (FC1, FC2, FC3)
-// =========================================================================
-const uint DIFF_FC1_WEIGHT_ELEM = 0u;     // 16x64: 1024 elems
-const uint DIFF_FC1_BIAS_ELEM   = 1024u;  // 64 elems
-const uint DIFF_FC2_WEIGHT_ELEM = 1088u;  // 64x64: 4096 elems
-const uint DIFF_FC2_BIAS_ELEM   = 5184u;  // 64 elems
-const uint DIFF_FC3_WEIGHT_ELEM = 5248u;  // 64x16: 1024 elems
-const uint DIFF_FC3_BIAS_ELEM   = 6272u;  // 16 elems
+// 96-byte Push Constants struct (24 fields x 4 bytes)
+layout(push_constant) uniform UpwaysPushConstants {
+    int inputWidth;
+    int inputHeight;
+    int outputWidth;
+    int outputHeight;
+    float invInputWidth;
+    float invInputHeight;
+    float invOutputWidth;
+    float invOutputHeight;
+    int tileOffsetX;       // Pixel X offset for local GPU tile
+    int tileOffsetY;       // Pixel Y offset for local GPU tile
+    int tileWidth;         // Width of active local GPU tile
+    int tileHeight;        // Height of active local GPU tile
+    int apronWidth;        // Boundary apron margin
+    float scaleFactorX;    // Continuous scaling factor X (e.g. 2.0 for 540p -> 1080p)
+    float scaleFactorY;    // Continuous scaling factor Y (e.g. 2.0 for 540p -> 1080p)
+    uint frameIndex;
+    uint resetHistory;
+    uint cameraMoved;
+    uint superResMode;     // 0 = 1:1 Denoising, 1 = Continuous Super-Resolution (2x)
+    float blendAlpha;
+    float minTau;
+    uint learnedDemod;     // 1 = Pure direct learned radiance
+    float invTotalSamples; // 1.0 / max(totalSamples, 1)
+    uint totalSamples;
+} pc;
 
-const uint SPEC_OFFSET_BASE     = 6288u;  // Specular head offset
-const uint SPEC_FC1_WEIGHT_ELEM = SPEC_OFFSET_BASE + 0u;    // 16x64: 1024 elems
-const uint SPEC_FC1_BIAS_ELEM   = SPEC_OFFSET_BASE + 1024u; // 64 elems
-const uint SPEC_FC2_WEIGHT_ELEM = SPEC_OFFSET_BASE + 1088u; // 64x64: 4096 elems
-const uint SPEC_FC2_BIAS_ELEM   = SPEC_OFFSET_BASE + 5184u; // 64 elems
-const uint SPEC_FC3_WEIGHT_ELEM = SPEC_OFFSET_BASE + 5248u; // 64x16: 1024 elems
-const uint SPEC_FC3_BIAS_ELEM   = SPEC_OFFSET_BASE + 6272u; // 16 elems
+// =========================================================================
+// WMMA Head Layer Offsets (Elements in weights[] = byte offset / 2)
+// From upways_weights.hpp
+// =========================================================================
+// Pure Wave32 WMMA Reconstructor Layer Offsets (Elements in weights[] = byte offset / 2)
+// From upways_weights.hpp
+// =========================================================================
+const uint FC1_WEIGHT_ELEM = 0u;     // (32 -> 64): 2048 elements
+const uint FC1_BIAS_ELEM   = 2048u;  // 64 elements
+const uint FC2_WEIGHT_ELEM = 2112u;  // (64 -> 64): 4096 elements
+const uint FC2_BIAS_ELEM   = 6208u;  // 64 elements
+const uint FC3_WEIGHT_ELEM = 6272u;  // (64 -> 64): 4096 elements
+const uint FC3_BIAS_ELEM   = 10368u; // 64 elements
+const uint FC4_WEIGHT_ELEM = 10432u; // (64 -> 16): 1024 elements
+const uint FC4_BIAS_ELEM   = 11456u; // 16 elements
 
-// =========================================================================
-// SHARED MEMORY (LDS Footprint: 7,168 bytes <= 32 KB)
-// =========================================================================
-shared float16_t s_diff_in[16 * 16]; // 512 bytes
-shared float16_t s_spec_in[16 * 16]; // 512 bytes
-shared float16_t s_fc1_out[16 * 64]; // 2,048 bytes
-shared float16_t s_fc2_out[16 * 64]; // 2,048 bytes
-shared float     s_acc[16 * 16];     // 1,024 bytes
-shared ivec2     s_pixelCoords[16];  // 128 bytes
-shared vec3      s_dispAlbedo[16];   // 192 bytes
-shared vec3      s_decodedDiff[16];  // 192 bytes
+// Shared Memory for 16 Pixels x Feature Channels (LDS Buffer)
+shared float16_t s_in_features[16 * 32];
+shared float16_t s_fc1_out[16 * 64];
+shared float16_t s_fc2_out[16 * 64];
+shared float16_t s_fc3_out[16 * 64];
+shared float16_t s_fc4_out[16 * 16];
+shared float     s_acc[16 * 16];
+
+shared ivec2 s_pixelCoords[16];
+shared vec3  s_albedo[16];
+shared float s_currentDepth[16];
+shared float s_specDisparity[16];
+shared float s_confidence[16];
+shared vec3  s_warpedHistDiff[16];
+shared vec3  s_warpedHistSpec[16];
+shared vec3  s_rawLogRadiance[16];
+
+// Subpixel Bilinear History Sampling
+vec4 sampleDiffHistoryBilinear(vec2 uv, ivec2 maxCoord) {
+    vec2 fCoord = uv * vec2(maxCoord + ivec2(1)) - vec2(0.5);
+    ivec2 baseCoord = ivec2(floor(fCoord));
+    vec2 f = fract(fCoord);
+
+    ivec2 c00 = clamp(baseCoord + ivec2(0, 0), ivec2(0), maxCoord);
+    ivec2 c10 = clamp(baseCoord + ivec2(1, 0), ivec2(0), maxCoord);
+    ivec2 c01 = clamp(baseCoord + ivec2(0, 1), ivec2(0), maxCoord);
+    ivec2 c11 = clamp(baseCoord + ivec2(1, 1), ivec2(0), maxCoord);
+
+    vec4 t00 = imageLoad(uDiffHistoryImage, c00);
+    vec4 t10 = imageLoad(uDiffHistoryImage, c10);
+    vec4 t01 = imageLoad(uDiffHistoryImage, c01);
+    vec4 t11 = imageLoad(uDiffHistoryImage, c11);
+
+    vec3 rgb = mix(mix(t00.rgb, t10.rgb, f.x), mix(t01.rgb, t11.rgb, f.x), f.y);
+    float w = (f.x < 0.5) ? ((f.y < 0.5) ? t00.w : t01.w) : ((f.y < 0.5) ? t10.w : t11.w);
+    return vec4(rgb, w);
+}
+
+vec4 sampleSpecHistoryBilinear(vec2 uv, ivec2 maxCoord) {
+    vec2 fCoord = uv * vec2(maxCoord + ivec2(1)) - vec2(0.5);
+    ivec2 baseCoord = ivec2(floor(fCoord));
+    vec2 f = fract(fCoord);
+
+    ivec2 c00 = clamp(baseCoord + ivec2(0, 0), ivec2(0), maxCoord);
+    ivec2 c10 = clamp(baseCoord + ivec2(1, 0), ivec2(0), maxCoord);
+    ivec2 c01 = clamp(baseCoord + ivec2(0, 1), ivec2(0), maxCoord);
+    ivec2 c11 = clamp(baseCoord + ivec2(1, 1), ivec2(0), maxCoord);
+
+    vec4 t00 = imageLoad(uSpecHistoryImage, c00);
+    vec4 t10 = imageLoad(uSpecHistoryImage, c10);
+    vec4 t01 = imageLoad(uSpecHistoryImage, c01);
+    vec4 t11 = imageLoad(uSpecHistoryImage, c11);
+
+    vec3 rgb = mix(mix(t00.rgb, t10.rgb, f.x), mix(t01.rgb, t11.rgb, f.x), f.y);
+    float w = (f.x < 0.5) ? ((f.y < 0.5) ? t00.w : t01.w) : ((f.y < 0.5) ? t10.w : t11.w);
+    return vec4(rgb, w);
+}
+
+vec4 sampleAccumBilinear(vec2 inCoordF, ivec2 maxCoord) {
+    ivec2 p0 = ivec2(floor(inCoordF));
+    vec2 f = fract(inCoordF);
+    ivec2 c00 = clamp(p0, ivec2(0), maxCoord);
+    ivec2 c10 = clamp(p0 + ivec2(1, 0), ivec2(0), maxCoord);
+    ivec2 c01 = clamp(p0 + ivec2(0, 1), ivec2(0), maxCoord);
+    ivec2 c11 = clamp(p0 + ivec2(1, 1), ivec2(0), maxCoord);
+
+    vec4 s00 = imageLoad(uAccumImage, c00);
+    vec4 s10 = imageLoad(uAccumImage, c10);
+    vec4 s01 = imageLoad(uAccumImage, c01);
+    vec4 s11 = imageLoad(uAccumImage, c11);
+
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+}
 
 void main() {
     uint pixelBase = gl_WorkGroupID.x * TILE_M;
-    uint totalPixels = u_DisplayRes.x * u_DisplayRes.y;
+    uint totalPixels = uint(pc.outputWidth * pc.outputHeight);
     if (pixelBase >= totalPixels) return;
 
-    uint tid = gl_LocalInvocationIndex; // 0..31
+    uint tid = gl_LocalInvocationIndex;
 
-    // Step 1: Ingest Subpixel Coordinates & Pass 1 Latents (16 Pixels per Tile)
+    // =========================================================================
+    // Step 1: Ingest Consolidated 4-Texture G-Buffers & Continuous Upscaling
+    // =========================================================================
     if (tid < 16u) {
         uint pIdx = pixelBase + tid;
         if (pIdx < totalPixels) {
-            int outY = int(pIdx / u_DisplayRes.x);
-            int outX = int(pIdx % u_DisplayRes.x);
+            int outY = int(pIdx / uint(pc.outputWidth));
+            int outX = int(pIdx % uint(pc.outputWidth));
             ivec2 outCoord = ivec2(outX, outY);
             s_pixelCoords[tid] = outCoord;
 
-            // Continuous subpixel coordinate mapping
-            vec2 uv = (vec2(outCoord) + vec2(0.5)) / vec2(u_DisplayRes);
-            vec2 renderCoord = (vec2(outCoord) + vec2(0.5)) / u_ScaleFactor - vec2(0.5) - u_JitterOffset;
-            vec2 renderUV = (renderCoord + vec2(0.5)) / vec2(u_RenderRes);
+            // Continuous subpixel coordinates (2x scaling for 540p -> 1080p)
+            float sx = (pc.scaleFactorX > 0.0) ? pc.scaleFactorX : (float(pc.outputWidth) / float(pc.inputWidth));
+            float sy = (pc.scaleFactorY > 0.0) ? pc.scaleFactorY : (float(pc.outputHeight) / float(pc.inputHeight));
+            vec2 inCoordF = (vec2(outCoord) + vec2(0.5)) / vec2(sx, sy) - vec2(0.5);
+            ivec2 inCoord = clamp(ivec2(floor(inCoordF + vec2(0.5))), ivec2(0), ivec2(pc.inputWidth - 1, pc.inputHeight - 1));
 
-            // Bilinear sampling of Pass 1 latents
-            vec4 diffLatent = texture(uTemporalLatentDiff, renderUV);
-            vec4 specLatent = texture(uTemporalLatentSpec, renderUV);
-            vec4 albedoSample = imageLoad(uDisplayAlbedo, outCoord);
+            // Tex 0: Invertible log composite radiance RGB + surface roughness alpha
+            vec4 tex0 = (pc.outputWidth > pc.inputWidth) ? sampleAccumBilinear(inCoordF, ivec2(pc.inputWidth - 1, pc.inputHeight - 1)) : imageLoad(uAccumImage, inCoord);
+            vec3 rawRadiance = tex0.rgb * pc.invTotalSamples;
+            vec3 logRadiance = upwaysLogTransform(rawRadiance);
+            float roughness = clamp(tex0.a, 0.0, 1.0);
 
-            s_dispAlbedo[tid] = albedoSample.rgb;
+            // Tex 1: Base color albedo RGB + specular disparity
+            vec4 tex1 = imageLoad(uAlbedoRoughnessImage, inCoord);
+            vec3 baseAlbedo = clamp(tex1.rgb, vec3(0.0), vec3(1.0));
+            float specDisparity = clamp(tex1.a, 0.0, 1.0);
 
-            // FiLM scale modulation: predict gamma & beta from continuous scale factor
-            float sx = u_ScaleFactor.x;
-            float sy = u_ScaleFactor.y;
-            float filmGamma = clamp((sx + sy) * 0.25 - 0.5, -0.5, 1.0);
-            float filmBeta  = 0.0;
+            // Tex 2: View-space surface normal XYZ + planar linear depth
+            vec4 tex2 = imageLoad(uNormalDepthImage, inCoord);
+            vec3 viewNormal = tex2.xyz;
+            float viewDepth = tex2.w;
+            float invDepth = 1.0 / (1.0 + max(viewDepth, 0.0));
 
-            // Stage 16 channels for Diffuse MLP
-            for (uint c = 0u; c < 16u; ++c) {
-                float val = (c < 4u) ? diffLatent[c] : 0.0;
-                val = val * (1.0 + filmGamma) + filmBeta;
-                s_diff_in[tid * 16u + c] = float16_t(val);
+            // Tex 3: Surface motion vector XY (RG16F)
+            vec2 vSurface = imageLoad(uMotionVectorImage, inCoord).xy;
+            vec2 vSpecular = vSurface;
+
+            // Check if separate specular motion buffer has additional precision
+            vec4 specMvData = imageLoad(uSpecularMotionImage, inCoord);
+            if (dot(specMvData.xy, specMvData.xy) > 0.0) {
+                vSpecular = specMvData.xy;
             }
 
-            // Stage 16 channels for Specular MLP
-            for (uint c = 0u; c < 16u; ++c) {
-                float val = (c < 4u) ? specLatent[c] : 0.0;
-                val = val * (1.0 + filmGamma) + filmBeta;
-                s_spec_in[tid * 16u + c] = float16_t(val);
+            // Divergence safety check on specular MV
+            if (dot(vSpecular, vSpecular) > 0.04 || specDisparity < 0.01) {
+                vSpecular = vSurface;
             }
+
+            // Subpixel UV reprojection in target resolution space
+            vec2 uv = (vec2(outCoord) + vec2(0.5)) * vec2(pc.invOutputWidth, pc.invOutputHeight);
+            vec2 prevUvSurf = uv - vSurface;
+            vec2 prevUvSpec = uv - vSpecular;
+
+            ivec2 maxHistCoord = ivec2(pc.outputWidth - 1, pc.outputHeight - 1);
+            vec4 histSurf = sampleDiffHistoryBilinear(prevUvSurf, maxHistCoord);
+            vec4 histSpec = sampleSpecHistoryBilinear(prevUvSpec, maxHistCoord);
+
+            // Plane-aware Disocclusion Confidence
+            float prevDepth = histSurf.w;
+            bool historyPresent = (prevDepth > 0.0) && (pc.frameIndex > 0u) && (pc.resetHistory == 0u);
+            float depthDelta = (viewDepth > 0.0 && prevDepth > 0.0) ? (abs(viewDepth - prevDepth) / max(viewDepth, prevDepth)) : 1.0;
+            bool surfValid = (prevUvSurf.x >= 0.0 && prevUvSurf.x <= 1.0 && prevUvSurf.y >= 0.0 && prevUvSurf.y <= 1.0);
+            float confidence = (surfValid && historyPresent) ? (1.0 - smoothstep(0.02, 0.18, depthDelta)) : 0.0;
+
+            s_albedo[tid] = baseAlbedo;
+            s_currentDepth[tid] = viewDepth;
+            s_specDisparity[tid] = specDisparity;
+            s_confidence[tid] = confidence;
+            s_warpedHistDiff[tid] = histSurf.rgb;
+            s_warpedHistSpec[tid] = histSpec.rgb;
+            s_rawLogRadiance[tid] = logRadiance;
+
+            // Sample density conditioning
+            float sNorm = upwaysComputeSnorm(float(pc.totalSamples));
+
+            // Assemble 32-channel continuous input features for Wave32 WMMA Head
+            s_in_features[tid * 32u + 0u]  = float16_t(logRadiance.r);
+            s_in_features[tid * 32u + 1u]  = float16_t(logRadiance.g);
+            s_in_features[tid * 32u + 2u]  = float16_t(logRadiance.b);
+            s_in_features[tid * 32u + 3u]  = float16_t(baseAlbedo.r);
+            s_in_features[tid * 32u + 4u]  = float16_t(baseAlbedo.g);
+            s_in_features[tid * 32u + 5u]  = float16_t(baseAlbedo.b);
+            s_in_features[tid * 32u + 6u]  = float16_t(viewNormal.x);
+            s_in_features[tid * 32u + 7u]  = float16_t(viewNormal.y);
+            s_in_features[tid * 32u + 8u]  = float16_t(viewNormal.z);
+            s_in_features[tid * 32u + 9u]  = float16_t(roughness);
+            s_in_features[tid * 32u + 10u] = float16_t(invDepth);
+            s_in_features[tid * 32u + 11u] = float16_t(specDisparity);
+            s_in_features[tid * 32u + 12u] = float16_t(vSurface.x);
+            s_in_features[tid * 32u + 13u] = float16_t(vSurface.y);
+            s_in_features[tid * 32u + 14u] = float16_t(vSpecular.x);
+            s_in_features[tid * 32u + 15u] = float16_t(vSpecular.y);
+
+            s_in_features[tid * 32u + 16u] = float16_t(histSurf.r);
+            s_in_features[tid * 32u + 17u] = float16_t(histSurf.g);
+            s_in_features[tid * 32u + 18u] = float16_t(histSurf.b);
+            s_in_features[tid * 32u + 19u] = float16_t(histSpec.r);
+            s_in_features[tid * 32u + 20u] = float16_t(histSpec.g);
+            s_in_features[tid * 32u + 21u] = float16_t(histSpec.b);
+            s_in_features[tid * 32u + 22u] = float16_t(confidence);
+            s_in_features[tid * 32u + 23u] = float16_t(sNorm);
+
+            vec3 logDiff = logRadiance - histSurf.rgb;
+            s_in_features[tid * 32u + 24u] = float16_t(logDiff.r);
+            s_in_features[tid * 32u + 25u] = float16_t(logDiff.g);
+            s_in_features[tid * 32u + 26u] = float16_t(logDiff.b);
+            s_in_features[tid * 32u + 27u] = float16_t(0.04);
+            s_in_features[tid * 32u + 28u] = float16_t(0.04);
+            s_in_features[tid * 32u + 29u] = float16_t(0.04);
+            s_in_features[tid * 32u + 30u] = float16_t(fract(inCoordF.x)); // Continuous subpixel phase X
+            s_in_features[tid * 32u + 31u] = float16_t(fract(inCoordF.y)); // Continuous subpixel phase Y
         } else {
             s_pixelCoords[tid] = ivec2(-1);
-            for (uint c = 0u; c < 16u; ++c) {
-                s_diff_in[tid * 16u + c] = float16_t(0.0);
-                s_spec_in[tid * 16u + c] = float16_t(0.0);
+            for (uint c = 0u; c < 32u; ++c) {
+                s_in_features[tid * 32u + c] = float16_t(0.0);
             }
         }
     }
+
     barrier();
 
     // =========================================================================
-    // Step 2: Evaluate Diffuse MLP Head (16 -> 64 -> 64 -> 16)
+    // Step 2: Pure Wave32 WMMA Execution (v_wmma_f32_16x16x16_f16)
     // =========================================================================
-    // LAYER 1: FC1 (16 -> 64)
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matDiffIn;
-    coopMatLoad(matDiffIn, s_diff_in, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    // LAYER 1: FC1 (32 -> 64)
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopMatLoad(matA0, s_in_features, 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matA1, s_in_features, 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
 
     for (uint n = 0u; n < 4u; ++n) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1;
+        acc1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-        uint w_offset = DIFF_FC1_WEIGHT_ELEM + n * 256u;
-        coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        acc = coopMatMulAdd(matDiffIn, wTile, acc);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w0;
+        uint w0_offset = FC1_WEIGHT_ELEM + (0u * 16u) * 64u + (n * 16u);
+        coopMatLoad(w0, weights, w0_offset, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        acc1 = coopMatMulAdd(matA0, w0, acc1);
 
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w1;
+        uint w1_offset = FC1_WEIGHT_ELEM + (1u * 16u) * 64u + (n * 16u);
+        coopMatLoad(w1, weights, w1_offset, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        acc1 = coopMatMulAdd(matA1, w1, acc1);
+
+        coopMatStore(acc1, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
         for (uint idx = tid; idx < 256u; idx += 32u) {
             uint r = idx / 16u;
             uint c = idx % 16u;
-            float val = s_acc[idx] + float(u_Weights.weights[DIFF_FC1_BIAS_ELEM + n * 16u + c]);
+            float val = s_acc[idx] + float(weights[FC1_BIAS_ELEM + n * 16u + c]);
             val = (val >= 0.0) ? val : (val * 0.1); // LeakyReLU(0.1)
             s_fc1_out[r * 64u + n * 16u + c] = float16_t(clamp(val, -65000.0, 65000.0));
         }
@@ -164,153 +331,160 @@ void main() {
 
     // LAYER 2: FC2 (64 -> 64)
     for (uint n = 0u; n < 4u; ++n) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc2;
+        acc2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
         for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> inTile;
             coopMatLoad(inTile, s_fc1_out, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
 
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-            uint w_offset = DIFF_FC2_WEIGHT_ELEM + (k * 4u + n) * 256u;
-            coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc = coopMatMulAdd(inTile, wTile, acc);
+            uint w_offset = FC2_WEIGHT_ELEM + (k * 16u) * 64u + (n * 16u);
+            coopMatLoad(wTile, weights, w_offset, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+            acc2 = coopMatMulAdd(inTile, wTile, acc2);
         }
 
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc2, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
         for (uint idx = tid; idx < 256u; idx += 32u) {
             uint r = idx / 16u;
             uint c = idx % 16u;
-            float val = s_acc[idx] + float(u_Weights.weights[DIFF_FC2_BIAS_ELEM + n * 16u + c]);
+            float val = s_acc[idx] + float(weights[FC2_BIAS_ELEM + n * 16u + c]);
             val = (val >= 0.0) ? val : (val * 0.1); // LeakyReLU(0.1)
             s_fc2_out[r * 64u + n * 16u + c] = float16_t(clamp(val, -65000.0, 65000.0));
         }
         barrier();
     }
 
-    // LAYER 3: FC3 (64 -> 16)
-    {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    // LAYER 3: FC3 (64 -> 64)
+    for (uint n = 0u; n < 4u; ++n) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc3;
+        acc3 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
         for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> inTile;
             coopMatLoad(inTile, s_fc2_out, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
 
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-            uint w_offset = DIFF_FC3_WEIGHT_ELEM + k * 256u;
-            coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc = coopMatMulAdd(inTile, wTile, acc);
+            uint w_offset = FC3_WEIGHT_ELEM + (k * 16u) * 64u + (n * 16u);
+            coopMatLoad(wTile, weights, w_offset, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+            acc3 = coopMatMulAdd(inTile, wTile, acc3);
         }
 
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        barrier();
-
-        if (tid < 16u) {
-            float r = max(s_acc[tid * 16u + 0u] + float(u_Weights.weights[DIFF_FC3_BIAS_ELEM + 0u]), 0.0);
-            float g = max(s_acc[tid * 16u + 1u] + float(u_Weights.weights[DIFF_FC3_BIAS_ELEM + 1u]), 0.0);
-            float b = max(s_acc[tid * 16u + 2u] + float(u_Weights.weights[DIFF_FC3_BIAS_ELEM + 2u]), 0.0);
-            s_decodedDiff[tid] = vec3(r, g, b);
-        }
-        barrier();
-    }
-
-    // =========================================================================
-    // Step 3: Evaluate Specular MLP Head (16 -> 64 -> 64 -> 16)
-    // =========================================================================
-    // LAYER 1: FC1 (16 -> 64)
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matSpecIn;
-    coopMatLoad(matSpecIn, s_spec_in, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-
-    for (uint n = 0u; n < 4u; ++n) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-        uint w_offset = SPEC_FC1_WEIGHT_ELEM + n * 256u;
-        coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        acc = coopMatMulAdd(matSpecIn, wTile, acc);
-
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc3, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
         for (uint idx = tid; idx < 256u; idx += 32u) {
             uint r = idx / 16u;
             uint c = idx % 16u;
-            float val = s_acc[idx] + float(u_Weights.weights[SPEC_FC1_BIAS_ELEM + n * 16u + c]);
+            float val = s_acc[idx] + float(weights[FC3_BIAS_ELEM + n * 16u + c]);
             val = (val >= 0.0) ? val : (val * 0.1); // LeakyReLU(0.1)
-            s_fc1_out[r * 64u + n * 16u + c] = float16_t(clamp(val, -65000.0, 65000.0));
+            s_fc3_out[r * 64u + n * 16u + c] = float16_t(clamp(val, -65000.0, 65000.0));
         }
         barrier();
     }
 
-    // LAYER 2: FC2 (64 -> 64)
-    for (uint n = 0u; n < 4u; ++n) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-
-        for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> inTile;
-            coopMatLoad(inTile, s_fc1_out, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-            uint w_offset = SPEC_FC2_WEIGHT_ELEM + (k * 4u + n) * 256u;
-            coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc = coopMatMulAdd(inTile, wTile, acc);
-        }
-
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        barrier();
-
-        for (uint idx = tid; idx < 256u; idx += 32u) {
-            uint r = idx / 16u;
-            uint c = idx % 16u;
-            float val = s_acc[idx] + float(u_Weights.weights[SPEC_FC2_BIAS_ELEM + n * 16u + c]);
-            val = (val >= 0.0) ? val : (val * 0.1); // LeakyReLU(0.1)
-            s_fc2_out[r * 64u + n * 16u + c] = float16_t(clamp(val, -65000.0, 65000.0));
-        }
-        barrier();
-    }
-
-    // LAYER 3: FC3 (64 -> 16) & Native Albedo Re-modulation
+    // LAYER 4: FC4 (64 -> 16)
     {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
-        acc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc4;
+        acc4 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
         for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> inTile;
-            coopMatLoad(inTile, s_fc2_out, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(inTile, s_fc3_out, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
 
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wTile;
-            uint w_offset = SPEC_FC3_WEIGHT_ELEM + k * 256u;
-            coopMatLoad(wTile, u_Weights.weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc = coopMatMulAdd(inTile, wTile, acc);
+            uint w_offset = FC4_WEIGHT_ELEM + (k * 16u) * 16u;
+            coopMatLoad(wTile, weights, w_offset, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+            acc4 = coopMatMulAdd(inTile, wTile, acc4);
         }
 
-        coopMatStore(acc, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc4, s_acc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
-        if (tid < 16u) {
-            ivec2 outCoord = s_pixelCoords[tid];
-            if (outCoord.x >= 0) {
-                float specR = max(s_acc[tid * 16u + 0u] + float(u_Weights.weights[SPEC_FC3_BIAS_ELEM + 0u]), 0.0);
-                float specG = max(s_acc[tid * 16u + 1u] + float(u_Weights.weights[SPEC_FC3_BIAS_ELEM + 1u]), 0.0);
-                float specB = max(s_acc[tid * 16u + 2u] + float(u_Weights.weights[SPEC_FC3_BIAS_ELEM + 2u]), 0.0);
-                vec3 decodedSpec = vec3(specR, specG, specB);
+        for (uint idx = tid; idx < 256u; idx += 32u) {
+            uint r = idx / 16u;
+            uint c = idx % 16u;
+            float val = s_acc[idx] + float(weights[FC4_BIAS_ELEM + c]);
+            s_fc4_out[r * 16u + c] = float16_t(val);
+        }
+        barrier();
+    }
 
-                vec3 decodedDiff = s_decodedDiff[tid];
-                vec3 displayAlbedo = s_dispAlbedo[tid];
-
-                // Native Albedo Re-modulation
-                vec3 logComposite = decodedDiff * displayAlbedo + decodedSpec;
-
-                // Clamped Inverse Log Transform yielding HDR Radiance
-                vec3 finalHdr = upwaysInverseLogTransform(logComposite);
-
-                imageStore(uOutputImage, outCoord, vec4(finalHdr, 1.0));
+    // =========================================================================
+    // Step 3: Decompress HDR Radiance & Write Outputs
+    // =========================================================================
+    if (tid < 16u) {
+        ivec2 outCoord = s_pixelCoords[tid];
+        if (outCoord.x >= 0 && outCoord.x < pc.outputWidth && outCoord.y < pc.outputHeight) {
+            // Multi-GPU TileDistributed boundary check:
+            if (pc.tileWidth > 0 && pc.tileHeight > 0) {
+                if (outCoord.x < pc.tileOffsetX || outCoord.x >= (pc.tileOffsetX + pc.tileWidth) ||
+                    outCoord.y < pc.tileOffsetY || outCoord.y >= (pc.tileOffsetY + pc.tileHeight)) {
+                    return;
+                }
             }
+
+            vec3 logRadiance = s_rawLogRadiance[tid];
+            vec3 histSurf = s_warpedHistDiff[tid];
+            vec3 histSpec = s_warpedHistSpec[tid];
+            float conf = s_confidence[tid];
+
+            // Extract predicted residuals and learned blend weights
+            vec3 deltaDiff = vec3(float(s_fc4_out[tid * 16u + 0u]),
+                                  float(s_fc4_out[tid * 16u + 1u]),
+                                  float(s_fc4_out[tid * 16u + 2u]));
+            vec3 deltaSpec = vec3(float(s_fc4_out[tid * 16u + 3u]),
+                                  float(s_fc4_out[tid * 16u + 4u]),
+                                  float(s_fc4_out[tid * 16u + 5u]));
+            vec3 rawAlpha  = vec3(float(s_fc4_out[tid * 16u + 6u]),
+                                  float(s_fc4_out[tid * 16u + 7u]),
+                                  float(s_fc4_out[tid * 16u + 8u]));
+
+            // Learned temporal blending alpha
+            vec3 sigmoidAlpha = vec3(1.0) / (vec3(1.0) + exp(-rawAlpha));
+            vec3 alpha = sigmoidAlpha * 0.12 + vec3(0.02);
+
+            // If disoccluded, history reset, or stationary progressive accumulation, take current frame
+            bool historyValid = (pc.cameraMoved != 0u && pc.resetHistory == 0u && conf > 0.05);
+            vec3 effectiveAlpha = historyValid ? mix(vec3(1.0), alpha, clamp(conf, 0.0, 1.0)) : vec3(1.0);
+
+            vec3 blendedLogDiff = mix(histSurf, logRadiance, effectiveAlpha);
+            vec3 blendedLogSpec = mix(histSpec, logRadiance, effectiveAlpha);
+
+            // Bounded residual correction: prevents runaway or negative clamping
+            vec3 cleanLogDiff = clamp(blendedLogDiff + clamp(deltaDiff * 0.25, vec3(-0.5), vec3(0.5)), vec3(0.0), vec3(3.8));
+            vec3 cleanLogSpec = clamp(blendedLogSpec + clamp(deltaSpec * 0.25, vec3(-0.5), vec3(0.5)), vec3(0.0), vec3(3.8));
+
+            // Clamped Inverse Log Decompression (y <= 3.8)
+            vec3 cleanDiff = upwaysInverseLogTransform(cleanLogDiff);
+            vec3 cleanSpec = upwaysInverseLogTransform(cleanLogSpec);
+
+            vec3 finalRadiance;
+            if (pc.learnedDemod != 0u) {
+                finalRadiance = cleanDiff;
+            } else {
+                vec3 albedo = s_albedo[tid];
+                finalRadiance = (dot(albedo, albedo) > 1e-4) ? (cleanDiff * albedo + cleanSpec * 0.04) : cleanDiff;
+            }
+
+            // Numerical safety sanity check: fall back to input if NaN or Inf
+            if (isnan(finalRadiance.r) || isnan(finalRadiance.g) || isnan(finalRadiance.b) ||
+                isinf(finalRadiance.r) || isinf(finalRadiance.g) || isinf(finalRadiance.b)) {
+                finalRadiance = upwaysInverseLogTransform(logRadiance);
+            }
+            finalRadiance = clamp(finalRadiance, vec3(0.0), vec3(65000.0));
+
+            // Write final HDR radiance to output image
+            imageStore(uOutputImage, outCoord, vec4(finalRadiance, 1.0));
+
+            // Write temporal history state
+            imageStore(uDiffHistoryOutputImage, outCoord, vec4(cleanLogDiff, s_currentDepth[tid]));
+            imageStore(uSpecHistoryOutputImage, outCoord, vec4(cleanLogSpec, s_specDisparity[tid]));
         }
     }
 }

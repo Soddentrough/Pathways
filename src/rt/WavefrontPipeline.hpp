@@ -141,8 +141,7 @@ public:
                                 VkBuffer materialArchetypeBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize matArchetypeSize = 0,
                                 VkBuffer shadeMaterialBuffer = VK_NULL_HANDLE,
-                                VkDeviceSize shadeMaterialSize = 0,
-                                VkImageView confidenceImageView = VK_NULL_HANDLE);
+                                VkDeviceSize shadeMaterialSize = 0);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }

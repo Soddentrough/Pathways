@@ -142,8 +142,7 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 32, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ReSTIRReservoirsBuffer
         { 33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PixelToRayBuffer
         { 34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // MaterialArchetypesBuffer
-        { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeMaterialsBuffer
-        { 36, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uConfidenceImage
+        { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // ShadeMaterialsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -333,8 +332,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer materialArchetypeBuffer,
                                                 VkDeviceSize matArchetypeSize,
                                                 VkBuffer shadeMaterialBuffer,
-                                                VkDeviceSize shadeMaterialSize,
-                                             VkImageView confidenceImageView) {
+                                                VkDeviceSize shadeMaterialSize) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -354,8 +352,6 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo specImageInfo{ VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : defaultStorageView;
     VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
-    VkImageView confView = (confidenceImageView != VK_NULL_HANDLE) ? confidenceImageView : defaultStorageView;
-    VkDescriptorImageInfo confImageInfo{ VK_NULL_HANDLE, confView, VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorBufferInfo camInfo{ cameraUBO, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo triInfo{ triangleBuffer, 0, triSize };
@@ -439,7 +435,6 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 32, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &restirInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 34, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matArchetypeInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 35, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeMatInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 36, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &confImageInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }

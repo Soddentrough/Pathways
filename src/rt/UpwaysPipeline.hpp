@@ -39,30 +39,11 @@ public:
         uint32_t inputHeight,
         uint32_t outputWidth,
         uint32_t outputHeight,
-        const std::vector<char>& temporalSpv,
-        const std::vector<char>& reconstructSpv,
-        const std::string& weightsPath = "",
-        bool enableSuperRes = false,
-        VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT
-    );
-
-    // Single-shader constructor for backwards compatibility
-    UpwaysPipeline(
-        VkDevice device,
-        VkPhysicalDevice physicalDevice,
-        VmaAllocator allocator,
-        uint32_t inputWidth,
-        uint32_t inputHeight,
-        uint32_t outputWidth,
-        uint32_t outputHeight,
         const std::vector<char>& shaderSpv,
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT
-    ) : UpwaysPipeline(device, physicalDevice, allocator,
-                       inputWidth, inputHeight, outputWidth, outputHeight,
-                       shaderSpv, shaderSpv, weightsPath, enableSuperRes, imageFormat) {}
-
+    );
     ~UpwaysPipeline();
 
     UpwaysPipeline(const UpwaysPipeline&) = delete;
@@ -82,7 +63,7 @@ public:
         VkImageView displayNormalsView = VK_NULL_HANDLE
     );
 
-    // Overload for backwards compatibility
+    // Overload for backwards compatibility with legacy 10-parameter signature
     void updateDescriptors(
         VkImageView accumImageView,
         VkImageView normalDepthImageView,
@@ -121,6 +102,7 @@ public:
         uint32_t totalSamples = 1u
     );
 
+    // Overload for backwards compatibility with legacy tile-based dispatch signature
     void recordFrame(
         VkCommandBuffer cmd,
         uint32_t frameIndex,
@@ -140,8 +122,6 @@ public:
 
     Image* getOutputImage() const { return m_outputImage.get(); }
     Image* getConfidenceImage() const { return m_confidenceImage.get(); }
-    Image* getTemporalLatentDiff() const { return m_temporalLatentDiff.get(); }
-    Image* getTemporalLatentSpec() const { return m_temporalLatentSpec.get(); }
     uint32_t getInputWidth() const { return m_inputWidth; }
     uint32_t getInputHeight() const { return m_inputHeight; }
     uint32_t getOutputWidth() const { return m_outputWidth; }
@@ -152,9 +132,9 @@ public:
 private:
     void initBuffers(const std::string& weightsPath);
     void initImages();
-    void createDescriptorSetLayouts();
+    void createDescriptorSetLayout();
     void allocateDescriptorSets();
-    void createPipelines(const std::vector<char>& temporalSpv, const std::vector<char>& reconstructSpv);
+    void createPipeline(const std::vector<char>& shaderSpv);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -172,27 +152,19 @@ private:
 
     std::unique_ptr<Buffer> m_weightBuffer;
     std::unique_ptr<Image> m_outputImage;
-    std::unique_ptr<Image> m_temporalLatentDiff;
-    std::unique_ptr<Image> m_temporalLatentSpec;
     std::unique_ptr<Image> m_confidenceImage;
     std::unique_ptr<Image> m_dummyBlackImage;
-
-    std::unique_ptr<Image> m_historyLatentDiff[2];
-    std::unique_ptr<Image> m_historyLatentSpec[2];
-    std::unique_ptr<Image> m_historyPosWorld[2];
+    std::unique_ptr<Image> m_diffHistoryImages[2];
+    std::unique_ptr<Image> m_specHistoryImages[2];
+    std::unique_ptr<Image> m_normHistoryImages[2];
     VkSampler m_historySampler = VK_NULL_HANDLE;
 
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_descLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_descSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    VkDescriptorSetLayout m_temporalDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_temporalDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_temporalPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_temporalPipeline = VK_NULL_HANDLE;
-
-    VkDescriptorSetLayout m_reconstructDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_reconstructDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_reconstructPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_reconstructPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_pipeline = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

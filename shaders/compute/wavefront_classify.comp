@@ -18,7 +18,6 @@ layout(binding = 24, rgba16f) uniform image2D uNormalDepthImage;
 layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
-layout(binding = 36, r16f) uniform readonly image2D uConfidenceImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -215,15 +214,6 @@ void main() {
     uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
 
     if (inBounds) {
-        float reliability = 1.0;
-        if (ubo.frameIndex > 0u) {
-            reliability = imageLoad(uConfidenceImage, storeCoord).r;
-        }
-        uint targetSpp = (reliability < 0.6) ? 2u : 1u;
-        if (pc.sppSampleIndex > 0u && targetSpp <= pc.sppSampleIndex) {
-            inBounds = false;
-        }
-
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
         bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
         vec2 jitter = enableTaa ? vec2(0.0) : (randVec2(seed) - vec2(0.5));
@@ -277,7 +267,7 @@ void main() {
             }
         }
 
-        float invSpp = 1.0 / float(targetSpp);
+        float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
         pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
         vec3 hitNormal = vec3(0.0, 1.0, 0.0);
 
