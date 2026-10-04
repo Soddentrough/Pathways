@@ -1244,8 +1244,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             const char* reconMethods[] = {
                 "Off (Pure Monte Carlo - Unbiased Reference)",
                 "Upways Neural Reconstruction (Wave32 WMMA)",
-                "AMD FidelityFX Super Resolution 3.1 (Temporal FSR 3.1)",
-                "AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)"
+                "Temporal Super Resolution (TAAU + RCAS)",
+                "Spatial Super Resolution (EASU + RCAS)"
             };
             int curMethod = 0;
             if (config.upscaler_mode == UpscalerMode::FSR3) {
@@ -1270,12 +1270,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         config.upways_superres = false;
                         config.render_scale = 1.0f;
                     }
-                } else if (curMethod == 2) { // FSR 3.1
+                } else if (curMethod == 2) { // Temporal Super Resolution
                     config.denoiser_mode = DenoiserMode::None;
                     config.upscaler_mode = UpscalerMode::FSR3;
                     config.upways_superres = false;
                     if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else if (curMethod == 3) { // FSR 1.0
+                } else if (curMethod == 3) { // Spatial Super Resolution
                     config.denoiser_mode = DenoiserMode::None;
                     config.upscaler_mode = UpscalerMode::FSR1;
                     config.upways_superres = false;
@@ -1290,7 +1290,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select the primary reconstruction or super-resolution method: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or AMD FidelityFX.");
+                ImGui::SetTooltip("Select the primary reconstruction or super-resolution method: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or Temporal / Spatial Super-Resolution.");
             }
 
             // Setting Dropdown (Nested under selected method)

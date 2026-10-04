@@ -18,6 +18,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <atomic>
 
 namespace pathways {
 
@@ -131,6 +132,16 @@ public:
     const PciLinkInfo& getPciLinkInfo() const { return m_pciLinkInfo; }
     const std::string& getPciLinkString() const { return m_pciLinkInfo.formattedLink; }
     bool isPciLinkDegraded() const { return m_pciLinkInfo.isDegraded; }
+    bool hasPositionFetch() const { return m_hasPositionFetch; }
+    bool hasDescriptorHeap() const { return m_hasDescriptorHeap; }
+#ifdef _WIN32
+    bool hasExternalMemoryWin32() const { return m_hasExternalMemoryWin32; }
+    bool hasExternalSemaphoreWin32() const { return m_hasExternalSemaphoreWin32; }
+    PFN_vkGetSemaphoreWin32HandleKHR pfnGetSemaphoreWin32HandleKHR = nullptr;
+    PFN_vkImportSemaphoreWin32HandleKHR pfnImportSemaphoreWin32HandleKHR = nullptr;
+    PFN_vkGetMemoryWin32HandleKHR pfnGetMemoryWin32HandleKHR = nullptr;
+    PFN_vkGetMemoryWin32HandlePropertiesKHR pfnGetMemoryWin32HandlePropertiesKHR = nullptr;
+#endif
     void refreshPciLinkInfo();
 
     // Physical devices enumeration (for multi-GPU)
@@ -177,11 +188,17 @@ private:
     PFN_vkAcquireFullScreenExclusiveModeEXT pfnVkAcquireFullScreenExclusiveModeEXT = nullptr;
     PFN_vkReleaseFullScreenExclusiveModeEXT pfnVkReleaseFullScreenExclusiveModeEXT = nullptr;
 #endif
+    bool m_hasPositionFetch = false;
+    bool m_hasDescriptorHeap = false;
+#ifdef _WIN32
+    bool m_hasExternalMemoryWin32 = false;
+    bool m_hasExternalSemaphoreWin32 = false;
+#endif
     PciLinkInfo m_pciLinkInfo;
     std::string m_contextRole = "Primary GPU";
     bool m_validationLayersEnabled = false;
 
-    static uint32_t s_validationErrors;
+    static std::atomic<uint32_t> s_validationErrors;
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
         VkDebugUtilsMessageTypeFlagsEXT messageType,

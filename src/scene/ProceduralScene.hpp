@@ -1,9 +1,12 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include <glm/gtc/packing.hpp>
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <cmath>
+#include <algorithm>
 #include "scene/Material.hpp"
 #include "scene/Light.hpp"
 #include "scene/LightTree.hpp"
@@ -26,19 +29,85 @@ struct TriangleGPU {
 };
 static_assert(sizeof(TriangleGPU) == 160, "TriangleGPU must be exactly 160 bytes");
 
-// 128-byte cache-line aligned shading triangle struct (Option 3 / RDNA 4 vector cache line)
+// 32-bit Octahedral normal/direction encoding (Cigolle et al.)
+inline glm::vec2 octSign(glm::vec2 v) {
+    return glm::vec2((v.x >= 0.0f) ? 1.0f : -1.0f, (v.y >= 0.0f) ? 1.0f : -1.0f);
+}
+
+inline glm::vec2 octEncode(glm::vec3 v) {
+    float l1 = std::abs(v.x) + std::abs(v.y) + std::abs(v.z);
+    if (l1 > 1e-6f) {
+        v /= l1;
+    } else {
+        v = glm::vec3(0.0f, 0.0f, 1.0f);
+    }
+    glm::vec2 xy(v.x, v.y);
+    if (v.z >= 0.0f) {
+        return xy;
+    }
+    return (glm::vec2(1.0f) - glm::abs(glm::vec2(v.y, v.x))) * octSign(xy);
+}
+
+inline uint32_t packOct32(glm::vec3 v) {
+    float len = glm::length(v);
+    if (len > 1e-6f) {
+        v /= len;
+    } else {
+        v = glm::vec3(0.0f, 0.0f, 1.0f);
+    }
+    return glm::packSnorm2x16(octEncode(v));
+}
+
+// 64-byte cache-line aligned shading triangle struct (2 triangles per 128B RDNA4 vector cache line)
 struct alignas(16) TriangleShadeGPU {
-    glm::vec4 normal0_u0; // xyz: normal0, w: uv0.x
-    glm::vec4 normal1_u1; // xyz: normal1, w: uv1.x
-    glm::vec4 normal2_u2; // xyz: normal2, w: uv2.x
-    glm::vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
-    glm::vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
-    glm::vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
-    glm::vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: 0.0f
-    uint32_t materialId;
-    uint32_t padding[3];
+    uint32_t octNormal0 = 0;
+    uint32_t octNormal1 = 0;
+    uint32_t octNormal2 = 0;
+    uint32_t octTan0 = 0;
+
+    uint32_t octTan1 = 0;
+    uint32_t octTan2 = 0;
+    uint32_t uv0 = 0;
+    uint32_t uv1 = 0;
+
+    uint32_t uv2 = 0;
+    uint32_t tanSigns = 0;
+    uint32_t materialId = 0;
+    uint32_t padding0 = 0;
+
+    uint32_t reserved[4] = {0, 0, 0, 0};
 };
-static_assert(sizeof(TriangleShadeGPU) == 128, "TriangleShadeGPU must be exactly 128 bytes (1 L0 cache line)");
+static_assert(sizeof(TriangleShadeGPU) == 64, "TriangleShadeGPU must be exactly 64 bytes (2 triangles per 128B cache line)");
+
+inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
+    TriangleShadeGPU s{};
+    s.octNormal0 = packOct32(glm::vec3(tri.v0.normal));
+    s.octNormal1 = packOct32(glm::vec3(tri.v1.normal));
+    s.octNormal2 = packOct32(glm::vec3(tri.v2.normal));
+    s.octTan0    = packOct32(glm::vec3(tri.v0.tangent));
+
+    s.octTan1    = packOct32(glm::vec3(tri.v1.tangent));
+    s.octTan2    = packOct32(glm::vec3(tri.v2.tangent));
+    s.uv0        = glm::packHalf2x16(glm::vec2(tri.v0.position.w, tri.v0.normal.w));
+    s.uv1        = glm::packHalf2x16(glm::vec2(tri.v1.position.w, tri.v1.normal.w));
+
+    s.uv2        = glm::packHalf2x16(glm::vec2(tri.v2.position.w, tri.v2.normal.w));
+
+    uint32_t signs = 0;
+    if (tri.v0.tangent.w >= 0.0f) signs |= (1u << 0);
+    if (tri.v1.tangent.w >= 0.0f) signs |= (1u << 1);
+    if (tri.v2.tangent.w >= 0.0f) signs |= (1u << 2);
+    s.tanSigns   = signs;
+
+    s.materialId = tri.materialId;
+    s.padding0   = 0;
+    s.reserved[0] = 0;
+    s.reserved[1] = 0;
+    s.reserved[2] = 0;
+    s.reserved[3] = 0;
+
+    return s;
+}
 
 struct SphereGPU {
     glm::vec4 centerRadius; // xyz: center, w: radius

@@ -612,7 +612,13 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 gpuLight.position = glm::vec4(pos, LIGHT_DIRECTIONAL);
                 gpuLight.normal = glm::vec4(dirToLight, 0.0f);
             } else {
-                gpuLight.position = glm::vec4(pos, LIGHT_AREA_QUAD);
+                // Point light proxy: small quad of radius 0.05m
+                const float r = 0.05f;
+                gpuLight.position = glm::vec4(pos - glm::vec3(r * 0.5f, r * 0.5f, 0.0f), LIGHT_AREA_QUAD);
+                gpuLight.u = glm::vec4(r, 0.0f, 0.0f, 0.0f);
+                gpuLight.v = glm::vec4(0.0f, r, 0.0f, 0.0f);
+                gpuLight.normal = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
+                gpuLight.emission.w = r * r;
             }
 
             outScene.lights.push_back(gpuLight);
@@ -639,7 +645,12 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
                 gpuLight.u.w = std::cos(light.spot_inner_cone_angle);
                 gpuLight.v.w = std::cos(light.spot_outer_cone_angle);
             } else {
-                gpuLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_AREA_QUAD);
+                const float r = 0.05f;
+                gpuLight.position = glm::vec4(-r * 0.5f, -r * 0.5f, 0.0f, LIGHT_AREA_QUAD);
+                gpuLight.u = glm::vec4(r, 0.0f, 0.0f, 0.0f);
+                gpuLight.v = glm::vec4(0.0f, r, 0.0f, 0.0f);
+                gpuLight.normal = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
+                gpuLight.emission.w = r * r;
             }
             outScene.lights.push_back(gpuLight);
         }
@@ -1028,8 +1039,9 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         return glm::dot(a - b, a - b) < 1e-6f;
     };
 
-    // 1. Pair coplanar adjacent triangles that form planar parallelograms / rectangles
-    for (size_t i = 0; i < candTris.size(); ++i) {
+    // 1. Pair coplanar adjacent triangles that form planar parallelograms / rectangles (bypass if N > 2000 to avoid CPU stalls)
+    if (candTris.size() <= 2000) {
+        for (size_t i = 0; i < candTris.size(); ++i) {
         if (candTris[i].paired) continue;
         const auto& t1 = candTris[i];
         std::array<glm::vec3, 3> v1 = { t1.v0, t1.v1, t1.v2 };
@@ -1106,6 +1118,7 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
             }
         }
     }
+    }
 
     // 2. Fallback for remaining unpaired isolated triangles
     for (size_t i = 0; i < candTris.size(); ++i) {
@@ -1130,15 +1143,6 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
 
     if (!emissiveMeshLights.empty()) {
         Logger::info("Extracted {} physical emissive mesh lights from scene geometry", emissiveMeshLights.size());
-        // If there are many emissive triangles, sort by total radiant flux and keep top 64
-        if (emissiveMeshLights.size() > 64) {
-            std::sort(emissiveMeshLights.begin(), emissiveMeshLights.end(), [](const LightGPU& a, const LightGPU& b) {
-                float fluxA = (a.emission.r + a.emission.g + a.emission.b) * a.emission.w;
-                float fluxB = (b.emission.r + b.emission.g + b.emission.b) * b.emission.w;
-                return fluxA > fluxB;
-            });
-            emissiveMeshLights.resize(64);
-        }
         for (const auto& l : emissiveMeshLights) {
             data.lights.push_back(l);
         }

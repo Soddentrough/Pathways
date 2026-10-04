@@ -152,6 +152,18 @@ bool ImageDumper::savePNG16(const std::string& filepath, uint32_t width, uint32_
     return true;
 }
 
+std::future<bool> ImageDumper::savePNGAsync(const std::string& filepath, uint32_t width, uint32_t height, std::vector<uint8_t> rgbaPixels) {
+    return std::async(std::launch::async, [filepath, width, height, pixels = std::move(rgbaPixels)]() {
+        return ImageDumper::savePNG(filepath, width, height, pixels.data());
+    });
+}
+
+std::future<bool> ImageDumper::savePNG16Async(const std::string& filepath, uint32_t width, uint32_t height, std::vector<uint16_t> rgba16Pixels) {
+    return std::async(std::launch::async, [filepath, width, height, pixels = std::move(rgba16Pixels)]() {
+        return ImageDumper::savePNG16(filepath, width, height, pixels.data());
+    });
+}
+
 bool ImageDumper::saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels) {
     if (!rgbaFloatPixels || width == 0 || height == 0) {
         Logger::error("Invalid float image buffer passed to saveEXR");

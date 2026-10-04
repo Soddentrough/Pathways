@@ -799,11 +799,6 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
             std::transform(lowerPrimPath.begin(), lowerPrimPath.end(), lowerPrimPath.begin(),
                            [](unsigned char c) { return std::tolower(c); });
 
-            if (lowerPrimPath.find("separator") != std::string::npos ||
-                lowerPrimPath.find("cloud") != std::string::npos) {
-                Logger::info("UsdLoader: Skipping atmospheric occlusion prim '{}'", primPathStr);
-                continue;
-            }
 
             // If this mesh is part of any PointInstancer prototype hierarchy, skip it here
             bool isPrototypePrim = false;
@@ -973,13 +968,14 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                     }
                     if (faceMatId < materialTransforms.size()) {
                         const auto& xf = materialTransforms[faceMatId];
+                        uv = uv * xf.scale;
                         if (xf.rotation != 0.0f) {
                             float rad = glm::radians(xf.rotation);
                             float cosR = std::cos(rad);
                             float sinR = std::sin(rad);
                             uv = glm::vec2(uv.x * cosR - uv.y * sinR, uv.x * sinR + uv.y * cosR);
                         }
-                        uv = uv * xf.scale + xf.translation;
+                        uv = uv + xf.translation;
                     }
                     v.position.w = uv.x;
                     v.normal.w = 1.0f - uv.y;

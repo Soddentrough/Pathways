@@ -246,10 +246,35 @@ bool VideoDecoder::decodeNextFrame() {
         return false;
     }
 
+    // Check if a frame is already decoded and available
+    int ret = avcodec_receive_frame(m_codecCtx, m_frame);
+    if (ret == 0) {
+        sws_scale(
+            m_swsCtx,
+            m_frame->data, m_frame->linesize,
+            0, m_height,
+            m_frameRgba->data, m_frameRgba->linesize
+        );
+        m_hasNewFrame = true;
+        return true;
+    }
+
     while (true) {
-        int ret = av_read_frame(m_formatCtx, m_packet);
+        ret = av_read_frame(m_formatCtx, m_packet);
         if (ret < 0) {
-            // EOF reached
+            // EOF reached - drain decoder buffered frames
+            avcodec_send_packet(m_codecCtx, nullptr);
+            ret = avcodec_receive_frame(m_codecCtx, m_frame);
+            if (ret == 0) {
+                sws_scale(
+                    m_swsCtx,
+                    m_frame->data, m_frame->linesize,
+                    0, m_height,
+                    m_frameRgba->data, m_frameRgba->linesize
+                );
+                m_hasNewFrame = true;
+                return true;
+            }
             if (m_loop) {
                 rewind();
                 ret = av_read_frame(m_formatCtx, m_packet);

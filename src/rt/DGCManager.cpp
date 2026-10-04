@@ -310,9 +310,7 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
                                          const std::vector<VkPipeline>& secondaryPipelines) {
     bool disabledViaEnv = (getenv("PATHWAYS_DISABLE_MATERIAL_DGC") != nullptr) ||
                           (getenv("PATHWAYS_DISABLE_DGC_EXECSET") != nullptr);
-    bool enabledViaEnv = (getenv("PATHWAYS_ENABLE_MATERIAL_DGC") != nullptr) ||
-                         (getenv("PATHWAYS_ENABLE_DGC_EXECSET") != nullptr);
-    bool enableMaterialDGC = (!disabledViaEnv) && enabledViaEnv;
+    bool enableMaterialDGC = !disabledViaEnv;
     if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
         Logger::info("Material microkernels active via GPU multi-dispatch indirect queues (6 specialized pipelines).");

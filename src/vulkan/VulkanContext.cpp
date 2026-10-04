@@ -14,7 +14,7 @@
 
 namespace pathways {
 
-uint32_t VulkanContext::s_validationErrors = 0;
+std::atomic<uint32_t> VulkanContext::s_validationErrors{0};
 
 static const std::vector<const char*> g_validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -409,7 +409,19 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
             m_hasHdrMetadata = true;
         }
+        if (std::strcmp(ext.extensionName, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) == 0) {
+            m_hasPositionFetch = true;
+        }
+        if (std::strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) == 0) {
+            m_hasDescriptorHeap = true;
+        }
 #ifdef _WIN32
+        if (std::strcmp(ext.extensionName, "VK_KHR_external_memory_win32") == 0) {
+            m_hasExternalMemoryWin32 = true;
+        }
+        if (std::strcmp(ext.extensionName, "VK_KHR_external_semaphore_win32") == 0) {
+            m_hasExternalSemaphoreWin32 = true;
+        }
         if (std::strcmp(ext.extensionName, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME) == 0) {
             m_hasFullScreenExclusive = true;
         }
@@ -835,8 +847,24 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasCooperativeMatrix) {
         deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
+    if (m_hasPositionFetch) {
+        deviceExtensions.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+    }
+    if (m_hasDescriptorHeap) {
+        deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+    }
+#ifdef _WIN32
+    if (m_hasExternalMemoryWin32) {
+        deviceExtensions.push_back("VK_KHR_external_memory_win32");
+    }
+    if (m_hasExternalSemaphoreWin32) {
+        deviceExtensions.push_back("VK_KHR_external_semaphore_win32");
+    }
+#endif
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featuresPositionFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
+
     VkPhysicalDeviceVulkan14Features features14{};
     features14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
     features14.shaderSubgroupRotate = VK_TRUE;
@@ -846,11 +874,18 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features14.dynamicRenderingLocalRead = VK_TRUE;
     features14.maintenance5 = VK_TRUE;
     features14.maintenance6 = VK_TRUE;
+    features14.pushDescriptor = VK_TRUE;
+
+    if (m_hasPositionFetch) {
+        featuresPositionFetch.rayTracingPositionFetch = VK_TRUE;
+        features14.pNext = &featuresPositionFetch;
+    }
 
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
+    features13.maintenance4 = VK_TRUE;
     if (m_hasSubgroupSizeControl) {
         features13.subgroupSizeControl = VK_TRUE;
         features13.computeFullSubgroups = VK_TRUE;
@@ -967,6 +1002,14 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (!config.headless && m_hasFullScreenExclusive) {
         pfnVkAcquireFullScreenExclusiveModeEXT = (PFN_vkAcquireFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(m_device, "vkAcquireFullScreenExclusiveModeEXT");
         pfnVkReleaseFullScreenExclusiveModeEXT = (PFN_vkReleaseFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(m_device, "vkReleaseFullScreenExclusiveModeEXT");
+    }
+    if (m_hasExternalSemaphoreWin32) {
+        pfnGetSemaphoreWin32HandleKHR = (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_device, "vkGetSemaphoreWin32HandleKHR");
+        pfnImportSemaphoreWin32HandleKHR = (PFN_vkImportSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_device, "vkImportSemaphoreWin32HandleKHR");
+    }
+    if (m_hasExternalMemoryWin32) {
+        pfnGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryWin32HandleKHR");
+        pfnGetMemoryWin32HandlePropertiesKHR = (PFN_vkGetMemoryWin32HandlePropertiesKHR)vkGetDeviceProcAddr(m_device, "vkGetMemoryWin32HandlePropertiesKHR");
     }
 #endif
 }

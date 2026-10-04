@@ -48,9 +48,16 @@ def analyze_image(png_path, label=""):
 
 def main():
     os.makedirs("output", exist_ok=True)
-    bin_path = "./build/bin/pathways"
-    if not os.path.exists(bin_path):
-        print(f"[FAIL] Pathways binary not found at {bin_path}")
+    candidates = [
+        os.environ.get("PATHWAYS_BIN"),
+        "./build/linux-release/bin/pathways",
+        "./build/bin/pathways",
+        "./build/windows-clang-release/bin/pathways.exe",
+        "./build/release/bin/pathways"
+    ]
+    bin_path = next((c for c in candidates if c and os.path.exists(c)), None)
+    if not bin_path:
+        print(f"[FAIL] Pathways binary not found in candidate paths: {candidates}")
         sys.exit(1)
 
     all_passed = True

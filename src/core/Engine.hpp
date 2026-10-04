@@ -19,9 +19,26 @@
 #include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
+#include "rt/SuperResolutionManager.hpp"
+#include "rt/CausticsPipeline.hpp"
+#include "rt/RayTracingOrchestrator.hpp"
+#include "rt/PostProcessPipeline.hpp"
+#include "core/InputController.hpp"
+#include "core/HwMonitor.hpp"
+#include "rt/TrainingCaptureManager.hpp"
+#include "video/VideoBillboardManager.hpp"
+#include "scene/SceneGeometryPipeline.hpp"
+#include "rt/GpuTlasUpdatePipeline.hpp"
+#include "rt/AccelerationStructurePipeline.hpp"
+#include "core/TelemetryReporter.hpp"
+#include "vulkan/RenderTargetManager.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/SceneRegistry.hpp"
+#include "scene/SceneManager.hpp"
+#include "vulkan/PresentationManager.hpp"
 #include "core/QualityGovernor.hpp"
+#include "vulkan/EngineDescriptorManager.hpp"
+#include "mgpu/MultiGpuCoordinator.hpp"
 
 #include <memory>
 #include <vector>
@@ -35,8 +52,6 @@
 
 namespace pathways {
 
-class VideoDecoder;
-
 class Engine {
 public:
     Engine(const Config& config);
@@ -46,28 +61,58 @@ public:
     void renderFrame();
     void dumpOutputFiles();
     void printExecutionSummary() const;
-    const std::vector<ConfigStatsTally>& getConfigTallies() const { return m_configTallies; }
+    const std::vector<ConfigStatsTally>& getConfigTallies() const {
+        static const std::vector<ConfigStatsTally> s_empty;
+        return m_telemetryReporter ? m_telemetryReporter->getConfigTallies() : s_empty;
+    }
     FrameStats getStats() const;
     std::string exportTelemetry(const std::string& customPath = "");
 
     void setCameraMode(bool active);
-    bool isCameraMode() const { return m_cameraMode; }
+    bool isCameraMode() const;
     void setMgpuMode(MultiGpuMode mode);
 
     bool loadScene(const std::string& filepath);
     bool applyLoadedScene(SceneData newScene, const std::string& filepath);
     void requestSceneChange(const std::string& filepath);
-    bool isSceneLoading() const { return m_isSceneLoading.load(); }
-    const std::string& getLoadingSceneName() const { return m_loadingSceneName; }
-    const std::vector<SceneEntry>& getAvailableScenes() const { return m_availableScenes; }
-    int getCurrentSceneIndex() const { return m_currentSceneIndex; }
+    bool isSceneLoading() const { return m_sceneManager ? m_sceneManager->isSceneLoading() : false; }
+    const std::string& getLoadingSceneName() const {
+        static const std::string s_empty;
+        return m_sceneManager ? m_sceneManager->getLoadingSceneName() : s_empty;
+    }
+    float getSceneLoadingElapsedSec() const {
+        return m_sceneManager ? m_sceneManager->getLoadingElapsedSec() : 0.0f;
+    }
+    const std::vector<SceneEntry>& getAvailableScenes() const {
+        static const std::vector<SceneEntry> s_empty;
+        return m_sceneManager ? m_sceneManager->getAvailableScenes() : m_availableScenes;
+    }
+    int getCurrentSceneIndex() const {
+        return m_sceneManager ? m_sceneManager->getCurrentSceneIndex() : m_currentSceneIndex;
+    }
     std::string getActiveSceneName() const;
     Window* getWindow() const { return m_window.get(); }
-    Swapchain* getSwapchain() const { return m_swapchain.get(); }
+    Swapchain* getSwapchain() const { return m_swapchain; }
+    PresentationManager* getPresentationManager() const { return m_presentation.get(); }
     QualityGovernor* getGovernor() const { return m_governor.get(); }
-    NRCManager* getNrcManager() const { return m_nrcManager.get(); }
-    UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
-    Fsr3Upscaler* getFsr3Upscaler() const { return m_fsr3Upscaler.get(); }
+    NRCManager* getNrcManager() const { return m_nrcManager; }
+    UpwaysPipeline* getUpwaysPipeline() const { return m_superResolution ? m_superResolution->getUpwaysPipeline() : nullptr; }
+    Fsr3Upscaler* getFsr3Upscaler() const { return m_superResolution ? m_superResolution->getFsr3Upscaler() : nullptr; }
+    SuperResolutionManager* getSuperResolution() const { return m_superResolution.get(); }
+    CausticsPipeline* getCausticsPipeline() const { return m_causticsPipeline.get(); }
+    PostProcessPipeline* getPostProcess() const { return m_postProcess.get(); }
+    InputController* getInputController() const { return m_inputController.get(); }
+    HwMonitor* getHwMonitor() const { return m_hwMonitor.get(); }
+    VideoBillboardManager* getVideoBillboard() const { return m_videoBillboard.get(); }
+    SceneGeometryPipeline* getGeometryPipeline() const { return m_geometryPipeline.get(); }
+    GpuTlasUpdatePipeline* getTlasUpdatePipeline() const { return m_tlasUpdatePipeline.get(); }
+    TelemetryReporter* getTelemetryReporter() const { return m_telemetryReporter.get(); }
+    RenderTargetManager* getRenderTargets() const { return m_renderTargets.get(); }
+    SceneManager* getSceneManager() const { return m_sceneManager.get(); }
+    AccelerationStructurePipeline* getAsPipeline() const { return m_asPipeline.get(); }
+    EngineDescriptorManager* getDescriptorManager() const { return m_descriptorManager.get(); }
+    MultiGpuCoordinator* getMgpuCoordinator() const { return m_mgpuCoordinator.get(); }
+    void refreshPciStatus();
 
 private:
     void initVulkan();
@@ -83,7 +128,6 @@ private:
     std::vector<char> loadShaderSPIRV(const std::string& filename);
     void onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate = false);
 
-    bool m_cameraMode = false;
     bool m_resetAccumulation = false;
     bool m_cameraMovedLastFrame = false;
     bool m_instanceMovedLastFrame = false;
@@ -94,7 +138,10 @@ private:
     Config m_config;
     std::unique_ptr<Window> m_window;
     std::unique_ptr<VulkanContext> m_context;
-    std::unique_ptr<Swapchain> m_swapchain;
+    std::unique_ptr<PresentationManager> m_presentation;
+    Swapchain* m_swapchain = nullptr;
+    Buffer* m_uiDumpBuffer = nullptr;
+    void syncPresentationPointers();
     std::unique_ptr<Camera> m_camera;
     std::unique_ptr<CameraPath> m_cameraPath;
     float m_cameraPathTime = 0.0f;
@@ -103,96 +150,86 @@ private:
 
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 
-    // GPU Buffers
-    std::unique_ptr<Buffer> m_triangleBuffer;
-    std::unique_ptr<Buffer> m_sphereBuffer;
-    std::unique_ptr<Buffer> m_materialBuffer;
-    std::unique_ptr<Buffer> m_materialArchetypeBuffer;
-    std::unique_ptr<Buffer> m_shadeMaterialBuffer;
-    std::unique_ptr<Buffer> m_lightBuffer;
-    std::unique_ptr<Buffer> m_lightTreeBuffer;
+    // GPU Buffers (Observing pointers to resources owned by SceneManager)
+    Buffer* m_triangleBuffer = nullptr;
+    Buffer* m_sphereBuffer = nullptr;
+    Buffer* m_materialBuffer = nullptr;
+    Buffer* m_materialArchetypeBuffer = nullptr;
+    Buffer* m_shadeMaterialBuffer = nullptr;
+    Buffer* m_lightBuffer = nullptr;
+    Buffer* m_lightTreeBuffer = nullptr;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
-    std::unique_ptr<Buffer> m_uiDumpBuffer;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_centerDepthBuffers;
     float m_gpuCenterDepth = 0.0f;
     bool m_hasGpuCenterDepth = false;
 
     // Hardware Acceleration Structures (VK_KHR_ray_query)
-    std::unique_ptr<Buffer> m_positionBuffer;
-    std::unique_ptr<Buffer> m_asIndexBuffer;
-    std::unique_ptr<Buffer> m_instanceBuffer;
-    std::unique_ptr<AccelerationStructureManager> m_asManager;
-    std::unique_ptr<AccelerationStructure> m_blas;
-    std::vector<std::unique_ptr<AccelerationStructure>> m_blases;
-    std::unique_ptr<AccelerationStructure> m_tlas;
+    friend class AccelerationStructurePipeline;
+    std::unique_ptr<AccelerationStructurePipeline> m_asPipeline;
+    Buffer* m_positionBuffer = nullptr;
+    Buffer* m_asIndexBuffer = nullptr;
+    Buffer* m_instanceBuffer = nullptr;
+    AccelerationStructureManager* m_asManager = nullptr;
+    AccelerationStructure* m_tlas = nullptr;
+    void syncAsPointers();
 
     void createAccelerationStructures();
     void uploadToDeviceBuffer(Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize);
-    void uploadIndexBuffer(Buffer& dstBuffer, uint32_t triangleCount);
 
-    // GPU-Timeline TLAS Instance & Scratch Buffers (Tier 3)
-    std::unique_ptr<Buffer> m_tlasInstanceBuffer;
-    std::unique_ptr<Buffer> m_tlasInputInstancesBuffer;
-    std::unique_ptr<Buffer> m_tlasScratchBuffer;
-    uint32_t m_tlasInstanceCount = 0;
-    bool m_tlasNeedsGpuUpdate = false;
-    uint32_t m_tlasGpuUpdateCount = 0;
-
-
-
-    // Textures & Environment Map (Bindings 7 & 8)
+    // Textures & Environment Map (Observing pointers to resources owned by SceneManager)
     static constexpr uint32_t MAX_SCENE_TEXTURES = 512;
-    std::unique_ptr<Texture> m_dummyWhite;
-    std::unique_ptr<Texture> m_dummyNormal;
-    std::unique_ptr<Texture> m_blueNoiseTexture;
-    std::unique_ptr<Texture> m_environmentMap;
-    std::vector<std::unique_ptr<Texture>> m_sceneTextures;
+    Texture* m_dummyWhite = nullptr;
+    Texture* m_dummyNormal = nullptr;
+    Texture* m_blueNoiseTexture = nullptr;
+    Texture* m_environmentMap = nullptr;
+    const std::vector<std::unique_ptr<Texture>>& getSceneTextures() const {
+        static const std::vector<std::unique_ptr<Texture>> s_empty;
+        return m_sceneManager ? m_sceneManager->getSceneTextures() : s_empty;
+    }
 
-    // Render Targets
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_frameImages;
-    std::unique_ptr<Image> m_accumImage;
-    std::unique_ptr<Image> m_outputImage;
+    // Render Targets Subsystem
+    friend class RenderTargetManager;
+    std::unique_ptr<RenderTargetManager> m_renderTargets;
+    Image* m_accumImage = nullptr;
+    Image* m_outputImage = nullptr;
+    Image* m_motionVectorImage = nullptr;
+    std::array<Image*, MAX_FRAMES_IN_FLIGHT> m_frameImages = { nullptr, nullptr };
 
-    // Descriptors & Pipelines
+    // Descriptors & Pipelines Subsystem
+    friend class EngineDescriptorManager;
+    std::unique_ptr<EngineDescriptorManager> m_descriptorManager;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_rtDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_tonemapDescLayout = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_tonemapDescSet = VK_NULL_HANDLE;
+    Buffer* m_secTransferBuffer = nullptr;
+    void syncDescriptorPointers();
 
+    // Ray Tracing Pipeline Subsystem (Wavefront, RTPipeline, NRC, ReSTIR)
+    friend class RayTracingOrchestrator;
+    std::unique_ptr<RayTracingOrchestrator> m_rtOrchestrator;
     VkPipelineLayout m_rtpPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
-    std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
-    std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
-    std::unique_ptr<NRCManager> m_nrcManager;
+    RTPipeline* m_rtpKhrPipeline = nullptr;
+    WavefrontPipeline* m_wavefrontPipeline = nullptr;
+    NRCManager* m_nrcManager = nullptr;
+    void syncRayTracingPointers();
+
     WavefrontPipeline::WavefrontProfilingData m_lastWavefrontProfile;
     uint32_t m_currentBatchCount = 0;
     uint32_t m_currentBatchPixels = 0;
     uint32_t getTargetBatchPixels() const;
     uint32_t getEffectiveBatchCount(uint32_t renderW, uint32_t renderH) const;
     uint32_t getEffectiveBatchPixels(uint32_t renderW, uint32_t renderH, uint32_t batchCount) const;
-    mutable float m_cachedDivergentAreaRatio = -1.0f;
     float getDivergentAreaRatio() const;
     WavefrontSortMode getEffectiveWavefrontSortMode() const;
 
-    // GPU-Timeline TLAS Instance Update Pipeline (Tier 3)
-    VkDescriptorSetLayout m_updateTlasDescLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_updateTlasDescPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_updateTlasDescSet = VK_NULL_HANDLE;
-    VkPipelineLayout m_updateTlasPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_updateTlasPipeline = VK_NULL_HANDLE;
+    // GPU-Timeline TLAS Instance Update Pipeline & Dynamic Simulation (Tier 3)
+    std::unique_ptr<GpuTlasUpdatePipeline> m_tlasUpdatePipeline;
     void initTlasBuffers(const std::vector<ASInstanceInput>& asInstances);
     void initTlasBuffers(uint32_t instanceCount);
     void initTlasUpdatePipeline();
     void recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode = true);
     void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
-    void markTlasDirty() { m_tlasNeedsGpuUpdate = true; }
-
-    // Decoupled Simulation & Animation Timing (Fix-Your-Timestep)
-    static constexpr float SIMULATION_FIXED_TIMESTEP = 1.0f / 60.0f; // 60 Hz fixed tick
-    float m_simAccumulator = 0.0f;
-    float m_simTime = 0.0f;
+    void markTlasDirty();
     void updateAnimatedInstances(float frameDelta);
 
     // Commands & Synchronization
@@ -200,160 +237,76 @@ private:
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_commandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_postCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkSurfaceKHR m_surface = VK_NULL_HANDLE;
-    std::array<VkFence, MAX_FRAMES_IN_FLIGHT> m_inFlightFences = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_rtCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     uint32_t m_currentFrame = 0;
-    std::vector<VkSemaphore> m_imageAvailableSemaphores;
-    std::vector<VkSemaphore> m_renderFinishedSemaphores;
 
     // Timestamp Profiling
     static constexpr uint32_t QUERIES_PER_FRAME = 6;
     VkQueryPool m_queryPool = VK_NULL_HANDLE;
     float m_timestampPeriod = 1.0f; // ns per tick
 
-    // Multi-GPU Transfer & Merge Resources
+    // Multi-GPU Transfer & Merge Resources (Coordinated by MultiGpuCoordinator)
+    friend class MultiGpuCoordinator;
+    std::unique_ptr<MultiGpuCoordinator> m_mgpuCoordinator;
     VkCommandPool m_asyncComputeCommandPool = VK_NULL_HANDLE;
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_mergeCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_mergeCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    void syncMgpuCoordinatorPointers();
     std::vector<uint32_t> getConcurrentQueueFamilies() const;
-    std::unique_ptr<Buffer> m_secTransferBuffer;
-    VkDescriptorSetLayout m_mergeDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_mergeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_mergePipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_mergePipeline = VK_NULL_HANDLE;
     void updateMergeDescriptors();
     void updateAllImageDescriptors();
     void updateSceneDescriptors();
     void updateWavefrontSceneDescriptors();
 
-    // Running Average Accumulation Pipeline (FP16 Frame -> FP32 Persistent History)
-    VkDescriptorSetLayout m_accumRunningAvgDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_accumRunningAvgDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_accumRunningAvgPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_accumRunningAvgPipeline = VK_NULL_HANDLE;
-    void createAccumRunningAvgPipeline();
-    void updateAccumRunningAvgDescriptors();
+    // Post-Processing Subsystem (ACES Tonemap, Fused Accum/Tonemap, Running Avg, Blend4K, Multi-GPU Merge)
+    std::unique_ptr<PostProcessPipeline> m_postProcess;
 
-    // Fused Accumulation & Tonemapping Pipeline (Single-Dispatch Pass Fusion)
-    VkDescriptorSetLayout m_accumTonemapDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_accumTonemapDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout m_accumTonemapPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_accumTonemapPipeline = VK_NULL_HANDLE;
-    void createAccumTonemapPipeline();
-    void updateAccumTonemapDescriptors();
-
-    // G-Buffer Resources (used by ray tracer, direct lighting, and FSR / Upways)
-    std::unique_ptr<Image> m_directLightImage;
-    std::unique_ptr<Image> m_normalDepthImage;
-    std::unique_ptr<Image> m_prevNormalDepthImage;
-    // Screen-Space Motion Vectors (used by ray tracer and temporal reconstruction passes)
-    std::unique_ptr<Image> m_motionVectorImage;
+    // G-Buffer & ML Observing Pointers (resources owned by RenderTargetManager)
+    Image* m_directLightImage = nullptr;
+    Image* m_normalDepthImage = nullptr;
+    Image* m_prevNormalDepthImage = nullptr;
+    Image* m_mlAlbedoRoughnessImage = nullptr;
+    Image* m_mlSpecularMotionImage = nullptr;
+    Image* m_mlDiffuseImage = nullptr;
+    Image* m_mlSpecularImage = nullptr;
     void createGBufferResources();
     void destroyGBufferResources();
+    void syncRenderTargetPointers();
 
-    // ML Training Data Capture Targets (Upways neural denoiser & continuous upscaler)
-    std::unique_ptr<Image> m_mlAlbedoRoughnessImage;
-    std::unique_ptr<Image> m_mlSpecularMotionImage;
-    std::unique_ptr<Image> m_mlDiffuseImage;
-    std::unique_ptr<Image> m_mlSpecularImage;
+    // ML Training Data Capture Subsystem (Upways neural denoiser & continuous upscaler)
+    friend class TrainingCaptureManager;
+    std::unique_ptr<TrainingCaptureManager> m_trainingCapture;
     void runTrainingDataCapture();
-    void captureTrainingFrame(uint32_t frameIdx, bool isReference, uint32_t spp);
-    void updateGamingChoreography(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName);
-    void updateCaptureCamera(Camera* camera, uint32_t frameIdx, uint32_t totalFrames, const std::string& sceneName);
-
-    bool m_choreoInitialized = false;
-    glm::vec3 m_choreoInitialPos{0.0f};
-    float m_choreoInitialYaw = 0.0f;
-    float m_choreoInitialPitch = 0.0f;
-    float m_choreoInitialFov = 45.0f;
 
     bool m_temporalResetRequested = true;
 
-    // Post-processing descriptor pool (for upscalers / tonemapping sets)
-    VkDescriptorPool m_postProcessDescPool = VK_NULL_HANDLE;
-    void createPostProcessDescPool();
-    void destroyPostProcessDescPool();
-
-    // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
-    std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
-    VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
-    std::unique_ptr<Image> m_displayAlbedoImage;
-    std::unique_ptr<Image> m_displayNormalsImage;
-
-    void createUpwaysPipelines();
-    void createUpwaysResources();
-    void destroyUpwaysResources();
-    void destroyUpwaysPipelines();
+    // Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR 3.1)
+    friend class SuperResolutionManager;
+    std::unique_ptr<SuperResolutionManager> m_superResolution;
     void updateUpwaysDescriptors();
-    bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory);
-
-    // AMD FidelityFX Super Resolution 3.1
-    std::unique_ptr<Fsr3Upscaler> m_fsr3Upscaler;
-    std::unique_ptr<Image> m_secAccumImage;
-    VkDescriptorSet m_tonemapFsr3DescSet = VK_NULL_HANDLE;
-
-    // FSR 3.1 Multi-GPU SampleBlend 4K resolve
-    VkDescriptorSetLayout m_fsr3BlendDescLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_fsr3BlendPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_fsr3BlendPipeline = VK_NULL_HANDLE;
-    VkDescriptorPool m_fsr3BlendDescPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_fsr3BlendDescSet = VK_NULL_HANDLE;
-
-    void createFsr3Pipelines();
-    void createFsr3Resources();
-    void destroyFsr3Resources();
-    void destroyFsr3Pipelines();
     void updateFsr3Descriptors();
-    bool dispatchFsr3(VkCommandBuffer cmd, bool resetHistory);
 
-    // Real-Time Caustics (Photon Injection + Atomic Splatting + Bilateral Filter)
-    std::unique_ptr<Buffer> m_causticPhotonBuffer;
-    std::unique_ptr<Buffer> m_causticAtomicBuffer;
-    std::unique_ptr<Image> m_filteredCausticImage;
-    std::unique_ptr<Image> m_prevCausticImage;
-
-    VkDescriptorSetLayout m_causticTraceDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_causticSplatDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_causticFilterDescLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_causticDescPool = VK_NULL_HANDLE;
-
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticTraceDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticSplatDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_causticFilterDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-
-    VkPipelineLayout m_causticTracePipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_causticSplatPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_causticFilterPipelineLayout = VK_NULL_HANDLE;
-
-    VkPipeline m_causticTracePipeline = VK_NULL_HANDLE;
-    VkPipeline m_causticSplatPipeline = VK_NULL_HANDLE;
-    VkPipeline m_causticFilterPipeline = VK_NULL_HANDLE;
-
-    void createCausticsPipelines();
-    void createCausticsResources();
-    void destroyCausticsResources();
-    void destroyCausticsPipelines();
+    // Real-Time Caustics Subsystem
+    std::unique_ptr<CausticsPipeline> m_causticsPipeline;
+    void initCaustics();
     void updateCausticsDescriptors();
-    void dispatchCausticTrace(VkCommandBuffer cmd, uint32_t frameSlot);
-    void dispatchCausticSplatAndFilter(VkCommandBuffer cmd, uint32_t frameSlot);
-    void dispatchCaustics(VkCommandBuffer cmd, uint32_t frameSlot);
 
     // ReSTIR DI Subsystem
-    std::unique_ptr<ReSTIRManager> m_restirManager;
+    ReSTIRManager* m_restirManager = nullptr;
     void createReSTIRResources();
     void destroyReSTIRResources();
     [[nodiscard]] bool isRestirActive() const noexcept {
         return m_config.enable_restir_di && (m_numLights >= m_config.restir_min_lights);
     }
 
+    // Scene Management Subsystem
+    friend class SceneManager;
+    std::unique_ptr<SceneManager> m_sceneManager;
+    void syncScenePointers();
+
     // Deferred GUI configuration actions
     bool m_pendingSceneChange = false;
     std::string m_pendingScenePath = "";
-    std::future<SceneData> m_sceneLoadingFuture;
-    std::atomic<bool> m_isSceneLoading{false};
-    std::string m_loadingScenePath = "";
-    std::string m_loadingSceneName = "";
-    std::chrono::steady_clock::time_point m_sceneLoadingStartTime;
     bool m_pendingMgpuModeChange = false;
     MultiGpuMode m_newMgpuMode = MultiGpuMode::Off;
     bool m_pendingMgpuUpscaleModeChange = false;
@@ -385,6 +338,7 @@ private:
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
     bool m_sceneHasAlphaMask = false;
+    std::unique_ptr<SceneGeometryPipeline> m_geometryPipeline;
     void updateSceneTransparencyFlag();
     void partitionSceneGeometry();
     void clusterInstancesToMacroBlas(SceneData& scene);
@@ -413,54 +367,23 @@ private:
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastLogTime;
 
-    // Per-configuration tallied statistics
-    std::vector<ConfigStatsTally> m_configTallies;
+    // Telemetry & Reporting Subsystem
+    friend class TelemetryReporter;
+    std::unique_ptr<TelemetryReporter> m_telemetryReporter;
     void recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
                           const WavefrontStageSample* wfSample = nullptr);
 
-    // Hardware Sensors & Telemetry (Infrequent background sampler)
-    void startHwMonThread();
-    void stopHwMonThread();
-    void sampleHwSensors();
-    void refreshPciStatus();
+    // Hardware Sensors & Telemetry Subsystem
+    std::unique_ptr<HwMonitor> m_hwMonitor;
 
-    std::atomic<bool> m_hwMonRunning{false};
-    std::thread m_hwMonThread;
-    std::mutex m_hwMonMutex;
-    std::condition_variable m_hwMonCv;
-    std::atomic<uint32_t> m_gpu0ClockMhz{0};
-    std::atomic<uint32_t> m_gpu0TempC{0};
-    std::atomic<uint32_t> m_gpu1ClockMhz{0};
-    std::atomic<uint32_t> m_gpu1TempC{0};
-
-    // State & Asynchronous Workers
+    // State
     bool m_isMinimized = false;
-    std::thread m_telemetryWorker;
 
-    // Gamepad Navigation & PS5 DualSense Support (FEAT-01)
-    SDL_Gamepad* m_gamepad = nullptr;
-    float m_gamepadLeftX = 0.0f;
-    float m_gamepadLeftY = 0.0f;
-    float m_gamepadRightX = 0.0f;
-    float m_gamepadRightY = 0.0f;
-    float m_gamepadLeftTrigger = 0.0f;
-    float m_gamepadRightTrigger = 0.0f;
-    bool m_gamepadBtnA = false;
-    bool m_gamepadBtnB = false;
-    bool m_gamepadBtnOrbit = false;
-    bool m_gamepadBtnBumperUp = false;
-    bool m_gamepadBtnBumperDown = false;
-    bool m_gamepadIsPs5 = false;
+    // Input & Interaction Subsystem (Keyboard, Mouse, Gamepad)
+    std::unique_ptr<InputController> m_inputController;
 
-    void initGamepad();
-    void updateGamepadLed();
-    void rumbleGamepad(uint16_t low, uint16_t high, uint32_t durationMs);
-
-    // Video billboard decoder & dynamic staging buffers
-    std::unique_ptr<VideoDecoder> m_videoDecoder;
-    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_videoStagingBuffers;
-    void initVideoBillboardDecoder(const std::string& scenePath);
-    void updateVideoBillboards(VkCommandBuffer cmd);
+    // Video Billboard Subsystem
+    std::unique_ptr<VideoBillboardManager> m_videoBillboard;
 };
 
 } // namespace pathways

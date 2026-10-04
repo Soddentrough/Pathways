@@ -1086,12 +1086,6 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
-#if defined(_WIN32)
-    Logger::warn("Multi-GPU requires hardware cross-GPU semaphore synchronization (VK_KHR_external_semaphore_win32), which is not yet supported on Windows. Multi-GPU disabled.");
-    m_mode = MultiGpuMode::Off;
-    return;
-#endif
-
     auto devices = VulkanContext::enumeratePhysicalDevices(m_primaryContext->getInstance());
     uint32_t secondaryGpuIndex = UINT32_MAX;
     for (uint32_t i = 0; i < devices.size(); ++i) {
@@ -1156,8 +1150,68 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         vkCreateQueryPool(secDevice, &queryInfo, nullptr, &secNode->queryPools[i]);
     }
 
-    // 2b. Cross-GPU Hardware Synchronization Semaphores (VK_KHR_external_semaphore_fd)
+    // 2b. Cross-GPU Hardware Synchronization Semaphores
     VkDevice primDevice = m_primaryContext->getDevice();
+#if defined(_WIN32)
+    m_useCrossGpuSync = m_primaryContext->hasExternalSemaphoreWin32() && secNode->context->hasExternalSemaphoreWin32() &&
+                        m_primaryContext->pfnImportSemaphoreWin32HandleKHR && secNode->context->pfnGetSemaphoreWin32HandleKHR;
+    if (!m_useCrossGpuSync) {
+        Logger::error("Multi-GPU requires cross-GPU hardware semaphore synchronization (VK_KHR_external_semaphore_win32), which is not supported by the Vulkan devices on this system. Disabling Multi-GPU.");
+        m_mode = MultiGpuMode::Off;
+        return;
+    }
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        VkExportSemaphoreCreateInfo exportInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+        exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+        VkSemaphoreCreateInfo secSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        secSemInfo.pNext = &exportInfo;
+        vkCreateSemaphore(secDevice, &secSemInfo, nullptr, &secNode->secSemaphores[i]);
+
+        VkSemaphoreCreateInfo primSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        vkCreateSemaphore(primDevice, &primSemInfo, nullptr, &secNode->primImportedSemaphores[i]);
+        secNode->exportedFd[i] = -1;
+        secNode->slotFdReady[i] = false;
+    }
+    // Permanent Cross-GPU Hardware Timeline Semaphore (VK_KHR_external_semaphore_win32 + VK_SEMAPHORE_TYPE_TIMELINE)
+    VkSemaphoreTypeCreateInfo timelineTypeSec{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    timelineTypeSec.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineTypeSec.initialValue = 0;
+
+    VkExportSemaphoreCreateInfo exportTimelineInfo{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+    exportTimelineInfo.pNext = &timelineTypeSec;
+    exportTimelineInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    VkSemaphoreCreateInfo secTimelineSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    secTimelineSemInfo.pNext = &exportTimelineInfo;
+    vkCreateSemaphore(secDevice, &secTimelineSemInfo, nullptr, &secNode->secTimelineSemaphore);
+
+    VkSemaphoreGetWin32HandleInfoKHR getTimelineHandleInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
+    getTimelineHandleInfo.semaphore = secNode->secTimelineSemaphore;
+    getTimelineHandleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    HANDLE timelineHandle = NULL;
+    secNode->context->pfnGetSemaphoreWin32HandleKHR(secDevice, &getTimelineHandleInfo, &timelineHandle);
+
+    VkSemaphoreTypeCreateInfo timelineTypePrim{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    timelineTypePrim.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineTypePrim.initialValue = 0;
+
+    VkSemaphoreCreateInfo primTimelineSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    primTimelineSemInfo.pNext = &timelineTypePrim;
+    vkCreateSemaphore(primDevice, &primTimelineSemInfo, nullptr, &secNode->primImportedTimelineSemaphore);
+
+    if (timelineHandle != NULL) {
+        VkImportSemaphoreWin32HandleInfoKHR importTimelineHandleInfo{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+        importTimelineHandleInfo.semaphore = secNode->primImportedTimelineSemaphore;
+        importTimelineHandleInfo.flags = 0; // Permanent import on primary device
+        importTimelineHandleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        importTimelineHandleInfo.handle = timelineHandle;
+        m_primaryContext->pfnImportSemaphoreWin32HandleKHR(primDevice, &importTimelineHandleInfo);
+        CloseHandle(timelineHandle);
+    }
+
+    Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_win32 & Timeline Semaphores (zero-wait GPU-to-GPU pipelining).");
+#else
     m_useCrossGpuSync = m_primaryContext->hasExternalSemaphoreFd() && secNode->context->hasExternalSemaphoreFd() &&
                         m_primaryContext->pfnImportSemaphoreFdKHR && secNode->context->pfnGetSemaphoreFdKHR;
     if (!m_useCrossGpuSync) {
@@ -1216,6 +1270,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 
     Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd & Timeline Semaphores (zero-wait GPU-to-GPU pipelining).");
+#endif
 
     // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
     uint32_t secWidth = config.width;
@@ -1241,19 +1296,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
 
-        TriangleShadeGPU s{};
-        s.normal0_u0 = glm::vec4(glm::vec3(tri.v0.normal), tri.v0.position.w);
-        s.normal1_u1 = glm::vec4(glm::vec3(tri.v1.normal), tri.v1.position.w);
-        s.normal2_u2 = glm::vec4(glm::vec3(tri.v2.normal), tri.v2.position.w);
-        s.tan0_v0    = glm::vec4(glm::vec3(tri.v0.tangent), tri.v0.normal.w);
-        s.tan1_v1    = glm::vec4(glm::vec3(tri.v1.tangent), tri.v1.normal.w);
-        s.tan2_v2    = glm::vec4(glm::vec3(tri.v2.tangent), tri.v2.normal.w);
-        s.tanSigns   = glm::vec4(tri.v0.tangent.w, tri.v1.tangent.w, tri.v2.tangent.w, 0.0f);
-        s.materialId = tri.materialId;
-        s.padding[0] = 0;
-        s.padding[1] = 0;
-        s.padding[2] = 0;
-        shadeTriangles.push_back(s);
+        shadeTriangles.push_back(createTriangleShadeGPU(tri));
     }
 
     VkDeviceSize posSize = std::max(sizeof(glm::vec4) * positions.size(), sizeof(glm::vec4) * 3);
@@ -2466,19 +2509,7 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
 
-        TriangleShadeGPU s{};
-        s.normal0_u0 = glm::vec4(glm::vec3(tri.v0.normal), tri.v0.position.w);
-        s.normal1_u1 = glm::vec4(glm::vec3(tri.v1.normal), tri.v1.position.w);
-        s.normal2_u2 = glm::vec4(glm::vec3(tri.v2.normal), tri.v2.position.w);
-        s.tan0_v0    = glm::vec4(glm::vec3(tri.v0.tangent), tri.v0.normal.w);
-        s.tan1_v1    = glm::vec4(glm::vec3(tri.v1.tangent), tri.v1.normal.w);
-        s.tan2_v2    = glm::vec4(glm::vec3(tri.v2.tangent), tri.v2.normal.w);
-        s.tanSigns   = glm::vec4(tri.v0.tangent.w, tri.v1.tangent.w, tri.v2.tangent.w, 0.0f);
-        s.materialId = tri.materialId;
-        s.padding[0] = 0;
-        s.padding[1] = 0;
-        s.padding[2] = 0;
-        shadeTriangles.push_back(s);
+        shadeTriangles.push_back(createTriangleShadeGPU(tri));
     }
 
     VkDeviceSize posSize = std::max(sizeof(glm::vec4) * positions.size(), sizeof(glm::vec4) * 3);

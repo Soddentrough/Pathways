@@ -22,7 +22,7 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Compiler options and warnings
-option(ENABLE_NATIVE_OPTIMIZATION "Enable CPU native architecture instruction optimizations (-march=native)" ON)
+option(ENABLE_NATIVE_OPTIMIZATION "Enable CPU native architecture instruction optimizations (-march=native)" OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(
@@ -271,7 +271,6 @@ target_include_directories(pathways PRIVATE
 
 target_compile_definitions(pathways PRIVATE
     SHADER_DIR="${SPV_OUTPUT_DIR}"
-    VK_ENABLE_BETA_EXTENSIONS=0
 )
 
 # OpenUSD (Pixar USD) Support
@@ -306,7 +305,7 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
                     set_target_properties(TBB::tbb PROPERTIES IMPORTED_LOCATION "/usr/lib64/libtbb.so.12")
                 endif()
             endif()
-            if(EXISTS "${USD_FALLBACK_DEPS}/include")
+            if(NOT EXISTS "/usr/include/tbb/tbb.h" AND EXISTS "${USD_FALLBACK_DEPS}/include")
                 set_property(TARGET TBB::tbb APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${USD_FALLBACK_DEPS}/include")
             endif()
         endif()
@@ -325,7 +324,7 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
             target_link_libraries(pathways PRIVATE Python3::Python)
             target_include_directories(pathways SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
         endif()
-        if(EXISTS "${USD_FALLBACK_DEPS}/include")
+        if(NOT EXISTS "/usr/include/tbb/tbb.h" AND EXISTS "${USD_FALLBACK_DEPS}/include")
             target_include_directories(pathways SYSTEM PRIVATE "${USD_FALLBACK_DEPS}/include")
         endif()
         target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS})
@@ -695,7 +694,7 @@ if(pxr_FOUND)
         ${THIRD_PARTY_DIR}/stb
         ${THIRD_PARTY_DIR}/tinyexr
     )
-    if(EXISTS "${USD_FALLBACK_DEPS}/include")
+    if(NOT EXISTS "/usr/include/tbb/tbb.h" AND EXISTS "${USD_FALLBACK_DEPS}/include")
         target_include_directories(test_usd_loader SYSTEM PRIVATE "${USD_FALLBACK_DEPS}/include")
     endif()
     target_include_directories(test_usd_loader SYSTEM PRIVATE
@@ -900,5 +899,13 @@ else()
     # Default generators
     set(CPACK_GENERATOR "RPM;TGZ")
 endif()
+
+# Exclude large references and repository internals from release source packages
+set(CPACK_SOURCE_IGNORE_FILES
+    "/tests/references/"
+    "/\\\\.git/"
+    "/build/"
+    "\\\\.DS_Store"
+)
 
 include(CPack)

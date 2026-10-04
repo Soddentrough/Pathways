@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <future>
 
 namespace pathways {
 
@@ -21,11 +22,11 @@ struct FrameStats {
     std::string driver_version_str = "";
     std::string vulkan_api_str = "";
     std::string device_type_str = "Discrete GPU";
-    std::string arch_name = "AMD RDNA4 (GFX1201)";
-    std::string short_arch = "RDNA4";
-    std::string ray_accelerator_name = "AMD RDNA4 3rd Gen Ray Accelerators";
+    std::string arch_name = "Unknown";
+    std::string short_arch = "GPU";
+    std::string ray_accelerator_name = "Hardware Ray Tracing";
     bool is_rdna3 = false;
-    bool is_rdna4 = true;
+    bool is_rdna4 = false;
     double total_vram_mb = 0.0;
     double vram_used_mb = 0.0;
     double vram_budget_mb = 0.0;
@@ -256,6 +257,8 @@ class ImageDumper {
 public:
     static bool savePNG(const std::string& filepath, uint32_t width, uint32_t height, const uint8_t* rgbaPixels);
     static bool savePNG16(const std::string& filepath, uint32_t width, uint32_t height, const uint16_t* rgba16Pixels);
+    static std::future<bool> savePNGAsync(const std::string& filepath, uint32_t width, uint32_t height, std::vector<uint8_t> rgbaPixels);
+    static std::future<bool> savePNG16Async(const std::string& filepath, uint32_t width, uint32_t height, std::vector<uint16_t> rgba16Pixels);
     static bool saveEXR(const std::string& filepath, uint32_t width, uint32_t height, const float* rgbaFloatPixels);
     static bool savePTTD(const std::string& filepath, uint32_t width, uint32_t height,
                          uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,

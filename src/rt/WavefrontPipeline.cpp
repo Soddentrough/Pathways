@@ -938,7 +938,15 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
             }
 
+            VkMemoryBarrier2 s2dMemBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            s2dMemBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            s2dMemBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            s2dMemBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            s2dMemBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
             VkDependencyInfo s2dDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            s2dDep.memoryBarrierCount = 1;
+            s2dDep.pMemoryBarriers = &s2dMemBarrier;
             s2dDep.bufferMemoryBarrierCount = s2dCount;
             s2dDep.pBufferMemoryBarriers = s2dBarriers.data();
             vkCmdPipelineBarrier2(cmd, &s2dDep);
@@ -1110,7 +1118,15 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
                 }
 
+                VkMemoryBarrier2 d2sMemBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                d2sMemBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                d2sMemBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                d2sMemBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                d2sMemBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
                 VkDependencyInfo d2sDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                d2sDep.memoryBarrierCount = 1;
+                d2sDep.pMemoryBarriers = &d2sMemBarrier;
                 d2sDep.bufferMemoryBarrierCount = d2sCount;
                 d2sDep.pBufferMemoryBarriers = d2sBarriers.data();
                 vkCmdPipelineBarrier2(cmd, &d2sDep);
