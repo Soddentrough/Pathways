@@ -37,6 +37,7 @@ public:
         m_focalRadius = focalRadius;
     }
     void setFullscreenToggleCallback(std::function<void()> cb) { m_onToggleFullscreen = std::move(cb); }
+    void setScreenshotCallback(std::function<void()> cb) { m_onScreenshot = std::move(cb); }
 
     /**
      * @brief Process an incoming SDL event.
@@ -71,6 +72,7 @@ private:
     glm::vec3 m_centralTarget{ 0.0f };
     float m_focalRadius = 1.0f;
     std::function<void()> m_onToggleFullscreen;
+    std::function<void()> m_onScreenshot;
 
     bool m_cameraMode = false;
 

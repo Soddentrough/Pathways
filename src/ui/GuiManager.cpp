@@ -1816,6 +1816,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             } else {
                 ImGui::TextDisabled("Console logging disabled (clean terminal)");
             }
+
+            ImGui::Spacing();
+            if (ImGui::Button("Capture Screenshot (F12)", ImVec2(-1.0f, 28.0f))) {
+                if (actions) actions->takeScreenshot = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Saves the current frame to a high-quality PNG in screenshots/\n(pw_<scene>_<Xspp>_<bounce>_<accum>_<timestamp>.png)\nShortcut: F12 or PrintScreen");
+            }
         }
 
         renderMoreDataBelowIndicator("ControlPanel");
@@ -1854,6 +1862,29 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::End();
         }
+    }
+
+    // On-screen screenshot captured toast notification badge
+    if (stats.screenshot_notification_timer > 0.0f && !stats.last_screenshot_path.empty()) {
+        ImGuiWindowFlags toastFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
+        float alpha = std::min(1.0f, stats.screenshot_notification_timer * 1.5f);
+        ImGui::SetNextWindowBgAlpha(0.88f * alpha);
+        float toastW = std::min(580.0f, dispW - 40.0f);
+        ImGui::SetNextWindowPos(ImVec2((dispW - toastW) * 0.5f, 22.0f), ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.12f, 0.10f, 0.92f * alpha));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.2f, 0.95f, 0.45f, 0.85f * alpha));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 10.0f));
+        if (ImGui::Begin("##ScreenshotNotificationToast", nullptr, toastFlags)) {
+            ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.5f, alpha), "SCREENSHOT CAPTURED [F12 / PrintScreen]");
+            ImGui::TextColored(ImVec4(0.85f, 0.90f, 0.95f, alpha), "%s", stats.last_screenshot_path.c_str());
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor(2);
     }
 
     // 5. Global Viewport Scene Loading Overlay & Scrim

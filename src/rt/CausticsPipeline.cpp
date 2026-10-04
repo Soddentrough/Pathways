@@ -438,7 +438,7 @@ void CausticsPipeline::recordTrace(
 
     vkCmdPushConstants(cmd, m_tracePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    uint32_t groups = (m_photonCount + 255) / 256;
+    uint32_t groups = (m_photonCount + 31) / 32;
     vkCmdDispatch(cmd, groups, 1, 1);
 
     // Barrier: Photon buffer write -> Photon buffer read in Splat pass

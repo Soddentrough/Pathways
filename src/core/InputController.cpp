@@ -143,6 +143,18 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return true;
     }
 
+    // 2. F12 or PrintScreen key: save current frame to high quality PNG (intercepted first so ImGui never swallows it)
+    if (e.type == SDL_EVENT_KEY_DOWN && (e.key.key == SDLK_F12 || e.key.key == SDLK_PRINTSCREEN) && !e.key.repeat) {
+        Logger::info("Screenshot hotkey pressed (F12 / PrintScreen) -> capturing high-quality frame.");
+        if (m_onScreenshot) {
+            m_onScreenshot();
+        }
+        return true;
+    }
+    if (e.type == SDL_EVENT_KEY_UP && (e.key.key == SDLK_F12 || e.key.key == SDLK_PRINTSCREEN)) {
+        return true;
+    }
+
     // 2. Window-level events
     if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) {
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {

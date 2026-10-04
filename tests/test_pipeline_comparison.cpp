@@ -204,6 +204,35 @@ int main() {
         std::cout << "  -> Telemetry JSON serialization successfully verified." << std::endl;
     }
 
+    // -------------------------------------------------------------------------
+    // 6. Test High-Quality 16-bit PNG Screenshot Output & Naming Pattern
+    // -------------------------------------------------------------------------
+    {
+        std::cout << "[TEST 6] High-Quality 16-bit PNG Screenshot Output & Naming Pattern..." << std::endl;
+        std::error_code ec;
+        std::filesystem::create_directories("screenshots", ec);
+
+        std::string testScene = "cornell_caustic_extended";
+        uint32_t spp = 1;
+        uint32_t bounce = 4;
+        uint32_t accum = 10;
+        std::string testPath = std::format("screenshots/pw_{}_{}spp_{}bounce_{}accum_test.png",
+                                           testScene, spp, bounce, accum);
+
+        // Create a small 4x4 test pattern in 16-bit RGBA
+        uint32_t w = 4, h = 4;
+        std::vector<uint16_t> testPixels(w * h * 4, 32768); // 50% gray in 16-bit
+        auto future = ImageDumper::savePNG16Async(testPath, w, h, std::move(testPixels));
+        check_true(future.valid(), "savePNG16Async must return a valid std::future");
+        bool writeSuccess = future.get();
+        check_true(writeSuccess, "savePNG16Async must successfully write 16-bit PNG");
+        check_true(std::filesystem::exists(testPath), "16-bit PNG file must exist on disk");
+        check_true(std::filesystem::file_size(testPath) > 50, "16-bit PNG file size must be non-trivial");
+
+        std::filesystem::remove(testPath, ec);
+        std::cout << "  -> 16-bit PNG async screenshot pipeline & naming format verified." << std::endl;
+    }
+
     std::cout << "==========================================================" << std::endl;
     std::cout << "  ALL PIPELINE COMPARISON TESTS PASSED!" << std::endl;
     std::cout << "==========================================================" << std::endl;

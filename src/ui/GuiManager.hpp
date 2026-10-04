@@ -15,6 +15,7 @@ struct DisplayInfo;
 struct GuiActions {
     bool resetAccumulation = false;
     bool toggleFullscreen = false;
+    bool takeScreenshot = false;
     uint32_t requestedWidth = 0;
     uint32_t requestedHeight = 0;
     bool exportTelemetry = false;

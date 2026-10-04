@@ -146,6 +146,8 @@ struct FrameStats {
     bool accumulation_complete = false;
     uint32_t max_accum_frames = 2048;
     bool is_animating = false;
+    std::string last_screenshot_path = "";
+    float screenshot_notification_timer = 0.0f;
 
     // GPU Timestamp Profiler Breakdown
     double primary_gpu_time_ms = 0.0;

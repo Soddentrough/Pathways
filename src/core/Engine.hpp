@@ -114,6 +114,10 @@ public:
     MultiGpuCoordinator* getMgpuCoordinator() const { return m_mgpuCoordinator.get(); }
     void refreshPciStatus();
 
+    bool saveScreenshot(const std::string& customPath = "");
+    std::string generateScreenshotFilename() const;
+    void requestScreenshot() noexcept { m_pendingScreenshot = true; }
+
 private:
     void initVulkan();
     void initScene();
@@ -378,6 +382,10 @@ private:
 
     // State
     bool m_isMinimized = false;
+    bool m_pendingScreenshot = false;
+    std::future<bool> m_pendingScreenshotFuture;
+    std::string m_lastScreenshotPath = "";
+    float m_screenshotNotificationTimer = 0.0f;
 
     // Input & Interaction Subsystem (Keyboard, Mouse, Gamepad)
     std::unique_ptr<InputController> m_inputController;

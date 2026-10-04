@@ -7,7 +7,7 @@
 
 #include "wavefront_common.glsl"
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 32) in;
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
@@ -56,11 +56,8 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.photonCount) return;
 
-    // Initialize output slot as inactive
+    // Initialize output slot as inactive (only flux.w = 0.0 marks inactive; splat checks flux.w)
     outPhotons[idx].flux = vec4(0.0);
-    outPhotons[idx].positionRoughness = vec4(0.0);
-    outPhotons[idx].normalDist = vec4(0.0);
-    outPhotons[idx].incidentDir = vec4(0.0);
 
     if (pc.numLights == 0u) return;
 
@@ -165,6 +162,11 @@ void main() {
         uint matId = triangles[triIdx].materialId + inst.materialOffset;
         Material mat = materials[matId];
 
+        bool isDielectric = ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);
+        if (!isDielectric && !hasHitDielectric) {
+            break; // Direct hit on non-dielectric receiver without passing through caster; handled by direct light
+        }
+
         mat4x3 hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
         vec3 hitPoint = rayOrigin + rayDir * hitT;
 
@@ -172,8 +174,6 @@ void main() {
         Triangle tri = triangles[triIdx];
         vec3 localNormal = getTriangleNormal(tri, bary);
         vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-
-        bool isDielectric = ((mat.type & 0xFFu) == 2u /* MATERIAL_DIELECTRIC */ || mat.transmission > 0.05f);
 
         if (isDielectric) {
             hasHitDielectric = true;
@@ -209,13 +209,16 @@ void main() {
         } else {
             // Hit a non-dielectric (receiver surface!)
             if (hasHitDielectric && (mat.type & 0xFFu) != 3u /* Not emissive light */) {
+                bool frontFace = dot(rayDir, hitNormal) < 0.0;
+                vec3 receiverNormal = frontFace ? hitNormal : -hitNormal;
+
                 // Successfully formed a caustic path (L -> S+ -> D)!
                 vec3 finalFlux = photonFlux * throughput;
                 float fluxLum = dot(finalFlux, vec3(0.2126, 0.7152, 0.0722));
 
                 if (fluxLum > 1e-7) {
                     outPhotons[idx].positionRoughness = vec4(hitPoint, mat.roughness);
-                    outPhotons[idx].normalDist = vec4(hitNormal, length(hitPoint - lightPos));
+                    outPhotons[idx].normalDist = vec4(receiverNormal, length(hitPoint - lightPos));
                     outPhotons[idx].flux = vec4(finalFlux, 1.0); // 1.0 = valid active hit
                     outPhotons[idx].incidentDir = vec4(rayDir, float(mat.type));
                 }

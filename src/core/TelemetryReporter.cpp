@@ -102,121 +102,9 @@ void TelemetryReporter::dumpOutputFiles() {
 
     // 1. Dump LDR PNG
     if (!m_engine->m_config.dump_frame_path.empty() && m_engine->m_outputImage) {
-        VkFormat outFmt = m_engine->m_outputImage->getFormat();
-        size_t bpp = (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
-        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_engine->m_config.width) * m_engine->m_config.height * bpp;
-        Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                       VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-
-        vkResetCommandBuffer(m_engine->m_commandBuffers[0], 0);
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(m_engine->m_commandBuffers[0], &beginInfo);
-
-        m_engine->m_outputImage->transitionLayout(
-            m_engine->m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
-        );
-
-        VkBufferImageCopy copyRegion{};
-        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.imageSubresource.layerCount = 1;
-        copyRegion.imageExtent = { m_engine->m_config.width, m_engine->m_config.height, 1 };
-
-        vkCmdCopyImageToBuffer(m_engine->m_commandBuffers[0], m_engine->m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
-
-        m_engine->m_outputImage->transitionLayout(
-            m_engine->m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-        );
-
-        vkEndCommandBuffer(m_engine->m_commandBuffers[0]);
-
-        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-        cmdSubmitInfo.commandBuffer = m_engine->m_commandBuffers[0];
-
-        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-        submitInfo.commandBufferInfoCount = 1;
-        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(queue);
-
-        staging.invalidate();
-        if (outFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
-            const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
-            bool isRgb = (outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
-            bool force8bit = m_engine->m_config.dump_8bit_png;
-            if (force8bit) {
-                std::vector<uint8_t> rgba8(static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height * 4);
-                for (size_t p = 0; p < static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height; ++p) {
-                    uint32_t px = src32[p];
-                    uint32_t c0 = (px >> 20) & 0x3FF;
-                    uint32_t c1 = (px >> 10) & 0x3FF;
-                    uint32_t c2 = px & 0x3FF;
-                    uint32_t a2 = (px >> 30) & 0x03;
-                    uint32_t r10 = isRgb ? c0 : c2;
-                    uint32_t g10 = c1;
-                    uint32_t b10 = isRgb ? c2 : c0;
-                    rgba8[p * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
-                    rgba8[p * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
-                    rgba8[p * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
-                    rgba8[p * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
-                }
-                ImageDumper::savePNG(m_engine->m_config.dump_frame_path, m_engine->m_config.width, m_engine->m_config.height, rgba8.data());
-            } else {
-                std::vector<uint16_t> rgba16(static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height * 4);
-                for (size_t p = 0; p < static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height; ++p) {
-                    uint32_t px = src32[p];
-                    uint32_t c0 = (px >> 20) & 0x3FF;
-                    uint32_t c1 = (px >> 10) & 0x3FF;
-                    uint32_t c2 = px & 0x3FF;
-                    uint32_t a2 = (px >> 30) & 0x03;
-                    uint32_t r10 = isRgb ? c0 : c2;
-                    uint32_t g10 = c1;
-                    uint32_t b10 = isRgb ? c2 : c0;
-                    rgba16[p * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
-                    rgba16[p * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
-                    rgba16[p * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
-                    rgba16[p * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
-                }
-                ImageDumper::savePNG16(m_engine->m_config.dump_frame_path, m_engine->m_config.width, m_engine->m_config.height, rgba16.data());
-            }
-            staging.unmap();
-        } else if (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
-            const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
-            bool force8bit = m_engine->m_config.dump_8bit_png;
-            if (force8bit) {
-                std::vector<uint8_t> rgba8(static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height * 4);
-                float invPaperWhite = 80.0f / (m_engine->m_config.hdr_paper_white_nits > 0.0f ? m_engine->m_config.hdr_paper_white_nits : 200.0f);
-                for (size_t p = 0; p < static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height; ++p) {
-                    for (int c = 0; c < 3; ++c) {
-                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
-                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
-                        rgba8[p * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
-                    }
-                    rgba8[p * 4 + 3] = 255;
-                }
-                ImageDumper::savePNG(m_engine->m_config.dump_frame_path, m_engine->m_config.width, m_engine->m_config.height, rgba8.data());
-            } else {
-                std::vector<uint16_t> rgba16(static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height * 4);
-                float invPaperWhite = 80.0f / (m_engine->m_config.hdr_paper_white_nits > 0.0f ? m_engine->m_config.hdr_paper_white_nits : 200.0f);
-                for (size_t p = 0; p < static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height; ++p) {
-                    for (int c = 0; c < 3; ++c) {
-                        float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
-                        float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
-                        rgba16[p * 4 + c] = static_cast<uint16_t>(std::clamp(srgb * 65535.0f + 0.5f, 0.0f, 65535.0f));
-                    }
-                    rgba16[p * 4 + 3] = 65535;
-                }
-                ImageDumper::savePNG16(m_engine->m_config.dump_frame_path, m_engine->m_config.width, m_engine->m_config.height, rgba16.data());
-            }
-            staging.unmap();
-        } else {
-            const uint8_t* pixels = static_cast<const uint8_t*>(staging.map());
-            ImageDumper::savePNG(m_engine->m_config.dump_frame_path, m_engine->m_config.width, m_engine->m_config.height, pixels);
-            staging.unmap();
+        m_engine->saveScreenshot(m_engine->m_config.dump_frame_path);
+        if (m_engine->m_pendingScreenshotFuture.valid()) {
+            m_engine->m_pendingScreenshotFuture.wait();
         }
     }
 
@@ -386,6 +274,8 @@ FrameStats TelemetryReporter::getStats() const {
     stats.accumulation_complete = m_engine->m_accumulationComplete;
     stats.is_animating = m_engine->m_config.animate_objects && (m_engine->m_config.animation_speed > 0.0001f) && !m_engine->m_sceneData.animatedInstances.empty();
     stats.validation_errors = m_engine->m_context->getValidationErrors();
+    stats.last_screenshot_path = m_engine->m_lastScreenshotPath;
+    stats.screenshot_notification_timer = m_engine->m_screenshotNotificationTimer;
 
     stats.is_scene_loading = m_engine->isSceneLoading() || m_engine->m_pendingSceneChange;
     stats.loading_scene_name = m_engine->getLoadingSceneName();

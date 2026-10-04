@@ -195,6 +195,9 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_inputController->setFullscreenToggleCallback([this]() {
         m_pendingToggleFullscreen = true;
     });
+    m_inputController->setScreenshotCallback([this]() {
+        m_pendingScreenshot = true;
+    });
     if (!m_config.headless && m_swapchain) {
         m_inputController->init();
     }
@@ -237,6 +240,9 @@ Engine::Engine(const Config& config) : m_config(config) {
 
 Engine::~Engine() {
     Logger::info("Shutting down Pathways Engine...");
+    if (m_pendingScreenshotFuture.valid()) {
+        m_pendingScreenshotFuture.wait();
+    }
     if (m_hwMonitor) {
         m_hwMonitor->stop();
     }
@@ -1012,6 +1018,9 @@ void Engine::updateFsr3Descriptors() {
 // === REAL-TIME CAUSTICS SUBSYSTEM ===
 
 void Engine::initCaustics() {
+    if (m_causticsPipeline) {
+        return;
+    }
     if (!m_config.enable_caustics) {
         return;
     }
@@ -1047,6 +1056,7 @@ void Engine::initCaustics() {
         );
 
         updateCausticsDescriptors();
+        updateWavefrontSceneDescriptors();
     } catch (const std::exception& e) {
         Logger::warn("CausticsPipeline initialization failed: {}", e.what());
     }
@@ -1669,9 +1679,12 @@ void Engine::renderFrame() {
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && isRestirActive())) flags |= (1 << 7);
-    if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) flags |= (1 << 8);
-    if (isRestirActive()) flags |= (1 << 9);
+    if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
+        if (!m_causticsPipeline) {
+            initCaustics();
+        }
+        flags |= (1 << 8);
+    }
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
@@ -2116,6 +2129,9 @@ void Engine::renderFrame() {
             m_pendingResizeW = guiActions.requestedWidth;
             m_pendingResizeH = guiActions.requestedHeight;
         }
+        if (guiActions.takeScreenshot) {
+            m_pendingScreenshot = true;
+        }
     }
 
     if (hasPostSubmission) {
@@ -2187,6 +2203,19 @@ void Engine::renderFrame() {
     // High-precision frame pacing if target FPS is set
     if (m_presentation) {
         m_presentation->paceFrame(m_config, m_governor.get(), accumReachedCutoff);
+    }
+
+    // Screenshot capture trigger
+    if (m_pendingScreenshot) {
+        m_pendingScreenshot = false;
+        saveScreenshot();
+    }
+
+    if (m_screenshotNotificationTimer > 0.0f) {
+        float dt = (m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0)
+            ? static_cast<float>(m_lastPresentationTimeMs * 0.001)
+            : 0.016f;
+        m_screenshotNotificationTimer = std::max(0.0f, m_screenshotNotificationTimer - dt);
     }
 
     m_frameIndex++;
@@ -2373,6 +2402,212 @@ void Engine::printExecutionSummary() const {
     if (m_telemetryReporter) {
         m_telemetryReporter->printExecutionSummary();
     }
+}
+
+std::string Engine::generateScreenshotFilename() const {
+    std::string sceneSlug;
+    if (!m_config.scene_path.empty() && !SceneManager::isProceduralCornellBoxPath(m_config.scene_path)) {
+        sceneSlug = std::filesystem::path(m_config.scene_path).stem().string();
+    } else {
+        sceneSlug = getActiveSceneName();
+    }
+
+    std::string cleanScene;
+    for (char c : sceneSlug) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            cleanScene += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else if (c == ' ' || c == '-' || c == '_') {
+            if (!cleanScene.empty() && cleanScene.back() != '_') {
+                cleanScene += '_';
+            }
+        }
+    }
+    while (!cleanScene.empty() && cleanScene.back() == '_') {
+        cleanScene.pop_back();
+    }
+    if (cleanScene.empty()) {
+        cleanScene = "scene";
+    }
+
+    uint32_t activeSpp = m_config.spp;
+    uint32_t activeBounces = (m_dynamicWavefrontBounces > 0) ? m_dynamicWavefrontBounces : m_config.max_bounces;
+    if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
+        activeSpp = m_governor->getState().currentSpp;
+        activeBounces = m_governor->getState().currentBounces;
+    }
+
+    uint32_t accumSamples = m_accumulatedSamples;
+    if (accumSamples == 0) {
+        accumSamples = 1;
+    }
+
+    std::time_t now = std::time(nullptr);
+    std::tm tmNow{};
+#ifdef _WIN32
+    localtime_s(&tmNow, &now);
+#else
+    localtime_r(&now, &tmNow);
+#endif
+    char timeBuf[32];
+    std::strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", &tmNow);
+
+    std::string filename = std::format("pw_{}_{}spp_{}bounce_{}accum_{}.png",
+                                       cleanScene, activeSpp, activeBounces, accumSamples, timeBuf);
+    return (std::filesystem::path("screenshots") / filename).string();
+}
+
+bool Engine::saveScreenshot(const std::string& customPath) {
+    if (!m_outputImage || !m_context) {
+        Logger::error("saveScreenshot failed: outputImage or VulkanContext is null");
+        return false;
+    }
+
+    std::string filepath = customPath.empty() ? generateScreenshotFilename() : customPath;
+
+    try {
+        std::filesystem::path p(filepath);
+        if (p.has_parent_path()) {
+            std::filesystem::create_directories(p.parent_path());
+        }
+    } catch (const std::exception& e) {
+        Logger::error("Failed to create directory for screenshot {}: {}", filepath, e.what());
+    }
+
+    VkDevice device = m_context->getDevice();
+    VmaAllocator allocator = m_context->getAllocator();
+    VkQueue queue = m_context->getGraphicsQueue();
+
+    vkDeviceWaitIdle(device);
+
+    VkFormat outFmt = m_outputImage->getFormat();
+    size_t bpp = (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
+    VkDeviceSize bufferSize = static_cast<VkDeviceSize>(m_config.width) * m_config.height * bpp;
+    Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+    vkResetCommandBuffer(m_commandBuffers[0], 0);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(m_commandBuffers[0], &beginInfo);
+
+    m_outputImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
+    );
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageExtent = { m_config.width, m_config.height, 1 };
+
+    vkCmdCopyImageToBuffer(m_commandBuffers[0], m_outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
+
+    m_outputImage->transitionLayout(
+        m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+    );
+
+    vkEndCommandBuffer(m_commandBuffers[0]);
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = m_commandBuffers[0];
+
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    staging.invalidate();
+
+    // Ensure any previously pending background screenshot has completed
+    if (m_pendingScreenshotFuture.valid()) {
+        m_pendingScreenshotFuture.wait();
+    }
+
+    if (outFmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
+        const uint32_t* src32 = static_cast<const uint32_t*>(staging.map());
+        bool isRgb = (outFmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+        bool force8bit = m_config.dump_8bit_png;
+        if (force8bit) {
+            std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                uint32_t px = src32[p];
+                uint32_t c0 = (px >> 20) & 0x3FF;
+                uint32_t c1 = (px >> 10) & 0x3FF;
+                uint32_t c2 = px & 0x3FF;
+                uint32_t a2 = (px >> 30) & 0x03;
+                uint32_t r10 = isRgb ? c0 : c2;
+                uint32_t g10 = c1;
+                uint32_t b10 = isRgb ? c2 : c0;
+                rgba8[p * 4 + 0] = static_cast<uint8_t>((r10 * 255 + 511) / 1023);
+                rgba8[p * 4 + 1] = static_cast<uint8_t>((g10 * 255 + 511) / 1023);
+                rgba8[p * 4 + 2] = static_cast<uint8_t>((b10 * 255 + 511) / 1023);
+                rgba8[p * 4 + 3] = static_cast<uint8_t>((a2 * 255) / 3);
+            }
+            staging.unmap();
+            m_pendingScreenshotFuture = ImageDumper::savePNGAsync(filepath, m_config.width, m_config.height, std::move(rgba8));
+        } else {
+            std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                uint32_t px = src32[p];
+                uint32_t c0 = (px >> 20) & 0x3FF;
+                uint32_t c1 = (px >> 10) & 0x3FF;
+                uint32_t c2 = px & 0x3FF;
+                uint32_t a2 = (px >> 30) & 0x03;
+                uint32_t r10 = isRgb ? c0 : c2;
+                uint32_t g10 = c1;
+                uint32_t b10 = isRgb ? c2 : c0;
+                rgba16[p * 4 + 0] = static_cast<uint16_t>((r10 * 65535 + 511) / 1023);
+                rgba16[p * 4 + 1] = static_cast<uint16_t>((g10 * 65535 + 511) / 1023);
+                rgba16[p * 4 + 2] = static_cast<uint16_t>((b10 * 65535 + 511) / 1023);
+                rgba16[p * 4 + 3] = static_cast<uint16_t>((a2 * 65535 + 1) / 3);
+            }
+            staging.unmap();
+            m_pendingScreenshotFuture = ImageDumper::savePNG16Async(filepath, m_config.width, m_config.height, std::move(rgba16));
+        }
+    } else if (outFmt == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
+        bool force8bit = m_config.dump_8bit_png;
+        float invPaperWhite = 80.0f / (m_config.hdr_paper_white_nits > 0.0f ? m_config.hdr_paper_white_nits : 200.0f);
+        if (force8bit) {
+            std::vector<uint8_t> rgba8(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                for (int c = 0; c < 3; ++c) {
+                    float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                    float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                    rgba8[p * 4 + c] = static_cast<uint8_t>(std::clamp(srgb * 255.0f + 0.5f, 0.0f, 255.0f));
+                }
+                rgba8[p * 4 + 3] = 255;
+            }
+            staging.unmap();
+            m_pendingScreenshotFuture = ImageDumper::savePNGAsync(filepath, m_config.width, m_config.height, std::move(rgba8));
+        } else {
+            std::vector<uint16_t> rgba16(static_cast<size_t>(m_config.width) * m_config.height * 4);
+            for (size_t p = 0; p < static_cast<size_t>(m_config.width) * m_config.height; ++p) {
+                for (int c = 0; c < 3; ++c) {
+                    float val = glm::detail::toFloat32(halfPixels[p * 4 + c]);
+                    float srgb = std::pow(std::clamp(val * invPaperWhite, 0.0f, 1.0f), 1.0f / 2.2f);
+                    rgba16[p * 4 + c] = static_cast<uint16_t>(std::clamp(srgb * 65535.0f + 0.5f, 0.0f, 65535.0f));
+                }
+                rgba16[p * 4 + 3] = 65535;
+            }
+            staging.unmap();
+            m_pendingScreenshotFuture = ImageDumper::savePNG16Async(filepath, m_config.width, m_config.height, std::move(rgba16));
+        }
+    } else {
+        const uint8_t* rawPixels = static_cast<const uint8_t*>(staging.map());
+        std::vector<uint8_t> rgba8(rawPixels, rawPixels + m_config.width * m_config.height * 4);
+        staging.unmap();
+        m_pendingScreenshotFuture = ImageDumper::savePNGAsync(filepath, m_config.width, m_config.height, std::move(rgba8));
+    }
+
+    m_lastScreenshotPath = filepath;
+    m_screenshotNotificationTimer = 3.5f;
+    Logger::info("Screenshot captured and saving asynchronously to: {}", filepath);
+    return true;
 }
 
 

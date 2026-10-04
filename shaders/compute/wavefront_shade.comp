@@ -14,6 +14,7 @@ layout(local_size_x = 32) in;
 layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
+layout(binding = 31, rgba16f) uniform readonly image2D uCausticImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -384,6 +385,27 @@ void main() {
                     bool enableSpecular = (ubo.flags & (1 << 2)) != 0;
                     bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
                     bool enableShadows = (ubo.flags & (1 << 4)) != 0;
+
+                    bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
+                    if (enableCaustics && (mat.type & MATERIAL_TYPE_MASK) != 3u /* !emissive */) {
+                        if (!causticApplied) {
+                            ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                            vec3 causticIrr = imageLoad(uCausticImage, pCoord).rgb;
+                            if (dot(causticIrr, causticIrr) > 1e-8) {
+                                vec3 causticRad = throughput * (diffuseColor * INV_PI) * causticIrr;
+                                if (bounce > 0u) {
+                                    causticRad = clampIndirectRadiance(causticRad, pc.indirectClamp);
+                                }
+                                vec4 prev = imageLoad(uAccumImage, pCoord);
+                                imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, causticRad, seed), prev.a));
+                                causticApplied = true;
+                                if (pc.captureMlData != 0u) {
+                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
+                                    imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), 0.0));
+                                }
+                            }
+                        }
+                    }
 
                     float Fc_V = fresnelSchlick(clamp(dot(V, clearcoatNormal), 0.0, 1.0), 1.5) * clearcoat;
                     float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? clamp(Fc_V, 0.04, 0.95) : 0.0;

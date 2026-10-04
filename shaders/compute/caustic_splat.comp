@@ -49,12 +49,12 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.photonCount) return;
 
-    CausticPhotonHit p = inPhotons[idx];
-    if (p.flux.w <= 0.5) return; // Inactive photon
+    vec4 fluxData = inPhotons[idx].flux;
+    if (fluxData.w <= 0.5) return; // Inactive photon
 
-    vec3 worldPos = p.positionRoughness.xyz;
-    vec3 worldNormal = p.normalDist.xyz;
-    vec3 flux = p.flux.rgb;
+    vec3 worldPos = inPhotons[idx].positionRoughness.xyz;
+    vec3 worldNormal = inPhotons[idx].normalDist.xyz;
+    vec3 flux = fluxData.rgb;
 
     // Project world hit position to camera clip space
     vec4 clip = ubo.unjitteredViewProj * vec4(worldPos, 1.0);
@@ -73,17 +73,19 @@ void main() {
     float gbufDepth = gbuf.w;
     vec3 gbufNormal = gbuf.xyz;
 
-    float photonCamDist = length(worldPos - ubo.position.xyz);
-    float depthDiff = photonCamDist - gbufDepth;
+    vec3 camForward = -ubo.viewInverse[2].xyz;
+    float photonPlanarDepth = max(dot(worldPos - ubo.position.xyz, camForward), 0.0);
+    float depthDiff = photonPlanarDepth - gbufDepth;
 
     // Discard photons that are substantially in front of the visible primary surface
     if (depthDiff < -max(0.05 * gbufDepth, 0.05)) {
         return;
     }
 
+    vec3 viewNormal = normalize(transpose(mat3(ubo.viewInverse)) * worldNormal);
     bool onPrimarySurface = (abs(depthDiff) <= max(0.08 * gbufDepth, 0.15));
     if (onPrimarySurface) {
-        if (dot(gbufNormal, worldNormal) < 0.2) {
+        if (dot(gbufNormal, viewNormal) < 0.2) {
             return; // Normal mismatch on primary surface
         }
     } else {
@@ -91,12 +93,16 @@ void main() {
         if (pc.targetBBoxMin.w < 0.5) return;
         vec3 bMin = pc.targetBBoxMin.xyz - vec3(0.05);
         vec3 bMax = pc.targetBBoxMax.xyz + vec3(0.05);
-        vec3 primaryHitPoint = ubo.position.xyz + normalize(worldPos - ubo.position.xyz) * gbufDepth;
+        vec3 rayDir = normalize(worldPos - ubo.position.xyz);
+        float cosCam = dot(rayDir, camForward);
+        vec3 primaryHitPoint = ubo.position.xyz + rayDir * (gbufDepth / max(cosCam, 1e-4));
         bool primaryInDielectric = all(greaterThanEqual(primaryHitPoint, bMin)) && all(lessThanEqual(primaryHitPoint, bMax));
         if (!primaryInDielectric) {
             return; // Primary surface is an opaque occluder blocking the photon
         }
     }
+
+    float photonCamDist = length(worldPos - ubo.position.xyz);
 
     // Camera ray direction to hit point
     vec3 toCam = normalize(ubo.position.xyz - worldPos);
@@ -116,43 +122,8 @@ void main() {
     uvec3 baseFixed = uvec3(irradiance * 65536.0 + 0.5);
     if ((baseFixed.x | baseFixed.y | baseFixed.z) == 0u) return;
 
-    // Fast path for interior pixels (99%+ of valid photons) with fully unrolled shifts
-    bool isInterior = (pixelCoord.x > 0 && pixelCoord.x < int(pc.width) - 1 &&
-                       pixelCoord.y > 0 && pixelCoord.y < int(pc.height) - 1);
-
-    if (isInterior) {
-        [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
-            uint sy = (dy == 0) ? 1u : 2u;
-            uint rowBase = uint((pixelCoord.y + dy) * int(pc.width) + pixelCoord.x) * 3u;
-
-            [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
-                uint shift = sy + ((dx == 0) ? 1u : 2u);
-                uvec3 fixedIrr = baseFixed >> shift;
-                uint base = rowBase + uint(dx * 3);
-
-                if (fixedIrr.x > 0u) atomicAdd(causticAtomicBuffer[base + 0u], fixedIrr.x);
-                if (fixedIrr.y > 0u) atomicAdd(causticAtomicBuffer[base + 1u], fixedIrr.y);
-                if (fixedIrr.z > 0u) atomicAdd(causticAtomicBuffer[base + 2u], fixedIrr.z);
-            }
-        }
-    } else {
-        // Fallback for screen border pixels
-        for (int dy = -1; dy <= 1; ++dy) {
-            int py = pixelCoord.y + dy;
-            if (py < 0 || py >= int(pc.height)) continue;
-            uint sy = (dy == 0) ? 1u : 2u;
-
-            for (int dx = -1; dx <= 1; ++dx) {
-                int px = pixelCoord.x + dx;
-                if (px < 0 || px >= int(pc.width)) continue;
-                uint shift = sy + ((dx == 0) ? 1u : 2u);
-                uvec3 fixedIrr = baseFixed >> shift;
-                uint base = uint(py * int(pc.width) + px) * 3u;
-
-                if (fixedIrr.x > 0u) atomicAdd(causticAtomicBuffer[base + 0u], fixedIrr.x);
-                if (fixedIrr.y > 0u) atomicAdd(causticAtomicBuffer[base + 1u], fixedIrr.y);
-                if (fixedIrr.z > 0u) atomicAdd(causticAtomicBuffer[base + 2u], fixedIrr.z);
-            }
-        }
-    }
+    uint base = uint(pixelCoord.y * int(pc.width) + pixelCoord.x) * 3u;
+    if (baseFixed.x > 0u) atomicAdd(causticAtomicBuffer[base + 0u], baseFixed.x);
+    if (baseFixed.y > 0u) atomicAdd(causticAtomicBuffer[base + 1u], baseFixed.y);
+    if (baseFixed.z > 0u) atomicAdd(causticAtomicBuffer[base + 2u], baseFixed.z);
 }

@@ -36,18 +36,18 @@ layout(push_constant) uniform PushConstants {
     uint accumulateHistory;
 } pc;
 
-shared vec3 s_rawIrr[20][20];
-shared vec4 s_normDepth[20][20];
+shared vec3 s_rawIrr[18][18];
+shared vec4 s_normDepth[18][18];
 
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - 2;
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16 - 1;
     uint tid = gl_LocalInvocationIndex;
 
-    // 1. Cooperative LDS tile load with 2-pixel apron (400 elements loaded across 256 threads)
-    for (uint i = tid; i < 400u; i += 256u) {
-        int ly = int(i / 20u);
-        int lx = int(i % 20u);
+    // 1. Cooperative LDS tile load with 1-pixel apron (324 elements loaded across 256 threads)
+    for (uint i = tid; i < 324u; i += 256u) {
+        int ly = int(i / 18u);
+        int lx = int(i % 18u);
         ivec2 gCoord = clamp(tileOrigin + ivec2(lx, ly), ivec2(0), ivec2(pc.width - 1u, pc.height - 1u));
 
         uint gIdx = uint(gCoord.y * int(pc.width) + gCoord.x);
@@ -62,8 +62,8 @@ void main() {
 
     if (pixelCoord.x >= int(pc.width) || pixelCoord.y >= int(pc.height)) return;
 
-    int smX = int(gl_LocalInvocationID.x) + 2;
-    int smY = int(gl_LocalInvocationID.y) + 2;
+    int smX = int(gl_LocalInvocationID.x) + 1;
+    int smY = int(gl_LocalInvocationID.y) + 1;
 
     vec4 centerGbuf = s_normDepth[smY][smX];
     vec3 centerNorm = centerGbuf.xyz;
@@ -76,8 +76,34 @@ void main() {
         return;
     }
 
-    // Raw caustic irradiance without heuristic 5x5 cross-bilateral filter
-    vec3 spatialFiltered = centerRawIrr;
+    // 2. Cross-bilateral 3x3 tent filter (separable weights [0.25, 0.5, 0.25])
+    const float kWeights[3] = float[3](0.25, 0.5, 0.25);
+    vec3 spatialFiltered = vec3(0.0);
+    float totalWeight = 0.0;
+
+    [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+        float wy = kWeights[dy + 1];
+        [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+            float wx = kWeights[dx + 1];
+            float w = wx * wy;
+
+            vec4 sampleGbuf = s_normDepth[smY + dy][smX + dx];
+            float sampleDepth = sampleGbuf.w;
+            vec3 sampleNorm = sampleGbuf.xyz;
+
+            float depthDiff = abs(sampleDepth - centerDepth) / max(centerDepth, 0.01);
+            float normDiff = dot(sampleNorm, centerNorm);
+            if (depthDiff < 0.1 && normDiff > 0.7) {
+                spatialFiltered += s_rawIrr[smY + dy][smX + dx] * w;
+                totalWeight += w;
+            }
+        }
+    }
+    if (totalWeight > 1e-4) {
+        spatialFiltered /= totalWeight;
+    } else {
+        spatialFiltered = centerRawIrr;
+    }
 
     // 2. Motion-Vector Guided Temporal Accumulation
     vec3 finalIrr = spatialFiltered;
