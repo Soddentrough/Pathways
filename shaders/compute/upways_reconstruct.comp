@@ -165,7 +165,10 @@ vec4 sampleAccumBilinear(vec2 inCoordF, ivec2 maxCoord) {
 }
 
 void main() {
-    uint pixelBase = gl_WorkGroupID.x * TILE_M;
+    // The host dispatches a 2D grid (ceil(outW/TILE_M) x ceil(outH/TILE_M));
+    // flatten it to a 1D row-major pixel base so every output pixel is covered.
+    uint gridX = uint((pc.outputWidth + TILE_M - 1u) / TILE_M);
+    uint pixelBase = (gl_WorkGroupID.y * gridX + gl_WorkGroupID.x) * TILE_M;
     uint totalPixels = uint(pc.outputWidth * pc.outputHeight);
     if (pixelBase >= totalPixels) return;
 

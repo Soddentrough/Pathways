@@ -125,6 +125,7 @@ struct Material {
     vec2 diffuseTransPad;
 };
 
+// 128-byte record: one RDNA 4 vector cache line per light (no straddling fetches)
 struct Light {
     vec4 position; // xyz: pos/corner, w: type
     vec4 emission; // rgb: color, w: area
@@ -132,6 +133,8 @@ struct Light {
     vec4 v;        // xyz: edge2, w: spot outer cos
     vec4 normal;   // xyz: normal/dir, w: padding
     vec4 sampling; // x: q, y: aliasIdx, z: pdf, w: flux
+    vec4 pad0;    // cache-line padding (128 bytes total)
+    vec4 pad1;    // cache-line padding (128 bytes total)
 };
 
 layout(binding = 1) uniform CameraUBO {

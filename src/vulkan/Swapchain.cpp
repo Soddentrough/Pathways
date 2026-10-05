@@ -307,8 +307,12 @@ Swapchain::~Swapchain() {
     }
 }
 
+// Bounded acquire timeout: a wedged GPU or stuck compositor must not hang the
+// process forever. VK_TIMEOUT propagates to the caller, which skips the frame.
+static constexpr uint64_t kAcquireTimeoutNs = 10'000'000'000ull; // 10 s
+
 VkResult Swapchain::acquireNextImage(VkSemaphore presentCompleteSemaphore, uint32_t* imageIndex) {
-    return vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX, presentCompleteSemaphore, VK_NULL_HANDLE, imageIndex);
+    return vkAcquireNextImageKHR(m_device, m_swapchain, kAcquireTimeoutNs, presentCompleteSemaphore, VK_NULL_HANDLE, imageIndex);
 }
 
 VkResult Swapchain::queuePresent(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore) {

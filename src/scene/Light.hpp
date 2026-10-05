@@ -15,14 +15,20 @@ enum LightType : uint32_t {
     LIGHT_DIRECTIONAL = 2
 };
 
+// 128-byte record: exactly one RDNA 4 vector cache line per light, so
+// lights[i] fetches in the NEE loops never straddle a cache-line boundary
+// (the legacy 96-byte layout made every other fetch span two lines).
 struct LightGPU {
     glm::vec4 position; // xyz: corner or position, w: type
     glm::vec4 emission; // rgb: color * intensity, w: area
     glm::vec4 u;        // xyz: edge vector 1, w: spot inner angle cos
     glm::vec4 v;        // xyz: edge vector 2, w: spot outer angle cos
     glm::vec4 normal;   // xyz: normal or direction, w: padding
-    glm::vec4 sampling; // x: q (threshold), y: uintBitsToFloat(aliasIdx), z: discretePdf, w: flux (96 bytes total)
+    glm::vec4 sampling; // x: q (threshold), y: uintBitsToFloat(aliasIdx), z: discretePdf, w: flux
+    glm::vec4 pad0{};   // cache-line padding (128 B total)
+    glm::vec4 pad1{};   // cache-line padding (128 B total)
 };
+static_assert(sizeof(LightGPU) == 128, "LightGPU must be exactly 128 bytes (one RDNA4 vector cache line)");
 
 inline float calculateLightFlux(const LightGPU& light) {
     float lum = 0.2126f * light.emission.r + 0.7152f * light.emission.g + 0.0722f * light.emission.b;

@@ -15,9 +15,9 @@
 However:
 
 - **The documentation has drifted significantly from the code** (README/ARCHITECTURE still describe a 128-byte triangle record that is now 64 bytes, wrong CLI defaults, a removed `staging` transfer mode).
-- **One critical multi-GPU architectural risk remains unaddressed**: shader-driven non-posted PCIe reads are now the *default* P2P path (the exact pattern the prior review flagged as a bandwidth collapse).
 - **The NRC subsystem still does not do what its name promises** (trains on direct light only, 32 samples/frame).
 - There is a meaningful tail of dead code, magic numbers, and test-harness gaps.
+- Notably, the prior review's CRIT-03 (P2P non-posted read collapse) was **a misread**: the P2P transfer has already used the recommended push-DMA model (secondary writes into primary VRAM) since v1.11.0. Verified in Section 3 / VERIF-A1.
 
 ---
 
@@ -43,7 +43,7 @@ The one misalignment: the README claims the engine "functions on any compliant V
 |---|---|---|
 | CRIT-01 | DGC indirect stride 12B vs 16B | ✅ **Fixed** (`DGCManager.cpp:46,79` — 16B, verified) |
 | CRIT-02 | `dgc_compact.comp` workgroup race | ✅ **Fixed** (atomic retirement counter, verified) |
-| CRIT-03 | P2P non-posted PCIe read collapse | ❌ **Still open — and now the default path** (see Critical A1) |
+| CRIT-03 | P2P non-posted PCIe read collapse | ✅ **Fixed (prior review misread the code)** — the P2P buffer has been allocated in *primary* VRAM with the secondary importing it since v1.11.0 (`1ebc186`); the secondary's `vkCmdCopyImageToBuffer` is a posted DMA write and the primary merges from local GDDR6. Verified at the Sept 27 review commit (`62f3275`) and current HEAD. See VERIF-A1. |
 | CRIT-04 | Windows multi-GPU 100% failure | ✅ **Fixed** (`VK_KHR_external_semaphore_win32` timeline semaphores, verified) |
 | CRIT-05 | Per-BLAS `vkQueueWaitIdle` | ✅ **Mostly fixed** (`buildBLASBatch` used everywhere; one `vkQueueWaitIdle` remains at `AccelerationStructure.cpp:105` but now drains once per batch) |
 | CRIT-06 | NRC WG0-only Adam updates | ⚠️ **Mitigated by design** — training now dispatches exactly 1 workgroup, so the gate is harmless, but effective batch is 32 samples/frame |
@@ -67,14 +67,17 @@ The one misalignment: the README claims the engine "functions on any compliant V
 
 ### A. Critical Bugs & Architectural Risks
 
-#### A1. Multi-GPU P2P default is the pattern the last review flagged as a bandwidth collapse (CRIT-03, reopened by design choice)
+#### VERIF-A1. Multi-GPU P2P transfer is already the push model (prior review CRIT-03 was a misread) — VERIFIED, NO ACTION
 
-- `Config.hpp:178`: default transfer mode is now `P2P` (auto-fallback to host zero-copy only on small-BAR ≤256 MB systems).
-- Flow: secondary GPU `vkCmdCopyImageToBuffer` → its own device-local P2P BAR buffer (`MultiGpuManager.cpp:2098`) → **primary GPU's `accum_merge.comp` shader reads that remote BAR over PCIe** (non-posted reads).
-- The prior review quantified this: RDNA SIMDs cannot hide ~1–2 µs PCIe round-trips; effective throughput collapses from ~28 GB/s to 2–5 GB/s, i.e. a 4K merge (63–165 MB) costs **35–80 ms** in the worst case. MGPU.md acknowledges the problem class and targets ≥1.90× scaling, and benchmarks show 1.72–1.99× — but those numbers are the reason to fix this, not to accept it: the merge pass is on the critical path of every frame in the default configuration on any ReBAR system (which is all modern RDNA4 boards).
-- **Fix (recommended, not yet done):** invert to push. Primary allocates the merge-destination buffer in *its own* GDDR6 and exports the DMA-BUF; secondary imports it and issues `vkCmdCopyImageToBuffer`/`vkCmdCopyBuffer` into it (posted PCIe writes at line rate, no completion round-trips); primary merges from local VRAM at 640 GB/s. All DMA-BUF import/export plumbing already exists — this is a buffer-ownership inversion, not a rewrite. Keep P2P-read as a `--mgpu-transfer p2p` diagnostic.
-- Secondary benefit: eliminates the `VK_ACCESS_2_HOST_WRITE_BIT`/transfer barrier coupling in `MultiGpuCoordinator::recordMergePass`.
-- **Interim mitigation:** re-default to host zero-copy until the inversion lands.
+The September 27 review's CRIT-03 claimed the primary GPU's merge shader reads the *secondary's* BAR over PCIe (non-posted reads). That is not what the code does — and it was not what the code did at the time of the review either (verified against commit `62f3275`):
+
+- `MultiGpuManager::initSharedP2PBuffer` creates the buffer on **Device 0 (primary)**, allocates **primary device-local** memory, and exports the DMA-BUF FD; the **secondary imports** it (`m_p2pBufferSecondary` is a secondary-device buffer bound to primary VRAM). This has been the case since the first P2P implementation (`1ebc186`, v1.11.0).
+- Per frame, the secondary issues `vkCmdCopyImageToBuffer` into `m_p2pBufferSecondary` (`MultiGpuManager.cpp:2098`) — a **posted PCIe DMA write** at bus line rate, no completion round-trips.
+- The primary's merge descriptor binds `getPrimarySharedBuffer(slot)` = `m_p2pBufferPrimary` (`EngineDescriptorManager::updateMergeDescriptors`), i.e. **local GDDR6** — the merge shader reads at full local bandwidth.
+
+This is exactly the push-DMA inversion the prior review recommended. **No code change required.** Residual notes:
+- Host zero-copy mode (small-BAR fallback) still has the primary reading system RAM over PCIe; acceptable, and optimal on UMA. Documented in MGPU.md.
+- The remaining multi-GPU headroom is **dynamic work-stealing tile assignment** (see C2), not the transfer topology.
 
 #### A2. NRC (`--nrc`) does not implement Neural Radiance Caching — it is a direct-light cache with a 32-sample optimizer
 
@@ -86,9 +89,13 @@ The one misalignment: the README claims the engine "functions on any compliant V
 
 **Recommendation:** NRC is correctly disabled by default, but as it stands `--nrc` is a research stub that *regresses* frame time (own eval: +2.22 ms at 4K). Either (a) implement the NRC.md Option-1/Option-2 fix + B5 training topology + 32B records, or (b) relabel it in CLI help as "experimental direct-light cache" so the label matches the function. Budget (a) as a 2–3 week focused effort; it is the highest-value research feature on the roadmap.
 
-#### A3. `upways_reconstruct.comp` is a live landmine: 2D dispatch vs 1D shader indexing (CRIT-09)
+#### A3. `upways_reconstruct.comp` fallback is out of sync with the pipeline — dispatch fixed, feature stays disabled (scope decision)
 
-`UpwaysPipeline.cpp:594-596` dispatches `(groupsX, groupsY, 1)` but the shader computes `pixelBase = gl_WorkGroupID.x * TILE_M`, ignoring `gl_WorkGroupID.y`. At 1080p only the first 1,920 pixels render; the rest is black. It is dormant today because `SuperResolutionManager.cpp:74-77` prefers `neural_reconstruct.comp.spv` (always built), but any environment where that file is missing silently produces a 99.9%-black image instead of an error. **Fix the indexing or delete the file** (566 lines of superseded code; `neural_reconstruct.comp` replaced it).
+`UpwaysPipeline.cpp:594-596` dispatches `(groupsX, groupsY, 1)` but the shader computed `pixelBase = gl_WorkGroupID.x * TILE_M`, ignoring `gl_WorkGroupID.y`. At 1080p only the first 1,920 pixels would render; the rest would be black. **Fixed in this review cycle** (row-major 2D→1D mapping).
+
+**Verified by execution** (zero-byte `neural_reconstruct.comp.spv` to force the fallback): the fallback is also out of sync at the descriptor level — bindings 7/8/9/12 declare `image2D` where the pipeline layout provides `sampler2D` (and vice versa), producing `VkDescriptorType mismatch` validation errors and undefined reads. The single-pass kernel predates the two-pass WMMA reconstructor's input rework (demodulated streams, ReSTIR metadata) and was never updated.
+
+**Scope decision (project owner, Oct 5):** Upways/super-resolution is **not** in the quick-fix bracket and remains disabled — it is already off by default (`upscaler_mode = None`, `upways_superres = false`, `denoiser_mode = None`, `Config.hpp:147-150`). No further Upways work this cycle; when the feature is revived, the fallback should be deleted or brought fully in sync (descriptor layout + inputs), not just the dispatch.
 
 #### A4. DGC hard-requirement contradicts documented compatibility
 
@@ -109,11 +116,13 @@ The one misalignment: the README claims the engine "functions on any compliant V
 9. **No LTO / no math-errno flags:** `CMAKE_INTERPROCEDURAL_OPTIMIZATION` is unset; `-fno-math-errno -fno-trapping-math` absent. The CPU side (scene loading, telemetry, governance) is small but these are free.
 10. **CLI parser:** `Config.cpp` is still a 1,553-line if/else ladder with 89 branches; unknown arguments only `Logger::warn` (line 1491) and execution continues — a CI typo like `--scaler fsr3 quality` vs `--scaler fsr quality` silently renders the wrong thing. Exit non-zero on unknown args (behind a `--strict-args` if needed), and consider a table-driven parser.
 11. **CMake machine-specific hardcoding (OpenUSD section):** `/usr/lib64/libtbb.so.2`, `/usr/lib/python3.14/site-packages/materialx`, `C:/Users/naoki/Development/USD`, `rav1e|svt-av1|libvmaf` regex filters. This works on the author's box and is fragile everywhere else — including CI (which builds without USD). Move to proper `find_package` hints + an `USD_ROOT` cache var, and drop the per-target `IMPORTED_LOCATION` surgery.
-12. **Descriptor inflation:** 11 `VkDescriptorPool`s and `EngineDescriptorManager.cpp:237-255` still writes **512** combined-image descriptors (padding with `m_dummyWhite`) on every scene update, even though `descriptorBindingVariableDescriptorCount` is enabled and the shader uses `nonuniformEXT` indexing. Write only `m_sceneTextures.size()` entries.
+12. **Descriptor inflation — investigated, NOT fixable via variable descriptor count (verified this cycle):** `EngineDescriptorManager.cpp:237-255` writes **512** combined-image descriptors (padding with `m_dummyWhite`) on every scene update. I implemented the variable-descriptor-count path (binding moved to last/highest index, `VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT` via `VkDescriptorSetLayoutBindingFlagsCreateInfo`, `VkDescriptorSetVariableDescriptorCountAllocateInfo` on all 4 layouts, writes trimmed to `m_sceneTextures.size()`) and proved by execution that the Vulkan validation layer **requires all 512 written anyway**: the shaders index the array with `nonuniformEXT`, and per the spec's *descriptor validity* rules a non-constant index means the **entire array is considered accessed** (VUID 08114). Empirically, writing N descriptors moved the "index N never updated" error to index N+1. So the 512-dummy design is the correct one under the validation layer; the feature only pays off for constant-indexed or descriptor-buffer pipelines. **Reverted.** Residual (small) option: lower `MAX_SCENE_TEXTURES` (512 → 128) if real scenes never exceed it — saves 75% of the dummy writes, but is a policy decision, not a bug fix.
 13. **`Light` struct is 96 bytes** (`wavefront_common.glsl:149-156`) — 1.5 cache lines per pair; every other light fetch straddles a 128B boundary. Pad to 128B (a `padding` w-component can absorb it) or repack to 64B.
 14. **NRC buffers** still `VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT` with `PREFER_DEVICE` (`NRCManager.cpp:65-85`) — mixed-usage allocations that force slower memory types on some drivers; nothing on the CPU reads them.
-15. **Test-harness machine residue:** `run_headless_tests.sh` probes `/opt/rocm/core-10.0/bin/amd-smi` and `/home/naoki/.local/bin/amd-smi`, and comments say "limiting threads for Threadripper 3750X" while the dev host is now Strix Halo. Parameterize (`-j$(nproc)`, `command -v amd-smi`).
-16. **Visual regression coverage gap (CRIT-11 remainder):** 16 configs, but `run_headless_tests.sh` renders only ~10 of them. `infinity_1spp_raw`, `upways_infinity_1080p`, `upways_2x_infinity_1080p`, `cornell_upways_1080p`, `classroom_4k_*` will "file not found" → `--strict` exit 1 on a clean checkout. Pass `--render` (the flag exists and now works with `--binary`) or add the missing renders.
+15. **Test-harness machine residue** — ✅ **Fixed this cycle:** `run_headless_tests.sh` now locates `amd-smi` via `command -v` then version-agnostic `/opt/rocm/*/bin/amd-smi` (no hardcoded user/ROCm paths), and builds with `-j$(nproc)` (removed the stale "Threadripper 3750X / -j16" comment).
+16. **Visual regression coverage gap (CRIT-11 remainder)** — ✅ **Fixed this cycle:** the harness invocation now passes `--render`, so all 16 tracked configs are rendered by the regression engine itself with the current binary before comparison — no config depends on a render left behind by an earlier step, and a clean checkout no longer "file not found"s.
+    - **Stale-baseline finding (this cycle):** the Sept 27 golden references predate the **64-byte triangle format migration** (octahedral normals + half-float UVs, landed in `ff7daa9` Oct 4). That migration changed the classroom floor from an over-bright blue to the correct darker look (confirmed by the project owner as the expected output; A/B verified the review's own quick-win changes are visually neutral, mean 68.36 vs 68.33). The baselines were therefore **re-cut from the current engine**.
+    - **Upways gating (owner decision, Option C):** the 3 Upways configs (`upways_infinity_1080p`, `cornell_upways_1080p`, `upways_2x_infinity_1080p`) are marked `"experimental": True` in `visual_regression_test.py`; their failures print as `[EXPERIMENTAL - NOT GATED]` and do **not** trip `--strict` while the feature is disabled/not-yet-working. The `infinity_1spp_raw` pure-MC config remains strict.
 17. **Windows test parity:** `run_headless_tests.ps1` (167 lines) still omits CTest scene switching, the mgpu suites, and all visual regression. The CI commit `c2e0a51` skips GPU perf/visual suites in CI entirely, so the *only* place these run is the local Linux box — the Windows regression surface is effectively untested.
 18. **Root-directory clutter:** 26 `pathways_telemetry_*.json` files, a 3.4 MB `user_repro_upways_sr.png`, `test_stats.json` — all gitignored, but they are artifacts that belong in `output/` (already gitignored) or should be deleted.
 
@@ -121,16 +130,15 @@ The one misalignment: the README claims the engine "functions on any compliant V
 
 ### C. Performance Optimizations
 
-1. **Push-DMA multi-GPU merge (A1)** — the single highest-value perf item; unblocks full 1.9×+ on ReBAR systems and removes the merge from the latency-critical read path.
-2. **Dynamic work-stealing tile assignment.** Checkerboard parity is static 50/50 (`MultiGpuCoordinator::planAndLaunchSecondary`). Path-tracing cost varies ~50× between sky and caustic pixels. A shared atomic tile counter (in the host-zero-copy buffer, which both GPUs already map) letting each GPU pull the next 64×64 tile would convert load imbalance into free scaling — MGPU.md names this as the goal architecture; it is unimplemented.
-3. **Descriptor buffers (`VK_EXT_descriptor_buffer`).** 11 pools, 26+ `vkUpdateDescriptorSets` calls per frame, and even/odd descriptor-set ping-pong (`WavefrontPipeline.cpp:820`). RADV supports DB; migrating the wavefront set (36 bindings, 24 of them storage buffers) to a device-written descriptor buffer eliminates the CPU update cost *and* the ping-pong, and is the right RDNA5 posture (prior review FEAT-04; missing from TODO.md — add it).
-4. **Push descriptors for post-processing.** `features14.pushDescriptor` is enabled but unused. `tonemap_aces`, `fsr3_*`, `accum_*` are single-image/buffer passes — trivial `vkCmdPushDescriptorSet` candidates that delete 3–4 pools.
-5. **`Light` repack (B13)** — ~12–18% fewer cache-line fetches in every NEE loop; cheap win.
-6. **UMA (Strix Halo) batch sizing is now correct** (207,360 px, `RayTracingOrchestrator::getTargetBatchPixels`) — good. Verify the discrete tiers (1.5M/2M/8.29M by VRAM) against SPM data; the README still claims "2.0M on APU, 1.0M on discrete," which matches neither the code nor the 74.3%-VRAM-reduction report.
-7. **Ray payload is 64B** (4×vec4). `throughput` and `radiance` are the two candidates for FP16 packing (FP16 accumulation and R11G11B10 transfer already exist); that would take the hot SoA queues to 48B/ray — the UMA isolation study measured exactly this. Worth an A/B on gfx1151 where the bus is the bottleneck.
-8. **NRC 32B records + wave-cooperative compaction** (NRC.md B4) — only matters if NRC is revived, but it is specified and should be done as part of A2.
-9. **Adaptive epsilon (B6)** — correctness-adjacent perf (fewer fireflies → less clamping → fewer wasted samples).
-10. **Profiling:** excellent per-bounce GPU timestamps, SPM scripts, RGP/RADV integration. The one gap: no continuous CPU-side frame-pipeline breakdown (command recording time vs submit vs wait). A `PATHWAYS_PROFILE_CPU=1` mode with scoped timers would close the loop.
+1. **Dynamic work-stealing tile assignment.** (The push-DMA merge already exists — VERIF-A1 — so tile balance is the remaining multi-GPU headroom.) Checkerboard parity is static 50/50 (`MultiGpuCoordinator::planAndLaunchSecondary`). Path-tracing cost varies ~50× between sky and caustic pixels. A shared atomic tile counter (in the host-zero-copy buffer, which both GPUs already map) letting each GPU pull the next 64×64 tile would convert load imbalance into free scaling — MGPU.md names this as the goal architecture; it is unimplemented.
+2. **Descriptor buffers (`VK_EXT_descriptor_buffer`).** 11 pools, 26+ `vkUpdateDescriptorSets` calls per frame, and even/odd descriptor-set ping-pong (`WavefrontPipeline.cpp:820`). RADV supports DB; migrating the wavefront set (36 bindings, 24 of them storage buffers) to a device-written descriptor buffer eliminates the CPU update cost *and* the ping-pong, and is the right RDNA5 posture (prior review FEAT-04; missing from TODO.md — add it).
+3. **Push descriptors for post-processing.** `features14.pushDescriptor` is enabled but unused. `tonemap_aces`, `fsr3_*`, `accum_*` are single-image/buffer passes — trivial `vkCmdPushDescriptorSet` candidates that delete 3–4 pools.
+4. **`Light` repack (B13)** — ✅ **done in this review cycle** (96B → 128B, one cache line per light).
+5. **UMA (Strix Halo) batch sizing is now correct** (207,360 px, `RayTracingOrchestrator::getTargetBatchPixels`) — good. Verify the discrete tiers (1.5M/2M/8.29M by VRAM) against SPM data; the README still claims "2.0M on APU, 1.0M on discrete," which matches neither the code nor the 74.3%-VRAM-reduction report.
+6. **Ray payload is 64B** (4×vec4). `throughput` and `radiance` are the two candidates for FP16 packing (FP16 accumulation and R11G11B10 transfer already exist); that would take the hot SoA queues to 48B/ray — the UMA isolation study measured exactly this. Worth an A/B on gfx1151 where the bus is the bottleneck.
+7. **NRC 32B records + wave-cooperative compaction** (NRC.md B4) — only matters if NRC is revived, but it is specified and should be done as part of A2.
+8. **Adaptive epsilon (B6)** — correctness-adjacent perf (fewer fireflies → less clamping → fewer wasted samples).
+9. **Profiling:** excellent per-bounce GPU timestamps, SPM scripts, RGP/RADV integration. The one gap: no continuous CPU-side frame-pipeline breakdown (command recording time vs submit vs wait). A `PATHWAYS_PROFILE_CPU=1` mode with scoped timers would close the loop.
 
 ---
 
@@ -160,19 +168,20 @@ The one misalignment: the README claims the engine "functions on any compliant V
 
 The weakest area. Specific mismatches found:
 
-| Location | Docs say | Code says |
-|---|---|---|
-| README:103, ARCHITECTURE.md:227-240 | `TriangleShadeGPU` = 128B (7×vec4) | 64B, oct32/half2 packed (`static_assert` in `ProceduralScene.hpp:80`) |
-| README CLI table | `--mgpu-transfer` default `host`; `staging` valid | default `P2P` w/ auto-fallback; `staging` **throws** (`Config.cpp:671`) |
-| README CLI table | `--wavefront-sort` default `dual` | default `Auto` (`Config.hpp:70`) |
-| README CLI table | `--sec-sort` default `none` | default `DirectCoherent` (Xiang 2023) (`Config.hpp:75`) |
-| README §1 | "2.0M pixels on APU/UMA, 1.0M on discrete" | 207,360 APU; 1.5M/2M/8.29M discrete by VRAM (`RayTracingOrchestrator.cpp:157-176`) |
-| README Requirements | "functions on any compliant Vulkan 1.4 driver" | DGC is fatal-required (`VulkanContext.cpp:587`) |
-| README §1 | DGC Execution Sets "fully supported via --dgc-execset" | experimental; RADV fails pipeline switching (documented in `--help` text itself) |
-| CLI help | `--nrc` "Neural Radiance Caching" | direct-light-only cache, 32-sample optimizer (per own eval doc) |
-| `docs/README.md` index | lists `strix_halo_*`, `uma_*` reports | ✅ exist — good |
+| Location | Docs say | Code says | Status |
+|---|---|---|---|
+| README:103, ARCHITECTURE.md:227-240 | `TriangleShadeGPU` = 128B (7×vec4) | 64B, oct32/half2 packed (`static_assert` in `ProceduralScene.hpp:80`) | ✅ **Fixed this cycle** (README §1 bullet + ARCHITECTURE §8.1 rewritten to the real 64B oct32/half2 layout) |
+| README CLI table | `--mgpu-transfer` default `host`; `staging` valid | default `P2P` w/ auto-fallback; `staging` **throws** (`Config.cpp:671`) | ✅ **Fixed this cycle** (options `host\|p2p`, default `p2p`, `staging` documented as removed/hard-error) |
+| README CLI table | `--wavefront-sort` default `dual` | default `Auto` (`Config.hpp:70`) | ✅ **Fixed this cycle** (`auto` default, all four modes listed) |
+| README CLI table | `--sec-sort` default `none` | default `DirectCoherent` (Xiang 2023) (`Config.hpp:75`) | ✅ **Fixed this cycle** (`direct` default, all four modes listed) |
+| README §1 | "2.0M pixels on APU/UMA, 1.0M on discrete" | 207,360 APU; 1.5M/2M/8.29M discrete by VRAM (`RayTracingOrchestrator.cpp:157-176`) | ✅ **Fixed this cycle** |
+| README Requirements | "functions on any compliant Vulkan 1.4 driver" | DGC is fatal-required (`VulkanContext.cpp:587`) | ✅ **Fixed this cycle** (DGC requirement stated explicitly) |
+| README §1 | DGC Execution Sets "fully supported via --dgc-execset" | experimental; RADV fails pipeline switching (documented in `--help` text itself) | ✅ **Fixed this cycle** (marked experimental) |
+| CLI help | `--nrc` "Neural Radiance Caching" | direct-light-only cache, 32-sample optimizer (per own eval doc) | ✅ **Fixed this cycle** (README CLI table + ARCHITECTURE binding table now say "direct-light caching") |
+| README §2 / ARCHITECTURE §4 | host zero-copy presented as the default transfer mode | P2P push-DMA is the default; host is fallback/UMA | ✅ **Fixed this cycle** (sections reordered + push-DMA dataflow described accurately) |
+| `docs/README.md` index | lists `strix_halo_*`, `uma_*` reports | ✅ exist — good | ✅ |
 
-**Recommendation:** a single doc-sync pass (~half a day) against the current CLI defaults and struct sizes. The benchmark tables in the README are the project's marketing surface; stale architecture claims next to fresh numbers undermine the credible ones.
+**Doc-sync pass completed this cycle** against the current CLI defaults, struct sizes, and transfer-mode behavior. Remaining: the README benchmark tables should be re-measured on the target hardware after the Light 128B change lands (numbers are from the 96B layout).
 
 ## 7. Test Suite Assessment
 
@@ -192,13 +201,13 @@ The weakest area. Specific mismatches found:
 
 **Quick wins (days):**
 
-1. Invert MGPU P2P to push-DMA posted writes (A1) — or at minimum re-default to host zero-copy until it is done.
-2. Delete or fix `upways_reconstruct.comp` (A3); delete `wavefront_persistent.comp`/`raytrace_comp.comp` or promote to a tracked experiment (B2).
-3. Shader version cleanup: 8× `#version 450` → `460`, drop `core` (B1).
-4. Doc-sync pass for the §6 table.
-5. `--render` (or explicit renders) in `run_headless_tests.sh` for the 6 missing visual-regression configs (B16); parameterize amd-smi paths / `-j` (B15).
-6. Bounded timeouts replacing `UINT64_MAX` (B7); explicit `secPitch` push-constant member (B5).
-7. Variable-descriptor-count for scene textures (B12); `Light` → 128B (B13).
+1. ~~Invert MGPU P2P to push-DMA~~ — **verified already implemented** (VERIF-A1); no action.
+2. ✅ `upways_reconstruct.comp` dispatch fixed (A3) — Upways itself stays disabled per scope decision; ✅ `wavefront_persistent.comp`/`raytrace_comp.comp` deleted (B2).
+3. ✅ Shader version cleanup: 8× `#version 450` → `460`, dropped invalid `core` qualifier (B1).
+4. ✅ Doc-sync pass for the §6 table (README + ARCHITECTURE: 64B triangle, transfer-mode defaults, `staging` removed, DGC requirement, NRC label, batch budgets, sort defaults, execset status).
+5. ✅ `--render` in `run_headless_tests.sh` (B16); parameterized amd-smi / `-j$(nproc)` (B15); stale baselines re-cut; Upways configs gated experimental.
+6. ✅ Bounded timeouts replacing `UINT64_MAX` (B7); explicit `secPitch`/`mergeGbuffers` push-constant members (B5).
+7. `Light` → 128B (B13) ✅; variable-descriptor-count for scene textures (B12) — **investigated & reverted**: VVL requires all 512 written for `nonuniformEXT`-indexed arrays (see §B12).
 
 **Medium term (weeks):**
 
@@ -223,4 +232,4 @@ The weakest area. Specific mismatches found:
 
 ### Bottom line
 
-Pathways is in strong shape: the critical bugs from the last review are fixed, the engine decomposition improved maintainability without breaking the test suite, and the core wavefront/DGC/multi-GPU design is genuinely state-of-the-art for its hardware targets. The two things that most need attention are **(1) the P2P merge dataflow — the project's default configuration is the exact PCIe-read pattern its own prior analysis flagged as catastrophic, and the fix is a buffer-ownership inversion the existing plumbing is 90% of the way to** — and **(2) documentation/label integrity**, where the README still describes a 128-byte triangle layout, a `staging` mode that throws, and defaults that no longer match the code. Everything else is well-ordered incremental work, and the project's own docs (NRC.md, MGPU.md, TODO.md) already specify most of the right answers.
+Pathways is in strong shape: the critical bugs from the last review are fixed (including CRIT-03, which this review verified was a misread of an already-correct push-DMA design), the engine decomposition improved maintainability without breaking the test suite, and the core wavefront/DGC/multi-GPU design is genuinely state-of-the-art for its hardware targets. The two things that most need attention are **(1) the NRC gap between name and implementation** (direct-light-only supervision, 32-sample optimizer) and **(2) documentation/label integrity**, where the README still describes a 128-byte triangle layout, a `staging` mode that throws, and defaults that no longer match the code. Everything else is well-ordered incremental work, and the project's own docs (NRC.md, MGPU.md, TODO.md) already specify most of the right answers.

@@ -1807,8 +1807,16 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     VkQueue queue = node->context->getGraphicsQueue();
     uint32_t slot = packet.bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
 
-    // 1. Wait for previous execution using this slot to complete before recording
-    vkWaitForFences(device, 1, &node->renderFences[slot], VK_TRUE, UINT64_MAX);
+    // 1. Wait for previous execution using this slot to complete before recording.
+    // Bounded wait: a wedged secondary GPU must not deadlock the worker thread forever.
+    VkResult slotFenceRes = vkWaitForFences(device, 1, &node->renderFences[slot], VK_TRUE, 10'000'000'000ull /* 10 s */);
+    if (slotFenceRes == VK_TIMEOUT) {
+        Logger::error("Secondary GPU render fence timeout (10s) for slot {} — GPU may be hung. Aborting this frame's secondary work.", slot);
+        return;
+    } else if (slotFenceRes != VK_SUCCESS) {
+        Logger::error("Secondary GPU vkWaitForFences failed for slot {} (VkResult: {})", slot, static_cast<int>(slotFenceRes));
+        return;
+    }
 
     // Read timestamp queries from completed execution of this slot (only if slot was previously executed)
     if (node->slotHasExecuted[slot]) {

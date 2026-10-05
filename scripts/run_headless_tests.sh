@@ -12,14 +12,22 @@ echo "=========================================================="
 
 # 1. Check GPU utilization & VRAM status per user rules
 echo "[1/4] Checking AMD GPU metrics via amd-smi..."
-if [ -x /opt/rocm/core-10.0/bin/amd-smi ]; then
-    /opt/rocm/core-10.0/bin/amd-smi || true
-elif [ -x /home/naoki/.local/bin/amd-smi ]; then
-    /home/naoki/.local/bin/amd-smi || true
-elif command -v amd-smi &> /dev/null; then
-    amd-smi || true
+# Locate amd-smi: PATH first, then common ROCm install prefixes (version-agnostic).
+AMD_SMI=""
+if command -v amd-smi &> /dev/null; then
+    AMD_SMI="amd-smi"
 else
-    echo "amd-smi not found in known paths, continuing..."
+    for candidate in /opt/rocm/*/bin/amd-smi /opt/rocm/bin/amd-smi; do
+        if [ -x "$candidate" ]; then
+            AMD_SMI="$candidate"
+            break
+        fi
+    done
+fi
+if [ -n "$AMD_SMI" ]; then
+    "$AMD_SMI" || true
+else
+    echo "amd-smi not found, continuing..."
 fi
 
 BUILD_DIR="${BUILD_DIR:-build}"
@@ -28,10 +36,10 @@ if [ ! -f "${BUILD_DIR}/build.ninja" ] && [ -f "build/linux-release/build.ninja"
 fi
 PATHWAYS_BIN="./${BUILD_DIR}/bin/pathways"
 
-# 2. Build / ensure binaries are up to date (limiting threads for Threadripper 3750X)
+# 2. Build / ensure binaries are up to date
 echo ""
-echo "[2/4] Verifying build with ninja (-j16)..."
-ninja -C "${BUILD_DIR}" -j16
+echo "[2/4] Verifying build with ninja (-j$(nproc))..."
+ninja -C "${BUILD_DIR}" -j"$(nproc)"
 
 # Create output directory
 mkdir -p output
@@ -371,7 +379,9 @@ python3 tests/test_image_quality.py
 # 11. Test Suite 8: Automated Before/After Visual Regression Verification
 echo ""
 echo "[8/9] Running Test Suite 8: Visual Regression Verification against Golden References..."
-python3 scripts/visual_regression_test.py --binary "${PATHWAYS_BIN}" --strict
+# --render: self-contained — the harness renders every tracked config with the current
+# binary before comparing, so no config depends on a render left behind by an earlier step.
+python3 scripts/visual_regression_test.py --binary "${PATHWAYS_BIN}" --render --strict
 
 # 12. Test Suite 9: Visual Integrity, Accumulation Exposure Stability & Multi-GPU Seams
 echo ""

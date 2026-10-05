@@ -68,9 +68,10 @@ public:
         uint32_t formatMode = 0;
         uint32_t mergeMode = 0;
         uint32_t primarySpp = 1;
-        uint32_t secDispatchArg = 0;
+        uint32_t secDispatchWidth = 0; // Secondary tile buffer pitch in pixels (0 = auto-derive from tile grid)
+        uint32_t mergeGbuffers = 0;    // 1 = also merge secondary G-buffers (motion vectors, normal/depth)
     };
-    static_assert(sizeof(MergePushConstants) == 32, "MergePushConstants must be 32 bytes");
+    static_assert(sizeof(MergePushConstants) == 36, "MergePushConstants must be 36 bytes (must match accum_merge.comp PC layout)");
 
     PostProcessPipeline(
         VkDevice device,

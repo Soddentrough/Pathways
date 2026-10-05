@@ -64,7 +64,7 @@ Pathways decomposes light transport into decoupled, specialized compute microker
    - Atomically stages rays into dedicated Structure-of-Arrays (SoA) ray queues via 64-bit Buffer Device Addresses (BDA).
 2. **Ray Traversal & Intersection (`shaders/compute/wavefront_intersect.comp`)**:
    - Evaluates fixed-function hardware BVH traversal using inline ray queries (`rayQueryEXT`).
-   - Retrieves triangle shading attributes from the 128-byte cache-line aligned `TriangleShadeGPU` buffer (binding 2).
+   - Retrieves triangle shading attributes from the 64-byte cache-line-packed `TriangleShadeGPU` buffer (binding 2; 2 triangles per 128-byte RDNA 4 vector cache line).
    - Conditionally evaluates tangent frames and object-to-world transforms exclusively for `COMPLEX`, `CONDUCTOR`, and `DIELECTRIC` archetypes, skipping tangent attribute loads and matrix math for diffuse and emissive surfaces.
 3. **GPU-Autonomous Command Synthesis (`shaders/compute/wavefront_classify.comp`)**:
    - The classifier kernel synthesizes dual execution command streams into device-local memory without host readbacks:
@@ -150,12 +150,14 @@ Pathways provides unlinked multi-GPU scaling across dual discrete GPUs (e.g. 2x 
   [ Final 4K Swapchain Presentation ]
 ```
 
-### 4.1 Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`)
-- **Default Mode (`--mgpu-transfer host`)**: Secondary GPU streams completed $64\times 64$ checkerboard tiles into pinned host memory via CP DMA posted writes at PCIe 4.0/5.0 bus line rate (~25 GB/s, latency <0.5 ms).
-- **Direct Primary Import**: Primary GPU imports the host pointer and composites alternate tiles in ~0.12 ms without PCIe bus contention, maintaining consistent frame pacing.
+### 4.1 Push-DMA P2P via Linux DMA-BUF (`--mgpu-transfer p2p`, Default)
+- **Push Model**: The **primary** GPU allocates the merge buffer in its own device-local VRAM and exports it via `VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`; the **secondary** GPU imports the handle and binds it to its own buffer object.
+- **Posted Writes Only**: The secondary streams completed $64\times 64$ checkerboard tiles into the imported buffer via CP DMA **posted writes** at PCIe 4.0/5.0 bus line rate (~25 GB/s, latency <0.5 ms). The primary then merges from **local** VRAM at full memory bandwidth — no shader-driven non-posted PCIe reads on the frame-critical path.
+- **Auto-Fallback**: Falls back to host zero-copy automatically when DMA-BUF export is unavailable or the BAR aperture is small ($\le$256 MB).
 
-### 4.2 Linux DMA-BUF Direct P2P (`--mgpu-transfer p2p`)
-- Uses `VK_EXT_external_memory_dma_buf` and `VK_KHR_external_semaphore_fd` for direct cross-device memory sharing on hardware with coherent inter-GPU links (e.g. Infinity Fabric).
+### 4.2 Zero-Copy Host Memory Streaming (`VK_EXT_external_memory_host`, `--mgpu-transfer host`)
+- Secondary GPU streams completed tiles into pinned host memory via CP DMA posted writes; the primary imports the host pointer and composites alternate tiles in ~0.12 ms without PCIe bus contention.
+- Optimal on UMA (Strix Halo, where "host memory" is the shared LPDDR5X) and the safe fallback on discrete PCIe.
 
 ### 4.3 Fine-Grained 2D Checkerboard Tiling
 Screen space is subdivided into $64\times 64$ alternating tiles (2,040 tiles at 4K). Dual GPUs execute balanced spatial and shading workloads across alternating tiles, scaling framerates by **$1.72\times$ to $1.93\times$** over single-GPU performance.
@@ -216,7 +218,7 @@ Pathways ingests complex VFX and CAD production assets via OpenUSD (`UsdLoader.c
 
 On modern GPU architectures such as AMD RDNA 4 (`gfx1201`), vector cache lines ($L0$ and $L1$) are strictly **128 bytes**. When memory transactions access unaligned data or structures that straddle 128-byte boundaries, the memory subsystem issues two memory requests instead of one—incurring a 100% bandwidth penalty ("split cache-line penalty"). Pathways structures all geometry and material buffers to ensure optimal cache-line alignment and minimal memory bandwidth.
 
-### 8.1 128-Byte Geometry Shading Buffer (`TriangleShadeGPU`)
+### 8.1 64-Byte Geometry Shading Buffer (`TriangleShadeGPU`)
 
 In traditional rasterization and path tracing engines, triangle vertex positions, normals, texture coordinates, and tangents are interleaved into a single fat vertex structure (e.g. 160+ bytes per triangle). In a wavefront path tracer, however:
 1. **Hardware BVH Traversal** requires only vertex positions during acceleration structure building (`VkAccelerationStructureGeometryTrianglesDataKHR`). Traversal itself runs in fixed-function ray tracing hardware.
@@ -224,34 +226,35 @@ In traditional rasterization and path tracing engines, triangle vertex positions
 
 Pathways segregates positions from shading geometry into two decoupled buffers:
 - **`m_positionBuffer`**: A contiguous array of 16-byte `glm::vec4(x, y, z, 1.0f)` positions used strictly for hardware BLAS builds.
-- **`m_triangleShadeBuffer` (`TriangleShadeGPU`)**: An aligned 128-byte structure containing exclusively the attributes required during shading:
+- **`m_triangleShadeBuffer` (`TriangleShadeGPU`)**: An aligned **64-byte** structure containing exclusively the attributes required during shading — **2 triangles per 128-byte RDNA 4 vector cache line**, so consecutive triangle fetches never straddle a cache-line boundary. Normals and tangents are octahedrally encoded (4 bytes each instead of 16) and UVs are packed as half-float pairs:
 
 | Field | GLSL / C++ Type | Byte Size | Description |
 | :--- | :--- | :---: | :--- |
-| `normal0_u0` | `vec4` / `glm::vec4` | 16 | Vertex 0 normal (`xyz`), Vertex 0 UV $u$ coordinate (`w`) |
-| `normal1_u1` | `vec4` / `glm::vec4` | 16 | Vertex 1 normal (`xyz`), Vertex 1 UV $u$ coordinate (`w`) |
-| `normal2_u2` | `vec4` / `glm::vec4` | 16 | Vertex 2 normal (`xyz`), Vertex 2 UV $u$ coordinate (`w`) |
-| `tan0_v0` | `vec4` / `glm::vec4` | 16 | Vertex 0 tangent (`xyz`), Vertex 0 UV $v$ coordinate (`w`) |
-| `tan1_v1` | `vec4` / `glm::vec4` | 16 | Vertex 1 tangent (`xyz`), Vertex 1 UV $v$ coordinate (`w`) |
-| `tan2_v2` | `vec4` / `glm::vec4` | 16 | Vertex 2 tangent (`xyz`), Vertex 2 UV $v$ coordinate (`w`) |
-| `tanSigns` | `vec4` / `glm::vec4` | 16 | Tangent handedness signs (`x: tan0.w, y: tan1.w, z: tan2.w, w: unused`) |
+| `octNormal0/1/2` | `uint32_t` × 3 | 12 | Per-vertex normals, octahedral 32-bit encoding (`unpackOct32`) |
+| `octTan0/1/2` | `uint32_t` × 3 | 12 | Per-vertex tangents, octahedral 32-bit encoding |
+| `uv0/1/2` | `uint32_t` × 3 | 12 | Per-vertex UVs, packed `half2` (`unpackHalf2x16`) |
+| `tanSigns` | `uint32_t` | 4 | Tangent handedness signs (bit-packed) |
 | `materialId` | `uint32_t` | 4 | Scene material index |
-| `padding[3]` | `uint32_t[3]` | 12 | Alignment padding to guarantee 16-byte / 128-byte boundary |
-| **Total** | | **128 Bytes** | **Exactly 1 RDNA 4 Vector Cache Line (0 Split Cache-Line Penalty)** |
+| `padding0` + `reserved[4]` | `uint32_t[5]` | 20 | Alignment / forward-compatibility padding |
+| **Total** | | **64 Bytes** | **2 triangles per 128B Vector Cache Line (0 Split Cache-Line Penalty)** |
 
 ```cpp
 struct alignas(16) TriangleShadeGPU {
-    glm::vec4 normal0_u0; // xyz: normal0, w: uv0.x
-    glm::vec4 normal1_u1; // xyz: normal1, w: uv1.x
-    glm::vec4 normal2_u2; // xyz: normal2, w: uv2.x
-    glm::vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
-    glm::vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
-    glm::vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
-    glm::vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: 0.0f
-    uint32_t materialId;
-    uint32_t padding[3];
+    uint32_t octNormal0 = 0;  // oct-encoded normal, vertex 0
+    uint32_t octNormal1 = 0;
+    uint32_t octNormal2 = 0;
+    uint32_t octTan0 = 0;     // oct-encoded tangent, vertex 0
+    uint32_t octTan1 = 0;
+    uint32_t octTan2 = 0;
+    uint32_t uv0 = 0;         // packed half2 UV, vertex 0
+    uint32_t uv1 = 0;
+    uint32_t uv2 = 0;
+    uint32_t tanSigns = 0;
+    uint32_t materialId = 0;
+    uint32_t padding0 = 0;
+    uint32_t reserved[4] = {0, 0, 0, 0};
 };
-static_assert(sizeof(TriangleShadeGPU) == 128, "TriangleShadeGPU must be exactly 128 bytes (1 L0 cache line)");
+static_assert(sizeof(TriangleShadeGPU) == 64, "TriangleShadeGPU must be exactly 64 bytes (2 triangles per 128B cache line)");
 ```
 
 ### 8.2 Compact 64-Byte Shading Material Buffer (`ShadeMaterialGPU`, Binding 35)
@@ -330,7 +333,7 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | **9** | `storageBuffer` | `inStates` | 32 B | Input ray state queue (throughput, seed, radiance) |
 | **10** | `storageBuffer` | `outStates` | 32 B | Output ray state queue for next bounce |
 | **11** | `storageBuffer` | `queueCounters` | 64 B | Atomic workgroup and ray queue counters |
-| **20–22** | `storageBuffer` | `nrcQueue/Counters` | Variable | Neural Radiance Caching query, train, and counter buffers |
+| **20–22** | `storageBuffer` | `nrcQueue/Counters` | Variable | Neural direct-light caching query, train, and counter buffers |
 | **23–24** | `storageImage` | `motionVectors / normalDepth` | RG16F / RGBA16F | Temporal motion vectors and G-Buffer normal/depth |
 | **25** | `storageBuffer` | `lightTree` | Variable | Hierarchical 3D Light Tree nodes |
 | **26–29** | `storageImage` | `albedoRough / specMetal / mlDiff / mlSpec` | RGBA16F | Denoising feature maps & separated diffuse/specular buffers |

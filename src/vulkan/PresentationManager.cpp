@@ -119,7 +119,13 @@ void PresentationManager::beginFrame(uint32_t frameSlot, uint64_t totalFramesRen
     m_currentFrameStartTime = frameNow;
 
     if (m_context && frameSlot < m_inFlightFences.size() && m_inFlightFences[frameSlot]) {
-        vkWaitForFences(m_context->getDevice(), 1, &m_inFlightFences[frameSlot], VK_TRUE, UINT64_MAX);
+        // Bounded wait: a wedged GPU must not deadlock the render loop forever.
+        VkResult fenceRes = vkWaitForFences(m_context->getDevice(), 1, &m_inFlightFences[frameSlot], VK_TRUE, 10'000'000'000ull /* 10 s */);
+        if (fenceRes == VK_TIMEOUT) {
+            Logger::error("In-flight fence timeout ({}s) for frame slot {} — GPU may be hung or validation-stalled. Continuing; further Vulkan calls may fail.", 10, frameSlot);
+        } else if (fenceRes != VK_SUCCESS) {
+            Logger::error("vkWaitForFences failed for frame slot {} (VkResult: {})", frameSlot, static_cast<int>(fenceRes));
+        }
     }
 }
 

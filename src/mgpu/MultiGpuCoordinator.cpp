@@ -321,9 +321,9 @@ void MultiGpuCoordinator::recordMergePass(
         bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
                              params.config.denoiser_mode == DenoiserMode::Upways);
-        uint32_t secDispatchArg = (plan.secDispatchWidth & 0x7FFFFFFFu) | (needGbuffers ? 0x80000000u : 0u);
         PostProcessPipeline::MergePushConstants mergePC{
-            plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp, secDispatchArg
+            plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp,
+            plan.secDispatchWidth, needGbuffers ? 1u : 0u
         };
 
         uint32_t mergeGroupsX = (plan.mgpuBaseW + 15) / 16;
