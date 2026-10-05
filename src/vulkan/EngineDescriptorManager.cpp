@@ -200,7 +200,7 @@ void EngineDescriptorManager::updatePrimaryImageDescriptors(const ImageDescripto
                 writes.push_back(w14);
             }
 
-            if (params.filteredCausticImage) {
+            if (causticInfo.imageView != VK_NULL_HANDLE) {
                 VkWriteDescriptorSet w15{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                 w15.dstSet = m_rtDescSets[i];
                 w15.dstBinding = 15;

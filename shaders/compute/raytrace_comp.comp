@@ -4,6 +4,7 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 
 #define SAMPLE_SCENE_TEXTURE(texId, uv) textureLod(sceneTextures[nonuniformEXT(uint(texId) - 1u)], (uv), 0.0)
+#define MATERIAL_TYPE_MASK 0x000000FFu
 
 layout(local_size_x = 8, local_size_y = 4) in;
 
@@ -22,46 +23,86 @@ layout(binding = 1) uniform CameraUBO {
     uint flags;      // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows
 } ubo;
 
-// 128-byte cache-line aligned shading triangle (Option 3 / RDNA 4 vector cache line)
+// 32-bit Octahedral normal/direction encoding (Cigolle et al.)
+vec2 octSign(vec2 v) {
+    return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);
+}
+
+vec2 octEncode(vec3 v) {
+    v /= (abs(v.x) + abs(v.y) + abs(v.z));
+    return (v.z >= 0.0) ? v.xy : (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+}
+
+vec3 octDecode(vec2 f) {
+    vec3 v = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (v.z < 0.0) {
+        v.xy = (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+    }
+    return normalize(v);
+}
+
+uint packOct32(vec3 v) {
+    return packSnorm2x16(octEncode(normalize(v)));
+}
+
+vec3 unpackOct32(uint p) {
+    return octDecode(unpackSnorm2x16(p));
+}
+
+// 64-byte cache-line aligned shading triangle (2 triangles per 128B RDNA 4 vector cache line)
 struct Triangle {
-    vec4 normal0_u0; // xyz: normal0, w: uv0.x
-    vec4 normal1_u1; // xyz: normal1, w: uv1.x
-    vec4 normal2_u2; // xyz: normal2, w: uv2.x
-    vec4 tan0_v0;    // xyz: tan0,    w: uv0.y
-    vec4 tan1_v1;    // xyz: tan1,    w: uv1.y
-    vec4 tan2_v2;    // xyz: tan2,    w: uv2.y
-    vec4 tanSigns;   // x: tan0.w, y: tan1.w, z: tan2.w, w: unused
+    uint octNormal0;
+    uint octNormal1;
+    uint octNormal2;
+    uint octTan0;
+
+    uint octTan1;
+    uint octTan2;
+    uint uv0;
+    uint uv1;
+
+    uint uv2;
+    uint tanSigns;
     uint materialId;
-    uint padding[3];
+    uint padding0;
+
+    uvec4 reserved;
 };
 
 vec3 getTriangleNormal(in Triangle tri, in vec2 bary) {
     float u = bary.x;
     float v = bary.y;
     float w = 1.0 - u - v;
-    return normalize(w * tri.normal0_u0.xyz + u * tri.normal1_u1.xyz + v * tri.normal2_u2.xyz);
+    vec3 n0 = unpackOct32(tri.octNormal0);
+    vec3 n1 = unpackOct32(tri.octNormal1);
+    vec3 n2 = unpackOct32(tri.octNormal2);
+    return normalize(w * n0 + u * n1 + v * n2);
 }
 
 vec2 getTriangleUV(in Triangle tri, in vec2 bary) {
     float u = bary.x;
     float v = bary.y;
     float w = 1.0 - u - v;
-    return w * vec2(tri.normal0_u0.w, tri.tan0_v0.w) +
-           u * vec2(tri.normal1_u1.w, tri.tan1_v1.w) +
-           v * vec2(tri.normal2_u2.w, tri.tan2_v2.w);
+    vec2 uv0 = unpackHalf2x16(tri.uv0);
+    vec2 uv1 = unpackHalf2x16(tri.uv1);
+    vec2 uv2 = unpackHalf2x16(tri.uv2);
+    return w * uv0 + u * uv1 + v * uv2;
 }
 
 vec3 getTriangleTangent(in Triangle tri, in vec2 bary) {
     float u = bary.x;
     float v = bary.y;
     float w = 1.0 - u - v;
-    vec3 geomTan = w * tri.tan0_v0.xyz + u * tri.tan1_v1.xyz + v * tri.tan2_v2.xyz;
+    vec3 t0 = unpackOct32(tri.octTan0);
+    vec3 t1 = unpackOct32(tri.octTan1);
+    vec3 t2 = unpackOct32(tri.octTan2);
+    vec3 geomTan = w * t0 + u * t1 + v * t2;
     float len = length(geomTan);
     return len > 1e-4 ? (geomTan / len) : vec3(1.0, 0.0, 0.0);
 }
 
 float getTriangleTangentSign(in Triangle tri) {
-    return tri.tanSigns.x != 0.0 ? tri.tanSigns.x : 1.0;
+    return ((tri.tanSigns & 1u) != 0u) ? 1.0 : -1.0;
 }
 
 
