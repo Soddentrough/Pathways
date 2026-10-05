@@ -14,6 +14,8 @@ docs/
 ├── BUILD_WINDOWS.md                    # Windows 11 Build, MSYS2 & Packaging Guide
 ├── VULKAN_API_AUDIT.md                 # Complete Vulkan 1.4 API Call Audit & Platform Coverage
 ├── reports/                            # Empirical Benchmarking & Deep Technical Audits
+│   ├── codebase_review_2026_10_05.md   # Full Project Review (Oct 5 2026): SOTA verification, quick wins & roadmap
+│   ├── codebase_sota_review.md         # SOTA Architectural & Performance Review (Sept 27 2026, superseded)
 │   ├── wavefront_batching_head_to_head.md # 2D Macro-Tile Partitioning & Queue Scaling Report
 │   ├── strix_halo_gfx1151_profiling_report.md # AMD Strix Halo / RDNA 3.5 Hardware Profiling
 │   ├── uma_optimization_isolation_study.md # UMA Memory Bandwidth & Payload Isolation Study
@@ -52,6 +54,10 @@ docs/
 
 The [`reports/`](reports/) directory contains formal research reports, architectural audits, and hardware profiling studies:
 
+- **[reports/codebase_review_2026_10_05.md](reports/codebase_review_2026_10_05.md)**:
+  Full project review (October 5, 2026). Re-verifies every finding from the September 27 SOTA review against current code, documents documentation/code drift, and provides the current prioritized action plan (quick wins through long-term SOTA roadmap).
+- **[reports/codebase_sota_review.md](reports/codebase_sota_review.md)**:
+  State-of-the-art architectural, performance, and implementation review (September 27, 2026). Superseded by the October 5 review for status tracking; retained for the original hardware-matrix analysis and remediation specs.
 - **[reports/wavefront_batching_head_to_head.md](reports/wavefront_batching_head_to_head.md)**:
   Empirical benchmark and bare-metal SPM hardware counter analysis (L0/L1/L2 hit rates, memory stalls, VRAM bandwidth) comparing Monolithic, 1D Horizontal Strips, and 2D Macro-Tile Partitioning on AMD Strix Halo (Radeon 8060S). Documents the 74.3% VRAM queue reduction (699 MB vs 2,721 MB at 4K) and adaptive secondary ray CU occupancy capping.
 - **[reports/strix_halo_gfx1151_profiling_report.md](reports/strix_halo_gfx1151_profiling_report.md)**:
