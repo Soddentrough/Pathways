@@ -124,9 +124,10 @@ def main():
     parser.add_argument("--frames", type=int, default=None, help="Measured frames per test point")
     parser.add_argument("--warmup", type=int, default=None, help="Warmup frames per test point")
     parser.add_argument("--scenes", type=str, default="", help="Comma-separated scene IDs or regex filter")
+    parser.add_argument("--profiles", type=str, default="", help="Comma-separated profile IDs or filter (e.g. '4k_mgpu' or '4k_single,4k_mgpu')")
     parser.add_argument("--update-baseline", action="store_true", help="Generate or update reference baseline JSON")
     parser.add_argument("--baseline-path", type=str, default="", help="Custom baseline JSON path")
-    parser.add_argument("--tolerance", type=float, default=0.15, help="Regression threshold tolerance (default: 0.15 = 15%%)")
+    parser.add_argument("--tolerance", type=float, default=None, help="Regression threshold tolerance (default: 0.15, or 0.20 in --quick mode)")
     parser.add_argument("--output-dir", type=str, default="output/benchmark_matrix", help="Output directory for reports")
     args = parser.parse_args()
 
@@ -152,8 +153,13 @@ def main():
         print(f"\033[33m[SKIP]\033[0m Vulkan Ray Tracing hardware not available in environment (code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}. Skipping performance matrix.")
         return 0
 
-    combined_output = (probe_res.stdout + probe_res.stderr).lower()
-    if any(sw in combined_output for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
+    target_hw = ""
+    for line in (probe_res.stdout + probe_res.stderr).splitlines():
+        if "Identified target hardware:" in line or "successfully initialized on:" in line:
+            target_hw = line.lower()
+            break
+
+    if target_hw and any(sw in target_hw for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
         print("\033[33m[SKIP]\033[0m Software/CPU Vulkan renderer detected. Skipping performance matrix.")
         return 0
 
@@ -164,6 +170,13 @@ def main():
     out_dir = os.path.abspath(args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+
+    # Filter profiles if requested
+    profile_filter = [p.strip().lower() for p in args.profiles.split(",") if p.strip()]
+    profiles_to_run = []
+    for prof in PROFILES:
+        if not profile_filter or any(f in prof["id"].lower() for f in profile_filter):
+            profiles_to_run.append(prof)
 
     # Filter scenes if requested
     scene_filter = [s.strip().lower() for s in args.scenes.split(",") if s.strip()]
@@ -177,12 +190,13 @@ def main():
             if any(f in sc_id or f in sc_name for f in scene_filter):
                 scenes_to_run.append(sc)
 
-    total_runs = len(scenes_to_run) * len(PROFILES)
+    tolerance = args.tolerance if args.tolerance is not None else (0.20 if args.quick else 0.15)
+    total_runs = len(scenes_to_run) * len(profiles_to_run)
     print("==========================================================================================")
-    print(f"  Pathways Automated Performance Regression Matrix ({len(scenes_to_run)} Scenes x {len(PROFILES)} Profiles = {total_runs} Runs)")
+    print(f"  Pathways Automated Performance Regression Matrix ({len(scenes_to_run)} Scenes x {len(profiles_to_run)} Profiles = {total_runs} Runs)")
     print(f"  Binary:   {os.path.relpath(bin_path, PATHWAYS_ROOT)}")
     print(f"  Frames:   {frames} measured (+ {warmup} warmup) per configuration")
-    print(f"  Mode:     {'Update Golden Baseline' if args.update_baseline else 'Regression Evaluation (Tolerance: ' + str(int(args.tolerance * 100)) + '%)'}")
+    print(f"  Mode:     {'Update Golden Baseline' if args.update_baseline else 'Regression Evaluation (Tolerance: ' + str(int(tolerance * 100)) + '%)'}")
     print("==========================================================================================")
 
     baseline_data = {}
@@ -207,7 +221,7 @@ def main():
         sc_id = sc["id"]
         matrix_results[sc_id] = {}
 
-        for prof in PROFILES:
+        for prof in profiles_to_run:
             run_idx += 1
             prof_id = prof["id"]
             tag = f"{sc_id}_{prof_id}"
@@ -241,7 +255,7 @@ def main():
                     delta_pct = (ratio - 1.0) * 100.0
                     delta_str = f"{delta_pct:+.1f}%"
 
-                    if ratio > 1.0 + args.tolerance:
+                    if ratio > 1.0 + tolerance:
                         status = "\033[31mREGRESSION\033[0m"
                         regressions.append((tag, f"{cur_time:.2f}ms vs baseline {base_time:.2f}ms ({delta_pct:+.1f}%)"))
                     elif ratio < 0.95:
@@ -282,7 +296,7 @@ def main():
     print("==========================================================================================")
     print(f"  Total Configurations: {total_runs}")
     print(f"  Failures / Errors:    {len(failures)}")
-    print(f"  Regressions (> {int(args.tolerance*100)}%):  {len(regressions)}")
+    print(f"  Regressions (> {int(tolerance*100)}%):  {len(regressions)}")
     print(f"  Improvements (> 5%):  {len(improvements)}")
     print(f"  Report written to:    {report_json_path}")
 

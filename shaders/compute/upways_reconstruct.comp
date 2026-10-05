@@ -464,13 +464,10 @@ void main() {
             vec3 cleanDiff = upwaysInverseLogTransform(cleanLogDiff);
             vec3 cleanSpec = upwaysInverseLogTransform(cleanLogSpec);
 
-            vec3 finalRadiance;
-            if (pc.learnedDemod != 0u) {
-                finalRadiance = cleanDiff;
-            } else {
-                vec3 albedo = s_albedo[tid];
-                finalRadiance = (dot(albedo, albedo) > 1e-4) ? (cleanDiff * albedo + cleanSpec * 0.04) : cleanDiff;
-            }
+            // Physical linear radiance resolve:
+            // cleanDiff and cleanSpec are already physical radiance components (Vector 0 & 1).
+            // Direct linear addition eliminates destructive albedo squaring and specular attenuation.
+            vec3 finalRadiance = cleanDiff + cleanSpec;
 
             // Numerical safety sanity check: fall back to input if NaN or Inf
             if (isnan(finalRadiance.r) || isnan(finalRadiance.g) || isnan(finalRadiance.b) ||
