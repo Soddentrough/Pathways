@@ -47,6 +47,16 @@ struct GltfScene {
     std::vector<std::string> extensionsUsed;
     std::vector<std::string> extensionsRequired;
     bool hasMeshQuantization = false;
+
+    // Scene Authoring Metadata & Fallback Tracking
+    bool hasSceneMetadata = false;
+    std::string sceneSourceFormat = "";
+    uint32_t sceneDefaultSpp = 0;
+    uint32_t sceneDefaultMaxBounces = 0;
+    uint32_t sceneDefaultWidth = 0;
+    uint32_t sceneDefaultHeight = 0;
+    bool hasFallbackSun = false;
+    std::vector<std::string> sceneWarnings;
 };
 
 class GltfLoader {

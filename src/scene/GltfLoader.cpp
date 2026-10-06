@@ -1,5 +1,6 @@
 #include "scene/GltfLoader.hpp"
 #include "core/Logger.hpp"
+#include "utils/MiniJson.hpp"
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
@@ -656,6 +657,145 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
         }
     }
 
+    // 4b. Parse scene authoring metadata and metadata lights (e.g. from PBRT / USD conversion)
+    const char* extrasJson = nullptr;
+    if (data->extras.data && data->extras.data[0] != '\0') {
+        extrasJson = data->extras.data;
+    } else if (data->asset.extras.data && data->asset.extras.data[0] != '\0') {
+        extrasJson = data->asset.extras.data;
+    } else if (data->scene && data->scene->extras.data && data->scene->extras.data[0] != '\0') {
+        extrasJson = data->scene->extras.data;
+    }
+
+    if (extrasJson) {
+        MiniJsonParser jsonParser(extrasJson);
+        JsonVal root = jsonParser.parseVal();
+        if (root.is_object()) {
+            if (root.contains("sourceFormat")) {
+                outScene.sceneSourceFormat = root["sourceFormat"].as_string();
+                outScene.hasSceneMetadata = true;
+            } else if (root.contains("format")) {
+                outScene.sceneSourceFormat = root["format"].as_string();
+                outScene.hasSceneMetadata = true;
+            }
+
+            // Ingest render settings (PBRT or direct render object)
+            JsonVal renderVal;
+            if (root.contains("pbrt") && root["pbrt"].is_object() && root["pbrt"].contains("render")) {
+                renderVal = root["pbrt"]["render"];
+            } else if (root.contains("render")) {
+                renderVal = root["render"];
+            }
+
+            if (renderVal.is_object()) {
+                outScene.hasSceneMetadata = true;
+                if (renderVal.contains("samples_per_pixel")) {
+                    outScene.sceneDefaultSpp = renderVal["samples_per_pixel"].as_uint();
+                } else if (renderVal.contains("spp")) {
+                    outScene.sceneDefaultSpp = renderVal["spp"].as_uint();
+                }
+
+                if (renderVal.contains("max_depth")) {
+                    outScene.sceneDefaultMaxBounces = renderVal["max_depth"].as_uint();
+                } else if (renderVal.contains("max_bounces")) {
+                    outScene.sceneDefaultMaxBounces = renderVal["max_bounces"].as_uint();
+                }
+
+                if (renderVal.contains("resolution") && renderVal["resolution"].is_array() && renderVal["resolution"].arr.size() >= 2) {
+                    outScene.sceneDefaultWidth = renderVal["resolution"][0].as_uint();
+                    outScene.sceneDefaultHeight = renderVal["resolution"][1].as_uint();
+                }
+            }
+
+            // Ingest metadata light sources if glTF punctual lights were omitted by the exporter
+            JsonVal lightsVal;
+            if (root.contains("pbrt") && root["pbrt"].is_object() && root["pbrt"].contains("light_sources")) {
+                lightsVal = root["pbrt"]["light_sources"];
+            } else if (root.contains("light_sources")) {
+                lightsVal = root["light_sources"];
+            } else if (root.contains("light_mappings")) {
+                lightsVal = root["light_mappings"];
+            }
+
+            if (lightsVal.is_array() && outScene.lights.empty()) {
+                for (const auto& lEntry : lightsVal.arr) {
+                    if (!lEntry.is_object()) continue;
+
+                    std::string lightType = lEntry.contains("pbrt") ? lEntry["pbrt"].as_string() : (lEntry.contains("type") ? lEntry["type"].as_string() : "");
+                    if (lightType == "distant") {
+                        glm::vec3 from(0.0f);
+                        glm::vec3 to(0.0f);
+                        bool hasFromTo = false;
+
+                        if (lEntry.contains("from") && lEntry["from"].is_array() && lEntry["from"].arr.size() >= 3 &&
+                            lEntry.contains("to") && lEntry["to"].is_array() && lEntry["to"].arr.size() >= 3) {
+                            from = glm::vec3(
+                                lEntry["from"][0].as_float(),
+                                lEntry["from"][1].as_float(),
+                                lEntry["from"][2].as_float()
+                            );
+                            to = glm::vec3(
+                                lEntry["to"][0].as_float(),
+                                lEntry["to"][1].as_float(),
+                                lEntry["to"][2].as_float()
+                            );
+                            hasFromTo = true;
+                        }
+
+                        glm::vec3 dirToLight(0.0f, 1.0f, 0.0f);
+                        if (hasFromTo) {
+                            glm::vec3 d = from - to;
+                            if (glm::length(d) > 1e-4f) {
+                                dirToLight = glm::normalize(d);
+                            }
+                        } else if (lEntry.contains("dir_to_light") && lEntry["dir_to_light"].is_array() && lEntry["dir_to_light"].arr.size() >= 3) {
+                            dirToLight = glm::normalize(glm::vec3(
+                                lEntry["dir_to_light"][0].as_float(),
+                                lEntry["dir_to_light"][1].as_float(),
+                                lEntry["dir_to_light"][2].as_float()
+                            ));
+                        }
+
+                        glm::vec3 radiance(10.0f);
+                        if (lEntry.contains("radiance_rgb") && lEntry["radiance_rgb"].is_array() && lEntry["radiance_rgb"].arr.size() >= 3) {
+                            radiance = glm::vec3(
+                                lEntry["radiance_rgb"][0].as_float(10.0f),
+                                lEntry["radiance_rgb"][1].as_float(10.0f),
+                                lEntry["radiance_rgb"][2].as_float(10.0f)
+                            );
+                        } else if (lEntry.contains("color") && lEntry["color"].is_array() && lEntry["color"].arr.size() >= 3) {
+                            float intensity = lEntry.contains("intensity") ? lEntry["intensity"].as_float(1.0f) : 1.0f;
+                            radiance = glm::vec3(
+                                lEntry["color"][0].as_float(1.0f),
+                                lEntry["color"][1].as_float(1.0f),
+                                lEntry["color"][2].as_float(1.0f)
+                            ) * intensity;
+                        }
+
+                        LightGPU gpuLight{};
+                        gpuLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
+                        gpuLight.normal = glm::vec4(dirToLight, 0.0f);
+                        gpuLight.emission = glm::vec4(radiance, 1.0f);
+                        outScene.lights.push_back(gpuLight);
+
+                        Logger::info("GltfLoader: Ingested authoring distant sun from {} metadata: dir=({:.3f},{:.3f},{:.3f}), radiance=({:.1f},{:.1f},{:.1f})",
+                                     outScene.sceneSourceFormat.empty() ? "scene" : outScene.sceneSourceFormat.c_str(),
+                                     dirToLight.x, dirToLight.y, dirToLight.z,
+                                     radiance.r, radiance.g, radiance.b);
+                    }
+                }
+            }
+
+            if (outScene.hasSceneMetadata) {
+                Logger::info("GltfLoader: Scene metadata found - Format: {}, Default SPP: {}, Max Bounces: {}, Target Res: {}x{}",
+                             outScene.sceneSourceFormat.empty() ? "Unknown" : outScene.sceneSourceFormat.c_str(),
+                             outScene.sceneDefaultSpp,
+                             outScene.sceneDefaultMaxBounces,
+                             outScene.sceneDefaultWidth, outScene.sceneDefaultHeight);
+            }
+        }
+    }
+
     // 5. Parse Cameras
     for (size_t n = 0; n < data->nodes_count; ++n) {
         const auto& node = data->nodes[n];
@@ -689,6 +829,15 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     }
 
     SceneData data;
+    data.hasSceneMetadata = gltfScene.hasSceneMetadata;
+    data.sceneSourceFormat = gltfScene.sceneSourceFormat;
+    data.sceneDefaultSpp = gltfScene.sceneDefaultSpp;
+    data.sceneDefaultMaxBounces = gltfScene.sceneDefaultMaxBounces;
+    data.sceneDefaultWidth = gltfScene.sceneDefaultWidth;
+    data.sceneDefaultHeight = gltfScene.sceneDefaultHeight;
+    data.hasFallbackSun = gltfScene.hasFallbackSun;
+    data.sceneWarnings = gltfScene.sceneWarnings;
+
     data.materials = gltfScene.materials;
     if (data.materials.empty()) {
         MaterialGPU defaultMat{};
@@ -1148,8 +1297,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         }
     }
 
-    // If the glTF had neither punctual lights nor physical emissive mesh lights,
-    // add a directional sun light matching the procedural sky dome and an overhead area light
+    // If the glTF had neither punctual lights, physical emissive mesh lights,
+    // nor metadata lights, add a directional sun light matching the procedural sky dome
     if (data.lights.empty()) {
         glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
         LightGPU sunLight{};
@@ -1158,6 +1307,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
         data.lights.push_back(sunLight);
 
+        data.hasFallbackSun = true;
+        data.sceneWarnings.push_back("Synthetic Directional Sun active (no lights or emissive sources in scene asset)");
         Logger::info("GltfLoader: Scene had no lights; generated directional sun fallback matching procedural sky");
     }
 

@@ -542,6 +542,16 @@ FrameStats TelemetryReporter::getStats() const {
     stats.scene_path = m_engine->m_config.scene_path.empty() ? "Cornell Box + Specular/Refraction Spheres" : m_engine->m_config.scene_path;
     stats.hdri_path = m_engine->m_config.hdri_path;
 
+    // Scene Authoring Metadata & Fallback Tracking
+    stats.has_scene_metadata = m_engine->m_sceneData.hasSceneMetadata;
+    stats.scene_source_format = m_engine->m_sceneData.sceneSourceFormat;
+    stats.scene_default_spp = m_engine->m_sceneData.sceneDefaultSpp;
+    stats.scene_default_max_bounces = m_engine->m_sceneData.sceneDefaultMaxBounces;
+    stats.scene_default_width = m_engine->m_sceneData.sceneDefaultWidth;
+    stats.scene_default_height = m_engine->m_sceneData.sceneDefaultHeight;
+    stats.has_fallback_sun = m_engine->m_sceneData.hasFallbackSun;
+    stats.scene_warnings = m_engine->m_sceneData.sceneWarnings;
+
     // 6. Active Camera Framing
     if (m_engine->m_camera) {
         glm::vec3 pos = m_engine->m_camera->getPosition();

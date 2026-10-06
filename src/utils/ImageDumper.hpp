@@ -122,6 +122,16 @@ struct FrameStats {
     float cam_pitch = 0.0f;
     float cam_fov = 45.0f;
 
+    // Scene Authoring Metadata & Fallback Tracking
+    bool has_scene_metadata = false;
+    std::string scene_source_format = "";
+    uint32_t scene_default_spp = 0;
+    uint32_t scene_default_max_bounces = 0;
+    uint32_t scene_default_width = 0;
+    uint32_t scene_default_height = 0;
+    bool has_fallback_sun = false;
+    std::vector<std::string> scene_warnings;
+
     // Dynamic Scene Loading Telemetry
     bool is_scene_loading = false;
     std::string loading_scene_name = "";

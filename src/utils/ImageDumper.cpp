@@ -366,7 +366,12 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"num_materials\": {},\n", stats.num_materials)
         << std::format("      \"num_lights\": {},\n", stats.num_lights)
         << std::format("      \"num_textures\": {},\n", stats.num_textures)
-        << std::format("      \"hdri_path\": \"{}\"\n", safeHdriPath)
+        << std::format("      \"hdri_path\": \"{}\",\n", safeHdriPath)
+        << std::format("      \"has_scene_metadata\": {},\n", stats.has_scene_metadata ? "true" : "false")
+        << std::format("      \"source_format\": \"{}\",\n", stats.scene_source_format)
+        << std::format("      \"default_spp\": {},\n", stats.scene_default_spp)
+        << std::format("      \"default_max_bounces\": {},\n", stats.scene_default_max_bounces)
+        << std::format("      \"has_fallback_sun\": {}\n", stats.has_fallback_sun ? "true" : "false")
         << "    },\n"
         << "    \"camera\": {\n"
         << std::format("      \"position\": [{:.3f}, {:.3f}, {:.3f}],\n", stats.cam_pos[0], stats.cam_pos[1], stats.cam_pos[2])

@@ -574,6 +574,21 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
+            if (stats.has_scene_metadata) {
+                if (stats.scene_default_width > 0 && stats.scene_default_height > 0) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Authoring:    %s (%u SPP, %u Bounces, %ux%u)",
+                                       stats.scene_source_format.empty() ? "Asset" : stats.scene_source_format.c_str(),
+                                       stats.scene_default_spp, stats.scene_default_max_bounces,
+                                       stats.scene_default_width, stats.scene_default_height);
+                } else {
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Authoring:    %s (%u SPP, %u Bounces)",
+                                       stats.scene_source_format.empty() ? "Asset" : stats.scene_source_format.c_str(),
+                                       stats.scene_default_spp, stats.scene_default_max_bounces);
+                }
+            }
+            if (stats.has_fallback_sun) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Lighting:     Fallback Synthetic Sun (0 lights in asset)");
+            }
             if (config.denoiser_mode == DenoiserMode::Upways) {
                 ImGui::Text("Denoising:    Upways Neural Denoising (Wave32 WMMA)");
             } else {
@@ -709,6 +724,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
         ImGui::PopStyleColor(2);
 
+        // 0. SCENE NOTICES & FALLBACKS (Zero-Scroll Alert)
+        if (stats.has_fallback_sun || !stats.scene_warnings.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.65f, 0.15f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.35f, 1.0f));
+            ImGui::SeparatorText("SCENE NOTICES & FALLBACKS");
+            if (stats.has_fallback_sun) {
+                ImGui::BulletText("FALLBACK ACTIVE: Synthetic Directional Sun");
+                ImGui::TextDisabled("  Asset defines 0 lights; fallback sun was generated.");
+            }
+            for (const auto& warn : stats.scene_warnings) {
+                ImGui::BulletText("%s", warn.c_str());
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::Spacing();
+        }
+
         // 1. PRIMARY RAY BUDGET & PROGRESSIVE ACCUMULATION (ZERO-SCROLL PRIORITY)
         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.32f, 0.24f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.44f, 0.32f, 1.0f));
@@ -717,9 +748,52 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PopStyleColor(3);
 
         if (qualityHeaderOpen) {
+            // Scene Authoring Defaults & Quick Sync
+            if (stats.has_scene_metadata && (stats.scene_default_spp > 0 || stats.scene_default_max_bounces > 0)) {
+                bool sppDiffers = (stats.scene_default_spp > 0 && config.spp != stats.scene_default_spp);
+                bool bncDiffers = (stats.scene_default_max_bounces > 0 && config.max_bounces != stats.scene_default_max_bounces);
+
+                std::string metaStr = std::format("Scene Authoring ({}): {} SPP, {} Bounces",
+                    stats.scene_source_format.empty() ? "Asset" : stats.scene_source_format.c_str(),
+                    stats.scene_default_spp, stats.scene_default_max_bounces);
+                if (stats.scene_default_width > 0 && stats.scene_default_height > 0) {
+                    metaStr += std::format(" ({}x{})", stats.scene_default_width, stats.scene_default_height);
+                }
+                ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), "%s", metaStr.c_str());
+
+                if (sppDiffers || bncDiffers) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.40f, 0.55f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.52f, 0.72f, 1.0f));
+                    std::string applyLabel = std::format("Apply Scene Defaults ({} SPP, {} Bounces)",
+                        stats.scene_default_spp > 0 ? stats.scene_default_spp : config.spp,
+                        stats.scene_default_max_bounces > 0 ? stats.scene_default_max_bounces : config.max_bounces);
+                    if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f))) {
+                        if (stats.scene_default_spp > 0) config.spp = stats.scene_default_spp;
+                        if (stats.scene_default_max_bounces > 0) config.max_bounces = stats.scene_default_max_bounces;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Instantly set ray budget and bounce depth to match author's reference scene settings.");
+                    }
+                    ImGui::PopStyleColor(2);
+                }
+                ImGui::Spacing();
+            }
+
             // Samples Per Pixel (SPP)
             int spp = static_cast<int>(config.spp);
-            if (ImGui::SliderInt("Samples/Pixel (SPP)", &spp, 1, 64)) {
+            int maxSppSlider = static_cast<int>(std::max(64u, stats.scene_default_spp));
+            ImGui::Text("Samples/Pixel (SPP)");
+            if (stats.scene_default_spp > 0) {
+                ImGui::SameLine();
+                if (config.spp == stats.scene_default_spp) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "(Scene default: %u - Matched)", stats.scene_default_spp);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "(Scene default: %u)", stats.scene_default_spp);
+                }
+            }
+            if (ImGui::SliderInt("##SppSlider", &spp, 1, maxSppSlider)) {
                 config.spp = static_cast<uint32_t>(spp);
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -739,7 +813,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement SPP by 1 (supports any integer / odd numbers)");
             ImGui::SameLine();
-            if (ImGui::SmallButton("+##SppInc") && config.spp < 64) {
+            if (ImGui::SmallButton("+##SppInc") && config.spp < static_cast<uint32_t>(maxSppSlider)) {
                 config.spp++;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -764,6 +838,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawSppPreset(16, "16");
             drawSppPreset(32, "32");
             drawSppPreset(64, "64");
+            if (stats.scene_default_spp > 0 && stats.scene_default_spp != 1 && stats.scene_default_spp != 2 &&
+                stats.scene_default_spp != 4 && stats.scene_default_spp != 8 && stats.scene_default_spp != 16 &&
+                stats.scene_default_spp != 32 && stats.scene_default_spp != 64) {
+                std::string scPresetLabel = std::format("Scene ({})", stats.scene_default_spp);
+                drawSppPreset(stats.scene_default_spp, scPresetLabel.c_str());
+            }
             ImGui::PopID();
             ImGui::NewLine();
 
@@ -771,7 +851,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             // Ray Bounces
             int bounces = static_cast<int>(config.max_bounces);
-            if (ImGui::SliderInt("Max Ray Bounces", &bounces, 1, 16)) {
+            int maxBouncesSlider = static_cast<int>(std::max(16u, std::min(64u, stats.scene_default_max_bounces)));
+            ImGui::Text("Max Ray Bounces");
+            if (stats.scene_default_max_bounces > 0) {
+                ImGui::SameLine();
+                if (config.max_bounces == stats.scene_default_max_bounces) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "(Scene default: %u - Matched)", stats.scene_default_max_bounces);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "(Scene default: %u)", stats.scene_default_max_bounces);
+                }
+            }
+            if (ImGui::SliderInt("##BncSlider", &bounces, 1, maxBouncesSlider)) {
                 config.max_bounces = static_cast<uint32_t>(bounces);
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -791,7 +881,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decrement bounce depth by 1");
             ImGui::SameLine();
-            if (ImGui::SmallButton("+##BncInc") && config.max_bounces < 16) {
+            if (ImGui::SmallButton("+##BncInc") && config.max_bounces < static_cast<uint32_t>(maxBouncesSlider)) {
                 config.max_bounces++;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -814,6 +904,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawBncPreset(4, "4 (Default)");
             drawBncPreset(8, "8");
             drawBncPreset(16, "16 (Max)");
+            if (stats.scene_default_max_bounces > 0 && stats.scene_default_max_bounces != 1 &&
+                stats.scene_default_max_bounces != 2 && stats.scene_default_max_bounces != 4 &&
+                stats.scene_default_max_bounces != 8 && stats.scene_default_max_bounces != 16) {
+                std::string scPresetLabel = std::format("Scene ({})", stats.scene_default_max_bounces);
+                drawBncPreset(stats.scene_default_max_bounces, scPresetLabel.c_str());
+            }
             ImGui::PopID();
             ImGui::NewLine();
 
