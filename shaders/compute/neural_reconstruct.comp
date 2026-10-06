@@ -618,22 +618,19 @@ void main() {
             float mvDivDisplay = clamp(length(v_surf - v_spec), 0.0, 1.0);
             specAlphaFloor = max(specAlphaFloor, 0.15 * mvDivDisplay);
 
-            float alphaDiff = (isNative && u_TotalSamples > 16u) ? 1.0 : mix(1.0, alphaBase, confDiff);
-            float alphaSpec = (isNative && u_TotalSamples > 16u) ? 1.0 : mix(1.0, clamp(alphaBase * 2.0 + 0.02, specAlphaFloor, 0.45), confSpec);
+            float alphaDiff = mix(1.0, alphaBase, confDiff);
+            float alphaSpec = mix(1.0, clamp(alphaBase * 2.0 + 0.02, specAlphaFloor, 0.45), confSpec);
 
             vec3 resolvedLinearDiff = mix(histDiff, spatialLinearDiff, alphaDiff);
             vec3 resolvedLinearSpec = mix(histSpec, spatialLinearSpec, alphaSpec);
 
-            // Remodulate diffuse irradiance by native display albedo on valid surfaces;
-            // preserve unmodulated radiance for sky / background void.
-            vec4 dispAlbedo = imageLoad(uDisplayAlbedo, outCoord);
-            bool isSurface = (centerDepth > 0.0 && centerDepth < 10000.0);
-            vec3 remodDiff = isSurface ? (resolvedLinearDiff * dispAlbedo.rgb) : resolvedLinearDiff;
-            vec3 finalHDR = remodDiff + resolvedLinearSpec;
+            // Physical linear radiance resolve:
+            // resolvedLinearDiff and resolvedLinearSpec are already physical radiance components (Vector 0 & 1).
+            // Direct linear summation strictly eliminates destructive albedo squaring.
+            vec3 finalHDR = resolvedLinearDiff + resolvedLinearSpec;
 
             if (any(isnan(finalHDR)) || any(isinf(finalHDR))) {
-                vec3 fallbackDiff = isSurface ? (spatialLinearDiff * dispAlbedo.rgb) : spatialLinearDiff;
-                finalHDR = fallbackDiff + spatialLinearSpec;
+                finalHDR = spatialLinearDiff + spatialLinearSpec;
                 if (any(isnan(finalHDR)) || any(isinf(finalHDR))) {
                     finalHDR = vec3(0.0);
                 }
