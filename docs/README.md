@@ -14,7 +14,7 @@ docs/
 ├── BUILD_WINDOWS.md                    # Windows 11 Build, MSYS2 & Packaging Guide
 ├── VULKAN_API_AUDIT.md                 # Complete Vulkan 1.4 API Call Audit & Platform Coverage
 ├── reports/                            # Empirical Benchmarking & Deep Technical Audits
-│   ├── codebase_review_2026_10_07.md   # Full Project Review (Oct 7 2026): current source of truth — DGC exec-set inversion, FSR 3.1 official integration, gate fixes
+│   ├── codebase_review_2026_10_07.md   # Full Project Review (Oct 7 2026): current source of truth — DGC exec-set inversion, FSR 3.1 feasibility, gate fixes
 │   ├── codebase_review_2026_10_05.md   # Full Project Review (Oct 5 2026, superseded): SOTA verification, quick wins & roadmap
 │   ├── codebase_sota_review.md         # SOTA Architectural & Performance Review (Sept 27 2026, superseded)
 │   ├── wavefront_batching_head_to_head.md # 2D Macro-Tile Partitioning & Queue Scaling Report
@@ -31,7 +31,7 @@ docs/
 ## 1. Architecture & Engineering Specifications
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**:
-  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), AMD FSR 3.1 Upscaler (official FidelityFX SDK, Vulkan backend), ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
+  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), temporal super-resolution (`fsr3` pass — a custom filter, *not* the official AMD FSR SDK; see review finding A3), ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
 
 ---
 
@@ -56,7 +56,7 @@ docs/
 The [`reports/`](reports/) directory contains formal research reports, architectural audits, and hardware profiling studies:
 
 - **[reports/codebase_review_2026_10_07.md](reports/codebase_review_2026_10_07.md)**:
-  Full project review (October 7, 2026) — **current source of truth**. Verifies the Oct 5 remediations survived the Oct 6 merge, documents the DGC execution-set default inversion (fixed), the FidelityFX-SDK Vulkan feasibility study and official FSR 3.1 Upscaler integration, the performance-matrix gate failure on non-RDNA4 hosts, and the prioritized roadmap.
+  Full project review (October 7, 2026) — **current source of truth**. Verifies the Oct 5 remediations survived the Oct 6 merge, documents the DGC execution-set default inversion (fixed), a FidelityFX-SDK Vulkan feasibility study for FSR 3.1 (integration descoped by the owner — the `fsr3` pass remains a custom filter, finding A3), the performance-matrix gate failure on non-RDNA4 hosts, and the prioritized roadmap.
 - **[reports/codebase_review_2026_10_05.md](reports/codebase_review_2026_10_05.md)**:
   Full project review (October 5, 2026). Re-verifies every finding from the September 27 SOTA review against current code, documents documentation/code drift, and provides the current prioritized action plan (quick wins through long-term SOTA roadmap).
 - **[reports/codebase_sota_review.md](reports/codebase_sota_review.md)**:
