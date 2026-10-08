@@ -226,6 +226,10 @@ private:
     float getDivergentAreaRatio() const;
     WavefrontSortMode getEffectiveWavefrontSortMode() const;
 
+    // Effective (post-capability) DGC explicit-preprocess state, recorded during
+    // pipeline init; telemetry must report this, never a hardcoded true.
+    bool isDgcPreprocessEnabled() const { return m_dgcPreprocessEnabled; }
+
     // GPU-Timeline TLAS Instance Update Pipeline & Dynamic Simulation (Tier 3)
     std::unique_ptr<GpuTlasUpdatePipeline> m_tlasUpdatePipeline;
     void initTlasBuffers(const std::vector<ASInstanceInput>& asInstances);
@@ -283,6 +287,7 @@ private:
     void runTrainingDataCapture();
 
     bool m_temporalResetRequested = true;
+    bool m_dgcPreprocessEnabled = false;
 
     // Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR 3.1)
     friend class SuperResolutionManager;

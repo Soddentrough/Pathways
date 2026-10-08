@@ -494,6 +494,8 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 #endif
     }
     m_hasRayTracing = hasAccStruct && hasRtPipeline && hasRayQuery && hasDeferredOps;
+    m_hasRayQuery = hasRayQuery;
+    m_hasDeferredOps = hasDeferredOps;
 
     // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
     VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps{};
@@ -511,14 +513,28 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 
     VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps{};
     pciBusProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+
+    // Core-feature structs: authoritative source for BDA / timeline semaphores /
+    // dynamic rendering / sync2 capability reporting (no hardcoded assumptions).
+    VkPhysicalDeviceVulkan12Features vk12Features{};
+    vk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceVulkan13Features vk13Features{};
+    vk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vk12Features.pNext = &vk13Features;
     if (hasPciBusInfo) {
         m_driverProperties.pNext = &pciBusProps;
+        pciBusProps.pNext = &vk12Features;
+    } else {
+        m_driverProperties.pNext = &vk12Features;
     }
 
     VkPhysicalDeviceProperties2 props2{};
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &subgroupProps;
     vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+    m_vk12Features = vk12Features;
+    m_vk13Features = vk13Features;
+    m_dgcProperties = dgcProps;
 
     Logger::info("Vulkan Driver: {} | Driver ID: {} ({}) | Conformance: {}.{}.{}.{}",
                  m_driverProperties.driverName,
@@ -548,6 +564,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
         m_hasSubgroupSizeControl = true;
     }
+    m_subgroupSize = (subgroupProps.minSubgroupSize <= 32 && subgroupProps.maxSubgroupSize >= 32)
+                         ? 32
+                         : subgroupProps.maxSubgroupSize;
     if (m_hasSubgroupSizeControl &&
         (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_RAYGEN_BIT_KHR) &&
         (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) &&
@@ -1114,29 +1133,26 @@ void VulkanContext::initVMA() {
 }
 
 namespace {
-// Single source of truth for per-architecture display metadata, indexed by
-// GpuArchitecture. One row per enumerator, in enum order (see VulkanContext.hpp).
-// Ray accelerator/RT core generations follow AMD and NVIDIA official numbering:
-// AMD ray accelerators start with RDNA2 (1st Gen) -> RDNA3/3.5 (2nd Gen) ->
-// RDNA4 (3rd Gen); RDNA1 has no ray accelerators. NVIDIA starts with Turing
-// (1st Gen RT Core) -> Ampere (2nd) -> Ada (3rd) -> Blackwell (4th).
+// Display metadata for detected architectures, indexed by GpuArchitecture.
+// One row per enumerator, in enum order (see VulkanContext.hpp). Identification
+// only: capability reporting must come from queried Vulkan features/extensions
+// (see getRayAcceleratorName() and the has*() accessors), never from this table.
 struct ArchInfo {
     const char* name;      // Full display name (telemetry JSON "arch_name")
     const char* shortName; // Compact name (window title)
-    const char* rtName;    // Ray accelerator generation description (telemetry JSON)
 };
 constexpr std::array<ArchInfo, 11> kArchInfoTable{{
-    /* Generic          */ {"Vulkan 1.4 Native GPU",   "Vulkan",    "Hardware Ray Queries (VK_KHR_ray_query)"},
-    /* AmdRDNA1        */ {"AMD RDNA1 (Navi 1x)",     "RDNA1",     "No Hardware Ray Accelerators (RDNA1)"},
-    /* AmdRDNA2        */ {"AMD RDNA2 (Navi 2x)",     "RDNA2",     "AMD RDNA2 1st Gen Ray Accelerators"},
-    /* AmdRDNA3        */ {"AMD RDNA3 (Navi 3x)",     "RDNA3",     "AMD RDNA3 2nd Gen Ray Accelerators"},
-    /* AmdRDNA3_5      */ {"AMD RDNA3.5 (GFX115x)",   "RDNA3.5",   "AMD RDNA3 2nd Gen Ray Accelerators"},
-    /* AmdRDNA4        */ {"AMD RDNA4 (GFX1201)",     "RDNA4",     "AMD RDNA4 3rd Gen Ray Accelerators"},
-    /* NvidiaTuring    */ {"NVIDIA Turing",           "Turing",    "NVIDIA 1st Gen RT Cores"},
-    /* NvidiaAmpere    */ {"NVIDIA Ampere",           "Ampere",    "NVIDIA 2nd Gen RT Cores"},
-    /* NvidiaAda       */ {"NVIDIA Ada Lovelace",     "Ada",       "NVIDIA 3rd Gen RT Cores"},
-    /* NvidiaBlackwell */ {"NVIDIA Blackwell",        "Blackwell", "NVIDIA 4th Gen RT Cores"},
-    /* IntelArc        */ {"Intel Arc Xe-HPG",        "Intel Arc", "Intel Xe Ray Tracing Units"},
+    /* Generic          */ {"Vulkan 1.4 Native GPU", "Vulkan"   },
+    /* AmdRDNA1        */ {"AMD RDNA1 (Navi 1x)",   "RDNA1"    },
+    /* AmdRDNA2        */ {"AMD RDNA2 (Navi 2x)",   "RDNA2"    },
+    /* AmdRDNA3        */ {"AMD RDNA3 (Navi 3x)",   "RDNA3"    },
+    /* AmdRDNA3_5      */ {"AMD RDNA3.5 (GFX115x)", "RDNA3.5"  },
+    /* AmdRDNA4        */ {"AMD RDNA4 (GFX1201)",   "RDNA4"    },
+    /* NvidiaTuring    */ {"NVIDIA Turing",         "Turing"   },
+    /* NvidiaAmpere    */ {"NVIDIA Ampere",         "Ampere"   },
+    /* NvidiaAda       */ {"NVIDIA Ada Lovelace",   "Ada"      },
+    /* NvidiaBlackwell */ {"NVIDIA Blackwell",      "Blackwell"},
+    /* IntelArc        */ {"Intel Arc Xe-HPG",      "Intel Arc"},
 }};
 
 const ArchInfo& archInfo(GpuArchitecture arch) {
@@ -1149,7 +1165,21 @@ std::string VulkanContext::getArchitectureName() const { return archInfo(m_archi
 
 std::string VulkanContext::getShortArchName() const { return archInfo(m_architecture).shortName; }
 
-std::string VulkanContext::getRayAcceleratorName() const { return archInfo(m_architecture).rtName; }
+std::string VulkanContext::getRayAcceleratorName() const {
+    // Derived from actually-queried extensions, not from the architecture table:
+    // report exactly the ray-tracing surface this device/driver exposes.
+    std::vector<const char*> features;
+    if (m_hasRayTracing) features.push_back("VK_KHR_ray_tracing_pipeline");
+    if (m_hasRayQuery) features.push_back("VK_KHR_ray_query");
+    if (m_hasPositionFetch) features.push_back("VK_KHR_ray_tracing_position_fetch");
+    if (features.empty()) return "No Hardware Ray Tracing";
+    std::string result = "Hardware Ray Tracing (";
+    for (size_t i = 0; i < features.size(); ++i) {
+        if (i) result += ", ";
+        result += features[i];
+    }
+    return result + ")";
+}
 
 uint64_t VulkanContext::getTotalVramBytes() const {
     VkPhysicalDeviceMemoryProperties memProperties;

@@ -493,20 +493,32 @@ FrameStats TelemetryReporter::getStats() const {
         stats.secondary_gpu_temp_c = 0;
     }
 
-    // 4. Hardware Support Levels
+    // 4. Hardware Support Levels (all values derived from queried device state;
+    //    no capability may be reported as a hardcoded literal)
     stats.has_hw_rt = (m_engine->m_tlas != nullptr);
-    stats.has_ray_query = true;
+    stats.has_ray_query = m_engine->m_context->hasRayQueryFeature();
     stats.has_as = (m_engine->m_tlas != nullptr);
-    stats.has_bda = true;
-    stats.has_dho = true;
+    stats.has_bda = m_engine->m_context->hasBufferDeviceAddress();
+    stats.has_dho = m_engine->m_context->hasDeferredHostOps();
     stats.has_rt_pipeline = (m_engine->m_rtpKhrPipeline != nullptr);
     stats.has_dgc = (m_engine->m_rtpKhrPipeline && m_engine->m_rtpKhrPipeline->isIndirectSupported());
-    stats.dgc_preprocess = true;
+    stats.dgc_preprocess = m_engine->isDgcPreprocessEnabled();
     stats.has_subgroup_control = m_engine->m_context->hasSubgroupSizeControl();
-    stats.subgroup_size = 32;
-    stats.has_dynamic_rendering = true;
-    stats.has_timeline_semaphores = true;
-    stats.has_sync2 = true;
+    stats.subgroup_size = m_engine->m_context->getSubgroupSize();
+    stats.has_dynamic_rendering = m_engine->m_context->hasDynamicRendering();
+    stats.has_timeline_semaphores = m_engine->m_context->hasTimelineSemaphores();
+    stats.has_sync2 = m_engine->m_context->hasSync2();
+
+    const auto& rtProps = m_engine->m_context->getRayTracingPipelineProperties();
+    stats.rt_handle_size = rtProps.shaderGroupHandleSize;
+    stats.rt_base_align = rtProps.shaderGroupBaseAlignment;
+    stats.rt_handle_align = rtProps.shaderGroupHandleAlignment;
+    stats.rt_max_recursion = rtProps.maxRayRecursionDepth;
+
+    const auto& dgcProps = m_engine->m_context->getDgcProperties();
+    stats.dgc_max_tokens = dgcProps.maxIndirectCommandsTokenCount;
+    stats.dgc_max_sequences = dgcProps.maxIndirectSequenceCount;
+    stats.dgc_max_stride = dgcProps.maxIndirectCommandsIndirectStride;
 
     // 5. Engine Settings & State
     stats.visualize_mgpu_split = m_engine->m_config.visualize_mgpu_split;

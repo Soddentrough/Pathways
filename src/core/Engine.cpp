@@ -802,6 +802,7 @@ void Engine::initPipelines() {
     m_currentBatchPixels = initBatchPixels;
 
     bool enableExecSet = m_context->supportsDgcExecutionSet() && Config::dgcExecSetRequested();
+    m_dgcPreprocessEnabled = m_config.dgc_preprocess && m_context->supportsDgcPreprocess();
 
     m_rtOrchestrator->initWavefrontPipeline(
         m_config.width, m_config.height,
@@ -810,7 +811,7 @@ void Engine::initPipelines() {
         wfShadeEmissiveCode, wfShadePassthroughCode,
         enableExecSet,
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-        m_config.dgc_preprocess && m_context->supportsDgcPreprocess(),
+        m_dgcPreprocessEnabled,
         m_context->hasSubgroupSizeControl(),
         initBatchPixels,
         wfTailMegakernelCode

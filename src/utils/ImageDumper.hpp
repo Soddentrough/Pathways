@@ -9,7 +9,7 @@ namespace pathways {
 
 struct FrameStats {
     // Platform & System Details
-    std::string os_name = "Linux";
+    std::string os_name = "Unknown";
     std::string kernel_version = "";
     std::string cpu_model = "";
     double ram_total_gb = 0.0;
@@ -21,10 +21,10 @@ struct FrameStats {
     uint32_t device_id = 0;
     std::string driver_version_str = "";
     std::string vulkan_api_str = "";
-    std::string device_type_str = "Discrete GPU";
+    std::string device_type_str = "Unknown";
     std::string arch_name = "Unknown";
     std::string short_arch = "GPU";
-    std::string ray_accelerator_name = "Hardware Ray Tracing";
+    std::string ray_accelerator_name = "Unknown";
     double total_vram_mb = 0.0;
     double vram_used_mb = 0.0;
     double vram_budget_mb = 0.0;
@@ -32,7 +32,7 @@ struct FrameStats {
     // Secondary GPU & Multi-GPU Topology
     std::string secondary_gpu_name = "";
     std::string secondary_arch_name = "";
-    std::string mgpu_interconnect_str = "PCIe 5.0 x16 (32 GT/s / ~64 GB/s Full-Duplex)";
+    std::string mgpu_interconnect_str = "N/A";
     std::string mgpu_mode_str = "off";
     std::string mgpu_transfer_mode_str = "N/A";
     bool is_mgpu_active = false;
@@ -60,26 +60,29 @@ struct FrameStats {
     uint32_t secondary_gpu_temp_c = 0;
 
     // Vulkan & Hardware RT Support Levels
-    bool has_hw_rt = true;
-    bool has_rt_pipeline = true;
-    bool has_ray_query = true;
-    bool has_as = true;
-    bool has_bda = true;
-    bool has_dho = true;
-    uint32_t rt_handle_size = 32;
-    uint32_t rt_base_align = 32;
-    uint32_t rt_handle_align = 16;
-    uint32_t rt_max_recursion = 31;
-    bool has_dgc = true;
-    bool dgc_preprocess = true;
-    uint32_t dgc_max_tokens = 128;
-    uint32_t dgc_max_sequences = 1048576;
-    uint32_t dgc_max_stride = 2048;
-    bool has_subgroup_control = true;
-    uint32_t subgroup_size = 32;
-    bool has_dynamic_rendering = true;
-    bool has_timeline_semaphores = true;
-    bool has_sync2 = true;
+    // Defaults are deliberately "unknown/false/0": a field that was never wired to
+    // a queried device property must never masquerade as a confirmed capability
+    // (see codebase_sota_review.md remediation note on FrameStats defaults).
+    bool has_hw_rt = false;
+    bool has_rt_pipeline = false;
+    bool has_ray_query = false;
+    bool has_as = false;
+    bool has_bda = false;
+    bool has_dho = false;
+    uint32_t rt_handle_size = 0;
+    uint32_t rt_base_align = 0;
+    uint32_t rt_handle_align = 0;
+    uint32_t rt_max_recursion = 0;
+    bool has_dgc = false;
+    bool dgc_preprocess = false;
+    uint32_t dgc_max_tokens = 0;
+    uint32_t dgc_max_sequences = 0;
+    uint32_t dgc_max_stride = 0;
+    bool has_subgroup_control = false;
+    uint32_t subgroup_size = 0;
+    bool has_dynamic_rendering = false;
+    bool has_timeline_semaphores = false;
+    bool has_sync2 = false;
 
     // Engine Settings & Configuration
     std::string pipeline_type_str = "rtp";

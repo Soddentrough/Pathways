@@ -120,6 +120,16 @@ public:
     bool hasDgcExecutionSet() const { return m_hasDgcExecutionSet; }
     bool supportsDgcPreprocess() const { return m_hasDGC; }
     bool supportsDgcExecutionSet() const { return m_hasDgcExecutionSet; }
+    // Capability queries derived exclusively from vkGetPhysicalDeviceProperties2
+    // results and the device extension list - never from architecture guesses.
+    bool hasRayQueryFeature() const { return m_hasRayQuery; }
+    bool hasDeferredHostOps() const { return m_hasDeferredOps; }
+    bool hasBufferDeviceAddress() const { return m_vk12Features.bufferDeviceAddress == VK_TRUE; }
+    bool hasTimelineSemaphores() const { return m_vk12Features.timelineSemaphore == VK_TRUE; }
+    bool hasDynamicRendering() const { return m_vk13Features.dynamicRendering == VK_TRUE; }
+    bool hasSync2() const { return m_vk13Features.synchronization2 == VK_TRUE; }
+    uint32_t getSubgroupSize() const { return m_subgroupSize; }
+    const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT& getDgcProperties() const { return m_dgcProperties; }
     bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
@@ -185,6 +195,12 @@ private:
     bool m_hasExternalMemoryDmaBuf = false;
     bool m_hasExternalSemaphoreFd = false;
     bool m_hasDgcExecutionSet = false;
+    bool m_hasRayQuery = false;
+    bool m_hasDeferredOps = false;
+    VkPhysicalDeviceVulkan12Features m_vk12Features{};
+    VkPhysicalDeviceVulkan13Features m_vk13Features{};
+    VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT m_dgcProperties{};
+    uint32_t m_subgroupSize = 0;
     bool m_hasCooperativeMatrix = false;
     bool m_hasHdrMetadata = false;
     bool m_hasFullScreenExclusive = false;
