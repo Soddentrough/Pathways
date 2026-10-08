@@ -10,8 +10,10 @@ Gate semantics (Oct 8 2026, review finding A2):
   device does not match the baseline device, the matrix SKIPS (exit 0) with a printed
   reason instead of reporting false regressions. Legacy baselines (flat dict, no metadata)
   also skip, prompting a re-cut with --update-baseline on the reference hardware.
-- Multi-GPU profiles (*_mgpu) are skipped automatically when the engine reports a
-  [Single GPU] configuration for --mgpu (i.e. fewer than 2 qualifying RT/DGC devices).
+- Multi-GPU profiles (*_mgpu) are skipped automatically when the engine's --mgpu run
+  reports no active secondary GPU (i.e. fewer than 2 qualifying RT/DGC devices).
+- The harness parses no engine stdout: device identity, driver, and dual-GPU capability
+  are all read from the engine's own --dump-stats JSON (the engine is the source of truth).
 - An idle-system guard checks amdgpu gpu_busy_percent before measuring; a busy GPU
   (e.g. another workload sharing a UMA APU) aborts the run with a printed reason.
 - RADV_PROFILE_PSTATE=peak is pinned for all benchmark subprocesses so Mesa does not
@@ -24,6 +26,7 @@ import argparse
 import subprocess
 import json
 import time
+import tempfile
 
 PATHWAYS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BIN_CANDIDATES = [
@@ -91,43 +94,43 @@ def benchmark_env():
     return env
 
 def probe_hardware(bin_path):
-    """Run a tiny headless frame and extract device name, driver version, and
-    whether --mgpu actually yields a Dual GPU configuration."""
-    base_cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240", "--spp", "1"]
+    """Run one tiny --mgpu headless frame with --dump-stats and read device identity,
+    driver version, and dual-GPU capability straight from the engine's own JSON.
+
+    A single run suffices: the primary-GPU block is identical with or without --mgpu,
+    and --mgpu additionally tells us whether a second GPU is actually active
+    (secondary_gpu.active). No stdout is parsed — the engine is the source of truth.
+    """
+    probe_json = os.path.join(tempfile.gettempdir(), "pathways_perf_probe.json")
+    cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240",
+           "--spp", "1", "--mgpu", "--dump-stats", probe_json]
     try:
-        probe_res = subprocess.run(base_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True,
-                                   timeout=15, env=benchmark_env())
+        probe_res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True,
+                                   timeout=20, env=benchmark_env())
     except subprocess.TimeoutExpired:
-        return None, None, False, "Hardware probe timed out after 15s (software emulation)"
+        return None, None, False, "Hardware probe timed out after 20s (software emulation)"
 
     if probe_res.returncode != 0:
         return None, None, False, (f"Vulkan Ray Tracing hardware not available in environment "
                                    f"(code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}")
 
-    out = probe_res.stdout + probe_res.stderr
-    device, driver = "", ""
-    for line in out.splitlines():
-        if "Identified target hardware:" in line:
-            m = line.split("Identified target hardware:", 1)[1].strip()
-            device = m.split(" (", 1)[0].strip()
-        elif "(Driver:" in line:
-            m = line.split("(Driver:", 1)[1].split(")", 1)[0].strip()
-            if m:
-                driver = m
+    try:
+        with open(probe_json, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        return None, None, False, f"Failed to read probe stats JSON: {e}"
+    finally:
+        try:
+            os.remove(probe_json)
+        except OSError:
+            pass
+
+    pg = data.get("primary_gpu", {})
+    device = pg.get("device_name", "").split(" (")[0].strip()
+    driver = pg.get("vulkan_api_version", "")
     if device and any(sw in device.lower() for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
         return None, None, False, "Software/CPU Vulkan renderer detected"
-
-    # Second probe: does --mgpu actually produce a Dual GPU configuration?
-    mgpu_available = False
-    try:
-        mgpu_res = subprocess.run(base_cmd + ["--mgpu"], cwd=PATHWAYS_ROOT, capture_output=True,
-                                  text=True, timeout=15, env=benchmark_env())
-        for line in (mgpu_res.stdout + mgpu_res.stderr).splitlines():
-            if "[Dual GPU" in line:
-                mgpu_available = True
-                break
-    except subprocess.TimeoutExpired:
-        pass
+    mgpu_available = bool(data.get("secondary_gpu", {}).get("active", False))
     return device or None, driver, mgpu_available, None
 
 def gpu_busy_percentages():

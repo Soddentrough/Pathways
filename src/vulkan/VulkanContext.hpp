@@ -170,7 +170,6 @@ private:
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtPipelineProperties{};
     std::string m_deviceName;
     GpuArchitecture m_architecture = GpuArchitecture::Generic;
-    bool m_isRDNA4 = false;
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;

@@ -421,8 +421,6 @@ FrameStats TelemetryReporter::getStats() const {
     stats.arch_name = m_engine->m_context->getArchitectureName();
     stats.short_arch = m_engine->m_context->getShortArchName();
     stats.ray_accelerator_name = m_engine->m_context->getRayAcceleratorName();
-    stats.is_rdna3 = m_engine->m_context->isRDNA3();
-    stats.is_rdna4 = m_engine->m_context->isRDNA4();
     uint32_t drvVer = m_engine->m_context->getDriverVersion();
     stats.driver_version_str = std::format("{}.{}.{}", (drvVer >> 22) & 0x3FF, (drvVer >> 12) & 0x3FF, drvVer & 0xFFF);
     uint32_t apiVer = m_engine->m_context->getApiVersion();

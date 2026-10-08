@@ -250,8 +250,6 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"architecture\": \"{}\",\n", stats.arch_name)
         << std::format("    \"short_architecture\": \"{}\",\n", stats.short_arch)
         << std::format("    \"ray_accelerator\": \"{}\",\n", stats.ray_accelerator_name)
-        << std::format("    \"is_rdna3\": {},\n", stats.is_rdna3 ? "true" : "false")
-        << std::format("    \"is_rdna4\": {},\n", stats.is_rdna4 ? "true" : "false")
         << "    \"pcie\": {\n"
         << std::format("      \"link_status\": \"{}\",\n", stats.primary_pci_link)
         << std::format("      \"active_speed\": \"{}\",\n", stats.primary_pci_speed)

@@ -25,8 +25,6 @@ struct FrameStats {
     std::string arch_name = "Unknown";
     std::string short_arch = "GPU";
     std::string ray_accelerator_name = "Hardware Ray Tracing";
-    bool is_rdna3 = false;
-    bool is_rdna4 = false;
     double total_vram_mb = 0.0;
     double vram_used_mb = 0.0;
     double vram_budget_mb = 0.0;

@@ -194,6 +194,95 @@ void VulkanContext::setupDebugMessenger() {
     }
 }
 
+namespace {
+// PCI deviceID is the authoritative, stable identifier for the exact hardware
+// variant — commercial names are localized and change between driver releases, so
+// they are only a best-effort fallback for device IDs not yet listed below.
+//
+// AMD (0x1002) RDNA device-ID table, verified against the PCI ID database
+// (/usr/share/hwdata/pci.ids, vendor 1002 "Advanced Micro Devices, Inc. [AMD/ATI]").
+GpuArchitecture detectAmdArchitecture(uint32_t deviceID, const std::string& nameLower) {
+    switch (deviceID) {
+        // RDNA4 (gfx120x)
+        case 0x7550: // Navi 48 [RX 9070 / 9070 XT / 9070 GRE]
+        case 0x7590: // Navi 44 [RX 9050 / 9060 XT]
+            return GpuArchitecture::AmdRDNA4;
+        // RDNA3.5 (gfx115x)
+        case 0x1586: // Strix Halo [Radeon 8050S / 8060S]
+        case 0x150e: // Strix [Radeon 880M / 890M]
+            return GpuArchitecture::AmdRDNA3_5;
+        // RDNA3 (gfx110x)
+        case 0x744c: // Navi 31 [RX 7900 XT / XTX / GRE / 7900M]
+        case 0x747e: // Navi 32 [RX 7700 XT / 7800 XT]
+        case 0x7480: // Navi 33 [RX 7600 / 7600 XT / 7600S / 7700S / PRO W7600]
+        case 0x73f0: // Navi 33 [RX 7600M XT]
+        case 0x7483: // Navi 33 [RX 7600M / 7600M XT]
+        case 0x164f: // Phoenix (Ryzen 7000 APU, gfx1102)
+        case 0x15bf: // Phoenix1
+        case 0x15c8: // Phoenix2
+            return GpuArchitecture::AmdRDNA3;
+        // RDNA2 (gfx103x)
+        case 0x73a5: // Navi 21 [RX 6950 XT]
+        case 0x73af: // Navi 21 [RX 6900 XT]
+        case 0x73bf: // Navi 21 [RX 6800 / 6800 XT / 6900 XT]
+        case 0x73df: // Navi 22 [RX 6700 / 6700 XT / 6750 XT / 6800M / 6850M XT]
+        case 0x73ef: // Navi 23 [RX 6650 XT / 6700S / 6800S]
+        case 0x73ff: // Navi 23 [RX 6600 / 6600 XT / 6600M]
+        case 0x1681: // Rembrandt [Radeon 680M]
+        case 0x164d: // Rembrandt
+        case 0x164c: // Lucienne
+            return GpuArchitecture::AmdRDNA2;
+        // RDNA1 (gfx101x)
+        case 0x7310: // Navi 10 [Radeon Pro W5700X]
+        case 0x7312: // Navi 10 [Radeon Pro W5700]
+        case 0x7319: // Navi 10 [Radeon Pro 5700 XT]
+        case 0x731b: // Navi 10 [Radeon Pro 5700]
+        case 0x731f: // Navi 10 [RX 5600 OEM / 5600 XT / 5700 / 5700 XT]
+        case 0x7340: // Navi 14 [RX 5500 / 5500M / Pro 5300 / 5300M / 5500M]
+        case 0x7341: // Navi 14 [Radeon Pro W5500]
+        case 0x7347: // Navi 14 [Radeon Pro W5500M]
+        case 0x734f: // Navi 14 [Radeon Pro W5300M]
+            return GpuArchitecture::AmdRDNA1;
+        default:
+            break; // unlisted ID -> name-based best-effort below
+    }
+
+    // Best-effort fallback for device IDs not in the table above (forward-compat).
+    if (nameLower.find("rdna4") != std::string::npos || nameLower.find("gfx12") != std::string::npos ||
+        nameLower.find("9070") != std::string::npos || nameLower.find("9080") != std::string::npos ||
+        nameLower.find("9060") != std::string::npos || nameLower.find("rx 9") != std::string::npos ||
+        nameLower.find("rx9") != std::string::npos) {
+        return GpuArchitecture::AmdRDNA4;
+    }
+    if (nameLower.find("rdna3.5") != std::string::npos || nameLower.find("gfx115") != std::string::npos ||
+        nameLower.find("strix_halo") != std::string::npos || nameLower.find("8060s") != std::string::npos ||
+        nameLower.find("8050s") != std::string::npos || nameLower.find("890m") != std::string::npos ||
+        nameLower.find("880m") != std::string::npos) {
+        return GpuArchitecture::AmdRDNA3_5;
+    }
+    if (nameLower.find("rdna3") != std::string::npos || nameLower.find("gfx11") != std::string::npos ||
+        nameLower.find("7900") != std::string::npos || nameLower.find("7800") != std::string::npos ||
+        nameLower.find("7700") != std::string::npos || nameLower.find("7600") != std::string::npos ||
+        nameLower.find("rx 7") != std::string::npos || nameLower.find("rx7") != std::string::npos) {
+        return GpuArchitecture::AmdRDNA3;
+    }
+    if (nameLower.find("rdna2") != std::string::npos || nameLower.find("gfx103") != std::string::npos ||
+        nameLower.find("6950") != std::string::npos || nameLower.find("6900") != std::string::npos ||
+        nameLower.find("6800") != std::string::npos || nameLower.find("6700") != std::string::npos ||
+        nameLower.find("6600") != std::string::npos || nameLower.find("6500") != std::string::npos ||
+        nameLower.find("rx 6") != std::string::npos || nameLower.find("rx6") != std::string::npos) {
+        return GpuArchitecture::AmdRDNA2;
+    }
+    if (nameLower.find("rdna1") != std::string::npos || nameLower.find("gfx101") != std::string::npos ||
+        nameLower.find("5700") != std::string::npos || nameLower.find("5600") != std::string::npos ||
+        nameLower.find("5500") != std::string::npos || nameLower.find("rx 57") != std::string::npos ||
+        nameLower.find("rx 56") != std::string::npos) {
+        return GpuArchitecture::AmdRDNA1;
+    }
+    return GpuArchitecture::Generic;
+}
+} // namespace
+
 void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surface) {
     auto devices = enumeratePhysicalDevices(m_instance);
     if (devices.empty()) {
@@ -235,35 +324,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
 
     if (m_deviceProperties.vendorID == 0x1002 || nameLower.find("amd") != std::string::npos || nameLower.find("radeon") != std::string::npos) {
-        if (nameLower.find("rdna4") != std::string::npos || nameLower.find("gfx12") != std::string::npos ||
-            nameLower.find("r9700") != std::string::npos || nameLower.find("9070") != std::string::npos ||
-            nameLower.find("9080") != std::string::npos || nameLower.find("9060") != std::string::npos ||
-            nameLower.find("rx 9") != std::string::npos || nameLower.find("rx9") != std::string::npos) {
-            m_architecture = GpuArchitecture::AmdRDNA4;
-            m_isRDNA4 = true;
-        } else if (nameLower.find("rdna3.5") != std::string::npos || nameLower.find("gfx115") != std::string::npos ||
-                   nameLower.find("890m") != std::string::npos || nameLower.find("880m") != std::string::npos) {
-            m_architecture = GpuArchitecture::AmdRDNA3_5;
-        } else if (nameLower.find("rdna3") != std::string::npos || nameLower.find("gfx11") != std::string::npos ||
-                   nameLower.find("7900") != std::string::npos || nameLower.find("7800") != std::string::npos ||
-                   nameLower.find("7700") != std::string::npos || nameLower.find("7600") != std::string::npos ||
-                   nameLower.find("w7900") != std::string::npos || nameLower.find("w7800") != std::string::npos ||
-                   nameLower.find("rx 7") != std::string::npos || nameLower.find("rx7") != std::string::npos) {
-            m_architecture = GpuArchitecture::AmdRDNA3;
-        } else if (nameLower.find("rdna2") != std::string::npos || nameLower.find("gfx103") != std::string::npos ||
-                   nameLower.find("6950") != std::string::npos || nameLower.find("6900") != std::string::npos ||
-                   nameLower.find("6800") != std::string::npos || nameLower.find("6700") != std::string::npos ||
-                   nameLower.find("6600") != std::string::npos || nameLower.find("6500") != std::string::npos ||
-                   nameLower.find("rx 6") != std::string::npos || nameLower.find("rx6") != std::string::npos) {
-            m_architecture = GpuArchitecture::AmdRDNA2;
-        } else if (nameLower.find("rdna1") != std::string::npos || nameLower.find("gfx101") != std::string::npos ||
-                   nameLower.find("5700") != std::string::npos || nameLower.find("5600") != std::string::npos ||
-                   nameLower.find("5500") != std::string::npos || nameLower.find("rx 57") != std::string::npos ||
-                   nameLower.find("rx 56") != std::string::npos) {
-            m_architecture = GpuArchitecture::AmdRDNA1;
-        } else {
-            m_architecture = GpuArchitecture::Generic;
-        }
+        // Identify the exact RDNA variant by PCI deviceID (authoritative); the
+        // helper falls back to name matching only for unlisted device IDs.
+        m_architecture = detectAmdArchitecture(m_deviceProperties.deviceID, nameLower);
     } else if (m_deviceProperties.vendorID == 0x10DE || nameLower.find("nvidia") != std::string::npos || nameLower.find("geforce") != std::string::npos) {
         if (nameLower.find("blackwell") != std::string::npos || nameLower.find("5090") != std::string::npos ||
             nameLower.find("5080") != std::string::npos || nameLower.find("5070") != std::string::npos ||
@@ -1037,7 +1100,7 @@ void VulkanContext::initVMA() {
 std::string VulkanContext::getArchitectureName() const {
     switch (m_architecture) {
         case GpuArchitecture::AmdRDNA4:        return "AMD RDNA4 (GFX1201)";
-        case GpuArchitecture::AmdRDNA3_5:      return "AMD RDNA3.5 (GFX1150)";
+        case GpuArchitecture::AmdRDNA3_5:      return "AMD RDNA3.5 (GFX115x)";
         case GpuArchitecture::AmdRDNA3:        return "AMD RDNA3 (Navi 3x)";
         case GpuArchitecture::AmdRDNA2:        return "AMD RDNA2 (Navi 2x)";
         case GpuArchitecture::AmdRDNA1:        return "AMD RDNA1 (Navi 1x)";
