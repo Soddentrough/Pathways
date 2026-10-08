@@ -191,7 +191,8 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
                                          plan.isSampleBlendFsr3, params.renderW, params.renderH, params.config.width, params.config.height,
                                          jitterSec, (params.hardReset || params.temporalResetRequested), isSecMotion, params.frameIndex,
                                          params.config.upscaler_sharpening, params.config.upscaler_sharpening ? params.config.upscaler_sharpness : 0.0f,
-                                         (params.config.progressive_accumulation && inOutAccumulatedSamples > 0) ? inOutAccumulatedSamples : 1u);
+                                         (params.config.progressive_accumulation && inOutAccumulatedSamples > 0) ? inOutAccumulatedSamples : 1u,
+                                         static_cast<uint32_t>(params.effectiveWavefrontSortMode));
     }
 
     return plan;

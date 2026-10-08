@@ -158,7 +158,7 @@ Engine::Engine(const Config& config) : m_config(config) {
             hwDeviceCount++;
         }
     }
-    if (hwDeviceCount >= 2 && m_config.mgpu_mode != MultiGpuMode::Off) {
+    if (hwDeviceCount >= 2) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
     // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
@@ -801,14 +801,17 @@ void Engine::initPipelines() {
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
 
+    const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
+    bool enableExecSet = m_context->supportsDgcExecutionSet() && (!execsetEnv || execsetEnv[0] != '0');
+
     m_rtOrchestrator->initWavefrontPipeline(
         m_config.width, m_config.height,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         wfShadeEmissiveCode, wfShadePassthroughCode,
-        m_context->hasDgcExecutionSet(),
+        enableExecSet,
         wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-        m_config.dgc_preprocess && !m_context->isRDNA4(), // enableDgcPreprocess (bypass on RDNA4/GFX1201 due to RADV illegal opcode bug)
+        m_config.dgc_preprocess && m_context->supportsDgcPreprocess(),
         m_context->hasSubgroupSizeControl(),
         initBatchPixels,
         wfTailMegakernelCode
@@ -901,7 +904,7 @@ void Engine::initPipelines() {
 
                 bool hasLt = m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && ltBuf != nullptr);
                 m_restirManager->recordFrame(cmd, frameSlot, rw, rh,
-                                             m_numLights, static_cast<uint32_t>(m_sceneData.triangles.size()), hasLt,
+                                             m_numLights, m_numTriangles, hasLt,
                                              m_frameIndex, m_config.restir_di_m_cap,
                                              rayGeom, rayHit, pixelToRay,
                                              lightsBuf, matsBuf,
@@ -1961,7 +1964,8 @@ void Engine::renderFrame() {
             envIntensity,
             useHwRT,
             m_temporalResetRequested,
-            m_accumulatedSamples
+            m_accumulatedSamples,
+            getEffectiveWavefrontSortMode()
         };
 
         if (m_mgpuCoordinator) {

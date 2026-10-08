@@ -164,19 +164,41 @@ python3 scripts/audit_vulkan_api.py -w all --exclude-mobile
 
 ## 7. Telemetry, Monitoring & Profiling
 
-### Hardware Telemetry with AMD SMI
-To monitor GPU power, clock speeds, VRAM allocation, and thermals on AMD GPUs:
-```bash
-# Monitor dual GPU memory and clock utilization
-/opt/rocm/core-10.0/bin/amd-smi monitor -putm
+Comprehensive profiling guidance and the full diagnostic decision matrix are detailed in **[docs/PROFILING.md](PROFILING.md)**.
 
-# Process resource consumption
-/opt/rocm/core-10.0/bin/amd-smi process
+### Hardware Telemetry with AMD SMI
+Use `/opt/rocm/core-10.0/bin/amd-smi` to monitor power, clock frequencies, memory controller saturation, and thermals on AMD GPUs:
+```bash
+# Live dashboard of clocks, power, thermals, engine %, and memory %:
+/opt/rocm/core-10.0/bin/amd-smi monitor -u -m -p -t -v -w 1
+
+# Full metric snapshot across all GPUs:
+/opt/rocm/core-10.0/bin/amd-smi metric -g all
+
+# Process resource consumption and engine occupancy:
+/opt/rocm/core-10.0/bin/amd-smi process -G -e
+
+# Multi-GPU PCIe & P2P DMA link topology:
+/opt/rocm/core-10.0/bin/amd-smi topology -a -t -d -b
 ```
+
+#### Key Telemetry Bottleneck Signals
+* **`GFX_ACTIVITY` < 85%**: Host CPU bottleneck, swapchain presentation stall, or synchronization barrier wait (`vkWaitForFences`, `vkQueuePresentKHR`).
+* **`UMC_ACTIVITY` > 75%**: Memory-bandwidth-bound (off-chip GDDR6 traffic saturation). Contrast with low UMC% (<30%) and 100% GFX%, which indicates an ALU/compute-bound workload.
+* **`USED_VISIBLE_VRAM` at 256 MB**: Resizable BAR (Smart Access Memory) is disabled or staging buffers are spilling into dynamically paged system memory.
+* **`USED_GTT` Non-Zero & Growing**: VRAM oversubscribed; allocations have spilled across PCIe into system RAM.
+* **Clock Dips / Deep Sleep**: Sparse command submission or inter-frame idle bubbles causing the AMDGPU governor to drop P-states. Fix for benchmarks via `amd-smi set -l high -g all`.
+* **Hotspot > 100°C / Power Limit**: Thermal or package power limit (TGP/PPT) throttling, verified via `amd-smi metric -v`.
+* **PCIe Replay Count**: Non-zero `REPLAY_COUNT` in `amd-smi metric -P` indicates bus transmission errors or degraded riser cables.
+
+### Driver Performance Hints & Compiler Diagnostics (Mesa RADV)
+* **`RADV_PERFEST=1`**: Flags driver-level optimization gaps (uncompressed DCC fallback, slow blits, sub-optimal layouts).
+* **`RADV_PERFTEST=rtcps`**: Toggles Continuation-Passing Style (CPS) lowering for ray tracing shaders.
+* **`RADV_DEBUG=shaderstats,nocache`**: Dumps ACO compiler statistics (VGPRs, SGPRs, scratch memory spilling, and Wave32 occupancy).
 
 ### Profiling with Radeon Developer Tool Suite (RDTS)
 Pathways is fully compatible with AMD RDTS tools located at `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`:
-- **Radeon GPU Profiler (RGP)**: Capture instruction-level wave execution, barrier stalls, and compute queue dispatches.
-- **Radeon Raytracing Analyzer (RRA)**: Inspect hardware BLAS/TLAS acceleration structures, surface areas, and traversal costs.
+- **Radeon GPU Profiler (RGP)**: Capture instruction-level wave execution, barrier stalls, and compute queue dispatches via `MESA_VK_TRACE=rgp`.
+- **Radeon Raytracing Analyzer (RRA)**: Inspect hardware BLAS/TLAS acceleration structures, surface areas, and traversal costs via `MESA_VK_TRACE=rra`.
 - **Radeon GPU Detective (RGD)**: Crash analysis and post-mortem page fault triage.
-- **Radeon GPU Analyzer (RGA)**: Offline ISA shader compilation and VGPR register pressure auditing.
+- **Radeon GPU Analyzer (RGA)**: Offline ISA shader compilation and VGPR register pressure auditing (`rga -s vk-spv-offline --asic gfx1201`).

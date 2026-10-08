@@ -88,10 +88,14 @@ public:
     }
 
     const VkPhysicalDeviceProperties& getDeviceProperties() const { return m_deviceProperties; }
+    const VkPhysicalDeviceDriverProperties& getDriverProperties() const { return m_driverProperties; }
     const std::string& getDeviceName() const { return m_deviceName; }
     uint32_t getVendorID() const { return m_deviceProperties.vendorID; }
     uint32_t getDeviceID() const { return m_deviceProperties.deviceID; }
     uint32_t getDriverVersion() const { return m_deviceProperties.driverVersion; }
+    VkDriverId getDriverID() const { return m_driverProperties.driverID; }
+    const char* getDriverName() const { return m_driverProperties.driverName; }
+    const char* getDriverInfo() const { return m_driverProperties.driverInfo; }
     uint32_t getApiVersion() const { return m_deviceProperties.apiVersion; }
     VkPhysicalDeviceType getDeviceType() const { return m_deviceProperties.deviceType; }
     uint64_t getTotalVramBytes() const;
@@ -101,8 +105,6 @@ public:
     std::string getShortArchName() const;
     std::string getRayAcceleratorName() const;
     bool isRDNA() const;
-    bool isRDNA3() const { return m_architecture == GpuArchitecture::AmdRDNA3; }
-    bool isRDNA4() const { return m_architecture == GpuArchitecture::AmdRDNA4; }
     static constexpr uint32_t PATHWAYS_MIN_VULKAN_API_VERSION = VK_MAKE_API_VERSION(0, 1, 4, 341);
 
     bool hasDGC() const { return m_hasDGC; }
@@ -112,9 +114,11 @@ public:
     bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
     bool hasExternalMemoryFd() const { return m_hasExternalMemoryFd; }
     bool hasExternalMemoryDmaBuf() const { return m_hasExternalMemoryDmaBuf; }
-    bool isValidationEnabled() const { return m_validationLayersEnabled; }
     bool hasExternalSemaphoreFd() const { return m_hasExternalSemaphoreFd; }
+    bool isValidationEnabled() const { return m_validationLayersEnabled; }
     bool hasDgcExecutionSet() const { return m_hasDgcExecutionSet; }
+    bool supportsDgcPreprocess() const { return m_hasDGC; }
+    bool supportsDgcExecutionSet() const { return m_hasDgcExecutionSet; }
     bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
@@ -167,6 +171,7 @@ private:
     QueueFamilyIndices m_queueIndices;
 
     VkPhysicalDeviceProperties m_deviceProperties{};
+    VkPhysicalDeviceDriverProperties m_driverProperties{};
     VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtPipelineProperties{};
     std::string m_deviceName;
     GpuArchitecture m_architecture = GpuArchitecture::Generic;

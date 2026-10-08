@@ -12,6 +12,7 @@ docs/
 ├── ARCHITECTURE.md                     # Core Engine Architecture & Technical Specification
 ├── BUILD_LINUX.md                      # Linux Build, Toolchain & Execution Guide
 ├── BUILD_WINDOWS.md                    # Windows 11 Build, MSYS2 & Packaging Guide
+├── PROFILING.md                        # Performance Profiling & Hardware Telemetry Guide
 ├── VULKAN_API_AUDIT.md                 # Complete Vulkan 1.4 API Call Audit & Platform Coverage
 ├── reports/                            # Empirical Benchmarking & Deep Technical Audits
 │   ├── codebase_review_2026_10_07.md   # Full Project Review (Oct 7 2026): current source of truth — DGC exec-set inversion, FSR 3.1 feasibility, gate fixes
@@ -35,8 +36,10 @@ docs/
 
 ---
 
-## 2. Platform Build & Toolchain Guides
+## 2. Platform Build, Toolchain & Profiling Guides
 
+- **[PROFILING.md](PROFILING.md)**:
+  Authoritative hardware telemetry and performance profiling guide for AMD RDNA architectures (Dual Radeon AI PRO R9700 / `gfx1201`). Details the three-tier profiling strategy, bottleneck identification using `/opt/rocm/core-10.0/bin/amd-smi` (engine activity, memory controller saturation, ReBAR/GTT spilling, DPM clocks, power/thermals, PCIe bus health), driver diagnostics (`RADV_PERFEST`, `RADV_DEBUG`), Radeon Developer Tool Suite integration (RGP, RRA, RGA), and the diagnostic decision matrix.
 - **[BUILD_LINUX.md](BUILD_LINUX.md)**:
   Detailed build and runtime instructions for Linux workstations (Fedora, Ubuntu/Debian, Arch Linux). Covers C++23 compilers (GCC 14+, Clang 20+), Ninja, CMake Presets (`linux-release`, `linux-debug`, `linux-test`), Mesa RADV / AMD ROCm 10 driver configuration, multi-GPU streaming, and automated test execution.
 - **[BUILD_WINDOWS.md](BUILD_WINDOWS.md)**:

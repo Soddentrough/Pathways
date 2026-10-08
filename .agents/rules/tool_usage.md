@@ -85,4 +85,21 @@ trigger: always_on
      - All test and engine executables in `build\windows-clang-release\bin\*` (e.g. `pathways.exe`, `test_*.exe`)
      - `./build/bin/pathways`
 
+5. **Proportional Verification Gate & Anti-Busywork**:
+   To prevent wasteful tool execution and cargo-cult testing, verification must strictly match the blast radius of the modified files. Never run non-applicable verification tools.
+
+   - **The Applicability Test (Mandatory Gate)**:
+     Before proposing or running any build or test command, verify:
+     *"Does this command have the technical capability to detect a defect in the specific files modified?"*
+     If the answer is **NO**, executing the command is strictly forbidden.
+
+   - **Tiered Verification Hierarchy**:
+     - **Tier 0 (Documentation & Text)**: When modifying `.md`, `.txt`, comments, or documentation files only, verify **strictly via `git diff`** (to inspect formatting, text, and link validity). **NEVER run `ctest`, `ninja`, `cmake`, `build.ps1`, or test scripts for documentation changes.**
+     - **Tier 1 (Shaders)**: When modifying individual shaders (`.comp`, `.rchit`, `.rgen`), compile only the targeted shader via `glslc` or audit via `rga`. Do not run full test suites unless evaluating runtime pipeline integration.
+     - **Tier 2 (Targeted C++ Modules)**: When fixing an isolated C++ bug, build incrementally and run only the targeted unit test (e.g. `ctest -R <specific_test>`). Do not run the full 20-test suite.
+     - **Tier 3 (Core Architecture & Regressions)**: Run the full test suite (`ctest`, `./scripts/run_headless_tests.sh`, or `.\scripts\run_headless_tests.ps1`) only when modifying core engine headers/pipelines or when explicitly requested by the user.
+
+   - **No Speculative Background Tasks or Timers**:
+     Never launch commands into the background or schedule status/check-in timers unless executing a genuinely long-running job (e.g., a multi-scene benchmark run) that was explicitly requested.
+
 

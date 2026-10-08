@@ -581,7 +581,7 @@ This section audits technical debt, non-optimal patterns, compiler warning suppr
   bool is_rdna4 = true;
   ```
   Rather than dynamically querying `VulkanContext::getArchitecture()`, any `FrameStats` object not explicitly wired through `Engine::populateFrameStats()` defaults to discrete RDNA4 telemetry. As a consequence, frame metadata dumps (`--dump-stats`) generated on AMD Strix Halo APUs (`gfx1151`), RDNA3 discrete GPUs (e.g., Radeon RX 7900 XTX / `gfx1100`), or future RDNA5 hardware falsely report that they executed on an RDNA4 GFX1201 GPU with 3rd Gen Ray Accelerators.
-- **Remediation**: Remove hardcoded architecture defaults from `FrameStats`. Initialize `arch_name` to `"Unknown"` and generation flags to `false`. Always query `VulkanContext::getArchitectureName()`, `VulkanContext::isRDNA4()`, and `VulkanContext::isRDNA3()` during struct initialization.
+- **Remediation**: Remove hardcoded architecture defaults from `FrameStats`. Initialize `arch_name` to `"Unknown"` and generation flags to `false`. Always query `VulkanContext::getArchitectureName()`, `VulkanContext::getShortArchName()`, and `VulkanContext::getRayAcceleratorName()` during struct initialization.
 
 #### 2. Main-Thread Synchronous PNG Encoding Blocking Presentation Loop
 - **References**: `src/utils/ImageDumper.cpp:37, 72-81`, `src/core/Engine.cpp:6862, 6879, 6896, 6913, 7051`

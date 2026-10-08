@@ -146,7 +146,8 @@ public:
                              uint32_t frameIndex = 0,
                              bool enableSharpening = false,
                              float sharpness = 0.0f,
-                             uint32_t totalSamples = 1u);
+                             uint32_t totalSamples = 1u,
+                             uint32_t sortMode = 0);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
@@ -237,6 +238,7 @@ private:
         bool enableSharpening = false;
         float sharpness = 0.0f;
         uint32_t totalSamples = 1u;
+        uint32_t sortMode = 0;
         uint64_t timelineValue = 0;
         bool valid = false;
     };

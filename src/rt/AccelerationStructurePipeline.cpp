@@ -54,8 +54,8 @@ void AccelerationStructurePipeline::build(
     if (!sceneData.instanceData.empty()) {
         instanceUpload = sceneData.instanceData;
     } else {
-        uint32_t numNonOpaque = numTriangles - numOpaqueTriangles;
-        if (numOpaqueTriangles > 0 && numNonOpaque > 0) {
+        uint32_t numNonOpaque = (numTriangles > numOpaqueTriangles) ? (numTriangles - numOpaqueTriangles) : 0;
+        if (numTriangles > 0 && numOpaqueTriangles > 0 && numNonOpaque > 0) {
             InstanceGPU instOpaque{};
             instOpaque.firstTriangle = 0;
             instOpaque.numOpaqueTriangles = numOpaqueTriangles;
@@ -72,7 +72,7 @@ void AccelerationStructurePipeline::build(
         } else {
             InstanceGPU defaultInst{};
             defaultInst.firstTriangle = 0;
-            defaultInst.numOpaqueTriangles = numOpaqueTriangles;
+            defaultInst.numOpaqueTriangles = (numTriangles > 0) ? numOpaqueTriangles : 0;
             defaultInst.materialOffset = 0;
             defaultInst.flags = 0;
             instanceUpload.push_back(defaultInst);
@@ -171,10 +171,10 @@ void AccelerationStructurePipeline::build(
                      m_blases.size(), m_asInstances.size());
     } else {
         // Monolithic scene path
-        uint32_t numNonOpaque = numTriangles - numOpaqueTriangles;
+        uint32_t numNonOpaque = (numTriangles > numOpaqueTriangles) ? (numTriangles - numOpaqueTriangles) : 0;
         m_asInstances.clear();
 
-        if (numOpaqueTriangles > 0 && numNonOpaque > 0) {
+        if (numTriangles > 0 && numOpaqueTriangles > 0 && numNonOpaque > 0) {
             std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
@@ -218,7 +218,7 @@ void AccelerationStructurePipeline::build(
             m_asInstances.push_back(inst1);
         } else {
             std::vector<ASGeometryInput> geoms;
-            bool isPureOpaque = (numOpaqueTriangles > 0);
+            bool isPureOpaque = (numTriangles > 0 && numOpaqueTriangles > 0);
             if (isPureOpaque) {
                 ASGeometryInput geomOpaque{};
                 geomOpaque.vertexBufferAddress = vertexBaseAddr;

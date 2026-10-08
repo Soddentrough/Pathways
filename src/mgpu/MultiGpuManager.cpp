@@ -194,8 +194,8 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     if (!scene.instanceData.empty()) {
         instanceUpload = scene.instanceData;
     } else {
-        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
-        if (scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
+        uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
+        if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
             InstanceGPU instOpaque{};
             instOpaque.firstTriangle = 0;
             instOpaque.numOpaqueTriangles = scene.numOpaqueTriangles;
@@ -212,7 +212,7 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
         } else {
             InstanceGPU defaultInst{};
             defaultInst.firstTriangle = 0;
-            defaultInst.numOpaqueTriangles = scene.numOpaqueTriangles;
+            defaultInst.numOpaqueTriangles = (numTriangles > 0) ? scene.numOpaqueTriangles : 0;
             defaultInst.materialOffset = 0;
             defaultInst.flags = 0;
             instanceUpload.push_back(defaultInst);
@@ -306,10 +306,10 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
                      secNode.blases.size(), asInstances.size());
     } else {
         // Monolithic scene path
-        uint32_t numNonOpaque = numTriangles - scene.numOpaqueTriangles;
+        uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
         std::vector<ASInstanceInput> asInstances;
 
-        if (scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
+        if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
             std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
@@ -353,7 +353,7 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             asInstances.push_back(inst1);
         } else {
             std::vector<ASGeometryInput> geoms;
-            bool isPureOpaque = (scene.numOpaqueTriangles > 0);
+            bool isPureOpaque = (numTriangles > 0 && scene.numOpaqueTriangles > 0);
             if (isPureOpaque) {
                 ASGeometryInput geomOpaque{};
                 geomOpaque.vertexBufferAddress = vertexBaseAddr;
@@ -1309,6 +1309,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     );
     if (!positions.empty()) {
         uploadToDeviceBufferSec(*secNode, *secNode->positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+    } else {
+        glm::vec4 dummyVerts[3] = {
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
+        };
+        uploadToDeviceBufferSec(*secNode, *secNode->positionBuffer, dummyVerts, sizeof(dummyVerts));
     }
 
     VkDeviceSize triSize = std::max(sizeof(TriangleShadeGPU) * shadeTriangles.size(), sizeof(TriangleShadeGPU));
@@ -1602,15 +1609,18 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
             auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
 
+            const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
+            bool enableSecExecSet = secNode->context->supportsDgcExecutionSet() && (!execsetEnv || execsetEnv[0] != '0');
+
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,
                 config.width, config.height,
                 wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
                 wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
                 wfShadeEmissiveCode, wfShadePassthroughCode,
-                secNode->context->hasDgcExecutionSet(),
+                enableSecExecSet,
                 wfShadeDiffuseSecCode, wfShadeComplexSecCode,
-                config.dgc_preprocess,
+                config.dgc_preprocess && secNode->context->supportsDgcPreprocess(),
                 secNode->context->hasSubgroupSizeControl(),
                 0,
                 wfTailMegakernelCode
@@ -1925,7 +1935,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.frameIndex = packet.cameraUniform.frameIndex;
         wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = packet.accumulateHistory;
-        wfSceneData.sortMode = static_cast<uint32_t>(m_config.wavefront_sort_mode);
+        wfSceneData.sortMode = packet.sortMode;
         wfSceneData.numOpaqueTriangles = packet.numOpaqueTriangles;
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = packet.cameraUniform.flags;
@@ -2214,7 +2224,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t frameIndex,
                                          bool enableSharpening,
                                          float sharpness,
-                                         uint32_t totalSamples) {
+                                         uint32_t totalSamples,
+                                         uint32_t sortMode) {
     if (!m_active || m_devices.empty()) return;
 
     {
@@ -2253,6 +2264,7 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.enableSharpening = enableSharpening;
         m_pendingWork.sharpness = sharpness;
         m_pendingWork.totalSamples = totalSamples;
+        m_pendingWork.sortMode = sortMode;
         m_pendingWork.timelineValue = ++m_currentTimelineValue;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
@@ -2530,6 +2542,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     );
     if (!positions.empty()) {
         uploadToDeviceBufferSec(*secNode, *secNode->positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+    } else {
+        glm::vec4 dummyVerts[3] = {
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
+        };
+        uploadToDeviceBufferSec(*secNode, *secNode->positionBuffer, dummyVerts, sizeof(dummyVerts));
     }
 
     VkDeviceSize triSize = std::max(sizeof(TriangleShadeGPU) * shadeTriangles.size(), sizeof(TriangleShadeGPU));

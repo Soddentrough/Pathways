@@ -205,6 +205,8 @@ GpuArchitecture detectAmdArchitecture(uint32_t deviceID, const std::string& name
     switch (deviceID) {
         // RDNA4 (gfx120x)
         case 0x7550: // Navi 48 [RX 9070 / 9070 XT / 9070 GRE]
+        case 0x7551: // Navi 48 [Radeon AI PRO R9700]
+        case 0x7552: // Navi 48
         case 0x7590: // Navi 44 [RX 9050 / 9060 XT]
             return GpuArchitecture::AmdRDNA4;
         // RDNA3.5 (gfx115x)
@@ -502,16 +504,29 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     m_rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
     dgcProps.pNext = &m_rtPipelineProperties;
 
+    m_driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    m_driverProperties.pNext = nullptr;
+    m_rtPipelineProperties.pNext = &m_driverProperties;
+
     VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps{};
     pciBusProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
     if (hasPciBusInfo) {
-        m_rtPipelineProperties.pNext = &pciBusProps;
+        m_driverProperties.pNext = &pciBusProps;
     }
 
     VkPhysicalDeviceProperties2 props2{};
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &subgroupProps;
     vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+
+    Logger::info("Vulkan Driver: {} | Driver ID: {} ({}) | Conformance: {}.{}.{}.{}",
+                 m_driverProperties.driverName,
+                 static_cast<uint32_t>(m_driverProperties.driverID),
+                 m_driverProperties.driverInfo,
+                 m_driverProperties.conformanceVersion.major,
+                 m_driverProperties.conformanceVersion.minor,
+                 m_driverProperties.conformanceVersion.subminor,
+                 m_driverProperties.conformanceVersion.patch);
 
     if (hasPciBusInfo) {
         m_pciLinkInfo.domain = pciBusProps.pciDomain;
