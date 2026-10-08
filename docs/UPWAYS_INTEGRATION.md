@@ -1,5 +1,10 @@
 # Pathways: Upways Real-Time Neural Reconstructor Integration
 
+> **STATUS: EXPERIMENTAL / INTERNAL — NOT USER-FACING DOCUMENTATION (owner decision, Oct 8 2026).**
+> Upways is experimental at best: it is excluded from the README, `--help`, and the GUI, and is reachable
+> only via hidden CLI flags. Its visual-regression configs are gated non-strict, and no performance or
+> quality claim in this file is a shipping guarantee. Kept as an internal engineering record.
+
 This document describes the in-engine integration, memory architecture, and verification protocol for the **Upways Wave32 WMMA KPN Neural Reconstructor** in **Pathways**.
 
 ---

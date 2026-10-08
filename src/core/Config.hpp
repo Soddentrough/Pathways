@@ -50,11 +50,16 @@ enum class DenoiserMode {
     Upways    // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
 };
 
+// EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
+// super-resolution modes below are experimental. They are intentionally absent from the README,
+// --help, and the GUI, and are reachable only via hidden CLI flags (--scaler/--denoiser/--upways*).
+// NOTE: the 'FSR3'/'FSR1' passes are Pathways-authored custom filters, NOT the official AMD
+// FidelityFX SDK techniques (see docs/reports/codebase_review_2026_10_07.md findings A3/A5).
 enum class UpscalerMode {
-    None,   // Native resolution or direct linear blit
-    FSR3,   // AMD FidelityFX Super Resolution 3.1 (Temporal Accumulation)
-    Upways, // Pathways Native Neural Combined Denoiser & Super-Resolution (Wave32 WMMA)
-    FSR1    // AMD FidelityFX Super Resolution 1.0 (Spatial EASU + RCAS)
+    None,   // Native resolution or direct linear blit [Default]
+    FSR3,   // EXPERIMENTAL: custom temporal upscaler (hidden)
+    Upways, // EXPERIMENTAL: neural denoiser/SR via Wave32 WMMA (hidden)
+    FSR1    // EXPERIMENTAL: custom spatial upscaler (hidden)
 };
 
 enum class CaptureCameraMode {

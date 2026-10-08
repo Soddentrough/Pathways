@@ -34,24 +34,23 @@ The findings this cycle cluster into one code-vs-documentation inversion, one br
 - A permanently-red gate trains developers to ignore test failures.
 - **Fix**: key baselines by device name (+ driver, git hash, build flags); skip `*_mgpu` profiles when <2 qualifying devices exist; add a pre-benchmark idle check (GPU utilization / competing VRAM consumers); enforce `RADV_PROFILE_PSTATE=peak` in the harness; auto-skip with a printed reason on hardware mismatch.
 
-#### A3. "AMD FidelityFX Super Resolution (FSR 3.1)" branding vs. actual implementation — **OPEN (integration work stopped per project owner, Oct 8)**
+#### A3. "AMD FidelityFX Super Resolution (FSR 3.1)" branding vs. actual implementation — **CLOSED (owner decision Oct 8: deprecated, hidden, removed from docs)**
 - The `fsr3_*` shaders are a bespoke temporal-reprojection upscaler with a 5-tap cross Laplacian sharpening pass — not AMD's EASU/RCAS, and the official SDK is not in the tree. The README, `ARCHITECTURE.md`, and the CLI brand it as AMD FSR 3.1; that claim is not accurate under inspection.
 - **SDK feasibility study (Oct 7–8)**, recorded for any future revival:
   - The local `FidelityFX-SDK` clone at tag `v2.3.0` is **DX12-only** (its own known-issues table: "Vulkan is currently not supported in AMD FSR SDK 2.3") — unusable for a Vulkan renderer.
   - The **`v1.1.x` tags of the same repository contain the open-source FSR 3.1 Upscaler (`ffx_fsr3upscaler`) with a Vulkan backend** (`sdk/src/components/fsr3upscaler/`, `sdk/src/backends/vk/` incl. `CMakeShadersFSR3Upscaler.txt`), matching AMD's *FSR 3.1 Release Overview and Integration* guide ("Supported graphics APIs are DX12 and Vulkan"). MIT licensed.
   - Verified: the v1.1.4 Vulkan `.glsl` pass sources **compile directly with stock `glslangValidator`** (`-DFFX_GLSL=1 -DFFX_GPU=1 --target-env vulkan1.2 -e CS -S comp`) — AMD's Windows-only `FidelityFX_SC.exe` is not strictly required for the shader step.
   - The real blocker is the host side: using the official component (`ffx_fsr3upscaler.cpp`, 1,509 ln) requires building AMD's ~4,700-line `ffx_vk.cpp` device/resource/pipeline framework alongside Pathways' own `VkDevice`/VMA/command-buffer ownership, plus generating SC-format permutation-blob headers (indirection tables + reflection metadata) for ~10 passes × 64 permutations × wave/16-bit variants, plus single- and multi-GPU barrier-coherency validation. Assessed as a multi-day, high-validation-risk project disproportionate to the technique's priority.
-- **Decision (project owner, Oct 8)**: FSR3 work is descoped — neither official integration nor feature removal will be pursued now; it is not a priority. Consequence: the finding stands — the FSR branding describes the custom filter, and published FSR-path benchmark numbers belong to that filter. A naming-only pass (drop AMD/FSR branding from the custom filter, or clearly label it "FSR-style") would close A3 at documentation cost only whenever the owner chooses.
+- **Decision (project owner, Oct 8)**: FSR is deprecated and hidden. **Landed**: all FSR mentions removed from README (headline, feature bullets, run examples, CLI table), from `--help`, and from the GUI (the Reconstruction Method combo no longer offers Temporal/Spatial upscalers; HUD status lines read "Temporal/Spatial Upscaler (EXPERIMENTAL)"). The `UpscalerMode::FSR3/FSR1` enum is annotated EXPERIMENTAL/hidden in `Config.hpp`; the CLI flags still parse for internal use. No AMD/FSR branding remains in any user-facing surface.
 
 #### A4. NRC still does not implement what its in-app labels promise — **FIXED (labels) this cycle; research gap OPEN**
 - Unchanged from Oct 5: training target is direct light only (`targetRad = vec3(secDirectL)`, `wavefront_shade_diffuse.comp:867`); training dispatch is hard-coded to 1 workgroup = 32 samples/frame (`NRCManager.cpp:575`).
 - The Oct 5 relabel was applied to the README but not to the surfaces users actually see: `--help` said "Neural Radiance Caching", the GUI header said "Neural Radiance Caching (Wave32 WMMA)", and startup logs said "Neural Radiance Caching Subsystem". **Fixed Oct 7**: all in-app surfaces now read "Neural Direct-Light Caching (experimental)" with a pointer to `docs/NRC.md` for the full-radiance roadmap.
 - The functional gap (Option-2 path-tail supervision, B5 hybrid training topology, 32 B query records) remains the highest-value research item, already fully specified in `docs/NRC.md`.
 
-#### A5. README showcases Upways performance numbers the test suite refuses to gate — **OPEN**
-- The Veach Ajar showcase advertises "Native 4K Upways Denoising — only 2.47 ms inference overhead" and "`--upways-sr` … 3.3x Speedup". Meanwhile the three Upways visual-regression configs are marked `"experimental": True` and excluded from `--strict`, and the reconstructor had a "destructive albedo squaring" bug fixed only on Oct 6 (`6c8be7a`).
-- The main WMMA pass now runs with 0 validation errors at 1080p (verified live); the fallback `upways_reconstruct.comp` still has the descriptor-type mismatch (bindings 7/8/9/12 `image2D` vs `sampler2D`) documented on Oct 5 — only the dispatch geometry was fixed.
-- **Fix**: re-measure and re-qualify the showcase numbers on the current build and un-gate the visual configs, or move the Upways rows to an explicitly-labeled "Experimental results" subsection.
+#### A5. Upways showcase claims vs. experimental gating — **CLOSED (owner decision Oct 8: not ready; hidden experimental CLI feature)**
+- Upways is experimental at best: its three visual-regression configs are gated `"experimental": True` (excluded from `--strict`), the reconstructor had a "destructive albedo squaring" bug fixed only on Oct 6 (`6c8be7a`), and the fallback `upways_reconstruct.comp` still carries the descriptor-type mismatch (bindings 7/8/9/12) documented on Oct 5.
+- **Decision (project owner, Oct 8)**: "Upways is not ready. Experimental at best and should not be mentioned in documentation or options. Keep as a hidden experimental CLI option." **Landed**: all Upways mentions removed from README (Veach Ajar showcase rows, feature bullets, run examples, CLI table rows `--upways*`/`--denoiser`/`--scaler`/`--capture-training-data`), from `--help`, and from the GUI; `docs/UPWAYS_INTEGRATION.md` banner-marked internal/experimental. CLI flags continue to parse (hidden) so the feature can be developed without re-exposing it.
 
 ---
 
@@ -94,7 +93,7 @@ The findings this cycle cluster into one code-vs-documentation inversion, one br
 
 A full feasibility study was performed (technical record in A3): the official Vulkan FSR 3.1 Upscaler exists (FidelityFX-SDK `v1.1.x` tags, MIT), its Vulkan `.glsl` passes compile with stock `glslangValidator`, and the local `v2.3.0` checkout is DX12-only. Clean integration would require adopting AMD's heavy VK device/pipeline framework plus SC-format permutation-blob generation and multi-GPU barrier-coherency validation — a multi-day, high-risk effort.
 
-**On October 8 the project owner directed that FSR3 work stop; it is not a priority.** No FSR code, shaders, CLI, or build files were changed this cycle. Consequence to keep in mind: the README/ARCHITECTURE "FSR 3.1" branding continues to describe the custom filter (A3 remains open), and FSR-path benchmark numbers belong to that filter, not to AMD's technique. A future naming-only pass would close this cheaply; nothing else was done.
+**On October 8 the project owner directed that FSR3 work stop and that FSR be deprecated, hidden, and removed from documentation. Landed same day**: FSR/Upways scrubbed from README, `--help`, and the GUI; `UpscalerMode` annotated experimental/hidden; HUD status wording neutralized; `docs/UPWAYS_INTEGRATION.md` banner-marked internal. The CLI flags (`--scaler fsr|upways`, `--denoiser`, `--upways*`) still parse as hidden experimental options. No shader or upscaler code paths were changed.
 
 ---
 
@@ -134,14 +133,14 @@ A full feasibility study was performed (technical record in A3): the official Vu
 
 ## 8. Prioritized Action Plan
 
-**Landed this cycle (Oct 7)**:
+**Landed this cycle (Oct 7–8)**:
 1. ✅ A1 — `--dgc-execset`/`--no-dgc-execset` made real; docs describe the actual default; RDNA4 A/B remains as follow-up.
-2. ⏹️ A3 — FSR 3.1 official-integration feasibility studied in depth (v1.1.4 Vulkan upscaler confirmed; shaders compile with stock glslangValidator); **work stopped per project owner (Oct 8)**. No FSR code changed; the branding finding remains open (see §4).
+2. ✅ A3 + A5 (owner decision Oct 8) — FSR and Upways **deprecated, hidden, and removed from all documentation and the GUI**. Scrubbed from README (headline, feature bullets, run examples, CLI table, Veach Ajar showcase rows), from `--help`, and from the ImGui reconstruction dropdown; HUD wording neutralized; `UpscalerMode` annotated experimental/hidden; `docs/UPWAYS_INTEGRATION.md` banner-marked internal. The `--scaler`/`--denoiser`/`--upways*` CLI flags still parse as hidden experimental options. (FSR feasibility study retained in §4 for any future revival.)
 3. ✅ A4 (labels) + B1 + B2 — in-app NRC labels honest; `--sec-sort` help fixed; `--restir-pt` warns; docs hub/binding-table 128 B→64 B; broken scene path, hardcoded tool path, coverage-date staleness fixed; "Welford"→"online mean" rename.
 
 **Next (days)**:
 4. A2 — per-hardware baselines + idle guards + mgpu device gating (or move matrix out of default CTest).
-5. A5 — Upways claims re-qualification or "Experimental" subsection; fix the fallback descriptor mismatch when Upways is revived.
+5. ~~A5 — Upways claims re-qualification~~ — closed Oct 8 (hidden). If Upways is ever revived: fix the fallback descriptor mismatch (bindings 7/8/9/12) and re-qualify before re-exposing.
 6. B13 — RGBA32F accumulation promotion above ~512 SPP.
 7. Re-cut all README benchmark tables in one session on the RDNA4 testbeds (fixes the 7.36/8.01 inconsistency and the 2.28x footnote with dated data).
 

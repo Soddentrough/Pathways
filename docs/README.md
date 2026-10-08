@@ -31,7 +31,7 @@ docs/
 ## 1. Architecture & Engineering Specifications
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**:
-  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), temporal super-resolution (`fsr3` pass — a custom filter, *not* the official AMD FSR SDK; see review finding A3), ReSTIR DI reservoir sampling, and OpenUSD stage ingestion.
+  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), ReSTIR DI reservoir sampling, and OpenUSD stage ingestion. (Experimental reconstruction/upscaler paths exist in code but are intentionally undocumented — see ARCHITECTURE §5.)
 
 ---
 

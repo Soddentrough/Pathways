@@ -590,16 +590,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Lighting:     Fallback Synthetic Sun (0 lights in asset)");
             }
             if (config.denoiser_mode == DenoiserMode::Upways) {
-                ImGui::Text("Denoising:    Upways Neural Denoising (Wave32 WMMA)");
+                ImGui::Text("Denoising:    Neural Reconstruction (EXPERIMENTAL)");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
             if (config.upscaler_mode == UpscalerMode::FSR3) {
-                ImGui::Text("Upscaling:    AMD FSR 3.1 (Temporal Accumulation, %.2fx)", config.render_scale);
+                ImGui::Text("Upscaling:    Temporal Upscaler (EXPERIMENTAL, %.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
-                ImGui::Text("Upscaling:    Upways Neural Reconstruction (Wave32 WMMA, %.2fx)", config.render_scale);
+                ImGui::Text("Upscaling:    Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::FSR1) {
-                ImGui::Text("Upscaling:    AMD FSR 1.0 (Spatial EASU + RCAS, %.2fx)", config.render_scale);
+                ImGui::Text("Upscaling:    Spatial Upscaler (EXPERIMENTAL, %.2fx)", config.render_scale);
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -1336,140 +1336,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 4. Post-Processing & Reconstruction
         if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
-            // Unified Reconstruction Method
-            const char* reconMethods[] = {
-                "Off (Pure Monte Carlo - Unbiased Reference)",
-                "Upways Neural Reconstruction (Wave32 WMMA)",
-                "Temporal Super Resolution (TAAU + RCAS)",
-                "Spatial Super Resolution (EASU + RCAS)"
-            };
-            int curMethod = 0;
-            if (config.upscaler_mode == UpscalerMode::FSR3) {
-                curMethod = 2;
-            } else if (config.upscaler_mode == UpscalerMode::FSR1) {
-                curMethod = 3;
-            } else if (config.denoiser_mode == DenoiserMode::Upways || config.upscaler_mode == UpscalerMode::Upways || config.upways_superres) {
-                curMethod = 1;
-            } else {
-                curMethod = 0;
-            }
-
-            if (ImGui::Combo("Reconstruction Method", &curMethod, reconMethods, IM_ARRAYSIZE(reconMethods))) {
-                if (curMethod == 1) { // Upways Neural Reconstruction
-                    config.denoiser_mode = DenoiserMode::Upways;
-                    if (config.upways_superres || config.upscaler_mode == UpscalerMode::Upways) {
-                        config.upscaler_mode = UpscalerMode::Upways;
-                        config.upways_superres = true;
-                        if (config.render_scale >= 1.0f) config.render_scale = 0.5000f;
-                    } else {
-                        config.upscaler_mode = UpscalerMode::None;
-                        config.upways_superres = false;
-                        config.render_scale = 1.0f;
-                    }
-                } else if (curMethod == 2) { // Temporal Super Resolution
-                    config.denoiser_mode = DenoiserMode::None;
-                    config.upscaler_mode = UpscalerMode::FSR3;
-                    config.upways_superres = false;
-                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else if (curMethod == 3) { // Spatial Super Resolution
-                    config.denoiser_mode = DenoiserMode::None;
-                    config.upscaler_mode = UpscalerMode::FSR1;
-                    config.upways_superres = false;
-                    if (config.render_scale >= 1.0f) config.render_scale = 0.6667f;
-                } else { // Pure Monte Carlo
-                    config.denoiser_mode = DenoiserMode::None;
-                    config.upscaler_mode = UpscalerMode::None;
-                    config.upways_superres = false;
-                    config.render_scale = 1.0f;
-                }
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Select the primary reconstruction or super-resolution method: Pure Monte Carlo (unbiased ground truth), Upways Neural (Wave32 WMMA), or Temporal / Spatial Super-Resolution.");
-            }
-
-            // Setting Dropdown (Nested under selected method)
-            if (curMethod == 1) { // Upways Settings
-                ImGui::Indent();
-                const char* upwaysSettings[] = {
-                    "Native Denoising (1:1 - Full Ray Tracing)",
-                    "Super-Resolution (2x Upscale - Half Resolution)"
-                };
-                int curSetting = (config.upways_superres || config.upscaler_mode == UpscalerMode::Upways) ? 1 : 0;
-                if (ImGui::Combo("Setting", &curSetting, upwaysSettings, IM_ARRAYSIZE(upwaysSettings))) {
-                    if (curSetting == 0) {
-                        config.upscaler_mode = UpscalerMode::None;
-                        config.upways_superres = false;
-                        config.render_scale = 1.0f;
-                    } else {
-                        config.upscaler_mode = UpscalerMode::Upways;
-                        config.upways_superres = true;
-                        config.render_scale = 0.5000f;
-                    }
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Choose between 1:1 full-resolution denoising or 2x neural super-resolution upscale from 1/4 ray count.");
-                }
-
-                if (curSetting == 1) {
-                    ImGui::BulletText("Internal Ray Tracing: %ux%u (0.50x Scale, 1/4 Rays)", config.getRenderWidth(), config.getRenderHeight());
-                    ImGui::BulletText("Reconstructed Output: %ux%u (Target Viewport)", config.width, config.height);
-                    ImGui::TextDisabled("Window size is preserved; internal rays are halved to accelerate performance.");
-                    if (ImGui::Checkbox("Enable Sharpening (RCAS)", &config.upscaler_sharpening)) {
-                        settingsChanged = true;
-                    }
-                    if (config.upscaler_sharpening) {
-                        if (ImGui::SliderFloat("Sharpness", &config.upscaler_sharpness, 0.0f, 1.0f, "%.2f")) {
-                            settingsChanged = true;
-                        }
-                    }
-                } else {
-                    ImGui::BulletText("Internal Ray Tracing: %ux%u (Full Resolution)", config.width, config.height);
-                    ImGui::BulletText("Reconstructed Output: %ux%u (Native 1:1)", config.width, config.height);
-                    ImGui::TextDisabled("Full ray budget with Wave32 WMMA cooperative matrix denoising.");
-                }
-                ImGui::Unindent();
-            } else if (curMethod == 2 || curMethod == 3) { // FSR Settings
-                ImGui::Indent();
-                const char* qualityPresets[] = {
-                    "Custom Scale",
-                    "Quality (1.5x - 1440p -> 4K)",
-                    "Balanced (1.7x)",
-                    "Performance (2.0x - 1080p -> 4K)",
-                    "Ultra Performance (3.0x - 720p -> 4K)"
-                };
-                int currentPreset = 0;
-                if (std::abs(config.render_scale - 0.6667f) < 0.01f) currentPreset = 1;
-                else if (std::abs(config.render_scale - 0.5882f) < 0.01f) currentPreset = 2;
-                else if (std::abs(config.render_scale - 0.5000f) < 0.01f) currentPreset = 3;
-                else if (std::abs(config.render_scale - 0.3333f) < 0.01f) currentPreset = 4;
-
-                if (ImGui::Combo("Setting", &currentPreset, qualityPresets, IM_ARRAYSIZE(qualityPresets))) {
-                    if (currentPreset == 1) config.render_scale = 0.6667f;
-                    else if (currentPreset == 2) config.render_scale = 0.5882f;
-                    else if (currentPreset == 3) config.render_scale = 0.5000f;
-                    else if (currentPreset == 4) config.render_scale = 0.3333f;
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-
-                if (ImGui::SliderFloat("Render Scale", &config.render_scale, 0.25f, 1.0f, "%.3fx")) {
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::Checkbox("Enable Sharpening", &config.upscaler_sharpening)) {
-                    settingsChanged = true;
-                }
-                if (config.upscaler_sharpening) {
-                    if (ImGui::SliderFloat("Sharpness", &config.upscaler_sharpness, 0.0f, 1.0f, "%.2f")) {
-                        settingsChanged = true;
-                    }
-                }
-                ImGui::Unindent();
-            }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation

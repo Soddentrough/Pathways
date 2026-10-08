@@ -1,6 +1,6 @@
 # Pathways
 
-Pathways (v1.24.0) is a real-time path tracing engine built on **Vulkan 1.4**. The architecture features **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, **OpenUSD Stage Ingestion**, and **AMD FidelityFX Super Resolution (FSR 3.1)**.
+Pathways (v1.24.0) is a real-time path tracing engine built on **Vulkan 1.4**. The architecture features **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, and **OpenUSD Stage Ingestion**.
 
 > **Design Philosophy**: Focusing on GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and standard Vulkan 1.4 core, KHR, and EXT specifications without vendor-proprietary extensions.
 
@@ -90,8 +90,6 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 | **Acceleration Structures** | BLAS: 46.30 MB (compacted from 59.3 MB, -21.9%) • TLAS: 0.44 KB |
 | **BSDF Material Models** | glTF 2.0 PBR Metallic-Roughness, dielectric transmission, dielectric caustic bounds, narrow portal aperture |
 | **RDNA 4 Single-GPU (4K Native)** | **26.35 ms (38.0 FPS)** • **1.26 GigaRays/s** (Pure MC Baseline) |
-| **Native 4K Upways Denoising** | **28.82 ms (34.7 FPS)** (Wave32 WMMA tensor reconstruction, only 2.47 ms inference overhead) |
-| **4K Continuous Super-Res (`--upways-sr`)** | **8.62 ms (116.0 FPS)** • **3.3x Speedup** (Reconstructed 1080p -> 4K) |
 
 ---
 
@@ -120,7 +118,6 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
   - `host`: Pinned zero-copy host memory (`VK_EXT_external_memory_host`). The secondary DMA-writes tiles into pinned system RAM (posted); the primary reads them back over PCIe. Optimal on UMA (Strix Halo) and the safe fallback on discrete PCIe.
   - `staging`/`cpu`: Removed — CPU staging was eliminated under the Vulkan 1.4 baseline (passing it is a hard error).
 - **Fine-Grained 2D Checkerboard Tiling**: Dynamically distributes screen space across $64\times 64$ alternating tiles (2,040 tiles at 4K) for balanced spatial and shading workload division across dual GPUs.
-- **Multi-GPU Upscaling Topologies**: Supports PostMerge upscaling (checkerboard tiles merged on primary GPU, then upscaled to 4K) and SampleBlend (independent dual-GPU full passes upscaled and blended).
 - **Sample Parallelism**: Temporal sample division mode for multi-SPP scenarios.
 - **Cross-Platform Fallback**: Automatic detection and transparent fallback to double-buffered shared host memory for platforms without DMA-BUF (such as Windows).
 
@@ -133,13 +130,12 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
   - Alpha MASK and BLEND transparency modes
 - **Real-Time Forward Ray-Traced Caustics (`--caustics`)**: Forward photon injection using Vulkan 1.4 hardware `rayQueryEXT` for crisp real-time refractive caustics.
 - **Hierarchical 3D Light Tree (`--light-tree`)**: Spatial octree importance sampling for scenes with dozens or hundreds of analytical and emissive light sources.
-- **AMD FidelityFX Super Resolution (FSR 3.1) & Upways Neural Denoising**: High-performance temporal super-resolution (`--upscaler fsr3`) with Robust Contrast Adaptive Sharpening (RCAS), and native Upways Neural Reconstruction (`--denoiser upways`) accelerated by Wave32 WMMA (`VK_KHR_cooperative_matrix`).
 - **Online Running-Mean Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`, `x̄_N = mix(x̄_{N-1}, x_N, 1/N)`) eliminating numeric overflow and preventing highlight blowout up to the 2048-frame accumulation ceiling (FP16 history; convergence resolution saturates near N ≈ 1024 — see `docs/reports/codebase_review_2026_10_07.md` B13 for the FP32 promotion plan).
 - **HDR Display Output & ACES Tonemapping**: Auto-negotiates scRGB Linear and HDR10 PQ (ST 2084) via `VK_EXT_hdr_metadata`, paired with compute-based filmic ACES tonemapping for standard SDR displays.
 
 ### 4. Dynamic Quality Regulation & Telemetry
 - **Dynamic Quality Governor**: Closed-loop frame-time budget regulation targeting user-defined FPS (e.g., 60, 90, 120 FPS via `--target-fps` or `--target-frame-time`), dynamically scaling SPP and bounce depth to guarantee smooth interactive framerates.
-- **Dear ImGui HUD & Controls**: Interactive in-engine UI overlay featuring collapsible controls, live GPU frame time histograms, camera controls, upscaler settings, and real-time pipeline toggles.
+- **Dear ImGui HUD & Controls**: Interactive in-engine UI overlay featuring collapsible controls, live GPU frame time histograms, camera controls, and real-time pipeline toggles.
 - **Telemetry & Benchmarking**: Headless automated benchmark suite (`--headless`) exporting comprehensive JSON telemetry breakdowns (MAE, RMSE, PSNR, bounce-by-bounce ray counts, acceleration structure memory footprints, and queue statistics).
 
 ---
@@ -231,11 +227,8 @@ ctest --test-dir build --output-on-failure
 # Launch OpenUSD scene with Multi-GPU load balancing enabled
 ./build/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
 
-# Launch glTF scene with AMD FSR 3.1 Super-Resolution
-./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --scaler fsr quality
-
-# Launch 4K rendering with Upways Wave32 Neural Super-Resolution from 1080p
-./build/bin/pathways --scene scenes/living-room/living_room_extended.glb --res 4k --scaler upways 1080
+# Launch glTF scene with real-time forward caustics and the light tree
+./build/bin/pathways --scene scenes/cornell-caustic/cornell_caustic_extended.glb --caustics --light-tree
 
 # Launch in windowed mode with target frame pacing at 1440p
 ./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
@@ -286,15 +279,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--sec-sort` | `direct` \| `directional` \| `coherent-k8` \| `none` | Secondary ray coherency mode: Direct Coherent Ray Generation via tangent-space reuse (`direct`/`coherent`, Xiang et al. 2023, K=4, default), on-chip 8-bin directional DGC octant binning (`directional`/`octant`), K=8 coherent, or unsorted (`none`) | `direct` |
 | `--macro-tiles`, `--batches` | `<int>` | 2D macro-tile batch count for wavefront queue partitioning (0 = auto based on budget) | `0` (Auto) |
 | `--dgc-execset` | *(flag)* | Force-enable DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels. Auto-enabled when the driver advertises compute execution sets; use `--no-dgc-execset` to force the multi-dispatch indirect fallback | Auto (driver-dependent) |
-| `--scaler`, `--upscaler` | `<mode> [ratio\|res]` | Consolidated upscaler: `upways`, `fsr`, `fsr1`, `none`. Presets: `native`, `quality`, `balanced`, `performance`, `ultra`, or arbitrary resolution (`1080`, `1440`, `1920x1080`, `0.75`) | `none` |
-| `--preset`, `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra` | Scaling ratio preset or resolution override | `quality` |
-| `--upscaler-sharpening` | *(flag)* | Enable Robust Contrast Adaptive Sharpening (RCAS) pass | Disabled |
-| `--upscaler-sharpness` | `<float>` | RCAS contrast-adaptive sharpness factor `[0.0 - 1.0]` | `0.0` |
-| `--denoiser` | `none` \| `upways` | Denoising mode: Pure Monte Carlo (unbiased) or Upways Wave32 WMMA | `none` |
-| `--upways` | *(flag)* | Enable Upways Neural Denoising with Wave32 WMMA (1:1 native resolution) | Disabled |
-| `--upways-sr` | *(flag)* | Enable Upways Continuous Super-Resolution (2.0x neural upscaling; `--upways-superres`) | Disabled |
-| `--upways-weights` | `<path>` | Custom path to Upways neural weights binary (`upways_weights.bin`) | `data/models/upways_weights.bin` |
-| `--capture-training-data` | `<dir>` | Save paired Upways neural reconstruction dataset to directory | Disabled |
+
 | `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
 | `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
 | `--nrc` | *(flag)* | Enable Neural **Direct-Light** Caching with Wave32 WMMA — a neural cache of unshadowed direct-light radiance only (indirect GI is not cached; see `docs/NRC.md` for the full-radiance roadmap) | Disabled |
@@ -465,7 +450,7 @@ Additional thanks to **MrMPFR**.
 
 Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - **[Documentation Hub](docs/README.md)**: Central landing page and directory catalog.
-- **[Engine Architecture Specification](docs/ARCHITECTURE.md)**: In-depth technical specification for DGC wavefront path tracing, multi-GPU scaling, and super-resolution.
+- **[Engine Architecture Specification](docs/ARCHITECTURE.md)**: In-depth technical specification for DGC wavefront path tracing and multi-GPU scaling.
 - **[Linux Build Guide](docs/BUILD_LINUX.md)**: Compilation, toolchain presets, driver configuration, and test execution for Fedora, Ubuntu, and Arch.
 - **[Windows 11 Build Guide](docs/BUILD_WINDOWS.md)**: MSYS2 UCRT64 toolchain, PowerShell automation, and CPack packaging.
 - **[Vulkan API Call Audit](docs/VULKAN_API_AUDIT.md)**: Specification tracking and multi-platform Vulkan Hardware Database comparison.
@@ -484,4 +469,4 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - [AMD RDNA4 Instruction Set Architecture (ISA)](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture)
 - [AMD RDNA Performance Guide](https://gpuopen.com/learn/rdna-performance-guide/)
 - [Improving Ray Tracing Performance with RRA](https://gpuopen.com/learn/improving-rt-perf-with-rra/)
-- https://www.mysimulator.uk/content/articles/realtime-denoising.html
+

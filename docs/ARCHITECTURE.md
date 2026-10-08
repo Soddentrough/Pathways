@@ -47,7 +47,7 @@ Pathways replaces the monolithic megakernel approach with a **GPU-driven Wavefro
                        [ Progressive Accumulation ] ──► Online Running Mean
                                     │
                                     ▼
-                       [ Temporal Super-Resolution ] ──► AMD FSR 3.1 / Upways ML
+                       [ (Experimental Upscalers — see §5) ]
 ```
 
 ---
@@ -164,38 +164,19 @@ Screen space is subdivided into $64\times 64$ alternating tiles (2,040 tiles at 
 
 ---
 
-## 5. Super-Resolution & Neural Reconstruction
+## 5. Super-Resolution & Neural Reconstruction (Experimental — Undocumented)
 
-Pathways provides two super-resolution options:
+Pathways contains experimental reconstruction and super-resolution code paths (`src/rt/Fsr3Upscaler.*`,
+`src/rt/UpwaysPipeline.*`, `shaders/compute/fsr3_*.comp`, `shaders/compute/upways_*.comp`). These are
+**experimental at best** and are intentionally excluded from user-facing documentation and the GUI. They
+are reachable only via hidden CLI flags (`--scaler`, `--denoiser`, `--upways*`) and carry no performance or
+quality guarantee.
 
-### 5.1 AMD FidelityFX Super Resolution 3.1 (FSR 3.1)
-- Integrated via modular `Fsr3Upscaler` compute pipeline (`shaders/compute/fsr3_*.comp`).
-- Processes jittered low-resolution color, inverted depth, and motion vectors through Lanczos accumulation and Robust Contrast Adaptive Sharpening (RCAS).
-- Multi-GPU checkerboard tile reprojection ensures jitter-free temporal stability across alternating GPU frames.
-
-### 5.2 Pathways Upways Neural Reconstruction & Continuous Super-Resolution (Wave32 WMMA)
-Pathways integrates a native in-engine neural reconstructor and continuous super-resolution pipeline (`src/rt/UpwaysPipeline.cpp`, `shaders/compute/upways_reconstruct.comp`) accelerated directly on hardware tensor cores via Vulkan `VK_KHR_cooperative_matrix`:
-- **Wave32 WMMA Tensor Architecture**:
-  - Targets AMD RDNA hardware matrix instructions (`v_wmma_f32_16x16x16_f16`) with native subgroup size 32.
-  - Features a 4-layer fully connected topology: `FC1` ($32 \to 64$), `FC2` ($64 \to 64$), `FC3` ($64 \to 64$), and `FC4` ($64 \to 16$).
-  - **Zero VRAM Traffic for Inference**: All intermediate activations (`s_acc`, `s_fc1_out`, `s_fc2_out`, `s_fc3_out`, `s_fc4_out`) execute entirely within Local Data Share (LDS) shared memory across 16-pixel workgroups, completely eliminating memory bus bandwidth overhead during inference.
-- **Physical Demodulation & Invertible Logarithmic Compression**:
-  - Compresses input radiance ($0$ to $10,000+$ nits) into an invertible logarithmic space:
-    $$\mathbf{y} = \text{sign}(\mathbf{x}) \cdot \log\big(1 + \mu \|\mathbf{x}\|\big)$$
-    preventing high-energy specular fireflies from destabilizing temporal history.
-  - Demodulates smooth irradiance from base albedo and surface roughness before inference, reconstructing pin-sharp high-frequency texture details at target display resolution.
-- **Dual-Stream Temporal Reprojection & Confidence Gating**:
-  - Warps independent temporal histories using surface motion vectors ($\mathbf{v}_{\text{surface}}$) for diffuse GI and virtual hit specular vectors ($\mathbf{v}_{\text{specular}}$) with planar depth-aware disocclusion confidence gating, eliminating ghosting during rapid camera motion.
-- **Continuous 2.0x Super-Resolution (`--upways-sr`)**:
-  - Ingests fractional subpixel coordinate phase offsets ($\text{fract}(\text{inCoordF})$ in channels 30–31) to reconstruct high-frequency geometric edges from lower-resolution render targets (e.g. 1080p $\to$ 4K in **8.62 ms / 116 FPS** on Veach Ajar).
-- **Compacted Weight Buffer & Embedded Fallback**:
-  - Uses an ultra-lean **16,704-byte** serialized FP16 SSBO binary (`data/models/upways_weights.bin`), automatically packaged by CMake (`cmake/PackageUpwaysWeights.cmake`) from the adjacent `~/Development/Upways` repository when present, with an embedded compiled-in fallback C++ header (`src/rt/upways_default_weights.hpp`) for 100% self-contained standalone execution.
-- **Hardware Timestamp Profiling**:
-  - Instrumented with dedicated Vulkan GPU query timestamps (`qBase + 4/5`), exposing microsecond-accurate inference latency (`m_lastUpwaysMs`) in `EngineStats` and telemetry JSON dumps.
-- **Unified Scaler CLI (`--scaler`)**:
-  - Consolidated `--scaler <mode> [ratio|res]` syntax supporting interchangeable scaler engines (`upways`, `fsr`, `fsr1`, `none`), standard presets (`native`, `quality`, `balanced`, `performance`, `ultra`), or arbitrary internal rendering resolutions (e.g. `--res 4k --scaler upways 1080` or `--scaler upways quality`). Legacy `--denoiser upways` and `--upways-sr` remain fully supported as seamless aliases.
-
----
+> **Accuracy note**: the `fsr3`/`fsr1` passes are Pathways-authored custom filters, **not** the official AMD
+> FidelityFX SDK techniques. A feasibility study for integrating the genuine AMD FSR 3.1 Vulkan Upscaler
+> (FidelityFX-SDK `v1.1.x`) is recorded in `docs/reports/codebase_review_2026_10_07.md` (finding A3); the
+> integration was descoped by the project owner. Until then, no AMD/FSR branding is claimed anywhere
+> user-facing.
 
 ## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR DI)
 
