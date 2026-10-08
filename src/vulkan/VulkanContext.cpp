@@ -1116,6 +1116,8 @@ void VulkanContext::initVMA() {
 namespace {
 // Single source of truth for per-architecture display metadata, indexed by
 // GpuArchitecture. One row per enumerator, in enum order (see VulkanContext.hpp).
+// Ray accelerator/RT core generations follow AMD and NVIDIA official numbering
+// (RDNA1 = 1st Gen RA ... RDNA4 = 4th Gen RA; Turing = 1st Gen RT Core ...).
 struct ArchInfo {
     const char* name;      // Full display name (telemetry JSON "arch_name")
     const char* shortName; // Compact name (window title)
@@ -1123,15 +1125,15 @@ struct ArchInfo {
 };
 constexpr std::array<ArchInfo, 11> kArchInfoTable{{
     /* Generic          */ {"Vulkan 1.4 Native GPU",   "Vulkan",    "Hardware Ray Queries (VK_KHR_ray_query)"},
-    /* AmdRDNA1        */ {"AMD RDNA1 (Navi 1x)",     "RDNA1",     "Hardware Ray Queries (VK_KHR_ray_query)"},
-    /* AmdRDNA2        */ {"AMD RDNA2 (Navi 2x)",     "RDNA2",     "AMD RDNA2 1st Gen Ray Accelerators"},
-    /* AmdRDNA3        */ {"AMD RDNA3 (Navi 3x)",     "RDNA3",     "AMD RDNA3 2nd Gen Ray Accelerators"},
-    /* AmdRDNA3_5      */ {"AMD RDNA3.5 (GFX115x)",   "RDNA3.5",   "AMD RDNA3 2nd Gen Ray Accelerators"},
-    /* AmdRDNA4        */ {"AMD RDNA4 (GFX1201)",     "RDNA4",     "AMD RDNA4 3rd Gen Ray Accelerators"},
-    /* NvidiaTuring    */ {"NVIDIA Turing",           "Turing",    "NVIDIA 2nd Gen RT Cores"},
-    /* NvidiaAmpere    */ {"NVIDIA Ampere",           "Ampere",    "NVIDIA 3rd Gen RT Cores"},
-    /* NvidiaAda       */ {"NVIDIA Ada Lovelace",     "Ada",       "NVIDIA 4th Gen RT Cores"},
-    /* NvidiaBlackwell */ {"NVIDIA Blackwell",        "Blackwell", "NVIDIA 5th Gen RT Cores"},
+    /* AmdRDNA1        */ {"AMD RDNA1 (Navi 1x)",     "RDNA1",     "AMD RDNA1 1st Gen Ray Accelerators"},
+    /* AmdRDNA2        */ {"AMD RDNA2 (Navi 2x)",     "RDNA2",     "AMD RDNA2 2nd Gen Ray Accelerators"},
+    /* AmdRDNA3        */ {"AMD RDNA3 (Navi 3x)",     "RDNA3",     "AMD RDNA3 3rd Gen Ray Accelerators"},
+    /* AmdRDNA3_5      */ {"AMD RDNA3.5 (GFX115x)",   "RDNA3.5",   "AMD RDNA3 3rd Gen Ray Accelerators"},
+    /* AmdRDNA4        */ {"AMD RDNA4 (GFX1201)",     "RDNA4",     "AMD RDNA4 4th Gen Ray Accelerators"},
+    /* NvidiaTuring    */ {"NVIDIA Turing",           "Turing",    "NVIDIA 1st Gen RT Cores"},
+    /* NvidiaAmpere    */ {"NVIDIA Ampere",           "Ampere",    "NVIDIA 2nd Gen RT Cores"},
+    /* NvidiaAda       */ {"NVIDIA Ada Lovelace",     "Ada",       "NVIDIA 3rd Gen RT Cores"},
+    /* NvidiaBlackwell */ {"NVIDIA Blackwell",        "Blackwell", "NVIDIA 4th Gen RT Cores"},
     /* IntelArc        */ {"Intel Arc Xe-HPG",        "Intel Arc", "Intel Xe Ray Tracing Units"},
 }};
 
