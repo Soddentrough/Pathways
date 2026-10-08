@@ -28,11 +28,17 @@ The findings this cycle cluster into one code-vs-documentation inversion, one br
 - Local A/B (Strix Halo, 1080p Cornell, contaminated host): exec-set 3.652 ms vs multi-dispatch 3.776 ms (~3.4% in favor of exec-set; the README's "+22.3%" multi-dispatch claim is RDNA4-attributed and could not be re-verified here).
 - **Resolution (Oct 7)**: the flag pair was made real — `--no-dgc-execset` disables, `--dgc-execset` force-enables, and the README/help text now describes the actual default (exec sets when the driver advertises compute execution sets; multi-dispatch otherwise or on request). The "+22.3%" sentence was re-attributed to GPU-autonomous indirect dispatch vs CPU readback. **Action item**: re-run the exec-set vs multi-dispatch A/B on the RDNA4 testbeds and let the winner be the single documented default.
 
-#### A2. The `PerformanceMatrix` CTest gate fails on a clean checkout on the project's own dev host — **OPEN**
+#### A2. The `PerformanceMatrix` CTest gate fails on a clean checkout on the project's own dev host — **CLOSED (Oct 8)**
 - Verified: `ctest` → 19/20, `PerformanceMatrix` FAILED with "+100% to +537%" apparent regressions across all 42 measured configs.
 - Root causes: (1) `tests/references/performance_baseline.json` carries **no hardware/driver/date/build metadata** — it was recorded on the dual-RDNA4 testbed (mgpu baselines ≈ half the single-GPU numbers) and compared verbatim on Strix Halo; (2) `--mgpu` on a single-GPU machine silently falls back to single-GPU rendering but the harness still compares against dual-GPU baselines; (3) no system-idle guard — on UMA, co-resident workloads (this review found a 22 GB LLM server on the same iGPU) directly steal LPDDR5X bandwidth.
 - A permanently-red gate trains developers to ignore test failures.
-- **Fix**: key baselines by device name (+ driver, git hash, build flags); skip `*_mgpu` profiles when <2 qualifying devices exist; add a pre-benchmark idle check (GPU utilization / competing VRAM consumers); enforce `RADV_PROFILE_PSTATE=peak` in the harness; auto-skip with a printed reason on hardware mismatch.
+- **Fix (landed Oct 8, `scripts/verify_performance_matrix.py`)**:
+  - Baselines are now hardware-keyed: the JSON carries a `metadata` block (device name, driver version, git commit, date, frames/warmup, dual-GPU flag) alongside `results`. A mismatch between the baseline device and the current host's device → graceful `[SKIP]` (exit 0) with a printed reason. Legacy flat baselines also skip, prompting a re-cut.
+  - `*_mgpu` profiles auto-skip when the engine's `--mgpu` probe reports `[Single GPU]` (fewer than 2 qualifying RT/DGC devices — llvmpipe correctly does not count).
+  - Idle-system guard reads amdgpu `gpu_busy_percent` for all DRM cards; a busy GPU (threshold `--max-gpu-busy`, default 15%) aborts with a printed reason. `--force` bypasses the guard and device-match for re-cutting baselines on a loaded host.
+  - `RADV_PROFILE_PSTATE=peak` is pinned in every benchmark subprocess environment.
+  - Verified on Strix Halo: gate now **passes** (graceful skip — GPU busy 51% from a co-resident LLM server, and the checked-in baseline is legacy-format/dual-RDNA4). Full `ctest` → **20/20**.
+- **Follow-up (owner action)**: re-cut the baseline on the reference hardware in an idle session with `--update-baseline` to re-arm the active gate there; the checked-in legacy baseline is retained in git history.
 
 #### A3. "AMD FidelityFX Super Resolution (FSR 3.1)" branding vs. actual implementation — **CLOSED (owner decision Oct 8: deprecated, hidden, removed from docs)**
 - The `fsr3_*` shaders are a bespoke temporal-reprojection upscaler with a 5-tap cross Laplacian sharpening pass — not AMD's EASU/RCAS, and the official SDK is not in the tree. The README, `ARCHITECTURE.md`, and the CLI brand it as AMD FSR 3.1; that claim is not accurate under inspection.
@@ -137,9 +143,10 @@ A full feasibility study was performed (technical record in A3): the official Vu
 1. ✅ A1 — `--dgc-execset`/`--no-dgc-execset` made real; docs describe the actual default; RDNA4 A/B remains as follow-up.
 2. ✅ A3 + A5 (owner decision Oct 8) — FSR and Upways **deprecated, hidden, and removed from all documentation and the GUI**. Scrubbed from README (headline, feature bullets, run examples, CLI table, Veach Ajar showcase rows), from `--help`, and from the ImGui reconstruction dropdown; HUD wording neutralized; `UpscalerMode` annotated experimental/hidden; `docs/UPWAYS_INTEGRATION.md` banner-marked internal. The `--scaler`/`--denoiser`/`--upways*` CLI flags still parse as hidden experimental options. (FSR feasibility study retained in §4 for any future revival.)
 3. ✅ A4 (labels) + B1 + B2 — in-app NRC labels honest; `--sec-sort` help fixed; `--restir-pt` warns; docs hub/binding-table 128 B→64 B; broken scene path, hardcoded tool path, coverage-date staleness fixed; "Welford"→"online mean" rename.
+4. ✅ A2 — `PerformanceMatrix` gate hardened: hardware-keyed baselines (metadata block), `*_mgpu` auto-skip on single-qualifying-device hosts, amdgpu `gpu_busy_percent` idle guard (`--force` to override), `RADV_PROFILE_PSTATE=peak` pinned. Graceful `[SKIP]` (exit 0) on hardware mismatch / legacy baseline / busy GPU. `ctest` now **20/20** on Strix Halo.
 
 **Next (days)**:
-4. A2 — per-hardware baselines + idle guards + mgpu device gating (or move matrix out of default CTest).
+4. ~~A2 — per-hardware baselines + idle guards + mgpu device gating~~ — closed Oct 8. Remaining: re-cut the baseline on the reference hardware (`--update-baseline`, idle session) to re-arm the active gate.
 5. ~~A5 — Upways claims re-qualification~~ — closed Oct 8 (hidden). If Upways is ever revived: fix the fallback descriptor mismatch (bindings 7/8/9/12) and re-qualify before re-exposing.
 6. B13 — RGBA32F accumulation promotion above ~512 SPP.
 7. Re-cut all README benchmark tables in one session on the RDNA4 testbeds (fixes the 7.36/8.01 inconsistency and the 2.28x footnote with dated data).

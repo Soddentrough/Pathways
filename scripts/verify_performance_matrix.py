@@ -3,6 +3,19 @@
 Pathways Automated Performance Regression Matrix
 Executes and validates the complete 21-Scene x 2-Resolution (1080p, 4K) x 2-GPU (Single, Dual)
 matrix (84 configurations total) against golden reference baselines.
+
+Gate semantics (Oct 8 2026, review finding A2):
+- Baselines are hardware-keyed. The baseline JSON carries a "metadata" block recording the
+  device name, driver version, and git commit it was captured on. If the current host's
+  device does not match the baseline device, the matrix SKIPS (exit 0) with a printed
+  reason instead of reporting false regressions. Legacy baselines (flat dict, no metadata)
+  also skip, prompting a re-cut with --update-baseline on the reference hardware.
+- Multi-GPU profiles (*_mgpu) are skipped automatically when the engine reports a
+  [Single GPU] configuration for --mgpu (i.e. fewer than 2 qualifying RT/DGC devices).
+- An idle-system guard checks amdgpu gpu_busy_percent before measuring; a busy GPU
+  (e.g. another workload sharing a UMA APU) aborts the run with a printed reason.
+- RADV_PROFILE_PSTATE=peak is pinned for all benchmark subprocesses so Mesa does not
+  downclock between runs.
 """
 
 import sys
@@ -62,6 +75,97 @@ PROFILES = [
     {"id": "4k_mgpu",      "label": "4K Dual",      "res": "4k",    "mgpu": True}
 ]
 
+def skip(reason):
+    print(f"\033[33m[SKIP]\033[0m {reason}")
+    return 0
+
+def normalize_device(name):
+    """Normalize a device name for cross-run comparison (case/punct insensitive)."""
+    import re
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+def benchmark_env():
+    """Subprocess environment with the Mesa P-state pinned for stable timing."""
+    env = os.environ.copy()
+    env.setdefault("RADV_PROFILE_PSTATE", "peak")
+    return env
+
+def probe_hardware(bin_path):
+    """Run a tiny headless frame and extract device name, driver version, and
+    whether --mgpu actually yields a Dual GPU configuration."""
+    base_cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240", "--spp", "1"]
+    try:
+        probe_res = subprocess.run(base_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True,
+                                   timeout=15, env=benchmark_env())
+    except subprocess.TimeoutExpired:
+        return None, None, False, "Hardware probe timed out after 15s (software emulation)"
+
+    if probe_res.returncode != 0:
+        return None, None, False, (f"Vulkan Ray Tracing hardware not available in environment "
+                                   f"(code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}")
+
+    out = probe_res.stdout + probe_res.stderr
+    device, driver = "", ""
+    for line in out.splitlines():
+        if "Identified target hardware:" in line:
+            m = line.split("Identified target hardware:", 1)[1].strip()
+            device = m.split(" (", 1)[0].strip()
+        elif "(Driver:" in line:
+            m = line.split("(Driver:", 1)[1].split(")", 1)[0].strip()
+            if m:
+                driver = m
+    if device and any(sw in device.lower() for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
+        return None, None, False, "Software/CPU Vulkan renderer detected"
+
+    # Second probe: does --mgpu actually produce a Dual GPU configuration?
+    mgpu_available = False
+    try:
+        mgpu_res = subprocess.run(base_cmd + ["--mgpu"], cwd=PATHWAYS_ROOT, capture_output=True,
+                                  text=True, timeout=15, env=benchmark_env())
+        for line in (mgpu_res.stdout + mgpu_res.stderr).splitlines():
+            if "[Dual GPU" in line:
+                mgpu_available = True
+                break
+    except subprocess.TimeoutExpired:
+        pass
+    return device or None, driver, mgpu_available, None
+
+def gpu_busy_percentages():
+    """Read amdgpu gpu_busy_percent for all DRM cards (empty list if unavailable)."""
+    busy = []
+    for card in sorted(os.listdir("/sys/class/drm")):
+        if not card.startswith("card") or not card[4:].isdigit():
+            continue
+        path = f"/sys/class/drm/{card}/device/gpu_busy_percent"
+        try:
+            with open(path) as f:
+                busy.append((card, int(f.read().strip())))
+        except (OSError, ValueError):
+            continue
+    return busy
+
+def git_commit():
+    try:
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=PATHWAYS_ROOT,
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return "unknown"
+
+def load_baseline(baseline_path):
+    """Return (results_dict_or_None, skip_reason_or_None, metadata_or_None)."""
+    if not os.path.isfile(baseline_path):
+        return None, "No baseline file found (run with --update-baseline to create one)", None
+    try:
+        with open(baseline_path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        return None, f"Failed to load baseline ({e})", None
+    if isinstance(data, dict) and "metadata" in data and "results" in data:
+        return data.get("results", {}), None, data.get("metadata", {})
+    # Legacy flat format: no hardware keying -> cannot be trusted on arbitrary hosts.
+    return None, ("Baseline is in the legacy flat format (no hardware metadata). "
+                  "Re-cut it on the reference hardware with --update-baseline."), None
+
 def run_single_benchmark(bin_path, scene, profile, frames, warmup, out_json):
     cmd = [
         bin_path,
@@ -79,7 +183,7 @@ def run_single_benchmark(bin_path, scene, profile, frames, warmup, out_json):
     if profile["mgpu"]:
         cmd.append("--mgpu")
 
-    res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True, env=benchmark_env())
     if res.returncode != 0:
         return None, f"Exited with code {res.returncode}: {res.stderr.strip()[:300]}"
 
@@ -129,39 +233,39 @@ def main():
     parser.add_argument("--baseline-path", type=str, default="", help="Custom baseline JSON path")
     parser.add_argument("--tolerance", type=float, default=None, help="Regression threshold tolerance (default: 0.15, or 0.20 in --quick mode)")
     parser.add_argument("--output-dir", type=str, default="output/benchmark_matrix", help="Output directory for reports")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass the idle-system guard and baseline device-match check (for re-cutting baselines on a loaded or non-reference host)")
+    parser.add_argument("--max-gpu-busy", type=int, default=15,
+                        help="Idle-system guard: skip if any amdgpu card reports higher busy%% (default: 15)")
     args = parser.parse_args()
 
     bin_path = find_binary()
     if not bin_path:
-        print("\033[33m[SKIP]\033[0m Pathways binary not found! Skipping performance matrix.")
-        return 0
+        return skip("Pathways binary not found! Skipping performance matrix.")
 
     # In CI environments (GitHub Actions) without dedicated hardware benchmarking GPUs, skip regression matrix
     if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
-        print("\033[33m[SKIP]\033[0m Detected CI environment without dedicated benchmarking hardware. Skipping performance matrix.")
-        return 0
+        return skip("Detected CI environment without dedicated benchmarking hardware. Skipping performance matrix.")
 
-    # Probe whether Vulkan ray tracing hardware is available in this environment
-    probe_cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240", "--spp", "1"]
-    try:
-        probe_res = subprocess.run(probe_cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True, timeout=10)
-    except subprocess.TimeoutExpired:
-        print("\033[33m[SKIP]\033[0m Hardware probe timed out after 10s (software emulation). Skipping performance matrix.")
-        return 0
+    # Probe hardware: device identity, driver, and dual-GPU capability
+    device, driver, mgpu_available, probe_err = probe_hardware(bin_path)
+    if probe_err:
+        return skip(probe_err)
 
-    if probe_res.returncode != 0:
-        print(f"\033[33m[SKIP]\033[0m Vulkan Ray Tracing hardware not available in environment (code {probe_res.returncode}): {probe_res.stderr.strip()[:200]}. Skipping performance matrix.")
-        return 0
-
-    target_hw = ""
-    for line in (probe_res.stdout + probe_res.stderr).splitlines():
-        if "Identified target hardware:" in line or "successfully initialized on:" in line:
-            target_hw = line.lower()
-            break
-
-    if target_hw and any(sw in target_hw for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
-        print("\033[33m[SKIP]\033[0m Software/CPU Vulkan renderer detected. Skipping performance matrix.")
-        return 0
+    # Idle-system guard: a GPU shared with other workloads (e.g. a 22 GB LLM server on a
+    # UMA APU) produces meaningless timings. Measure only on an idle GPU.
+    if not args.force:
+        busy = gpu_busy_percentages()
+        hot = [(c, p) for c, p in busy if p > args.max_gpu_busy]
+        if hot:
+            detail = ", ".join(f"{c} {p}%" for c, p in hot)
+            return skip(f"GPU is not idle ({detail}; threshold {args.max_gpu_busy}%). "
+                        f"Another workload is contending for the GPU — timings would be meaningless. "
+                        f"Re-run when the system is idle, or use --force to override.")
+        if not busy:
+            print("\033[33m[WARN]\033[0m gpu_busy_percent unavailable (non-amdgpu?); idle guard disabled.")
+    else:
+        print("\033[33m[WARN]\033[0m --force: idle-system guard and device-match checks bypassed.")
 
     frames = args.frames if args.frames is not None else (5 if args.quick else 15)
     warmup = args.warmup if args.warmup is not None else (4 if args.quick else 5)
@@ -171,12 +275,40 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
 
+    # Baseline load + hardware keying (review finding A2)
+    baseline_data = {}
+    baseline_meta = None
+    if not args.update_baseline:
+        baseline_data, skip_reason, baseline_meta = load_baseline(baseline_path)
+        if skip_reason:
+            return skip(f"{skip_reason} Skipping to avoid false regressions.")
+        base_device = (baseline_meta or {}).get("device_name", "")
+        if base_device and device and normalize_device(base_device) != normalize_device(device) and not args.force:
+            return skip(f"Baseline was recorded on '{base_device}' but this host is '{device}'. "
+                        f"Performance numbers are not comparable across hardware. "
+                        f"Run on the reference hardware, or re-cut with --update-baseline.")
+        if baseline_meta:
+            print(f"[INFO] Baseline device: {baseline_meta.get('device_name', '?')} "
+                  f"(driver {baseline_meta.get('driver_version', '?')}, git {baseline_meta.get('git_commit', '?')}, "
+                  f"{baseline_meta.get('date', '?')}) | Current: {device} (driver {driver})")
+
     # Filter profiles if requested
     profile_filter = [p.strip().lower() for p in args.profiles.split(",") if p.strip()]
     profiles_to_run = []
     for prof in PROFILES:
         if not profile_filter or any(f in prof["id"].lower() for f in profile_filter):
             profiles_to_run.append(prof)
+
+    # Multi-GPU capability gate (review finding A2): skip *_mgpu profiles when the engine
+    # cannot actually form a Dual GPU configuration on this host.
+    mgpu_profiles = [p for p in profiles_to_run if p["mgpu"]]
+    if mgpu_profiles and not mgpu_available:
+        skipped = ", ".join(p["id"] for p in mgpu_profiles)
+        print(f"\033[33m[WARN]\033[0m No Dual GPU configuration available on this host (only 1 qualifying "
+              f"RT/DGC device); skipping profiles: {skipped}")
+        profiles_to_run = [p for p in profiles_to_run if not p["mgpu"]]
+    if not profiles_to_run:
+        return skip("No profiles left to run after capability filtering.")
 
     # Filter scenes if requested
     scene_filter = [s.strip().lower() for s in args.scenes.split(",") if s.strip()]
@@ -195,18 +327,10 @@ def main():
     print("==========================================================================================")
     print(f"  Pathways Automated Performance Regression Matrix ({len(scenes_to_run)} Scenes x {len(profiles_to_run)} Profiles = {total_runs} Runs)")
     print(f"  Binary:   {os.path.relpath(bin_path, PATHWAYS_ROOT)}")
+    print(f"  Device:   {device} (driver {driver}) | Dual GPU: {'yes' if mgpu_available else 'no'}")
     print(f"  Frames:   {frames} measured (+ {warmup} warmup) per configuration")
     print(f"  Mode:     {'Update Golden Baseline' if args.update_baseline else 'Regression Evaluation (Tolerance: ' + str(int(tolerance * 100)) + '%)'}")
     print("==========================================================================================")
-
-    baseline_data = {}
-    if os.path.isfile(baseline_path) and not args.update_baseline:
-        try:
-            with open(baseline_path, "r") as f:
-                baseline_data = json.load(f)
-            print(f"[INFO] Loaded golden baseline with {len(baseline_data)} reference entries from {os.path.relpath(baseline_path, PATHWAYS_ROOT)}")
-        except Exception as e:
-            print(f"[WARN] Failed to load baseline ({e}); evaluating without baseline comparison.")
 
     matrix_results = {}
     regressions = []
@@ -269,6 +393,9 @@ def main():
     with open(report_json_path, "w") as f:
         json.dump({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "device": device,
+            "driver": driver,
+            "dual_gpu": mgpu_available,
             "total_configurations": total_runs,
             "regressions": regressions,
             "failures": failures,
@@ -276,7 +403,7 @@ def main():
             "results": matrix_results
         }, f, indent=2)
 
-    # Save or update baseline if requested
+    # Save or update baseline if requested (hardware-keyed format, review finding A2)
     if args.update_baseline:
         flat_baseline = {}
         for sc_id, profs in matrix_results.items():
@@ -286,9 +413,25 @@ def main():
                     "avg_fps": round(data["avg_fps"], 1),
                     "gigarays_per_second": round(data["gigarays_per_second"], 3)
                 }
+        if baseline_meta and baseline_meta.get("device_name") and device \
+                and normalize_device(baseline_meta["device_name"]) != normalize_device(device):
+            print(f"\033[33m[WARN]\033[0m Re-keying baseline from '{baseline_meta['device_name']}' to '{device}'.")
+        baseline_doc = {
+            "metadata": {
+                "device_name": device,
+                "driver_version": driver,
+                "git_commit": git_commit(),
+                "date": time.strftime("%Y-%m-%d", time.gmtime()),
+                "frames": frames,
+                "warmup": warmup,
+                "dual_gpu": mgpu_available,
+                "note": "Hardware-keyed golden baseline. Regenerate on the reference hardware with --update-baseline."
+            },
+            "results": flat_baseline
+        }
         with open(baseline_path, "w") as f:
-            json.dump(flat_baseline, f, indent=2)
-        print(f"\n\033[32m[SUCCESS]\033[0m Updated golden baseline ({len(flat_baseline)} entries) at: {baseline_path}")
+            json.dump(baseline_doc, f, indent=2)
+        print(f"\n\033[32m[SUCCESS]\033[0m Updated golden baseline ({len(flat_baseline)} entries, device: {device}) at: {baseline_path}")
 
     # Print summary
     print("\n==========================================================================================")
