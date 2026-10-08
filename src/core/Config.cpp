@@ -244,6 +244,19 @@ bool parseVec3(std::string_view str, glm::vec3& outVec) {
 }
 } // namespace
 
+bool Config::dgcExecSetRequested() {
+    // Unset = default policy: enable whenever the driver supports compute execution sets.
+    const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
+    if (execsetEnv && execsetEnv[0] == '0') {
+        return false;
+    }
+    // Legacy kill-switches (documented in the codebase review; still honored):
+    if (getenv("PATHWAYS_DISABLE_MATERIAL_DGC") || getenv("PATHWAYS_DISABLE_DGC_EXECSET")) {
+        return false;
+    }
+    return true;
+}
+
 void Config::printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n\n"
               << "General & Display:\n"

@@ -235,6 +235,13 @@ struct Config {
 
     static Config parse(int argc, char* argv[]);
     static void printUsage(const char* progName);
+
+    // Single source of truth for the DGC compute execution-set kill-switch policy.
+    // Set via --dgc-execset / --no-dgc-execset (which export PATHWAYS_DGC_EXECSET);
+    // unset means default policy: enable whenever the driver supports it.
+    // Also honors legacy kill-switches PATHWAYS_DISABLE_MATERIAL_DGC and
+    // PATHWAYS_DISABLE_DGC_EXECSET.
+    static bool dgcExecSetRequested();
 };
 
 } // namespace pathways

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <filesystem>
 #include <format>
+#include <array>
 
 namespace pathways {
 
@@ -1112,60 +1113,39 @@ void VulkanContext::initVMA() {
     Logger::info("VMA Allocator initialized successfully.");
 }
 
-std::string VulkanContext::getArchitectureName() const {
-    switch (m_architecture) {
-        case GpuArchitecture::AmdRDNA4:        return "AMD RDNA4 (GFX1201)";
-        case GpuArchitecture::AmdRDNA3_5:      return "AMD RDNA3.5 (GFX115x)";
-        case GpuArchitecture::AmdRDNA3:        return "AMD RDNA3 (Navi 3x)";
-        case GpuArchitecture::AmdRDNA2:        return "AMD RDNA2 (Navi 2x)";
-        case GpuArchitecture::AmdRDNA1:        return "AMD RDNA1 (Navi 1x)";
-        case GpuArchitecture::NvidiaBlackwell: return "NVIDIA Blackwell";
-        case GpuArchitecture::NvidiaAda:       return "NVIDIA Ada Lovelace";
-        case GpuArchitecture::NvidiaAmpere:    return "NVIDIA Ampere";
-        case GpuArchitecture::NvidiaTuring:    return "NVIDIA Turing";
-        case GpuArchitecture::IntelArc:        return "Intel Arc Xe-HPG";
-        default:                               return "Vulkan 1.4 Native GPU";
-    }
-}
+namespace {
+// Single source of truth for per-architecture display metadata, indexed by
+// GpuArchitecture. One row per enumerator, in enum order (see VulkanContext.hpp).
+struct ArchInfo {
+    const char* name;      // Full display name (telemetry JSON "arch_name")
+    const char* shortName; // Compact name (window title)
+    const char* rtName;    // Ray accelerator generation description (telemetry JSON)
+};
+constexpr std::array<ArchInfo, 11> kArchInfoTable{{
+    /* Generic          */ {"Vulkan 1.4 Native GPU",   "Vulkan",    "Hardware Ray Queries (VK_KHR_ray_query)"},
+    /* AmdRDNA1        */ {"AMD RDNA1 (Navi 1x)",     "RDNA1",     "Hardware Ray Queries (VK_KHR_ray_query)"},
+    /* AmdRDNA2        */ {"AMD RDNA2 (Navi 2x)",     "RDNA2",     "AMD RDNA2 1st Gen Ray Accelerators"},
+    /* AmdRDNA3        */ {"AMD RDNA3 (Navi 3x)",     "RDNA3",     "AMD RDNA3 2nd Gen Ray Accelerators"},
+    /* AmdRDNA3_5      */ {"AMD RDNA3.5 (GFX115x)",   "RDNA3.5",   "AMD RDNA3 2nd Gen Ray Accelerators"},
+    /* AmdRDNA4        */ {"AMD RDNA4 (GFX1201)",     "RDNA4",     "AMD RDNA4 3rd Gen Ray Accelerators"},
+    /* NvidiaTuring    */ {"NVIDIA Turing",           "Turing",    "NVIDIA 2nd Gen RT Cores"},
+    /* NvidiaAmpere    */ {"NVIDIA Ampere",           "Ampere",    "NVIDIA 3rd Gen RT Cores"},
+    /* NvidiaAda       */ {"NVIDIA Ada Lovelace",     "Ada",       "NVIDIA 4th Gen RT Cores"},
+    /* NvidiaBlackwell */ {"NVIDIA Blackwell",        "Blackwell", "NVIDIA 5th Gen RT Cores"},
+    /* IntelArc        */ {"Intel Arc Xe-HPG",        "Intel Arc", "Intel Xe Ray Tracing Units"},
+}};
 
-std::string VulkanContext::getShortArchName() const {
-    switch (m_architecture) {
-        case GpuArchitecture::AmdRDNA4:        return "RDNA4";
-        case GpuArchitecture::AmdRDNA3_5:      return "RDNA3.5";
-        case GpuArchitecture::AmdRDNA3:        return "RDNA3";
-        case GpuArchitecture::AmdRDNA2:        return "RDNA2";
-        case GpuArchitecture::AmdRDNA1:        return "RDNA1";
-        case GpuArchitecture::NvidiaBlackwell: return "Blackwell";
-        case GpuArchitecture::NvidiaAda:       return "Ada";
-        case GpuArchitecture::NvidiaAmpere:    return "Ampere";
-        case GpuArchitecture::NvidiaTuring:    return "Turing";
-        case GpuArchitecture::IntelArc:        return "Intel Arc";
-        default:                               return "Vulkan";
-    }
+const ArchInfo& archInfo(GpuArchitecture arch) {
+    const size_t idx = static_cast<size_t>(arch);
+    return kArchInfoTable[idx < kArchInfoTable.size() ? idx : 0];
 }
+} // namespace
 
-std::string VulkanContext::getRayAcceleratorName() const {
-    switch (m_architecture) {
-        case GpuArchitecture::AmdRDNA4:        return "AMD RDNA4 3rd Gen Ray Accelerators";
-        case GpuArchitecture::AmdRDNA3_5:
-        case GpuArchitecture::AmdRDNA3:        return "AMD RDNA3 2nd Gen Ray Accelerators";
-        case GpuArchitecture::AmdRDNA2:        return "AMD RDNA2 1st Gen Ray Accelerators";
-        case GpuArchitecture::NvidiaBlackwell: return "NVIDIA 5th Gen RT Cores";
-        case GpuArchitecture::NvidiaAda:       return "NVIDIA 4th Gen RT Cores";
-        case GpuArchitecture::NvidiaAmpere:    return "NVIDIA 3rd Gen RT Cores";
-        case GpuArchitecture::NvidiaTuring:    return "NVIDIA 2nd Gen RT Cores";
-        case GpuArchitecture::IntelArc:        return "Intel Xe Ray Tracing Units";
-        default:                               return "Hardware Ray Queries (VK_KHR_ray_query)";
-    }
-}
+std::string VulkanContext::getArchitectureName() const { return archInfo(m_architecture).name; }
 
-bool VulkanContext::isRDNA() const {
-    return m_architecture == GpuArchitecture::AmdRDNA1 ||
-           m_architecture == GpuArchitecture::AmdRDNA2 ||
-           m_architecture == GpuArchitecture::AmdRDNA3 ||
-           m_architecture == GpuArchitecture::AmdRDNA3_5 ||
-           m_architecture == GpuArchitecture::AmdRDNA4;
-}
+std::string VulkanContext::getShortArchName() const { return archInfo(m_architecture).shortName; }
+
+std::string VulkanContext::getRayAcceleratorName() const { return archInfo(m_architecture).rtName; }
 
 uint64_t VulkanContext::getTotalVramBytes() const {
     VkPhysicalDeviceMemoryProperties memProperties;

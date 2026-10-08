@@ -1609,8 +1609,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
             auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
 
-            const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
-            bool enableSecExecSet = secNode->context->supportsDgcExecutionSet() && (!execsetEnv || execsetEnv[0] != '0');
+            bool enableSecExecSet = secNode->context->supportsDgcExecutionSet() && Config::dgcExecSetRequested();
 
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,

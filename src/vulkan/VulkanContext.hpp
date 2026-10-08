@@ -32,6 +32,8 @@ struct QueueFamilyIndices {
     }
 };
 
+// Display metadata lives in kArchInfoTable (VulkanContext.cpp): keep one row per
+// enumerator, in this order, when adding or reordering architectures.
 enum class GpuArchitecture {
     Generic,
     AmdRDNA1,
@@ -104,7 +106,6 @@ public:
     std::string getArchitectureName() const;
     std::string getShortArchName() const;
     std::string getRayAcceleratorName() const;
-    bool isRDNA() const;
     static constexpr uint32_t PATHWAYS_MIN_VULKAN_API_VERSION = VK_MAKE_API_VERSION(0, 1, 4, 341);
 
     bool hasDGC() const { return m_hasDGC; }

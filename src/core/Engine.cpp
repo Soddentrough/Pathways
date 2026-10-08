@@ -801,8 +801,7 @@ void Engine::initPipelines() {
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
 
-    const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
-    bool enableExecSet = m_context->supportsDgcExecutionSet() && (!execsetEnv || execsetEnv[0] != '0');
+    bool enableExecSet = m_context->supportsDgcExecutionSet() && Config::dgcExecSetRequested();
 
     m_rtOrchestrator->initWavefrontPipeline(
         m_config.width, m_config.height,

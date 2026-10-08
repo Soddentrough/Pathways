@@ -1,4 +1,5 @@
 #include "rt/DGCManager.hpp"
+#include "core/Config.hpp"
 #include "core/Logger.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -309,17 +310,9 @@ void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materia
 
 void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
                                          const std::vector<VkPipeline>& secondaryPipelines) {
-    // PATHWAYS_DGC_EXECSET is set by --dgc-execset / --no-dgc-execset (Config.cpp).
-    // Unset = default policy: enable whenever the driver supports compute execution sets.
-    const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
-    bool enableMaterialDGC = true;
-    if (execsetEnv) {
-        enableMaterialDGC = (execsetEnv[0] != '0');
-    }
-    // Legacy kill-switches (documented in the codebase review; still honored):
-    if (getenv("PATHWAYS_DISABLE_MATERIAL_DGC") || getenv("PATHWAYS_DISABLE_DGC_EXECSET")) {
-        enableMaterialDGC = false;
-    }
+    // Kill-switch policy centralized in Config::dgcExecSetRequested():
+    // --dgc-execset / --no-dgc-execset, PATHWAYS_DGC_EXECSET, and legacy overrides.
+    const bool enableMaterialDGC = Config::dgcExecSetRequested();
     if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
         Logger::info("Material microkernels active via GPU multi-dispatch indirect queues (6 specialized pipelines).");
