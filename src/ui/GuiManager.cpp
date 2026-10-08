@@ -1248,7 +1248,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("Neural Radiance Caching (Wave32 WMMA):");
+            ImGui::TextDisabled("Neural Direct-Light Caching (Wave32 WMMA, experimental):");
             if (ImGui::Checkbox("Enable Neural Radiance Cache", &config.enable_nrc)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;

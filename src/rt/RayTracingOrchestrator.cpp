@@ -121,7 +121,7 @@ void RayTracingOrchestrator::initNRC(
         width, height,
         inferCode, trainCode, resolveCode
     );
-    Logger::info("Neural Radiance Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized successfully.");
+    Logger::info("Neural Direct-Light Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized. Note: caches unshadowed direct light only — see docs/NRC.md.");
 }
 
 void RayTracingOrchestrator::createReSTIRResources(

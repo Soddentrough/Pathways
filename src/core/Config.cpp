@@ -274,7 +274,9 @@ void Config::printUsage(const char* progName) {
               << "  --preset <preset|WxH>   Scaling ratio preset: native, quality, balanced, performance, ultra, or <W>x<H>\n"
               << "  --upways-weights <path> Path to Upways weights binary (default: data/models/upways_weights.bin, or embedded fallback)\n"
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
-              << "  --nrc                   Enable Neural Radiance Caching with Wave32 WMMA [default: disabled]\n"
+              << "  --nrc                   Enable Neural Direct-Light Caching (experimental) with Wave32 WMMA.\n"
+              << "                            Caches UNSHADOWED DIRECT-LIGHT radiance only (indirect GI is not\n"
+              << "                            cached; full-radiance roadmap: docs/NRC.md) [default: disabled]\n"
               << "  --nrc-bounce <int>      Path bounce depth where NRC terminates tracing (default: 2)\n"
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
@@ -301,10 +303,10 @@ void Config::printUsage(const char* progName) {
               << "Wavefront Architecture:\n"
               << "  --wavefront-sort <mode> Wavefront material sorting mode: 'auto' [default], 'dual' (D), 'none', or 'archetype' (A & B)\n"
               << "  --use-morton            Enable 2D Morton Z-curve mapping for wavefront classification (default: disabled / linear raster)\n"
-              << "  --sec-sort <mode>       Secondary ray coherency mode: 'directional'/'octant' (On-chip 8-bin Directional DGC) [default], 'direct'/'coherent' (Xiang 2023, K=4), 'coherent-k8' (K=8), or 'none'\n"
-              << "  --macro-blas            Merge static instance clusters into spatial Macro-BLASes (cuts 35-50% ray-box tests) [default: enabled]\n"
-              << "  --no-macro-blas         Disable Macro-BLAS merging (retain legacy fine-grained TLAS prototype instancing)\n"
-              << "  --macro-blas-max-tris <N> Maximum geometry expansion budget for Macro-BLAS merging (default: 2000000)\n"
+              << "  --sec-sort <mode>       Secondary ray coherency mode: 'direct'/'coherent' (Xiang 2023, K=4) [default], 'directional'/'octant' (On-chip 8-bin Directional DGC), 'coherent-k8' (K=8), or 'none'\n"
+              << "  --macro-blas            Merge static instance clusters into spatial Macro-BLASes (cuts 35-50% ray-box tests) [default: disabled, opt-in]\n"
+              << "  --no-macro-blas         Disable Macro-BLAS merging (fine-grained TLAS prototype instancing) [default]\n"
+              << "  --macro-blas-max-tris <N> Maximum geometry expansion budget for Macro-BLAS merging (default: 250000)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
@@ -320,18 +322,18 @@ void Config::printUsage(const char* progName) {
               << "  --macro-tiles <int|auto> Alias for --batches\n"
               << "  --batch-size <int|auto> Coarse batch pixel budget (e.g. 1000000, 2000000; default: auto)\n"
               << "  --batch-pixels <int>    Alias for --batch-size\n"
-              << "  --dgc-execset           Enable experimental DGC Execution Sets for material archetypes.\n"
+              << "  --dgc-execset           Force-enable DGC Execution Sets for material archetypes.\n"
               << "                            What it is: Uses VK_EXT_device_generated_commands Indirect Execution\n"
               << "                            Sets (VkIndirectExecutionSetEXT) to dynamically bind specialized\n"
               << "                            compute material pipelines on the GPU via indirect token streams\n"
               << "                            in a single vkCmdExecuteGeneratedCommandsEXT call.\n"
-              << "                            Needs: Driver support for compute indirect execution set pipeline switching.\n"
-              << "                            Why disabled: Current Vulkan drivers (including Mesa RADV 26.x) fail to switch\n"
-              << "                            compute pipelines dynamically via indirect execution set tokens, running\n"
-              << "                            only the initial pipeline and dropping secondary rays/reflections.\n"
-              << "                            The default multi-dispatch indirect path is already 100% GPU-driven,\n"
-              << "                            skips empty material queues with zero wave launches, and is fully correct.\n"
-              << "  --no-dgc-execset        Explicitly disable DGC Execution Sets (enforce default multi-dispatch indirect)\n\n"
+              << "                            Default: ENABLED when the driver advertises compute execution sets\n"
+              << "                            (all RDNA3/RDNA4 Mesa RADV drivers); otherwise the multi-dispatch\n"
+              << "                            indirect fallback is used automatically.\n"
+              << "                            Caveat: Some drivers fail to switch compute pipelines dynamically via\n"
+              << "                            execution set tokens (running only the initial pipeline). Use\n"
+              << "                            --no-dgc-execset to force the fully-correct multi-dispatch path.\n"
+              << "  --no-dgc-execset        Disable DGC Execution Sets (force GPU multi-dispatch indirect queues)\n\n"
               << "Camera & Navigation:\n"
               << "  --adaptive-speed        Enable distance-adaptive camera speed (smooth approach) [default: enabled]\n"
               << "  --no-adaptive-speed     Disable distance-adaptive camera speed (constant velocity)\n"
@@ -906,7 +908,12 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
             continue;
         }
-        if (arg == "--restir-pt" || arg == "--restir-di" || arg == "--restir") {
+        if (arg == "--restir-pt") {
+            Logger::warn("--restir-pt: full path-space ReSTIR PT is not yet implemented; enabling ReSTIR DI (direct-light) resampling only. See docs/reports/codebase_review_2026_10_07.md.");
+            cfg.enable_restir_di = true;
+            continue;
+        }
+        if (arg == "--restir-di" || arg == "--restir") {
             cfg.enable_restir_di = true;
             continue;
         }
@@ -1097,14 +1104,12 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--dgc-execset" || arg == "--dgc-tier2-execset") {
-            setEnvVar("PATHWAYS_ENABLE_DGC_EXECSET", "1");
-            setEnvVar("PATHWAYS_ENABLE_MATERIAL_DGC", "1");
-            Logger::warn("--dgc-execset enabled: Experimental compute execution sets active. Note: drivers such as Mesa RADV may fail to switch compute pipelines dynamically via execution set tokens.");
+            setEnvVar("PATHWAYS_DGC_EXECSET", "1");
+            Logger::info("--dgc-execset: DGC compute execution sets force-enabled (if supported by the driver).");
             continue;
         }
         if (arg == "--no-dgc-execset" || arg == "--no-dgc-tier2-execset") {
-            setEnvVar("PATHWAYS_DISABLE_DGC_EXECSET", "1");
-            setEnvVar("PATHWAYS_DISABLE_MATERIAL_DGC", "1");
+            setEnvVar("PATHWAYS_DGC_EXECSET", "0");
             continue;
         }
         if (arg == "--no-double-buffer" || arg == "--no-double-buffer-shared" || arg == "--single-buffer-shared") {

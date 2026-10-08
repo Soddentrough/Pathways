@@ -44,7 +44,7 @@ Pathways replaces the monolithic megakernel approach with a **GPU-driven Wavefro
                        [ Shadow Occlusion Test ] ──► Inline Ray Query
                                     │
                                     ▼
-                       [ Progressive Accumulation ] ──► Running Average / Welford
+                       [ Progressive Accumulation ] ──► Online Running Mean
                                     │
                                     ▼
                        [ Temporal Super-Resolution ] ──► AMD FSR 3.1 / Upways ML
@@ -82,7 +82,7 @@ Pathways decomposes light transport into decoupled, specialized compute microker
 5. **Shadow Occlusion (`shaders/compute/wavefront_shadow.comp`)**:
    - Evaluates direct lighting visibility using binary inline ray queries (`rayQueryConfirmIntersectionEXT`), bypassing hit shader overhead.
 6. **Accumulation Resolve (`shaders/compute/accum_running_avg.comp`)**:
-   - Numerically stable progressive HDR accumulation using online Welford updates, preventing highlight blowout and floating-point accumulation drift.
+   - Numerically stable progressive HDR accumulation using an online running-mean update (`x̄_N = mix(x̄_{N-1}, x_N, 1/N)` — note: an online mean, not Welford's variance algorithm), preventing highlight blowout and floating-point accumulation drift.
 
 ### 2.2 Coarse-Batch Wavefront Partitioning & 2D Macro-Tile Decomposition ($O(1)$ Memory Scaling)
 Staging all ray queues simultaneously across a native 4K UHD viewport ($3840 \times 2160 = 8.29\text{M pixels}$) consumes approximately **2,721 MB of VRAM** for double-buffered ray and state queues. On unified memory architectures (APUs/UMA) where CPU and GPU share memory bandwidth, cycling this volume of memory each frame induces severe memory unit stalls (>60%).
@@ -323,7 +323,7 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | :---: | :--- | :--- | :---: | :--- |
 | **0** | `storageImage` | `accumImage` | RGBA32F / RGBA16F | Progressive accumulation & render target |
 | **1** | `uniformBuffer` | `cameraUBO` | 256 B | Camera projection, view matrices, resolution |
-| **2** | `storageBuffer` | `triangles` | **128 B** | Cache-line aligned shading geometry (`TriangleShadeGPU`) |
+| **2** | `storageBuffer` | `triangles` | **64 B** | Cache-line-packed shading geometry (`TriangleShadeGPU`, 2 triangles per 128 B vector cache line) |
 | **3** | `storageBuffer` | `spheres` | 32 B | Procedural analytic spheres (`SphereGPU`) |
 | **4** | `storageBuffer` | `materials` | 208 B | Full glTF 2.0 extended PBR materials (`MaterialGPU`) |
 | **5** | `storageBuffer` | `lights` | 64 B | Analytical & directional scene lights |

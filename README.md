@@ -14,6 +14,8 @@ Pathways (v1.24.0) is a real-time path tracing engine built on **Vulkan 1.4**. T
 
 Pathways delivers high-throughput real-time path tracing across diverse geometric complexities, BSDF archetypes, and instancing loads. The following scene examples demonstrate real-world rendering quality and hardware throughput on **AMD RDNA 4 (`gfx1201`)** architecture at native **4K UHD (3840×2160)**, 1 SPP, 4 Bounces with FP16 HDR accumulation.
 
+> **Benchmark provenance**: All figures below are measured on the RDNA 4 (`gfx1201`) testbed under Mesa RADV ACO with `RADV_PROFILE_PSTATE=peak`, but were captured across separate sessions (Sept–Oct 2026) as the engine evolved (64-byte triangle migration, exec-set dispatch, etc.), so the same scene may differ slightly between tables (e.g. Cornell Box 4K appears as both 7.36 ms and 8.01 ms). They are directional, not a single controlled run. A one-session re-cut of every table is tracked in [`docs/reports/codebase_review_2026_10_07.md`](docs/reports/codebase_review_2026_10_07.md).
+
 ### 1. Classic Cornell Box
 ![Classic Cornell Box](docs/images/cornell_box.png)
 
@@ -99,7 +101,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 
 ### 1. Wavefront Path Tracing & Autonomous DGC
 - **Wavefront Architecture**: Decomposes ray tracing into decoupled compute stages (Ray Classification, Ray Intersection, Material Shading, Shadow Queries, Accumulation Resolve), reducing execution divergence across heterogeneous materials.
-- **GPU-Autonomous Material Sorting & Microkernels**: Dynamically partitions rays by BSDF archetype (diffuse, dielectric, conductor, complex). Production defaults to GPU multi-dispatch indirect queues (`vkCmdDispatchIndirect` consuming GPU-classified indirect argument streams), eliminating CPU readbacks and driver preprocessing latency (+22.3% higher throughput). DGC Execution Sets (`VkIndirectExecutionSetEXT` via `vkCmdExecuteGeneratedCommandsEXT`) are available as an **experimental** driver-validation path via `--dgc-execset` (the default multi-dispatch indirect path is the production path).
+- **GPU-Autonomous Material Sorting & Microkernels**: Dynamically partitions rays by BSDF archetype (diffuse, dielectric, conductor, complex) and dispatches the specialized microkernels entirely on-GPU — eliminating CPU readbacks and driver preprocessing latency (+22.3% higher throughput vs. host-staged dispatch). Two GPU-autonomous dispatch paths ship: **DGC Execution Sets** (`VkIndirectExecutionSetEXT` via `vkCmdExecuteGeneratedCommandsEXT`), auto-selected when the driver advertises compute execution sets (all current Mesa RADV RDNA3/RDNA4 drivers), and a **multi-dispatch indirect** path (`vkCmdDispatchIndirect` consuming GPU-classified argument streams) used otherwise and selectable via `--no-dgc-execset` on drivers with buggy execution-set pipeline switching.
 - **64-Byte Cache-Line-Packed Shading Geometry (`TriangleShadeGPU`)**: Shading triangle attributes are organized into exactly 64-byte records (oct-encoded normal/tangent, packed UVs, `tanSigns`, `materialId`, reserved), packing **2 triangles per 128-byte RDNA 4 vector cache line** ($L0/L1$) to eliminate split-cacheline fetch penalties. Vertex positions are segregated into a dedicated 16-byte aligned position buffer (`glm::vec4` stride) used exclusively for hardware BLAS builds, saving 48 bytes per triangle in the shading pipeline.
 - **64-Byte Compact Shading Material Buffer (`ShadeMaterialGPU`) & Scalar Archetype Buffer**: High-frequency shading microkernels sample a 64-byte compact material buffer (binding 35, packing 2 materials per 128-byte cache line) reducing memory bandwidth by over 69% vs legacy structs. Classification and shadow passes query an ultra-compact 4-byte scalar `materialArchetypes` buffer (binding 34) to determine BSDF archetypes without touching full material records or texture descriptors.
 - **Secondary Bounce Tangent & Normal Bypass**: Ray intersection (`wavefront_intersect.comp`) and secondary diffuse shading (`#if !IS_SECONDARY_BOUNCE`) bypass tangent attribute loads, TBN frame reconstruction, and normal map sampling for secondary bounces, preserving ALU throughput and vector register capacity for indirect diffuse GI transport.
@@ -132,7 +134,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
 - **Real-Time Forward Ray-Traced Caustics (`--caustics`)**: Forward photon injection using Vulkan 1.4 hardware `rayQueryEXT` for crisp real-time refractive caustics.
 - **Hierarchical 3D Light Tree (`--light-tree`)**: Spatial octree importance sampling for scenes with dozens or hundreds of analytical and emissive light sources.
 - **AMD FidelityFX Super Resolution (FSR 3.1) & Upways Neural Denoising**: High-performance temporal super-resolution (`--upscaler fsr3`) with Robust Contrast Adaptive Sharpening (RCAS), and native Upways Neural Reconstruction (`--denoiser upways`) accelerated by Wave32 WMMA (`VK_KHR_cooperative_matrix`).
-- **Welford Running Average Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`) eliminating numeric overflow and preventing highlight blowout up to 2048 SPP.
+- **Online Running-Mean Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`, `x̄_N = mix(x̄_{N-1}, x_N, 1/N)`) eliminating numeric overflow and preventing highlight blowout up to the 2048-frame accumulation ceiling (FP16 history; convergence resolution saturates near N ≈ 1024 — see `docs/reports/codebase_review_2026_10_07.md` B13 for the FP32 promotion plan).
 - **HDR Display Output & ACES Tonemapping**: Auto-negotiates scRGB Linear and HDR10 PQ (ST 2084) via `VK_EXT_hdr_metadata`, paired with compute-based filmic ACES tonemapping for standard SDR displays.
 
 ### 4. Dynamic Quality Regulation & Telemetry
@@ -181,14 +183,14 @@ Pathways is designed for modern desktop workstations and gaming PCs with hardwar
 
 | Extension / Feature | Spec Date | Desktop Coverage (Win + Linux) | Mobile Coverage (Android) | Global Coverage (All Devices) | Role & Status in Pathways |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~49.3%** | **~0.1%** | **~16.8%** | **Wavefront Acceleration**: Enables GPU-autonomous indirect command generation and execution for material microkernel dispatches via `VK_EXT_device_generated_commands`, reducing host CPU dispatch overhead. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). |
-| **`VK_KHR_acceleration_structure`** | Nov 20, 2020 | **~52.9%** | **~26.6%** | **~34.1%** | **BVH Management**: Required for building and querying hardware Top-Level (TLAS) and Bottom-Level (BLAS) ray tracing acceleration structures. |
-| **`VK_KHR_ray_tracing_pipeline`** | Nov 20, 2020 | **~51.3%** | **~7.6%** | **~21.8%** | **Hardware RTP**: Powers the dedicated hardware ray tracing pipeline (`--pipeline rtp` megakernel mode). |
-| **`VK_EXT_external_memory_host`** | Jan 17, 2018 | **~84.9%** | **~6.5%** | **~36.1%** | **Multi-GPU Zero-Copy**: Enables secondary GPU to stream rendered HDR tiles directly into pinned host RAM at PCIe line rate (~25 GB/s), eliminating peer PCIe BAR read stalls. |
-| **Vulkan 1.4 Core** | Jan 15, 2025 | **~61.2%** | **~7.9%** | **~28.2%** | **Engine Baseline**: Core driver version requirement (72.6% on Linux Mesa, 53.2% on Windows). |
+| **`VK_EXT_device_generated_commands`** | Dec 14, 2023 | **~48.8%** | **~0.1%** | **~17.0%** | **Wavefront Acceleration**: Enables GPU-autonomous indirect command generation and execution for material microkernel dispatches via `VK_EXT_device_generated_commands`, reducing host CPU dispatch overhead. Standard on modern desktop drivers (AMD RDNA3/RDNA4 on Mesa RADV, NVIDIA Ada/Blackwell). |
+| **`VK_KHR_acceleration_structure`** | Nov 20, 2020 | **~52.7%** | **~26.6%** | **~34.7%** | **BVH Management**: Required for building and querying hardware Top-Level (TLAS) and Bottom-Level (BLAS) ray tracing acceleration structures. |
+| **`VK_KHR_ray_tracing_pipeline`** | Nov 20, 2020 | **~51.2%** | **~7.6%** | **~22.2%** | **Hardware RTP**: Powers the dedicated hardware ray tracing pipeline (`--pipeline rtp` megakernel mode). |
+| **`VK_EXT_external_memory_host`** | Jan 17, 2018 | **~84.5%** | **~6.5%** | **~37.4%** | **Multi-GPU Zero-Copy**: Enables secondary GPU to stream rendered HDR tiles directly into pinned host RAM at PCIe line rate (~25 GB/s), eliminating peer PCIe BAR read stalls. |
+| **Vulkan 1.4 Core** | Jan 15, 2025 | **~61.6%** | **~7.9%** | **~29.2%** | **Engine Baseline**: Core driver version requirement (72.7% on Linux Mesa, 52.8% on Windows). |
 
 > [!NOTE]
-> **Desktop vs. Global Metrics**: Over 61.7% of all devices recorded in the Vulkan Hardware Database are low-power Android mobile phones and embedded SoCs (1,467 out of 2,376 devices), which pulls down global percentages for high-end rendering features. Among desktop PCs (976 reported Windows and Linux devices), hardware ray tracing and DGC achieve ~50–53% coverage across all recorded hardware generations, and approach ~100% on contemporary discrete gaming GPUs (AMD RDNA2+, NVIDIA RTX 20+). For a complete breakdown and call-site citations across the entire engine, see [VULKAN_API_AUDIT.md](docs/VULKAN_API_AUDIT.md) or run `python3 scripts/audit_vulkan_api.py --compare-platforms`.
+> **Desktop vs. Global Metrics** (Vulkan Hardware Database snapshot **2026-10-08**, live-refreshable via `python3 scripts/audit_vulkan_api.py`): Over 57% of all recorded devices are low-power Android mobile phones and embedded SoCs (1,353 out of 2,340 devices), which pulls down global percentages for high-end rendering features. Among desktop PCs (987 reported Windows and Linux devices), hardware ray tracing and DGC achieve ~49–53% coverage across all recorded hardware generations, and approach ~100% on contemporary discrete gaming GPUs (AMD RDNA2+, NVIDIA RTX 20+). For a complete breakdown and call-site citations across the entire engine, see [VULKAN_API_AUDIT.md](docs/VULKAN_API_AUDIT.md) or run `python3 scripts/audit_vulkan_api.py --compare-platforms`.
 
 ---
 
@@ -233,7 +235,7 @@ ctest --test-dir build --output-on-failure
 ./build/bin/pathways --scene scenes/classroom/classroom_extended.glb --scaler fsr quality
 
 # Launch 4K rendering with Upways Wave32 Neural Super-Resolution from 1080p
-./build/bin/pathways --scene scenes/living-room/living_room.glb --res 4k --scaler upways 1080
+./build/bin/pathways --scene scenes/living-room/living_room_extended.glb --res 4k --scaler upways 1080
 
 # Launch in windowed mode with target frame pacing at 1440p
 ./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
@@ -283,7 +285,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--wavefront-sort` | `auto` \| `dual` \| `archetype` \| `none` | Material sorting mode: scene & hardware adaptive (`auto`, default), 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `auto` |
 | `--sec-sort` | `direct` \| `directional` \| `coherent-k8` \| `none` | Secondary ray coherency mode: Direct Coherent Ray Generation via tangent-space reuse (`direct`/`coherent`, Xiang et al. 2023, K=4, default), on-chip 8-bin directional DGC octant binning (`directional`/`octant`), K=8 coherent, or unsorted (`none`) | `direct` |
 | `--macro-tiles`, `--batches` | `<int>` | 2D macro-tile batch count for wavefront queue partitioning (0 = auto based on budget) | `0` (Auto) |
-| `--dgc-execset` | *(flag)* | Enable experimental DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels (driver validation path; default is GPU multi-dispatch indirect) | Disabled |
+| `--dgc-execset` | *(flag)* | Force-enable DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels. Auto-enabled when the driver advertises compute execution sets; use `--no-dgc-execset` to force the multi-dispatch indirect fallback | Auto (driver-dependent) |
 | `--scaler`, `--upscaler` | `<mode> [ratio\|res]` | Consolidated upscaler: `upways`, `fsr`, `fsr1`, `none`. Presets: `native`, `quality`, `balanced`, `performance`, `ultra`, or arbitrary resolution (`1080`, `1440`, `1920x1080`, `0.75`) | `none` |
 | `--preset`, `--upscaler-preset` | `quality` \| `balanced` \| `perf` \| `ultra` | Scaling ratio preset or resolution override | `quality` |
 | `--upscaler-sharpening` | *(flag)* | Enable Robust Contrast Adaptive Sharpening (RCAS) pass | Disabled |
@@ -296,6 +298,12 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
 | `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
 | `--nrc` | *(flag)* | Enable Neural **Direct-Light** Caching with Wave32 WMMA — a neural cache of unshadowed direct-light radiance only (indirect GI is not cached; see `docs/NRC.md` for the full-radiance roadmap) | Disabled |
+| `--nrc-bounce` | `<int>` | Path bounce depth at which NRC terminates tracing | `2` |
+| `--nrc-train-ratio` | `<float>` | Fraction of paths that continue to ground truth for NRC training | `0.03` |
+| `--caustic-photons` | `<int>` | Photon count for the forward caustics pass | `1048576` |
+| `--restir` | *(flag)* | Enable ReSTIR DI (direct-light) reservoir resampling for many-light scenes. (`--restir-pt` currently warns and enables DI only — full ReSTIR PT is unimplemented) | Disabled |
+| `--restir-min-lights` | `<int>` | Minimum light count before ReSTIR DI auto-activates | `8` |
+| `--restir-m-cap` | `<int>` | ReSTIR DI temporal reservoir M cap | `30` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |
@@ -305,6 +313,12 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--target-fps` | `<int>` | Target frame rate limit (0 = uncapped) | `0` |
 | `--target-frame-time` | `<float>` | Target frame time budget in ms (e.g. 8.3 ms for 120 FPS) | `8.3` |
 | `--adaptive-spp` | *(flag)* | Enable dynamic 3-axis quality governor to track target FPS | Disabled |
+| `--min-spp` / `--max-spp` | `<int>` | SPP floor / ceiling for the quality governor and accumulation | `1` / `16` |
+| `--accum-format` | `fp16` \| `fp32` \| `rg11` | Progressive accumulation buffer format (`fp16` default for bandwidth; `fp32` for high-SPP precision) | `fp16` |
+| `--tail-megakernel` | *(flag)* | Hybrid wavefront→megakernel transition for late bounces (experimental) | Disabled |
+| `--macro-blas` | *(flag)* | Merge static instance clusters into spatial Macro-BLASes (cuts 35–50% ray-box tests) | Disabled |
+| `--delta-unroll` | `<int>` | Delta-chain unroll depth for smooth dielectrics (0 = pure wavefront) | `0` |
+| `--camera-path` | `<path.json>` | Cinematic camera trajectory (waypoints, Catmull-Rom, Bézier) | None |
 | `--no-hdr` | *(flag)* | Disable HDR display auto-negotiation (force SDR sRGB) | HDR on |
 | `--headless` | *(flag)* | Run offscreen without opening a window | Disabled |
 | `--frames` | `<int>` | Total frame execution limit (0 = run continuously in GUI; 1 in headless) | `0` (GUI) / `1` (Headless) |
@@ -327,7 +341,7 @@ Pathways is profiled and benchmarked on modern AMD RDNA 4 architecture (`gfx1201
 | Scene / Workload | Resolution & Settings | Single-GPU (ms / FPS) | Dual-GPU (ms / FPS) | Multi-GPU Mode | Speedup / Scaling | Throughput Gain |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Procedural Cornell Box** | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 7.35 ms (136.0 FPS) | **3.87 ms** (258.1 FPS) | Checkerboard ($64\times 64$) | **1.90x** | 8.56 GigaRays/s |
-| **Damaged Helmet (`.glb`)** | **1080p** (1920x1080), 16 SPP, 4 Bounces | 7.79 ms (128.5 FPS) | **3.41 ms** (293.0 FPS) | Sample Parallelism | **2.28x** (Super-linear scaling via cache partitioning) | 1.88x ($3.86 \times 10^{10}$ rays/s) |
+| **Damaged Helmet (`.glb`)** | **1080p** (1920x1080), 16 SPP, 4 Bounces | 7.79 ms (128.5 FPS) | **3.41 ms** (293.0 FPS) | Sample Parallelism | **2.28x** (>2.0x attributed to per-GPU working-set partitioning improving cache hit rate; re-verification pending) | 1.88x ($3.86 \times 10^{10}$ rays/s) |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **5.82 ms** (171.8 FPS) | Checkerboard ($64\times 64$) | **1.99x** (99.3% Efficiency) | 5.70 GigaRays/s |
 | **Pontiac GTO Extended** (1,063,260 Triangles) | **4K Native** (3840x2160), 1 SPP, 4 Bounces | 11.56 ms (86.5 FPS) | **6.97 ms** (143.4 FPS) | Sample Parallelism | **1.66x** (83.0% Efficiency) | 4.76 GigaRays/s |
 | **Zero-Copy Host Compositing** | 4K HDR Tile Merge (63.3 MB) | — | **0.12 ms** (8.3 kHz) | Host DMA (`VK_EXT_external_memory_host`) | **Avoids non-posted PCIe BAR stalls** | 258 FPS throughput |
@@ -413,7 +427,7 @@ RADV_DEBUG=syncshaders ./build/bin/pathways
 
 ## Profiling & Developer Tools
 
-- **AMD Developer Tools**: Fully compatible with the Radeon Developer Tool Suite (`/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`), Radeon GPU Profiler (RGP), Radeon Raytracing Analyzer (RRA), and Radeon GPU Detective (RGD).
+- **AMD Developer Tools**: Fully compatible with the Radeon Developer Tool Suite, Radeon GPU Profiler (RGP), Radeon Raytracing Analyzer (RRA), and Radeon GPU Detective (RGD).
 - **Automated Profiling Suite**:
   ```bash
   python3 scripts/benchmark_megakernel_vs_wavefront.py
