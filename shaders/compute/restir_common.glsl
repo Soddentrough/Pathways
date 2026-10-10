@@ -432,4 +432,176 @@ void restirDiApplyTap(
 
 #endif // RESTIR_INCLUDE_SAMPLER_HELPERS
 
+// =============================================================================
+// ReSTIR GI (path-space) — Phase 2, docs/RESTIR_PT_DESIGN.md
+// =============================================================================
+//
+// Resamples the direct-lighting integral at the primary hit x1:
+//     L_direct(x1) = ∫ f_r(x1) cosθ1 L(x2→x1) dω2
+// Candidates are bounce-1 continuation directions: a world-space secondary
+// vertex x2 plus the radiance estimate L̂2 measured there (shadowed NEE at
+// x2). Reuse happens entirely on the x1 side; the x2 side is only replayed
+// through an inline visibility ray from x1.
+//
+// Stored as scalar uints (fp32 bit patterns) to avoid std430 vec3 padding:
+// 32 bytes total.
+struct GiReservoir {
+    uint x2xBits;     // x2 world position (fp32 bits)
+    uint x2yBits;
+    uint x2zBits;
+    uint wSumBits;    // RIS running weight sum (fp32 bits)
+    uint targetBits;  // p̂ of the current winner AT THE RECORDING PIXEL (fp32 bits)
+    uint radRG;       // fp16 (L̂2.r, L̂2.g)
+    uint radB_dSrc;   // fp16 L̂2.b, fp16 d_src = |x2 - x1| when recorded
+    uint flagsM;      // [0] valid, [8:1] age, [24:9] M
+};
+
+// Per-pixel BRDF context at the primary hit x1. Written at bounce 0 and
+// consumed at bounce 1 of the same frame/sample. 24 bytes.
+struct X1Context {
+    uint n1Oct;     // oct32(x1 normal)
+    uint albedoRG;  // fp16 (albedo.r, albedo.g)
+    uint albedoB;   // fp16 albedo.b
+    uint flags;     // [0] valid: diffuse cosine reflection-lobe continuation
+    uint woOct;     // oct32(x1 -> camera direction, i.e. V at the primary hit)
+    uint f0Pad;     // fp16 scalar F0 of the primary material, fp16 reserved
+};
+
+const float GI_TAP_MIN_COS        = 0.05;
+const float GI_TAP_MIN_DIST       = 1e-3;
+const float GI_WEIGHT_CLAMP_MAX   = 500.0;
+
+X1Context invalidX1Context() {
+    X1Context c;
+    c.n1Oct = 0u;
+    c.albedoRG = 0u;
+    c.albedoB = 0u;
+    c.flags = 0u;
+    c.woOct = 0u;
+    c.f0Pad = 0u;
+    return c;
+}
+
+X1Context makeX1Context(vec3 n1, vec3 albedo, vec3 wo, float f0) {
+    X1Context c;
+    c.n1Oct = packOct32(normalize(n1));
+    c.albedoRG = packHalf2x16(clamp(albedo.rg, vec2(0.0), vec2(65000.0)));
+    c.albedoB = packHalf2x16(vec2(clamp(albedo.b, 0.0, 65000.0), 0.0));
+    c.flags = 1u;
+    c.woOct = packOct32(normalize(wo));
+    c.f0Pad = packHalf2x16(vec2(clamp(f0, 0.0, 1.0), 0.0));
+    return c;
+}
+
+bool x1ContextValid(X1Context c) { return (c.flags & 1u) != 0u; }
+vec3 x1ContextNormal(X1Context c) { return unpackOct32(c.n1Oct); }
+vec3 x1ContextAlbedo(X1Context c) {
+    vec2 rg = unpackHalf2x16(c.albedoRG);
+    return vec3(rg.x, rg.y, unpackHalf2x16(c.albedoB).x);
+}
+vec3 x1ContextWo(X1Context c) { return unpackOct32(c.woOct); }
+float x1ContextF0(X1Context c) { return unpackHalf2x16(c.f0Pad).x; }
+
+GiReservoir invalidGiReservoir() {
+    GiReservoir r;
+    r.x2xBits = 0u;
+    r.x2yBits = 0u;
+    r.x2zBits = 0u;
+    r.wSumBits = 0u;
+    r.targetBits = 0u;
+    r.radRG = 0u;
+    r.radB_dSrc = 0u;
+    r.flagsM = 0u;
+    return r;
+}
+
+bool  giIsValid(GiReservoir r) { return (r.flagsM & 1u) != 0u; }
+uint  giGetAge(GiReservoir r)  { return (r.flagsM >> 1u) & 0xFFu; }
+uint  giGetM(GiReservoir r)    { return (r.flagsM >> 9u) & 0xFFFFu; }
+vec3  giGetX2(GiReservoir r) {
+    return vec3(uintBitsToFloat(r.x2xBits), uintBitsToFloat(r.x2yBits), uintBitsToFloat(r.x2zBits));
+}
+vec3  giGetRadiance(GiReservoir r) {
+    vec2 rg = unpackHalf2x16(r.radRG);
+    vec2 bD = unpackHalf2x16(r.radB_dSrc);
+    return vec3(rg.x, rg.y, bD.x);
+}
+float giGetWSum(GiReservoir r)   { return uintBitsToFloat(r.wSumBits); }
+float giGetTarget(GiReservoir r) { return uintBitsToFloat(r.targetBits); }
+float giGetDSrc(GiReservoir r)   { return unpackHalf2x16(r.radB_dSrc).y; }
+
+GiReservoir makeGiReservoir(vec3 x2, float wSum, uint M, float target, vec3 radiance, float dSrc, uint age) {
+    GiReservoir r = invalidGiReservoir();
+    vec3 L = clamp(radiance, vec3(0.0), vec3(65000.0));
+    r.x2xBits = floatBitsToUint(x2.x);
+    r.x2yBits = floatBitsToUint(x2.y);
+    r.x2zBits = floatBitsToUint(x2.z);
+    r.wSumBits = floatBitsToUint(wSum);
+    r.targetBits = floatBitsToUint(target);
+    r.radRG = packHalf2x16(L.rg);
+    r.radB_dSrc = packHalf2x16(vec2(L.b, clamp(dSrc, 0.0, 65000.0)));
+    r.flagsM = 1u | (min(age, 255u) << 1u) | ((M & 0xFFFFu) << 9u);
+    return r;
+}
+
+// GI target proxy at x1 for a candidate secondary vertex:
+//     p̂ = (albedo_bar / π) · max(cosθ1, 0) · max(lum(L̂2), 1e-4)
+// Must be evaluated identically at recording and reuse time; it is a scalar
+// proxy of the colored integrand f_r(x1)·cosθ1·L̂2 used at finalization.
+// Returns 0 when the candidate is behind x1's horizon.
+float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
+    vec3 dv = x2 - x1;
+    float dist = length(dv);
+    if (dist < 1e-4) return 0.0;
+    float cos1 = dot(n1, dv / dist);
+    if (cos1 <= 0.0) return 0.0;
+    float albedoBar = dot(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.3333333));
+    float lum = max(dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    return albedoBar * INV_PI * cos1 * lum;
+}
+
+// Reconnects a previous-frame GI tap to the current x1 and stream-combines
+// it into r. Returns true when the tap wins the reservoir.
+//
+// Jacobian: the candidate is a FIXED world point x2, while q is a density
+// per unit solid angle at the reuse vertex. For the same point seen from
+// two vertices, dω_new/dω_src = (d_src/d_new)², hence
+//     w_new = (wsum_c/M_c) · min(M_c, cap) · (p̂_new/p̂_c) · (d_src/d_new)².
+// ageNew is stamped by the caller (temporal taps: age+1, spatial: age).
+bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
+                vec3 albedo, uint mCap, uint ageNew, inout uint seed) {
+    if (!giIsValid(tap) || giGetM(tap) == 0u) return false;
+
+    vec3 x2c = giGetX2(tap);
+    vec3 dv = x2c - x1;
+    float dNew = length(dv);
+    if (dNew < GI_TAP_MIN_DIST) return false;
+    float cosNew = dot(n1, dv / dNew);
+    if (cosNew <= GI_TAP_MIN_COS) return false;
+
+    vec3 radC = giGetRadiance(tap);
+    float pHat = giTargetAt(albedo, n1, x1, x2c, radC);
+    float dSrc = max(giGetDSrc(tap), 1e-3);
+    float jac = clamp((dSrc * dSrc) / (dNew * dNew), RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
+    float weight = (giGetWSum(tap) / float(giGetM(tap))) *
+                   min(giGetM(tap), mCap) *
+                   (pHat / max(giGetTarget(tap), 1e-9)) * jac;
+    if (!(weight > 0.0)) return false;
+
+    float wSelf = giIsValid(r) ? giGetWSum(r) : 0.0;
+    uint mSelf = giIsValid(r) ? giGetM(r) : 0u;
+    uint combinedM = mSelf + min(giGetM(tap), mCap);
+    float combined = wSelf + weight;
+
+    if (randFloat(seed) * combined < weight) {
+        r = makeGiReservoir(x2c, combined, combinedM, pHat, radC, dNew, ageNew);
+        return true;
+    }
+    if (mSelf > 0u) {
+        r = makeGiReservoir(giGetX2(r), combined, combinedM, giGetTarget(r),
+                            giGetRadiance(r), giGetDSrc(r), giGetAge(r));
+    }
+    return false;
+}
+
 #endif // RESTIR_COMMON_GLSL

@@ -132,6 +132,21 @@ layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
     DiReservoir currentReservoirs[];
 };
 
+// ReSTIR GI state (docs/RESTIR_PT_DESIGN.md): these materials neither
+// produce a GI candidate nor an X1 diffuse context; both slots are
+// invalidated so stale history cannot be tapped next frame.
+layout(std430, binding = 37) buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
+
+layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
+    GiReservoir giHistoryReservoirs[];
+};
+
 #ifndef ENABLE_INLINE_SHADOWS
 #define ENABLE_INLINE_SHADOWS 1
 #endif
@@ -202,6 +217,10 @@ void main() {
         // next frame (review 2026-10-10 §4.8).
         if (bounce == 0u && (ubo.flags & (1 << 9)) != 0) {
             currentReservoirs[pixelIndex] = invalidDiReservoir();
+        }
+        if ((ubo.flags & (1 << 24)) != 0) {
+            if (bounce == 0u) x1Contexts[pixelIndex] = invalidX1Context();
+            if (bounce == 1u) giReservoirs[pixelIndex] = invalidGiReservoir();
         }
 
         if (hitType == 2u) {

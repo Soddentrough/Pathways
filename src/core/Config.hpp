@@ -171,6 +171,7 @@ struct Config {
     // ReSTIR DI Spatio-Temporal Reservoir Resampling (Direct Light)
     bool enable_restir = false;           // ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [Default: false, opt-in via --restir]
     uint32_t restir_m_cap = 30;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 30)
+    bool restir_gi = true;                // ReSTIR GI (path-space secondary-vertex reuse at bounce 1) [Default: true, applies only when ReSTIR is enabled]
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)

@@ -777,6 +777,68 @@ def test_restir_many_lights_variance_and_gating():
 
     return result
 
+def test_restir_gi_energy_and_stability():
+    """ReSTIR GI (bounce-1 secondary-vertex reuse) regression guard.
+
+    Energy: GI replaces the 2-bounce estimator; converged GI must match the
+    plain path within tolerance (measured +1.7% at 512 frames on cornell-box;
+    threshold 5% catches estimator breakage, not sampling noise).
+    Stability: no NaN/Inf/fireflies with GI active.
+    """
+    result = TestResult("ReSTIR GI Energy Conservation & Stability")
+    print(f"\n--- Running: {result.name} ---")
+
+    common = ["--scene", "cornell-box", "--res", "512x512", "--spp", "1",
+              "--max-bounces", "4", "--frames", "256"]
+
+    out_plain = os.path.join(OUTPUT_DIR, "gi_energy_plain.png")
+    rc, _, stderr = run_pathways(common + ["--dump-frame", out_plain])
+    if rc != 0:
+        result.fail(f"Plain baseline run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    out_gi = os.path.join(OUTPUT_DIR, "gi_energy_restir.png")
+    rc, _, stderr = run_pathways(common + ["--restir", "--dump-frame", out_gi])
+    if rc != 0:
+        result.fail(f"ReSTIR GI run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_plain = cv2.imread(out_plain, cv2.IMREAD_UNCHANGED)
+    img_gi = cv2.imread(out_gi, cv2.IMREAD_UNCHANGED)
+    if img_plain is None or img_gi is None:
+        result.fail("Failed to load GI energy test outputs")
+        return result
+
+    if np.isnan(img_plain).any() or np.isinf(img_plain).any():
+        result.fail("NaN/Inf detected in plain baseline output")
+    if np.isnan(img_gi).any() or np.isinf(img_gi).any():
+        result.fail("NaN/Inf detected in ReSTIR GI output")
+
+    # Energy check on LINEAR samples (dump may be 16-bit; mean over scene energy).
+    mean_plain = float(np.mean(img_plain[..., :3].astype(np.float64)))
+    mean_gi = float(np.mean(img_gi[..., :3].astype(np.float64)))
+
+    # Firefly/clipping stats on the 8-bit display-referred version.
+    st_plain = compute_image_stats(cv2.imread(out_plain))
+    st_gi = compute_image_stats(cv2.imread(out_gi))
+
+    if mean_plain <= 0:
+        result.fail("Plain baseline mean luminance is zero")
+        return result
+    energy_err = abs(mean_gi - mean_plain) / mean_plain
+    result.record("gi_energy_error_pct", energy_err * 100.0)
+    print(f"  Plain energy={mean_plain:.1f}  GI energy={mean_gi:.1f}  "
+          f"energy error={energy_err * 100:.2f}%  "
+          f"(8bit clip: plain={st_plain['clipped_pct']:.2f}%, gi={st_gi['clipped_pct']:.2f}%)")
+    if energy_err > 0.05:
+        result.fail(f"ReSTIR GI energy deviation {energy_err * 100:.2f}% > 5% — estimator bias regression")
+    # Firefly guard: GI must not clip substantially more than the plain baseline.
+    if st_gi["clipped_pct"] > st_plain["clipped_pct"] + 5.0:
+        result.fail(f"ReSTIR GI firefly blowout: clipped {st_gi['clipped_pct']:.2f}% vs "
+                    f"plain {st_plain['clipped_pct']:.2f}%")
+
+    return result
+
 def test_specular_vmv_integrity():
     result = TestResult("First-Bounce Specular VMV & Secondary Reprojection Integrity")
     print(f"\n--- Running: {result.name} ---")
@@ -885,9 +947,18 @@ def main():
         print(f"[SKIP] Vulkan Ray Tracing hardware not available in environment (code {rc}): {stderr.strip()[:200]}. Skipping visual integrity test.")
         return 0
 
-    combined_output = (stdout + stderr).lower()
-    if any(sw in combined_output for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
-        print("[SKIP] Software/CPU Vulkan renderer detected. Skipping visual integrity test.")
+    # Only the ACTIVE device matters: the engine logs the full enumeration list,
+    # which includes software devices (e.g. llvmpipe) even when a real GPU is
+    # selected. Checking the whole log would skip every local run.
+    active_line = ""
+    for line in (stdout + stderr).splitlines():
+        if "successfully initialized on:" in line:
+            active_line = line.lower()
+    if not active_line:
+        print("[SKIP] Could not determine the active Vulkan device. Skipping visual integrity test.")
+        return 0
+    if any(sw in active_line for sw in ["llvmpipe", "lavapipe", "software rasterizer", "cpu device"]):
+        print("[SKIP] Software/CPU Vulkan renderer detected as active device. Skipping visual integrity test.")
         return 0
 
     tests = [
@@ -897,6 +968,7 @@ def main():
         test_mgpu_tile_motion_noise,
         test_breakfast_room_motion_noise,
         test_restir_many_lights_variance_and_gating,
+        test_restir_gi_energy_and_stability,
         test_specular_vmv_integrity
     ]
 

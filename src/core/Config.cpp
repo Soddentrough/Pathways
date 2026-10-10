@@ -285,9 +285,11 @@ void Config::printUsage(const char* progName) {
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
               << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
-              << "  --restir                Enable ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [default: disabled]\n"
-              << "  --restir-pt             Alias for --restir (path-space ReSTIR PT is NOT yet implemented; emits a warning)\n"
-              << "  --restir-m-cap <int>    ReSTIR DI temporal reuse M-cap (default: 30)\n\n"
+              << "  --restir                Enable ReSTIR: DI (direct light) + GI (bounce-1 secondary-vertex reuse) [default: disabled]\n"
+              << "  --restir-di             Alias for --restir\n"
+              << "  --no-restir-gi          Disable the ReSTIR GI component only (keep DI)\n"
+              << "  --restir-pt             Alias for --restir (full path replay PT is NOT yet implemented; emits a warning)\n"
+              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 30)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -913,7 +915,11 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--restir" || arg == "--restir-di") {
             cfg.enable_restir = true;
-            Logger::info("ReSTIR DI enabled: inline temporal + spatial reservoir reuse of direct light in wavefront shading.");
+            Logger::info("ReSTIR enabled: inline temporal + spatial reservoir reuse of direct light (DI) plus path-space secondary-vertex reuse at bounce 1 (GI).");
+            continue;
+        }
+        if (arg == "--no-restir-gi") {
+            cfg.restir_gi = false;
             continue;
         }
         if (arg == "--restir-pt") {

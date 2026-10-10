@@ -178,12 +178,13 @@ quality guarantee.
 > integration was descoped by the project owner. Until then, no AMD/FSR branding is claimed anywhere
 > user-facing.
 
-## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR DI)
+## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR DI + GI)
 
-Pathways implements ReSTIR Direct Illumination to handle many-light environments. All
+Pathways implements ReSTIR resampling of direct light (DI) and of the bounce-1 indirect
+term (GI, path-space secondary-vertex reuse; see `docs/RESTIR_PT_DESIGN.md`). All
 resampling runs **inline in the wavefront shade passes** (`shaders/compute/restir_common.glsl`,
 used by `wavefront_shade_diffuse/complex.comp`); `src/rt/ReSTIRManager.cpp` is a lean owner
-of the double-buffered per-pixel reservoir grid (lazy allocation, zero-fill on (re)alloc).
+of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc).
 
 - **Reservoir layout**: 28 B `DiReservoir` (light index + M, weight sum, scalar target p̂,
   age/valid/lobe flags, oct-encoded x1 & light normals, 8-bit-per-channel light UV,
@@ -199,8 +200,16 @@ of the double-buffered per-pixel reservoir grid (lazy allocation, zero-fill on (
   was undefined behavior — see `docs/reports/restir_review_2026_10_10.md`).
 - **Finalization**: Full GGX + diffuse BRDF evaluation of the winning light with a single
   inline shadow ray; an occluded winner zeroes its reservoir so bad history dies immediately.
-- **Path-space ReSTIR PT** (GI reservoirs with path replay) is a roadmap item, not yet
-  implemented; see `docs/RESTIR_PT_DESIGN.md`.
+- **ReSTIR GI (bounce 1)**: the 2-bounce term `T1·L_direct(x1)` is estimated by resampling
+  cached secondary vertices at the primary hit x1. A 24 B per-pixel `X1Context` (normal,
+  albedo, wo, F0) is written at bounce 0; a 32 B `GiReservoir` (x2 world position, shadowed
+  L̂2 radiance, weight sum, p̂, d_src, age/M) is double-buffered like DI. Taps reconnect
+  neighbors' x2 to the current x1 with the `(d_src/d_new)²` solid-angle Jacobian; the
+  winner gets one replay visibility ray (skipped when the path's own candidate wins).
+  Requires material sort + hardware ray queries; toggle with `--no-restir-gi`.
+- **Path replay beyond x2 (Phase 2b)** — redirecting the bounce-2 continuation through the
+  reservoir winner — remains a roadmap item; continuations currently follow the path's own
+  x2, keeping deeper bounces unbiased without path storage.
 
 ---
 
@@ -340,5 +349,8 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | **31** | `storageImage` | `causticImage` | RGBA16F | Forward photon-traced caustic splat target |
 | **32** | `storageBuffer` | `restirReservoirs` | **28 B**/px | ReSTIR DI reservoirs, current frame slot (write) |
 | **36** | `storageBuffer` | `restirHistory` | **28 B**/px | ReSTIR DI reservoirs, previous frame slot (temporal/spatial taps, read-only) |
+| **37** | `storageBuffer` | `x1Contexts` | **24 B**/px | ReSTIR GI: BRDF context at primary hit (written bounce 0, read bounce 1, single-buffered) |
+| **38** | `storageBuffer` | `giReservoirs` | **32 B**/px | ReSTIR GI reservoirs, current frame slot (write) |
+| **39** | `storageBuffer` | `giHistory` | **32 B**/px | ReSTIR GI reservoirs, previous frame slot (taps, read-only) |
 | **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
 | **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |

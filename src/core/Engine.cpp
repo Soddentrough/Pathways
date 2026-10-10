@@ -1661,6 +1661,7 @@ void Engine::renderFrame() {
         flags |= (1 << 8);
     }
     if (isRestirActive()) flags |= (1 << 9);
+    if (isRestirActive() && m_config.restir_gi) flags |= (1 << 24); // ReSTIR GI (bounce-1 path-space reuse)
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag

@@ -156,6 +156,19 @@ layout(std430, binding = 36) readonly buffer ReSTIRHistoryReservoirsBuffer {
     DiReservoir historyReservoirs[];
 };
 
+// ReSTIR GI (path-space) state — docs/RESTIR_PT_DESIGN.md
+layout(std430, binding = 37) buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
+
+layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
+    GiReservoir giHistoryReservoirs[];
+};
+
 #ifndef ENABLE_INLINE_SHADOWS
 #define ENABLE_INLINE_SHADOWS 1
 #endif
@@ -224,6 +237,16 @@ void main() {
         uint bounce = pc.currentBounce;
         bool sampledSpecularLobe = false;
 
+#if !IS_SECONDARY_BOUNCE
+        // ReSTIR GI: the X1 context is invalidated by default at bounce 0 and
+        // only made valid below where a diffuse cosine reflection lobe emits
+        // the bounce-1 ray (docs/RESTIR_PT_DESIGN.md).
+        bool giCtxEligible = false;
+        if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+            x1Contexts[pixelIndex] = invalidX1Context();
+        }
+#endif
+
         if (hitType == 2u) {
             // Environment sky miss
             vec3 skyColor;
@@ -244,6 +267,11 @@ void main() {
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
             if (enableRestirPT && bounce == 0u) {
                 currentReservoirs[pixelIndex] = invalidDiReservoir();
+            }
+            if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
+                // Bounce-1 ray escaped to the sky: no secondary vertex exists,
+                // so this pixel contributes no GI candidate this frame.
+                giReservoirs[pixelIndex] = invalidGiReservoir();
             }
 
 
@@ -339,6 +367,11 @@ void main() {
             bool isCutout = (alphaMode == 1u && baseColor.a < materials[matId].alphaCutoff) ||
                             (alphaMode == 2u && randFloat(seed) > baseColor.a);
             if (isCutout) {
+                if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
+                    // Cutout pass-through: the shaded x2 belongs to the next
+                    // vertex; this pixel's GI slot must not reuse stale data.
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
                 if (bounce + 1u < pc.maxBounces) {
                     survivesToNext = true;
                     nextDirection = rayDir;
@@ -459,6 +492,18 @@ void main() {
 
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Pure Lambertian Diffuse) ---
+            // ReSTIR GI (docs/RESTIR_PT_DESIGN.md): for bounce-1 rays the 2-bounce
+            // term T1·L_direct(x1) is estimated by resampling cached secondary
+            // vertices at the primary hit x1 (this ray's origin) instead of the
+            // plain T1·NEE(x2) accumulation. Requires inline ray queries for the
+            // L̂2 shadow test and the winner replay ray.
+            bool giActive = ((ubo.flags & (1u << 24)) != 0u) && (bounce == 1u) &&
+                            (pc.useHardwareRT == 1u) && enableDirect && (pc.numLights > 0u);
+            vec3 giL2 = vec3(0.0);              // shadowed radiance leaving x2 toward x1
+            vec3 giLightDir = vec3(0.0);
+            float giLightDist = 0.0;
+            vec3 giShadowOrigin = vec3(0.0);
+            bool giLightSampled = false;
             if (!pathTerminated && !isDelta && enableDirect && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
@@ -515,6 +560,15 @@ void main() {
                     float factor = (NdotL / lightPdfEff) * misWeight;
                     vec3 directLightRadiance = clamp(lightEmission * factor, vec3(0.0), vec3(65500.0));
                     secDirectL = diffBrdf * f16vec3(directLightRadiance);
+
+                    if (giActive) {
+                        // Candidate data for this frame's own secondary vertex.
+                        giL2 = vec3(secDirectL);
+                        giLightDir = lightDir;
+                        giLightDist = lightDist;
+                        giShadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
+                        giLightSampled = true;
+                    } else {
                     f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, pc.indirectClamp);
 
                     if (length(unshadowed) > float16_t(1e-5)) {
@@ -565,6 +619,138 @@ void main() {
                                 imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                             }
                         }
+                    }
+                    } // !giActive (legacy secondary accumulation)
+                }
+            }
+
+            if (giActive) {
+                // Shadow-test this frame's own L̂2 inline (synchronous: the
+                // reservoir must store the shadowed estimate; the deferred
+                // shadow queue cannot feed it).
+                if (giLightSampled && enableShadows) {
+                    bool giOcc0 = traceShadowRayInline(giShadowOrigin, giLightDir, giLightDist,
+                                                       (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                    if (giOcc0) {
+                        giL2 = vec3(0.0);
+                    }
+                }
+
+                // Every bounce-1 ray owns its pixel's GI slot this frame:
+                // write invalid first, overwrite below when a candidate exists.
+                giReservoirs[pixelIndex] = invalidGiReservoir();
+
+                X1Context giCtx = x1Contexts[pixelIndex];
+                if (x1ContextValid(giCtx) && !pathTerminated && !isDelta) {
+                    vec3 giX1 = origin;              // primary hit point (epsilon-offset)
+                    vec3 giN1 = x1ContextNormal(giCtx);
+                    vec3 giAlbedo = x1ContextAlbedo(giCtx);
+                    float giAlbedoBar = max(dot(clamp(giAlbedo, vec3(0.0), vec3(1.0)), vec3(0.3333333)), 1e-4);
+
+                    // Fresh candidate: the path's own secondary vertex.
+                    // q̂ = cosine pdf at x1, so w = p̂/q̂ = albedoBar·l̄um(L̂2).
+                    float giCosSelf = max(dot(giN1, rayDir), 0.0);
+                    float giPSelf = giTargetAt(giAlbedo, giN1, giX1, hitPoint, giL2);
+                    GiReservoir giR = invalidGiReservoir();
+                    bool giWinnerSelf = true;
+                    if (giPSelf > 0.0 && giCosSelf > 0.0) {
+                        float giWSelf = giPSelf / max(giCosSelf * INV_PI, 1e-9);
+                        giR = makeGiReservoir(hitPoint, giWSelf, 1u, giPSelf, giL2, hitT, 0u);
+                    }
+
+                    if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
+                        // History taps on the previous frame's GI grid:
+                        // temporal center (MV-reprojected) + rotated cross.
+                        ivec2 giPix = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec2 giMv = imageLoad(uMotionVectorImage, giPix).xy;
+                        ivec2 giPrev = ivec2(round(vec2(giPix) - giMv * vec2(pc.width, pc.height)));
+                        uint giHash = (pixelIndex * 0x9E3779B9u) ^ (pc.frameIndex * 0x85EBCA6Bu);
+                        uint giRot = (giHash >> 30u) & 3u;
+
+                        for (uint tap = 0u; tap < 5u; ++tap) {
+                            ivec2 giOff = ivec2(0, 0);
+                            if (tap > 0u) {
+                                ivec2 base = RESTIR_TAP_OFFSETS[tap - 1u];
+                                for (uint rr = 0u; rr < giRot; ++rr) {
+                                    base = ivec2(-base.y, base.x);
+                                }
+                                giOff = base;
+                            }
+                            ivec2 giCoord = giPrev + giOff;
+                            if (giCoord.x < 0 || giCoord.y < 0 ||
+                                giCoord.x >= int(pc.width) || giCoord.y >= int(pc.height)) {
+                                continue;
+                            }
+                            GiReservoir giTap = giHistoryReservoirs[uint(giCoord.y) * pc.width + uint(giCoord.x)];
+                            if (!giIsValid(giTap) || giGetAge(giTap) >= RESTIR_MAX_AGE) continue;
+                            uint giMCap = (tap == 0u) ? pc.restirMCap : min(pc.restirMCap, 8u);
+                            uint giAgeNew = min(giGetAge(giTap) + (tap == 0u ? 1u : 0u), RESTIR_MAX_AGE);
+                            if (giApplyTap(giR, giTap, giX1, giN1, giAlbedo, giMCap, giAgeNew, seed)) {
+                                giWinnerSelf = false;
+                            }
+                        }
+                    }
+
+                    if (giIsValid(giR) && giGetM(giR) > 0u) {
+                        vec3 giL2w = giGetRadiance(giR);
+                        float giLumW = max(dot(giL2w, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+
+                        // Finalization: C2 = T1·f_r(x1)·cosθ1_w·L̂2_w·W with
+                        // W = wsum/(M·p̂_w) and p̂_w = (albedoBar/π)·cosθ1_w·l̄um_w.
+                        // The bounce-0 continuation folded
+                        // ratio = (1-F̂)·albedo/(1-specProb) into this ray's
+                        // throughput T2 (lobe coin and RR conditioning cancel),
+                        // giving per-channel:
+                        //   C2 = T2·L̂2_w · wsum/(M·albedoBar·l̄um_w) · (1-F_w)/(1-F̂)
+                        // Single candidate reduces exactly to T2·L̂2 (legacy).
+                        float giW = clamp(giGetWSum(giR) / (float(giGetM(giR)) * giAlbedoBar * giLumW), 0.0, 500.0);
+
+                        // Fresnel ratio between the winner direction and the
+                        // path's own direction at x1 (both vs the stored wo).
+                        vec3 giWo = x1ContextWo(giCtx);
+                        float giF0 = x1ContextF0(giCtx);
+                        vec3 giDirSelfN = normalize(rayDir);
+                        vec3 giHs = normalize(giDirSelfN + giWo);
+                        float giFS = fresnelSchlick(clamp(dot(giWo, giHs), 0.0, 1.0), giF0);
+                        vec3 giDirW0 = normalize(giGetX2(giR) - giX1);
+                        vec3 giHw = normalize(giDirW0 + giWo);
+                        float giFW = fresnelSchlick(clamp(dot(giWo, giHw), 0.0, 1.0), giF0);
+                        giW *= (1.0 - giFW) / max(1.0 - giFS, 0.05);
+
+                        // Replay visibility x1↔x2_w; the path itself already
+                        // traversed x1→x2, so a self winner needs no ray.
+                        float giVis = 1.0;
+                        if (!giWinnerSelf) {
+                            vec3 giX2w = giGetX2(giR);
+                            vec3 giDirW = giX2w - giX1;
+                            float giDistW = length(giDirW);
+                            if (giDistW > 2.0 * EPSILON) {
+                                giDirW /= giDistW;
+                                bool giOccW = traceShadowRayInline(giX1 + giN1 * EPSILON, giDirW, giDistW - 2.0 * EPSILON,
+                                                                   (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                giVis = giOccW ? 0.0 : 1.0;
+                            } else {
+                                giVis = 0.0;
+                            }
+                        }
+
+                        vec3 giContrib = clampIndirectRadiance(vec3(throughput) * giL2w * (giW * giVis), pc.indirectClamp);
+                        if (dot(giContrib, giContrib) > 1e-12) {
+                            ivec2 giPixC = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                            vec4 giPrevAcc = imageLoad(uAccumImage, giPixC);
+                            imageStore(uAccumImage, giPixC, vec4(addFp16Stochastic(giPrevAcc.rgb, giContrib, seed), giPrevAcc.a));
+                            if (pc.captureMlData != 0u) {
+                                if (isSpecularPath) {
+                                    vec4 prevSpec = imageLoad(uMlSpecularImage, giPixC);
+                                    imageStore(uMlSpecularImage, giPixC, vec4(addFp16Stochastic(prevSpec.rgb, giContrib, seed), 0.0));
+                                } else {
+                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, giPixC);
+                                    imageStore(uMlDiffuseImage, giPixC, vec4(addFp16Stochastic(prevDiff.rgb, giContrib, seed), 0.0));
+                                }
+                            }
+                        }
+
+                        giReservoirs[pixelIndex] = giR;
                     }
                 }
             }
@@ -652,8 +838,17 @@ void main() {
                         float specProb = selectedIsTrans ? 0.0 : clamp(float(dot(F, f16vec3(0.3333))), 0.05, 0.95);
                         float bsdfPdf = (1.0 - specProb) * diffPdf + specProb * specPdf;
 
+                        // Balance-heuristic MIS weight vs. the path's own
+                        // random-walk light hits (emissive surfaces accumulated
+                        // along the continuation). Applies in BOTH modes: the
+                        // RIS finalization Ī = g(x̂)·W is unbiased for ∫g for any
+                        // target p̂, so multiplying the winner by misW makes the
+                        // NEE term estimate ∫g·misW — exactly the share left to
+                        // light sampling once random hits keep their own term.
+                        // (Skipping this double-counts area lights; measured
+                        //  +9% energy on cornell-box before the fix.)
                         float misWeight = 1.0;
-                        if (!enableRestirPT) {
+                        {
                             Light selLight = lights[selectedLightIdx];
                             if (uint(selLight.position.w) == 0u) {
                                 float effCos = max(selectedCosLight, 1e-4);
@@ -912,6 +1107,12 @@ void main() {
                         float invDiffProb = 1.0 / (1.0 - specProb);
                         throughput *= (f16vec3(1.0) - F) * (diffuseColor * float16_t(invDiffProb));
                         validBounce = true;
+#if !IS_SECONDARY_BOUNCE
+                        // ReSTIR GI context: diffuse cosine REFLECTION lobe only.
+                        // Transmitted lobes carry a different BSDF branch and are
+                        // excluded from GI reuse for now.
+                        giCtxEligible = !isTrans;
+#endif
                     }
 #endif
 
@@ -925,6 +1126,11 @@ void main() {
                             survivesToNext = true;
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                             nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel);
+#if !IS_SECONDARY_BOUNCE
+                            if (giCtxEligible && bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)));
+                            }
+#endif
                         }
                     }
                 }

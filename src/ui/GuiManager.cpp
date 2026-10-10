@@ -1290,18 +1290,25 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("ReSTIR DI (Direct-Light Reservoir Resampling):");
-            if (ImGui::Checkbox("Enable ReSTIR DI", &config.enable_restir)) {
+            ImGui::TextDisabled("ReSTIR (Reservoir Resampling):");
+            if (ImGui::Checkbox("Enable ReSTIR", &config.enable_restir)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("ReSTIR DI: inline spatiotemporal reservoir resampling of direct light (28B per-pixel reservoirs, MV-reprojected temporal tap + 4 spatial taps). Path-space ReSTIR PT is on the roadmap (docs/RESTIR_PT_DESIGN.md). Opt-in via --restir.");
+                ImGui::SetTooltip("ReSTIR: inline spatiotemporal reservoir resampling. DI resamples direct light (28B reservoirs); GI resamples bounce-1 secondary vertices (32B reservoirs + 24B X1 context). Both use a MV-reprojected temporal tap + 4 spatial taps. Opt-in via --restir.");
             }
             if (config.enable_restir) {
                 ImGui::Indent();
+                if (ImGui::Checkbox("GI (bounce-1 path-space reuse)", &config.restir_gi)) {
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("ReSTIR GI: resample cached secondary vertices at the primary hit (docs/RESTIR_PT_DESIGN.md). Requires inline ray queries. Disable with --no-restir-gi.");
+                }
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
-                ImGui::TextWrapped("Status: Active (Direct-Light Reconnection Resampling)");
+                ImGui::TextWrapped("Status: Active (DI%s)", config.restir_gi ? " + GI" : " only");
                 ImGui::PopStyleColor();
 
                 int mCap = static_cast<int>(config.restir_m_cap);
@@ -1311,7 +1318,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (actions) actions->resetAccumulation = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Maximum temporal history sample count M cap to prevent lag and bias.");
+                    ImGui::SetTooltip("Maximum temporal history sample count M cap (DI and GI) to prevent lag and bias. Spatial taps are additionally capped at 8.");
                 }
                 ImGui::Unindent();
             }

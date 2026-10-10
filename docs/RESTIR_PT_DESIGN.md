@@ -1,8 +1,35 @@
 # ReSTIR PT Design — Path-Space Reservoir Resampling with Replay
 
-**Status:** Planned (Phase 2). The Phase 1 foundation — the inline ReSTIR DI pipeline, the
+**Status:** Phase 2a IMPLEMENTED (2026-10-11): single-vertex GI reservoir with X1 context,
+winner replay visibility, and bounce-1 estimator replacement. Phase 2b (multi-vertex path
+replay) remains planned. The Phase 1 foundation — the inline ReSTIR DI pipeline, the
 shared `restir_common.glsl` core, history-tap reuse, and the honest naming — landed on
 2026-10-10 (`docs/reports/restir_review_2026_10_10.md`).
+
+### Phase 2a as built (deviations from the plan below)
+
+- **Scope:** GI reservoirs apply at bounce 1 only, for paths whose continuation at the
+  primary hit was a diffuse cosine REFLECTION lobe (transmitted and specular lobes write
+  an invalid X1 context and keep legacy shading). x2 on complex/dielectric/emissive
+  surfaces invalidates the GI slot (no candidate).
+- **X1Context is 24 B** (n1 oct32, fp16 albedo, oct32 wo, fp16 scalar F0, valid flag).
+  `wo`/`F0` are needed because the bounce-0 continuation folds `(1-F)·albedo/(1-specProb)`
+  into the carried throughput; the finalization therefore multiplies the winner by the
+  Fresnel ratio `(1-F_w)/(1-F̂)` to stay unbiased (without it: ~+9% on cornell-box).
+- **GiReservoir is 32 B**: x2 world position fp32×3, wSum, p̂, fp16 L̂2, fp16 d_src, and
+  `flagsM = valid | age[8:1] | M[24:9]`. The tap weight keeps the `(d_src/d_new)²`
+  solid-angle Jacobian; `q` itself is not stored (cosine lobe ⇒ recoverable).
+- **L̂2 is stored SHADOWED** (inline shadow x2→light traced in the same pass; the deferred
+  shadow queue cannot feed the reservoir). The winner replay ray covers x1↔x2 only when
+  the winner is a reused tap (self-winner needs no ray: the path proved visibility).
+- **Finalization identity:** `C2 = T2·L̂2_w · wsum/(M·albedoBar·l̄um_w) · (1-F_w)/(1-F̂)`;
+  with a single candidate this reduces exactly to the legacy `T2·L̂2` accumulation
+  (verified: frame-1 images bit-comparable, 512-frame energy within 1.7% of plain PT).
+- **Activation:** UBO flag bit 24 (`restir_gi`, implied by `--restir`, off via
+  `--no-restir-gi`) AND material-sort secondary pipelines AND hardware ray queries.
+  The unified (non-material-sort) pipeline never runs GI — grids stay invalid there.
+- **Bindings:** 37 = X1 contexts (single-buffered, same-frame producer/consumer),
+  38 = GI current, 39 = GI history (double-buffered like DI).
 **Goal:** Resample *indirect* illumination (bounce ≥ 1) with the same reservoir machinery
 that already serves direct light, targeting the 1-SPP real-time goal on Strix Halo and the
 Veach-Ajar stress scenes.
@@ -122,5 +149,10 @@ For the ray currently hitting x2 with origin x1 and direction ω2:
 ## 4. Explicit non-goals for Phase 2
 
 - Full multi-vertex path replay (needs per-sample path storage; separate milestone).
+  Phase 2a deliberately does NOT redirect the bounce-2 continuation toward the reservoir
+  winner: the continuation always follows the path's own x2, so deeper bounces stay
+  unbiased and no path storage is needed. Winner-consistent continuation is Phase 2b.
 - ReSTIR for conductors/dielectrics (their shade passes keep their 1-stage RIS).
 - Light trees for GI candidate proposals (reuse the alias table first).
+- GI on transmitted diffuse lobes or on complex-material x2 surfaces (context invalid →
+  legacy shading).

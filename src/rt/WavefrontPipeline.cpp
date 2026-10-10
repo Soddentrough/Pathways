@@ -153,7 +153,10 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PixelToRayBuffer
         { 34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // MaterialArchetypesBuffer
         { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeMaterialsBuffer
-        { 36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // HistoryReservoirsBuffer
+        { 36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // HistoryReservoirsBuffer
+        { 37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // X1ContextsBuffer (ReSTIR GI)
+        { 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiCurrentReservoirsBuffer
+        { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // GiHistoryReservoirsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -344,7 +347,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkDeviceSize matArchetypeSize,
                                                 VkBuffer shadeMaterialBuffer,
                                                 VkDeviceSize shadeMaterialSize,
-                                                VkBuffer restirHistoryReservoirBuffer) {
+                                                VkBuffer restirHistoryReservoirBuffer,
+                                                VkBuffer x1ContextBuffer,
+                                                VkBuffer giReservoirBuffer,
+                                                VkBuffer giHistoryReservoirBuffer) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -401,6 +407,16 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkBuffer actualRestirHistory = (restirHistoryReservoirBuffer != VK_NULL_HANDLE) ? restirHistoryReservoirBuffer : actualRestir;
     VkDescriptorBufferInfo restirHistoryInfo{ actualRestirHistory, 0, VK_WHOLE_SIZE };
 
+    // ReSTIR GI state (bindings 37/38/39): fall back to the 128B dummy so the
+    // grid bindings are always valid even before lazy allocation or when
+    // ReSTIR is disabled.
+    VkBuffer actualX1Ctx = (x1ContextBuffer != VK_NULL_HANDLE) ? x1ContextBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo x1CtxInfo{ actualX1Ctx, 0, VK_WHOLE_SIZE };
+    VkBuffer actualGi = (giReservoirBuffer != VK_NULL_HANDLE) ? giReservoirBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo giInfo{ actualGi, 0, VK_WHOLE_SIZE };
+    VkBuffer actualGiHistory = (giHistoryReservoirBuffer != VK_NULL_HANDLE) ? giHistoryReservoirBuffer : actualGi;
+    VkDescriptorBufferInfo giHistoryInfo{ actualGiHistory, 0, VK_WHOLE_SIZE };
+
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
     asInfo.accelerationStructureCount = 1;
@@ -451,6 +467,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 34, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matArchetypeInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 35, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeMatInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 36, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &restirHistoryInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 37, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &x1CtxInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 38, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 39, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giHistoryInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
