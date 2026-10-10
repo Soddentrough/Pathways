@@ -28,6 +28,7 @@ def verify_mgpu_pacing(json_path, max_avg_ms=6.0, max_peak_ms=10.0, min_frames=3
         avg_ms = perf.get("avg_frame_time_ms", 0.0)
         min_ms = perf.get("min_frame_time_ms", 0.0)
         max_ms = perf.get("max_frame_time_ms", 0.0)
+        std_dev_ms = perf.get("std_dev_frame_time_ms", 0.0)
         fps = perf.get("avg_fps", 0.0)
         total_frames = perf.get("total_frames", 0)
         val_errors = perf.get("validation_errors", -1)
@@ -38,7 +39,10 @@ def verify_mgpu_pacing(json_path, max_avg_ms=6.0, max_peak_ms=10.0, min_frames=3
         print(f"Primary GPU:    {gpu_name_prim}")
         print(f"Secondary GPU:  {gpu_name_sec} (Active: {sec_active})")
         print(f"Frames Sampled: {total_frames} (Min Required: {min_frames})")
-        print(f"Avg Frame Time: {avg_ms:.3f} ms ({fps:.1f} FPS) [Target: <= {max_avg_ms:.1f} ms]")
+        if std_dev_ms > 0.0:
+            print(f"Avg Frame Time: {avg_ms:.3f} ms ({fps:.1f} FPS) ± {std_dev_ms:.3f} ms (σ) [Target: <= {max_avg_ms:.1f} ms]")
+        else:
+            print(f"Avg Frame Time: {avg_ms:.3f} ms ({fps:.1f} FPS) [Target: <= {max_avg_ms:.1f} ms]")
         print(f"Min Frame Time: {min_ms:.3f} ms")
         print(f"Max Frame Time: {max_ms:.3f} ms [Peak Budget: <= {max_peak_ms:.1f} ms]")
         print(f"Vulkan Errors:  {val_errors}")

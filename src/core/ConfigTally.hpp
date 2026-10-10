@@ -7,6 +7,7 @@
 #include <format>
 #include <algorithm>
 #include <numeric>
+#include <cmath>
 
 namespace pathways {
 
@@ -143,6 +144,7 @@ struct ConfigStatsTally {
     double sumPrimaryRtMs = 0.0;
     double sumSecondaryRtMs = 0.0;
     double sumTonemapMs = 0.0;
+    std::vector<double> frameTimesMs;
 
     // Acceleration structures
     double blasBuildTimeMs = 0.0;
@@ -194,6 +196,7 @@ struct ConfigStatsTally {
         sumPrimaryRtMs += primRtMs;
         sumSecondaryRtMs += secRtMs;
         sumTonemapMs += tonemapMs;
+        frameTimesMs.push_back(frameTimeMs);
 
         if (wfSample && (!wfSample->bounces.empty() || wfSample->tailMegakernelMs > 0.0)) {
             hasWavefrontStages = true;
@@ -230,6 +233,17 @@ struct ConfigStatsTally {
     double getAvgFps() const {
         double avg = getAvgFrameTimeMs();
         return avg > 0.0001 ? (1000.0 / avg) : 0.0;
+    }
+
+    double getStdDevFrameTimeMs() const {
+        if (frameCount <= 1 || frameTimesMs.empty()) return 0.0;
+        double mean = getAvgFrameTimeMs();
+        double sumSqDiff = 0.0;
+        for (double t : frameTimesMs) {
+            double diff = t - mean;
+            sumSqDiff += diff * diff;
+        }
+        return std::sqrt(sumSqDiff / (frameTimesMs.size() - 1));
     }
 
     double getAvgPrimaryRtMs() const {

@@ -584,6 +584,19 @@ target_include_directories(test_upways_pipeline PRIVATE
 target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
 add_dependencies(test_upways_pipeline package_upways_weights)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
+
+# ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
+add_executable(test_restir_pt_math
+    tests/test_restir_pt_math.cpp
+)
+target_include_directories(test_restir_pt_math PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+if(UNIX)
+    target_link_libraries(test_restir_pt_math PRIVATE m)
+endif()
+add_test(NAME RestirPtMath COMMAND test_restir_pt_math)
 add_test(NAME VisualIntegrity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_visual_integrity.py)
 add_test(NAME PerformanceMatrix COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_performance_matrix.py --quick)
 

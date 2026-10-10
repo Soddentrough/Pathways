@@ -496,9 +496,13 @@ void main() {
             // term T1·L_direct(x1) is estimated by resampling cached secondary
             // vertices at the primary hit x1 (this ray's origin) instead of the
             // plain T1·NEE(x2) accumulation. Requires inline ray queries for the
-            // L̂2 shadow test and the winner replay ray.
+            X1Context giCtx = x1Contexts[pixelIndex];
             bool giActive = ((ubo.flags & (1u << 24)) != 0u) && (bounce == 1u) &&
-                            (pc.useHardwareRT == 1u) && enableDirect && (pc.numLights > 0u);
+                            (pc.useHardwareRT == 1u) && enableDirect && (pc.numLights > 0u) &&
+                            x1ContextValid(giCtx);
+            if (!giActive && bounce == 1u && (ubo.flags & (1u << 24)) != 0u) {
+                giReservoirs[pixelIndex] = invalidGiReservoir();
+            }
             vec3 giL2 = vec3(0.0);              // shadowed radiance leaving x2 toward x1
             vec3 giLightDir = vec3(0.0);
             float giLightDist = 0.0;
@@ -640,8 +644,7 @@ void main() {
                 // write invalid first, overwrite below when a candidate exists.
                 giReservoirs[pixelIndex] = invalidGiReservoir();
 
-                X1Context giCtx = x1Contexts[pixelIndex];
-                if (x1ContextValid(giCtx) && !pathTerminated && !isDelta) {
+                if (!pathTerminated && !isDelta) {
                     vec3 giX1 = origin;              // primary hit point (epsilon-offset)
                     vec3 giN1 = x1ContextNormal(giCtx);
                     vec3 giAlbedo = x1ContextAlbedo(giCtx);

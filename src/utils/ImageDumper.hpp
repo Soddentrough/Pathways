@@ -146,6 +146,7 @@ struct FrameStats {
     double avg_frame_time_ms = 0.0;
     double min_frame_time_ms = 0.0;
     double max_frame_time_ms = 0.0;
+    double std_dev_frame_time_ms = 0.0;
     double avg_fps = 0.0;
     double presentation_time_ms = 0.0;
     double presentation_fps = 0.0;
@@ -228,6 +229,7 @@ struct FrameStats {
         double avg_frame_time_ms = 0.0;
         double min_frame_time_ms = 0.0;
         double max_frame_time_ms = 0.0;
+        double std_dev_frame_time_ms = 0.0;
         double avg_fps = 0.0;
         double primary_gpu_time_ms = 0.0;
         double secondary_gpu_time_ms = 0.0;

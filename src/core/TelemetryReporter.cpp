@@ -312,6 +312,16 @@ FrameStats TelemetryReporter::getStats() const {
         stats.avg_frame_time_ms = sum / m_engine->m_frameTimesMs.size();
         stats.min_frame_time_ms = *std::min_element(m_engine->m_frameTimesMs.begin(), m_engine->m_frameTimesMs.end());
         stats.max_frame_time_ms = *std::max_element(m_engine->m_frameTimesMs.begin(), m_engine->m_frameTimesMs.end());
+        if (m_engine->m_frameTimesMs.size() > 1) {
+            double sumSqDiff = 0.0;
+            for (double t : m_engine->m_frameTimesMs) {
+                double diff = t - stats.avg_frame_time_ms;
+                sumSqDiff += diff * diff;
+            }
+            stats.std_dev_frame_time_ms = std::sqrt(sumSqDiff / (m_engine->m_frameTimesMs.size() - 1));
+        } else {
+            stats.std_dev_frame_time_ms = 0.0;
+        }
         stats.avg_fps = stats.avg_frame_time_ms > 0.0 ? 1000.0 / stats.avg_frame_time_ms : 0.0;
         stats.target_frame_time_ms = m_engine->m_config.target_frame_time_ms;
         stats.target_achieved = (stats.avg_frame_time_ms < m_engine->m_config.target_frame_time_ms);
@@ -590,8 +600,9 @@ FrameStats TelemetryReporter::getStats() const {
         s.label = tally.label;
         s.frame_count = tally.frameCount;
         s.avg_frame_time_ms = tally.getAvgFrameTimeMs();
-        s.min_frame_time_ms = tally.minFrameTimeMs;
+        s.min_frame_time_ms = tally.frameCount == 0 ? 0.0 : tally.minFrameTimeMs;
         s.max_frame_time_ms = tally.maxFrameTimeMs;
+        s.std_dev_frame_time_ms = tally.getStdDevFrameTimeMs();
         s.avg_fps = tally.getAvgFps();
         s.primary_gpu_time_ms = tally.getAvgPrimaryRtMs();
         s.secondary_gpu_time_ms = tally.getAvgSecondaryRtMs();
@@ -758,8 +769,10 @@ void TelemetryReporter::printExecutionSummary() const {
         const auto& tally = *activeTallies[i];
         Logger::info("  [Config {}/{}] {}", i + 1, activeTallies.size(), tally.label);
         Logger::info("    Frames Sampled:      {}", tally.frameCount);
-        Logger::info("    Average Frame Time:  {:.3f} ms ({:.1f} FPS)", tally.getAvgFrameTimeMs(), tally.getAvgFps());
-        Logger::info("    Frame Time Range:    min: {:.3f} ms | max: {:.3f} ms", tally.minFrameTimeMs, tally.maxFrameTimeMs);
+        double minTime = tally.frameCount == 0 ? 0.0 : tally.minFrameTimeMs;
+        Logger::info("    Frame Time:          avg: {:.3f} ms ({:.1f} FPS) ± {:.3f} ms (σ) | min: {:.3f} ms | max: {:.3f} ms",
+                     tally.getAvgFrameTimeMs(), tally.getAvgFps(), tally.getStdDevFrameTimeMs(),
+                     minTime, tally.maxFrameTimeMs);
         Logger::info("    Acceleration Structures:");
         if (tally.blasCompacted) {
             double ratio = (1.0 - (tally.blasSizeKb / tally.uncompactedBlasSizeKb)) * 100.0;

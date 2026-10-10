@@ -198,6 +198,7 @@ int main() {
         check_true(content.find("pipeline_stages_ms") != std::string::npos, "JSON contains pipeline_stages_ms");
         check_true(content.find("primary_rays") != std::string::npos, "JSON contains primary_rays");
         check_true(content.find("rays_left") != std::string::npos, "JSON contains rays_left");
+        check_true(content.find("std_dev_frame_time_ms") != std::string::npos, "JSON contains std_dev_frame_time_ms");
 
         // Clean up test file
         std::filesystem::remove(testJsonPath, ec);

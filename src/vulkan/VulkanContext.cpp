@@ -514,6 +514,15 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps{};
     pciBusProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
 
+    if (hasPciBusInfo) {
+        m_driverProperties.pNext = &pciBusProps;
+    }
+
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroupProps;
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+
     // Core-feature structs: authoritative source for BDA / timeline semaphores /
     // dynamic rendering / sync2 capability reporting (no hardcoded assumptions).
     VkPhysicalDeviceVulkan12Features vk12Features{};
@@ -521,17 +530,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     VkPhysicalDeviceVulkan13Features vk13Features{};
     vk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vk12Features.pNext = &vk13Features;
-    if (hasPciBusInfo) {
-        m_driverProperties.pNext = &pciBusProps;
-        pciBusProps.pNext = &vk12Features;
-    } else {
-        m_driverProperties.pNext = &vk12Features;
-    }
 
-    VkPhysicalDeviceProperties2 props2{};
-    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props2.pNext = &subgroupProps;
-    vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+    VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    feat2.pNext = &vk12Features;
+    vkGetPhysicalDeviceFeatures2(m_physicalDevice, &feat2);
+
     m_vk12Features = vk12Features;
     m_vk13Features = vk13Features;
     m_dgcProperties = dgcProps;

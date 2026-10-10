@@ -924,6 +924,125 @@ def test_specular_vmv_integrity():
 
     return result
 
+def test_restir_pt_veach_ajar_indirect_integrity():
+    result = TestResult("ReSTIR PT Indirect Path Resampling & Veach Ajar Integrity")
+    print(f"\n--- Running: {result.name} ---")
+
+    ref_path = os.path.join(PATHWAYS_ROOT, "scenes", "veach-ajar", "veach_ajar_reference_1024spp.png")
+    if not os.path.exists(ref_path):
+        result.fail(f"Reference image missing at {ref_path}")
+        return result
+
+    img_ref = cv2.imread(ref_path)
+    if img_ref is None:
+        result.fail(f"Failed to load reference image from {ref_path}")
+        return result
+
+    # 1. Baseline Pure Path Tracing (1 SPP, 4 Bounces, 60 frames progressive accumulation)
+    out_baseline = os.path.join(OUTPUT_DIR, "veach_ajar_baseline_pt.png")
+    rc, stdout, stderr = run_pathways([
+        "--scene", "scenes/veach-ajar/veach_ajar_extended.glb",
+        "--res", "1080p",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "60",
+        "--no-animate",
+        "--dump-frame", out_baseline
+    ])
+    if rc != 0:
+        result.fail(f"Baseline PT run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_baseline = cv2.imread(out_baseline)
+    if img_baseline is None:
+        result.fail("Failed to load baseline output image")
+        return result
+
+    # 2. Candidate ReSTIR PT (1 SPP, 4 Bounces, 60 frames progressive accumulation)
+    out_restir = os.path.join(OUTPUT_DIR, "veach_ajar_restir_pt.png")
+    rc, stdout, stderr = run_pathways([
+        "--scene", "scenes/veach-ajar/veach_ajar_extended.glb",
+        "--restir",
+        "--res", "1080p",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "60",
+        "--no-animate",
+        "--dump-frame", out_restir
+    ])
+    if rc != 0:
+        result.fail(f"ReSTIR PT run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_restir = cv2.imread(out_restir)
+    if img_restir is None:
+        result.fail("Failed to load ReSTIR PT output image")
+        return result
+
+    # Error metrics
+    ref_f = img_ref.astype(np.float32) / 255.0
+    base_f = img_baseline.astype(np.float32) / 255.0
+    restir_f = img_restir.astype(np.float32) / 255.0
+
+    denom = (ref_f ** 2) + 0.01
+    rel_mse_base = float(np.mean(((base_f - ref_f) ** 2) / denom))
+    rel_mse_restir = float(np.mean(((restir_f - ref_f) ** 2) / denom))
+
+    mse_base = float(np.mean((base_f - ref_f) ** 2))
+    mse_restir = float(np.mean((restir_f - ref_f) ** 2))
+
+    psnr_base = 10.0 * np.log10(1.0 / max(mse_base, 1e-10))
+    psnr_restir = 10.0 * np.log10(1.0 / max(mse_restir, 1e-10))
+
+    rel_mse_ratio = rel_mse_base / max(rel_mse_restir, 1e-6)
+
+    # Luminance conservation
+    mean_lum_ref = float(np.mean(ref_f))
+    mean_lum_restir = float(np.mean(restir_f))
+    lum_bias = abs(mean_lum_restir - mean_lum_ref) / max(mean_lum_ref, 1e-4)
+
+    result.record("baseline_rel_mse", rel_mse_base)
+    result.record("restir_rel_mse", rel_mse_restir)
+    result.record("rel_mse_improvement", rel_mse_ratio)
+    result.record("baseline_psnr", psnr_base)
+    result.record("restir_psnr", psnr_restir)
+    result.record("lum_bias_pct", lum_bias * 100.0)
+
+    print(f"  Veach Ajar Baseline 1-SPP: RelMSE={rel_mse_base:.4f}, PSNR={psnr_base:.2f} dB")
+    print(f"  Veach Ajar ReSTIR PT:     RelMSE={rel_mse_restir:.4f}, PSNR={psnr_restir:.2f} dB ({rel_mse_ratio:.2f}x reduction)")
+    print(f"  Luminance Conservation:   Ref={mean_lum_ref:.3f}, ReSTIR={mean_lum_restir:.3f} (Bias: {lum_bias*100.0:.2f}%)")
+
+    # Generate 4-way visual verification montage
+    err_mag = np.linalg.norm(restir_f - ref_f, axis=2)
+    err_norm = np.clip(err_mag * 3.0, 0.0, 1.0)
+    heatmap = cv2.applyColorMap((err_norm * 255.0).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+    h, w, _ = img_ref.shape
+    half_w, half_h = w // 2, h // 2
+
+    p1 = cv2.resize(img_baseline, (half_w, half_h))
+    p2 = cv2.resize(img_restir, (half_w, half_h))
+    p3 = cv2.resize(heatmap, (half_w, half_h))
+    p4 = cv2.resize(img_ref, (half_w, half_h))
+
+    cv2.putText(p1, f"Baseline 1-SPP PT (RelMSE: {rel_mse_base:.4f})", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.putText(p2, f"ReSTIR PT 1-SPP (RelMSE: {rel_mse_restir:.4f}, {rel_mse_ratio:.2f}x)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(p3, "Absolute Error Heatmap (Inferno)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(p4, "1024-SPP Ground Truth Reference", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    montage = np.vstack([np.hstack([p1, p2]), np.hstack([p3, p4])])
+    out_montage = os.path.join(OUTPUT_DIR, "veach_ajar_restir_pt_comparison.png")
+    cv2.imwrite(out_montage, montage)
+    print(f"  [+] Visual Verification Montage saved to: {out_montage}")
+
+    # Pass Gates (requires genuine error reduction and physical conservation)
+    if rel_mse_ratio < 1.30:
+        result.fail(f"ReSTIR PT RelMSE reduction insufficient: {rel_mse_ratio:.2f}x < 1.30x (Target: >= 1.30x)")
+    if lum_bias > 0.15:
+        result.fail(f"Energy conservation violation: Luminance bias {lum_bias*100.0:.1f}% > 15.0%")
+
+    return result
+
 def main():
     print("================================================================")
     print("  Pathways Visual Integrity & Exposure Stability Test Suite     ")
@@ -952,7 +1071,7 @@ def main():
     # selected. Checking the whole log would skip every local run.
     active_line = ""
     for line in (stdout + stderr).splitlines():
-        if "successfully initialized on:" in line:
+        if "successfully initialized on:" in line or "Primary GPU:" in line or "Primary GPU fully initialized:" in line:
             active_line = line.lower()
     if not active_line:
         print("[SKIP] Could not determine the active Vulkan device. Skipping visual integrity test.")
@@ -969,8 +1088,21 @@ def main():
         test_breakfast_room_motion_noise,
         test_restir_many_lights_variance_and_gating,
         test_restir_gi_energy_and_stability,
-        test_specular_vmv_integrity
+        test_specular_vmv_integrity,
+        test_restir_pt_veach_ajar_indirect_integrity
     ]
+
+    # Optional test filtering via command-line argument: --filter <substr>
+    filter_arg = None
+    for idx, arg in enumerate(sys.argv):
+        if arg.startswith("--filter="):
+            filter_arg = arg.split("=")[1].lower()
+        elif arg == "--filter" and idx + 1 < len(sys.argv):
+            filter_arg = sys.argv[idx + 1].lower()
+
+    if filter_arg:
+        tests = [t for t in tests if filter_arg in t.__name__.lower()]
+        print(f"[INFO] Filtering tests matching '{filter_arg}': {[t.__name__ for t in tests]}")
 
     all_passed = True
     summary = []
