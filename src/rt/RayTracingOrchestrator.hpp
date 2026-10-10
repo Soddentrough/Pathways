@@ -101,13 +101,9 @@ public:
         const std::vector<char>& resolveCode
     );
 
-    /// Initializes ReSTIRManager.
-    void createReSTIRResources(
-        uint32_t width,
-        uint32_t height,
-        const std::vector<char>& temporalCode,
-        const std::vector<char>& spatialCode
-    );
+    /// Initializes ReSTIRManager (reservoir grid allocation is deferred until
+    /// ReSTIR is first enabled; see Engine lazy-init path).
+    void createReSTIRResources();
 
     /// Destroys ReSTIRManager.
     void destroyReSTIRResources();

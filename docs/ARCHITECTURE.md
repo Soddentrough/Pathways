@@ -180,9 +180,27 @@ quality guarantee.
 
 ## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR DI)
 
-Pathways implements ReSTIR Direct Illumination (`src/rt/ReSTIRManager.cpp`) to handle many-light environments:
-- **Temporal Reservoir Reuse**: Projects light candidate reservoirs across consecutive frames via motion vectors, evaluating temporal visibility confidence.
-- **Spatial Reservoir Reuse**: Exchanges light candidates across neighboring pixels within a spatial radius, significantly reducing direct lighting variance with a single shadow ray evaluation.
+Pathways implements ReSTIR Direct Illumination to handle many-light environments. All
+resampling runs **inline in the wavefront shade passes** (`shaders/compute/restir_common.glsl`,
+used by `wavefront_shade_diffuse/complex.comp`); `src/rt/ReSTIRManager.cpp` is a lean owner
+of the double-buffered per-pixel reservoir grid (lazy allocation, zero-fill on (re)alloc).
+
+- **Reservoir layout**: 28 B `DiReservoir` (light index + M, weight sum, scalar target p̂,
+  age/valid/lobe flags, oct-encoded x1 & light normals, 8-bit-per-channel light UV,
+  fp16 cosine & primary distance) — every field is read back during reuse.
+- **Temporal Reservoir Reuse**: The previous frame's grid is sampled at the
+  MV-reprojected pixel; stored samples are reconnected to the current surface, re-weighted
+  with the correct solid-angle measure ratio (`q_src/q_curr` for area lights, 1.0 for
+  point-like lights), M-truncated by `--restir-m-cap`, and gated by stored x1 normal/depth
+  disocclusion checks plus a max-age cutoff.
+- **Spatial Reservoir Reuse**: Four additional taps read the previous frame's grid at a
+  per-pixel randomly rotated cross offset (±2 px). Buffer-based taps keep reuse legal under
+  the wavefront's divergent per-material control flow (the previous shuffle-based scheme
+  was undefined behavior — see `docs/reports/restir_review_2026_10_10.md`).
+- **Finalization**: Full GGX + diffuse BRDF evaluation of the winning light with a single
+  inline shadow ray; an occluded winner zeroes its reservoir so bad history dies immediately.
+- **Path-space ReSTIR PT** (GI reservoirs with path replay) is a roadmap item, not yet
+  implemented; see `docs/RESTIR_PT_DESIGN.md`.
 
 ---
 
@@ -320,6 +338,7 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | **26–29** | `storageImage` | `albedoRough / specMetal / mlDiff / mlSpec` | RGBA16F | Denoising feature maps & separated diffuse/specular buffers |
 | **30** | `storageBuffer` | `instances` | 64 B | Scene mesh instance transforms and material offsets |
 | **31** | `storageImage` | `causticImage` | RGBA16F | Forward photon-traced caustic splat target |
-| **32** | `storageBuffer` | `restirReservoirs` | Variable | ReSTIR DI spatio-temporal light candidate reservoirs |
+| **32** | `storageBuffer` | `restirReservoirs` | **28 B**/px | ReSTIR DI reservoirs, current frame slot (write) |
+| **36** | `storageBuffer` | `restirHistory` | **28 B**/px | ReSTIR DI reservoirs, previous frame slot (temporal/spatial taps, read-only) |
 | **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
 | **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |

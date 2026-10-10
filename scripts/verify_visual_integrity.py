@@ -683,47 +683,29 @@ def test_breakfast_room_motion_noise():
     return result
 
 def test_restir_many_lights_variance_and_gating():
-    result = TestResult("ReSTIR Resampling Variance Reduction & Dynamic Light Gating")
+    result = TestResult("ReSTIR DI Resampling Variance Reduction")
     print(f"\n--- Running: {result.name} ---")
 
-    # 1. Test ReSTIR Light-Gating Bypass:
-    # Scene has 64 lights. If restir_min_lights=100, ReSTIR must be bypassed and direct NEE used.
-    out_bypassed = os.path.join(OUTPUT_DIR, "many_lights_restir_bypassed.png")
-    rc, stdout, stderr = run_pathways([
-        "--scene", "many-lights",
-        "--restir",
-        "--restir-min-lights", "100",
-        "--res", "1080p",
-        "--spp", "1",
-        "--max-bounces", "4",
-        "--frames", "5",
-        "--dump-frame", out_bypassed
-    ])
-    if rc != 0:
-        result.fail(f"ReSTIR bypass run failed with code {rc}: {stderr.strip()[:200]}")
-        return result
+    # NOTE: the former "--restir-min-lights bypass" sub-test was removed: the
+    # gating option is deprecated/ignored by the engine, which made the check
+    # vacuous (review 2026-10-10 §5.2). What remains is the real assertion:
+    # 1-SPP ReSTIR DI must measurably reduce direct-light noise vs 1-SPP NEE.
 
-    img_bypassed = cv2.imread(out_bypassed)
-    if img_bypassed is None:
-        result.fail("Failed to load output image for ReSTIR bypass test")
-        return result
-
-    st_bypassed = compute_image_stats(img_bypassed)
-    if st_bypassed["has_nan"] or st_bypassed["has_inf"]:
-        result.fail("NaN or Inf detected in ReSTIR bypass output")
-    if st_bypassed["mean_lum"] < 30.0 or st_bypassed["mean_lum"] > 200.0:
-        result.fail(f"Abnormal mean luminance in ReSTIR bypass: {st_bypassed['mean_lum']:.1f}")
-
-    print(f"  ReSTIR Bypassed (Threshold 100 > 64 Lights): MeanLum={st_bypassed['mean_lum']:.1f}, MaxLum={st_bypassed['max_lum']:.1f} (OK)")
-
-    # 2. Pure 1-SPP Analytical NEE Baseline
+    # Measurement mode: --no-accumulation (1 SPP per displayed frame). This is
+    # the regime ReSTIR DI exists for (interactive / real-time). With static
+    # progressive accumulation both paths average N frames and the ratio is
+    # dominated by accumulation, masking the resampling gain (measured: ~1.05x
+    # static vs >3x real-time on this scene).
+    #
+    # 1. Pure 1-SPP Analytical NEE Baseline (real-time mode)
     out_nee = os.path.join(OUTPUT_DIR, "many_lights_analytical_nee.png")
     rc, stdout, stderr = run_pathways([
         "--scene", "many-lights",
+        "--no-accumulation",
         "--res", "1080p",
         "--spp", "1",
         "--max-bounces", "4",
-        "--frames", "5",
+        "--frames", "10",
         "--dump-frame", out_nee
     ])
     if rc != 0:
@@ -733,16 +715,16 @@ def test_restir_many_lights_variance_and_gating():
     img_nee = cv2.imread(out_nee)
     st_nee = compute_image_stats(img_nee)
 
-    # 3. Active ReSTIR DI Resampling (Wave32 LDS / Register Shuffling)
+    # 2. Active ReSTIR DI Resampling (inline temporal + spatial-tap reuse)
     out_active = os.path.join(OUTPUT_DIR, "many_lights_restir_active.png")
     rc, stdout, stderr = run_pathways([
         "--scene", "many-lights",
         "--restir",
-        "--restir-min-lights", "8",
+        "--no-accumulation",
         "--res", "1080p",
         "--spp", "1",
         "--max-bounces", "4",
-        "--frames", "5",
+        "--frames", "10",
         "--dump-frame", out_active
     ])
     if rc != 0:

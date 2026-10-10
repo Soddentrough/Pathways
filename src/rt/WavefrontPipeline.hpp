@@ -82,6 +82,7 @@ struct WavefrontSceneData {
     bool enableTailMegakernel = false;    // Hybrid Wavefront-to-Megakernel transition for late bounces
     uint32_t tailMegakernelBounce = 2;    // Cutoff bounce to switch to Tail Megakernel (default: 2)
     uint32_t deltaUnroll = 0;             // Max delta-chain unroll depth for smooth dielectrics (default: 0 = Pure Wavefront)
+    uint32_t restirMCap = 30;             // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader)
 };
 
 class WavefrontPipeline {
@@ -141,7 +142,8 @@ public:
                                 VkBuffer materialArchetypeBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize matArchetypeSize = 0,
                                 VkBuffer shadeMaterialBuffer = VK_NULL_HANDLE,
-                                VkDeviceSize shadeMaterialSize = 0);
+                                VkDeviceSize shadeMaterialSize = 0,
+                                VkBuffer restirHistoryReservoirBuffer = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
@@ -284,6 +286,7 @@ private:
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;
+    std::unique_ptr<Buffer> m_dummyReservoir; // 128B fallback target for ReSTIR reservoir bindings 32/36
     bool m_dummyImageTransitioned = false;
     bool m_supportsSubgroupSizeControl = true;
 };

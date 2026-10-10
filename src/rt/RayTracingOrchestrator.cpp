@@ -124,18 +124,12 @@ void RayTracingOrchestrator::initNRC(
     Logger::info("Neural Direct-Light Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized. Note: caches unshadowed direct light only — see docs/NRC.md.");
 }
 
-void RayTracingOrchestrator::createReSTIRResources(
-    uint32_t width,
-    uint32_t height,
-    const std::vector<char>& temporalCode,
-    const std::vector<char>& spatialCode
-) {
-    m_restirManager = std::make_unique<ReSTIRManager>(
-        m_device, m_allocator,
-        width, height,
-        temporalCode, spatialCode
-    );
-    Logger::info("Ultra-Lean ReSTIR PT Subsystem (32B Reservoirs, Fused Temporal & LDS Spatial Reuse) initialized successfully.");
+void RayTracingOrchestrator::createReSTIRResources() {
+    // Buffer allocation is deferred: the grid is only (re)allocated when
+    // ReSTIR is actually enabled (Engine::renderFrame lazy-init path) to
+    // avoid ~2 x W*H*28 B of idle VRAM when the feature is off.
+    m_restirManager = std::make_unique<ReSTIRManager>(m_device, m_allocator);
+    Logger::info("ReSTIR DI subsystem initialized (28B reservoirs; inline temporal + spatial-tap reuse in wavefront shading).");
 }
 
 void RayTracingOrchestrator::destroyReSTIRResources() {
@@ -218,7 +212,22 @@ float RayTracingOrchestrator::getDivergentAreaRatio(const SceneData& sceneData) 
     if (m_cachedDivergentAreaRatio >= 0.0f) {
         return m_cachedDivergentAreaRatio;
     }
-    if (sceneData.triangles.empty() || sceneData.materials.empty()) {
+    if (sceneData.materials.empty()) {
+        m_cachedDivergentAreaRatio = 0.0f;
+        return 0.0f;
+    }
+    if (sceneData.triangles.empty()) {
+        if (sceneData.hasDielectrics) {
+            m_cachedDivergentAreaRatio = 0.5f;
+            return 0.5f;
+        }
+        for (const auto& mat : sceneData.materials) {
+            uint32_t arch = computeMaterialArchetype(mat);
+            if (arch == MATERIAL_ARCHETYPE_COMPLEX || arch == MATERIAL_ARCHETYPE_DIELECTRIC) {
+                m_cachedDivergentAreaRatio = 0.5f;
+                return 0.5f;
+            }
+        }
         m_cachedDivergentAreaRatio = 0.0f;
         return 0.0f;
     }
@@ -251,6 +260,10 @@ WavefrontSortMode RayTracingOrchestrator::getEffectiveWavefrontSortMode(const Co
         return config.wavefront_sort_mode;
     }
 
+    if (config.enable_restir) {
+        return WavefrontSortMode::Dual;
+    }
+
     if (sceneData.materials.empty()) {
         return WavefrontSortMode::None;
     }
@@ -273,7 +286,7 @@ void RayTracingOrchestrator::resize(uint32_t width, uint32_t height, const Confi
     if (m_nrcManager) {
         m_nrcManager->resize(width, height);
     }
-    if (m_restirManager) {
+    if (m_restirManager && m_restirManager->isInitialized()) {
         m_restirManager->resize(width, height);
     }
     if (m_wavefrontPipeline) {
@@ -318,6 +331,13 @@ void RayTracingOrchestrator::recordRayTracing(
     if (useWavefront) {
         if (config.enable_nrc && m_nrcManager) {
             m_nrcManager->resetCounters(cmd);
+        }
+
+        // Zero-fill freshly allocated ReSTIR reservoir grids before any shade
+        // dispatch reads them (uninitialized memory must never alias a valid
+        // reservoir; review 2026-10-10 §4.6).
+        if (params.isRestirActive && m_restirManager) {
+            m_restirManager->recordClearIfNeeded(cmd);
         }
 
         // Clear per-frame ray tracing target (FP16)
@@ -402,6 +422,7 @@ void RayTracingOrchestrator::recordRayTracing(
         wfSceneData.tailMegakernelBounce = config.tail_megakernel_bounce;
         wfSceneData.deltaUnroll = config.delta_unroll;
         wfSceneData.inlineShadows = config.inline_primary_shadows;
+        wfSceneData.restirMCap = config.restir_m_cap;
 
         if (params.isMultiGpu) {
             wfSceneData.tileOffsetX = params.tileOffsetX;

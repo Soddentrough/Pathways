@@ -286,9 +286,9 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--nrc-bounce` | `<int>` | Path bounce depth at which NRC terminates tracing | `2` |
 | `--nrc-train-ratio` | `<float>` | Fraction of paths that continue to ground truth for NRC training | `0.03` |
 | `--caustic-photons` | `<int>` | Photon count for the forward caustics pass | `1048576` |
-| `--restir` | *(flag)* | Enable ReSTIR DI (direct-light) reservoir resampling for many-light scenes. (`--restir-pt` currently warns and enables DI only — full ReSTIR PT is unimplemented) | Disabled |
-| `--restir-min-lights` | `<int>` | Minimum light count before ReSTIR DI auto-activates | `8` |
-| `--restir-m-cap` | `<int>` | ReSTIR DI temporal reservoir M cap | `30` |
+| `--restir` | *(flag)* | Enable ReSTIR DI: inline temporal + spatial reservoir resampling of direct light in wavefront shading. (`--restir-pt` is an alias that warns — path-space ReSTIR PT is not yet implemented; see `docs/RESTIR_PT_DESIGN.md`) | Disabled |
+| `--restir-min-lights` | `<int>` | *Deprecated, ignored* (kept for CLI compatibility) | — |
+| `--restir-m-cap` | `<int>` | ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader) | `30` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |

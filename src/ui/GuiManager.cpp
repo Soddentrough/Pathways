@@ -1290,40 +1290,23 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("ReSTIR Resampling (Unified 16B Reservoirs):");
-            if (ImGui::Checkbox("Enable ReSTIR", &config.enable_restir_di)) {
+            ImGui::TextDisabled("ReSTIR DI (Direct-Light Reservoir Resampling):");
+            if (ImGui::Checkbox("Enable ReSTIR DI", &config.enable_restir)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spatio-temporal reservoir resampling (ReSTIR) with unified 16B reservoirs and multi-scale spatial reuse. Opt-in via --restir.");
+                ImGui::SetTooltip("ReSTIR DI: inline spatiotemporal reservoir resampling of direct light (28B per-pixel reservoirs, MV-reprojected temporal tap + 4 spatial taps). Path-space ReSTIR PT is on the roadmap (docs/RESTIR_PT_DESIGN.md). Opt-in via --restir.");
             }
-            if (config.enable_restir_di) {
+            if (config.enable_restir) {
                 ImGui::Indent();
-                if (stats.num_lights < config.restir_min_lights) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
-                    ImGui::TextWrapped("Status: Bypassed (%u light%s < %u threshold; direct NEE active)",
-                                       stats.num_lights, stats.num_lights == 1 ? "" : "s", config.restir_min_lights);
-                    ImGui::PopStyleColor();
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
-                    ImGui::TextWrapped("Status: Active (%u lights resampled)", stats.num_lights);
-                    ImGui::PopStyleColor();
-                }
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
+                ImGui::TextWrapped("Status: Active (Direct-Light Reconnection Resampling)");
+                ImGui::PopStyleColor();
 
-                int minLights = static_cast<int>(config.restir_min_lights);
-                if (ImGui::SliderInt("Min Lights for ReSTIR", &minLights, 1, 64)) {
-                    config.restir_min_lights = static_cast<uint32_t>(minLights);
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Minimum dynamic scene lights required to engage ReSTIR. Below this threshold, analytical direct NEE is used with zero overhead.");
-                }
-
-                int mCap = static_cast<int>(config.restir_di_m_cap);
+                int mCap = static_cast<int>(config.restir_m_cap);
                 if (ImGui::SliderInt("Temporal M-Cap", &mCap, 1, 100)) {
-                    config.restir_di_m_cap = static_cast<uint32_t>(mCap);
+                    config.restir_m_cap = static_cast<uint32_t>(mCap);
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
                 }

@@ -128,8 +128,8 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 
 #include "restir_common.glsl"
 
-layout(std430, binding = 32) buffer ReSTIRReservoirsBuffer {
-    ReservoirDI restirReservoirs[];
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
@@ -196,6 +196,13 @@ void main() {
         uint dispersionChannel = 0u;
         unpackRayState(state, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         uint bounce = pc.currentBounce;
+
+        // ReSTIR DI: conductor surfaces do not maintain a reservoir; invalidate
+        // this pixel's current-frame slot so stale history cannot be tapped
+        // next frame (review 2026-10-10 §4.8).
+        if (bounce == 0u && (ubo.flags & (1 << 9)) != 0) {
+            currentReservoirs[pixelIndex] = invalidDiReservoir();
+        }
 
         if (hitType == 2u) {
             // Environment sky miss
@@ -332,87 +339,6 @@ void main() {
                 float selectedTarget = 0.0;
                 float totalWeightSum = 0.0;
                 bool hasCandidate = false;
-                bool usedRestir = false;
-
-                bool enableRestirDI = ((ubo.flags & (1 << 9)) != 0 && pc.currentBounce == 0u);
-                if (enableRestirDI) {
-                    ReservoirDI res = restirReservoirs[pixelIndex];
-                    if (isValidReservoir(res.age_flags) && res.wSum > 0.0) {
-                        uint pLen = getPathLength(res.flags_uv_age);
-                        if (pLen <= 1u) {
-                            uint lightIdx = getLightIndex(res.lightIndex_M);
-                            if (lightIdx < pc.numLights) {
-                                Light light = lights[lightIdx];
-                                vec3 lightPoint;
-                                vec3 lightDir;
-                                float lightDist = 0.0;
-                                float lightPdf = 1.0;
-                                vec3 lightEmission = light.emission.rgb;
-                                bool validLightSample = false;
-
-                                if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                                    vec2 luv = unpackUV(res.age_flags);
-                                    lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                                    vec3 toLight = lightPoint - hitPoint;
-                                    lightDist = length(toLight);
-                                    lightDir = toLight / max(lightDist, 1e-4);
-
-                                    float cosLight = dot(-lightDir, light.normal.xyz);
-                                    if (cosLight > 0.0) {
-                                        float area = max(light.emission.w, 1e-4);
-                                        lightPdf = (lightDist * lightDist) / (area * cosLight);
-                                        validLightSample = true;
-                                    }
-                                } else if (uint(light.position.w) == 1u /* SPOT */) {
-                                    vec3 toLight = light.position.xyz - hitPoint;
-                                    lightDist = length(toLight);
-                                    lightDir = toLight / max(lightDist, 1e-4);
-
-                                    float cosSpot = dot(-lightDir, light.normal.xyz);
-                                    float innerCos = light.u.w;
-                                    float outerCos = light.v.w;
-                                    if (cosSpot >= outerCos) {
-                                        float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                                        lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
-                                        lightPdf = 1.0;
-                                        validLightSample = true;
-                                    }
-                                } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
-                                    lightDir = normalize(light.normal.xyz);
-                                    lightDist = 10000.0;
-                                    lightPdf = 1.0;
-                                    validLightSample = true;
-                                }
-
-                                float NdotL = dot(hitNormal, lightDir);
-                                if (validLightSample && NdotL > 0.0) {
-                                    vec3 H = normalize(V + lightDir);
-                                    float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
-
-                                    float D = isAniso ? distributionAnisotropicGGX(dot(T, H), dot(B, H), NdotH, ax, ay)
-                                                      : distributionGGX(NdotH, alphaRoughness);
-                                    float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                                    f16vec3 F = fresnelSchlickVec(float16_t(VdotH), F0);
-                                    f16vec3 specBrdf = float16_t(clamp(D * G, 0.0, 65500.0)) * F;
-
-                                    selectedLightIdx = lightIdx;
-                                    selectedLightDir = lightDir;
-                                    selectedLightDist = lightDist;
-                                    selectedLightEmission = lightEmission;
-                                    selectedLightPdf = lightPdf;
-                                    selectedBrdf = specBrdf;
-                                    selectedNdotL = NdotL;
-                                    selectedMisWeight = 1.0;
-                                    selectedTarget = max(res.targetPdf, 1e-6);
-                                    totalWeightSum = res.wSum;
-                                    hasCandidate = true;
-                                    usedRestir = true;
-                                }
-                            }
-                        }
-                    }
-                }
 
                 if (!hasCandidate) {
                     for (uint c = 0u; c < M; ++c) {
@@ -510,8 +436,7 @@ void main() {
                 }
 
                 if (hasCandidate && selectedTarget > 1e-6) {
-                    uint restirM = usedRestir ? max(getM(restirReservoirs[pixelIndex].lightIndex_M), 1u) : M;
-                    float risWeight = totalWeightSum / (float(restirM) * max(selectedTarget, 1e-6));
+                    float risWeight = totalWeightSum / (float(M) * max(selectedTarget, 1e-6));
                     risWeight = clamp(risWeight, 0.0, 10000.0);
                     vec3 directLightRadiance = clamp(selectedLightEmission * (selectedNdotL * selectedMisWeight * risWeight), vec3(0.0), vec3(65500.0));
                     secDirectL = selectedBrdf * f16vec3(directLightRadiance);
@@ -534,13 +459,6 @@ void main() {
                                     if (pc.captureMlData != 0u) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                         imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
-                                    }
-                                } else {
-                                    if (enableRestirDI) {
-                                        restirReservoirs[pixelIndex].wSum = 0.0;
-                                        restirReservoirs[pixelIndex].flags_uv_age = 0u;
-                                        restirReservoirs[pixelIndex].targetPdf = 0.0;
-                                        restirReservoirs[pixelIndex].lightIndex_M = 0u;
                                     }
                                 }
                             } else

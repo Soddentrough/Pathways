@@ -127,6 +127,11 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 
 #if ENABLE_INLINE_SHADOWS
 #include "wavefront_shadow_inline.glsl"
+#include "restir_common.glsl"
+
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -186,6 +191,13 @@ void main() {
         unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
+
+        // ReSTIR DI: passthrough (cutout continuation) does not maintain a
+        // reservoir; invalidate this pixel's current-frame slot so stale
+        // history cannot be tapped next frame (review 2026-10-10 §4.8).
+        if (bounce == 0u && (ubo.flags & (1 << 9)) != 0) {
+            currentReservoirs[pixelIndex] = invalidDiReservoir();
+        }
 
         if (hitType == 2u) {
             // Sky miss fallback

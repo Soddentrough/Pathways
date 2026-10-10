@@ -14,7 +14,7 @@ struct CameraUniform {
     uint32_t frameIndex;
     uint32_t spp;
     uint32_t maxBounces;
-    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: inlinePrimaryShadows, 7: lightTree, 8: caustics, 9: restir_di, 10: alphaMask, 11: delta_unroll, 12: dynamicVideoBypass, 20: shadowDenoiser, 21: taa, 23: cameraMoved / history reset
+    uint32_t flags; // bit 0: direct, 1: indirect, 2: specular, 3: refraction, 4: shadows, 5: hasNonOpaque, 6: inlinePrimaryShadows, 7: lightTree, 8: caustics, 9: restir_di, 10: alphaMask, 11: delta_unroll, 12: dynamicVideoBypass, 20: shadowDenoiser, 21: taa, 23: accumulation reset (ReSTIR history kill; camera motion alone no longer sets it)
     glm::mat4 unjitteredViewProj;
     glm::vec4 jitterOffset; // xy = pixel jitter [-0.5, 0.5], zw = NDC jitter
 };

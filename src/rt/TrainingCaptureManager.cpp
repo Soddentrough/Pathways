@@ -304,32 +304,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
         m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_engine->m_config.max_bounces, wfSceneData);
 
-        if (m_engine->m_config.capture_channels >= 23 && m_engine->m_restirManager && m_engine->isRestirActive()) {
-            Buffer* rayGeom = m_engine->m_wavefrontPipeline->getRayGeomQueue(0);
-            Buffer* rayHit = m_engine->m_wavefrontPipeline->getRayHitQueue(0);
-            Buffer* pixelToRay = m_engine->m_wavefrontPipeline->getPixelToRayQueue(0);
-            Buffer* camUBO = m_engine->m_cameraUBOs[0].get();
-            Buffer* lightsBuf = m_engine->m_lightBuffer;
-            Buffer* matsBuf = m_engine->m_materialBuffer;
-            Buffer* ltBuf = m_engine->m_lightTreeBuffer;
-            VkImageView mvView = m_engine->m_motionVectorImage ? m_engine->m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
-            VkImageView ndView = m_engine->m_normalDepthImage ? m_engine->m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
-            VkImageView prevNdView = m_engine->m_prevNormalDepthImage ? m_engine->m_prevNormalDepthImage->getImageView() : ndView;
-            UpwaysPipeline* upways = m_engine->getUpwaysPipeline();
-            VkImageView confView = (upways && upways->getConfidenceImage())
-                ? upways->getConfidenceImage()->getImageView()
-                : VK_NULL_HANDLE;
-
-            bool hasLt = m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && ltBuf != nullptr);
-            m_engine->m_restirManager->recordFrame(cmd, 0, width, height,
-                                         m_engine->m_numLights, static_cast<uint32_t>(m_engine->m_sceneData.triangles.size()), hasLt,
-                                         frameIdx, m_engine->m_config.restir_di_m_cap,
-                                         rayGeom, rayHit, pixelToRay,
-                                         lightsBuf, matsBuf,
-                                         camUBO, ltBuf,
-                                         mvView, ndView, prevNdView,
-                                         confView);
-        }
+        // NOTE: ReSTIR DI resampling happens inline in the wavefront shade
+        // dispatches above; there is no separate ReSTIR pass to record here.
+        // The reservoir grid is captured directly from the manager's buffers.
 
         // 4. Staging copy for 6 ML images (and ReSTIR reservoir buffer if capture_channels >= 23)
         VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
@@ -349,10 +326,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         VkDeviceSize resSize = 0;
         Buffer* resBuffer = nullptr;
         if (outChannels >= 23 && m_engine->m_restirManager && m_engine->isRestirActive()) {
-            resBuffer = m_engine->m_restirManager->getSpatialReservoirBuffer(0);
+            resBuffer = m_engine->m_restirManager->getReservoirBuffer(0);
             if (resBuffer) {
                 offsetRes = totalInputStagingSize;
-                resSize = numPixels * sizeof(UnifiedReservoirPT);
+                resSize = numPixels * sizeof(DiReservoirGPU);
                 totalInputStagingSize += resSize;
             }
         }
@@ -436,7 +413,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         const uint16_t* ndPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetND);
         const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
-        const UnifiedReservoirPT* resPixels = resBuffer ? reinterpret_cast<const UnifiedReservoirPT*>(basePtr + offsetRes) : nullptr;
+        const DiReservoirGPU* resPixels = resBuffer ? reinterpret_cast<const DiReservoirGPU*>(basePtr + offsetRes) : nullptr;
 
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
 
@@ -471,12 +448,13 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 if (outChannels >= 23) {
                     if (resPixels) {
                         const auto& res = resPixels[p];
-                        uint32_t M = (res.lightIndex_M >> 16) & 0xFFFFu;
+                        uint32_t M = (res.idxM >> 16) & 0xFFFFu;
                         float res_m = std::clamp(static_cast<float>(M) / 64.0f, 0.0f, 1.0f);
                         float pHat = std::max(res.targetPdf, 1e-4f);
                         float res_w = std::clamp(res.wSum / (std::max(static_cast<float>(M), 1.0f) * pHat), 0.0f, 4.0f) * 0.25f;
-                        uint32_t pathLen = (res.flags_uv_age >> 9) & 0x3u;
-                        float res_is_gi = (pathLen >= 2u) ? 1.0f : 0.0f;
+                        // Reservoirs are direct-light (DI) only; the GI flag
+                        // channel is reserved for path-space ReSTIR PT.
+                        float res_is_gi = 0.0f;
 
                         inputPayload[p * outChannels + 20] = glm::packHalf1x16(res_m);
                         inputPayload[p * outChannels + 21] = glm::packHalf1x16(res_w);

@@ -168,10 +168,9 @@ struct Config {
     bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]
     uint32_t caustic_photons = 1048576;   // Number of caustic photons traced per frame (default: 1048576 = 1024x1024)
 
-    // ReSTIR Spatio-Temporal Reservoir Resampling
-    bool enable_restir_di = false;        // Spatio-temporal reservoir resampling [Default: false, opt-in via --restir]
-    uint32_t restir_di_m_cap = 30;        // Temporal history M-cap for ReSTIR (default: 30)
-    uint32_t restir_min_lights = 8;       // Minimum dynamic scene lights required to engage ReSTIR (default: 8; below this, direct NEE is mathematically superior)
+    // ReSTIR DI Spatio-Temporal Reservoir Resampling (Direct Light)
+    bool enable_restir = false;           // ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [Default: false, opt-in via --restir]
+    uint32_t restir_m_cap = 30;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 30)
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)

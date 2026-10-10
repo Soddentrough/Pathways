@@ -8,6 +8,11 @@
 
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
+#include "restir_common.glsl"
+
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
 
 layout(local_size_x = 32) in;
 
@@ -167,6 +172,13 @@ void main() {
         uint seed, pixelIndex;
         bool isSpecularPath, causticApplied;
         unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+
+        // ReSTIR DI: emissive surfaces do not maintain a reservoir; invalidate
+        // this pixel's current-frame slot so stale history cannot be tapped
+        // next frame (review 2026-10-10 §4.8).
+        if (pc.currentBounce == 0u && (ubo.flags & (1 << 9)) != 0) {
+            currentReservoirs[pixelIndex] = invalidDiReservoir();
+        }
         vec3 throughput = vec3(throughputHalf);
         vec3 accumRadiance = vec3(0.0);
 

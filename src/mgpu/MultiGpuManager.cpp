@@ -1956,7 +1956,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
                              m_config.denoiser_mode == DenoiserMode::Upways ||
-                             m_config.enable_restir_di ||
+                             m_config.enable_restir ||
                              m_config.enable_caustics ||
                              m_config.upways_superres ||
                              !m_config.capture_training_data_dir.empty());

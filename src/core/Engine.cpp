@@ -619,6 +619,7 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_frameTimesMs.clear();
     if (m_rtOrchestrator) {
         m_rtOrchestrator->invalidateDivergentAreaCache();
+        m_rtOrchestrator->getDivergentAreaRatio(m_sceneData);
     }
 
     // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
@@ -833,7 +834,7 @@ void Engine::initPipelines() {
         Logger::warn("NRCManager initialization failed: {}", e.what());
     }
 
-    // 6d. Ultra-Lean ReSTIR DI Subsystem
+    // 6d. Ultra-Lean ReSTIR PT Subsystem
     createReSTIRResources();
     syncRayTracingPointers();
 
@@ -884,34 +885,9 @@ void Engine::initPipelines() {
                     m_sceneData.dielectricBoundsMax
                 );
             }
-            if (isRestirActive() && m_restirManager) {
-                uint32_t rw = m_config.width;
-                uint32_t rh = m_config.height;
-                Buffer* rayGeom = m_wavefrontPipeline->getRayGeomQueue(frameSlot);
-                Buffer* rayHit = m_wavefrontPipeline->getRayHitQueue(frameSlot);
-                Buffer* pixelToRay = m_wavefrontPipeline->getPixelToRayQueue(frameSlot);
-                Buffer* camUBO = m_cameraUBOs[frameSlot].get();
-                Buffer* lightsBuf = m_lightBuffer;
-                Buffer* matsBuf = m_materialBuffer;
-                Buffer* ltBuf = m_lightTreeBuffer;
-                VkImageView mvView = m_motionVectorImage ? m_motionVectorImage->getImageView() : VK_NULL_HANDLE;
-                VkImageView ndView = m_normalDepthImage ? m_normalDepthImage->getImageView() : VK_NULL_HANDLE;
-                VkImageView prevNdView = m_prevNormalDepthImage ? m_prevNormalDepthImage->getImageView() : ndView;
-                UpwaysPipeline* upways = getUpwaysPipeline();
-                VkImageView confView = (upways && upways->getConfidenceImage())
-                    ? upways->getConfidenceImage()->getImageView()
-                    : VK_NULL_HANDLE;
-
-                bool hasLt = m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty() && ltBuf != nullptr);
-                m_restirManager->recordFrame(cmd, frameSlot, rw, rh,
-                                             m_numLights, m_numTriangles, hasLt,
-                                             m_frameIndex, m_config.restir_di_m_cap,
-                                             rayGeom, rayHit, pixelToRay,
-                                             lightsBuf, matsBuf,
-                                             camUBO, ltBuf,
-                                             mvView, ndView, prevNdView,
-                                             confView);
-            }
+            // ReSTIR DI resampling is inline in the wavefront shade passes; no
+            // post-classify dispatch is required (the former dead "fused
+            // ReSTIR pass" hook was removed — review 2026-10-10 §6).
         });
     }
 
@@ -1068,12 +1044,7 @@ void Engine::initCaustics() {
 void Engine::createReSTIRResources() {
     if (!m_rtOrchestrator) return;
     try {
-        auto temporalCode  = loadShaderSPIRV("restir_di_temporal.comp.spv");
-        auto spatialCode   = loadShaderSPIRV("restir_di_spatial.comp.spv");
-        m_rtOrchestrator->createReSTIRResources(
-            m_config.width, m_config.height,
-            temporalCode, spatialCode
-        );
+        m_rtOrchestrator->createReSTIRResources();
         syncRayTracingPointers();
     } catch (const std::exception& e) {
         Logger::warn("ReSTIRManager initialization failed: {}", e.what());
@@ -1682,18 +1653,31 @@ void Engine::renderFrame() {
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
+    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty())) flags |= (1 << 7);
     if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
         if (!m_causticsPipeline) {
             initCaustics();
         }
         flags |= (1 << 8);
     }
+    if (isRestirActive()) flags |= (1 << 9);
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
     }
-    if (accumReset || m_cameraMovedLastFrame) {
-        flags |= (1 << 23); // Camera motion / history reset flag
+    if (accumReset) {
+        // History reset flag for ReSTIR DI temporal taps. Camera motion no
+        // longer kills history: MV reprojection plus the reservoir's stored
+        // x1 normal/depth disocclusion gates handle it (review 2026-10-10 §4.6).
+        flags |= (1 << 23);
+    }
+
+    // Lazy reservoir allocation: the grid only exists while ReSTIR has been
+    // enabled at least once, keeping ~2 x W*H*28 B out of the idle footprint.
+    if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_restirManager->resize(m_config.width, m_config.height);
+        updateWavefrontSceneDescriptors();
     }
 
     uint32_t imageIndex = 0;

@@ -220,7 +220,7 @@ Cache Hit Rate H(ρ)
 
 #### 2. Checkerboard Inter-Device Boundary Length
 At 4K ($3840 \times 2160$), a $64 \times 64$ checkerboard produces **1,980 tiles** with **507,000 pixels of inter-device boundary**. In contrast, a contiguous 2-region split generates only **2,160 pixels of boundary**—a **$235\times$ reduction**.
-- Spatial filtering algorithms in Pathways—such as ReSTIR DI spatial resampling ([`restir_di_spatial.comp`](file:///home/naoki/Development/Pathways/shaders/compute/restir_di_spatial.comp)) and Upways neural reconstruction ([`upways_reconstruct.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_reconstruct.comp))—cannot access neighbor samples across tile boundaries without expensive cross-PCIe halo exchanges.
+- Spatial filtering algorithms in Pathways—such as ReSTIR PT spatial resampling ([`restir_pt_spatial.comp`](file:///home/naoki/Development/Pathways/shaders/compute/restir_pt_spatial.comp)) and Upways neural reconstruction ([`upways_reconstruct.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_reconstruct.comp))—cannot access neighbor samples across tile boundaries without expensive cross-PCIe halo exchanges.
 - Clamping kernels to tile boundaries eliminates cross-pixel variance reduction, directly inflating the number of secondary and shadow rays required for clean convergence.
 
 #### 3. Per-Bounce Serialization & Pipeline Bubbles

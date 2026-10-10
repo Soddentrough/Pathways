@@ -305,7 +305,7 @@ private:
     void createReSTIRResources();
     void destroyReSTIRResources();
     [[nodiscard]] bool isRestirActive() const noexcept {
-        return m_config.enable_restir_di && (m_numLights >= m_config.restir_min_lights);
+        return m_config.enable_restir;
     }
 
     // Scene Management Subsystem

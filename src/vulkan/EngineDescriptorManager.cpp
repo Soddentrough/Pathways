@@ -283,7 +283,10 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
 
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         if (!params.cameraUBOs || !(*params.cameraUBOs)[slot] || !params.frameImages[slot]) continue;
-        VkBuffer restirReservoirBuf = params.restirManager ? params.restirManager->getSpatialReservoirBuffer(slot)->getBuffer() : VK_NULL_HANDLE;
+        Buffer* restirCurrBuf = params.restirManager ? params.restirManager->getReservoirBuffer(slot) : nullptr;
+        Buffer* restirPrevBuf = params.restirManager ? params.restirManager->getReservoirBuffer(1 - slot) : nullptr;
+        VkBuffer restirReservoirBuf = restirCurrBuf ? restirCurrBuf->getBuffer() : VK_NULL_HANDLE;
+        VkBuffer restirHistoryReservoirBuf = restirPrevBuf ? restirPrevBuf->getBuffer() : VK_NULL_HANDLE;
         params.wavefrontPipeline->updateSceneDescriptors(
             slot,
             params.frameImages[slot]->getImageView(),
@@ -313,7 +316,8 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             params.materialArchetypeBuffer ? params.materialArchetypeBuffer->getBuffer() : VK_NULL_HANDLE,
             params.materialArchetypeBuffer ? params.materialArchetypeBuffer->getSize() : 0,
             params.shadeMaterialBuffer ? params.shadeMaterialBuffer->getBuffer() : VK_NULL_HANDLE,
-            params.shadeMaterialBuffer ? params.shadeMaterialBuffer->getSize() : 0
+            params.shadeMaterialBuffer ? params.shadeMaterialBuffer->getSize() : 0,
+            restirHistoryReservoirBuf
         );
     }
 

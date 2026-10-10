@@ -59,6 +59,16 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     );
     m_dummyImageTransitioned = false;
 
+    // Dedicated fallback target for ReSTIR reservoir bindings (32/36) when no
+    // real grid is bound. Previously these aliased the queue-counters buffer —
+    // one refactor away from reservoir writes corrupting dispatch bookkeeping
+    // (review 2026-10-10 §7).
+    m_dummyReservoir = std::make_unique<Buffer>(
+        m_allocator, 128,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_GPU_ONLY
+    );
+
     Logger::info("Pure WavefrontPipeline created successfully (capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, Streamlined Secondary: {}).",
                  m_maxCapacity, (m_shadeDiffusePipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
                  (m_shadeDiffuseSecPipeline != VK_NULL_HANDLE ? "enabled" : "disabled"));
@@ -142,7 +152,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 32, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ReSTIRReservoirsBuffer
         { 33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PixelToRayBuffer
         { 34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // MaterialArchetypesBuffer
-        { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // ShadeMaterialsBuffer
+        { 35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeMaterialsBuffer
+        { 36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // HistoryReservoirsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -332,7 +343,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer materialArchetypeBuffer,
                                                 VkDeviceSize matArchetypeSize,
                                                 VkBuffer shadeMaterialBuffer,
-                                                VkDeviceSize shadeMaterialSize) {
+                                                VkDeviceSize shadeMaterialSize,
+                                                VkBuffer restirHistoryReservoirBuffer) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -383,8 +395,11 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDeviceSize actualInstanceSize = (instanceBuffer != VK_NULL_HANDLE && instanceSize > 0) ? instanceSize : VK_WHOLE_SIZE;
     VkDescriptorBufferInfo instanceInfo{ actualInstanceBuffer, 0, actualInstanceSize };
 
-    VkBuffer actualRestir = (restirReservoirBuffer != VK_NULL_HANDLE) ? restirReservoirBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualRestir = (restirReservoirBuffer != VK_NULL_HANDLE) ? restirReservoirBuffer : m_dummyReservoir->getBuffer();
     VkDescriptorBufferInfo restirInfo{ actualRestir, 0, VK_WHOLE_SIZE };
+
+    VkBuffer actualRestirHistory = (restirHistoryReservoirBuffer != VK_NULL_HANDLE) ? restirHistoryReservoirBuffer : actualRestir;
+    VkDescriptorBufferInfo restirHistoryInfo{ actualRestirHistory, 0, VK_WHOLE_SIZE };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -435,6 +450,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 32, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &restirInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 34, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matArchetypeInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 35, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeMatInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 36, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &restirHistoryInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -826,7 +842,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
             // 4a. Shading microkernel(s)
-            uint32_t shadePC[22] = {
+            uint32_t shadePC[23] = {
                 sceneData.numTriangles,
                 sceneData.numSpheres,
                 sceneData.numMaterials,
@@ -848,7 +864,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.numOpaqueTriangles,
                 sceneData.captureMlData,
                 std::bit_cast<uint32_t>(sceneData.indirectClamp),
-                sceneData.deltaUnroll
+                sceneData.deltaUnroll,
+                sceneData.restirMCap
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
