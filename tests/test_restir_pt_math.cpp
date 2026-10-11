@@ -332,6 +332,115 @@ int main() {
         assert_true(sizeof(TestPackedShadowRay) == 32, "PackedShadowRay size must strictly equal 32 bytes");
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 8: 16-Byte Hit Atom & Dynamic Position Reconstruction Math (Phase 2b.2)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 8] 16-Byte Hit Atom & Dynamic Position Reconstruction Math..." << std::endl;
+    {
+        // 8a. Hit atom representation: 16 bytes exactly
+        struct HitAtomTest {
+            uint32_t instanceId;
+            uint32_t primitiveId;
+            uint32_t baryPacked;
+            uint32_t flags;
+        };
+        assert_true(sizeof(HitAtomTest) == 16, "Hit atom struct must strictly equal 16 bytes");
+
+        // 8b. 32-Byte GiReservoir layout verification with Hit atom packing
+        struct GiReservoirTest {
+            uint32_t hitInstanceId;
+            uint32_t hitPrimitiveId;
+            uint32_t hitBaryPacked;
+            uint32_t wSumBits;
+            uint32_t targetBits;
+            uint32_t radRG;
+            uint32_t radB_dSrc;
+            uint32_t flagsM; // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
+        };
+        assert_true(sizeof(GiReservoirTest) == 32, "GiReservoir struct must strictly equal 32 bytes");
+
+        // 8c. Bit-packing roundtrip verification for flagsM (zero bit collisions)
+        uint32_t testAge = 127u;
+        uint32_t testM = 4095u;
+        uint32_t testHitFlags = 0x4Au & 0x7Fu; // 7-bit hit flags
+        bool testValid = true;
+
+        uint32_t packedFlagsM = (testValid ? 1u : 0u) |
+                                ((testAge & 0xFFu) << 1u) |
+                                ((testM & 0xFFFFu) << 9u) |
+                                ((testHitFlags & 0x7Fu) << 25u);
+
+        bool unpackedValid = (packedFlagsM & 1u) != 0u;
+        uint32_t unpackedAge = (packedFlagsM >> 1u) & 0xFFu;
+        uint32_t unpackedM = (packedFlagsM >> 9u) & 0xFFFFu;
+        uint32_t unpackedHitFlags = (packedFlagsM >> 25u) & 0x7Fu;
+
+        assert_true(unpackedValid == testValid, "flagsM valid bit preserved");
+        assert_true(unpackedAge == testAge, "flagsM age (8-bit) preserved without overflow");
+        assert_true(unpackedM == testM, "flagsM M-confidence (16-bit) preserved without truncation");
+        assert_true(unpackedHitFlags == testHitFlags, "flagsM hit flags (7-bit) preserved without collision");
+
+        // 8d. Barycentric unorm16 quantization precision verification
+        auto packUnorm2x16 = [](float u, float v) -> uint32_t {
+            uint16_t u16 = static_cast<uint16_t>(std::clamp(std::round(u * 65535.0f), 0.0f, 65535.0f));
+            uint16_t v16 = static_cast<uint16_t>(std::clamp(std::round(v * 65535.0f), 0.0f, 65535.0f));
+            return (static_cast<uint32_t>(v16) << 16u) | static_cast<uint32_t>(u16);
+        };
+        auto unpackUnorm2x16 = [](uint32_t p) -> glm::vec2 {
+            float u = static_cast<float>(p & 0xFFFFu) / 65535.0f;
+            float v = static_cast<float>((p >> 16u) & 0xFFFFu) / 65535.0f;
+            return glm::vec2(u, v);
+        };
+
+        std::mt19937 rng(1337);
+        std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+        float maxBaryError = 0.0f;
+
+        for (int i = 0; i < 10000; ++i) {
+            float r1 = dist01(rng);
+            float r2 = dist01(rng);
+            if (r1 + r2 > 1.0f) {
+                r1 = 1.0f - r1;
+                r2 = 1.0f - r2;
+            }
+            uint32_t packed = packUnorm2x16(r1, r2);
+            glm::vec2 unpacked = unpackUnorm2x16(packed);
+            float errU = std::abs(r1 - unpacked.x);
+            float errV = std::abs(r2 - unpacked.y);
+            maxBaryError = std::max(maxBaryError, std::max(errU, errV));
+        }
+        assert_true(maxBaryError <= (1.0f / 65535.0f), "Max unorm16 quantization error is <= 1/65535 (1.52e-5)");
+
+        // 8e. Dynamic Triangle Position Reconstruction Accuracy
+        glm::vec3 v0(0.0f, 0.0f, 0.0f);
+        glm::vec3 v1(2.5f, 0.0f, 0.0f);
+        glm::vec3 v2(0.0f, 3.2f, 1.5f);
+
+        float maxPosError = 0.0f;
+        for (int i = 0; i < 10000; ++i) {
+            float u = dist01(rng);
+            float v = dist01(rng);
+            if (u + v > 1.0f) {
+                u = 1.0f - u;
+                v = 1.0f - v;
+            }
+            float w = 1.0f - u - v;
+            glm::vec3 truePos = w * v0 + u * v1 + v * v2;
+
+            uint32_t packedBary = packUnorm2x16(u, v);
+            glm::vec2 decBary = unpackUnorm2x16(packedBary);
+            float wDec = 1.0f - decBary.x - decBary.y;
+            glm::vec3 reconPos = wDec * v0 + decBary.x * v1 + decBary.y * v2;
+
+            float posDiff = glm::length(truePos - reconPos);
+            maxPosError = std::max(maxPosError, posDiff);
+        }
+        // Triangle has ~3.5m edge length; 1.52e-5 relative precision gives < 60 micrometer error
+        assert_true(maxPosError < 6e-5f, "Reconstructed position error strictly bounded under 60 micrometers (< 0.06 mm)");
+        std::cout << "  [+] PASS: Max position reconstruction error across 10,000 triangles = "
+                  << (maxPosError * 1e6f) << " micrometers." << std::endl;
+    }
+
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "  ALL ReSTIR PT Mathematical & Estimator Unit Tests PASSED!" << std::endl;
     std::cout << "================================================================================" << std::endl;

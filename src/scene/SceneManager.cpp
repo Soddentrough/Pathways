@@ -348,6 +348,7 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     m_positionBuffer = std::make_unique<Buffer>(
         m_allocator, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0

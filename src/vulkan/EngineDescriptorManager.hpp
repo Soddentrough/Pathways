@@ -50,6 +50,7 @@ struct WavefrontDescriptorParams {
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
     const std::array<std::unique_ptr<Buffer>, 2>* cameraUBOs = nullptr;
     Buffer* triangleBuffer = nullptr;
+    Buffer* positionBuffer = nullptr;
     Buffer* sphereBuffer = nullptr;
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;

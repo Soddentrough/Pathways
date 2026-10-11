@@ -1111,6 +1111,7 @@ void Engine::updateWavefrontSceneDescriptors() {
     wfParams.frameImages = m_frameImages;
     wfParams.cameraUBOs = &m_cameraUBOs;
     wfParams.triangleBuffer = m_triangleBuffer;
+    wfParams.positionBuffer = m_positionBuffer;
     wfParams.sphereBuffer = m_sphereBuffer;
     wfParams.materialBuffer = m_materialBuffer;
     wfParams.lightBuffer = m_lightBuffer;

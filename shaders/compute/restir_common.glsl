@@ -453,16 +453,16 @@ void restirDiApplyTap(
 // through an inline visibility ray from x1.
 //
 // Stored as scalar uints (fp32 bit patterns) to avoid std430 vec3 padding:
-// 32 bytes total.
+// 32 bytes total. Stores 16-byte Hit atom (instanceId, primitiveId, baryPacked, flags).
 struct GiReservoir {
-    uint x2xBits;     // x2 world position (fp32 bits)
-    uint x2yBits;
-    uint x2zBits;
-    uint wSumBits;    // RIS running weight sum (fp32 bits)
-    uint targetBits;  // p̂ of the current winner AT THE RECORDING PIXEL (fp32 bits)
-    uint radRG;       // fp16 (L̂2.r, L̂2.g)
-    uint radB_dSrc;   // fp16 L̂2.b, fp16 d_src = |x2 - x1| when recorded
-    uint flagsM;      // [0] valid, [8:1] age, [24:9] M
+    uint hitInstanceId;   // TLAS instance custom index
+    uint hitPrimitiveId;  // Triangle index in BLAS geometry (or sphere index)
+    uint hitBaryPacked;   // packUnorm2x16(bary.xy) or oct32 normal
+    uint wSumBits;        // RIS running weight sum (fp32 bits)
+    uint targetBits;      // p̂ of the current winner AT THE RECORDING PIXEL (fp32 bits)
+    uint radRG;           // fp16 (L̂2.r, L̂2.g)
+    uint radB_dSrc;       // fp16 L̂2.b, fp16 d_src = |x2 - x1| when recorded
+    uint flagsM;          // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
 };
 
 // Per-pixel BRDF context at the primary hit x1. Written at bounce 0 and
@@ -513,9 +513,9 @@ float x1ContextF0(X1Context c) { return unpackHalf2x16(c.f0Pad).x; }
 
 GiReservoir invalidGiReservoir() {
     GiReservoir r;
-    r.x2xBits = 0u;
-    r.x2yBits = 0u;
-    r.x2zBits = 0u;
+    r.hitInstanceId = 0xFFFFFFFFu;
+    r.hitPrimitiveId = 0xFFFFFFFFu;
+    r.hitBaryPacked = 0u;
     r.wSumBits = 0u;
     r.targetBits = 0u;
     r.radRG = 0u;
@@ -527,8 +527,16 @@ GiReservoir invalidGiReservoir() {
 bool  giIsValid(GiReservoir r) { return (r.flagsM & 1u) != 0u; }
 uint  giGetAge(GiReservoir r)  { return (r.flagsM >> 1u) & 0xFFu; }
 uint  giGetM(GiReservoir r)    { return (r.flagsM >> 9u) & 0xFFFFu; }
+Hit   giGetHit(GiReservoir r) {
+    Hit h;
+    h.instanceId = r.hitInstanceId;
+    h.primitiveId = r.hitPrimitiveId;
+    h.baryPacked = r.hitBaryPacked;
+    h.flags = (r.flagsM >> 25u) & 0x7Fu;
+    return h;
+}
 vec3  giGetX2(GiReservoir r) {
-    return vec3(uintBitsToFloat(r.x2xBits), uintBitsToFloat(r.x2yBits), uintBitsToFloat(r.x2zBits));
+    return reconstructHitPosition(giGetHit(r));
 }
 vec3  giGetRadiance(GiReservoir r) {
     vec2 rg = unpackHalf2x16(r.radRG);
@@ -539,17 +547,17 @@ float giGetWSum(GiReservoir r)   { return uintBitsToFloat(r.wSumBits); }
 float giGetTarget(GiReservoir r) { return uintBitsToFloat(r.targetBits); }
 float giGetDSrc(GiReservoir r)   { return unpackHalf2x16(r.radB_dSrc).y; }
 
-GiReservoir makeGiReservoir(vec3 x2, float wSum, uint M, float target, vec3 radiance, float dSrc, uint age) {
+GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radiance, float dSrc, uint age) {
     GiReservoir r = invalidGiReservoir();
     vec3 L = clamp(radiance, vec3(0.0), vec3(65000.0));
-    r.x2xBits = floatBitsToUint(x2.x);
-    r.x2yBits = floatBitsToUint(x2.y);
-    r.x2zBits = floatBitsToUint(x2.z);
+    r.hitInstanceId = hit.instanceId;
+    r.hitPrimitiveId = hit.primitiveId;
+    r.hitBaryPacked = hit.baryPacked;
     r.wSumBits = floatBitsToUint(wSum);
     r.targetBits = floatBitsToUint(target);
     r.radRG = packHalf2x16(L.rg);
     r.radB_dSrc = packHalf2x16(vec2(L.b, clamp(dSrc, 0.0, 65000.0)));
-    r.flagsM = 1u | (min(age, 255u) << 1u) | ((M & 0xFFFFu) << 9u);
+    r.flagsM = 1u | (min(age, 255u) << 1u) | ((M & 0xFFFFu) << 9u) | ((hit.flags & 0x7Fu) << 25u);
     return r;
 }
 
@@ -622,14 +630,14 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
     float combined = wSelf + weight;
 
     if (weight > 0.0 && (randFloat(seed) * combined < weight)) {
-        r = makeGiReservoir(x2c, combined, combinedM, pHat, radC, dNew, ageNew);
+        r = makeGiReservoir(giGetHit(tap), combined, combinedM, pHat, radC, dNew, ageNew);
         return true;
     }
     if (giIsValid(r) && giGetTarget(r) > 0.0) {
-        r = makeGiReservoir(giGetX2(r), combined, combinedM, giGetTarget(r),
+        r = makeGiReservoir(giGetHit(r), combined, combinedM, giGetTarget(r),
                             giGetRadiance(r), giGetDSrc(r), giGetAge(r));
     } else {
-        r = makeGiReservoir(giIsValid(r) ? giGetX2(r) : vec3(0.0), 0.0, combinedM, 0.0,
+        r = makeGiReservoir(giIsValid(r) ? giGetHit(r) : invalidHit(), 0.0, combinedM, 0.0,
                             vec3(0.0), giIsValid(r) ? giGetDSrc(r) : 0.0, ageNew);
     }
     return false;

@@ -146,7 +146,8 @@ public:
                                 VkBuffer restirHistoryReservoirBuffer = VK_NULL_HANDLE,
                                 VkBuffer x1ContextBuffer = VK_NULL_HANDLE,
                                 VkBuffer giReservoirBuffer = VK_NULL_HANDLE,
-                                VkBuffer giHistoryReservoirBuffer = VK_NULL_HANDLE);
+                                VkBuffer giHistoryReservoirBuffer = VK_NULL_HANDLE,
+                                VkBuffer positionBuffer = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
@@ -247,7 +248,7 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_rayGeomQueueB;  // 16B RayGeometry
     std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueA; // 16B PackedRayState
     std::array<std::unique_ptr<Buffer>, 2> m_rayStateQueueB; // 16B PackedRayState
-    std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 16B PackedRayHit
+    std::array<std::unique_ptr<Buffer>, 2> m_rayHitQueue;    // 32B PackedRayHit
     std::array<std::unique_ptr<Buffer>, 2> m_materialIndexQueue; // 4B index * 6 archetypes (Index-Based Material Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Directional DGC Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_shadowQueue;    // 32B PackedShadowRay

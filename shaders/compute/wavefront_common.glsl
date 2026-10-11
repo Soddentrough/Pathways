@@ -137,6 +137,10 @@ layout(std430, binding = 35) readonly buffer ShadeMaterialsBuffer {
     ShadeMaterial shadeMaterials[];
 };
 
+layout(std430, binding = 40) readonly buffer VertexPositionsBuffer {
+    vec4 vertexPositions[];
+};
+
 struct Material {
     vec4 albedo;
     vec4 emissive;
@@ -335,12 +339,64 @@ vec3 unpackTangentAngle13(vec3 normal, uint code) {
     return normalize(b1 * cos(angle) + b2 * sin(angle));
 }
 
+// 16-byte Hit atom: the canonical geometry hit traded across trace, shift, and shade kernels
+struct Hit {
+    uint instanceId;    // TLAS instance custom index
+    uint primitiveId;   // Triangle index in BLAS geometry (or sphere index)
+    uint baryPacked;    // packUnorm2x16(bary.xy) or oct32 normal for spheres
+    uint flags;         // [0]: isTriangle (0: triangle, 1: sphere), [1]: frontFace, [6:2]: lobe/mat flags
+};
+
+Hit makeHit(uint instId, uint primId, vec2 bary, uint flags) {
+    Hit h;
+    h.instanceId = instId;
+    h.primitiveId = primId;
+    h.baryPacked = packUnorm2x16(bary);
+    h.flags = flags;
+    return h;
+}
+
+Hit invalidHit() {
+    Hit h;
+    h.instanceId = 0xFFFFFFFFu;
+    h.primitiveId = 0xFFFFFFFFu;
+    h.baryPacked = 0u;
+    h.flags = 0u;
+    return h;
+}
+
+bool hitIsValid(Hit h) {
+    return h.instanceId != 0xFFFFFFFFu && h.primitiveId != 0xFFFFFFFFu;
+}
+
+vec2 hitGetBary(Hit h) {
+    return unpackUnorm2x16(h.baryPacked);
+}
+
+// Reconstruct 3D world position dynamically from a 16-byte Hit atom
+vec3 reconstructHitPosition(Hit h) {
+    if ((h.flags & 1u) != 0u) {
+        // Procedural sphere: exact world-space position stored directly in Hit data fields
+        return vec3(uintBitsToFloat(h.instanceId),
+                    uintBitsToFloat(h.primitiveId),
+                    uintBitsToFloat(h.baryPacked));
+    } else {
+        // Triangle: fetch BLAS vertices from binding 40 and interpolate by unorm16 barycentrics
+        vec2 bary = unpackUnorm2x16(h.baryPacked);
+        float w = 1.0 - bary.x - bary.y;
+        vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
+        vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
+        vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
+        return w * v0 + bary.x * v1 + bary.y * v2;
+    }
+}
+
 // 16-byte packed ray geometry (read by intersect & shade)
 struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
-// 16-byte packed pre-interpolated ray hit (written by intersect/classify, read by shade)
+// 32-byte packed pre-interpolated ray hit (written by intersect/classify, read by shade)
 struct RayHit {
     vec4 hitData0;
     // x: hitT (float)
@@ -352,9 +408,14 @@ struct RayHit {
     // bits 16..17: hitType (2 bits: 0: triangle, 1: sphere, 2: miss)
     // bit 18: tanSign (1 bit: 0: positive +1.0, 1: negative -1.0)
     // bits 19..31: tanAngle13 (13 bits: angle in [0, 8191])
+    uvec4 hitData1;
+    // x: instanceId
+    // y: primitiveId
+    // z: baryPacked
+    // w: flags
 };
 
-RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign) {
+RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign, Hit hitAtom) {
     RayHit hit;
     uint tSignBit = (tanSign < 0.0) ? 1u : 0u;
     uint angleCode = packTangentAngle13(hitNormal, geomTan);
@@ -363,7 +424,12 @@ RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hit
                         uintBitsToFloat(packOct32(hitNormal)),
                         uintBitsToFloat(packHalf2x16(hitUv)),
                         uintBitsToFloat(packedInfo));
+    hit.hitData1 = uvec4(hitAtom.instanceId, hitAtom.primitiveId, hitAtom.baryPacked, hitAtom.flags);
     return hit;
+}
+
+RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign) {
+    return packRayHit(hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign, invalidHit());
 }
 
 void unpackRayHit(RayHit hit, out float hitT, out uint matId, out uint hitType, out vec3 hitNormal, out vec2 hitUv, out vec3 geomTan, out float tanSign) {
@@ -375,6 +441,15 @@ void unpackRayHit(RayHit hit, out float hitT, out uint matId, out uint hitType, 
     hitType = (packedInfo >> 16u) & 0x3u;
     tanSign = ((packedInfo >> 18u) & 1u) != 0u ? -1.0 : 1.0;
     geomTan = unpackTangentAngle13(hitNormal, (packedInfo >> 19u) & 0x1FFFu);
+}
+
+Hit getRayHitAtom(RayHit hit) {
+    Hit h;
+    h.instanceId = hit.hitData1.x;
+    h.primitiveId = hit.hitData1.y;
+    h.baryPacked = hit.hitData1.z;
+    h.flags = hit.hitData1.w;
+    return h;
 }
 
 // 16-byte packed ray state (read/written by shade, NEVER touched by intersect)

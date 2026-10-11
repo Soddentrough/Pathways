@@ -156,7 +156,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // HistoryReservoirsBuffer
         { 37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // X1ContextsBuffer (ReSTIR GI)
         { 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiCurrentReservoirsBuffer
-        { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // GiHistoryReservoirsBuffer
+        { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiHistoryReservoirsBuffer
+        { 40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // VertexPositionsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -222,8 +223,8 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
     // RayState = 16 bytes (packed throughput, flags, seed, pixelIndex)
     VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
 
-    // RayHit = 16 bytes (packed hitT, normal, UV, matId, hitType, tangent)
-    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
+    // RayHit = 32 bytes (16B packed hit attributes + 16B Hit atom)
+    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
 
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
     VkDeviceSize shadowQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
@@ -350,7 +351,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer restirHistoryReservoirBuffer,
                                                 VkBuffer x1ContextBuffer,
                                                 VkBuffer giReservoirBuffer,
-                                                VkBuffer giHistoryReservoirBuffer) {
+                                                VkBuffer giHistoryReservoirBuffer,
+                                                VkBuffer positionBuffer) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -416,6 +418,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorBufferInfo giInfo{ actualGi, 0, VK_WHOLE_SIZE };
     VkBuffer actualGiHistory = (giHistoryReservoirBuffer != VK_NULL_HANDLE) ? giHistoryReservoirBuffer : actualGi;
     VkDescriptorBufferInfo giHistoryInfo{ actualGiHistory, 0, VK_WHOLE_SIZE };
+    VkBuffer actualPosBuf = (positionBuffer != VK_NULL_HANDLE) ? positionBuffer : triangleBuffer;
+    VkDescriptorBufferInfo posBufferInfo{ actualPosBuf, 0, VK_WHOLE_SIZE };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -470,6 +474,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 37, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &x1CtxInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 38, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 39, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giHistoryInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 40, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &posBufferInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }

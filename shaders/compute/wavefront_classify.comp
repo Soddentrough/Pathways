@@ -234,6 +234,7 @@ void main() {
         mat4x3 hitW2o = mat4x3(1.0);
         mat4x3 hitO2w = mat4x3(1.0);
         uint hitInstMatOffset = 0u;
+        uint hitInstIdx = 0u;
 
         // Hardware BVH Traversal with 100% fixed-function opaque traversal
         rayQueryEXT rq;
@@ -242,7 +243,8 @@ void main() {
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(rq, true);
-            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+            hitInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+            uint instIdx = hitInstIdx;
             uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
             uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
             InstanceGPU inst = instances[instIdx];
@@ -325,11 +327,26 @@ void main() {
                     tanSign = getTriangleTangentSign(tri);
                 }
 
-                hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign);
+                Hit hitAtom;
+                hitAtom.instanceId = hitInstIdx;
+                hitAtom.primitiveId = uint(closestTri);
+                hitAtom.baryPacked = packUnorm2x16(closestBary);
+                bool frontFace = dot(direction, hitNormal) < 0.0;
+                hitAtom.flags = frontFace ? 2u : 0u;
+
+                hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
             } else {
                 hitNormal = closestSphereNorm;
                 matId = spheres[closestSphere].materialId;
-                hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0);
+
+                vec3 spPos = origin + closestT * direction;
+                Hit hitAtom;
+                hitAtom.instanceId = floatBitsToUint(spPos.x);
+                hitAtom.primitiveId = floatBitsToUint(spPos.y);
+                hitAtom.baryPacked = floatBitsToUint(spPos.z);
+                hitAtom.flags = 1u;
+
+                hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0, hitAtom);
                 archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
             }
 

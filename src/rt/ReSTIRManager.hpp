@@ -22,17 +22,26 @@ struct DiReservoirGPU {
 };
 static_assert(sizeof(DiReservoirGPU) == 28, "DiReservoirGPU must be exactly 28 bytes (GLSL std430 scalar layout)");
 
+// 16-byte Hit atom: canonical geometry hit traded across trace, shift, and shade kernels.
+struct HitGPU {
+    uint32_t instanceId;  // TLAS instance custom index
+    uint32_t primitiveId; // Triangle index in BLAS geometry (or sphere index)
+    uint32_t baryPacked;  // packUnorm2x16(bary.xy) or oct32 normal
+    uint32_t flags;       // [0]: isTriangle (0: tri, 1: sphere), [1]: frontFace, [6:2]: lobe/mat flags
+};
+static_assert(sizeof(HitGPU) == 16, "HitGPU must be exactly 16 bytes");
+
 // 32-byte ReSTIR GI reservoir (path-space, docs/RESTIR_PT_DESIGN.md).
 // Must match `GiReservoir` in shaders/compute/restir_common.glsl.
 struct GiReservoirGPU {
-    uint32_t x2x;      // fp32 bits of secondary vertex world position
-    uint32_t x2y;
-    uint32_t x2z;
-    uint32_t wSum;     // fp32 bits
-    uint32_t target;   // fp32 bits, p-hat at the recording pixel
-    uint32_t radRG;    // fp16 (L2.r, L2.g)
-    uint32_t radB_dSrc;// fp16 L2.b, fp16 |x2 - x1| at recording time
-    uint32_t flagsM;   // [0] valid, [8:1] age, [24:9] M
+    uint32_t hitInstanceId;  // TLAS instance custom index
+    uint32_t hitPrimitiveId; // Triangle index in BLAS geometry (or sphere index)
+    uint32_t hitBaryPacked;  // packUnorm2x16(bary.xy) or oct32 normal
+    uint32_t wSum;           // fp32 bits
+    uint32_t target;         // fp32 bits, p-hat at the recording pixel
+    uint32_t radRG;          // fp16 (L2.r, L2.g)
+    uint32_t radB_dSrc;      // fp16 L2.b, fp16 |x2 - x1| at recording time
+    uint32_t flagsM;         // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
 };
 static_assert(sizeof(GiReservoirGPU) == 32, "GiReservoirGPU must be exactly 32 bytes");
 

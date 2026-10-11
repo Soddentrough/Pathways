@@ -323,7 +323,8 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             restirHistoryReservoirBuf,
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
-            giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE
+            giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
+            params.positionBuffer ? params.positionBuffer->getBuffer() : VK_NULL_HANDLE
         );
     }
 
