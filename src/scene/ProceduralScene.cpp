@@ -2976,6 +2976,38 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     scene.lights.push_back(spotLight);
     recordRange("Caustic_Spotlight", tStart);
 
+    // 3c. Overhead Theatrical Spotlight (Targeting Multi-Ring Gyroscopic Sculpture at X = 1.3, Z = -2.2)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    glm::vec3 gyroSpotMountPos(1.3f, frameH - barThick, -3.0f);
+    glm::vec3 gyroSpotLensPos(1.3f, 3.10f, -2.85f);
+    glm::vec3 gyroSculptureTarget(1.3f, pedH + 0.52f, -2.2f);
+    glm::vec3 gyroSpotDir = glm::normalize(gyroSculptureTarget - gyroSpotLensPos);
+
+    // Projector bracket and barrel
+    addBeam(scene.triangles, gyroSpotMountPos, gyroSpotLensPos - gyroSpotDir * 0.16f, 0.05f, 0.05f, 1 /* matFrame */);
+    addBeam(scene.triangles, gyroSpotLensPos - gyroSpotDir * 0.16f, gyroSpotLensPos, 0.16f, 0.16f, 1 /* matFrame */);
+
+    // Emissive spotlight lens quad facing along gyroSpotDir
+    glm::vec3 gyroSpotRight = glm::normalize(glm::cross(gyroSpotDir, upRef));
+    glm::vec3 gyroSpotUp = glm::cross(gyroSpotRight, gyroSpotDir);
+    float gyroLensR = 0.075f;
+    addQuad(scene.triangles,
+            gyroSpotLensPos - gyroSpotRight * gyroLensR - gyroSpotUp * gyroLensR,
+            gyroSpotLensPos + gyroSpotRight * gyroLensR - gyroSpotUp * gyroLensR,
+            gyroSpotLensPos + gyroSpotRight * gyroLensR + gyroSpotUp * gyroLensR,
+            gyroSpotLensPos - gyroSpotRight * gyroLensR + gyroSpotUp * gyroLensR,
+            gyroSpotDir, 14 /* matSpotLens */);
+
+    // Analytical LightGPU: High-flux focused spotlight aimed at the multi-ring gyroscope
+    LightGPU gyroSpotLight{};
+    gyroSpotLight.position = glm::vec4(gyroSpotLensPos, LIGHT_SPOT);
+    gyroSpotLight.normal = glm::vec4(gyroSpotDir, 0.0f);
+    gyroSpotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(14.0f)));
+    gyroSpotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(22.0f)));
+    gyroSpotLight.emission = glm::vec4(165.0f, 170.0f, 195.0f, 1.0f);
+    scene.lights.push_back(gyroSpotLight);
+    recordRange("Gyroscope_Spotlight", tStart);
+
     // 4. Center Runway Sculptures
 
     auto addPedestal = [&](float x, float z, const std::string& name) {
@@ -3024,35 +3056,35 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     recordRange("Art_YellowCube_2", tStart);
 
     // 5. Off-Axis Accent Sculptures
-    // Left: Prominent Polished Chrome Mirror Sphere (X = -1.3, Z = -5.5)
+    // Right (screen-right): Prominent Polished Chrome Mirror Sphere (X = -1.3, Z = -5.0)
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, -5.5f), 0.50f, pedH, 9, 28);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, -5.0f), 0.50f, pedH, 9, 28);
     recordRange("Pedestal_ChromeSphere", tStart);
 
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.5f), 0.70f, 3, 48, 48);
+    addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.0f), 0.70f, 3, 48, 48);
     recordRange("Art_ChromeSphere", tStart);
 
-    // Right: Pedestal & Emissive Area Light for Gold Accent Ring (X = 1.3, Z = -2.5)
+    // Right Midground: Pedestal & Emissive Area Light for Gold Accent Ring (X = -1.3, Z = 0.25)
     tStart = static_cast<uint32_t>(scene.triangles.size());
     // Glowing base plinth at floor level
-    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -2.5f), 0.44f, 0.03f, 12 /* matGoldLight */, 28);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, 0.015f, 0.25f), 0.44f, 0.03f, 12 /* matGoldLight */, 28);
     // Dark pedestal column
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -2.5f), 0.40f, pedH, 9, 24);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, 0.25f), 0.40f, pedH, 9, 24);
     // Luminaire fixture bezel atop platform
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -2.5f), 0.34f, 0.01f, 1 /* matFrame */, 24);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH + 0.005f, 0.25f), 0.34f, 0.01f, 1 /* matFrame */, 24);
     // Emissive area light pad directly underneath the gold torus (facing +Y upwards)
     const float goldLightPadW = 0.22f; // 44cm x 44cm square area emitter
     addQuad(scene.triangles,
-            glm::vec3(1.3f - goldLightPadW, pedH + 0.011f, -2.5f - goldLightPadW),
-            glm::vec3(1.3f + goldLightPadW, pedH + 0.011f, -2.5f - goldLightPadW),
-            glm::vec3(1.3f + goldLightPadW, pedH + 0.011f, -2.5f + goldLightPadW),
-            glm::vec3(1.3f - goldLightPadW, pedH + 0.011f, -2.5f + goldLightPadW),
+            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 0.25f - goldLightPadW),
+            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 0.25f - goldLightPadW),
+            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 0.25f + goldLightPadW),
+            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 0.25f + goldLightPadW),
             glm::vec3(0.0f, 1.0f, 0.0f), 12 /* matGoldLight */);
 
     // Analytical LightGPU: Upward-facing warm amber/golden area light quad illuminating the gold torus
     LightGPU goldLight{};
-    goldLight.position = glm::vec4(1.3f - goldLightPadW, pedH + 0.012f, -2.5f - goldLightPadW, LIGHT_AREA_QUAD);
+    goldLight.position = glm::vec4(-1.3f - goldLightPadW, pedH + 0.012f, 0.25f - goldLightPadW, LIGHT_AREA_QUAD);
     goldLight.u = glm::vec4(2.0f * goldLightPadW, 0.0f, 0.0f, 0.0f);
     goldLight.v = glm::vec4(0.0f, 0.0f, 2.0f * goldLightPadW, 0.0f);
     goldLight.normal = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
@@ -3060,29 +3092,28 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     scene.lights.push_back(goldLight);
     recordRange("Pedestal_GoldRing", tStart);
 
-    // Foreground Side Accent: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -5.5)
-    // Symmetrically counterbalances the Chrome Mirror Sphere (X = -1.3, Z = -5.5) across the corridor
+    // Left Foreground: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -2.2)
     tStart = static_cast<uint32_t>(scene.triangles.size());
     // Glowing base plinth at floor level (Ice blue neon trim)
-    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -5.5f), 0.48f, 0.03f, 13 /* matNeon */, 28);
+    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -2.2f), 0.48f, 0.03f, 13 /* matNeon */, 28);
     // Dark pedestal column
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -5.5f), 0.44f, pedH, 9 /* matPed */, 24);
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -2.2f), 0.44f, pedH, 9 /* matPed */, 24);
     // Metallic bezel platform
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -5.5f), 0.40f, 0.01f, 1 /* matFrame */, 24);
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -2.2f), 0.40f, 0.01f, 1 /* matFrame */, 24);
 
     // Support cradle fork arms elevating the gimbal
-    const glm::vec3 gyroPos(1.3f, pedH + 0.52f, -5.5f);
+    const glm::vec3 gyroPos(1.3f, pedH + 0.52f, -2.2f);
     const float forkSpan = 0.48f;
-    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.01f, -5.5f),
-            glm::vec3(1.3f - forkSpan, gyroPos.y, -5.5f), 0.03f, 0.045f, 1 /* matFrame */);
-    addBeam(scene.triangles, glm::vec3(1.3f + forkSpan, pedH + 0.01f, -5.5f),
-            glm::vec3(1.3f + forkSpan, gyroPos.y, -5.5f), 0.03f, 0.045f, 1 /* matFrame */);
-    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.02f, -5.5f),
-            glm::vec3(1.3f + forkSpan, pedH + 0.02f, -5.5f), 0.04f, 0.035f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.01f, -2.2f),
+            glm::vec3(1.3f - forkSpan, gyroPos.y, -2.2f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f + forkSpan, pedH + 0.01f, -2.2f),
+            glm::vec3(1.3f + forkSpan, gyroPos.y, -2.2f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.02f, -2.2f),
+            glm::vec3(1.3f + forkSpan, pedH + 0.02f, -2.2f), 0.04f, 0.035f, 1 /* matFrame */);
 
     // Gold gimbal pivot bearing nodes
-    addSphere(scene.triangles, glm::vec3(1.3f - forkSpan, gyroPos.y, -5.5f), 0.035f, 4 /* matGold */, 16, 16);
-    addSphere(scene.triangles, glm::vec3(1.3f + forkSpan, gyroPos.y, -5.5f), 0.035f, 4 /* matGold */, 16, 16);
+    addSphere(scene.triangles, glm::vec3(1.3f - forkSpan, gyroPos.y, -2.2f), 0.035f, 4 /* matGold */, 16, 16);
+    addSphere(scene.triangles, glm::vec3(1.3f + forkSpan, gyroPos.y, -2.2f), 0.035f, 4 /* matGold */, 16, 16);
     recordRange("Pedestal_Gyroscope", tStart);
 
     // =========================================================================
@@ -3194,8 +3225,8 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animTorus.baseTransform = baseTilt;
     scene.animatedInstances.push_back(animTorus);
 
-    // Instance 2: Gold Torus atop Pedestal (X = 1.3, Z = -2.5)
-    glm::vec3 goldTorusPos(1.3f, pedH + 0.42f, -2.5f);
+    // Instance 2: Gold Torus atop Pedestal (X = -1.3, Z = 0.25)
+    glm::vec3 goldTorusPos(-1.3f, pedH + 0.42f, 0.25f);
     glm::mat4 goldInitialTransform = glm::translate(glm::mat4(1.0f), goldTorusPos);
 
     SceneInstance instGoldTorus{};
@@ -3220,7 +3251,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGoldTorus.baseTransform = glm::mat4(1.0f);
     scene.animatedInstances.push_back(animGoldTorus);
 
-    // Instance 3: Gyroscope Outer Ring (X = 1.3, Z = -5.5)
+    // Instance 3: Gyroscope Outer Ring (X = 1.3, Z = -2.2)
     SceneInstance instGyroOuter{};
     instGyroOuter.blasIndex = 3;
     instGyroOuter.transform = glm::translate(glm::mat4(1.0f), gyroPos);
@@ -3242,7 +3273,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGyroOuter.baseTransform = glm::mat4(1.0f);
     scene.animatedInstances.push_back(animGyroOuter);
 
-    // Instance 4: Gyroscope Middle Ring (X = 1.3, Z = -5.5)
+    // Instance 4: Gyroscope Middle Ring (X = 1.3, Z = -2.2)
     glm::mat4 midInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(35.0f), glm::vec3(0.0f, 0.0f, 1.0f));
     SceneInstance instGyroMid{};
     instGyroMid.blasIndex = 4;
@@ -3265,7 +3296,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGyroMid.baseTransform = midInitialTilt;
     scene.animatedInstances.push_back(animGyroMid);
 
-    // Instance 5: Gyroscope Inner Ring & Core (X = 1.3, Z = -5.5)
+    // Instance 5: Gyroscope Inner Ring & Core (X = 1.3, Z = -2.2)
     glm::vec3 innerAxis = glm::normalize(glm::vec3(0.0f, 0.7071f, 0.7071f));
     glm::mat4 innerInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(-25.0f), glm::vec3(1.0f, 0.0f, 0.0f));
     SceneInstance instGyroInner{};
