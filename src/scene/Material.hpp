@@ -3,6 +3,8 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/packing.hpp>
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
 
 namespace pathways {
 
@@ -112,14 +114,25 @@ inline ShadeMaterialGPU createShadeMaterial(const MaterialGPU& mat) {
     uint32_t em  = (mat.emissiveTex <= 512u) ? mat.emissiveTex : 0u;
     uint32_t dt  = (mat.diffuseTransmissionTex <= 512u) ? mat.diffuseTransmissionTex : 0u;
     uint32_t sp  = (mat.specularTex <= 512u) ? mat.specularTex : 0u;
-    uint32_t tp  = mat.type & 0xFFFFu;
+    uint32_t tp  = mat.type & 0xFFu;
     uint32_t nScaleHalf = glm::packHalf2x16(glm::vec2(mat.normalScale, 0.0f)) & 0xFFFFu;
+
+    // Conservative upper bound of directional-hemispherical reflectance rho_max in [0, 1]
+    // for ReSTIR PT geometric target proxy evaluation (Approach B: Path-Database).
+    float maxColor = std::max({ mat.albedo.r, mat.albedo.g, mat.albedo.b });
+    float maxTrans = mat.diffuseTransmission;
+    float rhoMax = std::clamp(std::max(maxColor, maxTrans), 0.01f, 1.0f);
+    uint32_t rhoMaxU8 = static_cast<uint32_t>(std::clamp(std::round(rhoMax * 255.0f), 1.0f, 255.0f));
 
     sm.tex_flags.x = alb | (nrm << 16u);
     sm.tex_flags.y = mr | (em << 16u);
     sm.tex_flags.z = dt | (sp << 16u);
-    sm.tex_flags.w = tp | (nScaleHalf << 16u);
+    sm.tex_flags.w = tp | (rhoMaxU8 << 8u) | (nScaleHalf << 16u);
     return sm;
+}
+
+inline float getShadeMaterialRhoMax(const ShadeMaterialGPU& sm) {
+    return static_cast<float>((sm.tex_flags.w >> 8u) & 0xFFu) * (1.0f / 255.0f);
 }
 
 enum MaterialArchetype : uint32_t {

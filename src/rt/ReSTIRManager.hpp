@@ -6,81 +6,17 @@
 #include <array>
 
 #include "vulkan/Buffer.hpp"
+#include "rt/ReSTIRTypes.hpp"
 
 namespace pathways {
-
-// 28-byte ReSTIR DI reservoir. Must match `DiReservoir` in
-// shaders/compute/restir_common.glsl (scalar-only std430 layout).
-struct DiReservoirGPU {
-    uint32_t idxM;        // [15:0] light index, [31:16] M
-    float    wSum;        // RIS weight sum
-    float    targetPdf;   // p-hat of the selected sample at the storing pixel
-    uint32_t flags;       // [7:0] age, [8] valid, [9] trans lobe, [25:10] oct16(x1 normal)
-    float    hitDist;     // x1 -> light-sample distance
-    uint32_t lightPacked; // [15:0] oct16(light normal), [23:16] u8, [31:24] v8
-    uint32_t x1Misc;      // [15:0] fp16 cos(theta at light), [31:16] fp16 primary hit distance
-};
-static_assert(sizeof(DiReservoirGPU) == 28, "DiReservoirGPU must be exactly 28 bytes (GLSL std430 scalar layout)");
-
-// 16-byte Hit atom: canonical geometry hit traded across trace, shift, and shade kernels.
-struct HitGPU {
-    uint32_t instanceId;  // TLAS instance custom index
-    uint32_t primitiveId; // Triangle index in BLAS geometry (or sphere index)
-    uint32_t baryPacked;  // packUnorm2x16(bary.xy) or oct32 normal
-    uint32_t flags;       // [0]: isTriangle (0: tri, 1: sphere), [1]: frontFace, [6:2]: lobe/mat flags
-};
-static_assert(sizeof(HitGPU) == 16, "HitGPU must be exactly 16 bytes");
-
-// 32-byte ShadeRequest: emitted by shift/trace kernels to request BSDF evaluation (Approach A).
-struct ShadeRequestGPU {
-    HitGPU   hit;          // 16 bytes: hit atom at the evaluated vertex
-    uint32_t wiOct;        // 4 bytes: octahedral incoming direction (x_{k-1} -> x_k)
-    uint32_t woOct;        // 4 bytes: octahedral outgoing direction (x_k -> x_{k+1})
-    uint32_t resultSlot;   // 4 bytes: linear index into ShadeResult buffer
-    uint32_t matIdFlags;   // 4 bytes: [23:0] materialId, [31:24] lobeMask
-};
-static_assert(sizeof(ShadeRequestGPU) == 32, "ShadeRequestGPU must be exactly 32 bytes");
-
-// 16-byte ShadeResult: output of binned material shading kernels (Approach A).
-struct ShadeResultGPU {
-    uint32_t fRG;          // 4 bytes: fp16 (f.r, f.g) where f = BSDF * |cos|
-    uint32_t fB_pdfFwd;    // 4 bytes: fp16 f.b, fp16 forward pdf
-    uint32_t pdfRev_flags; // 4 bytes: fp16 reverse pdf, [31:16] lobe flags
-    uint32_t pad;          // 4 bytes: alignment / reserved
-};
-static_assert(sizeof(ShadeResultGPU) == 16, "ShadeResultGPU must be exactly 16 bytes");
-
-// 32-byte ReSTIR GI reservoir (path-space, docs/RESTIR_PT_DESIGN.md).
-// Must match `GiReservoir` in shaders/compute/restir_common.glsl.
-struct GiReservoirGPU {
-    uint32_t hitInstanceId;  // TLAS instance custom index
-    uint32_t hitPrimitiveId; // Triangle index in BLAS geometry (or sphere index)
-    uint32_t hitBaryPacked;  // packUnorm2x16(bary.xy) or oct32 normal
-    uint32_t wSum;           // fp32 bits
-    uint32_t target;         // fp32 bits, p-hat at the recording pixel
-    uint32_t radRG;          // fp16 (L2.r, L2.g)
-    uint32_t radB_dSrc;      // fp16 L2.b, fp16 |x2 - x1| at recording time
-    uint32_t flagsM;         // [0] valid, [8:1] age, [18:9] M, [20:19] hitFlags, [28:21] cosSrc (unorm8), [31:29] reserved
-};
-static_assert(sizeof(GiReservoirGPU) == 32, "GiReservoirGPU must be exactly 32 bytes");
-
-// 24-byte per-pixel BRDF context at the primary hit x1, written at bounce 0
-// and consumed at bounce 1 of the same frame. Must match `X1Context` in GLSL.
-struct X1ContextGPU {
-    uint32_t n1Oct;       // oct32(x1 normal)
-    uint32_t albedoRG;    // fp16 (albedo.r, albedo.g)
-    uint32_t albedoB;     // fp16 albedo.b
-    uint32_t flags;       // [0] valid (diffuse cosine reflection lobe)
-    uint32_t woOct;       // oct32(x1 -> camera direction)
-    uint32_t f0Roughness; // [15:0] fp16 scalar F0, [31:16] fp16 roughness
-};
-static_assert(sizeof(X1ContextGPU) == 24, "X1ContextGPU must be exactly 24 bytes");
 
 // Owns the per-pixel ReSTIR state grids consumed by the wavefront shade
 // passes:
 //   binding 32/36: double-buffered DI reservoirs (current / history)
 //   binding 37:    single-buffered X1 context (same-frame producer/consumer)
 //   binding 38/39: double-buffered GI reservoirs (current / history)
+//   binding 41/42: double-buffered PT reservoirs (current / history)
+//   binding 43:    single-buffered PathSample pool (Approach B)
 //
 // All resampling happens inline in the wavefront shade shaders; this class
 // deliberately contains no pipelines or dispatches (the former "fused ReSTIR
@@ -114,6 +50,10 @@ public:
     Buffer* getGiReservoirBuffer(uint32_t frameSlot) const {
         return (frameSlot < MAX_FRAMES_IN_FLIGHT) ? m_giReservoirBuffers[frameSlot].get() : nullptr;
     }
+    Buffer* getReservoirPTBuffer(uint32_t frameSlot) const {
+        return (frameSlot < MAX_FRAMES_IN_FLIGHT) ? m_reservoirPTBuffers[frameSlot].get() : nullptr;
+    }
+    Buffer* getPathSampleBuffer() const { return m_pathSampleBuffer.get(); }
     Buffer* getX1ContextBuffer() const { return m_x1Context.get(); }
     Buffer* getShadeRequestBuffer() const { return m_shadeRequestBuffer.get(); }
     Buffer* getShadeResultBuffer() const { return m_shadeResultBuffer.get(); }
@@ -129,12 +69,16 @@ private:
     uint32_t m_height = 0;
     bool m_clearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_giClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
+    bool m_ptClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
+    bool m_pathClearPending = true;
     bool m_ctxClearPending = true;
     bool m_reqClearPending = true;
     bool m_resClearPending = true;
 
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_reservoirBuffers;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_giReservoirBuffers;
+    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_reservoirPTBuffers;
+    std::unique_ptr<Buffer> m_pathSampleBuffer;
     std::unique_ptr<Buffer> m_x1Context;
     std::unique_ptr<Buffer> m_shadeRequestBuffer;
     std::unique_ptr<Buffer> m_shadeResultBuffer;

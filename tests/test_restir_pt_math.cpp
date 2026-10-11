@@ -3,11 +3,34 @@
 #include <cmath>
 #include <random>
 #include <cassert>
+#include <algorithm>
 #include <glm/glm.hpp>
+
+#include "rt/ReSTIRTypes.hpp"
+#include "scene/Material.hpp"
 
 // =============================================================================
 // ReSTIR PT Mathematical Reference Functions (Direct C++ Implementations of GLSL Math)
 // =============================================================================
+
+// Symmetric geometric transport coupling between two differential surface elements:
+// G(a, b) = (max(cos theta_a, 0.0) * max(cos theta_b, 0.0)) / max(||b - a||^2, 1e-4)
+static float evalGeometricCoupling(const glm::vec3& posA, const glm::vec3& normA,
+                                   const glm::vec3& posB, const glm::vec3& normB) {
+    glm::vec3 d = posB - posA;
+    float distSq = glm::dot(d, d);
+    if (distSq >= 2.5e7f) {
+        // Sky dome / optical infinity (> 5000 units): direct cosine projection
+        float dist = std::sqrt(distSq);
+        glm::vec3 dir = d / dist;
+        return std::max(glm::dot(normA, dir), 0.0f);
+    }
+    float dist = std::sqrt(std::max(distSq, 1e-8f));
+    glm::vec3 dir = d / dist;
+    float cosA = std::max(glm::dot(normA, dir), 0.0f);
+    float cosB = std::max(glm::dot(normB, -dir), 0.0f);
+    return (cosA * cosB) / std::max(distSq, 1e-4f);
+}
 
 // Jacobian determinant for secondary path reconnection:
 // J = (||x1 - x_orig||^2 / ||x1 - x_new||^2) * (cos(theta1_new) / cos(theta1_orig))
@@ -527,6 +550,172 @@ int main() {
         float relError = std::abs(J_quant - expected_J) / expected_J;
         assert_true(relError < 0.005f, "Jacobian error from unorm8 cosSrc quantization is < 0.5%");
         std::cout << "  [+] PASS: Max Jacobian quantization deviation = " << (relError * 100.0f) << "%." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 10: Phase 3 Pure Path-Database Paradigm & Geometric Proxy Math (Approach B)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 10] Pure Path-Database Paradigm & Geometric Proxy Math..." << std::endl;
+    {
+        // 10a. Static size & std430 alignment verification of Phase 3 structs
+        assert_true(sizeof(pathways::PathVertexGPU) == 32, "PathVertexGPU must strictly equal 32 bytes");
+        assert_true(sizeof(pathways::PathSampleGPU) == 160, "PathSampleGPU must strictly equal 160 bytes");
+        assert_true(sizeof(pathways::ReservoirPTGPU) == 32, "ReservoirPTGPU must strictly equal 32 bytes");
+        assert_true(sizeof(pathways::HitGPU) == 16, "HitGPU must strictly equal 16 bytes");
+        assert_true(sizeof(pathways::GiReservoirGPU) == 32, "GiReservoirGPU must strictly equal 32 bytes");
+        assert_true(sizeof(pathways::ShadeRequestGPU) == 32, "ShadeRequestGPU must strictly equal 32 bytes");
+        assert_true(sizeof(pathways::ShadeResultGPU) == 16, "ShadeResultGPU must strictly equal 16 bytes");
+        assert_true(sizeof(pathways::DiReservoirGPU) == 28, "DiReservoirGPU must strictly equal 28 bytes");
+        assert_true(sizeof(pathways::X1ContextGPU) == 24, "X1ContextGPU must strictly equal 24 bytes");
+
+        // Stride array alignment check: 4 reservoirs fit exactly into one 128B RDNA 4 vector cache line
+        pathways::ReservoirPTGPU resArray[4];
+        assert_true(sizeof(resArray) == 128, "4x ReservoirPTGPU fits exactly into one 128B RDNA 4 vector cache line");
+
+        // 10b. rho_max conservative admissibility & 8-bit unorm quantization precision
+        pathways::MaterialGPU matDiffuse{};
+        matDiffuse.albedo = glm::vec4(0.85f, 0.2f, 0.1f, 1.0f);
+        matDiffuse.diffuseTransmission = 0.0f;
+        pathways::ShadeMaterialGPU smDiff = pathways::createShadeMaterial(matDiffuse);
+        float rhoDiff = pathways::getShadeMaterialRhoMax(smDiff);
+        assert_true(rhoDiff >= 0.85f - 1.0f / 255.0f, "rho_max captures maximum RGB albedo channel");
+        assert_true(rhoDiff <= 1.0f, "rho_max bounded within [0, 1]");
+
+        pathways::MaterialGPU matTrans{};
+        matTrans.albedo = glm::vec4(0.1f, 0.1f, 0.1f, 1.0f);
+        matTrans.diffuseTransmission = 0.95f;
+        pathways::ShadeMaterialGPU smTrans = pathways::createShadeMaterial(matTrans);
+        float rhoTrans = pathways::getShadeMaterialRhoMax(smTrans);
+        assert_true(rhoTrans >= 0.95f - 1.0f / 255.0f, "rho_max captures diffuse transmission factor");
+
+        // Quantization precision test across 1000 random reflectance levels
+        std::mt19937 rng(777);
+        std::uniform_real_distribution<float> dist01(0.01f, 1.0f);
+        float maxQuantErr = 0.0f;
+        for (int i = 0; i < 1000; ++i) {
+            float trueRho = dist01(rng);
+            pathways::MaterialGPU m{};
+            m.albedo = glm::vec4(trueRho, 0.0f, 0.0f, 1.0f);
+            pathways::ShadeMaterialGPU sm = pathways::createShadeMaterial(m);
+            float recoveredRho = pathways::getShadeMaterialRhoMax(sm);
+            maxQuantErr = std::max(maxQuantErr, std::abs(trueRho - recoveredRho));
+        }
+        assert_true(maxQuantErr <= (1.0f / 255.0f + 1e-5f), "rho_max quantization error strictly bounded under 1/255 (0.00392)");
+        std::cout << "  [+] PASS: Max rho_max quantization error = " << maxQuantErr << " (within 8-bit unorm tol)." << std::endl;
+
+        // 10c. Symmetric geometric transport coupling G(a, b)
+        glm::vec3 posA(0.0f, 0.0f, 0.0f);
+        glm::vec3 normA(0.0f, 1.0f, 0.0f);
+        glm::vec3 posB(0.0f, 2.0f, 0.0f);
+        glm::vec3 normB(0.0f, -1.0f, 0.0f); // Face-to-face parallel plates at dist = 2.0
+
+        float G_ab = evalGeometricCoupling(posA, normA, posB, normB);
+        float G_ba = evalGeometricCoupling(posB, normB, posA, normA);
+        assert_near(G_ab, G_ba, 1e-6f, "G(a, b) reciprocity / symmetry (G_ab == G_ba)");
+        // Analytical: cosA = 1.0, cosB = 1.0, distSq = 4.0 -> G = 1.0 / 4.0 = 0.25
+        assert_near(G_ab, 0.25f, 1e-5f, "Analytical parallel plates geometric coupling (G = 0.25)");
+
+        // Inverse square distance law: double distance to 4.0 -> G should scale by 1/4 (0.0625)
+        glm::vec3 posB_far(0.0f, 4.0f, 0.0f);
+        float G_far = evalGeometricCoupling(posA, normA, posB_far, normB);
+        assert_near(G_far, 0.0625f, 1e-5f, "Geometric coupling inverse-square distance scaling");
+
+        // Tilted receiver: normB tilted 45 degrees
+        glm::vec3 normB_tilted = glm::normalize(glm::vec3(0.0f, -1.0f, 1.0f));
+        float G_tilted = evalGeometricCoupling(posA, normA, posB, normB_tilted);
+        float expected_G_tilted = (1.0f * (1.0f / std::sqrt(2.0f))) / 4.0f;
+        assert_near(G_tilted, expected_G_tilted, 1e-5f, "G(a, b) cosine law with tilted normal");
+
+        // Optical infinity sky dome test
+        glm::vec3 posSky(0.0f, 6000.0f, 0.0f);
+        float G_sky = evalGeometricCoupling(posA, normA, posSky, normB);
+        assert_near(G_sky, 1.0f, 1e-5f, "Optical infinity (>5000 units) directional projection");
+
+        // 10d. Path Target Proxy p_hat(X) evaluation & zero-admissibility guards
+        auto evalPathTargetProxy = [&](const std::vector<glm::vec3>& pos,
+                                       const std::vector<glm::vec3>& norm,
+                                       const std::vector<float>& rho,
+                                       float emitLuminance) -> float {
+            if (pos.size() < 2 || emitLuminance <= 1e-6f) return 0.0f;
+            float pProxy = emitLuminance;
+            for (size_t i = 1; i < pos.size(); ++i) {
+                float G = evalGeometricCoupling(pos[i-1], norm[i-1], pos[i], norm[i]);
+                if (G <= 1e-7f) return 0.0f;
+                float r = (i - 1 < rho.size()) ? rho[i - 1] : 1.0f;
+                pProxy *= (r * G);
+                if (pProxy <= 1e-9f) return 0.0f;
+            }
+            return pProxy;
+        };
+
+        // 3-vertex path: Camera hit x1 (0, 0, 0) -> Secondary hit x2 (0, 2, 0) -> Light x3 (1, 2, 0)
+        // x1 normal: (0, 1, 0) facing upwards along +Y
+        // x2 normal: normalize(1, -1, 0) facing 45-degrees down towards x1 and right towards x3
+        // x3 normal: (-1, 0, 0) facing left towards x2
+        glm::vec3 n2 = glm::normalize(glm::vec3(1.0f, -1.0f, 0.0f));
+        std::vector<glm::vec3> validPos = { glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 2.0f, 0.0f), glm::vec3(1.0f, 2.0f, 0.0f) };
+        std::vector<glm::vec3> validNorm = { glm::vec3(0.0f, 1.0f, 0.0f), n2, glm::vec3(-1.0f, 0.0f, 0.0f) };
+        std::vector<float> validRho = { 0.8f, 0.5f };
+        float p_valid = evalPathTargetProxy(validPos, validNorm, validRho, 10.0f);
+        assert_true(p_valid > 0.0f, "Physically admissible 3-vertex subpath evaluates to positive target proxy");
+
+        // Backfacing secondary surface (normal facing away into negative hemisphere) -> strictly 0.0 target
+        std::vector<glm::vec3> backNorm = validNorm;
+        backNorm[1] = -n2; // Points away into back hemisphere
+        float p_back = evalPathTargetProxy(validPos, backNorm, validRho, 10.0f);
+        assert_near(p_back, 0.0f, 1e-9f, "Backfacing vertex strictly evaluates to zero target proxy");
+
+        // Zero light emission -> strictly 0.0 target
+        float p_dark = evalPathTargetProxy(validPos, validNorm, validRho, 0.0f);
+        assert_near(p_dark, 0.0f, 1e-9f, "Zero emitter luminance strictly evaluates to zero target proxy");
+
+        // 10e. Streaming ReservoirPT Unbiased Monte Carlo Convergence (100,000 Trials)
+        const int NUM_TRIALS = 100000;
+        const int M = 4;
+        double sumEstimates = 0.0;
+        std::uniform_real_distribution<float> unitDist(0.0f, 1.0f);
+
+        // Ground truth integral: int_0^1 4 * x^3 dx = 1.0
+        // Target proxy: p_hat(x) = x^2 (geometric coupling surrogate)
+        // Proposal q(x) = uniform on [0, 1] (q = 1.0)
+        // True integrand: f(x) = 4 * x^3
+        for (int t = 0; t < NUM_TRIALS; ++t) {
+            pathways::ReservoirPTGPU r{};
+            r.weightSum = 0.0f;
+            r.W = 0.0f;
+            r.M = 0.0f;
+            r.targetProxy = 0.0f;
+            r.pathIndex = 0xFFFFFFFFu;
+
+            float selected_x = 0.0f;
+
+            for (int c = 0; c < M; ++c) {
+                float x = unitDist(rng);
+                float p_hat = x * x; // Target proxy
+                float q = 1.0f;      // Uniform proposal
+                float weight = p_hat / q;
+
+                float combinedWeight = r.weightSum + weight;
+                r.weightSum = combinedWeight;
+                r.M += 1.0f;
+
+                if (unitDist(rng) * combinedWeight < weight) {
+                    r.pathIndex = static_cast<uint32_t>(c);
+                    r.targetProxy = p_hat;
+                    selected_x = x;
+                }
+            }
+
+            if (r.targetProxy > 1e-6f) {
+                r.W = r.weightSum / (r.M * r.targetProxy);
+                float f_val = 4.0f * selected_x * selected_x * selected_x;
+                sumEstimates += static_cast<double>(r.W * f_val);
+            }
+        }
+
+        double meanIntegral = sumEstimates / NUM_TRIALS;
+        assert_near(static_cast<float>(meanIntegral), 1.0f, 0.005f,
+                    "ReservoirPT streaming estimator unbiased convergence (analytical expectation: 1.0)");
     }
 
     std::cout << "\n================================================================================" << std::endl;

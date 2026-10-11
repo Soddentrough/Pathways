@@ -13,6 +13,8 @@ ReSTIRManager::ReSTIRManager(VkDevice device, VmaAllocator allocator)
 ReSTIRManager::~ReSTIRManager() {
     for (auto& b : m_reservoirBuffers) b.reset();
     for (auto& b : m_giReservoirBuffers) b.reset();
+    for (auto& b : m_reservoirPTBuffers) b.reset();
+    m_pathSampleBuffer.reset();
     m_x1Context.reset();
     m_shadeRequestBuffer.reset();
     m_shadeResultBuffer.reset();
@@ -33,7 +35,15 @@ void ReSTIRManager::initBuffers() {
         m_giReservoirBuffers[i] = std::make_unique<Buffer>(
             m_allocator, pixels * sizeof(GiReservoirGPU), usage, VMA_MEMORY_USAGE_GPU_ONLY);
         m_giClearPending[i] = true;
+
+        m_reservoirPTBuffers[i] = std::make_unique<Buffer>(
+            m_allocator, pixels * sizeof(ReservoirPTGPU), usage, VMA_MEMORY_USAGE_GPU_ONLY);
+        m_ptClearPending[i] = true;
     }
+
+    m_pathSampleBuffer = std::make_unique<Buffer>(
+        m_allocator, pixels * sizeof(PathSampleGPU), usage, VMA_MEMORY_USAGE_GPU_ONLY);
+    m_pathClearPending = true;
 
     m_x1Context = std::make_unique<Buffer>(
         m_allocator, pixels * sizeof(X1ContextGPU), usage, VMA_MEMORY_USAGE_GPU_ONLY);
@@ -53,10 +63,12 @@ void ReSTIRManager::resize(uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
     initBuffers();
-    Logger::info("ReSTIRManager grids (re)allocated: {}x{} — DI 2x{}B, GI 2x{}B, X1 ctx {}B, ShadeReq {}B, ShadeRes {}B.",
+    Logger::info("ReSTIRManager grids (re)allocated: {}x{} — DI 2x{}B, GI 2x{}B, PT 2x{}B, PathSample {}B, X1 ctx {}B, ShadeReq {}B, ShadeRes {}B.",
                  m_width, m_height,
                  static_cast<uint32_t>(sizeof(DiReservoirGPU)),
                  static_cast<uint32_t>(sizeof(GiReservoirGPU)),
+                 static_cast<uint32_t>(sizeof(ReservoirPTGPU)),
+                 static_cast<uint32_t>(sizeof(PathSampleGPU)),
                  static_cast<uint32_t>(sizeof(X1ContextGPU)),
                  static_cast<uint32_t>(sizeof(ShadeRequestGPU)),
                  static_cast<uint32_t>(sizeof(ShadeResultGPU)));
@@ -71,7 +83,9 @@ void ReSTIRManager::recordClearIfNeeded(VkCommandBuffer cmd) {
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_reservoirBuffers[i] && m_clearPending[i]) pending.push_back({ m_reservoirBuffers[i].get(), &m_clearPending[i] });
         if (m_giReservoirBuffers[i] && m_giClearPending[i]) pending.push_back({ m_giReservoirBuffers[i].get(), &m_giClearPending[i] });
+        if (m_reservoirPTBuffers[i] && m_ptClearPending[i]) pending.push_back({ m_reservoirPTBuffers[i].get(), &m_ptClearPending[i] });
     }
+    if (m_pathSampleBuffer && m_pathClearPending) pending.push_back({ m_pathSampleBuffer.get(), &m_pathClearPending });
     if (m_x1Context && m_ctxClearPending) pending.push_back({ m_x1Context.get(), &m_ctxClearPending });
     if (m_shadeRequestBuffer && m_reqClearPending) pending.push_back({ m_shadeRequestBuffer.get(), &m_reqClearPending });
     if (m_shadeResultBuffer && m_resClearPending) pending.push_back({ m_shadeResultBuffer.get(), &m_resClearPending });

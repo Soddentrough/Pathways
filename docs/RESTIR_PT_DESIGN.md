@@ -77,66 +77,149 @@ The Fully Inverted architecture is the highest-performance, most complete long-t
 
 ### 3.1 Separation of Concerns Matrix
 
-| System Layer | Question Answered | Knows Materials? | Uses Ray Tracing? |
-|---|---|---|---|
-| **Layer 1: Path Topology & Sampling** | Which geometric subpaths exist and how were they sampled? | No (Geometry + Seeds only) | Yes (Skeleton tracing) |
-| **Layer 2: Shift & Visibility Validation** | Can a shifted path connect validly without occlusion? | No (Topology + Sidedness only) | Yes (Visibility-only rays) |
-| **Layer 3: Material / BSDF Shading** | What spectral radiance $f / p$ does the transport produce? | **Yes** (Closures, textures, BRDFs) | **No** (Pure compute gather) |
+| System Layer | Question Answered | Knows Materials? | Uses Ray Tracing? | Target Memory / ALU Cost |
+|---|---|---|---|---|
+| **Layer 1: Path Topology & Sampling** | Which geometric subpaths exist and how were they sampled? | No (Geometry + Seeds only) | Yes (Skeleton tracing) | 32B vertex, 160B sample |
+| **Layer 2: Shift & Visibility Validation** | Can a shifted path connect validly without occlusion? | No (Topology + Sidedness only) | Yes (Visibility-only rays) | 16B Hit, pure rayQuery |
+| **Layer 3: Material / BSDF Shading** | What spectral radiance $f / p$ does the transport produce? | **Yes** (Closures, textures, BRDFs) | **No** (Pure compute gather) | Evaluated ONCE per winning path |
 
-### 3.2 Data Structures for Approach B
+### 3.2 Data Structures for Approach B (C++ std430 & GLSL Scalar Layout)
 
-#### Hit Record (The 16-byte Atomic Currency)
+All structures are defined in [`src/rt/ReSTIRTypes.hpp`](file:///home/naoki/Development/Pathways/src/rt/ReSTIRTypes.hpp) and [`shaders/compute/restir_common.glsl`](file:///home/naoki/Development/Pathways/shaders/compute/restir_common.glsl).
+
+#### 1. Hit Record (The 16-byte Atomic Currency)
 ```glsl
-struct Hit {            // 16 bytes
+struct Hit {            // 16 bytes strictly
     uint instanceId;    // TLAS instance custom index
-    uint primitiveId;   // Triangle index in BLAS geometry
+    uint primitiveId;   // Triangle index in BLAS geometry (or sphere index)
     uint baryPacked;    // 2 x unorm16 (u, v barycentrics)
-    uint flags;         // Front/back face, isLight, alphaTested, isDelta hint
+    uint flags;         // [0]: isTriangle, [1]: frontFace, [6:2]: lobe/mat flags
 };
 ```
-*Note:* World positions and normals are **never** stored in the reservoir. They are reconstructed on demand in whatever kernel needs them using `rayQueryGetIntersectionTriangleVertexPositionsEXT` or BDA vertex streaming. This guarantees that temporal shifts remain bit-for-bit exact even under dynamic rigid or skinned mesh animation.
+*Design Invariant:* World positions and normals are **never** stored in reservoirs or path skeletons. They are reconstructed on demand via `reconstructHitPositionAndNormal()` from binding 40 BLAS vertices. This guarantees that temporal shifts remain bit-for-bit exact under rigid or skinned mesh animation without geometric drift.
 
-#### Path Vertex & Path Sample
+#### 2. Path Vertex (32 Bytes, std430 Aligned)
 ```glsl
 struct PathVertex {
-    Hit   hit;
-    uint  woOct;         // Outgoing direction towards previous vertex (octahedral 32-bit)
-    uint  materialId;    // Integer material ID (for deferred stage routing only)
-    uint  vertexType;    // CAMERA, SURFACE, LIGHT, SPECULAR_DELTA
-};
-
-struct PathSample {              // Stored as Structure of Arrays (SoA)
-    uint       vertexCount;      // Effective length of subpath (e.g. 2 to 6)
-    PathVertex vertices[6];      // Compact fixed-capacity prefix/suffix
-    uint       rngSeedPrefix;    // Replay seed for vertices before reconnection
-    uint       rngSeedSuffix;    // Replay seed for vertices after reconnection
-    uint       strategyId;       // Sampling provenance (unidirectional, NEE, BSDF)
+    Hit   hit;        // 16 bytes: canonical geometry hit atom
+    uint  woOct;      // 4 bytes: octahedral outgoing direction towards predecessor
+    uint  matId;      // 4 bytes: integer material ID for deferred gather routing
+    uint  vertexType; // 4 bytes: 0: CAMERA, 1: SURFACE_DIFFUSE, 2: SURFACE_GLOSSY, 3: SURFACE_DELTA, 4: LIGHT
+    uint  flags;      // 4 bytes: [7:0] subpath index, [15:8] lobe flags, [31:16] reserved
 };
 ```
+- Fits exactly 4 vertices per 128B RDNA 4 vector cache line.
+- Contains zero material closure data; textures and BRDF params are untouched during traversal.
 
-#### ReSTIR PT Reservoir (SoA Layout)
+#### 3. Path Sample Skeleton (160 Bytes, 16-Byte Aligned)
 ```glsl
-struct ReservoirPT {             // Packed SoA streams
-    float weightSum;             // Sum of resample weights
-    float W;                     // Unbiased contribution weight
-    float M;                     // Confidence counter (capped)
-    float targetProxy;           // Cached geometric target value
-    uint  pathIndex;             // Index into PathSample SoA buffer
-    uint  lastFrameAge;          // Age tracking for temporal expiry
+const uint PATH_SAMPLE_MAX_VERTICES = 4u;
+
+struct PathSample {
+    uint       vertexCount;      // 4 bytes: effective length of subpath (2 to 4)
+    uint       rngSeedPrefix;    // 4 bytes: stateless replay seed for vertices before reconnection
+    uint       rngSeedSuffix;    // 4 bytes: stateless replay seed for vertices after reconnection
+    uint       strategyId;       // 4 bytes: sampling provenance (unidirectional, NEE, BSDF)
+    uint       flags;            // 4 bytes: [0]: isComplete, [1]: hasLightVertex, [31:2]: reserved
+    uint       rcIndex;          // 4 bytes: reconnection vertex index k (default 2)
+    uint       reserved[2];      // 8 bytes: alignment / reserved
+    PathVertex vertices[PATH_SAMPLE_MAX_VERTICES]; // 4 * 32 = 128 bytes
 };
 ```
+- Total size: $32\text{B metadata} + 128\text{B vertices} = 160$ bytes ($10 \times 16$ bytes).
+- At 1080p, the full pool requires only 330 MB VRAM (~1% of single 32GB Radeon AI PRO R9700 VRAM).
+- Prefix and suffix are replayed statelessly via PCG hashes on `(rngSeed, bounce, dimension)` with zero storage overhead.
 
-### 3.3 Decoupled Target Function: Geometric Proxies
-Because full BSDFs and textures are not evaluated during resampling, the target function $\hat{p}(X)$ is computed via **conservative geometric upper bounds**:
-$$\hat{p}(X) \approx \prod_{i=1}^{k} \rho_{\text{max}}(\text{material}_i) \cdot G(v_{i-1}, v_i) \cdot L_{\text{emit-bound}}(v_k)$$
-where:
-- $\rho_{\text{max}}$ is a precomputed 8-bit scalar upper bound of the material's hemispherical reflectance.
-- $G(v_{i-1}, v_i) = \frac{|\cos\theta_{i-1}| \cdot |\cos\theta_i|}{\|v_{i-1} - v_i\|^2}$ is the geometric coupling factor.
-- $L_{\text{emit-bound}}$ is the flux or bounding emission of the terminal light/emitter.
-
-This decouples the entire resampling loop from bindless texture fetches, material branching, and closure evaluation.
+#### 4. ReSTIR PT Reservoir (32 Bytes, Cache-Line Aligned)
+```glsl
+struct ReservoirPT {
+    float weightSum;    // 4 bytes: sum of candidate sample weights (w_sum)
+    float W;            // 4 bytes: unbiased contribution weight: W = w_sum / (M * targetProxy)
+    float M;            // 4 bytes: confidence counter (candidate count)
+    float targetProxy;  // 4 bytes: geometric target proxy p̂(X)
+    uint  pathIndex;    // 4 bytes: index into PathSample pool
+    uint  age;          // 4 bytes: temporal age in frames
+    uint  flags;        // 4 bytes: [0]: valid, [1]: isSpecular, [31:2]: reserved
+    uint  pad;          // 4 bytes: 32-byte cache-line alignment
+};
+```
+- Stride: exactly 32 bytes ($4 \times 32\text{B} = 128$ bytes; exactly four reservoirs fit per RDNA 4 vector cache line).
+- Double-buffered footprint: $2 \times 66\text{ MB} = 132\text{ MB}$ at 1080p.
 
 ---
+
+### 3.3 Decoupled Target Function: Conservative Geometric Proxies
+
+Because full BSDFs and textures are not evaluated during spatial/temporal resampling, the target function $\hat{p}(X)$ is computed via **conservative geometric transport coupling**:
+
+$$\hat{p}(X) = L_{\text{emit-bound}}(v_k) \cdot G(v_{k-1}, v_k) \cdot \prod_{i=1}^{k-1} \left[ \rho_{\text{max}}(\text{mat}_i) \cdot G(v_{i-1}, v_i) \right]$$
+
+#### Symmetric Geometric Transport Coupling Factor $G(a, b)$
+For two differential surface elements with positions $p_a, p_b$ and surface normals $n_a, n_b$:
+$$d = p_b - p_a, \quad r = \|d\|, \quad \omega = \frac{d}{r}$$
+$$G(a, b) = \frac{\max(n_a \cdot \omega, 0) \cdot \max(n_b \cdot (-\omega), 0)}{\max(r^2, 10^{-4})}$$
+
+- **Strict Reciprocity / Symmetry:** $G(a, b) = G(b, a)$ holds identically, preserving path integral balance.
+- **Sidedness & Visibility Gating:** Back-facing surfaces ($n \cdot \omega \le 0$) evaluate strictly to $G = 0$, immediately cutting unphysical paths with zero ALU divergence.
+- **Optical Infinity Handling:** For environment maps or distant emitters ($r \ge 5000$), $G$ transitions continuously to directional cosine projection $\max(n_a \cdot \omega, 0)$.
+
+#### Conservative Reflectance Upper Bound $\rho_{\text{max}}$
+Precomputed at scene load and packed into 8-bit unorm in bits [15:8] of `ShadeMaterialGPU::tex_flags.w`:
+$$\rho_{\text{max}} = \text{clamp}\Big(\max\big(\max(R, G, B), \text{diffuseTransmission}\big), 0.01, 1.0\Big)$$
+
+- **Strict Admissibility:** Because $\rho_{\text{max}} \ge \rho_{\text{true}}$ everywhere across the hemisphere, $\hat{p}(X) > 0$ whenever true radiance transport is non-zero.
+- **M-Dilution Immunity:** If any segment is occluded, backfacing, or dark, $\hat{p}(X)$ evaluates strictly to $0.0$, preventing reservoir confidence $M$ from diluting valid paths.
+- **Smooth Boundary Stability:** Removing high-frequency albedo textures from the resampling loop eliminates artificial target ratios ($p_{\text{src}} / p_{\text{dst}}$) that cause fireflies across checkerboard or tiled textures.
+
+---
+
+### 3.4 Multi-Pass Execution Choreography (Approach B)
+
+```mermaid
+flowchart TD
+    subgraph Pass1 ["1. Primary Hit Generation"]
+        P1["Visibility Buffer Raster / Classify RayGen"] -->|"InstanceId, PrimId, Bary"| V1["Primary Hit v1 (Hit Atom)"]
+    end
+
+    subgraph Pass2 ["2. Seed Path Tracing (Wavefront)"]
+        V1 -->|"Ray Query Traversal (Bounces 2..4)"| P2["Geometric Path Skeleton Tracing"]
+        P2 -->|"Writes PathSample pool + seeds"| Skeletons["PathSample GPU Buffer (160B/pixel)"]
+        P2 -->|"Computes Initial Proxy p̂(X0)"| R0["Initial Reservoirs R0 (32B/pixel)"]
+    end
+
+    subgraph Pass3 ["3. Temporal Resampling"]
+        R0 & Skeletons -->|"Reprojection + Reconnect / Replay"| P3["Temporal Shift-Trace Kernel"]
+        P3 -->|"Pure ALU Proxy + Exact |J|"| RTemp["Temporal Reservoir R_temp"]
+    end
+
+    subgraph Pass4 ["4. Spatial Resampling (1-2 Passes)"]
+        RTemp -->|"Neighborhood Reconnection + Footprint Gate"| P4["Spatial Shift-Trace Kernel"]
+        P4 -->|"Pairwise MIS + Pure ALU Proxy"| RSpatial["Spatial Reservoir R_spatial"]
+    end
+
+    subgraph Pass5 ["5. Batch Reconnection Visibility"]
+        RSpatial -->|"Stream-Compacted Winning Rays"| P5["Pure Traversal Kernel (gl_RayFlagsTerminateOnFirstHitEXT)"]
+        P5 -->|"100% SIMD Occupancy"| VisMask["Visibility Mask"]
+    end
+
+    subgraph Pass6 ["6. Single-Pass Deferred Material Gather"]
+        VisMask & RSpatial & Skeletons -->|"Winning Path Index per pixel"| P6["Deferred Material Shading Kernel"]
+        P6 -->|"Evaluates full textures, normal maps, BSDF closures"| GatherRad["Unbiased Radiance L = W · f_true"]
+    end
+
+    subgraph Pass7 ["7. Reconstruction & Denoiser"]
+        GatherRad --> P7["Upways Neural Reconstruction / Denoiser"]
+    end
+```
+
+### 3.5 Advantages over Approach A and Classic Wavefront PT
+
+| Metric | Classic Wavefront PT | Approach A (Request/Result) | Approach B (Fully Inverted Database) |
+|---|---|---|---|
+| **BSDF Evaluations per Candidate** | 1 per bounce (4-6x per pixel) | 1 per shift candidate (2-4x per pixel) | **Strictly 1 per PIXEL (winning path only)** |
+| **Texture Bandwidth in Resampling** | Full textures loaded every bounce | Full textures loaded during shift | **ZERO texture reads during resampling** |
+| **Shift Kernel Complexity** | Monolithic megakernel | Ray trace + DGC queue emit | **Pure ray query + ALU dot products** |
+| **Multi-GPU Scaling** | Geometry + texture sync | Geometry + transient queue sync | **Only 32B Reservoir + 160B Sample sync** |
 
 ## 4. Intermediate Architecture: Request / Result Wavefront (Approach A)
 

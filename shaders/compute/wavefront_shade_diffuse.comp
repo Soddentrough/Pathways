@@ -300,7 +300,7 @@ void main() {
             uint emissiveTex = mat.tex_flags.y >> 16u;
             uint diffTransTex = mat.tex_flags.z & 0xFFFFu;
             uint specularTex = mat.tex_flags.z >> 16u;
-            uint matType = mat.tex_flags.w & 0xFFFFu;
+            uint matType = mat.tex_flags.w & 0xFFu;
             float normalScale = unpackHalf2x16(mat.tex_flags.w).y;
 
 #if !IS_SECONDARY_BOUNCE

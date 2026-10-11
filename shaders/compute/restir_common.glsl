@@ -691,4 +691,183 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
     return false;
 }
 
+// =============================================================================
+// ReSTIR PT Phase 3: Fully Inverted / Deferred Gather Path-Database (Approach B)
+// =============================================================================
+// Pure geometric path skeletons, stateless PRNG replay, conservative geometric
+// proxy targets, and single-pass deferred material evaluation.
+// =============================================================================
+
+// 32-byte PathVertex: pure geometric hit atom and routing metadata
+struct PathVertex {
+    Hit   hit;        // 16 bytes: TLAS instance, BLAS primitive, unorm16 barycentrics, flags
+    uint  woOct;      // 4 bytes: octahedral outgoing direction towards previous vertex
+    uint  matId;      // 4 bytes: integer material ID for deferred gather routing
+    uint  vertexType; // 4 bytes: 0: CAMERA, 1: SURFACE_DIFFUSE, 2: SURFACE_GLOSSY, 3: SURFACE_DELTA, 4: LIGHT
+    uint  flags;      // 4 bytes: [7:0] subpath index, [15:8] lobe flags, [31:16] reserved
+};
+
+const uint PATH_SAMPLE_MAX_VERTICES = 4u;
+
+// 160-byte PathSample: compact geometric subpath skeleton with stateless RNG replay seeds
+struct PathSample {
+    uint       vertexCount;      // 4 bytes: effective length of subpath (e.g. 2 to 4)
+    uint       rngSeedPrefix;    // 4 bytes: replay seed for vertices before reconnection
+    uint       rngSeedSuffix;    // 4 bytes: replay seed for vertices after reconnection
+    uint       strategyId;       // 4 bytes: sampling provenance (unidirectional, NEE, BSDF)
+    uint       flags;            // 4 bytes: [0]: isComplete, [1]: hasLightVertex, [31:2]: reserved
+    uint       rcIndex;          // 4 bytes: reconnection vertex index k (default 2)
+    uint       reserved[2];      // 8 bytes: alignment / reserved
+    PathVertex vertices[PATH_SAMPLE_MAX_VERTICES]; // 4 * 32 = 128 bytes
+};
+
+// 32-byte ReSTIR PT reservoir (Approach B: Fully Inverted Path-Database)
+struct ReservoirPT {
+    float weightSum;    // 4 bytes: sum of candidate sample weights (w_sum)
+    float W;            // 4 bytes: unbiased contribution weight: W = w_sum / (M * targetProxy)
+    float M;            // 4 bytes: confidence counter (candidate count)
+    float targetProxy;  // 4 bytes: geometric target proxy p̂(X)
+    uint  pathIndex;    // 4 bytes: index into PathSample pool
+    uint  age;          // 4 bytes: temporal age in frames
+    uint  flags;        // 4 bytes: [0]: valid, [1]: isSpecular, [31:2]: reserved
+    uint  pad;          // 4 bytes: 32-byte cache-line alignment
+};
+
+PathVertex invalidPathVertex() {
+    PathVertex v;
+    v.hit = invalidHit();
+    v.woOct = 0u;
+    v.matId = 0xFFFFFFFFu;
+    v.vertexType = 0u;
+    v.flags = 0u;
+    return v;
+}
+
+PathVertex makePathVertex(Hit hit, vec3 wo, uint matId, uint vertexType, uint flags) {
+    PathVertex v;
+    v.hit = hit;
+    v.woOct = packOct32(normalize(wo));
+    v.matId = matId;
+    v.vertexType = vertexType;
+    v.flags = flags;
+    return v;
+}
+
+PathSample invalidPathSample() {
+    PathSample s;
+    s.vertexCount = 0u;
+    s.rngSeedPrefix = 0u;
+    s.rngSeedSuffix = 0u;
+    s.strategyId = 0u;
+    s.flags = 0u;
+    s.rcIndex = 0u;
+    s.reserved[0] = 0u;
+    s.reserved[1] = 0u;
+    for (uint i = 0u; i < PATH_SAMPLE_MAX_VERTICES; ++i) {
+        s.vertices[i] = invalidPathVertex();
+    }
+    return s;
+}
+
+ReservoirPT invalidReservoirPT() {
+    ReservoirPT r;
+    r.weightSum = 0.0;
+    r.W = 0.0;
+    r.M = 0.0;
+    r.targetProxy = 0.0;
+    r.pathIndex = 0xFFFFFFFFu;
+    r.age = 0u;
+    r.flags = 0u;
+    r.pad = 0u;
+    return r;
+}
+
+ReservoirPT makeReservoirPT(float weightSum, float W, float M, float targetProxy, uint pathIndex, uint age, uint flags) {
+    ReservoirPT r;
+    r.weightSum = weightSum;
+    r.W = W;
+    r.M = M;
+    r.targetProxy = targetProxy;
+    r.pathIndex = pathIndex;
+    r.age = min(age, 255u);
+    r.flags = flags | 1u; // Ensure valid bit is set
+    r.pad = 0u;
+    return r;
+}
+
+bool  ptIsValid(ReservoirPT r)     { return (r.flags & 1u) != 0u && r.pathIndex != 0xFFFFFFFFu; }
+uint  ptGetAge(ReservoirPT r)      { return r.age; }
+float ptGetM(ReservoirPT r)        { return r.M; }
+float ptGetTarget(ReservoirPT r)   { return r.targetProxy; }
+float ptGetW(ReservoirPT r)        { return r.W; }
+float ptGetWSum(ReservoirPT r)     { return r.weightSum; }
+
+// Fetch conservative directional-hemispherical reflectance upper bound rho_max in [0, 1]
+float getMaterialRhoMax(uint matId) {
+    if (matId >= shadeMaterials.length()) return 1.0;
+    uint tfW = shadeMaterials[matId].tex_flags.w;
+    uint rho8 = (tfW >> 8u) & 0xFFu;
+    return float(rho8) * (1.0 / 255.0);
+}
+
+// Symmetric geometric transport coupling between two differential surface elements:
+// G(a, b) = (max(cos theta_a, 0.0) * max(cos theta_b, 0.0)) / max(||b - a||^2, 1e-4)
+float evalGeometricCoupling(vec3 posA, vec3 normA, vec3 posB, vec3 normB) {
+    vec3 d = posB - posA;
+    float distSq = dot(d, d);
+    if (distSq >= 2.5e7) {
+        // Sky dome / optical infinity (> 5000 units): direct cosine projection
+        float dist = sqrt(distSq);
+        vec3 dir = d / dist;
+        return max(dot(normA, dir), 0.0);
+    }
+    float dist = sqrt(max(distSq, 1e-8));
+    vec3 dir = d / dist;
+    float cosA = max(dot(normA, dir), 0.0);
+    float cosB = max(dot(normB, -dir), 0.0);
+    return (cosA * cosB) / max(distSq, 1e-4);
+}
+
+// Geometric target proxy p̂(X) for an arbitrary length-k path skeleton:
+// p̂(X) = L_emit * G(v_{k-1}, v_k) * prod_{i=1}^{k-1} [ rho_max(mat_i) * G(v_{i-1}, v_i) ]
+// Evaluates purely from reconstructed geometry and rho_max table with ZERO texture fetches.
+float evalPathTargetProxy(in PathSample path, float emitLuminance) {
+    if (path.vertexCount < 2u || emitLuminance <= 1e-6) return 0.0;
+
+    float pProxy = emitLuminance;
+    vec3 prevPos, prevNorm;
+    reconstructHitPositionAndNormal(path.vertices[0].hit, prevPos, prevNorm);
+
+    for (uint i = 1u; i < path.vertexCount; ++i) {
+        vec3 currPos, currNorm;
+        reconstructHitPositionAndNormal(path.vertices[i].hit, currPos, currNorm);
+
+        float G = evalGeometricCoupling(prevPos, prevNorm, currPos, currNorm);
+        if (G <= 1e-7) return 0.0;
+
+        float rho = getMaterialRhoMax(path.vertices[i - 1u].matId);
+        pProxy *= (rho * G);
+        if (pProxy <= 1e-9) return 0.0;
+
+        prevPos = currPos;
+        prevNorm = currNorm;
+    }
+
+    return pProxy;
+}
+
+// Stream resample a candidate path into a ReservoirPT
+bool ptUpdate(inout ReservoirPT r, uint candidatePathIdx, float candidateWeight, float candidateProxy, inout uint seed) {
+    float combinedWeight = r.weightSum + candidateWeight;
+    r.weightSum = combinedWeight;
+    r.M += 1.0;
+
+    if (candidateWeight > 0.0 && (randFloat(seed) * combinedWeight < candidateWeight)) {
+        r.pathIndex = candidatePathIdx;
+        r.targetProxy = candidateProxy;
+        return true;
+    }
+    return false;
+}
+
 #endif // RESTIR_COMMON_GLSL
