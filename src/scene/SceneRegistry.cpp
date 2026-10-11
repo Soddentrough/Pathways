@@ -208,8 +208,8 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     infinityMirror.label = "Infinity Mirror";
     infinityMirror.filepath = "infinity-mirror";
     infinityMirror.group = "Procedural";
-    infinityMirror.triangleCount = 14172;
-    infinityMirror.materialCount = 12;
+    infinityMirror.triangleCount = 20600;
+    infinityMirror.materialCount = 18;
     infinityMirror.fileSizeBytes = 0;
     entries.push_back(infinityMirror);
 

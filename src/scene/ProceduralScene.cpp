@@ -2782,6 +2782,44 @@ static std::vector<MaterialGPU> createInfinityMirrorMaterials() {
     matGoldLight.type = MATERIAL_EMISSIVE;
     materials.push_back(matGoldLight);
 
+    // 13: Perimeter Frame Neon Strip (Ice Blue Luminescent Conduit)
+    MaterialGPU matNeon{};
+    matNeon.albedo = glm::vec4(0.70f, 0.90f, 1.0f, 1.0f);
+    matNeon.emissive = glm::vec4(16.0f, 20.0f, 26.0f, 1.0f);
+    matNeon.type = MATERIAL_EMISSIVE;
+    materials.push_back(matNeon);
+
+    // 14: Focused Caustic Spotlight Lens / Emitter (Cool White Beam)
+    MaterialGPU matSpotLens{};
+    matSpotLens.albedo = glm::vec4(0.95f, 0.98f, 1.0f, 1.0f);
+    matSpotLens.emissive = glm::vec4(120.0f, 125.0f, 140.0f, 1.0f);
+    matSpotLens.type = MATERIAL_EMISSIVE;
+    materials.push_back(matSpotLens);
+
+    // 15: Gyroscope Outer Ring (Polished Platinum / Titanium)
+    MaterialGPU matPlatinum{};
+    matPlatinum.albedo = glm::vec4(0.92f, 0.93f, 0.96f, 1.0f);
+    matPlatinum.roughness = 0.008f;
+    matPlatinum.metallic = 1.0f;
+    matPlatinum.type = MATERIAL_METALLIC;
+    materials.push_back(matPlatinum);
+
+    // 16: Gyroscope Middle Ring (Polished Rose Gold / Copper)
+    MaterialGPU matCopper{};
+    matCopper.albedo = glm::vec4(0.97f, 0.72f, 0.58f, 1.0f);
+    matCopper.roughness = 0.012f;
+    matCopper.metallic = 1.0f;
+    matCopper.type = MATERIAL_METALLIC;
+    materials.push_back(matCopper);
+
+    // 17: Gyroscope Inner Ring (Dark Mirror Chrome)
+    MaterialGPU matDarkChrome{};
+    matDarkChrome.albedo = glm::vec4(0.82f, 0.84f, 0.88f, 1.0f);
+    matDarkChrome.roughness = 0.005f;
+    matDarkChrome.metallic = 1.0f;
+    matDarkChrome.type = MATERIAL_METALLIC;
+    materials.push_back(matDarkChrome);
+
     return materials;
 }
 
@@ -2871,12 +2909,74 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
         light.emission = glm::vec4(20.0f, 18.8f, 16.0f, (2.0f * lightHalfW) * lightDepth);
         scene.lights.push_back(light);
 
+        // Emissive Perimeter Frame Neon Conduit (Luminescent trim tracing the rectangular portal)
+        const float neonW = 0.035f;
+        const float neonD = 0.008f;
+        const float zFront = z + barThick * 0.5f + neonD * 0.5f;
+        const float zBack = z - barThick * 0.5f - neonD * 0.5f;
+
+        // Front Face Neon Trim (Facing +Z into corridor/front mirror)
+        addBox(scene.triangles, glm::vec3(-frameW * 0.5f + barThick * 0.5f, frameH * 0.5f, zFront),
+               glm::vec3(neonW, frameH, neonD), 0.0f, 13 /* matNeon */);
+        addBox(scene.triangles, glm::vec3(frameW * 0.5f - barThick * 0.5f, frameH * 0.5f, zFront),
+               glm::vec3(neonW, frameH, neonD), 0.0f, 13 /* matNeon */);
+        addBox(scene.triangles, glm::vec3(0.0f, frameH - barThick * 0.5f, zFront),
+               glm::vec3(frameW, neonW, neonD), 0.0f, 13 /* matNeon */);
+
+        // Rear Face Neon Trim (Facing -Z into corridor/rear mirror)
+        addBox(scene.triangles, glm::vec3(-frameW * 0.5f + barThick * 0.5f, frameH * 0.5f, zBack),
+               glm::vec3(neonW, frameH, neonD), 0.0f, 13 /* matNeon */);
+        addBox(scene.triangles, glm::vec3(frameW * 0.5f - barThick * 0.5f, frameH * 0.5f, zBack),
+               glm::vec3(neonW, frameH, neonD), 0.0f, 13 /* matNeon */);
+        addBox(scene.triangles, glm::vec3(0.0f, frameH - barThick * 0.5f, zBack),
+               glm::vec3(frameW, neonW, neonD), 0.0f, 13 /* matNeon */);
+
+        // Inner Reveal Strips (Facing inward toward corridor center)
+        addBox(scene.triangles, glm::vec3(-frameW * 0.5f + barThick + 0.002f, (frameH - barThick) * 0.5f, z),
+               glm::vec3(0.006f, frameH - barThick, barThick * 0.8f), 0.0f, 13 /* matNeon */);
+        addBox(scene.triangles, glm::vec3(frameW * 0.5f - barThick - 0.002f, (frameH - barThick) * 0.5f, z),
+               glm::vec3(0.006f, frameH - barThick, barThick * 0.8f), 0.0f, 13 /* matNeon */);
+
         recordRange("Frame_" + std::to_string(i), tStart);
     }
 
-    // 4. Center Runway Sculptures
     const float pedR = 0.40f;
     const float pedH = 0.20f;
+
+    // 3b. Focused Theatrical Caustic Projector (Targeting Glass Crystal Sphere at Z = 4.0)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    glm::vec3 spotMountPos(0.0f, frameH - barThick, 3.0f);
+    glm::vec3 spotLensPos(0.0f, 3.10f, 3.08f);
+    glm::vec3 glassSphereTarget(0.0f, pedH + 0.42f, 4.0f);
+    glm::vec3 spotDir = glm::normalize(glassSphereTarget - spotLensPos);
+
+    // Projector bracket and barrel
+    addBeam(scene.triangles, spotMountPos, spotLensPos - spotDir * 0.16f, 0.05f, 0.05f, 1 /* matFrame */);
+    addBeam(scene.triangles, spotLensPos - spotDir * 0.16f, spotLensPos, 0.16f, 0.16f, 1 /* matFrame */);
+
+    // Emissive spotlight lens quad facing along spotDir
+    glm::vec3 upRef(0.0f, 1.0f, 0.0f);
+    glm::vec3 spotRight = glm::normalize(glm::cross(spotDir, upRef));
+    glm::vec3 spotUp = glm::cross(spotRight, spotDir);
+    float lensR = 0.075f;
+    addQuad(scene.triangles,
+            spotLensPos - spotRight * lensR - spotUp * lensR,
+            spotLensPos + spotRight * lensR - spotUp * lensR,
+            spotLensPos + spotRight * lensR + spotUp * lensR,
+            spotLensPos - spotRight * lensR + spotUp * lensR,
+            spotDir, 14 /* matSpotLens */);
+
+    // Analytical LightGPU: High-flux focused spotlight aimed at dielectric crystal for photon caustics
+    LightGPU spotLight{};
+    spotLight.position = glm::vec4(spotLensPos, LIGHT_SPOT);
+    spotLight.normal = glm::vec4(spotDir, 0.0f);
+    spotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(12.0f)));
+    spotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(18.0f)));
+    spotLight.emission = glm::vec4(130.0f, 135.0f, 155.0f, 1.0f);
+    scene.lights.push_back(spotLight);
+    recordRange("Caustic_Spotlight", tStart);
+
+    // 4. Center Runway Sculptures
 
     auto addPedestal = [&](float x, float z, const std::string& name) {
         tStart = static_cast<uint32_t>(scene.triangles.size());
@@ -2960,6 +3060,31 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     scene.lights.push_back(goldLight);
     recordRange("Pedestal_GoldRing", tStart);
 
+    // Foreground Side Accent: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -5.5)
+    // Symmetrically counterbalances the Chrome Mirror Sphere (X = -1.3, Z = -5.5) across the corridor
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    // Glowing base plinth at floor level (Ice blue neon trim)
+    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -5.5f), 0.48f, 0.03f, 13 /* matNeon */, 28);
+    // Dark pedestal column
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -5.5f), 0.44f, pedH, 9 /* matPed */, 24);
+    // Metallic bezel platform
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -5.5f), 0.40f, 0.01f, 1 /* matFrame */, 24);
+
+    // Support cradle fork arms elevating the gimbal
+    const glm::vec3 gyroPos(1.3f, pedH + 0.52f, -5.5f);
+    const float forkSpan = 0.48f;
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.01f, -5.5f),
+            glm::vec3(1.3f - forkSpan, gyroPos.y, -5.5f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f + forkSpan, pedH + 0.01f, -5.5f),
+            glm::vec3(1.3f + forkSpan, gyroPos.y, -5.5f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.02f, -5.5f),
+            glm::vec3(1.3f + forkSpan, pedH + 0.02f, -5.5f), 0.04f, 0.035f, 1 /* matFrame */);
+
+    // Gold gimbal pivot bearing nodes
+    addSphere(scene.triangles, glm::vec3(1.3f - forkSpan, gyroPos.y, -5.5f), 0.035f, 4 /* matGold */, 16, 16);
+    addSphere(scene.triangles, glm::vec3(1.3f + forkSpan, gyroPos.y, -5.5f), 0.035f, 4 /* matGold */, 16, 16);
+    recordRange("Pedestal_Gyroscope", tStart);
+
     // =========================================================================
     // 6. BLAS Geometry Prototypes & Hardware TLAS Instancing
     // =========================================================================
@@ -3000,6 +3125,32 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     addTorus(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), 0.38f, 0.10f, 4 /* matGold */, 36, 18,
              glm::normalize(glm::vec3(0.35f, 0.88f, 0.25f)));
     recordBlasPrototype("Prototype_GoldTorus", goldTorusStart);
+
+    // Record BLAS 3: Dynamic Multi-Ring Gyroscope - Outer Ring (Platinum/Titanium)
+    uint32_t gyroOuterStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f), 0.44f, 0.024f, 15 /* matPlatinum */, 36, 18, glm::vec3(0.0f, 0.0f, 1.0f));
+    // Outer ring bearing pins along X axis
+    addBeam(scene.triangles, glm::vec3(-0.48f, 0.0f, 0.0f), glm::vec3(-0.42f, 0.0f, 0.0f), 0.016f, 0.016f, 4 /* matGold */);
+    addBeam(scene.triangles, glm::vec3( 0.42f, 0.0f, 0.0f), glm::vec3( 0.48f, 0.0f, 0.0f), 0.016f, 0.016f, 4 /* matGold */);
+    recordBlasPrototype("Prototype_GyroOuter", gyroOuterStart);
+
+    // Record BLAS 4: Dynamic Multi-Ring Gyroscope - Middle Ring (Rose Gold / Copper)
+    uint32_t gyroMidStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f), 0.34f, 0.020f, 16 /* matCopper */, 32, 16, glm::vec3(1.0f, 0.0f, 0.0f));
+    // Middle ring bearing pins along Y axis
+    addBeam(scene.triangles, glm::vec3(0.0f, -0.38f, 0.0f), glm::vec3(0.0f, -0.32f, 0.0f), 0.014f, 0.014f, 4 /* matGold */);
+    addBeam(scene.triangles, glm::vec3(0.0f,  0.32f, 0.0f), glm::vec3(0.0f,  0.38f, 0.0f), 0.014f, 0.014f, 4 /* matGold */);
+    recordBlasPrototype("Prototype_GyroMiddle", gyroMidStart);
+
+    // Record BLAS 5: Dynamic Multi-Ring Gyroscope - Inner Ring & Core (Dark Chrome & Gold)
+    uint32_t gyroInnerStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f), 0.24f, 0.016f, 17 /* matDarkChrome */, 28, 14, glm::vec3(0.0f, 1.0f, 0.0f));
+    // Inner ring bearing pins along Z axis
+    addBeam(scene.triangles, glm::vec3(0.0f, 0.0f, -0.28f), glm::vec3(0.0f, 0.0f, -0.22f), 0.012f, 0.012f, 4 /* matGold */);
+    addBeam(scene.triangles, glm::vec3(0.0f, 0.0f,  0.22f), glm::vec3(0.0f, 0.0f,  0.28f), 0.012f, 0.012f, 4 /* matGold */);
+    // Central kinetic jewel core
+    addSphere(scene.triangles, glm::vec3(0.0f), 0.09f, 4 /* matGold */, 20, 20);
+    recordBlasPrototype("Prototype_GyroInner", gyroInnerStart);
 
     // Hardware TLAS Instances
     // Instance 0: Static Room
@@ -3068,6 +3219,75 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGoldTorus.rotationSpeed = -0.6f;                       // Counter-rotation to chrome torus (~-34.4 deg/s)
     animGoldTorus.baseTransform = glm::mat4(1.0f);
     scene.animatedInstances.push_back(animGoldTorus);
+
+    // Instance 3: Gyroscope Outer Ring (X = 1.3, Z = -5.5)
+    SceneInstance instGyroOuter{};
+    instGyroOuter.blasIndex = 3;
+    instGyroOuter.transform = glm::translate(glm::mat4(1.0f), gyroPos);
+    instGyroOuter.customIndex = 3;
+    scene.instances.push_back(instGyroOuter);
+
+    InstanceGPU instGyroOuterGPU{};
+    instGyroOuterGPU.firstTriangle = scene.blasRanges[3].firstTriangle;
+    instGyroOuterGPU.numOpaqueTriangles = scene.blasRanges[3].numOpaqueTriangles;
+    instGyroOuterGPU.materialOffset = 0;
+    instGyroOuterGPU.flags = 0;
+    scene.instanceData.push_back(instGyroOuterGPU);
+
+    AnimatedInstance animGyroOuter{};
+    animGyroOuter.instanceIndex = 3;
+    animGyroOuter.basePosition = gyroPos;
+    animGyroOuter.rotationAxis = glm::vec3(0.0f, 1.0f, 0.0f); // Smooth yaw rotation
+    animGyroOuter.rotationSpeed = 0.70f;                      // ~40.1 deg/s
+    animGyroOuter.baseTransform = glm::mat4(1.0f);
+    scene.animatedInstances.push_back(animGyroOuter);
+
+    // Instance 4: Gyroscope Middle Ring (X = 1.3, Z = -5.5)
+    glm::mat4 midInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(35.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    SceneInstance instGyroMid{};
+    instGyroMid.blasIndex = 4;
+    instGyroMid.transform = glm::translate(glm::mat4(1.0f), gyroPos) * midInitialTilt;
+    instGyroMid.customIndex = 4;
+    scene.instances.push_back(instGyroMid);
+
+    InstanceGPU instGyroMidGPU{};
+    instGyroMidGPU.firstTriangle = scene.blasRanges[4].firstTriangle;
+    instGyroMidGPU.numOpaqueTriangles = scene.blasRanges[4].numOpaqueTriangles;
+    instGyroMidGPU.materialOffset = 0;
+    instGyroMidGPU.flags = 0;
+    scene.instanceData.push_back(instGyroMidGPU);
+
+    AnimatedInstance animGyroMid{};
+    animGyroMid.instanceIndex = 4;
+    animGyroMid.basePosition = gyroPos;
+    animGyroMid.rotationAxis = glm::vec3(1.0f, 0.0f, 0.0f); // Pitch rotation
+    animGyroMid.rotationSpeed = -1.15f;                     // ~-65.9 deg/s counter-rotation
+    animGyroMid.baseTransform = midInitialTilt;
+    scene.animatedInstances.push_back(animGyroMid);
+
+    // Instance 5: Gyroscope Inner Ring & Core (X = 1.3, Z = -5.5)
+    glm::vec3 innerAxis = glm::normalize(glm::vec3(0.0f, 0.7071f, 0.7071f));
+    glm::mat4 innerInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(-25.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    SceneInstance instGyroInner{};
+    instGyroInner.blasIndex = 5;
+    instGyroInner.transform = glm::translate(glm::mat4(1.0f), gyroPos) * innerInitialTilt;
+    instGyroInner.customIndex = 5;
+    scene.instances.push_back(instGyroInner);
+
+    InstanceGPU instGyroInnerGPU{};
+    instGyroInnerGPU.firstTriangle = scene.blasRanges[5].firstTriangle;
+    instGyroInnerGPU.numOpaqueTriangles = scene.blasRanges[5].numOpaqueTriangles;
+    instGyroInnerGPU.materialOffset = 0;
+    instGyroInnerGPU.flags = 0;
+    scene.instanceData.push_back(instGyroInnerGPU);
+
+    AnimatedInstance animGyroInner{};
+    animGyroInner.instanceIndex = 5;
+    animGyroInner.basePosition = gyroPos;
+    animGyroInner.rotationAxis = innerAxis;                 // Compound oblique roll/spin
+    animGyroInner.rotationSpeed = 1.75f;                    // ~100.3 deg/s
+    animGyroInner.baseTransform = innerInitialTilt;
+    scene.animatedInstances.push_back(animGyroInner);
 
     // 7. Camera Setup
     scene.hasCamera = true;

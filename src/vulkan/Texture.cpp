@@ -468,21 +468,79 @@ std::unique_ptr<Texture> Texture::createProceduralStudioHdrSky(
             glm::vec3 radiance(0.0f);
 
             if (dir.y > 0.0f) {
-                // Subtle dark studio ambient gradient (deep charcoal/slate ceiling)
-                // Pure indoor gallery space without direct sunlight or sky disk
+                // Subtle dark studio ambient gradient with deep midnight slate ceiling
                 float skyFactor = std::pow(dir.y, 0.6f);
-                glm::vec3 zenithColor(0.003f, 0.003f, 0.004f);
-                glm::vec3 horizonColor(0.008f, 0.008f, 0.010f);
+                glm::vec3 zenithColor(0.0018f, 0.0022f, 0.0040f);
+                glm::vec3 horizonColor(0.0055f, 0.0065f, 0.0090f);
                 radiance = glm::mix(horizonColor, zenithColor, skyFactor);
             } else {
                 // Dark matte ground / studio floor reflection
                 float groundFactor = std::clamp(-dir.y, 0.0f, 1.0f);
-                glm::vec3 deepGround(0.001f, 0.001f, 0.0015f);
-                glm::vec3 horizonHaze(0.008f, 0.008f, 0.010f);
+                glm::vec3 deepGround(0.0008f, 0.0008f, 0.0012f);
+                glm::vec3 horizonHaze(0.0055f, 0.0065f, 0.0090f);
                 radiance = glm::mix(horizonHaze, deepGround, groundFactor);
             }
 
             pixels[y * width + x] = glm::vec4(radiance, 1.0f);
+        }
+    }
+
+    // Procedural Starry Void: 1,600 subtle deterministic stars in upper hemisphere
+    // Provides an authentic, deep cosmic starry backdrop outside the mirror gallery void
+    uint32_t rngState = 0x9e3779b9u;
+    auto lcg = [&rngState]() -> float {
+        rngState = rngState * 1664525u + 1013904223u;
+        return static_cast<float>(rngState & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
+    };
+
+    for (int s = 0; s < 1600; ++s) {
+        float u = lcg();
+        float elev = lcg();
+        if (elev < 0.03f) continue;
+        float v = (1.0f - elev) * 0.5f; // Upper hemisphere: v in [0, 0.485]
+
+        float magRnd = lcg();
+        // Subtle star brightness between 0.15 and 0.85 (delicate twinkling without caustic fireflies)
+        float brightness = 0.15f + 0.65f * std::pow(magRnd, 3.0f);
+
+        float colorRnd = lcg();
+        glm::vec3 starColor;
+        if (colorRnd < 0.50f) {
+            starColor = glm::vec3(0.85f, 0.95f, 1.30f); // Blue-white
+        } else if (colorRnd < 0.80f) {
+            starColor = glm::vec3(1.0f, 1.0f, 1.0f);   // Pure white
+        } else {
+            starColor = glm::vec3(1.20f, 1.10f, 0.85f); // Warm starlight
+        }
+
+        float cx = u * static_cast<float>(width);
+        float cy = v * static_cast<float>(height);
+        float sigma = 0.45f + 0.10f * (brightness > 0.5f ? 1.0f : 0.0f);
+        float twoSigmaSq = 2.0f * sigma * sigma;
+        float maxR = 2.2f * sigma;
+
+        int cyi = static_cast<int>(cy);
+        int cxi = static_cast<int>(cx);
+        int ky = std::min(static_cast<int>(std::ceil(maxR)), 3);
+
+        for (int dy = -ky; dy <= ky; ++dy) {
+            int py = cyi + dy;
+            if (py < 0 || py >= static_cast<int>(height)) continue;
+            float latFactor = std::max(0.15f, std::sin(static_cast<float>(py + 0.5f) / static_cast<float>(height) * PI));
+            float dY = static_cast<float>(py) + 0.5f - cy;
+
+            int curKx = std::min(static_cast<int>(std::ceil(maxR / latFactor)), 5);
+            for (int dx = -curKx; dx <= curKx; ++dx) {
+                int px = (cxi + dx + static_cast<int>(width)) % static_cast<int>(width);
+                float dX = (static_cast<float>(cxi + dx) + 0.5f - cx) * latFactor;
+                float dist = std::sqrt(dX * dX + dY * dY);
+                if (dist >= maxR) continue;
+
+                // Hann-windowed Gaussian taper: continuously and smoothly vanishes to 0 at maxR
+                float window = 0.5f * (1.0f + std::cos(PI * dist / maxR));
+                float w = std::exp(-dist * dist / twoSigmaSq) * window;
+                pixels[py * width + px] += glm::vec4(starColor * (brightness * w), 0.0f);
+            }
         }
     }
 
@@ -593,7 +651,7 @@ std::unique_ptr<Texture> Texture::createSceneEnvironmentMap(
             Logger::info("Initialized procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
         } else if (isInfinityMirror) {
             envMap = Texture::createProceduralStudioHdrSky(device, allocator, queue, pool);
-            Logger::info("Initialized procedural Dark Studio HDRI environment (512x256, 32-bit Float, No Sun).");
+            Logger::info("Initialized procedural Starry Void HDRI environment (1024x512, 32-bit Float, Subtle Stars).");
         } else {
             envMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
             Logger::info("Initialized procedural Day HDRI sky dome (512x256, 32-bit Float).");

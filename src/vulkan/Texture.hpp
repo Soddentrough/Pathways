@@ -66,7 +66,7 @@ public:
 
     static std::unique_ptr<Texture> createProceduralStudioHdrSky(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-        uint32_t width = 512, uint32_t height = 256
+        uint32_t width = 1024, uint32_t height = 512
     );
 
     static std::unique_ptr<Texture> loadFromFile(
