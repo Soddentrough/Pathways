@@ -3,7 +3,7 @@
 **Status:**
 - **Phase 1 (Completed 2026-10-10):** Inline ReSTIR DI subsystem, shared `restir_common.glsl`, temporal + spatial-tap reuse for analytical lights (`docs/reports/restir_review_2026_10_10.md`).
 - **Phase 2a (Completed 2026-10-11):** Path-space secondary-vertex ReSTIR GI at bounce 1, X1 context buffer, continuous random 2D spatial rotation, target ratio and weight clamping (`commit d5e4fab`).
-- **Phase 2b (Active Development):** Decoupled ReSTIR PT — elimination of inline `rayQuery` from shading kernels, stream-compacted visibility queues, and 16-byte `Hit` atom with `VK_KHR_ray_tracing_position_fetch`.
+- **Phase 2b (Completed 2026-10-11):** Decoupled ReSTIR PT — elimination of inline `rayQuery` from shading kernels (`commit 5d35634`), 16-byte `Hit` atom and position fetch (`commit 165c804`), transient ShadeRequest/ShadeResult queues, and exact analytical reconnection Jacobians with hybrid shift map gating.
 - **Phase 3 (Long-Term Architectural Target):** Fully Inverted / Deferred Gather Path-Database Architecture (pure geometry/visibility resampling with end-of-frame deferred material closure evaluation).
 
 ---

@@ -941,7 +941,7 @@ void main() {
                 nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                 nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel);
                 if (giCtxEligible && bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
-                    x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)));
+                    x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
                 }
             }
         }

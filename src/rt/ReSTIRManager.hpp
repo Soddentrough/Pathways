@@ -31,6 +31,25 @@ struct HitGPU {
 };
 static_assert(sizeof(HitGPU) == 16, "HitGPU must be exactly 16 bytes");
 
+// 32-byte ShadeRequest: emitted by shift/trace kernels to request BSDF evaluation (Approach A).
+struct ShadeRequestGPU {
+    HitGPU   hit;          // 16 bytes: hit atom at the evaluated vertex
+    uint32_t wiOct;        // 4 bytes: octahedral incoming direction (x_{k-1} -> x_k)
+    uint32_t woOct;        // 4 bytes: octahedral outgoing direction (x_k -> x_{k+1})
+    uint32_t resultSlot;   // 4 bytes: linear index into ShadeResult buffer
+    uint32_t matIdFlags;   // 4 bytes: [23:0] materialId, [31:24] lobeMask
+};
+static_assert(sizeof(ShadeRequestGPU) == 32, "ShadeRequestGPU must be exactly 32 bytes");
+
+// 16-byte ShadeResult: output of binned material shading kernels (Approach A).
+struct ShadeResultGPU {
+    uint32_t fRG;          // 4 bytes: fp16 (f.r, f.g) where f = BSDF * |cos|
+    uint32_t fB_pdfFwd;    // 4 bytes: fp16 f.b, fp16 forward pdf
+    uint32_t pdfRev_flags; // 4 bytes: fp16 reverse pdf, [31:16] lobe flags
+    uint32_t pad;          // 4 bytes: alignment / reserved
+};
+static_assert(sizeof(ShadeResultGPU) == 16, "ShadeResultGPU must be exactly 16 bytes");
+
 // 32-byte ReSTIR GI reservoir (path-space, docs/RESTIR_PT_DESIGN.md).
 // Must match `GiReservoir` in shaders/compute/restir_common.glsl.
 struct GiReservoirGPU {
@@ -41,19 +60,19 @@ struct GiReservoirGPU {
     uint32_t target;         // fp32 bits, p-hat at the recording pixel
     uint32_t radRG;          // fp16 (L2.r, L2.g)
     uint32_t radB_dSrc;      // fp16 L2.b, fp16 |x2 - x1| at recording time
-    uint32_t flagsM;         // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
+    uint32_t flagsM;         // [0] valid, [8:1] age, [18:9] M, [20:19] hitFlags, [28:21] cosSrc (unorm8), [31:29] reserved
 };
 static_assert(sizeof(GiReservoirGPU) == 32, "GiReservoirGPU must be exactly 32 bytes");
 
 // 24-byte per-pixel BRDF context at the primary hit x1, written at bounce 0
 // and consumed at bounce 1 of the same frame. Must match `X1Context` in GLSL.
 struct X1ContextGPU {
-    uint32_t n1Oct;     // oct32(x1 normal)
-    uint32_t albedoRG;  // fp16 (albedo.r, albedo.g)
-    uint32_t albedoB;   // fp16 albedo.b
-    uint32_t flags;     // [0] valid (diffuse cosine reflection lobe)
-    uint32_t woOct;     // oct32(x1 -> camera direction)
-    uint32_t f0Pad;     // fp16 scalar F0, fp16 reserved
+    uint32_t n1Oct;       // oct32(x1 normal)
+    uint32_t albedoRG;    // fp16 (albedo.r, albedo.g)
+    uint32_t albedoB;     // fp16 albedo.b
+    uint32_t flags;       // [0] valid (diffuse cosine reflection lobe)
+    uint32_t woOct;       // oct32(x1 -> camera direction)
+    uint32_t f0Roughness; // [15:0] fp16 scalar F0, [31:16] fp16 roughness
 };
 static_assert(sizeof(X1ContextGPU) == 24, "X1ContextGPU must be exactly 24 bytes");
 
@@ -96,6 +115,8 @@ public:
         return (frameSlot < MAX_FRAMES_IN_FLIGHT) ? m_giReservoirBuffers[frameSlot].get() : nullptr;
     }
     Buffer* getX1ContextBuffer() const { return m_x1Context.get(); }
+    Buffer* getShadeRequestBuffer() const { return m_shadeRequestBuffer.get(); }
+    Buffer* getShadeResultBuffer() const { return m_shadeResultBuffer.get(); }
 
     bool isInitialized() const { return m_width > 0 && m_height > 0; }
 
@@ -109,10 +130,14 @@ private:
     bool m_clearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_giClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_ctxClearPending = true;
+    bool m_reqClearPending = true;
+    bool m_resClearPending = true;
 
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_reservoirBuffers;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_giReservoirBuffers;
     std::unique_ptr<Buffer> m_x1Context;
+    std::unique_ptr<Buffer> m_shadeRequestBuffer;
+    std::unique_ptr<Buffer> m_shadeResultBuffer;
 };
 
 } // namespace pathways

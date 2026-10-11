@@ -467,13 +467,30 @@ struct GiReservoir {
 
 // Per-pixel BRDF context at the primary hit x1. Written at bounce 0 and
 // consumed at bounce 1 of the same frame/sample. 24 bytes.
+// 32-byte ShadeRequest: emitted by shift/trace kernels to request BSDF evaluation (Approach A).
+struct ShadeRequest {
+    Hit   hit;          // 16 bytes: hit atom at the evaluated vertex
+    uint  wiOct;        // 4 bytes: octahedral incoming direction (x_{k-1} -> x_k)
+    uint  woOct;        // 4 bytes: octahedral outgoing direction (x_k -> x_{k+1})
+    uint  resultSlot;   // 4 bytes: linear index into ShadeResult buffer
+    uint  matIdFlags;   // 4 bytes: [23:0] materialId, [31:24] lobeMask
+};
+
+// 16-byte ShadeResult: output of binned material shading kernels (Approach A).
+struct ShadeResult {
+    uint fRG;           // 4 bytes: fp16 (f.r, f.g) where f = BSDF * |cos|
+    uint fB_pdfFwd;     // 4 bytes: fp16 f.b, fp16 forward pdf
+    uint pdfRev_flags;  // 4 bytes: fp16 reverse pdf, [31:16] lobe flags
+    uint pad;           // 4 bytes: alignment / reserved
+};
+
 struct X1Context {
     uint n1Oct;     // oct32(x1 normal)
     uint albedoRG;  // fp16 (albedo.r, albedo.g)
     uint albedoB;   // fp16 albedo.b
     uint flags;     // [0] valid: diffuse cosine reflection-lobe continuation
     uint woOct;     // oct32(x1 -> camera direction, i.e. V at the primary hit)
-    uint f0Pad;     // fp16 scalar F0 of the primary material, fp16 reserved
+    uint f0Pad;     // [15:0] fp16 scalar F0, [31:16] fp16 roughness
 };
 
 const float GI_TAP_MIN_COS        = 0.05;
@@ -491,14 +508,14 @@ X1Context invalidX1Context() {
     return c;
 }
 
-X1Context makeX1Context(vec3 n1, vec3 albedo, vec3 wo, float f0) {
+X1Context makeX1Context(vec3 n1, vec3 albedo, vec3 wo, float f0, float roughness) {
     X1Context c;
     c.n1Oct = packOct32(normalize(n1));
     c.albedoRG = packHalf2x16(clamp(albedo.rg, vec2(0.0), vec2(65000.0)));
     c.albedoB = packHalf2x16(vec2(clamp(albedo.b, 0.0, 65000.0), 0.0));
     c.flags = 1u;
     c.woOct = packOct32(normalize(wo));
-    c.f0Pad = packHalf2x16(vec2(clamp(f0, 0.0, 1.0), 0.0));
+    c.f0Pad = packHalf2x16(vec2(clamp(f0, 0.0, 1.0), clamp(roughness, 0.0, 1.0)));
     return c;
 }
 
@@ -510,6 +527,7 @@ vec3 x1ContextAlbedo(X1Context c) {
 }
 vec3 x1ContextWo(X1Context c) { return unpackOct32(c.woOct); }
 float x1ContextF0(X1Context c) { return unpackHalf2x16(c.f0Pad).x; }
+float x1ContextRoughness(X1Context c) { return unpackHalf2x16(c.f0Pad).y; }
 
 GiReservoir invalidGiReservoir() {
     GiReservoir r;
@@ -524,15 +542,17 @@ GiReservoir invalidGiReservoir() {
     return r;
 }
 
-bool  giIsValid(GiReservoir r) { return (r.flagsM & 1u) != 0u; }
-uint  giGetAge(GiReservoir r)  { return (r.flagsM >> 1u) & 0xFFu; }
-uint  giGetM(GiReservoir r)    { return (r.flagsM >> 9u) & 0xFFFFu; }
+bool  giIsValid(GiReservoir r)     { return (r.flagsM & 1u) != 0u; }
+uint  giGetAge(GiReservoir r)      { return (r.flagsM >> 1u) & 0xFFu; }
+uint  giGetM(GiReservoir r)        { return (r.flagsM >> 9u) & 0x3FFu; }
+uint  giGetHitFlags(GiReservoir r) { return (r.flagsM >> 19u) & 0x3u; }
+float giGetCosSrc(GiReservoir r)   { return float((r.flagsM >> 21u) & 0xFFu) * (1.0 / 255.0); }
 Hit   giGetHit(GiReservoir r) {
     Hit h;
     h.instanceId = r.hitInstanceId;
     h.primitiveId = r.hitPrimitiveId;
     h.baryPacked = r.hitBaryPacked;
-    h.flags = (r.flagsM >> 25u) & 0x7Fu;
+    h.flags = giGetHitFlags(r);
     return h;
 }
 vec3  giGetX2(GiReservoir r) {
@@ -547,7 +567,7 @@ float giGetWSum(GiReservoir r)   { return uintBitsToFloat(r.wSumBits); }
 float giGetTarget(GiReservoir r) { return uintBitsToFloat(r.targetBits); }
 float giGetDSrc(GiReservoir r)   { return unpackHalf2x16(r.radB_dSrc).y; }
 
-GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radiance, float dSrc, uint age) {
+GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
     GiReservoir r = invalidGiReservoir();
     vec3 L = clamp(radiance, vec3(0.0), vec3(65000.0));
     r.hitInstanceId = hit.instanceId;
@@ -557,7 +577,8 @@ GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radi
     r.targetBits = floatBitsToUint(target);
     r.radRG = packHalf2x16(L.rg);
     r.radB_dSrc = packHalf2x16(vec2(L.b, clamp(dSrc, 0.0, 65000.0)));
-    r.flagsM = 1u | (min(age, 255u) << 1u) | ((M & 0xFFFFu) << 9u) | ((hit.flags & 0x7Fu) << 25u);
+    uint uCos = uint(clamp(round(clamp(cosSrc, 0.0, 1.0) * 255.0), 0.0, 255.0));
+    r.flagsM = 1u | ((min(age, 255u) & 0xFFu) << 1u) | ((min(M, 1023u) & 0x3FFu) << 9u) | ((hit.flags & 0x3u) << 19u) | ((uCos & 0xFFu) << 21u);
     return r;
 }
 
@@ -579,16 +600,27 @@ float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
     return albedoBar * INV_PI * cos1 * lum;
 }
 
+// Full analytical Jacobian for path reconnection:
+// J = (||x2 - x_src||^2 / ||x2 - x_new||^2) * (cos(theta_rc_new) / cos(theta_rc_src))
+// Matches test_restir_pt_math.cpp TEST 1 exactly.
+float evalGIJacobian(float dSrc, float dNew, float cosRcSrc, float cosRcNew) {
+    if (dSrc >= 5000.0 || dNew >= 5000.0) return 1.0;
+    float dSqSrc = dSrc * dSrc;
+    float dSqNew = max(dNew * dNew, 1e-4);
+    float cosSrcEff = max(cosRcSrc, 1e-3);
+    float cosNewEff = max(cosRcNew, 1e-4);
+    float J = (dSqSrc / dSqNew) * (cosNewEff / cosSrcEff);
+    return clamp(J, RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
+}
+
 // Reconnects a previous-frame GI tap to the current x1 and stream-combines
 // it into r. Returns true when the tap wins the reservoir.
 //
-// Jacobian: the candidate is a FIXED world point x2, while q is a density
-// per unit solid angle at the reuse vertex. For the same point seen from
-// two vertices, dω_new/dω_src = (d_src/d_new)², hence
-//     w_new = (wsum_c/M_c) · min(M_c, cap) · (p̂_new/p̂_c) · (d_src/d_new)².
+// Exact analytical Jacobian with dynamic normal reconstruction and hybrid
+// shift map footprint gating.
 // ageNew is stamped by the caller (temporal taps: age+1, spatial: age).
 bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
-                vec3 albedo, uint mCap, uint ageNew, inout uint seed) {
+                vec3 albedo, float roughness, uint mCap, uint ageNew, inout uint seed) {
     if (!giIsValid(tap) || giGetM(tap) == 0u) return false;
 
     uint mTap = min(giGetM(tap), mCap);
@@ -597,27 +629,43 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
     float pTap = giGetTarget(tap);
     float weight = 0.0;
     float pHat = 0.0;
-    vec3 x2c = giGetX2(tap);
+    vec3 x2c;
+    vec3 n2c;
+    reconstructHitPositionAndNormal(giGetHit(tap), x2c, n2c);
     vec3 radC = giGetRadiance(tap);
     float dNew = 0.0;
+    float cosRcNew = 0.0;
 
     if (pTap > 0.0) {
-        vec3 dv = x2c - x1;
-        dNew = length(dv);
+        vec3 toNew = x2c - x1;
+        dNew = length(toNew);
         if (dNew >= GI_TAP_MIN_DIST) {
-            float cosNew = dot(n1, dv / dNew);
-            if (cosNew > GI_TAP_MIN_COS) {
-                pHat = giTargetAt(albedo, n1, x1, x2c, radC);
+            vec3 dirNew = toNew / dNew;
+            float cos1 = dot(n1, dirNew);
+            if (cos1 > GI_TAP_MIN_COS) {
                 float dSrc = max(giGetDSrc(tap), 1e-3);
                 float distRatio = dSrc / max(dNew, 1e-3);
-                if (distRatio >= 0.1 && distRatio <= 10.0 && pHat > 0.0) {
-                    float jac = clamp((dSrc * dSrc) / (dNew * dNew), RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
-                    float targetRatio = clamp(pHat / max(pTap, 1e-6), 0.0, 2.5);
-                    weight = (giGetWSum(tap) / float(giGetM(tap))) *
-                             float(mTap) *
-                             targetRatio * jac;
-                    if (isnan(weight) || isinf(weight) || !(weight > 0.0)) {
-                        weight = 0.0;
+
+                // Footprint-based reconnection criterion (validateReconnectionFootprint):
+                // Distance ratio in [0.2, 5.0]; reject reconnection if receiver is specular/glossy
+                bool validFootprint = (distRatio >= 0.2 && distRatio <= 5.0);
+                if (validFootprint && roughness < 0.15) {
+                    validFootprint = false;
+                }
+
+                if (validFootprint) {
+                    pHat = giTargetAt(albedo, n1, x1, x2c, radC);
+                    if (pHat > 0.0) {
+                        cosRcNew = clamp(abs(dot(n2c, -dirNew)), 0.0, 1.0);
+                        float cosRcSrc = giGetCosSrc(tap);
+                        float jac = evalGIJacobian(dSrc, dNew, cosRcSrc, cosRcNew);
+                        float targetRatio = clamp(pHat / max(pTap, 1e-6), 0.0, 2.5);
+                        weight = (giGetWSum(tap) / float(giGetM(tap))) *
+                                 float(mTap) *
+                                 targetRatio * jac;
+                        if (isnan(weight) || isinf(weight) || !(weight > 0.0)) {
+                            weight = 0.0;
+                        }
                     }
                 }
             }
@@ -630,15 +678,15 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
     float combined = wSelf + weight;
 
     if (weight > 0.0 && (randFloat(seed) * combined < weight)) {
-        r = makeGiReservoir(giGetHit(tap), combined, combinedM, pHat, radC, dNew, ageNew);
+        r = makeGiReservoir(giGetHit(tap), combined, combinedM, pHat, radC, dNew, cosRcNew, ageNew);
         return true;
     }
     if (giIsValid(r) && giGetTarget(r) > 0.0) {
         r = makeGiReservoir(giGetHit(r), combined, combinedM, giGetTarget(r),
-                            giGetRadiance(r), giGetDSrc(r), giGetAge(r));
+                            giGetRadiance(r), giGetDSrc(r), giGetCosSrc(r), giGetAge(r));
     } else {
         r = makeGiReservoir(giIsValid(r) ? giGetHit(r) : invalidHit(), 0.0, combinedM, 0.0,
-                            vec3(0.0), giIsValid(r) ? giGetDSrc(r) : 0.0, ageNew);
+                            vec3(0.0), giIsValid(r) ? giGetDSrc(r) : 0.0, giIsValid(r) ? giGetCosSrc(r) : 0.0, ageNew);
     }
     return false;
 }

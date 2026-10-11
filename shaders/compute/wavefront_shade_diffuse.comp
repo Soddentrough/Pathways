@@ -650,9 +650,14 @@ void main() {
                     vec3 giX1 = origin;              // primary hit point (epsilon-offset)
                     vec3 giN1 = x1ContextNormal(giCtx);
                     vec3 giAlbedo = x1ContextAlbedo(giCtx);
+                    float giRoughness = x1ContextRoughness(giCtx);
                     float giAlbedoBar = max(dot(clamp(giAlbedo, vec3(0.0), vec3(1.0)), vec3(0.3333333)), 1e-4);
 
                     Hit selfHit = getRayHitAtom(hit);
+                    vec3 selfX2;
+                    vec3 selfN2;
+                    reconstructHitPositionAndNormal(selfHit, selfX2, selfN2);
+                    float cosRcSelf = clamp(abs(dot(selfN2, -rayDir)), 0.0, 1.0);
 
                     // Fresh candidate: the path's own secondary vertex.
                     // q̂ = cosine pdf at x1, so w = p̂/q̂ = albedoBar·l̄um(L̂2).
@@ -662,10 +667,10 @@ void main() {
                     bool giWinnerSelf = true;
                     if (giPSelf > 0.0 && giCosSelf > GI_TAP_MIN_COS) {
                         float giWSelf = giPSelf / max(giCosSelf * INV_PI, 1e-9);
-                        giR = makeGiReservoir(selfHit, giWSelf, 1u, giPSelf, giL2, hitT, 0u);
+                        giR = makeGiReservoir(selfHit, giWSelf, 1u, giPSelf, giL2, hitT, cosRcSelf, 0u);
                     } else {
                         // Unlit / shadowed candidate evaluated this frame: carries 0 weight, but M=1
-                        giR = makeGiReservoir(selfHit, 0.0, 1u, 0.0, vec3(0.0), hitT, 0u);
+                        giR = makeGiReservoir(selfHit, 0.0, 1u, 0.0, vec3(0.0), hitT, cosRcSelf, 0u);
                     }
 
                     if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
@@ -685,7 +690,7 @@ void main() {
                                     GiReservoir giTap = giHistoryReservoirs[uint(giPrev.y) * pc.width + uint(giPrev.x)];
                                     if (giIsValid(giTap) && giGetAge(giTap) < RESTIR_MAX_AGE) {
                                         uint giAgeNew = min(giGetAge(giTap) + 1u, RESTIR_MAX_AGE);
-                                        if (giApplyTap(giR, giTap, giX1, giN1, giAlbedo, pc.restirMCap, giAgeNew, seed)) {
+                                        if (giApplyTap(giR, giTap, giX1, giN1, giAlbedo, giRoughness, pc.restirMCap, giAgeNew, seed)) {
                                             giWinnerSelf = false;
                                         }
                                     }
@@ -735,7 +740,7 @@ void main() {
                             GiReservoir giTap = giHistoryReservoirs[uint(giCoord.y) * pc.width + uint(giCoord.x)];
                             if (!giIsValid(giTap) || giGetAge(giTap) >= RESTIR_MAX_AGE) continue;
                             uint giMCap = min(pc.restirMCap, 8u);
-                            if (giApplyTap(giShadeR, giTap, giX1, giN1, giAlbedo, giMCap, giGetAge(giTap), seed)) {
+                            if (giApplyTap(giShadeR, giTap, giX1, giN1, giAlbedo, giRoughness, giMCap, giGetAge(giTap), seed)) {
                                 giShadeWinnerSelf = false;
                             }
                         }
@@ -1158,7 +1163,7 @@ void main() {
                             nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel);
 #if !IS_SECONDARY_BOUNCE
                             if (giCtxEligible && bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
-                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)));
+                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), 1.0);
                             }
 #endif
                         }

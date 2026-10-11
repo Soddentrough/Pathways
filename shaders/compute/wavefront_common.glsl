@@ -391,6 +391,29 @@ vec3 reconstructHitPosition(Hit h) {
     }
 }
 
+// Reconstruct 3D world position and surface normal dynamically from a 16-byte Hit atom
+void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
+    if ((h.flags & 1u) != 0u) {
+        pos = vec3(uintBitsToFloat(h.instanceId),
+                   uintBitsToFloat(h.primitiveId),
+                   uintBitsToFloat(h.baryPacked));
+        norm = vec3(0.0, 1.0, 0.0);
+    } else {
+        vec2 bary = unpackUnorm2x16(h.baryPacked);
+        float w = 1.0 - bary.x - bary.y;
+        vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
+        vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
+        vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
+        pos = w * v0 + bary.x * v1 + bary.y * v2;
+        vec3 crossN = cross(v1 - v0, v2 - v0);
+        float lenCross = length(crossN);
+        norm = (lenCross > 1e-8) ? (crossN / lenCross) : vec3(0.0, 1.0, 0.0);
+        if ((h.flags & 2u) == 0u) {
+            norm = -norm; // Back-facing
+        }
+    }
+}
+
 // 16-byte packed ray geometry (read by intersect & shade)
 struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)

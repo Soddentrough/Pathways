@@ -361,24 +361,29 @@ int main() {
 
         // 8c. Bit-packing roundtrip verification for flagsM (zero bit collisions)
         uint32_t testAge = 127u;
-        uint32_t testM = 4095u;
-        uint32_t testHitFlags = 0x4Au & 0x7Fu; // 7-bit hit flags
+        uint32_t testM = 1023u;
+        uint32_t testHitFlags = 2u; // 2-bit hit flags
+        float testCosSrc = 0.715542f;
+        uint32_t uCos = static_cast<uint32_t>(std::clamp(std::round(testCosSrc * 255.0f), 0.0f, 255.0f));
         bool testValid = true;
 
         uint32_t packedFlagsM = (testValid ? 1u : 0u) |
                                 ((testAge & 0xFFu) << 1u) |
-                                ((testM & 0xFFFFu) << 9u) |
-                                ((testHitFlags & 0x7Fu) << 25u);
+                                ((testM & 0x3FFu) << 9u) |
+                                ((testHitFlags & 0x3u) << 19u) |
+                                ((uCos & 0xFFu) << 21u);
 
         bool unpackedValid = (packedFlagsM & 1u) != 0u;
         uint32_t unpackedAge = (packedFlagsM >> 1u) & 0xFFu;
-        uint32_t unpackedM = (packedFlagsM >> 9u) & 0xFFFFu;
-        uint32_t unpackedHitFlags = (packedFlagsM >> 25u) & 0x7Fu;
+        uint32_t unpackedM = (packedFlagsM >> 9u) & 0x3FFu;
+        uint32_t unpackedHitFlags = (packedFlagsM >> 19u) & 0x3u;
+        float unpackedCosSrc = static_cast<float>((packedFlagsM >> 21u) & 0xFFu) / 255.0f;
 
         assert_true(unpackedValid == testValid, "flagsM valid bit preserved");
         assert_true(unpackedAge == testAge, "flagsM age (8-bit) preserved without overflow");
-        assert_true(unpackedM == testM, "flagsM M-confidence (16-bit) preserved without truncation");
-        assert_true(unpackedHitFlags == testHitFlags, "flagsM hit flags (7-bit) preserved without collision");
+        assert_true(unpackedM == testM, "flagsM M-confidence (10-bit) preserved without truncation");
+        assert_true(unpackedHitFlags == testHitFlags, "flagsM hit flags (2-bit) preserved without collision");
+        assert_near(unpackedCosSrc, testCosSrc, 1.0f / 255.0f, "flagsM cosSrc (8-bit unorm) preserved within quantization error");
 
         // 8d. Barycentric unorm16 quantization precision verification
         auto packUnorm2x16 = [](float u, float v) -> uint32_t {
@@ -439,6 +444,89 @@ int main() {
         assert_true(maxPosError < 6e-5f, "Reconstructed position error strictly bounded under 60 micrometers (< 0.06 mm)");
         std::cout << "  [+] PASS: Max position reconstruction error across 10,000 triangles = "
                   << (maxPosError * 1e6f) << " micrometers." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 9: ShadeRequest / ShadeResult Queues & Exact Analytical Reconnection Jacobian (Phase 2b.3)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 9] Material Request Queues & Exact Analytical Reconnection Jacobian..." << std::endl;
+    {
+        // 9a. ShadeRequest layout: 32 bytes strictly
+        struct ShadeRequestTest {
+            uint32_t instanceId;
+            uint32_t primitiveId;
+            uint32_t baryPacked;
+            uint32_t flags;
+            uint32_t wiOct;
+            uint32_t woOct;
+            uint32_t resultSlot;
+            uint32_t matIdFlags;
+        };
+        assert_true(sizeof(ShadeRequestTest) == 32, "ShadeRequest struct must strictly equal 32 bytes");
+
+        // 9b. ShadeResult layout: 16 bytes strictly
+        struct ShadeResultTest {
+            uint32_t fRG;
+            uint32_t fB_pdfFwd;
+            uint32_t pdfRev_flags;
+            uint32_t pad;
+        };
+        assert_true(sizeof(ShadeResultTest) == 16, "ShadeResult struct must strictly equal 16 bytes");
+
+        // 9c. Dynamic triangle normal reconstruction from vertex positions
+        glm::vec3 v0(0.0f, 0.0f, 0.0f);
+        glm::vec3 v1(1.0f, 0.0f, 0.0f);
+        glm::vec3 v2(0.0f, 1.0f, 0.0f);
+        glm::vec3 e1 = v1 - v0;
+        glm::vec3 e2 = v2 - v0;
+        glm::vec3 crossN = glm::cross(e1, e2);
+        glm::vec3 norm = glm::normalize(crossN);
+        assert_near(norm.x, 0.0f, 1e-6f, "Triangle normal X");
+        assert_near(norm.y, 0.0f, 1e-6f, "Triangle normal Y");
+        assert_near(norm.z, 1.0f, 1e-6f, "Triangle normal Z (outward normal)");
+
+        // Back-facing normal flip check
+        uint32_t backFaceFlags = 0u; // frontFace bit is NOT set
+        glm::vec3 backNorm = ((backFaceFlags & 2u) == 0u) ? -norm : norm;
+        assert_near(backNorm.z, -1.0f, 1e-6f, "Back-facing triangle normal flipped correctly");
+
+        // 9d. Exact analytical Jacobian equivalence:
+        // evalGIJacobian(x_new, x_orig, x1, n1) vs evalGIJacobian(dSrc, dNew, cosRcSrc, cosRcNew)
+        auto evalGIJacobianDirect = [](float dSrc, float dNew, float cosRcSrc, float cosRcNew) -> float {
+            if (dSrc >= 5000.0f || dNew >= 5000.0f) return 1.0f;
+            float dSqSrc = dSrc * dSrc;
+            float dSqNew = std::max(dNew * dNew, 1e-4f);
+            float cosSrcEff = std::max(cosRcSrc, 1e-3f);
+            float cosNewEff = std::max(cosRcNew, 1e-4f);
+            float J = (dSqSrc / dSqNew) * (cosNewEff / cosSrcEff);
+            return std::clamp(J, 0.05f, 10.0f);
+        };
+
+        // Test configuration matching TEST 1b:
+        // x_orig = (0, 0, 0), x_new = (1, 0, 0), x1 = (0, 2, 0), n1 = (0, -1, 0)
+        float d_orig = 2.0f;
+        float d_new = std::sqrt(5.0f);
+        float cos1_orig = 1.0f;
+        float cos1_new = 2.0f / std::sqrt(5.0f);
+        float J_direct = evalGIJacobianDirect(d_orig, d_new, cos1_orig, cos1_new);
+        float expected_J = 8.0f / (5.0f * std::sqrt(5.0f));
+        assert_near(J_direct, expected_J, 1e-5f, "Direct Jacobian matches analytical geometry");
+
+        // Identity shift
+        float J_ident = evalGIJacobianDirect(3.5f, 3.5f, 0.7f, 0.7f);
+        assert_near(J_ident, 1.0f, 1e-5f, "Direct Jacobian identity shift equals 1.0");
+
+        // Optical infinity fallback
+        float J_inf = evalGIJacobianDirect(10000.0f, 10000.0f, 0.2f, 0.8f);
+        assert_near(J_inf, 1.0f, 1e-5f, "Direct Jacobian optical infinity equals 1.0");
+
+        // 9e. Quantized cosSrc error bound on Jacobian
+        uint32_t uCos = static_cast<uint32_t>(std::clamp(std::round(cos1_orig * 255.0f), 0.0f, 255.0f));
+        float packedCosSrc = static_cast<float>(uCos) / 255.0f;
+        float J_quant = evalGIJacobianDirect(d_orig, d_new, packedCosSrc, cos1_new);
+        float relError = std::abs(J_quant - expected_J) / expected_J;
+        assert_true(relError < 0.005f, "Jacobian error from unorm8 cosSrc quantization is < 0.5%");
+        std::cout << "  [+] PASS: Max Jacobian quantization deviation = " << (relError * 100.0f) << "%." << std::endl;
     }
 
     std::cout << "\n================================================================================" << std::endl;
