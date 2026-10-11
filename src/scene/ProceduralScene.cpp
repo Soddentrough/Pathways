@@ -2854,16 +2854,17 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
         addBox(scene.triangles, glm::vec3(0.0f, lightY + 0.025f, z),
                glm::vec3(2.0f * lightHalfW + 0.04f, 0.05f, lightDepth + 0.04f), 0.0f, 1);
 
+        const float quadY = lightY - 0.001f;
         addQuad(scene.triangles,
-                glm::vec3(-lightHalfW, lightY, z - lightHalfDepth),
-                glm::vec3( lightHalfW, lightY, z - lightHalfDepth),
-                glm::vec3( lightHalfW, lightY, z + lightHalfDepth),
-                glm::vec3(-lightHalfW, lightY, z + lightHalfDepth),
+                glm::vec3(-lightHalfW, quadY, z - lightHalfDepth),
+                glm::vec3( lightHalfW, quadY, z - lightHalfDepth),
+                glm::vec3( lightHalfW, quadY, z + lightHalfDepth),
+                glm::vec3(-lightHalfW, quadY, z + lightHalfDepth),
                 glm::vec3(0.0f, -1.0f, 0.0f), 10);
 
         // Add corresponding analytical LightGPU
         LightGPU light{};
-        light.position = glm::vec4(-lightHalfW, lightY - 0.01f, z - lightHalfDepth, LIGHT_AREA_QUAD);
+        light.position = glm::vec4(-lightHalfW, quadY - 0.005f, z - lightHalfDepth, LIGHT_AREA_QUAD);
         light.u = glm::vec4(2.0f * lightHalfW, 0.0f, 0.0f, 0.0f);
         light.v = glm::vec4(0.0f, 0.0f, lightDepth, 0.0f);
         light.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
