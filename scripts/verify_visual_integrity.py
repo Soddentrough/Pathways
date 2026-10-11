@@ -942,6 +942,7 @@ def test_restir_pt_veach_ajar_indirect_integrity():
     out_baseline = os.path.join(OUTPUT_DIR, "veach_ajar_baseline_pt.png")
     rc, stdout, stderr = run_pathways([
         "--scene", "scenes/veach-ajar/veach_ajar_extended.glb",
+        "--scene-bounces",
         "--res", "1080p",
         "--spp", "2",
         "--frames", "64",
@@ -961,6 +962,7 @@ def test_restir_pt_veach_ajar_indirect_integrity():
     out_restir = os.path.join(OUTPUT_DIR, "veach_ajar_restir_pt.png")
     rc, stdout, stderr = run_pathways([
         "--scene", "scenes/veach-ajar/veach_ajar_extended.glb",
+        "--scene-bounces",
         "--restir",
         "--res", "1080p",
         "--spp", "2",

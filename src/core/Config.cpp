@@ -468,6 +468,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.custom_bounces = true;
             continue;
         }
+        if (arg == "--scene-bounces") {
+            cfg.adopt_scene_bounces = true;
+            continue;
+        }
+        if (arg == "--no-scene-bounces") {
+            cfg.adopt_scene_bounces = false;
+            continue;
+        }
         if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
             cfg.frame_limit = static_cast<uint32_t>(std::stoul(argv[++i]));
             continue;

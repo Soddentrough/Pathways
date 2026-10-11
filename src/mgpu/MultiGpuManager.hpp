@@ -10,6 +10,7 @@
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
+#include "rt/ReSTIRManager.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -94,6 +95,9 @@ struct GpuDeviceNode {
 
     // Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
     std::unique_ptr<Fsr3Upscaler> upscaler;
+
+    // Secondary GPU ReSTIR Spatiotemporal Resampling Manager
+    std::unique_ptr<ReSTIRManager> restirManager;
 
     ~GpuDeviceNode();
 };

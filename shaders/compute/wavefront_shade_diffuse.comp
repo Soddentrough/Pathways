@@ -722,7 +722,7 @@ void main() {
                         float giCosA = cos(giAngle);
                         float giSinA = sin(giAngle);
 
-                        for (uint tap = 1u; tap <= 32u; ++tap) {
+                        for (uint tap = 1u; tap <= 4u; ++tap) {
                             vec2 baseF = vec2(RESTIR_TAP_OFFSETS[tap - 1u]);
                             ivec2 rotBase = ivec2(round(vec2(giCosA * baseF.x - giSinA * baseF.y,
                                                              giSinA * baseF.x + giCosA * baseF.y)));

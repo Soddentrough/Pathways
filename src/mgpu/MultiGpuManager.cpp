@@ -1303,6 +1303,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->positionBuffer = std::make_unique<Buffer>(
         secAlloc, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
@@ -1624,6 +1625,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 0,
                 wfTailMegakernelCode
             );
+            secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
+            if (config.enable_restir) {
+                secNode->restirManager->resize(config.width, config.height);
+            }
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
         } catch (const std::exception& e) {
@@ -1749,6 +1754,14 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
 
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
         if (!secNode->cameraUBOs[slot]) continue;
+        Buffer* restirCurrBuf = secNode->restirManager ? secNode->restirManager->getReservoirBuffer(slot) : nullptr;
+        Buffer* restirPrevBuf = secNode->restirManager ? secNode->restirManager->getReservoirBuffer(1 - slot) : nullptr;
+        VkBuffer restirReservoirBuf = restirCurrBuf ? restirCurrBuf->getBuffer() : VK_NULL_HANDLE;
+        VkBuffer restirHistoryReservoirBuf = restirPrevBuf ? restirPrevBuf->getBuffer() : VK_NULL_HANDLE;
+        Buffer* giCurrBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(slot) : nullptr;
+        Buffer* giPrevBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(1 - slot) : nullptr;
+        Buffer* x1CtxBuf = secNode->restirManager ? secNode->restirManager->getX1ContextBuffer() : nullptr;
+
         secNode->wavefrontPipeline->updateSceneDescriptors(
             slot,
             secNode->accumTargets[slot]->getImageView(),
@@ -1769,11 +1782,16 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             secNode->instanceBuffer ? secNode->instanceBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->instanceBuffer ? secNode->instanceBuffer->getSize() : 0,
             secNode->causticImage ? secNode->causticImage->getImageView() : VK_NULL_HANDLE,
-            VK_NULL_HANDLE,
+            restirReservoirBuf,
             secNode->materialArchetypeBuffer ? secNode->materialArchetypeBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->materialArchetypeBuffer ? secNode->materialArchetypeBuffer->getSize() : 0,
             secNode->shadeMaterialBuffer ? secNode->shadeMaterialBuffer->getBuffer() : VK_NULL_HANDLE,
-            secNode->shadeMaterialBuffer ? secNode->shadeMaterialBuffer->getSize() : 0
+            secNode->shadeMaterialBuffer ? secNode->shadeMaterialBuffer->getSize() : 0,
+            restirHistoryReservoirBuf,
+            x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
+            giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
+            giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
+            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE
         );
     }
 }
@@ -1961,6 +1979,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                              m_config.upways_superres ||
                              !m_config.capture_training_data_dir.empty());
         wfSceneData.captureMlData = needGbuffers ? 2u : 0u;
+
+        if (m_config.enable_restir && node->restirManager) {
+            node->restirManager->recordClearIfNeeded(cmd);
+        }
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, packet.cameraUniform.maxBounces, wfSceneData);
@@ -2443,6 +2465,12 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         }
         if (node->wavefrontPipeline) {
             node->wavefrontPipeline->resize(width, height);
+            if (m_config.enable_restir) {
+                if (!node->restirManager) {
+                    node->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
+                }
+                node->restirManager->resize(width, height);
+            }
             updateSecondaryWavefrontDescriptors(node.get());
         }
         if (node->upscaler) {
@@ -2462,39 +2490,51 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 void MultiGpuManager::setConfig(const Config& config) {
     bool upscalerChanged = (config.upscaler_mode != m_config.upscaler_mode) ||
                            (config.render_scale != m_config.render_scale);
+    bool restirChanged = (config.enable_restir != m_config.enable_restir);
     m_config = config;
-    if (upscalerChanged && !m_devices.empty()) {
+    if (!m_devices.empty()) {
         GpuDeviceNode* secNode = m_devices[0].get();
-        if (config.upscaler_mode == UpscalerMode::FSR3) {
-            uint32_t renderW = (config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(config.width * config.render_scale) :
-                config.width;
-            uint32_t renderH = (config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(config.height * config.render_scale) :
-                config.height;
-            if (!secNode->upscaler) {
-                try {
-                    auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
-                    auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
-                    VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-                    secNode->upscaler = std::make_unique<Fsr3Upscaler>(
-                        secNode->context->getDevice(),
-                        secNode->context->getPhysicalDevice(),
-                        secNode->context->getAllocator(),
-                        renderW, renderH, config.width, config.height,
-                        upscaleCode, rcasCode, accumFormat,
-                        "[GPU 1 Secondary Peer]"
-                    );
-                    Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
-                } catch (const std::exception& e) {
-                    Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler on setConfig: {}", e.what());
-                    secNode->upscaler.reset();
+        if (m_config.enable_restir) {
+            if (!secNode->restirManager) {
+                secNode->restirManager = std::make_unique<ReSTIRManager>(secNode->context->getDevice(), secNode->context->getAllocator());
+            }
+            if (!secNode->restirManager->isInitialized()) {
+                secNode->restirManager->resize(m_config.width, m_config.height);
+                updateSecondaryWavefrontDescriptors(secNode);
+            }
+        }
+        if (upscalerChanged) {
+            if (config.upscaler_mode == UpscalerMode::FSR3) {
+                uint32_t renderW = (config.render_scale < 1.0f) ?
+                    static_cast<uint32_t>(config.width * config.render_scale) :
+                    config.width;
+                uint32_t renderH = (config.render_scale < 1.0f) ?
+                    static_cast<uint32_t>(config.height * config.render_scale) :
+                    config.height;
+                if (!secNode->upscaler) {
+                    try {
+                        auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
+                        auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
+                        VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+                        secNode->upscaler = std::make_unique<Fsr3Upscaler>(
+                            secNode->context->getDevice(),
+                            secNode->context->getPhysicalDevice(),
+                            secNode->context->getAllocator(),
+                            renderW, renderH, config.width, config.height,
+                            upscaleCode, rcasCode, accumFormat,
+                            "[GPU 1 Secondary Peer]"
+                        );
+                        Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
+                    } catch (const std::exception& e) {
+                        Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler on setConfig: {}", e.what());
+                        secNode->upscaler.reset();
+                    }
+                } else {
+                    secNode->upscaler->resize(renderW, renderH, config.width, config.height);
                 }
             } else {
-                secNode->upscaler->resize(renderW, renderH, config.width, config.height);
+                secNode->upscaler.reset();
             }
-        } else {
-            secNode->upscaler.reset();
         }
     }
 }
@@ -2535,6 +2575,7 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     secNode->positionBuffer = std::make_unique<Buffer>(
         secAlloc, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0

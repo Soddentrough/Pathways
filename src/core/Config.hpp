@@ -108,6 +108,7 @@ struct Config {
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
     bool custom_bounces = false;    // Set to true when --max-bounces or --bounces is passed explicitly on CLI
+    bool adopt_scene_bounces = false; // Set to true via --scene-bounces to adopt sceneDefaultMaxBounces from scene metadata
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;
