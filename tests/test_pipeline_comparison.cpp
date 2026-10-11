@@ -108,6 +108,42 @@ int main() {
         Config cFps1 = Config::parse(3, const_cast<char**>(argvFps1));
         assert_near(cFps1.target_frame_time_ms, 16.6667f, 0.01f, "--target-fps auto-derives frame budget");
 
+        // CLI default values and flag overrides verification
+        check_true(cfgDef.restir_m_cap == 60, "Default restir_m_cap must be 60");
+        const char* argvMCap[] = { "pathways", "--restir-m-cap", "45" };
+        Config cMCap = Config::parse(3, const_cast<char**>(argvMCap));
+        check_true(cMCap.restir_m_cap == 45, "--restir-m-cap sets custom M-cap");
+
+        const char* argvMCapEq[] = { "pathways", "--restir-m-cap=80" };
+        Config cMCapEq = Config::parse(2, const_cast<char**>(argvMCapEq));
+        check_true(cMCapEq.restir_m_cap == 80, "--restir-m-cap=val sets custom M-cap");
+
+        check_true(cfgDef.capture_reference_spp == 256, "Default capture_reference_spp must be 256");
+        const char* argvRefSpp[] = { "pathways", "--capture-reference-spp", "128" };
+        Config cRefSpp = Config::parse(3, const_cast<char**>(argvRefSpp));
+        check_true(cRefSpp.capture_reference_spp == 128, "--capture-reference-spp sets custom reference SPP");
+
+        check_true(cfgDef.capture_channels == 20, "Default capture_channels must be 20");
+        check_true(cfgDef.instance_density == 1.0f, "Default instance_density must be 1.0");
+        check_true(cfgDef.cull_distance == 0.0f, "Default cull_distance must be 0.0");
+
+        const char* argvDensity[] = { "pathways", "--instance-density", "0.75", "--cull-distance", "50.0" };
+        Config cDensity = Config::parse(5, const_cast<char**>(argvDensity));
+        assert_near(cDensity.instance_density, 0.75f, 0.001f, "--instance-density sets density");
+        assert_near(cDensity.cull_distance, 50.0f, 0.001f, "--cull-distance sets cull distance");
+
+        const char* argvDensityEq[] = { "pathways", "--density=0.5", "--cull-dist=100.0" };
+        Config cDensityEq = Config::parse(3, const_cast<char**>(argvDensityEq));
+        assert_near(cDensityEq.instance_density, 0.5f, 0.001f, "--density=val sets density");
+        assert_near(cDensityEq.cull_distance, 100.0f, 0.001f, "--cull-dist=val sets cull distance");
+
+        check_true(!cfgDef.adopt_scene_bounces, "Default adopt_scene_bounces must be false");
+        const char* argvSceneBnc[] = { "pathways", "--scene-bounces" };
+        Config cSceneBnc = Config::parse(2, const_cast<char**>(argvSceneBnc));
+        check_true(cSceneBnc.adopt_scene_bounces, "--scene-bounces enables adopt_scene_bounces");
+
+        check_true(!Config::dgcExecSetRequested(), "Default DGC execution set policy must be disabled (multi-dispatch default)");
+
         std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, and frame budget successfully verified." << std::endl;
     }
 

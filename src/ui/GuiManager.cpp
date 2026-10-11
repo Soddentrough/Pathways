@@ -513,13 +513,34 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (stats.secondary_gpu_time_ms > 0.001) {
                 ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms);
                 ImGui::Text("  GPU 1 Ray Tracing:     %.3f ms", stats.secondary_gpu_time_ms);
-                ImGui::Text("  Tonemap & Merge Pass:  %.3f ms", stats.tonemap_time_ms);
 
-                float totalWork = static_cast<float>(stats.primary_gpu_time_ms + stats.secondary_gpu_time_ms);
-                float primaryFraction = totalWork > 0.001f ? (static_cast<float>(stats.primary_gpu_time_ms) / totalWork) : 0.5f;
-                char loadBuf[64];
-                std::snprintf(loadBuf, sizeof(loadBuf), "GPU 0: %.1f%% | GPU 1: %.1f%%", primaryFraction * 100.0f, (1.0f - primaryFraction) * 100.0f);
-                ImGui::ProgressBar(primaryFraction, ImVec2(hudW - 60.0f, 16.0f), loadBuf);
+                if (stats.mgpu_bottleneck_gpu == -1) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "  Workload Balance:      Balanced (Skew: %.3f ms)", stats.mgpu_skew_ms);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "  Workload Balance:      Skew %.3f ms (%.1f%%) [GPU %d Bottleneck]",
+                                       stats.mgpu_skew_ms, stats.mgpu_imbalance_pct, stats.mgpu_bottleneck_gpu);
+                }
+
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "PCIe Interconnect Transfers:");
+                double secToPrimMb = static_cast<double>(stats.mgpu_sec_to_prim_bytes) / (1024.0 * 1024.0);
+                if (stats.pcie_transfer_time_ms > 0.0001) {
+                    ImGui::Text("  GPU 1 -> GPU 0 (Image): %.2f MB @ %.1f GB/s (%.3f ms)",
+                                secToPrimMb, stats.mgpu_sec_to_prim_gbps, stats.pcie_transfer_time_ms);
+                } else if (secToPrimMb > 0.0) {
+                    ImGui::Text("  GPU 1 -> GPU 0 (Image): %.2f MB (P2P Direct BAR)", secToPrimMb);
+                }
+                ImGui::Text("  GPU 0 -> GPU 1 (UBO):   %zu B @ %.1f GB/s (<0.001 ms)",
+                            stats.mgpu_prim_to_sec_bytes, stats.mgpu_prim_to_sec_gbps);
+
+                ImGui::Separator();
+                if (stats.mgpu_async_merge_active) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.7f, 1.0f), "  Async Compute Merge:   %.3f ms [Family 1, Non-blocking]", stats.mgpu_async_merge_time_ms);
+                    ImGui::Text("  Tonemap & Present:     %.3f ms [Family 0]", stats.tonemap_time_ms);
+                } else {
+                    ImGui::Text("  Tonemap & Merge Pass:  %.3f ms [Inline Graphics]", stats.tonemap_time_ms);
+                }
+
             } else {
                 ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms > 0.0 ? stats.primary_gpu_time_ms : currentFrameTime);
                 ImGui::Text("  ACES Filmic Tonemap:   %.3f ms", stats.tonemap_time_ms);
@@ -724,22 +745,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         }
         ImGui::PopStyleColor(2);
 
-        // 0. SCENE NOTICES & FALLBACKS (Zero-Scroll Alert)
-        if (stats.has_fallback_sun || !stats.scene_warnings.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.65f, 0.15f, 0.9f));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.35f, 1.0f));
-            ImGui::SeparatorText("SCENE NOTICES & FALLBACKS");
-            if (stats.has_fallback_sun) {
-                ImGui::BulletText("FALLBACK ACTIVE: Synthetic Directional Sun");
-                ImGui::TextDisabled("  Asset defines 0 lights; fallback sun was generated.");
-            }
-            for (const auto& warn : stats.scene_warnings) {
-                ImGui::BulletText("%s", warn.c_str());
-            }
-            ImGui::PopStyleColor(2);
-            ImGui::Spacing();
-        }
-
         // 1. PRIMARY RAY BUDGET & PROGRESSIVE ACCUMULATION (ZERO-SCROLL PRIORITY)
         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.32f, 0.24f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.44f, 0.32f, 1.0f));
@@ -748,51 +753,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PopStyleColor(3);
 
         if (qualityHeaderOpen) {
-            // Scene Authoring Defaults & Quick Sync
-            if (stats.has_scene_metadata && (stats.scene_default_spp > 0 || stats.scene_default_max_bounces > 0)) {
-                bool sppDiffers = (stats.scene_default_spp > 0 && config.spp != stats.scene_default_spp);
-                bool bncDiffers = (stats.scene_default_max_bounces > 0 && config.max_bounces != stats.scene_default_max_bounces);
-
-                std::string metaStr = std::format("Scene Authoring ({}): {} SPP, {} Bounces",
-                    stats.scene_source_format.empty() ? "Asset" : stats.scene_source_format.c_str(),
-                    stats.scene_default_spp, stats.scene_default_max_bounces);
-                if (stats.scene_default_width > 0 && stats.scene_default_height > 0) {
-                    metaStr += std::format(" ({}x{})", stats.scene_default_width, stats.scene_default_height);
-                }
-                ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), "%s", metaStr.c_str());
-
-                if (sppDiffers || bncDiffers) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.40f, 0.55f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.52f, 0.72f, 1.0f));
-                    std::string applyLabel = std::format("Apply Scene Defaults ({} SPP, {} Bounces)",
-                        stats.scene_default_spp > 0 ? stats.scene_default_spp : config.spp,
-                        stats.scene_default_max_bounces > 0 ? stats.scene_default_max_bounces : config.max_bounces);
-                    if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f))) {
-                        if (stats.scene_default_spp > 0) config.spp = stats.scene_default_spp;
-                        if (stats.scene_default_max_bounces > 0) config.max_bounces = stats.scene_default_max_bounces;
-                        settingsChanged = true;
-                        if (actions) actions->resetAccumulation = true;
-                    }
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Instantly set ray budget and bounce depth to match author's reference scene settings.");
-                    }
-                    ImGui::PopStyleColor(2);
-                }
-                ImGui::Spacing();
-            }
-
             // Samples Per Pixel (SPP)
             int spp = static_cast<int>(config.spp);
-            int maxSppSlider = static_cast<int>(std::max(64u, stats.scene_default_spp));
+            int maxSppSlider = static_cast<int>(std::max(64u, config.spp));
             ImGui::Text("Samples/Pixel (SPP)");
-            if (stats.scene_default_spp > 0) {
-                ImGui::SameLine();
-                if (config.spp == stats.scene_default_spp) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "(Scene default: %u - Matched)", stats.scene_default_spp);
-                } else {
-                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "(Scene default: %u)", stats.scene_default_spp);
-                }
-            }
             if (ImGui::SliderInt("##SppSlider", &spp, 1, maxSppSlider)) {
                 config.spp = static_cast<uint32_t>(spp);
                 settingsChanged = true;
@@ -838,12 +802,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawSppPreset(16, "16");
             drawSppPreset(32, "32");
             drawSppPreset(64, "64");
-            if (stats.scene_default_spp > 0 && stats.scene_default_spp != 1 && stats.scene_default_spp != 2 &&
-                stats.scene_default_spp != 4 && stats.scene_default_spp != 8 && stats.scene_default_spp != 16 &&
-                stats.scene_default_spp != 32 && stats.scene_default_spp != 64) {
-                std::string scPresetLabel = std::format("Scene ({})", stats.scene_default_spp);
-                drawSppPreset(stats.scene_default_spp, scPresetLabel.c_str());
-            }
             ImGui::PopID();
             ImGui::NewLine();
 
@@ -851,16 +809,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             // Ray Bounces
             int bounces = static_cast<int>(config.max_bounces);
-            int maxBouncesSlider = static_cast<int>(std::max(16u, std::min(64u, stats.scene_default_max_bounces)));
+            int maxBouncesSlider = static_cast<int>(std::max(16u, config.max_bounces));
             ImGui::Text("Max Ray Bounces");
-            if (stats.scene_default_max_bounces > 0) {
-                ImGui::SameLine();
-                if (config.max_bounces == stats.scene_default_max_bounces) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "(Scene default: %u - Matched)", stats.scene_default_max_bounces);
-                } else {
-                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "(Scene default: %u)", stats.scene_default_max_bounces);
-                }
-            }
             if (ImGui::SliderInt("##BncSlider", &bounces, 1, maxBouncesSlider)) {
                 config.max_bounces = static_cast<uint32_t>(bounces);
                 settingsChanged = true;
@@ -904,12 +854,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawBncPreset(4, "4 (Default)");
             drawBncPreset(8, "8");
             drawBncPreset(16, "16 (Max)");
-            if (stats.scene_default_max_bounces > 0 && stats.scene_default_max_bounces != 1 &&
-                stats.scene_default_max_bounces != 2 && stats.scene_default_max_bounces != 4 &&
-                stats.scene_default_max_bounces != 8 && stats.scene_default_max_bounces != 16) {
-                std::string scPresetLabel = std::format("Scene ({})", stats.scene_default_max_bounces);
-                drawBncPreset(stats.scene_default_max_bounces, scPresetLabel.c_str());
-            }
             ImGui::PopID();
             ImGui::NewLine();
 
@@ -1041,6 +985,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (sceneHeaderOpen) {
                 // Category Filter Tabs
                 static int sceneCategoryFilter = 0; // 0: All, 1: Showcase, 2: Research, 3: USD, 4: Custom, 5: Procedural
+                static int lastSyncedSceneIndex = -1;
+                if (lastSyncedSceneIndex != currentSceneIndex && currentSceneIndex >= 0 && currentSceneIndex < static_cast<int>(availableScenes.size())) {
+                    lastSyncedSceneIndex = currentSceneIndex;
+                    const auto& grp = availableScenes[currentSceneIndex].group;
+                    if (grp == "Showcase") sceneCategoryFilter = 1;
+                    else if (grp == "Research") sceneCategoryFilter = 2;
+                    else if (grp == "USD Scenes") sceneCategoryFilter = 3;
+                    else if (grp == "Custom") sceneCategoryFilter = 4;
+                    else if (grp == "Procedural") sceneCategoryFilter = 5;
+                }
 
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 3.0f));
                 auto drawFilterTab = [&](const char* name, int filterIdx) {
@@ -1182,6 +1136,51 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
 
                 ImGui::EndDisabled();
+
+                // Scene Authoring Reference Info & Quick Sync (Contextual to selected scene)
+                if (stats.has_scene_metadata && (stats.scene_default_spp > 0 || stats.scene_default_max_bounces > 0)) {
+                    ImGui::Spacing();
+                    std::string metaStr = std::format("Author Reference ({}): {} SPP, {} Bounces",
+                        stats.scene_source_format.empty() ? "Asset" : stats.scene_source_format.c_str(),
+                        stats.scene_default_spp, stats.scene_default_max_bounces);
+                    if (stats.scene_default_width > 0 && stats.scene_default_height > 0) {
+                        metaStr += std::format(" ({}x{})", stats.scene_default_width, stats.scene_default_height);
+                    }
+                    ImGui::TextColored(ImVec4(0.45f, 0.82f, 1.0f, 1.0f), "%s", metaStr.c_str());
+
+                    uint32_t targetSpp = std::clamp(stats.scene_default_spp, 1u, 64u);
+                    uint32_t targetBnc = std::clamp(stats.scene_default_max_bounces, 1u, 16u);
+                    bool canApply = (stats.scene_default_spp > 0 && config.spp != targetSpp) ||
+                                    (stats.scene_default_max_bounces > 0 && config.max_bounces != targetBnc);
+
+                    ImGui::BeginDisabled(!canApply);
+                    std::string applyLabel = canApply
+                        ? std::format("Apply Reference Settings ({} SPP, {} Bounces)", targetSpp, targetBnc)
+                        : "Reference Settings Active (Matched)";
+                    if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f))) {
+                        if (stats.scene_default_spp > 0) config.spp = targetSpp;
+                        if (stats.scene_default_max_bounces > 0) config.max_bounces = targetBnc;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (canApply && ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Set ray budget and bounce depth to match author's reference scene settings (clamped to real-time limits).");
+                    }
+                    ImGui::EndDisabled();
+                }
+
+                // Scene Notices & Fallbacks (Contextual to active scene asset)
+                if (stats.has_fallback_sun || !stats.scene_warnings.empty()) {
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.82f, 0.30f, 1.0f));
+                    if (stats.has_fallback_sun) {
+                        ImGui::BulletText("Lighting: Fallback Synthetic Sun active (0 lights in asset)");
+                    }
+                    for (const auto& warn : stats.scene_warnings) {
+                        ImGui::BulletText("%s", warn.c_str());
+                    }
+                    ImGui::PopStyleColor();
+                }
 
                 // Prominent Activity Banner when Scene Loading is in Progress
                 if (stats.is_scene_loading) {

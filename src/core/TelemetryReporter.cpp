@@ -472,6 +472,35 @@ FrameStats TelemetryReporter::getStats() const {
             stats.secondary_gpu_clock_mhz = m_engine->m_hwMonitor ? m_engine->m_hwMonitor->getGpu1ClockMhz() : 0;
             stats.secondary_gpu_temp_c = m_engine->m_hwMonitor ? m_engine->m_hwMonitor->getGpu1TempC() : 0;
         }
+
+        // Multi-GPU Interconnect, Skew, and Async Telemetry
+        stats.pcie_transfer_time_ms = m_engine->m_mgpu->getSecondaryTransferTimeMs();
+        stats.mgpu_sec_to_prim_bytes = m_engine->m_mgpuCoordinator ? m_engine->m_mgpuCoordinator->getLastSecToPrimBytes() : 0;
+        if (stats.pcie_transfer_time_ms > 0.0001 && stats.mgpu_sec_to_prim_bytes > 0) {
+            stats.mgpu_sec_to_prim_gbps = (static_cast<double>(stats.mgpu_sec_to_prim_bytes) / (1024.0 * 1024.0 * 1024.0)) / (stats.pcie_transfer_time_ms * 0.001);
+        }
+        stats.mgpu_prim_to_sec_bytes = sizeof(CameraUniform) + 64; // Camera UBO + Push Constants
+        uint32_t width = stats.secondary_pci_width > 0 ? stats.secondary_pci_width : 16;
+        double laneGbps = 1.969; // PCIe 4.0 ~1.969 GB/s per lane
+        if (stats.secondary_pci_speed.find("Gen 5") != std::string::npos || stats.secondary_pci_speed.find("5.0") != std::string::npos) {
+            laneGbps = 3.938;
+        } else if (stats.secondary_pci_speed.find("Gen 3") != std::string::npos || stats.secondary_pci_speed.find("3.0") != std::string::npos) {
+            laneGbps = 0.985;
+        }
+        stats.mgpu_prim_to_sec_gbps = width * laneGbps;
+
+        if (m_engine->m_mgpuCoordinator && m_engine->m_mgpuCoordinator->hasDedicatedAsyncCompute()) {
+            stats.mgpu_async_merge_active = true;
+            stats.mgpu_async_merge_time_ms = m_engine->m_mgpuCoordinator->getLastAsyncMergeTimeMs();
+        } else {
+            stats.mgpu_async_merge_active = false;
+            stats.mgpu_async_merge_time_ms = 0.0;
+        }
+
+        stats.mgpu_skew_ms = std::abs(stats.primary_gpu_time_ms - stats.secondary_gpu_time_ms);
+        double maxRt = std::max(stats.primary_gpu_time_ms, stats.secondary_gpu_time_ms);
+        stats.mgpu_imbalance_pct = (maxRt > 0.001) ? static_cast<float>((stats.mgpu_skew_ms / maxRt) * 100.0) : 0.0f;
+        stats.mgpu_bottleneck_gpu = (stats.mgpu_skew_ms < 0.02) ? -1 : ((stats.primary_gpu_time_ms > stats.secondary_gpu_time_ms) ? 0 : 1);
     } else if (m_engine->m_mgpu && m_engine->m_mgpu->isSecondaryInitialized()) {
         stats.is_mgpu_active = false;
         stats.secondary_gpu_name = m_engine->m_mgpu->getSecondaryDeviceName();
@@ -488,6 +517,16 @@ FrameStats TelemetryReporter::getStats() const {
         }
         stats.secondary_gpu_clock_mhz = m_engine->m_hwMonitor ? m_engine->m_hwMonitor->getGpu1ClockMhz() : 0;
         stats.secondary_gpu_temp_c = m_engine->m_hwMonitor ? m_engine->m_hwMonitor->getGpu1TempC() : 0;
+        stats.pcie_transfer_time_ms = 0.0;
+        stats.mgpu_sec_to_prim_bytes = 0;
+        stats.mgpu_prim_to_sec_bytes = 0;
+        stats.mgpu_sec_to_prim_gbps = 0.0;
+        stats.mgpu_prim_to_sec_gbps = 0.0;
+        stats.mgpu_async_merge_active = false;
+        stats.mgpu_async_merge_time_ms = 0.0;
+        stats.mgpu_skew_ms = 0.0;
+        stats.mgpu_imbalance_pct = 0.0f;
+        stats.mgpu_bottleneck_gpu = -1;
     } else {
         stats.is_mgpu_active = false;
         stats.secondary_gpu_name = "";
@@ -501,6 +540,16 @@ FrameStats TelemetryReporter::getStats() const {
         stats.secondary_pci_degraded_reason = "";
         stats.secondary_gpu_clock_mhz = 0;
         stats.secondary_gpu_temp_c = 0;
+        stats.pcie_transfer_time_ms = 0.0;
+        stats.mgpu_sec_to_prim_bytes = 0;
+        stats.mgpu_prim_to_sec_bytes = 0;
+        stats.mgpu_sec_to_prim_gbps = 0.0;
+        stats.mgpu_prim_to_sec_gbps = 0.0;
+        stats.mgpu_async_merge_active = false;
+        stats.mgpu_async_merge_time_ms = 0.0;
+        stats.mgpu_skew_ms = 0.0;
+        stats.mgpu_imbalance_pct = 0.0f;
+        stats.mgpu_bottleneck_gpu = -1;
     }
 
     // 4. Hardware Support Levels (all values derived from queried device state;

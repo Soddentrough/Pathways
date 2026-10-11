@@ -12,9 +12,10 @@ MultiGpuCoordinator::~MultiGpuCoordinator() {
     }
 }
 
-void MultiGpuCoordinator::init(VkDevice device, uint32_t asyncComputeQueueFamily, bool hasDedicatedAsyncCompute) {
+void MultiGpuCoordinator::init(VkDevice device, uint32_t asyncComputeQueueFamily, bool hasDedicatedAsyncCompute, float timestampPeriod) {
     m_device = device;
     m_hasDedicatedAsyncCompute = hasDedicatedAsyncCompute;
+    m_timestampPeriod = timestampPeriod;
     if (hasDedicatedAsyncCompute) {
         VkCommandPoolCreateInfo asyncPoolInfo{};
         asyncPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -28,6 +29,11 @@ void MultiGpuCoordinator::init(VkDevice device, uint32_t asyncComputeQueueFamily
         asyncAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         asyncAllocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
         vkAllocateCommandBuffers(device, &asyncAllocInfo, m_mergeCommandBuffers.data());
+
+        VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = MAX_FRAMES_IN_FLIGHT * 2;
+        vkCreateQueryPool(device, &queryInfo, nullptr, &m_queryPool);
     }
 
     VkSemaphoreCreateInfo semInfo{};
@@ -45,6 +51,11 @@ void MultiGpuCoordinator::destroy(VkDevice device) {
             m_mergeCompleteSemaphores[i] = VK_NULL_HANDLE;
         }
     }
+    if (m_queryPool != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(device, m_queryPool, nullptr);
+        m_queryPool = VK_NULL_HANDLE;
+    }
+    m_slotHasExecuted.fill(false);
     if (m_asyncComputeCommandPool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device, m_asyncComputeCommandPool, nullptr);
         m_asyncComputeCommandPool = VK_NULL_HANDLE;
@@ -63,11 +74,6 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     uint32_t bytesPerPixel = (plan.formatMode == 0u) ? 8 : (plan.formatMode == 2u) ? 4 : 16;
     plan.frameBytes = 0;
     plan.dstHost = nullptr;
-
-    if (params.mgpu && !params.mgpu->isZeroCopyActive() && !params.mgpu->isP2PDirectBarActive()) {
-        plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * bytesPerPixel;
-        plan.dstHost = params.secTransferBuffer ? params.secTransferBuffer->map() : nullptr;
-    }
 
     plan.activeMode = params.config.mgpu_mode;
     if (plan.activeMode == MultiGpuMode::Auto) {
@@ -170,8 +176,20 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         params.mgpu->setConfig(params.config);
     }
 
-    if (params.mgpu && !params.mgpu->isZeroCopyActive() && !params.mgpu->isP2PDirectBarActive()) {
+    if (plan.isSampleBlendFsr3) {
+        plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * 8;
+    } else {
         plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
+        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+                             params.config.upscaler_mode == UpscalerMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Upways);
+        if (plan.tileOffsetX_sec == 2u && needGbuffers) {
+            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 12; // 4 MV + 8 NormDepth
+        }
+    }
+    m_lastSecToPrimBytes = plan.frameBytes;
+
+    if (params.mgpu && !params.mgpu->isZeroCopyActive() && !params.mgpu->isP2PDirectBarActive()) {
         plan.dstHost = params.secTransferBuffer ? params.secTransferBuffer->map() : nullptr;
     }
 
@@ -417,14 +435,34 @@ bool MultiGpuCoordinator::executeAsyncMerge(
     VkCommandBuffer cmd = m_mergeCommandBuffers[slot];
     if (cmd == VK_NULL_HANDLE) return false;
 
+    // Read timestamp query results from previous execution of this slot
+    if (m_slotHasExecuted[slot] && m_queryPool != VK_NULL_HANDLE) {
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(m_device, m_queryPool, slot * 2, 2, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            if (ts[1] > ts[0]) {
+                m_lastAsyncMergeTimeMs = (ts[1] - ts[0]) * m_timestampPeriod * 1e-6;
+            }
+        }
+    }
+
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    if (m_queryPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, m_queryPool, slot * 2, 2);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, slot * 2 + 0);
+    }
+
     recordMergePass(cmd, plan, params, postProcess, frameImage, mlDiffuseImage);
 
+    if (m_queryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, slot * 2 + 1);
+    }
+
     vkEndCommandBuffer(cmd);
+    m_slotHasExecuted[slot] = true;
 
     std::vector<VkSemaphoreSubmitInfo> waitInfos;
     VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };

@@ -92,7 +92,7 @@ public:
     MultiGpuCoordinator& operator=(const MultiGpuCoordinator&) = delete;
 
     /// Initializes async compute command pool and merge command buffers/semaphores if supported.
-    void init(VkDevice device, uint32_t asyncComputeQueueFamily, bool hasDedicatedAsyncCompute);
+    void init(VkDevice device, uint32_t asyncComputeQueueFamily, bool hasDedicatedAsyncCompute, float timestampPeriod = 1.0f);
 
     /// Destroys Vulkan resources owned by the coordinator.
     void destroy(VkDevice device);
@@ -164,13 +164,22 @@ public:
     [[nodiscard]] VkCommandPool getAsyncComputeCommandPool() const noexcept { return m_asyncComputeCommandPool; }
     [[nodiscard]] VkCommandBuffer getMergeCommandBuffer(uint32_t slot) const noexcept { return m_mergeCommandBuffers[slot]; }
     [[nodiscard]] VkSemaphore getMergeCompleteSemaphore(uint32_t slot) const noexcept { return m_mergeCompleteSemaphores[slot]; }
+    [[nodiscard]] bool hasDedicatedAsyncCompute() const noexcept { return m_hasDedicatedAsyncCompute; }
+    [[nodiscard]] double getLastAsyncMergeTimeMs() const noexcept { return m_lastAsyncMergeTimeMs; }
+    [[nodiscard]] size_t getLastSecToPrimBytes() const noexcept { return m_lastSecToPrimBytes; }
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
     bool m_hasDedicatedAsyncCompute = false;
     VkCommandPool m_asyncComputeCommandPool = VK_NULL_HANDLE;
+    VkQueryPool m_queryPool = VK_NULL_HANDLE;
+    float m_timestampPeriod = 1.0f;
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_mergeCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_mergeCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotHasExecuted = { false, false };
+
+    double m_lastAsyncMergeTimeMs = 0.0;
+    size_t m_lastSecToPrimBytes = 0;
 
     MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;
 };

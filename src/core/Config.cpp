@@ -265,16 +265,25 @@ void Config::printUsage(const char* progName) {
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
+              << "  --exposure <float>      Display exposure scale factor (default: 1.0)\n"
               << "  --no-hdr                Disable HDR display auto-negotiation (force SDR sRGB)\n"
               << "  --hdr-peak <float>      Display peak luminance in nits (default: 1000.0)\n"
-              << "  --hdr-white <float>     Reference paper white luminance in nits (default: 200.0)\n\n"
+              << "  --hdr-white <float>     Reference paper white luminance in nits (default: 200.0)\n"
+              << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
+              << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
+              << "  --dump-ui <path.png>    Save full window framebuffer with UI overlay to PNG\n"
+              << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
+              << "  --dump-stats <path.json> Export per-frame telemetry breakdown to JSON\n\n"
               << "Rendering & Path Tracing:\n"
               << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Ray Queues & DGC [default]) or 'rtp' (KHR RTP)\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
+              << "  --scene-bounces         Adopt scene metadata default max bounces if present [default: disabled]\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
+              << "  --accum-cutoff <int>    Max progressive accumulation frames before freeze (default: 2048, alias: --max-accum-frames)\n"
+              << "  --no-indirect           Disable indirect illumination (direct-only path tracing, alias: --direct-only)\n"
               << "  --render-scale <float>  Continuous internal render scale factor (e.g. 0.6667 for 1.5x, 0.5 for 2.0x)\n"
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Direct-Light Caching (experimental) with Wave32 WMMA.\n"
@@ -288,7 +297,7 @@ void Config::printUsage(const char* progName) {
               << "  --restir-di             Alias for --restir\n"
               << "  --no-restir-gi          Disable the ReSTIR GI component only (keep DI)\n"
               << "  --restir-pt             Alias for --restir (full path replay PT is NOT yet implemented; emits a warning)\n"
-              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 30)\n"
+              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-di-m | restir-di-w |\n"
               << "                          restir-di-light | restir-gi-m | restir-gi-w | restir-coverage | none\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
@@ -300,6 +309,7 @@ void Config::printUsage(const char* progName) {
               << "  --min-bounces <int>     Minimum dynamic bounce floor (default: 2)\n"
               << "  --max-dynamic-bounces <int> Maximum dynamic bounce ceiling (default: 8)\n\n"
               << "Multi-GPU Subsystem:\n"
+              << "  --gpu <int>             Device index of primary GPU (default: 0)\n"
               << "  --mgpu                  Enable Multi-GPU mode (default: CheckerboardTile [50/50 balanced load])\n"
               << "  --mgpu-mode <mode>      Multi-GPU mode: 'tile' (Checkerboard [default]), 'sample' (Sample Parallel), 'auto', or 'off'\n"
               << "  --mgpu-transfer <mode>  Multi-GPU transfer mode: 'p2p' (Direct BAR via Linux DMA-BUF), 'host' (Zero-Copy Host Memory) [default: auto-detects Resizable BAR vs small-BAR fallback]\n"
@@ -314,6 +324,7 @@ void Config::printUsage(const char* progName) {
               << "  --macro-blas            Merge static instance clusters into spatial Macro-BLASes (cuts 35-50% ray-box tests) [default: disabled, opt-in]\n"
               << "  --no-macro-blas         Disable Macro-BLAS merging (fine-grained TLAS prototype instancing) [default]\n"
               << "  --macro-blas-max-tris <N> Maximum geometry expansion budget for Macro-BLAS merging (default: 250000)\n"
+              << "  --macro-blas-max-prop-tris <N> Maximum prototype triangle count to consider for merging (default: 800)\n"
               << "  --no-streamlined-secondary Disable streamlined secondary bounce shading (keep primary shading math on all bounces)\n"
               << "  --no-distance-clamping  Disable scene-scale intelligent secondary ray distance clamping\n"
               << "  --sec-max-dist <float>  Override maximum secondary ray distance in world units (default: 0 = auto)\n"
@@ -334,13 +345,12 @@ void Config::printUsage(const char* progName) {
               << "                            Sets (VkIndirectExecutionSetEXT) to dynamically bind specialized\n"
               << "                            compute material pipelines on the GPU via indirect token streams\n"
               << "                            in a single vkCmdExecuteGeneratedCommandsEXT call.\n"
-              << "                            Default: ENABLED when the driver advertises compute execution sets\n"
-              << "                            (all RDNA3/RDNA4 Mesa RADV drivers); otherwise the multi-dispatch\n"
-              << "                            indirect fallback is used automatically.\n"
-              << "                            Caveat: Some drivers fail to switch compute pipelines dynamically via\n"
-              << "                            execution set tokens (running only the initial pipeline). Use\n"
-              << "                            --no-dgc-execset to force the fully-correct multi-dispatch path.\n"
-              << "  --no-dgc-execset        Disable DGC Execution Sets (force GPU multi-dispatch indirect queues)\n\n"
+              << "                            Default: DISABLED (multi-dispatch indirect queues are the default\n"
+              << "                            reliable path; avoids driver dynamic switching stalls on Mesa RADV).\n"
+              << "  --no-dgc-execset        Disable DGC Execution Sets (force GPU multi-dispatch indirect queues) [default]\n\n"
+              << "Asset Ingestion & Point Instancing:\n"
+              << "  --instance-density <float> Scale factor for point instancing (default: 1.0, alias: --density)\n"
+              << "  --cull-distance <float> Max camera distance in meters to cull instances (default: 0 = disabled, alias: --cull-dist)\n\n"
               << "Camera & Navigation:\n"
               << "  --adaptive-speed        Enable distance-adaptive camera speed (smooth approach) [default: enabled]\n"
               << "  --no-adaptive-speed     Disable distance-adaptive camera speed (constant velocity)\n"
@@ -362,18 +372,22 @@ void Config::printUsage(const char* progName) {
               << "  --camera-fov <degrees>  Set camera vertical field of view in degrees (or --fov)\n\n"
               << "Benchmarking & Diagnostics:\n"
               << "  --benchmark             Enable per-frame latency logging and verification\n"
-              << "  --frames <int>          Number of frames to execute (default: 0 = infinite)\n"
+              << "  --frames <int>          Number of frames to execute (default: 0 = infinite, 1 in headless)\n"
               << "  --warmup-frames <int>   Initial frames to exclude from benchmark stats (default: 0)\n"
               << "  --log-interval <float>  Console frame stats log interval in seconds (default: 0 = disabled)\n"
-              << "  --dump-frame <path.png> Save tonemapped frame to PNG (10/16-bit by default)\n"
-              << "  --dump-8bit             Force 8-bit PNG dump instead of default 10/16-bit\n"
               << "  --inline-shadows        Enable hybrid inline hardware shadow queries on primary bounce (default: enabled)\n"
               << "  --no-inline-shadows     Enforce detached shadow queue evaluation\n"
               << "  --diagnostic-half-tiles Benchmark diagnostic: trace only even 64x64 checkerboard tiles on single GPU\n"
+              << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
               << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
-              << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 1 for noisy input)\n"
-              << "  --capture-channels <int> Number of channels: 16, 19, or 20 (default: 20 PTTD v2)\n"
+              << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 256)\n"
+              << "  --capture-channels <int> Number of channels: 16, 19, or 20 (default: 20 PTTD v3)\n"
               << "  --no-capture-normals    Legacy 16-channel export without surface normals\n"
+              << "  --capture-camera-mode <mode> Camera trajectory: 'gaming' [default], 'static', 'rotate', 'translate', 'orbit'\n"
+              << "  --capture-halton-length <int> Halton jitter sequence cycle length (default: 32)\n"
+              << "  --capture-input-res <res> Internal render resolution for dataset capture (default: render scale resolution)\n"
+              << "  --capture-ref-res <res>   Ground truth reference resolution for dataset capture (default: target resolution)\n"
+              << "  --test-scene-switching  Run headless dynamic scene switching verification test\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
               << "  -h, --help              Show this help message\n";
@@ -1035,6 +1049,22 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--macro-blas-max-prop-tris=") || arg.starts_with("--macro-max-prop-tris=")) {
             cfg.macro_blas_max_prop_tris = std::stoul(arg.substr(arg.find('=') + 1));
+            continue;
+        }
+        if ((arg == "--instance-density" || arg == "--density") && i + 1 < argc) {
+            cfg.instance_density = std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
+            continue;
+        }
+        if (arg.starts_with("--instance-density=") || arg.starts_with("--density=")) {
+            cfg.instance_density = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.0f, 1.0f);
+            continue;
+        }
+        if ((arg == "--cull-distance" || arg == "--cull-dist") && i + 1 < argc) {
+            cfg.cull_distance = std::max(0.0f, std::stof(argv[++i]));
+            continue;
+        }
+        if (arg.starts_with("--cull-distance=") || arg.starts_with("--cull-dist=")) {
+            cfg.cull_distance = std::max(0.0f, std::stof(arg.substr(arg.find('=') + 1)));
             continue;
         }
         if (arg == "--no-streamlined-secondary" || arg == "--no-secondary-shading-opt") {

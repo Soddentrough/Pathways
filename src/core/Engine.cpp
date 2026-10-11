@@ -58,39 +58,16 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     Logger::info("Initializing Pathways Engine...");
 
-    // Point instancing CLI options and environment variable parsing
-    {
-        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
-        if (cmdline) {
-            std::string arg;
-            std::vector<std::string> args;
-            while (std::getline(cmdline, arg, '\0')) {
-                args.push_back(arg);
-            }
-            for (size_t i = 1; i < args.size(); ++i) {
-                if ((args[i] == "--instance-density" || args[i] == "--density") && i + 1 < args.size()) {
-                    m_config.instance_density = std::clamp(std::stof(args[++i]), 0.0f, 1.0f);
-                } else if (args[i].starts_with("--instance-density=")) {
-                    m_config.instance_density = std::clamp(std::stof(args[i].substr(args[i].find('=') + 1)), 0.0f, 1.0f);
-                } else if (args[i].starts_with("--density=")) {
-                    m_config.instance_density = std::clamp(std::stof(args[i].substr(args[i].find('=') + 1)), 0.0f, 1.0f);
-                } else if ((args[i] == "--cull-distance" || args[i] == "--cull-dist") && i + 1 < args.size()) {
-                    m_config.cull_distance = std::max(0.0f, std::stof(args[++i]));
-                } else if (args[i].starts_with("--cull-distance=") || args[i].starts_with("--cull-dist=")) {
-                    m_config.cull_distance = std::max(0.0f, std::stof(args[i].substr(args[i].find('=') + 1)));
-                }
-            }
-        }
-        if (const char* envDensity = std::getenv("PATHWAYS_INSTANCE_DENSITY")) {
-            m_config.instance_density = std::clamp(std::stof(envDensity), 0.0f, 1.0f);
-        }
-        if (const char* envCull = std::getenv("PATHWAYS_CULL_DISTANCE")) {
-            m_config.cull_distance = std::max(0.0f, std::stof(envCull));
-        }
-        if (m_config.instance_density < 0.999f || m_config.cull_distance > 0.0f) {
-            Logger::info("Point Instancing Configuration: instance-density={:.2f}, cull-distance={:.1f}m",
-                         m_config.instance_density, m_config.cull_distance);
-        }
+    // Point instancing environment variable overrides
+    if (const char* envDensity = std::getenv("PATHWAYS_INSTANCE_DENSITY")) {
+        m_config.instance_density = std::clamp(std::stof(envDensity), 0.0f, 1.0f);
+    }
+    if (const char* envCull = std::getenv("PATHWAYS_CULL_DISTANCE")) {
+        m_config.cull_distance = std::max(0.0f, std::stof(envCull));
+    }
+    if (m_config.instance_density < 0.999f || m_config.cull_distance > 0.0f) {
+        Logger::info("Point Instancing Configuration: instance-density={:.2f}, cull-distance={:.1f}m",
+                     m_config.instance_density, m_config.cull_distance);
     }
     m_window = std::make_unique<Window>(m_config);
 
@@ -352,7 +329,7 @@ void Engine::initVulkan() {
     vkAllocateCommandBuffers(device, &allocInfo, m_postCommandBuffers.data());
 
     m_mgpuCoordinator = std::make_unique<MultiGpuCoordinator>();
-    m_mgpuCoordinator->init(device, m_context->getAsyncComputeQueueFamily(), m_context->hasDedicatedAsyncCompute());
+    m_mgpuCoordinator->init(device, m_context->getAsyncComputeQueueFamily(), m_context->hasDedicatedAsyncCompute(), m_context->getDeviceProperties().limits.timestampPeriod);
     syncMgpuCoordinatorPointers();
     if (m_context->hasDedicatedAsyncCompute()) {
         Logger::info("Async Compute Merge initialized (Family: {})", m_context->getAsyncComputeQueueFamily());

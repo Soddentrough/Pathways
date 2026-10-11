@@ -168,6 +168,17 @@ struct FrameStats {
     double upways_time_ms = 0.0;
     double pcie_transfer_time_ms = 0.0;
 
+    // Multi-GPU Interconnect & Async Queue Telemetry
+    size_t mgpu_sec_to_prim_bytes = 0;
+    size_t mgpu_prim_to_sec_bytes = 0;
+    double mgpu_sec_to_prim_gbps = 0.0;
+    double mgpu_prim_to_sec_gbps = 0.0;
+    bool mgpu_async_merge_active = false;
+    double mgpu_async_merge_time_ms = 0.0;
+    double mgpu_skew_ms = 0.0;
+    float mgpu_imbalance_pct = 0.0f;
+    int mgpu_bottleneck_gpu = -1;
+
     // Wavefront Sub-Pass & Bounce Breakdown
     struct BounceProfile {
         uint32_t bounce = 0;

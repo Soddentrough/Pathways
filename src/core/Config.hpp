@@ -253,7 +253,7 @@ struct Config {
 
     // Single source of truth for the DGC compute execution-set kill-switch policy.
     // Set via --dgc-execset / --no-dgc-execset (which export PATHWAYS_DGC_EXECSET);
-    // unset means default policy: enable whenever the driver supports it.
+    // default policy is disabled (multi-dispatch indirect), opt-in via --dgc-execset.
     // Also honors legacy kill-switches PATHWAYS_DISABLE_MATERIAL_DGC and
     // PATHWAYS_DISABLE_DGC_EXECSET.
     static bool dgcExecSetRequested();

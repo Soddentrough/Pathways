@@ -278,7 +278,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--wavefront-sort` | `auto` \| `dual` \| `archetype` \| `none` | Material sorting mode: scene & hardware adaptive (`auto`, default), 3D Spatial-Morton dual-binning (`dual`), archetype (`archetype`), or unsorted (`none`) | `auto` |
 | `--sec-sort` | `direct` \| `directional` \| `coherent-k8` \| `none` | Secondary ray coherency mode: Direct Coherent Ray Generation via tangent-space reuse (`direct`/`coherent`, Xiang et al. 2023, K=4, default), on-chip 8-bin directional DGC octant binning (`directional`/`octant`), K=8 coherent, or unsorted (`none`) | `direct` |
 | `--macro-tiles`, `--batches` | `<int>` | 2D macro-tile batch count for wavefront queue partitioning (0 = auto based on budget) | `0` (Auto) |
-| `--dgc-execset` | *(flag)* | Force-enable DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels. Auto-enabled when the driver advertises compute execution sets; use `--no-dgc-execset` to force the multi-dispatch indirect fallback | Auto (driver-dependent) |
+| `--dgc-execset` | *(flag)* | Force-enable DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels. Multi-dispatch indirect is the default; opt-in via `--dgc-execset` | Disabled (multi-dispatch default) |
 
 | `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
 | `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
@@ -289,7 +289,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--restir` | *(flag)* | Enable ReSTIR: DI (direct-light reservoir resampling) + GI (bounce-1 secondary-vertex reuse) in wavefront shading. (`--restir-pt` is an alias that warns — full path-replay PT is not yet implemented; see `docs/RESTIR_PT_DESIGN.md`) | Disabled |
 | `--no-restir-gi` | *(flag)* | Disable the ReSTIR GI component only (keep DI) | GI on when `--restir` |
 | `--restir-min-lights` | `<int>` | *Deprecated, ignored* (kept for CLI compatibility) | — |
-| `--restir-m-cap` | `<int>` | ReSTIR temporal reuse M-cap for DI and GI (spatial taps additionally capped at 8 in-shader) | `30` |
+| `--restir-m-cap` | `<int>` | ReSTIR temporal reuse M-cap for DI and GI (spatial taps additionally capped at 8 in-shader) | `60` |
 | `--debug-view` | `<name>` | Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap; requires `--restir`): `restir-di-m` / `restir-di-w` / `restir-di-light` / `restir-gi-m` / `restir-gi-w` / `restir-coverage` / `none` | `none` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
