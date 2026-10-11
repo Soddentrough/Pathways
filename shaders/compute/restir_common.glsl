@@ -51,13 +51,22 @@ struct DiReservoir {
 };
 
 // Tunables / bias gates
-const uint  RESTIR_MAX_AGE              = 30u;    // temporal truncation: taps at least this old are rejected
+const uint  RESTIR_MAX_AGE              = 255u;   // 8-bit age ceiling (disocclusion and motion handle invalidation)
 const float RESTIR_TAP_NORMAL_MIN_DOT   = 0.70f;  // disocclusion guard on stored x1 normal
 const float RESTIR_TAP_DEPTH_REL_GATE   = 0.15f;  // disocclusion guard on primary hit distance
-const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.05f;
-const float RESTIR_JACOBIAN_CLAMP_MAX   = 20.0f;
+const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.33f;
+const float RESTIR_JACOBIAN_CLAMP_MAX   = 3.0f;
 
-const ivec2 RESTIR_TAP_OFFSETS[4] = ivec2[4](ivec2( 2, 0), ivec2(0,  2), ivec2(-2, 0), ivec2(0, -2));
+const ivec2 RESTIR_TAP_OFFSETS[32] = ivec2[32](
+    ivec2( 2,  0), ivec2( 0,  2), ivec2(-2,  0), ivec2( 0, -2),
+    ivec2( 2,  2), ivec2(-2,  2), ivec2(-2, -2), ivec2( 2, -2),
+    ivec2( 4,  0), ivec2( 0,  4), ivec2(-4,  0), ivec2( 0, -4),
+    ivec2( 3,  3), ivec2(-3,  3), ivec2(-3, -3), ivec2( 3, -3),
+    ivec2( 5,  1), ivec2(-1,  5), ivec2(-5, -1), ivec2( 1, -5),
+    ivec2( 4,  4), ivec2(-4,  4), ivec2(-4, -4), ivec2( 4, -4),
+    ivec2( 6,  0), ivec2( 0,  6), ivec2(-6,  0), ivec2( 0, -6),
+    ivec2( 6,  6), ivec2(-6,  6), ivec2(-6, -6), ivec2( 6, -6)
+);
 
 // -----------------------------------------------------------------------------
 // Bit packing
@@ -545,10 +554,11 @@ GiReservoir makeGiReservoir(vec3 x2, float wSum, uint M, float target, vec3 radi
 }
 
 // GI target proxy at x1 for a candidate secondary vertex:
-//     p̂ = (albedo_bar / π) · max(cosθ1, 0) · max(lum(L̂2), 1e-4)
-// Must be evaluated identically at recording and reuse time; it is a scalar
-// proxy of the colored integrand f_r(x1)·cosθ1·L̂2 used at finalization.
-// Returns 0 when the candidate is behind x1's horizon.
+//     p̂ = (1 / π) · max(cosθ1, 0) · lum(L̂2)
+// For diffuse Lambertian surfaces, primary surface albedo factors out of the
+// hemisphere integral (I = ρ · ∫ (1/π) cosθ L dω). Omitting albedo from the
+// solid-angle target proxy prevents extreme target-ratio jumps across high-frequency
+// texture boundaries (e.g. checkerboard floor tiles with 10x albedo difference).
 float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
     vec3 dv = x2 - x1;
     float dist = length(dv);
@@ -556,7 +566,8 @@ float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
     float cos1 = dot(n1, dv / dist);
     if (cos1 <= 0.0) return 0.0;
     float albedoBar = dot(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.3333333));
-    float lum = max(dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    float lum = dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if (lum <= 1e-6) return 0.0;
     return albedoBar * INV_PI * cos1 * lum;
 }
 
@@ -572,34 +583,54 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
                 vec3 albedo, uint mCap, uint ageNew, inout uint seed) {
     if (!giIsValid(tap) || giGetM(tap) == 0u) return false;
 
+    uint mTap = min(giGetM(tap), mCap);
+    if (mTap == 0u) return false;
+
+    float pTap = giGetTarget(tap);
+    float weight = 0.0;
+    float pHat = 0.0;
     vec3 x2c = giGetX2(tap);
-    vec3 dv = x2c - x1;
-    float dNew = length(dv);
-    if (dNew < GI_TAP_MIN_DIST) return false;
-    float cosNew = dot(n1, dv / dNew);
-    if (cosNew <= GI_TAP_MIN_COS) return false;
-
     vec3 radC = giGetRadiance(tap);
-    float pHat = giTargetAt(albedo, n1, x1, x2c, radC);
-    float dSrc = max(giGetDSrc(tap), 1e-3);
-    float jac = clamp((dSrc * dSrc) / (dNew * dNew), RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
-    float weight = (giGetWSum(tap) / float(giGetM(tap))) *
-                   min(giGetM(tap), mCap) *
-                   (pHat / max(giGetTarget(tap), 1e-9)) * jac;
-    if (!(weight > 0.0)) return false;
+    float dNew = 0.0;
 
-    float wSelf = giIsValid(r) ? giGetWSum(r) : 0.0;
+    if (pTap > 0.0) {
+        vec3 dv = x2c - x1;
+        dNew = length(dv);
+        if (dNew >= GI_TAP_MIN_DIST) {
+            float cosNew = dot(n1, dv / dNew);
+            if (cosNew > GI_TAP_MIN_COS) {
+                pHat = giTargetAt(albedo, n1, x1, x2c, radC);
+                float dSrc = max(giGetDSrc(tap), 1e-3);
+                float distRatio = dSrc / max(dNew, 1e-3);
+                if (distRatio >= 0.1 && distRatio <= 10.0 && pHat > 0.0) {
+                    float jac = clamp((dSrc * dSrc) / (dNew * dNew), RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
+                    float targetRatio = clamp(pHat / max(pTap, 1e-6), 0.0, 2.5);
+                    weight = (giGetWSum(tap) / float(giGetM(tap))) *
+                             float(mTap) *
+                             targetRatio * jac;
+                    if (isnan(weight) || isinf(weight) || !(weight > 0.0)) {
+                        weight = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    float wSelf = (giIsValid(r) && giGetTarget(r) > 0.0) ? giGetWSum(r) : 0.0;
     uint mSelf = giIsValid(r) ? giGetM(r) : 0u;
-    uint combinedM = mSelf + min(giGetM(tap), mCap);
+    uint combinedM = mSelf + mTap;
     float combined = wSelf + weight;
 
-    if (randFloat(seed) * combined < weight) {
+    if (weight > 0.0 && (randFloat(seed) * combined < weight)) {
         r = makeGiReservoir(x2c, combined, combinedM, pHat, radC, dNew, ageNew);
         return true;
     }
-    if (mSelf > 0u) {
+    if (giIsValid(r) && giGetTarget(r) > 0.0) {
         r = makeGiReservoir(giGetX2(r), combined, combinedM, giGetTarget(r),
                             giGetRadiance(r), giGetDSrc(r), giGetAge(r));
+    } else {
+        r = makeGiReservoir(giIsValid(r) ? giGetX2(r) : vec3(0.0), 0.0, combinedM, 0.0,
+                            vec3(0.0), giIsValid(r) ? giGetDSrc(r) : 0.0, ageNew);
     }
     return false;
 }

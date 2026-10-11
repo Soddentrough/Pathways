@@ -182,7 +182,7 @@ struct Config {
 
     // ReSTIR DI Spatio-Temporal Reservoir Resampling (Direct Light)
     bool enable_restir = false;           // ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [Default: false, opt-in via --restir]
-    uint32_t restir_m_cap = 30;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 30)
+    uint32_t restir_m_cap = 60;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 60)
     bool restir_gi = true;                // ReSTIR GI (path-space secondary-vertex reuse at bounce 1) [Default: true, applies only when ReSTIR is enabled]
     DebugViewMode debug_view = DebugViewMode::None; // Reservoir debug overlay (requires --restir; see --debug-view)
 

@@ -216,6 +216,75 @@ int main() {
                     "Streaming RIS unbiased convergence (analytical integral: 1.0)");
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 5: ReSTIR GI Target Proxy Zero-Radiance Immunity (M-Dilution Guard)
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 5] ReSTIR GI Target Function Zero-Radiance & Geometry Immunity..." << std::endl;
+    {
+        auto evalGiTarget = [](const glm::vec3& albedo, const glm::vec3& n1,
+                               const glm::vec3& x1, const glm::vec3& x2, const glm::vec3& radiance) -> float {
+            glm::vec3 dv = x2 - x1;
+            float dist = glm::length(dv);
+            if (dist < 1e-4f) return 0.0f;
+            float cos1 = glm::dot(n1, dv / dist);
+            if (cos1 <= 0.0f) return 0.0f;
+            float albedoBar = glm::dot(glm::clamp(albedo, glm::vec3(0.0f), glm::vec3(1.0f)), glm::vec3(0.3333333f));
+            float lum = glm::dot(glm::max(radiance, glm::vec3(0.0f)), glm::vec3(0.2126f, 0.7152f, 0.0722f));
+            if (lum <= 1e-6f) return 0.0f;
+            return albedoBar * (1.0f / 3.14159265359f) * cos1 * lum;
+        };
+
+        glm::vec3 x1(0.0f, 0.0f, 0.0f);
+        glm::vec3 n1(0.0f, 1.0f, 0.0f);
+        glm::vec3 x2(0.0f, 2.0f, 0.0f);
+        glm::vec3 albedo(0.8f, 0.8f, 0.8f);
+
+        // 5a. Zero radiance MUST return strictly 0.0 (immune to M-dilution)
+        float target_zero = evalGiTarget(albedo, n1, x1, x2, glm::vec3(0.0f));
+        assert_near(target_zero, 0.0f, 1e-9f, "Zero radiance candidate evaluates to strictly 0.0 target");
+
+        // 5b. Behind horizon (cos <= 0) MUST return strictly 0.0
+        glm::vec3 x2_behind(0.0f, -2.0f, 0.0f);
+        float target_behind = evalGiTarget(albedo, n1, x1, x2_behind, glm::vec3(5.0f));
+        assert_near(target_behind, 0.0f, 1e-9f, "Behind-horizon candidate evaluates to strictly 0.0 target");
+
+        // 5c. Valid lit secondary hit produces positive proportional target
+        float target_lit = evalGiTarget(albedo, n1, x1, x2, glm::vec3(1.0f));
+        assert_true(target_lit > 0.0f, "Lit secondary candidate evaluates to positive target");
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 6: GI Surface Disocclusion & Depth Gating
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 6] GI Disocclusion & Relative Depth Similarity Gates..." << std::endl;
+    {
+        const float RESTIR_TAP_NORMAL_MIN_DOT = 0.70f;
+        const float RESTIR_TAP_DEPTH_REL_GATE = 0.15f;
+
+        auto testDisocclusion = [&](const glm::vec3& nSelf, float depthSelf,
+                                    const glm::vec3& nTap, float depthTap) -> bool {
+            if (glm::dot(nSelf, nTap) < RESTIR_TAP_NORMAL_MIN_DOT) return false;
+            float relDepthDiff = std::abs(depthSelf - depthTap) / std::max(std::max(depthSelf, depthTap), 1e-4f);
+            if (relDepthDiff > RESTIR_TAP_DEPTH_REL_GATE) return false;
+            return true;
+        };
+
+        glm::vec3 nWall(0.0f, 0.0f, 1.0f);
+        glm::vec3 nJamb(1.0f, 0.0f, 0.0f); // 90 degree corner
+
+        // 6a. 90-degree corner (dot = 0.0 < 0.70) must be rejected
+        bool passCorner = testDisocclusion(nWall, 5.0f, nJamb, 5.0f);
+        assert_true(!passCorner, "90-degree corner tap rejected by normal gate");
+
+        // 6b. Depth silhouette jump (e.g. 5.0m vs 10.0m, relDiff = 0.50 > 0.15) must be rejected
+        bool passDepth = testDisocclusion(nWall, 5.0f, nWall, 10.0f);
+        assert_true(!passDepth, "Depth silhouette discontinuity rejected by depth gate");
+
+        // 6c. Co-planar neighbor on same wall (dot = 1.0, depth 5.0 vs 5.05) must be accepted
+        bool passNeighbor = testDisocclusion(nWall, 5.0f, nWall, 5.05f);
+        assert_true(passNeighbor, "Co-planar continuous surface neighbor accepted for GI reuse");
+    }
+
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "  ALL ReSTIR PT Mathematical & Estimator Unit Tests PASSED!" << std::endl;
     std::cout << "================================================================================" << std::endl;

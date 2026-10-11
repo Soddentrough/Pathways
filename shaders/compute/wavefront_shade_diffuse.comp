@@ -567,7 +567,7 @@ void main() {
 
                     if (giActive) {
                         // Candidate data for this frame's own secondary vertex.
-                        giL2 = vec3(secDirectL);
+                        giL2 = clampIndirectRadiance(vec3(secDirectL), pc.indirectClamp * 2.0);
                         giLightDir = lightDir;
                         giLightDist = lightDist;
                         giShadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
@@ -656,75 +656,96 @@ void main() {
                     float giPSelf = giTargetAt(giAlbedo, giN1, giX1, hitPoint, giL2);
                     GiReservoir giR = invalidGiReservoir();
                     bool giWinnerSelf = true;
-                    if (giPSelf > 0.0 && giCosSelf > 0.0) {
+                    if (giPSelf > 0.0 && giCosSelf > GI_TAP_MIN_COS) {
                         float giWSelf = giPSelf / max(giCosSelf * INV_PI, 1e-9);
                         giR = makeGiReservoir(hitPoint, giWSelf, 1u, giPSelf, giL2, hitT, 0u);
+                    } else {
+                        // Unlit / shadowed candidate evaluated this frame: carries 0 weight, but M=1
+                        giR = makeGiReservoir(hitPoint, 0.0, 1u, 0.0, vec3(0.0), hitT, 0u);
                     }
 
                     if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
-                        // History taps on the previous frame's GI grid:
-                        // temporal center (MV-reprojected) + rotated cross.
+                        // Temporal center tap (MV-reprojected) from previous frame's temporal history
                         ivec2 giPix = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec4 selfND = imageLoad(uNormalDepthImage, giPix);
+                        vec3 selfN = selfND.xyz;
+                        float selfDepth = selfND.w;
+
                         vec2 giMv = imageLoad(uMotionVectorImage, giPix).xy;
                         ivec2 giPrev = ivec2(round(vec2(giPix) - giMv * vec2(pc.width, pc.height)));
-                        uint giHash = (pixelIndex * 0x9E3779B9u) ^ (pc.frameIndex * 0x85EBCA6Bu);
-                        uint giRot = (giHash >> 30u) & 3u;
-
-                        for (uint tap = 0u; tap < 5u; ++tap) {
-                            ivec2 giOff = ivec2(0, 0);
-                            if (tap > 0u) {
-                                ivec2 base = RESTIR_TAP_OFFSETS[tap - 1u];
-                                for (uint rr = 0u; rr < giRot; ++rr) {
-                                    base = ivec2(-base.y, base.x);
+                        if (giPrev.x >= 0 && giPrev.y >= 0 && giPrev.x < int(pc.width) && giPrev.y < int(pc.height)) {
+                            vec4 tapND = imageLoad(uNormalDepthImage, giPrev);
+                            if (dot(selfN, tapND.xyz) >= RESTIR_TAP_NORMAL_MIN_DOT) {
+                                float relDepthDiff = abs(selfDepth - tapND.w) / max(max(selfDepth, tapND.w), 1e-4);
+                                if (relDepthDiff <= RESTIR_TAP_DEPTH_REL_GATE) {
+                                    GiReservoir giTap = giHistoryReservoirs[uint(giPrev.y) * pc.width + uint(giPrev.x)];
+                                    if (giIsValid(giTap) && giGetAge(giTap) < RESTIR_MAX_AGE) {
+                                        uint giAgeNew = min(giGetAge(giTap) + 1u, RESTIR_MAX_AGE);
+                                        if (giApplyTap(giR, giTap, giX1, giN1, giAlbedo, pc.restirMCap, giAgeNew, seed)) {
+                                            giWinnerSelf = false;
+                                        }
+                                    }
                                 }
-                                giOff = base;
-                            }
-                            ivec2 giCoord = giPrev + giOff;
-                            if (giCoord.x < 0 || giCoord.y < 0 ||
-                                giCoord.x >= int(pc.width) || giCoord.y >= int(pc.height)) {
-                                continue;
-                            }
-                            GiReservoir giTap = giHistoryReservoirs[uint(giCoord.y) * pc.width + uint(giCoord.x)];
-                            if (!giIsValid(giTap) || giGetAge(giTap) >= RESTIR_MAX_AGE) continue;
-                            uint giMCap = (tap == 0u) ? pc.restirMCap : min(pc.restirMCap, 8u);
-                            uint giAgeNew = min(giGetAge(giTap) + (tap == 0u ? 1u : 0u), RESTIR_MAX_AGE);
-                            if (giApplyTap(giR, giTap, giX1, giN1, giAlbedo, giMCap, giAgeNew, seed)) {
-                                giWinnerSelf = false;
                             }
                         }
                     }
 
-                    if (giIsValid(giR) && giGetM(giR) > 0u) {
-                        vec3 giL2w = giGetRadiance(giR);
+                    // Save the pure TEMPORAL reservoir to history.
+                    // Spatial reuse must NEVER be fed back into temporal history (prevents correlation runaway).
+                    if (giIsValid(giR)) {
+                        giReservoirs[pixelIndex] = giR;
+                    } else {
+                        giReservoirs[pixelIndex] = invalidGiReservoir();
+                    }
+
+                    // Shading reservoir: starts from temporal reservoir, then gathers spatial neighbors
+                    GiReservoir giShadeR = giR;
+                    bool giShadeWinnerSelf = giWinnerSelf;
+
+                    if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
+                        ivec2 giPix = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec4 selfND = imageLoad(uNormalDepthImage, giPix);
+                        vec3 selfN = selfND.xyz;
+                        float selfDepth = selfND.w;
+                        vec2 giMv = imageLoad(uMotionVectorImage, giPix).xy;
+                        ivec2 giPrev = ivec2(round(vec2(giPix) - giMv * vec2(pc.width, pc.height)));
+                        float giAngle = randFloat(seed) * 6.28318530718;
+                        float giCosA = cos(giAngle);
+                        float giSinA = sin(giAngle);
+
+                        for (uint tap = 1u; tap <= 32u; ++tap) {
+                            vec2 baseF = vec2(RESTIR_TAP_OFFSETS[tap - 1u]);
+                            ivec2 rotBase = ivec2(round(vec2(giCosA * baseF.x - giSinA * baseF.y,
+                                                             giSinA * baseF.x + giCosA * baseF.y)));
+                            ivec2 giCoord = giPrev + rotBase;
+                            if (giCoord.x < 0 || giCoord.y < 0 ||
+                                giCoord.x >= int(pc.width) || giCoord.y >= int(pc.height)) {
+                                continue;
+                            }
+
+                            vec4 tapND = imageLoad(uNormalDepthImage, giCoord);
+                            if (dot(selfN, tapND.xyz) < RESTIR_TAP_NORMAL_MIN_DOT) continue;
+                            float relDepthDiff = abs(selfDepth - tapND.w) / max(max(selfDepth, tapND.w), 1e-4);
+                            if (relDepthDiff > RESTIR_TAP_DEPTH_REL_GATE) continue;
+
+                            GiReservoir giTap = giHistoryReservoirs[uint(giCoord.y) * pc.width + uint(giCoord.x)];
+                            if (!giIsValid(giTap) || giGetAge(giTap) >= RESTIR_MAX_AGE) continue;
+                            uint giMCap = min(pc.restirMCap, 8u);
+                            if (giApplyTap(giShadeR, giTap, giX1, giN1, giAlbedo, giMCap, giGetAge(giTap), seed)) {
+                                giShadeWinnerSelf = false;
+                            }
+                        }
+                    }
+
+                    if (giIsValid(giShadeR) && giGetM(giShadeR) > 0u && giGetTarget(giShadeR) > 0.0) {
+                        vec3 giL2w = giGetRadiance(giShadeR);
                         float giLumW = max(dot(giL2w, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+                        float giW = clamp(giGetWSum(giShadeR) / (float(giGetM(giShadeR)) * giAlbedoBar * giLumW), 0.0, 2.8);
 
-                        // Finalization: C2 = T1·f_r(x1)·cosθ1_w·L̂2_w·W with
-                        // W = wsum/(M·p̂_w) and p̂_w = (albedoBar/π)·cosθ1_w·l̄um_w.
-                        // The bounce-0 continuation folded
-                        // ratio = (1-F̂)·albedo/(1-specProb) into this ray's
-                        // throughput T2 (lobe coin and RR conditioning cancel),
-                        // giving per-channel:
-                        //   C2 = T2·L̂2_w · wsum/(M·albedoBar·l̄um_w) · (1-F_w)/(1-F̂)
-                        // Single candidate reduces exactly to T2·L̂2 (legacy).
-                        float giW = clamp(giGetWSum(giR) / (float(giGetM(giR)) * giAlbedoBar * giLumW), 0.0, 500.0);
-
-                        // Fresnel ratio between the winner direction and the
-                        // path's own direction at x1 (both vs the stored wo).
-                        vec3 giWo = x1ContextWo(giCtx);
-                        float giF0 = x1ContextF0(giCtx);
-                        vec3 giDirSelfN = normalize(rayDir);
-                        vec3 giHs = normalize(giDirSelfN + giWo);
-                        float giFS = fresnelSchlick(clamp(dot(giWo, giHs), 0.0, 1.0), giF0);
-                        vec3 giDirW0 = normalize(giGetX2(giR) - giX1);
-                        vec3 giHw = normalize(giDirW0 + giWo);
-                        float giFW = fresnelSchlick(clamp(dot(giWo, giHw), 0.0, 1.0), giF0);
-                        giW *= (1.0 - giFW) / max(1.0 - giFS, 0.05);
-
-                        // Replay visibility x1↔x2_w; the path itself already
-                        // traversed x1→x2, so a self winner needs no ray.
+                        // Replay visibility x1↔x2_w
                         float giVis = 1.0;
-                        if (!giWinnerSelf) {
-                            vec3 giX2w = giGetX2(giR);
+                        if (!giShadeWinnerSelf) {
+                            vec3 giX2w = giGetX2(giShadeR);
                             vec3 giDirW = giX2w - giX1;
                             float giDistW = length(giDirW);
                             if (giDistW > 2.0 * EPSILON) {
@@ -737,23 +758,23 @@ void main() {
                             }
                         }
 
-                        vec3 giContrib = clampIndirectRadiance(vec3(throughput) * giL2w * (giW * giVis), pc.indirectClamp);
-                        if (dot(giContrib, giContrib) > 1e-12) {
-                            ivec2 giPixC = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                            vec4 giPrevAcc = imageLoad(uAccumImage, giPixC);
-                            imageStore(uAccumImage, giPixC, vec4(addFp16Stochastic(giPrevAcc.rgb, giContrib, seed), giPrevAcc.a));
-                            if (pc.captureMlData != 0u) {
-                                if (isSpecularPath) {
-                                    vec4 prevSpec = imageLoad(uMlSpecularImage, giPixC);
-                                    imageStore(uMlSpecularImage, giPixC, vec4(addFp16Stochastic(prevSpec.rgb, giContrib, seed), 0.0));
-                                } else {
-                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, giPixC);
-                                    imageStore(uMlDiffuseImage, giPixC, vec4(addFp16Stochastic(prevDiff.rgb, giContrib, seed), 0.0));
+                        if (giVis > 0.0) {
+                            vec3 giContrib = clampIndirectRadiance(vec3(throughput) * giL2w * (giW * giVis), pc.indirectClamp);
+                            if (dot(giContrib, giContrib) > 1e-12) {
+                                ivec2 giPixC = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                vec4 giPrevAcc = imageLoad(uAccumImage, giPixC);
+                                imageStore(uAccumImage, giPixC, vec4(addFp16Stochastic(giPrevAcc.rgb, giContrib, seed), giPrevAcc.a));
+                                if (pc.captureMlData != 0u) {
+                                    if (isSpecularPath) {
+                                        vec4 prevSpec = imageLoad(uMlSpecularImage, giPixC);
+                                        imageStore(uMlSpecularImage, giPixC, vec4(addFp16Stochastic(prevSpec.rgb, giContrib, seed), 0.0));
+                                    } else {
+                                        vec4 prevDiff = imageLoad(uMlDiffuseImage, giPixC);
+                                        imageStore(uMlDiffuseImage, giPixC, vec4(addFp16Stochastic(prevDiff.rgb, giContrib, seed), 0.0));
+                                    }
                                 }
                             }
                         }
-
-                        giReservoirs[pixelIndex] = giR;
                     }
                 }
             }
