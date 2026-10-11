@@ -14,6 +14,7 @@ MultiGpuCoordinator::~MultiGpuCoordinator() {
 
 void MultiGpuCoordinator::init(VkDevice device, uint32_t asyncComputeQueueFamily, bool hasDedicatedAsyncCompute) {
     m_device = device;
+    m_hasDedicatedAsyncCompute = hasDedicatedAsyncCompute;
     if (hasDedicatedAsyncCompute) {
         VkCommandPoolCreateInfo asyncPoolInfo{};
         asyncPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -37,6 +38,7 @@ void MultiGpuCoordinator::init(VkDevice device, uint32_t asyncComputeQueueFamily
 }
 
 void MultiGpuCoordinator::destroy(VkDevice device) {
+    m_hasDedicatedAsyncCompute = false;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (m_mergeCompleteSemaphores[i] != VK_NULL_HANDLE) {
             vkDestroySemaphore(device, m_mergeCompleteSemaphores[i], nullptr);
@@ -398,13 +400,85 @@ void MultiGpuCoordinator::syncSecondaryTransfer(MultiGpuManager* mgpu, const Mul
     }
 }
 
+bool MultiGpuCoordinator::executeAsyncMerge(
+    VkQueue asyncComputeQueue,
+    const MultiGpuFramePlan& plan,
+    const MultiGpuPlanParams& params,
+    PostProcessPipeline* postProcess,
+    Image* frameImage,
+    Image* mlDiffuseImage,
+    VkSemaphore rtCompleteSemaphore
+) {
+    if (!m_hasDedicatedAsyncCompute || params.skipRayTracing || plan.isSampleBlendFsr3 || !postProcess) {
+        return false;
+    }
+
+    uint32_t slot = params.currentFrame % MAX_FRAMES_IN_FLIGHT;
+    VkCommandBuffer cmd = m_mergeCommandBuffers[slot];
+    if (cmd == VK_NULL_HANDLE) return false;
+
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    recordMergePass(cmd, plan, params, postProcess, frameImage, mlDiffuseImage);
+
+    vkEndCommandBuffer(cmd);
+
+    std::vector<VkSemaphoreSubmitInfo> waitInfos;
+    VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+    waitRt.semaphore = rtCompleteSemaphore;
+    waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    waitInfos.push_back(waitRt);
+
+    if (params.mgpu && params.mgpu->isCrossGpuSyncActive()) {
+        VkSemaphore secSem = params.mgpu->getPrimaryImportedTimelineSemaphore();
+        if (secSem != VK_NULL_HANDLE) {
+            VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            waitSec.semaphore = secSem;
+            waitSec.value = params.mgpu->getCurrentTimelineValue();
+            waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            waitInfos.push_back(waitSec);
+        }
+    }
+
+    VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+    signalInfo.semaphore = m_mergeCompleteSemaphores[slot];
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    VkCommandBufferSubmitInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdInfo;
+    submit.waitSemaphoreInfoCount = static_cast<uint32_t>(waitInfos.size());
+    submit.pWaitSemaphoreInfos = waitInfos.data();
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signalInfo;
+
+    vkQueueSubmit2(asyncComputeQueue, 1, &submit, VK_NULL_HANDLE);
+    return true;
+}
+
 void MultiGpuCoordinator::populatePostWaitSemaphores(
     std::vector<VkSemaphoreSubmitInfo>& waitSemaphoreInfos,
     MultiGpuManager* mgpu,
     uint32_t currentFrame,
     VkSemaphore rtCompleteSemaphore,
-    bool skipRayTracing
+    bool skipRayTracing,
+    bool asyncMergeExecuted
 ) {
+    if (asyncMergeExecuted) {
+        uint32_t slot = currentFrame % MAX_FRAMES_IN_FLIGHT;
+        VkSemaphoreSubmitInfo waitMerge{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+        waitMerge.semaphore = m_mergeCompleteSemaphores[slot];
+        waitMerge.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        waitSemaphoreInfos.push_back(waitMerge);
+        return;
+    }
+
     VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     waitRt.semaphore = rtCompleteSemaphore;
     waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;

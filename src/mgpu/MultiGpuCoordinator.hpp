@@ -140,13 +140,25 @@ public:
     /// Awaits secondary GPU completion and syncs host/PCIe staging buffer if host fallback is active.
     void syncSecondaryTransfer(MultiGpuManager* mgpu, const MultiGpuFramePlan& plan, bool skipRayTracing);
 
+    /// Executes merge pass on dedicated async compute queue, signaling mergeCompleteSemaphore.
+    bool executeAsyncMerge(
+        VkQueue asyncComputeQueue,
+        const MultiGpuFramePlan& plan,
+        const MultiGpuPlanParams& params,
+        PostProcessPipeline* postProcess,
+        Image* frameImage,
+        Image* mlDiffuseImage,
+        VkSemaphore rtCompleteSemaphore
+    );
+
     /// Populates semaphore wait lists for the final post-processing/presentation queue submission.
     void populatePostWaitSemaphores(
         std::vector<VkSemaphoreSubmitInfo>& waitSemaphoreInfos,
         MultiGpuManager* mgpu,
         uint32_t currentFrame,
         VkSemaphore rtCompleteSemaphore,
-        bool skipRayTracing
+        bool skipRayTracing,
+        bool asyncMergeExecuted = false
     );
 
     [[nodiscard]] VkCommandPool getAsyncComputeCommandPool() const noexcept { return m_asyncComputeCommandPool; }
@@ -155,6 +167,7 @@ public:
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
+    bool m_hasDedicatedAsyncCompute = false;
     VkCommandPool m_asyncComputeCommandPool = VK_NULL_HANDLE;
     std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_mergeCommandBuffers = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkSemaphore, MAX_FRAMES_IN_FLIGHT> m_mergeCompleteSemaphores = { VK_NULL_HANDLE, VK_NULL_HANDLE };

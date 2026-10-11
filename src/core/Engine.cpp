@@ -2006,12 +2006,25 @@ void Engine::renderFrame() {
             postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             vkBeginCommandBuffer(activeCmd, &postBeginInfo);
 
-            m_mgpuCoordinator->recordMergePass(
-                activeCmd, mgpuPlan, planParams,
-                m_postProcess.get(),
-                m_frameImages[mgpuPlan.slot],
-                m_mlDiffuseImage
-            );
+            if (m_context->hasDedicatedAsyncCompute() && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3) {
+                useAsyncComputeMerge = m_mgpuCoordinator->executeAsyncMerge(
+                    m_context->getAsyncComputeQueue(),
+                    mgpuPlan, planParams,
+                    m_postProcess.get(),
+                    m_frameImages[mgpuPlan.slot],
+                    m_mlDiffuseImage,
+                    m_rtCompleteSemaphores[m_currentFrame]
+                );
+            }
+
+            if (!useAsyncComputeMerge) {
+                m_mgpuCoordinator->recordMergePass(
+                    activeCmd, mgpuPlan, planParams,
+                    m_postProcess.get(),
+                    m_frameImages[mgpuPlan.slot],
+                    m_mlDiffuseImage
+                );
+            }
         }
 
         // Post-processing passes on activeCmd: Upways / FSR3 / Tonemap
@@ -2188,7 +2201,7 @@ void Engine::renderFrame() {
         std::vector<VkSemaphoreSubmitInfo> signalSemaphoreInfos;
 
         if (isMgpu && m_mgpuCoordinator) {
-            m_mgpuCoordinator->populatePostWaitSemaphores(waitSemaphoreInfos, m_mgpu.get(), m_currentFrame, m_rtCompleteSemaphores[m_currentFrame], skipRayTracing);
+            m_mgpuCoordinator->populatePostWaitSemaphores(waitSemaphoreInfos, m_mgpu.get(), m_currentFrame, m_rtCompleteSemaphores[m_currentFrame], skipRayTracing, useAsyncComputeMerge);
         }
 
         if (!m_config.headless && m_swapchain && m_presentation) {
