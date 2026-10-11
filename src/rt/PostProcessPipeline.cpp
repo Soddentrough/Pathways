@@ -15,7 +15,8 @@ PostProcessPipeline::PostProcessPipeline(
     const std::vector<char>& fusedAccumTonemapSpv,
     const std::vector<char>& runningAvgSpv,
     const std::vector<char>& blendSpv,
-    const std::vector<char>& mergeSpv)
+    const std::vector<char>& mergeSpv,
+    const std::vector<char>& restirDebugSpv)
     : m_device(device),
       m_allocator(allocator),
       m_hasSubgroupSizeControl(hasSubgroupSizeControl),
@@ -24,8 +25,9 @@ PostProcessPipeline::PostProcessPipeline(
     createDescriptorLayouts();
     allocateDescriptorSets();
     createPipelines(tonemapSpv, fusedAccumTonemapSpv, runningAvgSpv, blendSpv, mergeSpv);
+    createDebugViewPipeline(restirDebugSpv);
 
-    Logger::info("PostProcessPipeline (ACES Tonemap, Fused Accum/Tonemap, Running Avg, Blend4K, Multi-GPU Merge) initialized.");
+    Logger::info("PostProcessPipeline (ACES Tonemap, Fused Accum/Tonemap, Running Avg, Blend4K, Multi-GPU Merge, ReSTIR Debug View) initialized.");
 }
 
 PostProcessPipeline::~PostProcessPipeline() {
@@ -34,6 +36,9 @@ PostProcessPipeline::~PostProcessPipeline() {
     if (m_accumTonemapPipeline)     { vkDestroyPipeline(m_device, m_accumTonemapPipeline, nullptr); m_accumTonemapPipeline = VK_NULL_HANDLE; }
     if (m_fsr3BlendPipeline)        { vkDestroyPipeline(m_device, m_fsr3BlendPipeline, nullptr); m_fsr3BlendPipeline = VK_NULL_HANDLE; }
     if (m_mergePipeline)            { vkDestroyPipeline(m_device, m_mergePipeline, nullptr); m_mergePipeline = VK_NULL_HANDLE; }
+    if (m_restirDebugPipeline)      { vkDestroyPipeline(m_device, m_restirDebugPipeline, nullptr); m_restirDebugPipeline = VK_NULL_HANDLE; }
+
+    m_debugDummyBuffer.reset();
 
     if (m_tonemapPipelineLayout)          { vkDestroyPipelineLayout(m_device, m_tonemapPipelineLayout, nullptr); m_tonemapPipelineLayout = VK_NULL_HANDLE; }
     if (m_accumRunningAvgPipelineLayout)  { vkDestroyPipelineLayout(m_device, m_accumRunningAvgPipelineLayout, nullptr); m_accumRunningAvgPipelineLayout = VK_NULL_HANDLE; }
@@ -42,12 +47,15 @@ PostProcessPipeline::~PostProcessPipeline() {
     if (m_mergePipelineLayout)            { vkDestroyPipelineLayout(m_device, m_mergePipelineLayout, nullptr); m_mergePipelineLayout = VK_NULL_HANDLE; }
 
     if (m_fsr3BlendDescPool)        { vkDestroyDescriptorPool(m_device, m_fsr3BlendDescPool, nullptr); m_fsr3BlendDescPool = VK_NULL_HANDLE; }
+    if (m_restirDebugDescPool)      { vkDestroyDescriptorPool(m_device, m_restirDebugDescPool, nullptr); m_restirDebugDescPool = VK_NULL_HANDLE; }
 
     if (m_tonemapDescLayout)          { vkDestroyDescriptorSetLayout(m_device, m_tonemapDescLayout, nullptr); m_tonemapDescLayout = VK_NULL_HANDLE; }
     if (m_accumRunningAvgDescLayout)  { vkDestroyDescriptorSetLayout(m_device, m_accumRunningAvgDescLayout, nullptr); m_accumRunningAvgDescLayout = VK_NULL_HANDLE; }
     if (m_accumTonemapDescLayout)     { vkDestroyDescriptorSetLayout(m_device, m_accumTonemapDescLayout, nullptr); m_accumTonemapDescLayout = VK_NULL_HANDLE; }
     if (m_fsr3BlendDescLayout)        { vkDestroyDescriptorSetLayout(m_device, m_fsr3BlendDescLayout, nullptr); m_fsr3BlendDescLayout = VK_NULL_HANDLE; }
     if (m_mergeDescLayout)            { vkDestroyDescriptorSetLayout(m_device, m_mergeDescLayout, nullptr); m_mergeDescLayout = VK_NULL_HANDLE; }
+    if (m_restirDebugDescLayout)      { vkDestroyDescriptorSetLayout(m_device, m_restirDebugDescLayout, nullptr); m_restirDebugDescLayout = VK_NULL_HANDLE; }
+    if (m_restirDebugPipelineLayout)  { vkDestroyPipelineLayout(m_device, m_restirDebugPipelineLayout, nullptr); m_restirDebugPipelineLayout = VK_NULL_HANDLE; }
 }
 
 VkShaderModule PostProcessPipeline::createShaderModule(const std::vector<char>& code) {
@@ -130,6 +138,20 @@ void PostProcessPipeline::createDescriptorLayouts() {
     mergeLayoutInfo.pBindings = mergeBindings.data();
     if (vkCreateDescriptorSetLayout(m_device, &mergeLayoutInfo, nullptr, &m_mergeDescLayout) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create merge descriptor set layout");
+    }
+
+    // 6. ReSTIR Debug View Layout: (0: outImage, 1: DI reservoirs, 2: GI reservoirs, 3: X1 contexts)
+    std::vector<VkDescriptorSetLayoutBinding> debugBindings = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+    };
+    VkDescriptorSetLayoutCreateInfo debugLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    debugLayoutInfo.bindingCount = static_cast<uint32_t>(debugBindings.size());
+    debugLayoutInfo.pBindings = debugBindings.data();
+    if (vkCreateDescriptorSetLayout(m_device, &debugLayoutInfo, nullptr, &m_restirDebugDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create ReSTIR debug view descriptor set layout");
     }
 }
 
@@ -357,6 +379,99 @@ void PostProcessPipeline::updateTonemapDescriptors(VkDescriptorSet descSet, Imag
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
     writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void PostProcessPipeline::updateDebugViewDescriptors(uint32_t slot, Buffer* diReservoirs, Buffer* giReservoirs, Buffer* x1Contexts, Image* outputImage) {
+    if (slot >= MAX_FRAMES_IN_FLIGHT || m_restirDebugDescSets[slot] == VK_NULL_HANDLE || !outputImage) return;
+
+    auto bufInfo = [this](Buffer* b, VkDescriptorBufferInfo& out) {
+        // Null grids fall back to the small dummy buffer; the shader's
+        // .length() bounds check then rejects (nearly) every pixel.
+        out.buffer = b ? b->getBuffer() : m_debugDummyBuffer->getBuffer();
+        out.offset = 0;
+        out.range = b ? b->getSize() : m_debugDummyBuffer->getSize();
+    };
+    VkDescriptorBufferInfo diInfo{}, giInfo{}, x1Info{};
+    bufInfo(diReservoirs, diInfo);
+    bufInfo(giReservoirs, giInfo);
+    bufInfo(x1Contexts, x1Info);
+
+    VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+    std::array<VkWriteDescriptorSet, 4> writes{};
+    writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_restirDebugDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_restirDebugDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &diInfo, nullptr };
+    writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_restirDebugDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giInfo, nullptr };
+    writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_restirDebugDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &x1Info, nullptr };
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void PostProcessPipeline::recordDebugView(VkCommandBuffer cmd, uint32_t slot, const DebugViewPushConstants& pc) {
+    if (!m_restirDebugPipeline || slot >= MAX_FRAMES_IN_FLIGHT || m_restirDebugDescSets[slot] == VK_NULL_HANDLE) return;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirDebugPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirDebugPipelineLayout, 0, 1, &m_restirDebugDescSets[slot], 0, nullptr);
+    vkCmdPushConstants(cmd, m_restirDebugPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DebugViewPushConstants), &pc);
+    vkCmdDispatch(cmd, (pc.outWidth + 15) / 16, (pc.outHeight + 15) / 16, 1);
+}
+
+void PostProcessPipeline::createDebugViewPipeline(const std::vector<char>& spv) {
+    if (spv.empty()) return;
+
+    // Dedicated pool: the global pool budget is fully allocated elsewhere.
+    VkDescriptorPoolSize poolSizes[] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAMES_IN_FLIGHT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES_IN_FLIGHT * 3 }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_restirDebugDescPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create ReSTIR debug view descriptor pool");
+    }
+
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> sets{};
+    std::array<VkDescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> layouts{ m_restirDebugDescLayout, m_restirDebugDescLayout };
+    VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    allocInfo.descriptorPool = m_restirDebugDescPool;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts.data();
+    if (vkAllocateDescriptorSets(m_device, &allocInfo, sets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate ReSTIR debug view descriptor sets");
+    }
+    m_restirDebugDescSets = sets;
+
+    // Fallback binding for null reservoir grids (shader never reads past its
+    // .length(), so a small buffer is safe).
+    m_debugDummyBuffer = std::make_unique<Buffer>(
+        m_allocator, 128,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_GPU_ONLY
+    );
+
+    VkPushConstantRange pushConstant{};
+    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(DebugViewPushConstants);
+
+    VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &m_restirDebugDescLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushConstant;
+    if (vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_restirDebugPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create ReSTIR debug view pipeline layout");
+    }
+
+    VkShaderModule mod = createShaderModule(spv);
+    VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+    pipelineInfo.layout = m_restirDebugPipelineLayout;
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_restirDebugPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(m_device, mod, nullptr);
+        throw std::runtime_error("Failed to create ReSTIR debug view pipeline");
+    }
+    vkDestroyShaderModule(m_device, mod, nullptr);
 }
 
 void PostProcessPipeline::updateRunningAvgDescriptors(

@@ -207,6 +207,11 @@ of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc).
   neighbors' x2 to the current x1 with the `(d_src/d_new)²` solid-angle Jacobian; the
   winner gets one replay visibility ray (skipped when the path's own candidate wins).
   Requires material sort + hardware ray queries; toggle with `--no-restir-gi`.
+- **Debug views** (`--debug-view`, also a GUI combo): a post pass overwrites the output
+  image with live reservoir state — DI/GI sample-count M (log heatmap), finalized weight
+  w = wSum/(p̂·M) (log scale, firefly hunting), DI winner light index (golden-ratio hue),
+  and a validity coverage map (R = DI, G = GI, B = X1 context). Runs after accumulation &
+  tonemap so the state is never temporal-blurred; see `shaders/compute/restir_debug_view.comp`.
 - **Path replay beyond x2 (Phase 2b)** — redirecting the bounce-2 continuation through the
   reservoir winner — remains a roadmap item; continuations currently follow the path's own
   x2, keeping deeper bounces unbiased without path storage.

@@ -1320,6 +1320,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Maximum temporal history sample count M cap (DI and GI) to prevent lag and bias. Spatial taps are additionally capped at 8.");
                 }
+
+                static const char* debugViewLabels[] = {
+                    "None", "DI: Sample Count M", "DI: Weight w", "DI: Light Index",
+                    "GI: Sample Count M", "GI: Weight w", "Coverage (R=DI G=GI B=X1)"
+                };
+                int debugViewIdx = static_cast<int>(config.debug_view);
+                if (ImGui::Combo("Debug View", &debugViewIdx, debugViewLabels, IM_ARRAYSIZE(debugViewLabels))) {
+                    config.debug_view = static_cast<DebugViewMode>(debugViewIdx);
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap).\n"
+                                      "M: reuse depth (dark = taps failing / disocclusion, saturates ~64).\n"
+                                      "Weight: w = wSum/(p_hat*M), log scale centered at w=1 (bright = high-variance pixels).\n"
+                                      "Light Index: winner hue per light. Coverage: R=DI valid, G=GI valid, B=X1 context valid.");
+                }
                 ImGui::Unindent();
             }
         }

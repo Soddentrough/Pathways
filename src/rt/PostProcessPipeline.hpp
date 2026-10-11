@@ -60,6 +60,15 @@ public:
     };
     static_assert(sizeof(Blend4KPushConstants) == 16, "Blend4KPushConstants must be 16 bytes");
 
+    struct DebugViewPushConstants {
+        uint32_t outWidth = 0;   // Output image (display) dimensions
+        uint32_t outHeight = 0;
+        uint32_t resWidth = 0;   // Reservoir grid (render resolution) dimensions
+        uint32_t resHeight = 0;
+        uint32_t mode = 0;       // 0 = off, 1..6 see restir_debug_view.comp
+    };
+    static_assert(sizeof(DebugViewPushConstants) == 20, "DebugViewPushConstants must be 20 bytes");
+
     struct MergePushConstants {
         uint32_t width = 0;
         uint32_t height = 0;
@@ -82,7 +91,8 @@ public:
         const std::vector<char>& fusedAccumTonemapSpv,
         const std::vector<char>& runningAvgSpv,
         const std::vector<char>& blendSpv,
-        const std::vector<char>& mergeSpv
+        const std::vector<char>& mergeSpv,
+        const std::vector<char>& restirDebugSpv
     );
     ~PostProcessPipeline();
 
@@ -94,6 +104,10 @@ public:
     void updateRunningAvgDescriptors(const std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT>& frameImages, Image* accumImage);
     void updateFusedAccumTonemapDescriptors(const std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT>& frameImages, Image* accumImage, Image* outputImage);
     void updateBlendDescriptors(Image* dstImage, Image* srcImage);
+    // ReSTIR debug view: binds the CURRENT frame's reservoir slot + X1 context
+    // grid (null buffers fall back to a dummy — callers should skip the
+    // dispatch when ReSTIR is inactive) and the output image to overwrite.
+    void updateDebugViewDescriptors(uint32_t slot, Buffer* diReservoirs, Buffer* giReservoirs, Buffer* x1Contexts, Image* outputImage);
     void updateMergeDescriptors(uint32_t slot, VkBuffer secBuffer, VkDeviceSize curSize, Image* frameImage, Image* mvImage, Image* normDepthImage, uint32_t width, uint32_t height, AccumFormat format);
 
     // Recording commands
@@ -101,6 +115,7 @@ public:
     void recordFusedAccumTonemap(VkCommandBuffer cmd, uint32_t frameSlot, const FusedAccumTonemapPushConstants& pc);
     void recordRunningAvg(VkCommandBuffer cmd, uint32_t frameSlot, const RunningAvgPushConstants& pc);
     void recordBlend4K(VkCommandBuffer cmd, const Blend4KPushConstants& pc);
+    void recordDebugView(VkCommandBuffer cmd, uint32_t slot, const DebugViewPushConstants& pc);
     void recordMerge(VkCommandBuffer cmd, uint32_t slot, const MergePushConstants& pc, uint32_t groupCountX, uint32_t groupCountY);
 
     VkDescriptorSetLayout getTonemapDescLayout() const { return m_tonemapDescLayout; }
@@ -121,12 +136,14 @@ public:
     VkDescriptorSetLayout getAccumTonemapDescLayout() const { return m_accumTonemapDescLayout; }
     VkDescriptorSetLayout getFsr3BlendDescLayout() const { return m_fsr3BlendDescLayout; }
     VkDescriptorSetLayout getMergeDescLayout() const { return m_mergeDescLayout; }
+    VkDescriptorSet getDebugViewDescSet(uint32_t slot) const { return m_restirDebugDescSets[slot]; }
 
     bool hasFusedPipeline() const { return m_accumTonemapPipeline != VK_NULL_HANDLE; }
     bool hasRunningAvgPipeline() const { return m_accumRunningAvgPipeline != VK_NULL_HANDLE; }
     bool hasTonemapPipeline() const { return m_tonemapPipeline != VK_NULL_HANDLE; }
     bool hasBlendPipeline() const { return m_fsr3BlendPipeline != VK_NULL_HANDLE; }
     bool hasMergePipeline() const { return m_mergePipeline != VK_NULL_HANDLE; }
+    bool hasDebugViewPipeline() const { return m_restirDebugPipeline != VK_NULL_HANDLE; }
 
 private:
     void createDescriptorLayouts();
@@ -139,6 +156,7 @@ private:
         const std::vector<char>& mergeSpv
     );
     VkShaderModule createShaderModule(const std::vector<char>& code);
+    void createDebugViewPipeline(const std::vector<char>& spv);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
@@ -162,12 +180,18 @@ private:
     VkDescriptorSetLayout m_mergeDescLayout = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, 2> m_mergeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
+    VkDescriptorSetLayout m_restirDebugDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_restirDebugDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_restirDebugDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::unique_ptr<Buffer> m_debugDummyBuffer;
+
     // Pipeline Layouts
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_accumRunningAvgPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_accumTonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_fsr3BlendPipelineLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_mergePipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_restirDebugPipelineLayout = VK_NULL_HANDLE;
 
     // Pipelines
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
@@ -175,6 +199,7 @@ private:
     VkPipeline m_accumTonemapPipeline = VK_NULL_HANDLE;
     VkPipeline m_fsr3BlendPipeline = VK_NULL_HANDLE;
     VkPipeline m_mergePipeline = VK_NULL_HANDLE;
+    VkPipeline m_restirDebugPipeline = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

@@ -289,7 +289,9 @@ void Config::printUsage(const char* progName) {
               << "  --restir-di             Alias for --restir\n"
               << "  --no-restir-gi          Disable the ReSTIR GI component only (keep DI)\n"
               << "  --restir-pt             Alias for --restir (full path replay PT is NOT yet implemented; emits a warning)\n"
-              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 30)\n\n"
+              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 30)\n"
+              << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-di-m | restir-di-w |\n"
+              << "                          restir-di-light | restir-gi-m | restir-gi-w | restir-coverage | none\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -941,6 +943,19 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--restir-min-lights=")) {
             continue; // Deprecated, ignore
+        }
+        if (arg == "--debug-view" || arg.starts_with("--debug-view=")) {
+            std::string v = (arg == "--debug-view") ? (i + 1 < argc ? argv[++i] : "none")
+                                                    : arg.substr(arg.find('=') + 1);
+            if (v == "none") cfg.debug_view = DebugViewMode::None;
+            else if (v == "restir-di-m") cfg.debug_view = DebugViewMode::RestirDiM;
+            else if (v == "restir-di-w") cfg.debug_view = DebugViewMode::RestirDiW;
+            else if (v == "restir-di-light") cfg.debug_view = DebugViewMode::RestirDiLight;
+            else if (v == "restir-gi-m") cfg.debug_view = DebugViewMode::RestirGiM;
+            else if (v == "restir-gi-w") cfg.debug_view = DebugViewMode::RestirGiW;
+            else if (v == "restir-coverage") cfg.debug_view = DebugViewMode::RestirCoverage;
+            else Logger::warn("Unknown --debug-view '{}': using none. Options: none, restir-di-m, restir-di-w, restir-di-light, restir-gi-m, restir-gi-w, restir-coverage", v);
+            continue;
         }
         if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {
             uint32_t sz = static_cast<uint32_t>(std::stoul(argv[++i]));

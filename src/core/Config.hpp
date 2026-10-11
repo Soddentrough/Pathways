@@ -62,6 +62,18 @@ enum class UpscalerMode {
     FSR1    // EXPERIMENTAL: custom spatial upscaler (hidden)
 };
 
+// Post-mortem visualization overlays written directly over the output image
+// (bypass accumulation & tonemap). ReSTIR views require --restir.
+enum class DebugViewMode {
+    None = 0,       // Normal rendering [Default]
+    RestirDiM = 1,  // DI reservoir temporal sample count M (heatmap)
+    RestirDiW = 2,  // DI finalized RIS weight w = wSum/(pr*M) (log scale)
+    RestirDiLight = 3, // DI winner light index (golden-ratio hue)
+    RestirGiM = 4,  // GI reservoir temporal sample count M (heatmap)
+    RestirGiW = 5,  // GI finalized weight (log scale)
+    RestirCoverage = 6 // R = DI valid, G = GI valid, B = X1 context valid
+};
+
 enum class CaptureCameraMode {
     Gaming,   // Full 6-DOF multi-phase trajectory (walk, sprint, jump, twitch flick, ADS zoom, tactical scan) [Default]
     Static,   // Camera position, orientation, and FOV completely stationary (v_cam = 0)
@@ -172,6 +184,7 @@ struct Config {
     bool enable_restir = false;           // ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [Default: false, opt-in via --restir]
     uint32_t restir_m_cap = 30;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 30)
     bool restir_gi = true;                // ReSTIR GI (path-space secondary-vertex reuse at bounce 1) [Default: true, applies only when ReSTIR is enabled]
+    DebugViewMode debug_view = DebugViewMode::None; // Reservoir debug overlay (requires --restir; see --debug-view)
 
     uint32_t gpu_index = 0;
     MultiGpuMode mgpu_mode = MultiGpuMode::Off; // Default: Primary GPU (Multi-GPU only when passed via CLI or selected in menu)

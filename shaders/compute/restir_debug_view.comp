@@ -1,0 +1,133 @@
+#version 460
+#extension GL_EXT_shader_image_load_formatted : require
+
+// =============================================================================
+// ReSTIR debug view overlay.
+//
+// Runs AFTER all accumulation/tonemapping passes and overwrites the output
+// image directly with per-pixel reservoir state, so the view is never blurred
+// by temporal accumulation or distorted by ACES. Display-referred output
+// (gamma-encoded); intended for SDR display modes.
+//
+// Modes (push constant):
+//   1  DI M        temporal sample count of the DI reservoir (heatmap, 0..64)
+//   2  DI weight   finalized RIS weight w = wSum/(p̂·M) (log2, [-4..+4])
+//   3  DI light    winner light index (golden-ratio hue)
+//   4  GI M        temporal sample count of the GI reservoir
+//   5  GI weight   GI finalized weight w = wSum/(p̂·M) (log2)
+//   6  coverage    R = DI valid, G = GI valid, B = X1 context valid
+//
+// Invalid reservoirs render black. Reads the CURRENT frame's reservoir slot
+// (the one written by this frame's shade passes).
+// =============================================================================
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) writeonly uniform image2D uOutputImage;
+
+layout(std430, binding = 1) readonly buffer DiReservoirsBuffer {
+    DiReservoir diReservoirs[];
+};
+layout(std430, binding = 2) readonly buffer GiReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
+layout(std430, binding = 3) readonly buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint outWidth;   // Output image dimensions (display)
+    uint outHeight;
+    uint resWidth;   // Reservoir grid dimensions (render resolution)
+    uint resHeight;
+    uint mode;
+} pc;
+
+// Perceptual heat ramp: dark blue -> teal -> green -> yellow -> red.
+vec3 debugHeat(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3(0.02, 0.02, 0.18);
+    const vec3 c1 = vec3(0.00, 0.45, 0.75);
+    const vec3 c2 = vec3(0.05, 0.80, 0.30);
+    const vec3 c3 = vec3(0.98, 0.85, 0.15);
+    const vec3 c4 = vec3(0.95, 0.10, 0.05);
+    if (t < 0.25) return mix(c0, c1, t * 4.0);
+    if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+    if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+    return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
+// Golden-ratio hue hash: adjacent light indices get maximum hue contrast.
+// Standard hue->RGB (full saturation); the clamp MUST span [-1, 1] — a
+// [0, 1] clamp collapses the whole h <= 1/6 range to white.
+vec3 debugIndexHue(uint idx) {
+    float h = fract(float(idx) * 0.6180339887);
+    vec3 rgb = clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    return rgb * 0.85 + 0.15;
+}
+
+// Symmetric log scale: maps w in [2^-4, 2^+4] to [0, 1] around w = 1.
+float debugLogScale(float w) {
+    float l = log2(max(abs(w), 1e-8));
+    return clamp((l + 4.0) / 8.0, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 outPixel = ivec2(gl_GlobalInvocationID.xy);
+    if (outPixel.x >= int(pc.outWidth) || outPixel.y >= int(pc.outHeight)) return;
+
+    // Display -> render-resolution mapping (nearest).
+    ivec2 rp = ivec2(
+        min(uint(outPixel.x) * pc.resWidth / max(pc.outWidth, 1u), pc.resWidth - 1u),
+        min(uint(outPixel.y) * pc.resHeight / max(pc.outHeight, 1u), pc.resHeight - 1u)
+    );
+    uint idx = uint(rp.y) * pc.resWidth + uint(rp.x);
+
+    vec3 color = vec3(0.0);  // black = nothing here
+
+    // Bounds guard: the buffers may be smaller than expected (e.g. after a
+    // resize race between passes) — never index out of range.
+    if (idx < x1Contexts.length()) {
+        bool diValid = restirIsValid(diReservoirs[idx].flags);
+        bool x1Valid = x1ContextValid(x1Contexts[idx]);
+        bool giValid = giIsValid(giReservoirs[idx]);
+        uint diM = restirGetM(diReservoirs[idx].idxM);
+        uint giM = giGetM(giReservoirs[idx]);
+
+        switch (pc.mode) {
+            case 1u: // DI M (log scale: 1 -> 0, 30 -> ~0.5, >=128 -> 1)
+                if (diValid) color = debugHeat(log2(float(max(diM, 1u))) / 7.0);
+                break;
+            case 2u: // DI finalized weight
+                if (diValid) {
+                    float w = diReservoirs[idx].wSum / max(diReservoirs[idx].targetPdf * float(max(diM, 1u)), 1e-8);
+                    color = debugHeat(debugLogScale(w));
+                }
+                break;
+            case 3u: // DI winner light index
+                if (diValid) color = debugIndexHue(restirGetLightIdx(diReservoirs[idx].idxM));
+                break;
+            case 4u: // GI M (log scale)
+                if (giValid) color = debugHeat(log2(float(max(giM, 1u))) / 7.0);
+                break;
+            case 5u: // GI finalized weight
+                if (giValid) {
+                    float w = giGetWSum(giReservoirs[idx]) /
+                              max(giGetTarget(giReservoirs[idx]) * float(max(giM, 1u)), 1e-8);
+                    color = debugHeat(debugLogScale(w));
+                }
+                break;
+            case 6u: // coverage
+                color = vec3(diValid ? 1.0 : 0.0, giValid ? 1.0 : 0.0, x1Valid ? 1.0 : 0.0);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Display-referred write (the pass bypasses the tonemap entirely).
+    color = pow(color, vec3(1.0 / 2.2));
+    imageStore(uOutputImage, outPixel, vec4(color, 1.0));
+}

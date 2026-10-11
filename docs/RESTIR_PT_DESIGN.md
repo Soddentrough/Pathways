@@ -145,6 +145,8 @@ For the ray currently hitting x2 with origin x1 and direction ω2:
 5. **Validation**: extend `scripts/verify_visual_integrity.py` with a GI variance-reduction
    + bias gate (many-lights + cornell-box vs. high-SPP reference images); add the
    M/W debug view for both DI and GI.
+   *(Done 2026-10-11: `test_restir_gi_energy_and_stability` gates energy + fireflies; the
+   M/W/light/coverage debug views ship as `--debug-view` + GUI combo.)*
 
 ## 4. Explicit non-goals for Phase 2
 

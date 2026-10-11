@@ -844,12 +844,13 @@ void Engine::initPipelines() {
     auto runningAvgCode = loadShaderSPIRV("accum_running_avg.comp.spv");
     auto blendCode = loadShaderSPIRV("fsr3_blend.comp.spv");
     auto mergeCode = loadShaderSPIRV("accum_merge.comp.spv");
+    auto restirDebugCode = loadShaderSPIRV("restir_debug_view.comp.spv");
 
     m_postProcess = std::make_unique<PostProcessPipeline>(
         device, allocator,
         m_context->hasSubgroupSizeControl(),
         m_descriptorPool,
-        tonemapCode, fusedCode, runningAvgCode, blendCode, mergeCode
+        tonemapCode, fusedCode, runningAvgCode, blendCode, mergeCode, restirDebugCode
     );
     updateMergeDescriptors();
 
@@ -2064,6 +2065,39 @@ void Engine::renderFrame() {
             m_postProcess->recordTonemap(activeCmd, tmSet, m_config.width, m_config.height, tonemapConstants);
         }
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
+    }
+
+    // 2.9 ReSTIR debug view overlay: overwrites m_outputImage with per-pixel
+    // reservoir state (bypasses accumulation and tonemapping entirely).
+    if (m_config.debug_view != DebugViewMode::None && m_postProcess && m_outputImage) {
+        if (m_restirManager && m_restirManager->isInitialized()) {
+            VkMemoryBarrier2 dbgOrderBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            dbgOrderBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            dbgOrderBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            dbgOrderBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            dbgOrderBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            VkDependencyInfo dbgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            dbgDep.memoryBarrierCount = 1;
+            dbgDep.pMemoryBarriers = &dbgOrderBarrier;
+            vkCmdPipelineBarrier2(activeCmd, &dbgDep);
+
+            m_postProcess->updateDebugViewDescriptors(
+                m_currentFrame,
+                m_restirManager->getReservoirBuffer(m_currentFrame),
+                m_restirManager->getGiReservoirBuffer(m_currentFrame),
+                m_restirManager->getX1ContextBuffer(),
+                m_outputImage
+            );
+            PostProcessPipeline::DebugViewPushConstants dbgPC{};
+            dbgPC.outWidth = m_config.width;
+            dbgPC.outHeight = m_config.height;
+            dbgPC.resWidth = renderW;
+            dbgPC.resHeight = renderH;
+            dbgPC.mode = static_cast<uint32_t>(m_config.debug_view);
+            m_postProcess->recordDebugView(activeCmd, m_currentFrame, dbgPC);
+        } else if (m_frameIndex % 120 == 0) {
+            Logger::warn("--debug-view is active but ReSTIR reservoirs are not allocated (enable with --restir).");
+        }
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay

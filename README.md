@@ -290,6 +290,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--no-restir-gi` | *(flag)* | Disable the ReSTIR GI component only (keep DI) | GI on when `--restir` |
 | `--restir-min-lights` | `<int>` | *Deprecated, ignored* (kept for CLI compatibility) | — |
 | `--restir-m-cap` | `<int>` | ReSTIR temporal reuse M-cap for DI and GI (spatial taps additionally capped at 8 in-shader) | `30` |
+| `--debug-view` | `<name>` | Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap; requires `--restir`): `restir-di-m` / `restir-di-w` / `restir-di-light` / `restir-gi-m` / `restir-gi-w` / `restir-coverage` / `none` | `none` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |
