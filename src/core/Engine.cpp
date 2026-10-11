@@ -569,10 +569,14 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 
     syncScenePointers();
 
-    if (m_config.adopt_scene_bounces && !m_config.custom_bounces && m_sceneData.sceneDefaultMaxBounces > 0) {
-        m_config.max_bounces = std::clamp(m_sceneData.sceneDefaultMaxBounces, 1u, 16u);
+    if (m_config.adopt_scene_bounces && !m_config.custom_bounces) {
+        if (m_sceneData.sceneDefaultMaxBounces > 0) {
+            m_config.max_bounces = std::clamp(m_sceneData.sceneDefaultMaxBounces, 1u, 16u);
+            Logger::info("Applied scene default max bounces: {} (from scene metadata)", m_config.max_bounces);
+        } else {
+            m_config.max_bounces = 4;
+        }
         m_dynamicWavefrontBounces = m_config.max_bounces;
-        Logger::info("Applied scene default max bounces: {} (from scene metadata)", m_config.max_bounces);
     }
 
     // Rebuild Acceleration Structures (BLAS & TLAS)
@@ -859,6 +863,13 @@ void Engine::initPipelines() {
 
     // 12. Real-Time Caustics Subsystem
     initCaustics();
+    if (m_config.enable_caustics) {
+        if (!m_sceneData.hasDielectrics) {
+            Logger::warn("--caustics requested, but active scene contains no dielectric or transmission materials; caustics pass will remain inactive.");
+        } else if (m_numLights == 0) {
+            Logger::warn("--caustics requested, but active scene contains no analytical lights; caustics pass will remain inactive.");
+        }
+    }
 
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->setPostClassifyCallback([this](VkCommandBuffer cmd, uint32_t frameSlot) {
@@ -1024,8 +1035,7 @@ void Engine::initCaustics() {
             }
         );
 
-        updateCausticsDescriptors();
-        updateWavefrontSceneDescriptors();
+        updateAllImageDescriptors();
     } catch (const std::exception& e) {
         Logger::warn("CausticsPipeline initialization failed: {}", e.what());
     }
@@ -1645,11 +1655,26 @@ void Engine::renderFrame() {
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty())) flags |= (1 << 7);
-    if (m_config.enable_caustics && m_sceneData.hasDielectrics && m_numLights > 0) {
-        if (!m_causticsPipeline) {
-            initCaustics();
+    if (m_config.enable_caustics) {
+        if (m_sceneData.hasDielectrics && m_numLights > 0) {
+            if (!m_causticsPipeline) {
+                initCaustics();
+                m_accumulatedSamples = 0;
+                m_resetAccumulation = true;
+                accumReset = true;
+            }
+            flags |= (1 << 8);
+        } else {
+            static bool s_causticsWarned = false;
+            if (!s_causticsWarned) {
+                if (!m_sceneData.hasDielectrics) {
+                    Logger::warn("Real-time caustics enabled, but active scene contains no dielectric or transmission materials; caustics pass bypassed.");
+                } else if (m_numLights == 0) {
+                    Logger::warn("Real-time caustics enabled, but active scene contains no analytical lights; caustics pass bypassed.");
+                }
+                s_causticsWarned = true;
+            }
         }
-        flags |= (1 << 8);
     }
     if (isRestirActive()) flags |= (1 << 9);
     if (isRestirActive() && m_config.restir_gi) flags |= (1 << 24); // ReSTIR GI (bounce-1 path-space reuse)

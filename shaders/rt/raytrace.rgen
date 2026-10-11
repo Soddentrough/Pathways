@@ -247,7 +247,8 @@ void main() {
                 primaryRoughness = albB_r.y;
 
                 if (hit) {
-                    primaryDepth = length(primaryHitPoint - ubo.position.xyz);
+                    vec3 camForward = -ubo.viewInverse[2].xyz;
+                    primaryDepth = max(dot(primaryHitPoint - ubo.position.xyz, camForward), 0.0);
                     vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
                     vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPoint, 1.0);
                     if (currClip.w > 1e-4 && prevClip.w > 1e-4) {

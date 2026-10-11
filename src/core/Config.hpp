@@ -108,7 +108,7 @@ struct Config {
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
     bool custom_bounces = false;    // Set to true when --max-bounces or --bounces is passed explicitly on CLI
-    bool adopt_scene_bounces = false; // Set to true via --scene-bounces to adopt sceneDefaultMaxBounces from scene metadata
+    bool adopt_scene_bounces = false; // Adopt sceneDefaultMaxBounces from scene metadata via --scene-bounces (default: false)
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;
@@ -154,7 +154,7 @@ struct Config {
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation via hardware rayQueryEXT (Default: true)
     bool enable_direct_light = true;
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
-    bool enable_delta_unroll = false;    // Collapse dielectric double-bounce via inline rayQuery delta unrolling (experimental) [Default: false]
+    bool enable_delta_unroll = true;     // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: true]
     uint32_t max_delta_events = 2;       // Maximum internal delta events to unroll per dielectric vertex (default: 2)
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)

@@ -38,13 +38,11 @@ void SceneGeometryPipeline::updateSceneTransparency(
 }
 
 void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_t& outNumOpaqueTriangles) {
-    if (sceneData.triangles.empty()) {
-        outNumOpaqueTriangles = 0;
-        sceneData.numOpaqueTriangles = 0;
-        return;
-    }
+    outNumOpaqueTriangles = 0;
+    sceneData.numOpaqueTriangles = 0;
 
-    auto isOpaqueTriangle = [&sceneData](const TriangleGPU& tri) {
+    if (!sceneData.triangles.empty()) {
+        auto isOpaqueTriangle = [&sceneData](const TriangleGPU& tri) {
         if (tri.materialId >= sceneData.materials.size()) {
             return true;
         }
@@ -78,8 +76,92 @@ void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_
         sceneData.numOpaqueTriangles = outNumOpaqueTriangles;
     }
 
-    Logger::info("Geometry Partitioning: {} Opaque triangles, {} Non-Opaque triangles (Total: {})",
-                 outNumOpaqueTriangles, sceneData.triangles.size() - outNumOpaqueTriangles, sceneData.triangles.size());
+        Logger::info("Geometry Partitioning: {} Opaque triangles, {} Non-Opaque triangles (Total: {})",
+                     outNumOpaqueTriangles, sceneData.triangles.size() - outNumOpaqueTriangles, sceneData.triangles.size());
+    }
+
+    // Compute Dielectric Target Bounding Box for Caustic Photon Injection
+    bool foundDielectric = false;
+    glm::vec3 dMin(1e30f);
+    glm::vec3 dMax(-1e30f);
+
+    auto isDielectricMat = [&sceneData](uint32_t matId) {
+        if (matId >= sceneData.materials.size()) return false;
+        const auto& mat = sceneData.materials[matId];
+        return (mat.type == MATERIAL_DIELECTRIC || mat.transmission > 0.05f);
+    };
+
+    if (!sceneData.instances.empty() && !sceneData.blasRanges.empty()) {
+        std::vector<glm::vec3> blasDielectricMin(sceneData.blasRanges.size(), glm::vec3(1e30f));
+        std::vector<glm::vec3> blasDielectricMax(sceneData.blasRanges.size(), glm::vec3(-1e30f));
+        std::vector<bool> blasHasDielectric(sceneData.blasRanges.size(), false);
+
+        for (size_t b = 0; b < sceneData.blasRanges.size(); ++b) {
+            const auto& range = sceneData.blasRanges[b];
+            for (uint32_t t = 0; t < range.triangleCount; ++t) {
+                uint32_t triIdx = range.firstTriangle + t;
+                if (triIdx < sceneData.triangles.size()) {
+                    const auto& tri = sceneData.triangles[triIdx];
+                    if (isDielectricMat(tri.materialId)) {
+                        blasHasDielectric[b] = true;
+                        blasDielectricMin[b] = glm::min(blasDielectricMin[b], glm::vec3(tri.v0.position));
+                        blasDielectricMin[b] = glm::min(blasDielectricMin[b], glm::vec3(tri.v1.position));
+                        blasDielectricMin[b] = glm::min(blasDielectricMin[b], glm::vec3(tri.v2.position));
+                        blasDielectricMax[b] = glm::max(blasDielectricMax[b], glm::vec3(tri.v0.position));
+                        blasDielectricMax[b] = glm::max(blasDielectricMax[b], glm::vec3(tri.v1.position));
+                        blasDielectricMax[b] = glm::max(blasDielectricMax[b], glm::vec3(tri.v2.position));
+                    }
+                }
+            }
+        }
+
+        for (const auto& inst : sceneData.instances) {
+            if (inst.blasIndex < sceneData.blasRanges.size() && blasHasDielectric[inst.blasIndex]) {
+                foundDielectric = true;
+                const glm::vec3& lMin = blasDielectricMin[inst.blasIndex];
+                const glm::vec3& lMax = blasDielectricMax[inst.blasIndex];
+                for (int c = 0; c < 8; ++c) {
+                    glm::vec3 corner(
+                        (c & 1) ? lMax.x : lMin.x,
+                        (c & 2) ? lMax.y : lMin.y,
+                        (c & 4) ? lMax.z : lMin.z
+                    );
+                    glm::vec3 wCorner = glm::vec3(inst.transform * glm::vec4(corner, 1.0f));
+                    dMin = glm::min(dMin, wCorner);
+                    dMax = glm::max(dMax, wCorner);
+                }
+            }
+        }
+    } else {
+        for (const auto& tri : sceneData.triangles) {
+            if (isDielectricMat(tri.materialId)) {
+                foundDielectric = true;
+                glm::vec3 p0(tri.v0.position);
+                glm::vec3 p1(tri.v1.position);
+                glm::vec3 p2(tri.v2.position);
+                dMin = glm::min(dMin, glm::min(p0, glm::min(p1, p2)));
+                dMax = glm::max(dMax, glm::max(p0, glm::max(p1, p2)));
+            }
+        }
+    }
+
+    for (const auto& sph : sceneData.spheres) {
+        if (isDielectricMat(sph.materialId)) {
+            foundDielectric = true;
+            glm::vec3 center(sph.centerRadius.x, sph.centerRadius.y, sph.centerRadius.z);
+            float radius = sph.centerRadius.w;
+            dMin = glm::min(dMin, center - glm::vec3(radius));
+            dMax = glm::max(dMax, center + glm::vec3(radius));
+        }
+    }
+
+    if (foundDielectric) {
+        sceneData.hasDielectrics = true;
+        sceneData.dielectricBoundsMin = dMin;
+        sceneData.dielectricBoundsMax = dMax;
+        Logger::info("Dielectric Caustic Target Bounding Box: [({:.3f}, {:.3f}, {:.3f}) to ({:.3f}, {:.3f}, {:.3f})]",
+                     dMin.x, dMin.y, dMin.z, dMax.x, dMax.y, dMax.z);
+    }
 }
 
 void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const Config& config) {

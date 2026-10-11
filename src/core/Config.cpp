@@ -279,6 +279,7 @@ void Config::printUsage(const char* progName) {
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene-bounces         Adopt scene metadata default max bounces if present [default: disabled]\n"
+              << "  --no-scene-bounces      Disable adopting scene metadata default max bounces (enforce 4 bounces) [default: enabled]\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"

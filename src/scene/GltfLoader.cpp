@@ -1035,7 +1035,7 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
     for (const auto& tri : data.triangles) {
         if (tri.materialId < data.materials.size()) {
             const auto& mat = data.materials[tri.materialId];
-            if ((mat.type == MATERIAL_DIELECTRIC || mat.transmission > 0.05f) && mat.thickness > 0.001f) {
+            if (mat.type == MATERIAL_DIELECTRIC || mat.transmission > 0.05f) {
                 data.hasDielectrics = true;
                 glm::vec3 p0(tri.v0.position);
                 glm::vec3 p1(tri.v1.position);

@@ -102,6 +102,10 @@ struct FrameStats {
     bool enable_refraction = true;
     bool enable_shadows = true;
     bool aces_tonemap = true;
+    bool enable_caustics = false;
+    bool caustics_active = false;
+    bool has_dielectrics = false;
+    uint32_t caustic_photons = 0;
     // HDR Display Pipeline Telemetry
     std::string swapchain_format_str = "B8G8R8A8_UNORM";
     std::string swapchain_color_space_str = "SRGB_NONLINEAR";

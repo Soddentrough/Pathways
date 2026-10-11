@@ -220,6 +220,23 @@ echo "[6b] Running Test Suite 6: Extreme Scenes Regression Verification (Caustic
 
 python3 scripts/verify_frame.py output/test_cornell_caustic.png output/stats_cornell_caustic.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 15.0
 
+# 8b. Real-Time Forward Caustics Verification (Photon Splatting & G-Buffer Gating)
+echo ""
+echo "[6b.1] Running Real-Time Caustics Verification (--caustics)..."
+"${PATHWAYS_BIN}" \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --frames 10 \
+    --caustics \
+    --scene scenes/cornell-caustic/cornell_caustic_extended.glb \
+    --dump-frame output/test_cornell_caustic_on.png \
+    --dump-stats output/stats_cornell_caustic_on.json
+
+python3 scripts/verify_caustics.py output/test_cornell_caustic.png output/test_cornell_caustic_on.png output/stats_cornell_caustic_on.json
+
 "${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \

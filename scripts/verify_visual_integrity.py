@@ -1080,6 +1080,98 @@ def test_restir_pt_veach_ajar_indirect_integrity():
 
     return result
 
+def test_caustics_differential_energy_and_stability():
+    result = TestResult("Real-Time Caustics Photon Splatting & Differential Energy")
+    print(f"\n--- Running: {result.name} ---")
+
+    scene_path = "scenes/cornell-caustic/cornell_caustic_extended.glb"
+    if not os.path.exists(os.path.join(PATHWAYS_ROOT, scene_path)):
+        scene_path = "cornell-box"
+
+    common = [
+        "--scene", scene_path,
+        "--res", "512x512",
+        "--spp", "1",
+        "--max-bounces", "4",
+        "--frames", "16"
+    ]
+
+    # 1. Wavefront Baseline (Caustics Off)
+    out_plain = os.path.join(OUTPUT_DIR, "caustics_baseline_off.png")
+    stats_plain = os.path.join(OUTPUT_DIR, "caustics_baseline_stats.json")
+    rc, _, stderr = run_pathways(common + ["--dump-frame", out_plain, "--dump-stats", stats_plain])
+    if rc != 0:
+        result.fail(f"Baseline (caustics off) run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    # 2. Wavefront Caustics Active
+    out_on = os.path.join(OUTPUT_DIR, "caustics_photon_on.png")
+    stats_on = os.path.join(OUTPUT_DIR, "caustics_photon_stats.json")
+    rc, _, stderr = run_pathways(common + ["--caustics", "--dump-frame", out_on, "--dump-stats", stats_on])
+    if rc != 0:
+        result.fail(f"Caustics (--caustics) run failed with code {rc}: {stderr.strip()[:200]}")
+        return result
+
+    img_plain = cv2.imread(out_plain, cv2.IMREAD_UNCHANGED)
+    img_on = cv2.imread(out_on, cv2.IMREAD_UNCHANGED)
+    if img_plain is None or img_on is None:
+        result.fail("Failed to load caustics test outputs")
+        return result
+
+    if np.isnan(img_on).any() or np.isinf(img_on).any():
+        result.fail("NaN/Inf detected in caustics image output")
+
+    # Verify telemetry in stats.json
+    if os.path.exists(stats_on):
+        try:
+            with open(stats_on, "r") as f:
+                st_data = json.load(f)
+            caustics_sec = st_data.get("engine_settings", {}).get("caustics", st_data.get("caustics", {}))
+            if not caustics_sec.get("caustics_active", False):
+                result.fail("stats.json reported caustics_active == false despite --caustics flag")
+            if not caustics_sec.get("has_dielectrics", False):
+                result.fail("stats.json reported has_dielectrics == false for dielectric scene")
+            result.record("caustics_active", caustics_sec.get("caustics_active", False))
+            result.record("has_dielectrics", caustics_sec.get("has_dielectrics", False))
+        except Exception as e:
+            result.fail(f"Failed to parse caustics stats JSON: {e}")
+
+    # Compute pixel difference between caustics ON vs OFF
+    diff = np.abs(img_on.astype(np.float64) - img_plain.astype(np.float64))
+    max_diff = float(np.max(diff))
+    mean_diff = float(np.mean(diff))
+
+    result.record("max_diff", max_diff)
+    result.record("mean_diff", mean_diff)
+    print(f"  Wavefront Diff: Max={max_diff:.1f}, Mean={mean_diff:.3f}")
+
+    if max_diff < 40.0:
+        result.fail(f"Caustic focal hot-spot absent: max difference {max_diff:.1f} < 40.0")
+    if mean_diff < 1.0:
+        result.fail(f"Caustic energy injection absent: mean difference {mean_diff:.3f} < 1.0")
+
+    # 3. Hardware RTP Mode Verification
+    out_rtp_plain = os.path.join(OUTPUT_DIR, "caustics_rtp_off.png")
+    rc, _, _ = run_pathways(common + ["--pipeline", "rtp", "--dump-frame", out_rtp_plain])
+    out_rtp_on = os.path.join(OUTPUT_DIR, "caustics_rtp_on.png")
+    rc2, _, stderr2 = run_pathways(common + ["--pipeline", "rtp", "--caustics", "--dump-frame", out_rtp_on])
+    if rc == 0 and rc2 == 0:
+        img_rtp_plain = cv2.imread(out_rtp_plain, cv2.IMREAD_UNCHANGED)
+        img_rtp_on = cv2.imread(out_rtp_on, cv2.IMREAD_UNCHANGED)
+        if img_rtp_plain is not None and img_rtp_on is not None:
+            diff_rtp = np.abs(img_rtp_on.astype(np.float64) - img_rtp_plain.astype(np.float64))
+            rtp_max_diff = float(np.max(diff_rtp))
+            rtp_mean_diff = float(np.mean(diff_rtp))
+            result.record("rtp_max_diff", rtp_max_diff)
+            result.record("rtp_mean_diff", rtp_mean_diff)
+            print(f"  Hardware RTP Diff: Max={rtp_max_diff:.1f}, Mean={rtp_mean_diff:.3f}")
+            if rtp_max_diff < 40.0:
+                result.fail(f"Hardware RTP caustics absent: max difference {rtp_max_diff:.1f} < 40.0")
+    else:
+        result.fail(f"Hardware RTP execution failed: {stderr2.strip()[:200]}")
+
+    return result
+
 def main():
     print("================================================================")
     print("  Pathways Visual Integrity & Exposure Stability Test Suite     ")
@@ -1126,7 +1218,8 @@ def main():
         test_restir_many_lights_variance_and_gating,
         test_restir_gi_energy_and_stability,
         test_specular_vmv_integrity,
-        test_restir_pt_veach_ajar_indirect_integrity
+        test_restir_pt_veach_ajar_indirect_integrity,
+        test_caustics_differential_energy_and_stability
     ]
 
     # Optional test filtering via command-line argument: --filter <substr>

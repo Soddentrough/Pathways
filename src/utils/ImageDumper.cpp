@@ -341,6 +341,12 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"soft_shadows\": {},\n", stats.enable_shadows ? "true" : "false")
         << std::format("      \"aces_tonemapping\": {}\n", stats.aces_tonemap ? "true" : "false")
         << "    },\n"
+        << "    \"caustics\": {\n"
+        << std::format("      \"enable_caustics\": {},\n", stats.enable_caustics ? "true" : "false")
+        << std::format("      \"caustics_active\": {},\n", stats.caustics_active ? "true" : "false")
+        << std::format("      \"has_dielectrics\": {},\n", stats.has_dielectrics ? "true" : "false")
+        << std::format("      \"caustic_photons\": {}\n", stats.caustic_photons)
+        << "    },\n"
         << "    \"display_and_color\": {\n"
         << std::format("      \"hdr_display_active\": {},\n", stats.is_hdr_display ? "true" : "false")
         << std::format("      \"hdr_mode\": \"{}\",\n", stats.hdr_mode_str)

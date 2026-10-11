@@ -813,6 +813,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Max Ray Bounces");
             if (ImGui::SliderInt("##BncSlider", &bounces, 1, maxBouncesSlider)) {
                 config.max_bounces = static_cast<uint32_t>(bounces);
+                config.custom_bounces = true;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
@@ -826,6 +827,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::SameLine();
             if (ImGui::SmallButton("-##BncDec") && config.max_bounces > 1) {
                 config.max_bounces--;
+                config.custom_bounces = true;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
@@ -833,6 +835,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::SameLine();
             if (ImGui::SmallButton("+##BncInc") && config.max_bounces < static_cast<uint32_t>(maxBouncesSlider)) {
                 config.max_bounces++;
+                config.custom_bounces = true;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
@@ -843,6 +846,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (isCurrent) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
                 if (ImGui::SmallButton(label)) {
                     config.max_bounces = val;
+                    config.custom_bounces = true;
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
                 }
@@ -1159,7 +1163,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         : "Reference Settings Active (Matched)";
                     if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f))) {
                         if (stats.scene_default_spp > 0) config.spp = targetSpp;
-                        if (stats.scene_default_max_bounces > 0) config.max_bounces = targetBnc;
+                        if (stats.scene_default_max_bounces > 0) {
+                            config.max_bounces = targetBnc;
+                            config.custom_bounces = false;
+                        }
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
                     }

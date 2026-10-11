@@ -691,6 +691,31 @@ if(UNIX)
 endif()
 add_test(NAME ProceduralCyberCity COMMAND test_procedural_cyber_city)
 
+# Real-Time Caustics Dielectric Target & Bounding Volume Unit Test Target
+add_executable(test_caustics_detection
+    tests/test_caustics_detection.cpp
+    src/scene/SceneGeometryPipeline.cpp
+    src/scene/ProceduralScene.cpp
+    src/scene/GltfLoader.cpp
+    src/scene/Camera.cpp
+    src/core/Logger.cpp
+    src/core/Config.cpp
+    src/vulkan/Buffer.cpp
+    src/vulkan/VulkanContext.cpp
+)
+target_include_directories(test_caustics_detection PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+    ${THIRD_PARTY_DIR}/cgltf
+    ${THIRD_PARTY_DIR}/stb
+    ${THIRD_PARTY_DIR}/vma
+)
+target_link_libraries(test_caustics_detection PRIVATE Vulkan::Vulkan Threads::Threads)
+if(UNIX)
+    target_link_libraries(test_caustics_detection PRIVATE m)
+endif()
+add_test(NAME CausticsDetection COMMAND test_caustics_detection)
+
 # OpenUSD Native Scene Ingestion Unit Test Target
 if(pxr_FOUND)
     add_executable(test_usd_loader

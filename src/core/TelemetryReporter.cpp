@@ -274,6 +274,10 @@ FrameStats TelemetryReporter::getStats() const {
     stats.accumulation_complete = m_engine->m_accumulationComplete;
     stats.is_animating = m_engine->m_config.animate_objects && (m_engine->m_config.animation_speed > 0.0001f) && !m_engine->m_sceneData.animatedInstances.empty();
     stats.validation_errors = m_engine->m_context->getValidationErrors();
+    stats.enable_caustics = m_engine->m_config.enable_caustics;
+    stats.has_dielectrics = m_engine->m_sceneData.hasDielectrics;
+    stats.caustics_active = m_engine->m_config.enable_caustics && m_engine->m_sceneData.hasDielectrics && (m_engine->m_numLights > 0);
+    stats.caustic_photons = m_engine->m_config.caustic_photons;
     stats.last_screenshot_path = m_engine->m_lastScreenshotPath;
     stats.screenshot_notification_timer = m_engine->m_screenshotNotificationTimer;
 
