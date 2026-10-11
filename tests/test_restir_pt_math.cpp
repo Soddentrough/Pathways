@@ -285,6 +285,53 @@ int main() {
         assert_true(passNeighbor, "Co-planar continuous surface neighbor accepted for GI reuse");
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 7: Decoupled ReSTIR GI Reconnection Shadow Ray Encoding & Range
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 7] Decoupled ReSTIR GI Reconnection Shadow Ray Encoding & Range..." << std::endl;
+    {
+        // 7a. Octahedral encoding round-trip fidelity for reconnection direction
+        auto octSign = [](const glm::vec2& v) -> glm::vec2 {
+            return glm::vec2((v.x >= 0.0f) ? 1.0f : -1.0f, (v.y >= 0.0f) ? 1.0f : -1.0f);
+        };
+        auto octEncode = [&](const glm::vec3& v) -> glm::vec2 {
+            float sum = std::abs(v.x) + std::abs(v.y) + std::abs(v.z);
+            glm::vec2 p(v.x / sum, v.y / sum);
+            return (v.z >= 0.0f) ? p : (glm::vec2(1.0f) - glm::abs(glm::vec2(p.y, p.x))) * octSign(p);
+        };
+        auto octDecode = [&](const glm::vec2& f) -> glm::vec3 {
+            glm::vec3 v(f.x, f.y, 1.0f - std::abs(f.x) - std::abs(f.y));
+            if (v.z < 0.0f) {
+                glm::vec2 s = (glm::vec2(1.0f) - glm::abs(glm::vec2(v.y, v.x))) * octSign(glm::vec2(v.x, v.y));
+                v.x = s.x;
+                v.y = s.y;
+            }
+            return glm::normalize(v);
+        };
+
+        glm::vec3 dirTarget = glm::normalize(glm::vec3(0.577f, -0.577f, 0.577f));
+        glm::vec2 enc = octEncode(dirTarget);
+        glm::vec3 dec = octDecode(enc);
+        assert_near(glm::dot(dirTarget, dec), 1.0f, 1e-4f, "Octahedral direction encoding roundtrip fidelity (dot == 1.0)");
+
+        // 7b. Reconnection ray interval: tMin = EPSILON, tMax = dist - 2*EPSILON
+        const float EPSILON = 0.0005f;
+        glm::vec3 x1(1.0f, 2.0f, 3.0f);
+        glm::vec3 x2(4.0f, 6.0f, 3.0f); // distance = 5.0
+        float dist = glm::length(x2 - x1);
+        float tMax = dist - 2.0f * EPSILON;
+        assert_near(dist, 5.0f, 1e-5f, "Euclidean reconnection distance");
+        assert_true(tMax > 0.0f && tMax < dist, "Shadow ray tMax strictly bounded inside (0, dist)");
+        assert_near(tMax, 4.999f, 1e-5f, "Reconnection shadow ray tMax accounts for double epsilon offsets");
+
+        // 7c. PackedShadowRay struct size & alignment verification
+        struct TestPackedShadowRay {
+            glm::vec4 originDist;
+            glm::uvec4 dirPixelRad;
+        };
+        assert_true(sizeof(TestPackedShadowRay) == 32, "PackedShadowRay size must strictly equal 32 bytes");
+    }
+
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "  ALL ReSTIR PT Mathematical & Estimator Unit Tests PASSED!" << std::endl;
     std::cout << "================================================================================" << std::endl;

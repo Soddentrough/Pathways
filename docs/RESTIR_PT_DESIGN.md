@@ -1,160 +1,212 @@
-# ReSTIR PT Design — Path-Space Reservoir Resampling with Replay
+# ReSTIR PT Design — Path-Space Reservoir Resampling & Decoupled Architecture
 
-**Status:** Phase 2a IMPLEMENTED (2026-10-11): single-vertex GI reservoir with X1 context,
-winner replay visibility, and bounce-1 estimator replacement. Phase 2b (multi-vertex path
-replay) remains planned. The Phase 1 foundation — the inline ReSTIR DI pipeline, the
-shared `restir_common.glsl` core, history-tap reuse, and the honest naming — landed on
-2026-10-10 (`docs/reports/restir_review_2026_10_10.md`).
-
-### Phase 2a as built (deviations from the plan below)
-
-- **Scope:** GI reservoirs apply at bounce 1 only, for paths whose continuation at the
-  primary hit was a diffuse cosine REFLECTION lobe (transmitted and specular lobes write
-  an invalid X1 context and keep legacy shading). x2 on complex/dielectric/emissive
-  surfaces invalidates the GI slot (no candidate).
-- **X1Context is 24 B** (n1 oct32, fp16 albedo, oct32 wo, fp16 scalar F0, valid flag).
-  `wo`/`F0` are needed because the bounce-0 continuation folds `(1-F)·albedo/(1-specProb)`
-  into the carried throughput; the finalization therefore multiplies the winner by the
-  Fresnel ratio `(1-F_w)/(1-F̂)` to stay unbiased (without it: ~+9% on cornell-box).
-- **GiReservoir is 32 B**: x2 world position fp32×3, wSum, p̂, fp16 L̂2, fp16 d_src, and
-  `flagsM = valid | age[8:1] | M[24:9]`. The tap weight keeps the `(d_src/d_new)²`
-  solid-angle Jacobian; `q` itself is not stored (cosine lobe ⇒ recoverable).
-- **L̂2 is stored SHADOWED** (inline shadow x2→light traced in the same pass; the deferred
-  shadow queue cannot feed the reservoir). The winner replay ray covers x1↔x2 only when
-  the winner is a reused tap (self-winner needs no ray: the path proved visibility).
-- **Finalization identity:** `C2 = T2·L̂2_w · wsum/(M·albedoBar·l̄um_w) · (1-F_w)/(1-F̂)`;
-  with a single candidate this reduces exactly to the legacy `T2·L̂2` accumulation
-  (verified: frame-1 images bit-comparable, 512-frame energy within 1.7% of plain PT).
-- **Activation:** UBO flag bit 24 (`restir_gi`, implied by `--restir`, off via
-  `--no-restir-gi`) AND material-sort secondary pipelines AND hardware ray queries.
-  The unified (non-material-sort) pipeline never runs GI — grids stay invalid there.
-- **Bindings:** 37 = X1 contexts (single-buffered, same-frame producer/consumer),
-  38 = GI current, 39 = GI history (double-buffered like DI).
-**Goal:** Resample *indirect* illumination (bounce ≥ 1) with the same reservoir machinery
-that already serves direct light, targeting the 1-SPP real-time goal on Strix Halo and the
-Veach-Ajar stress scenes.
+**Status:**
+- **Phase 1 (Completed 2026-10-10):** Inline ReSTIR DI subsystem, shared `restir_common.glsl`, temporal + spatial-tap reuse for analytical lights (`docs/reports/restir_review_2026_10_10.md`).
+- **Phase 2a (Completed 2026-10-11):** Path-space secondary-vertex ReSTIR GI at bounce 1, X1 context buffer, continuous random 2D spatial rotation, target ratio and weight clamping (`commit d5e4fab`).
+- **Phase 2b (Active Development):** Decoupled ReSTIR PT — elimination of inline `rayQuery` from shading kernels, stream-compacted visibility queues, and 16-byte `Hit` atom with `VK_KHR_ray_tracing_position_fetch`.
+- **Phase 3 (Long-Term Architectural Target):** Fully Inverted / Deferred Gather Path-Database Architecture (pure geometry/visibility resampling with end-of-frame deferred material closure evaluation).
 
 ---
 
-## 1. Why the old `PathReservoirPT` scaffolding was deleted
+## 1. Executive Architectural Summary
 
-The purged struct implied that path-space reuse was one struct away. It was not. Correct
-GI reuse requires three things the wavefront did not have:
+ReSTIR PT (*Path-Space Reservoir Spatio-Temporal Importance Resampling*) resamples light transport paths across space and time. However, how the resampling pipeline is structured determines whether the engine achieves real-time frame rates or collapses under GPU hardware penalties.
 
-1. **The BRDF context of the reuse vertex x1** at the time reuse is evaluated. In a
-   material-sorted wavefront, the bounce-1 shade pass knows x2 (its hit) but has lost x1's
-   material, albedo, and outgoing BSDF pdf. Reconnecting a neighbor's candidate *without*
-   re-evaluating `f_r(x1, ωo, ω2')` is not reuse — it is stale caching.
-2. **A consistent estimator decomposition.** If a reused candidate supplies the 2-bounce
-   contribution, the path's own pixel contribution for that same bounce must be *replaced*,
-   not added, or the 2-bounce term is double-counted.
-3. **Path replay for deeper bounces.** If the reservoir winner is not the path's own
-   candidate, the continuation beyond x2 must originate from the *winner's* x2', which
-   requires sampling the BSDF at x2' — i.e. its material — which the wavefront cannot do
-   from the reservoir alone.
+Two major decoupled architectures exist for production-grade ReSTIR PT in Vulkan 1.4:
 
-## 2. Architecture
+1. **Approach A: Request / Result Wavefront Ping-Pong (Lin et al. 2022, GRIS)**
+   - **Premise:** Geometry kernels trace rays and evaluate shift mappings; when they reach a reconnected vertex, they emit a lightweight `ShadeRequest`. Specialized material kernels evaluate BSDF $(f, \text{pdf})$ binned by material class, and a resolve pass computes exact Jacobians and MIS weights.
+   - **Key Advantage:** Resampling operates on the **exact** target function $\hat{p}$ and true BSDF lobes at every step, maximizing convergence and maintaining mathematical unbiasedness.
 
-### 2.1 X1-Context buffer (new, per pixel, written at bounce 0)
+2. **Approach B: Fully Inverted / Deferred Gather Path-Database (Bitterli et al., Benty et al. 2023)**
+   - **Premise:** Treat the renderer as a **path-sampling database with a deferred material evaluator**. Reservoirs store pure geometric path topology and sampling provenance (seeds, vertices, hints). Resampling, shifting, and visibility-validation operate with **zero material code**, using geometric target proxies. Materials and spectral closures are evaluated **only on the surviving paths at the end of the frame**.
+   - **Key Advantage:** Maximum architectural purity and theoretical peak SIMD efficiency. Resampling kernels never load textures, evaluate closures, or ping-pong with material passes.
 
-The bounce-0 diffuse/complex shade pass already knows everything the reuse vertex needs.
-It writes one record per pixel per frame alongside the GI reservoir:
+Below is the complete specification of both paradigms, followed by Pathways' progressive adoption path.
+
+---
+
+## 2. The Core Problem: Why Shading and Geometry Must Never Mix
+
+In a naive or prototype ReSTIR implementation (including Pathways Phase 2a), visibility testing and path shifting are performed inline inside the material shading shader (`wavefront_shade_diffuse.comp`) via `traceShadowRayInline()` (`rayQueryEXT`).
+
+On modern SIMD/SIMT architectures (such as AMD RDNA 4 Wave32 and NVIDIA Ada/Blackwell), this creates three severe, compounding hardware penalties:
+
+### 2.1 SIMD Traversal Lockstep Penalty
+- In a 32-lane wave, threads that retain their own candidate skip the inline ray query, while threads selecting a neighbor candidate execute it. The inactive lanes sit idle.
+- For active lanes, every thread traces toward a different 3D secondary vertex in arbitrary directions. Lane 0 may hit an occluder on step 1, while Lane 1 traverses 40 BVH nodes deep into a mesh. **The entire 32-lane wave is stalled until the single slowest lane finishes traversal.**
+
+### 2.2 VGPR Pressure and Occupancy Collapse
+- Shading kernels require significant Vector General-Purpose Registers (VGPRs) for BSDF evaluation, VNDF sampling, textures, PRNG state, and reservoir arithmetic.
+- Incorporating `rayQueryEXT` forces the shader compiler to allocate traversal state registers, ray descriptor registers, and stack scratch space inside the same shader.
+- On RDNA 4 (`gfx1201`), exceeding register limits drastically cuts occupancy (waves per Compute Unit), crippling the GPU's ability to hide memory latency during texture and reservoir fetches.
+
+### 2.3 L0 / L1 Vector Cache Thrashing
+- Dedicated ray traversal kernels fetch only BVH nodes and triangle descriptors into cache lines.
+- Mixing traversal into shading forces the cache hierarchy to juggle BVH bounding boxes and triangle data alongside material properties, normal maps, and albedo textures, causing severe cache line evictions.
+
+**Rule:** *Tracing and shifting are geometry problems; shading is a material problem. The two never live in the same kernel.*
+
+---
+
+## 3. Long-Term Architecture: Fully Inverted / Deferred Gather (Approach B)
+
+The Fully Inverted architecture is the highest-performance, most complete long-term paradigm for ReSTIR PT. It treats the path tracer as a **geometric path database**:
 
 ```
-struct X1Context {              // 32 B
-    vec3  position;             // x1
-    vec3  normal;               // n1 (shading normal)
-    vec3  albedo;               // diffuse color
-    vec3  wo;                   // -primary ray direction (toward camera)
-    float roughness;
-    float metallic;
-    uint  packed;               // fp16 F0.x proxy, valid bit, frame stamp
-    float pad;
+[1. Primary VisBuffer / G-Buffer]
+       ↓
+[2. Seed Path Generation] ───────────────► Emits raw geometric PathSkeletons (no BSDF/colors)
+       ↓
+[3. Initial Reservoir Construction (R0)]
+       ↓
+[4. Temporal Path Resampling] ───────────► Reconnection / Shift logic (pure geometry)
+       ↓
+[5. Spatial Path Resampling] ────────────► Reconnection / Shift logic (pure geometry)
+       ↓
+[6. Batch Visibility Verification] ──────► 100% SIMD-utilized rayQuery / traversal pass
+       ↓
+[7. MIS & Reservoir Combination] ────────► Pure ALU resolve (Jacobian |J| + geometric proxy)
+       ↓
+[8. Path Reconstruction] ────────────────► Extract winning path keys per pixel
+       ↓
+[9. Deferred Material Evaluation] ───────► Evaluate BSDF closures, textures, emission
+       ↓
+[10. Final Accumulation & Denoiser]
+```
+
+### 3.1 Separation of Concerns Matrix
+
+| System Layer | Question Answered | Knows Materials? | Uses Ray Tracing? |
+|---|---|---|---|
+| **Layer 1: Path Topology & Sampling** | Which geometric subpaths exist and how were they sampled? | No (Geometry + Seeds only) | Yes (Skeleton tracing) |
+| **Layer 2: Shift & Visibility Validation** | Can a shifted path connect validly without occlusion? | No (Topology + Sidedness only) | Yes (Visibility-only rays) |
+| **Layer 3: Material / BSDF Shading** | What spectral radiance $f / p$ does the transport produce? | **Yes** (Closures, textures, BRDFs) | **No** (Pure compute gather) |
+
+### 3.2 Data Structures for Approach B
+
+#### Hit Record (The 16-byte Atomic Currency)
+```glsl
+struct Hit {            // 16 bytes
+    uint instanceId;    // TLAS instance custom index
+    uint primitiveId;   // Triangle index in BLAS geometry
+    uint baryPacked;    // 2 x unorm16 (u, v barycentrics)
+    uint flags;         // Front/back face, isLight, alphaTested, isDelta hint
+};
+```
+*Note:* World positions and normals are **never** stored in the reservoir. They are reconstructed on demand in whatever kernel needs them using `rayQueryGetIntersectionTriangleVertexPositionsEXT` or BDA vertex streaming. This guarantees that temporal shifts remain bit-for-bit exact even under dynamic rigid or skinned mesh animation.
+
+#### Path Vertex & Path Sample
+```glsl
+struct PathVertex {
+    Hit   hit;
+    uint  woOct;         // Outgoing direction towards previous vertex (octahedral 32-bit)
+    uint  materialId;    // Integer material ID (for deferred stage routing only)
+    uint  vertexType;    // CAMERA, SURFACE, LIGHT, SPECULAR_DELTA
+};
+
+struct PathSample {              // Stored as Structure of Arrays (SoA)
+    uint       vertexCount;      // Effective length of subpath (e.g. 2 to 6)
+    PathVertex vertices[6];      // Compact fixed-capacity prefix/suffix
+    uint       rngSeedPrefix;    // Replay seed for vertices before reconnection
+    uint       rngSeedSuffix;    // Replay seed for vertices after reconnection
+    uint       strategyId;       // Sampling provenance (unidirectional, NEE, BSDF)
 };
 ```
 
-Cost: 32 B/px/frame write + random reads at bounce 1. On UMA (gfx1151) this is L2-friendly
-since taps are spatially local.
-
-### 2.2 GI reservoir (new, per pixel, double-buffered like DI)
-
-```
-struct GiReservoir {            // 32 B
-    uint  idxM;                 // [15:0] candidate tag, [31:16] M
-    float wSum;
-    float targetPdf;            // p̂ at storing pixel (scalar, solid-angle measure at x1)
-    uint  flags;                // [7:0] age, [8] valid, [9] lobe, [25:10] oct16(x2 normal)
-    float x2Dist;               // |x2 - x1| at storage time
-    uint  dirPacked;            // oct16(ω2) — direction x1 -> x2
-    uint  radRG;                // fp16x2  L̂2 (unshadowed direct light + emissive at x2, previous frame)
-    uint  radB_misc;            // fp16 B + fp16 cos(theta at x2, stored config)
+#### ReSTIR PT Reservoir (SoA Layout)
+```glsl
+struct ReservoirPT {             // Packed SoA streams
+    float weightSum;             // Sum of resample weights
+    float W;                     // Unbiased contribution weight
+    float M;                     // Confidence counter (capped)
+    float targetProxy;           // Cached geometric target value
+    uint  pathIndex;             // Index into PathSample SoA buffer
+    uint  lastFrameAge;          // Age tracking for temporal expiry
 };
 ```
 
-`L̂2` is the **previous frame's** unshadowed direct radiance computed at x2 during bounce-1
-shading (exactly the `secDirectL` the DI stage already computes there — no new probe pass).
+### 3.3 Decoupled Target Function: Geometric Proxies
+Because full BSDFs and textures are not evaluated during resampling, the target function $\hat{p}(X)$ is computed via **conservative geometric upper bounds**:
+$$\hat{p}(X) \approx \prod_{i=1}^{k} \rho_{\text{max}}(\text{material}_i) \cdot G(v_{i-1}, v_i) \cdot L_{\text{emit-bound}}(v_k)$$
+where:
+- $\rho_{\text{max}}$ is a precomputed 8-bit scalar upper bound of the material's hemispherical reflectance.
+- $G(v_{i-1}, v_i) = \frac{|\cos\theta_{i-1}| \cdot |\cos\theta_i|}{\|v_{i-1} - v_i\|^2}$ is the geometric coupling factor.
+- $L_{\text{emit-bound}}$ is the flux or bounding emission of the terminal light/emitter.
 
-### 2.3 Estimator (bounce-1 shade, diffuse x1 paths only, initially)
+This decouples the entire resampling loop from bindless texture fetches, material branching, and closure evaluation.
 
-For the ray currently hitting x2 with origin x1 and direction ω2:
+---
 
-- **Fresh candidate:** `(ω2, |x2-x1|, n2, L̂2 := unshadowed direct at x2 computed this pass)`.
-  Source pdf `q(ω2)` = the cosine-lobe pdf used at bounce 0 (`cosθ1/π`, recorded in the
-  X1-context at generation time so it survives the queue reshuffle).
-- **Target:** `p̂(x1, candidate) = max(lum(albedo·L̂2/π), ε) · cosθ1` — computable for *any*
-  candidate from the X1-context + reservoir fields.
-- **Taps:** same 1 temporal + 4 spatial rotated-cross pattern as DI, reading the previous
-  frame's GI grid. Reconnection keeps the candidate's **x2 fixed** and re-aims from the
-  current x1: `ω2' = (x2 - x1_new)/d'`, `d' = |x2 - x1_new|`, with
-  - geometry gates: `cosθ1' > 0`, `cosθ2' > 0`, distance-ratio and x1-normal/depth gates
-    (same constants as DI),
-  - measure factor: solid-angle `q_src/q_curr` (the p̂ above is per-solid-angle at the
-    vertex; radiance is ray-constant so no 1/d² appears in p̂ — the q-ratio carries it,
-    analogous to the DI area-light case),
-  - **replay visibility:** one inline ray query x1 → x2' (`traceShadowRayInline` already
-    exists in the shade passes); a blocked candidate contributes weight 0 and is dropped.
-- **Finalization (the double-count fix):** the winning candidate's contribution
-  `f_r(x1, ωo, ω2') · cosθ1' · L̂2 · W` **replaces** this ray's usual pixel accumulation of
-  `T1 · direct(x2)`. The path still continues to bounce 2+ as today, contributing only
-  3+-bounce transport; its own 2-bounce pixel term is emitted solely through the reservoir
-  estimator. To keep the fresh candidate's L̂2 identical to what the path would have added,
-  the winner's L̂2 for the *self* candidate is the full direct+emissive term of this pass.
+## 4. Intermediate Architecture: Request / Result Wavefront (Approach A)
 
-### 2.4 Known bias sources (must be documented in-code, like DI §4.3)
+While Approach B represents the ultimate theoretical ceiling, **Approach A (Lin et al. 2022 / GRIS)** provides an immediate, pragmatic transition because it matches Pathways' existing **material-sorted DGC pipelines**:
 
-- `L̂2` is one frame stale → lag on animated lights/materials (bounded by max-age truncation).
-- Deeper-than-2-bounce transport of *reused* candidates is lost (their paths are not
-  replayed beyond x2); mitigated by keeping the self-path continuation as the unbiased
-  3+-bounce estimator.
-- M-truncation caps (temporal/spatial), geometry gates, replay-visibility rejection
-  weighting.
-- Specular x1 lobes are excluded initially (q is undefined for them from the context
-  record); they fall back to plain path continuation.
+```
+[Wavefront Bounce Loops] ──► Writes Initial PathSample (rcVertex, seeds, throughput)
+                                    │
+                                    ▼
+[Shift-Trace Kernel] ──────► Traces Reconnection Visibility (x_{k-1} ↔ rcVertex)
+                             Emits ShadeRequests to transient queue:
+                             struct ShadeRequest { Hit hit; uint wi, wo; uint slot; uint matId; }
+                                    │
+                                    ▼
+[DGC Material Pipelines] ──► Consumes ShadeRequests binned by materialId
+                             Evaluates true BSDF f and pdf (zero ray queries!)
+                             Emits ShadeResult: { f16vec3 f; float16_t pdfFwd, pdfRev; }
+                                    │
+                                    ▼
+[ReSTIR PT Resolve] ───────► Evaluates exact Jacobian |J| & pairwise MIS
+                             Updates reservoirs: w_i = m_i · p̂ · W · |J|
+```
 
-## 3. Implementation sequence
+### Key Advantage for Pathways
+Pathways already possesses:
+- `m_materialIndexQueue` and material sorting logic.
+- Separate `shadeDiffuse`, `shadeComplex`, `shadeDielectric`, and `shadeEmissive` pipelines.
+- DGC (`vkCmdExecuteGeneratedCommandsEXT`) execution sets for indirect material execution.
 
-1. **X1-context buffer**: struct, allocation (lazy, same pattern as DI reservoirs),
-   binding (next free slot in the wavefront descriptor layout), bounce-0 writes.
-2. **GI reservoir grid**: extend `ReSTIRManager` to own a second pair of buffers;
-   zero-fill on (re)alloc (same `recordClearIfNeeded` pattern).
-3. **Bounce-1 reuse block** in `wavefront_shade_diffuse.comp` (secondary path section)
-   calling new `restirGi*` functions in `restir_common.glsl` — mirroring the DI function
-   shapes (`restirGiFreshCandidate`, `restirGiApplyTap`).
-4. **Estimator switch**: gate the replacement of the bounce-1 pixel accumulation behind
-   the ReSTIR flag; A/B validate energy conservation on Cornell Box (2-bounce reference).
-5. **Validation**: extend `scripts/verify_visual_integrity.py` with a GI variance-reduction
-   + bias gate (many-lights + cornell-box vs. high-SPP reference images); add the
-   M/W debug view for both DI and GI.
-   *(Done 2026-10-11: `test_restir_gi_energy_and_stability` gates energy + fireflies; the
-   M/W/light/coverage debug views ship as `--debug-view` + GUI combo.)*
+Instead of writing a completely new material system, Approach A reuses Pathways' existing material pipelines to evaluate `ShadeRequest` records, achieving zero ray divergence with exact BSDF targets.
 
-## 4. Explicit non-goals for Phase 2
+---
 
-- Full multi-vertex path replay (needs per-sample path storage; separate milestone).
-  Phase 2a deliberately does NOT redirect the bounce-2 continuation toward the reservoir
-  winner: the continuation always follows the path's own x2, so deeper bounces stay
-  unbiased and no path storage is needed. Winner-consistent continuation is Phase 2b.
-- ReSTIR for conductors/dielectrics (their shade passes keep their 1-stage RIS).
-- Light trees for GI candidate proposals (reuse the alias table first).
-- GI on transmitted diffuse lobes or on complex-material x2 surfaces (context invalid →
-  legacy shading).
+## 5. Vulkan 1.4 Native Capabilities & Implementation Rules
+
+Both architectures rely on standard, cross-vendor Vulkan 1.4 features:
+
+1. **`VK_KHR_ray_query`**: Primary traversal engine inside compute shaders.
+2. **`VK_KHR_ray_tracing_position_fetch`**: Reconstructs world-space triangle positions directly from `(instanceId, primitiveId, bary)` without touching vertex buffers.
+3. **Buffer Device Address (BDA) & `buffer_reference`**: Accesses SoA reservoir buffers and request queues without descriptor set churn.
+4. **`float_controls2` & Strict Determinism**:
+   - Compiling all shift, trace, and resolve shaders with `SignedZeroInfNanPreserve` and uniform FMA contraction rules to ensure that geometric Jacobians and reconnection tests match bit-for-bit.
+5. **Synchronization 2 (`VK_KHR_synchronization2`)**: Global compute-to-compute buffer memory barriers (`COMPUTE_SHADER → COMPUTE_SHADER`) gating each pass.
+
+---
+
+## 6. Phased Implementation Roadmap for Pathways
+
+### Phase 2b.1 (Immediate): Reconnection Visibility Decoupling
+- **Goal:** Eliminate `traceShadowRayInline` and `rayQueryEXT` from [`shaders/compute/wavefront_shade_diffuse.comp`](file:///home/naoki/Development/Pathways/shaders/compute/wavefront_shade_diffuse.comp).
+- **Implementation:**
+  - When `!giShadeWinnerSelf`, append a reconnection ray to a dedicated stream-compacted visibility queue (or extend `PackedShadowRay`).
+  - Execute traversal in a pure shadow/visibility compute kernel.
+  - Accumulate winner radiance only for unoccluded rays.
+  - **Outcome:** Shading kernel VGPR usage drops significantly, wave occupancy doubles, and SIMD lockstep stalls are completely eliminated.
+
+### Phase 2b.2: 16-Byte `Hit` Atom & Position Fetch
+- Replace the 32-byte world-position representation in `GiReservoir` with the 16-byte `Hit` struct.
+- Reconstruct $x_2$ on demand via `VK_KHR_ray_tracing_position_fetch` or BDA.
+- **Outcome:** Eliminates geometric drift on animated geometry; cuts reservoir bandwidth in half.
+
+### Phase 2b.3: Multi-Bounce Shift-Trace & Material Request Queues (Approach A)
+- Implement `ShadeRequest` and `ShadeResult` transient buffers in `ReSTIRManager`.
+- Dispatch Shift-Trace $\to$ DGC Material Pipelines $\to$ ReSTIR Resolve.
+- Implement exact geometric Jacobian $|J|$:
+  $$\|J\| = \frac{\cos\theta_{\text{rc}}'}{\cos\theta_{\text{rc}}} \cdot \frac{\|x_{k-1} - x_{\text{rc}}\|^2}{\|x_{k-1}' - x_{\text{rc}}\|^2}$$
+- **Outcome:** Full multi-bounce ReSTIR PT with exact BSDF targets and pairwise MIS.
+
+### Phase 3: Fully Inverted Path-Database Architecture (Approach B)
+- Transition reservoir storage to pure `PathSample` SoA records with RNG seeds and topology hashes.
+- Replace mid-frame material evaluation with geometric target proxies $\hat{p}$.
+- Defer all material BSDF closure evaluation to an end-of-frame gather pass.
+- **Outcome:** Ultimate theoretical ceiling of performance and architectural purity.
