@@ -583,11 +583,9 @@ GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radi
 }
 
 // GI target proxy at x1 for a candidate secondary vertex:
-//     p̂ = (1 / π) · max(cosθ1, 0) · lum(L̂2)
-// For diffuse Lambertian surfaces, primary surface albedo factors out of the
-// hemisphere integral (I = ρ · ∫ (1/π) cosθ L dω). Omitting albedo from the
-// solid-angle target proxy prevents extreme target-ratio jumps across high-frequency
-// texture boundaries (e.g. checkerboard floor tiles with 10x albedo difference).
+//     p̂ = (1 / π) · max(cosθ1, 0) · lum(L̂2) · ρ̄
+// Incorporates cosine lobe projection, average primary albedo, and
+// candidate arrival radiance for robust relative weighting.
 float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
     vec3 dv = x2 - x1;
     float dist = length(dv);
@@ -622,6 +620,10 @@ float evalGIJacobian(float dSrc, float dNew, float cosRcSrc, float cosRcNew) {
 bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
                 vec3 albedo, float roughness, uint mCap, uint ageNew, inout uint seed) {
     if (!giIsValid(tap) || giGetM(tap) == 0u) return false;
+
+    // Reject procedural spheres as x2: Hit atom encodes spPos.xyz in instance/primitive/bary
+    // and lacks the reconstructed surface normal, causing biased reconnection Jacobians.
+    if ((giGetHit(tap).flags & 1u) != 0u) return false;
 
     uint mTap = min(giGetM(tap), mCap);
     if (mTap == 0u) return false;

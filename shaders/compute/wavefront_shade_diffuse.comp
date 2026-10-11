@@ -399,6 +399,10 @@ void main() {
                 );
                 emissive *= holoMod;
             }
+            // Emissive hit accumulation: accumulated directly for primary hits (bounce == 0)
+            // and specular bounces (where NEE cannot connect). Diffuse secondary bounces (bounce >= 1)
+            // omit hit emission because direct lighting / NEE already stochastically samples emitters,
+            // preventing unweighted double counting without full MIS.
             if (length(emissive) > 1e-3 && (bounce == 0u || isSpecularPath)) {
                 vec3 emissiveContrib = vec3(throughput) * emissive;
                 if (bounce > 0u) {
@@ -794,7 +798,7 @@ void main() {
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
             if (!pathTerminated && !isDelta && enableDirect && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
-                uint M = (enableRestirPT && bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
+                uint M = (bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
                 f16vec3 proxyLumWeight = max(diffuseColor + F0, f16vec3(0.04)) * f16vec3(0.2126, 0.7152, 0.0722);
 
@@ -1163,7 +1167,7 @@ void main() {
                             nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel);
 #if !IS_SECONDARY_BOUNCE
                             if (giCtxEligible && bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
-                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), 1.0);
+                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
                             }
 #endif
                         }

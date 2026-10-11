@@ -60,6 +60,9 @@ public:
 
     bool isInitialized() const { return m_width > 0 && m_height > 0; }
 
+    bool isPhase3Enabled() const { return m_enablePhase3; }
+    void setPhase3Enabled(bool enabled) { m_enablePhase3 = enabled; }
+
 private:
     void initBuffers();
 
@@ -67,6 +70,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    bool m_enablePhase3 = false;
     bool m_clearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_giClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_ptClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };

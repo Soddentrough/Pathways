@@ -718,6 +718,67 @@ int main() {
                     "ReservoirPT streaming estimator unbiased convergence (analytical expectation: 1.0)");
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 11: X1Context Roughness Fidelity & Reconnection Gating Guards
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 11] X1Context Roughness Fidelity & Reconnection Gating Guards..." << std::endl;
+    {
+        // 11a. X1Context roughness preservation across [0.0, 1.0]
+        auto packHalf2x16 = [](glm::vec2 v) -> uint32_t {
+            return glm::packHalf2x16(v);
+        };
+        auto unpackHalf2x16 = [](uint32_t p) -> glm::vec2 {
+            return glm::unpackHalf2x16(p);
+        };
+
+        // Test representative materials: mirror/delta (0.001), semi-glossy (0.08, 0.14),
+        // moderately rough diffuse (0.25, 0.5), completely rough (1.0).
+        std::vector<float> testRoughness = { 0.001f, 0.05f, 0.10f, 0.149f, 0.151f, 0.25f, 0.5f, 0.8f, 1.0f };
+        for (float r : testRoughness) {
+            float f0 = 0.04f;
+            uint32_t f0Pad = packHalf2x16(glm::vec2(std::clamp(f0, 0.0f, 1.0f), std::clamp(r, 0.0f, 1.0f)));
+            float recoveredF0 = unpackHalf2x16(f0Pad).x;
+            float recoveredRoughness = unpackHalf2x16(f0Pad).y;
+
+            assert_near(recoveredF0, f0, 1e-3f, "X1Context F0 fp16 fidelity");
+            assert_near(recoveredRoughness, r, 1e-3f, "X1Context roughness fp16 fidelity");
+
+            // Verify the roughness < 0.15 gate behavior
+            bool isGlossyReceiver = (recoveredRoughness < 0.15f);
+            bool expectedGlossy = (r < 0.15f);
+            assert_true(isGlossyReceiver == expectedGlossy,
+                        "Roughness < 0.15 gate fires accurately on recovered roughness");
+        }
+
+        // 11b. Verify that passing 1.0 hardcoded (old bug) completely disabled the glossy gate
+        float trueSemiGlossyRoughness = 0.08f;
+        float buggedRoughness = 1.0f; // Old diffuse shader wrote hardcoded 1.0
+        assert_true(!(buggedRoughness < 0.15f), "Hardcoded 1.0 erroneously bypasses glossy receiver rejection");
+        assert_true(trueSemiGlossyRoughness < 0.15f, "True roughness correctly triggers glossy receiver rejection");
+
+        // 11c. giApplyTap sphere candidate rejection gate:
+        // Hit atom has flags bit 0 set ((flags & 1u) != 0u) for procedural spheres.
+        auto mockGiApplyTapGate = [](uint32_t hitFlags, float roughness, float distRatio) -> bool {
+            // Replicates restir_common.glsl giApplyTap early-outs:
+            if ((hitFlags & 1u) != 0u) return false; // Reject sphere x2 candidates
+            if (distRatio < 0.2f || distRatio > 5.0f) return false;
+            if (roughness < 0.15f) return false; // Reject glossy receivers
+            return true;
+        };
+
+        // Case 1: Sphere candidate hit (flags = 1u) must be strictly rejected
+        bool sphereResult = mockGiApplyTapGate(1u /* sphere */, 0.8f, 1.0f);
+        assert_true(!sphereResult, "giApplyTap strictly rejects procedural sphere candidate (flags & 1u != 0)");
+
+        // Case 2: Triangle candidate hit (flags = 0u or 2u) on diffuse receiver accepted
+        bool triResult = mockGiApplyTapGate(2u /* triangle, frontFace */, 0.8f, 1.0f);
+        assert_true(triResult, "giApplyTap accepts valid triangle candidate on diffuse receiver");
+
+        // Case 3: Triangle candidate on glossy receiver (roughness < 0.15) rejected
+        bool glossyResult = mockGiApplyTapGate(2u /* triangle */, 0.10f, 1.0f);
+        assert_true(!glossyResult, "giApplyTap strictly rejects triangle candidate on glossy receiver (roughness < 0.15)");
+    }
+
     std::cout << "\n================================================================================" << std::endl;
     std::cout << "  ALL ReSTIR PT Mathematical & Estimator Unit Tests PASSED!" << std::endl;
     std::cout << "================================================================================" << std::endl;

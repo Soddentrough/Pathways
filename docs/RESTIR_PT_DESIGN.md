@@ -3,7 +3,7 @@
 **Status:**
 - **Phase 1 (Completed 2026-10-10):** Inline ReSTIR DI subsystem, shared `restir_common.glsl`, temporal + spatial-tap reuse for analytical lights (`docs/reports/restir_review_2026_10_10.md`).
 - **Phase 2a (Completed 2026-10-11):** Path-space secondary-vertex ReSTIR GI at bounce 1, X1 context buffer, continuous random 2D spatial rotation, target ratio and weight clamping (`commit d5e4fab`).
-- **Phase 2b (Completed 2026-10-11):** Decoupled ReSTIR PT — elimination of inline `rayQuery` from shading kernels (`commit 5d35634`), 16-byte `Hit` atom and position fetch (`commit 165c804`), transient ShadeRequest/ShadeResult queues, and exact analytical reconnection Jacobians with hybrid shift map gating.
+- **Phase 2b (Partial — 2026-10-11):** Decoupled ReSTIR PT — winner replay visibility decoupled to shadow ray queue (`commit 5d35634`), eliminating inline `rayQuery` from replay evaluation (candidate generation retains synchronous inline rayQuery for shadowed $\hat{L}_2$ storage), 16-byte `Hit` atom and position fetch (`commit 165c804`), transient ShadeRequest/ShadeResult queues, and exact analytical reconnection Jacobians with hybrid shift map gating.
 - **Phase 3 (Long-Term Architectural Target):** Fully Inverted / Deferred Gather Path-Database Architecture (pure geometry/visibility resampling with end-of-frame deferred material closure evaluation).
 
 ---
@@ -268,13 +268,12 @@ Both architectures rely on standard, cross-vendor Vulkan 1.4 features:
 
 ## 6. Phased Implementation Roadmap for Pathways
 
-### Phase 2b.1 (Immediate): Reconnection Visibility Decoupling
-- **Goal:** Eliminate `traceShadowRayInline` and `rayQueryEXT` from [`shaders/compute/wavefront_shade_diffuse.comp`](file:///home/naoki/Development/Pathways/shaders/compute/wavefront_shade_diffuse.comp).
+### Phase 2b.1 (Partial): Reconnection Visibility Decoupling
+- **Goal:** Decouple replay visibility from the shading kernel.
 - **Implementation:**
-  - When `!giShadeWinnerSelf`, append a reconnection ray to a dedicated stream-compacted visibility queue (or extend `PackedShadowRay`).
-  - Execute traversal in a pure shadow/visibility compute kernel.
-  - Accumulate winner radiance only for unoccluded rays.
-  - **Outcome:** Shading kernel VGPR usage drops significantly, wave occupancy doubles, and SIMD lockstep stalls are completely eliminated.
+  - Winner replay visibility (`!giShadeWinnerSelf`) is decoupled via the `PackedShadowRay` queue, evaluated asynchronously in the shadow kernel.
+  - Candidate generation at bounce 1 retains synchronous `traceShadowRayInline` so that the local reservoir can store unoccluded/shadowed $\hat{L}_2$ immediately. Full elimination of inline rayQuery for candidate generation requires deferred gather (Phase 3).
+  - **Outcome:** Reconnection replay divergence is eliminated from shading kernels.
 
 ### Phase 2b.2: 16-Byte `Hit` Atom & Position Fetch
 - Replace the 32-byte world-position representation in `GiReservoir` with the 16-byte `Hit` struct.

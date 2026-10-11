@@ -343,7 +343,7 @@ vec3 unpackTangentAngle13(vec3 normal, uint code) {
 struct Hit {
     uint instanceId;    // TLAS instance custom index
     uint primitiveId;   // Triangle index in BLAS geometry (or sphere index)
-    uint baryPacked;    // packUnorm2x16(bary.xy) or oct32 normal for spheres
+    uint baryPacked;    // packUnorm2x16(bary.xy) for triangles, or floatBitsToUint(spPos.z) for spheres
     uint flags;         // [0]: isTriangle (0: triangle, 1: sphere), [1]: frontFace, [6:2]: lobe/mat flags
 };
 
@@ -373,7 +373,11 @@ vec2 hitGetBary(Hit h) {
     return unpackUnorm2x16(h.baryPacked);
 }
 
-// Reconstruct 3D world position dynamically from a 16-byte Hit atom
+// Reconstruct 3D world position dynamically from a 16-byte Hit atom.
+// NOTE: For triangles, fetches from binding 40 (vertexPositions). This assumes
+// identity TLAS instance transforms (vertices pre-baked to world space). Non-identity
+// TLAS instances are not supported for ReSTIR GI hit reconstruction without
+// applying instance transforms or VK_KHR_ray_tracing_position_fetch.
 vec3 reconstructHitPosition(Hit h) {
     if ((h.flags & 1u) != 0u) {
         // Procedural sphere: exact world-space position stored directly in Hit data fields
@@ -391,7 +395,9 @@ vec3 reconstructHitPosition(Hit h) {
     }
 }
 
-// Reconstruct 3D world position and surface normal dynamically from a 16-byte Hit atom
+// Reconstruct 3D world position and surface normal dynamically from a 16-byte Hit atom.
+// NOTE: Assumes identity TLAS instance transforms for triangle vertices (pre-baked world space).
+// Procedural spheres return dummy norm=(0,1,0) and are rejected in giApplyTap().
 void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
     if ((h.flags & 1u) != 0u) {
         pos = vec3(uintBitsToFloat(h.instanceId),

@@ -313,6 +313,10 @@ void main() {
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             }
+            // Emissive hit accumulation: accumulated directly for primary hits (bounce == 0)
+            // and specular bounces (where NEE cannot connect). Diffuse secondary bounces (bounce >= 1)
+            // omit hit emission because direct lighting / NEE already stochastically samples emitters,
+            // preventing unweighted double counting without full MIS.
             if (length(emissive) > 1e-3 && (bounce == 0u || isSpecularPath)) {
                 vec3 emissiveContrib = vec3(throughput) * emissive;
                 if (bounce > 0u) {
@@ -576,7 +580,7 @@ void main() {
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
             if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
-                uint M = (enableRestirPT && bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
+                uint M = (bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
 
                 f16vec3 proxyLumWeight = max(diffuseColor + F0, f16vec3(0.04)) * f16vec3(0.2126, 0.7152, 0.0722);
 
