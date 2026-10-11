@@ -80,7 +80,8 @@ void SceneManager::discoverScenes(const std::filesystem::path& scenesDir) {
 bool SceneManager::isProceduralCornellBoxPath(const std::string& path) {
     return path.empty() || path == "__procedural_cornell_box__" ||
            path == "cornell-box" || path == "cornell_box" ||
-           path == "procedural:cornell-box" || path == "procedural:cornell_box";
+           path == "procedural:cornell-box" || path == "procedural:cornell_box" ||
+           path == "Cornell Box" || path == "Procedural Cornell Box";
 }
 
 std::string SceneManager::resolveScenePath(const std::string& inputPath) const {
@@ -182,7 +183,16 @@ std::string SceneManager::getActiveSceneName(const std::string& fallbackPath) co
         }
     }
     if (isProceduralCornellBoxPath(fallbackPath)) {
-        return "Procedural Cornell Box";
+        return "Cornell Box";
+    }
+    if (fallbackPath == "many-lights" || fallbackPath == "many_lights" || fallbackPath == "procedural:many-lights") {
+        return "Many-Lights (64 Lights)";
+    }
+    if (fallbackPath == "cyber-city" || fallbackPath == "cyber_city" || fallbackPath == "procedural:cyber-city" || fallbackPath == "procedural:cyber_city" || fallbackPath == "Procedural Cyber City") {
+        return "Cyber City";
+    }
+    if (fallbackPath == "infinity-mirror" || fallbackPath == "infinity_mirror" || fallbackPath == "procedural:infinity-mirror" || fallbackPath == "procedural:infinity_mirror" || fallbackPath == "Infinity Mirror" || fallbackPath == "Procedural Infinity Mirror") {
+        return "Infinity Mirror";
     }
     std::filesystem::path p(fallbackPath);
     return SceneRegistry::formatSceneName(p.stem().string());
@@ -190,7 +200,7 @@ std::string SceneManager::getActiveSceneName(const std::string& fallbackPath) co
 
 SceneData SceneManager::loadRawSceneData(const std::string& filepath, const UsdLoadOptions& usdOptions) {
     if (isProceduralCornellBoxPath(filepath)) {
-        Logger::info("Loading Procedural Cornell Box...");
+        Logger::info("Loading Cornell Box...");
         return ProceduralScene::createCornellBox();
     } else if (filepath == "procedural:many-lights" || filepath == "many-lights" || filepath == "many_lights") {
         Logger::info("Loading Procedural Many-Lights Cornell Box (64 Lights)...");
@@ -318,11 +328,19 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
     m_currentSceneIndex = -1;
     for (size_t i = 0; i < m_availableScenes.size(); ++i) {
         std::error_code ec;
-        if (m_availableScenes[i].filepath == filepath ||
-            (!m_availableScenes[i].filepath.empty() &&
-             std::filesystem::exists(m_availableScenes[i].filepath) &&
+        const auto& scenePath = m_availableScenes[i].filepath;
+        if (scenePath == filepath ||
+            (isProceduralCornellBoxPath(scenePath) && isProceduralCornellBoxPath(filepath)) ||
+            (scenePath == "many-lights" &&
+             (filepath == "many-lights" || filepath == "many_lights" || filepath == "procedural:many-lights")) ||
+            (scenePath == "cyber-city" &&
+             (filepath == "cyber-city" || filepath == "cyber_city" || filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "Procedural Cyber City")) ||
+            (scenePath == "infinity-mirror" &&
+             (filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "Infinity Mirror" || filepath == "Procedural Infinity Mirror")) ||
+            (!scenePath.empty() && !filepath.empty() &&
+             std::filesystem::exists(scenePath) &&
              std::filesystem::exists(filepath) &&
-             std::filesystem::equivalent(m_availableScenes[i].filepath, filepath, ec))) {
+             std::filesystem::equivalent(scenePath, filepath, ec))) {
             m_currentSceneIndex = static_cast<int>(i);
             break;
         }

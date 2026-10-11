@@ -1690,7 +1690,7 @@ void Engine::renderFrame() {
     }
 
     // Lazy reservoir allocation: the grid only exists while ReSTIR has been
-    // enabled at least once, keeping ~2 x W*H*28 B out of the idle footprint.
+    // enabled at least once, keeping ~144 B/pixel (DI 56B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
         vkDeviceWaitIdle(m_context->getDevice());
         m_restirManager->resize(m_config.width, m_config.height);
@@ -2439,7 +2439,7 @@ std::string Engine::getActiveSceneName() const {
     if (m_sceneManager) {
         return m_sceneManager->getActiveSceneName(m_config.scene_path);
     }
-    return "Procedural Cornell Box";
+    return "Cornell Box";
 }
 
 void Engine::recordFrameTally(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,

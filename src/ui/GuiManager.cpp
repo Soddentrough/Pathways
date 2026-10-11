@@ -1043,7 +1043,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                     previewText += "]";
                 } else {
-                    previewText = "Procedural Cornell Box  [2.0K tris, 7 mats]";
+                    previewText = "Cornell Box  [2.0K tris, 7 mats]";
                 }
 
                 // If a scene load is currently in-flight, disable selection controls to prevent duplicate requests

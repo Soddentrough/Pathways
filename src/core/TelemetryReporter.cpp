@@ -814,7 +814,7 @@ void TelemetryReporter::printExecutionSummary() const {
         }
     }
 
-    Logger::info("  Pathways Hybrid Path Tracing Engine - Execution Summary ({} Configuration{})",
+    Logger::info("  Pathways Path Tracing Engine - Execution Summary ({} Configuration{})",
                  activeTallies.size(), activeTallies.size() == 1 ? "" : "s");
     Logger::info("========================================================================================");
 
