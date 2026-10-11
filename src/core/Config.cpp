@@ -245,16 +245,15 @@ bool parseVec3(std::string_view str, glm::vec3& outVec) {
 } // namespace
 
 bool Config::dgcExecSetRequested() {
-    // Unset = default policy: enable whenever the driver supports compute execution sets.
+    // Default policy: Multi-dispatch indirect is the default, fully standard, reliable path.
+    // Vulkan compute Indirect Execution Sets (VkIndirectExecutionSetEXT) on Linux drivers (e.g. Mesa RADV)
+    // currently suffer from dynamic compute pipeline switching defects (only initial pipeline executes,
+    // dropping non-diffuse material queues). Require explicit opt-in via --dgc-execset or PATHWAYS_DGC_EXECSET=1.
     const char* execsetEnv = getenv("PATHWAYS_DGC_EXECSET");
-    if (execsetEnv && execsetEnv[0] == '0') {
-        return false;
+    if (execsetEnv && execsetEnv[0] == '1') {
+        return true;
     }
-    // Legacy kill-switches (documented in the codebase review; still honored):
-    if (getenv("PATHWAYS_DISABLE_MATERIAL_DGC") || getenv("PATHWAYS_DISABLE_DGC_EXECSET")) {
-        return false;
-    }
-    return true;
+    return false;
 }
 
 void Config::printUsage(const char* progName) {
@@ -456,14 +455,17 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if ((arg == "--max-bounces" || arg == "--bounces") && i + 1 < argc) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
+            cfg.custom_bounces = true;
             continue;
         }
         if (arg.starts_with("--max-bounces=")) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+            cfg.custom_bounces = true;
             continue;
         }
         if (arg.starts_with("--bounces=")) {
             cfg.max_bounces = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
+            cfg.custom_bounces = true;
             continue;
         }
         if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {
@@ -1069,12 +1071,24 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_tail_megakernel = true;
             continue;
         }
-        if ((arg == "--delta-unroll" || arg == "-du") && i + 1 < argc) {
+        if ((arg == "--delta-unroll" || arg == "-du") && i + 1 < argc && argv[i + 1][0] != '-') {
             cfg.delta_unroll = std::stoul(argv[++i]);
+            cfg.enable_delta_unroll = (cfg.delta_unroll > 0);
+            continue;
+        }
+        if (arg == "--delta-unroll" || arg == "-du") {
+            cfg.enable_delta_unroll = true;
+            if (cfg.delta_unroll == 0) cfg.delta_unroll = 4;
             continue;
         }
         if (arg.starts_with("--delta-unroll=") || arg.starts_with("-du=")) {
             cfg.delta_unroll = std::stoul(arg.substr(arg.find('=') + 1));
+            cfg.enable_delta_unroll = (cfg.delta_unroll > 0);
+            continue;
+        }
+        if (arg == "--no-delta-unroll") {
+            cfg.enable_delta_unroll = false;
+            cfg.delta_unroll = 0;
             continue;
         }
         if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
@@ -1099,14 +1113,6 @@ Config Config::parse(int argc, char* argv[]) {
             } else {
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
-            continue;
-        }
-        if (arg == "--delta-unroll") {
-            cfg.enable_delta_unroll = true;
-            continue;
-        }
-        if (arg == "--no-delta-unroll") {
-            cfg.enable_delta_unroll = false;
             continue;
         }
         if (arg == "--no-dgc-preprocess" || arg == "--no-dgc-tier1") {

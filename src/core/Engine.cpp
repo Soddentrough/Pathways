@@ -540,6 +540,12 @@ void Engine::initScene() {
 
     syncScenePointers();
 
+    if (!m_config.custom_bounces && m_sceneData.sceneDefaultMaxBounces > 0) {
+        m_config.max_bounces = std::clamp(m_sceneData.sceneDefaultMaxBounces, 1u, 16u);
+        m_dynamicWavefrontBounces = m_config.max_bounces;
+        Logger::info("Applied scene default max bounces: {} (from scene metadata)", m_config.max_bounces);
+    }
+
     // Hardware Acceleration Structures (VK_KHR_ray_query)
     createAccelerationStructures();
 
@@ -585,6 +591,12 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     }
 
     syncScenePointers();
+
+    if (!m_config.custom_bounces && m_sceneData.sceneDefaultMaxBounces > 0) {
+        m_config.max_bounces = std::clamp(m_sceneData.sceneDefaultMaxBounces, 1u, 16u);
+        m_dynamicWavefrontBounces = m_config.max_bounces;
+        Logger::info("Applied scene default max bounces: {} (from scene metadata)", m_config.max_bounces);
+    }
 
     // Rebuild Acceleration Structures (BLAS & TLAS)
     createAccelerationStructures();
