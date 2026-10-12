@@ -2,7 +2,7 @@
 
 Pathways (v1.24.0) is a real-time path tracing engine built on **Vulkan 1.4**. The architecture features **GPU-Autonomous Device Generated Commands** (`VK_EXT_device_generated_commands`) for Ray Compaction and Material Sorting, **Wavefront Path Tracing**, high-throughput **Zero-Copy Host Memory (`VK_EXT_external_memory_host`) Multi-GPU scaling**, and **OpenUSD Stage Ingestion**.
 
-> **Design Philosophy**: Focusing on GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, and standard Vulkan 1.4 core, KHR, and EXT specifications without vendor-proprietary extensions.
+> **Design Philosophy**: Focusing on GPU-autonomous Device Generated Commands, decoupled wavefront microkernels, compacted & binned work queues, and standard Vulkan 1.4 core, KHR, and EXT specifications without vendor-proprietary extensions.
 
 - **API Baseline**: Vulkan 1.4 (1.4.341+)
 - **Primary Hardware Targets**: AMD RDNA4 (`gfx1201`) and RDNA3 architectures (and compatible Vulkan 1.4 hardware; requires `VK_EXT_device_generated_commands` — the engine fatals at startup without it, so "any Vulkan 1.4 driver" means any that exposes DGC + ray query)

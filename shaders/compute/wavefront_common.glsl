@@ -116,6 +116,8 @@ struct InstanceGPU {
     uint numOpaqueTriangles;
     uint materialOffset;
     uint flags;
+    mat4 transform;
+    mat4 invTransform;
 };
 
 layout(std430, binding = 30) readonly buffer InstancesBuffer {
@@ -374,10 +376,7 @@ vec2 hitGetBary(Hit h) {
 }
 
 // Reconstruct 3D world position dynamically from a 16-byte Hit atom.
-// NOTE: For triangles, fetches from binding 40 (vertexPositions). This assumes
-// identity TLAS instance transforms (vertices pre-baked to world space). Non-identity
-// TLAS instances are not supported for ReSTIR GI hit reconstruction without
-// applying instance transforms or VK_KHR_ray_tracing_position_fetch.
+// Triangle vertices are fetched in object space and transformed by the TLAS instance matrix.
 vec3 reconstructHitPosition(Hit h) {
     if ((h.flags & 1u) != 0u) {
         // Procedural sphere: exact world-space position stored directly in Hit data fields
@@ -391,12 +390,14 @@ vec3 reconstructHitPosition(Hit h) {
         vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
         vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
         vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
-        return w * v0 + bary.x * v1 + bary.y * v2;
+        vec3 localPos = w * v0 + bary.x * v1 + bary.y * v2;
+        InstanceGPU inst = instances[h.instanceId];
+        return (inst.transform * vec4(localPos, 1.0)).xyz;
     }
 }
 
 // Reconstruct 3D world position and surface normal dynamically from a 16-byte Hit atom.
-// NOTE: Assumes identity TLAS instance transforms for triangle vertices (pre-baked world space).
+// Triangle vertices and normals are transformed by instance transform and inverse-transpose.
 // Procedural spheres return dummy norm=(0,1,0) and are rejected in giApplyTap().
 void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
     if ((h.flags & 1u) != 0u) {
@@ -410,13 +411,19 @@ void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
         vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
         vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
         vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
-        pos = w * v0 + bary.x * v1 + bary.y * v2;
+        vec3 localPos = w * v0 + bary.x * v1 + bary.y * v2;
         vec3 crossN = cross(v1 - v0, v2 - v0);
         float lenCross = length(crossN);
-        norm = (lenCross > 1e-8) ? (crossN / lenCross) : vec3(0.0, 1.0, 0.0);
+        vec3 localNorm = (lenCross > 1e-8) ? (crossN / lenCross) : vec3(0.0, 1.0, 0.0);
         if ((h.flags & 2u) == 0u) {
-            norm = -norm; // Back-facing
+            localNorm = -localNorm; // Back-facing
         }
+        InstanceGPU inst = instances[h.instanceId];
+        pos = (inst.transform * vec4(localPos, 1.0)).xyz;
+        mat3 normalMat = transpose(mat3(inst.invTransform));
+        vec3 worldNorm = normalMat * localNorm;
+        float lenNorm = length(worldNorm);
+        norm = (lenNorm > 1e-8) ? (worldNorm / lenNorm) : vec3(0.0, 1.0, 0.0);
     }
 }
 

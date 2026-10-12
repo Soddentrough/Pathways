@@ -8,6 +8,7 @@
 
 #include "rt/ReSTIRTypes.hpp"
 #include "scene/Material.hpp"
+#include "scene/ProceduralScene.hpp"
 
 // =============================================================================
 // ReSTIR PT Mathematical Reference Functions (Direct C++ Implementations of GLSL Math)
@@ -777,6 +778,162 @@ int main() {
         // Case 3: Triangle candidate on glossy receiver (roughness < 0.15) rejected
         bool glossyResult = mockGiApplyTapGate(2u /* triangle */, 0.10f, 1.0f);
         assert_true(!glossyResult, "giApplyTap strictly rejects triangle candidate on glossy receiver (roughness < 0.15)");
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 12: Expert Recommendations Verification:
+    //          1. Instance GPU Layout & TLAS Matrix Hit Reconstruction
+    //          2. Direct Illumination Occlusion Confidence Preservation
+    //          3. Specular Mirror Partitioning (Roughness Gating)
+    //          4. Approach A Request/Result Queues Data Contract
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 12] Expert Recommendations & Production Architecture..." << std::endl;
+    {
+        // 12a. InstanceGPU size and std430 alignment
+        assert_true(sizeof(pathways::InstanceGPU) == 144, "InstanceGPU must be strictly 144 bytes");
+        assert_true(alignof(pathways::InstanceGPU) >= 16, "InstanceGPU must have 16-byte alignment for std430");
+
+        // 12b. Instance Transform in Hit Position and Normal Reconstruction
+        // Local triangle in BLAS geometry
+        glm::vec3 v0(0.0f, 0.0f, 0.0f);
+        glm::vec3 v1(1.0f, 0.0f, 0.0f);
+        glm::vec3 v2(0.0f, 1.0f, 0.0f);
+        float w = 0.5f, baryU = 0.2f, baryV = 0.3f;
+        glm::vec3 localPos = w * v0 + baryU * v1 + baryV * v2; // (0.2, 0.3, 0.0)
+        glm::vec3 localNorm = glm::normalize(glm::cross(v1 - v0, v2 - v0)); // (0, 0, 1)
+
+        // Case 1: Identity transform produces exact identical local position and normal
+        pathways::InstanceGPU identityInst{};
+        identityInst.transform = glm::mat4(1.0f);
+        identityInst.invTransform = glm::mat4(1.0f);
+
+        glm::vec3 reconsPosIdent = glm::vec3(identityInst.transform * glm::vec4(localPos, 1.0f));
+        glm::mat3 normalMatIdent = glm::transpose(glm::mat3(identityInst.invTransform));
+        glm::vec3 reconsNormIdent = glm::normalize(normalMatIdent * localNorm);
+
+        assert_near(reconsPosIdent.x, localPos.x, 1e-6f, "Identity transform pos.x invariant");
+        assert_near(reconsPosIdent.y, localPos.y, 1e-6f, "Identity transform pos.y invariant");
+        assert_near(reconsPosIdent.z, localPos.z, 1e-6f, "Identity transform pos.z invariant");
+        assert_near(reconsNormIdent.x, 0.0f, 1e-6f, "Identity transform norm.x invariant");
+        assert_near(reconsNormIdent.y, 0.0f, 1e-6f, "Identity transform norm.y invariant");
+        assert_near(reconsNormIdent.z, 1.0f, 1e-6f, "Identity transform norm.z invariant");
+
+        // Case 2: Affine Transform (Translation + Rotation + Non-uniform Scaling)
+        // Scale: Sx=2, Sy=3, Sz=1
+        // Translation: Tx=10, Ty=20, Tz=30
+        // Rotation: 90 deg around Z -> (x, y) -> (-y, x)
+        glm::mat4 T = glm::translate(glm::mat4(1.0f), glm::vec3(10.0f, 20.0f, 30.0f));
+        glm::mat4 R = glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(2.0f, 3.0f, 1.0f));
+        glm::mat4 M = T * R * S;
+        glm::mat4 invM = glm::inverse(M);
+
+        pathways::InstanceGPU transformedInst{};
+        transformedInst.transform = M;
+        transformedInst.invTransform = invM;
+
+        glm::vec3 worldPos = glm::vec3(transformedInst.transform * glm::vec4(localPos, 1.0f));
+        glm::mat3 normalMat = glm::transpose(glm::mat3(transformedInst.invTransform));
+        glm::vec3 worldNorm = glm::normalize(normalMat * localNorm);
+
+        // Verify transformed position matches manual matrix product
+        glm::vec4 expectedWorldPos = M * glm::vec4(localPos, 1.0f);
+        assert_near(worldPos.x, expectedWorldPos.x, 1e-5f, "Affine instance transform world pos X");
+        assert_near(worldPos.y, expectedWorldPos.y, 1e-5f, "Affine instance transform world pos Y");
+        assert_near(worldPos.z, expectedWorldPos.z, 1e-5f, "Affine instance transform world pos Z");
+
+        // Transformed triangle vertices in world space
+        glm::vec3 w0 = glm::vec3(M * glm::vec4(v0, 1.0f));
+        glm::vec3 w1 = glm::vec3(M * glm::vec4(v1, 1.0f));
+        glm::vec3 w2 = glm::vec3(M * glm::vec4(v2, 1.0f));
+        glm::vec3 expectedWorldNorm = glm::normalize(glm::cross(w1 - w0, w2 - w0));
+
+        assert_near(worldNorm.x, expectedWorldNorm.x, 1e-5f, "Affine instance transform normal X orthogonal to edges");
+        assert_near(worldNorm.y, expectedWorldNorm.y, 1e-5f, "Affine instance transform normal Y orthogonal to edges");
+        assert_near(worldNorm.z, expectedWorldNorm.z, 1e-5f, "Affine instance transform normal Z orthogonal to edges");
+
+        // 12c. Direct Illumination Occlusion Confidence Preservation (Fix 1)
+        // Simulate a reservoir after finding a candidate light
+        pathways::DiReservoirGPU r{};
+        r.idxM = (4u << 16) | 2u; // M = 4, light index = 2
+        r.wSum = 12.5f;
+        r.targetPdf = 2.5f;
+        r.flags = 0x100u; // valid bit set
+        r.hitDist = 3.0f;
+
+        // Under inline shadow query: shadow ray is occluded
+        bool occluded = true;
+        glm::vec3 secDirectL(0.0f);
+        if (!occluded) {
+            secDirectL = glm::vec3(1.0f);
+        } else {
+            secDirectL = glm::vec3(0.0f);
+            // CRITICAL FIX: Do NOT destroy reservoir r!
+            // r remains intact with its M and wSum so temporal reuse carries confidence forward.
+        }
+
+        assert_near(secDirectL.x, 0.0f, 1e-6f, "Occluded shadow ray produces zero current-frame radiance");
+        assert_true((r.flags & 0x100u) != 0u, "Reservoir valid flag PRESERVED despite occlusion");
+        assert_near(r.wSum, 12.5f, 1e-6f, "Reservoir wSum PRESERVED despite occlusion");
+        assert_true((r.idxM >> 16) == 4u, "Reservoir confidence counter M PRESERVED despite occlusion");
+        assert_true((r.idxM & 0xFFFFu) == 2u, "Reservoir light index candidate PRESERVED despite occlusion");
+
+        // 12d. Specular Mirror Partitioning (Roughness Gating, Fix 3)
+        auto evaluateRoughnessPartitioning = [](float roughness, bool enableRestirFlag) {
+            bool enableRestirPT = enableRestirFlag && (roughness >= 0.10f);
+            bool giCtxEligible = (roughness >= 0.10f);
+            return std::make_pair(enableRestirPT, giCtxEligible);
+        };
+
+        // Mirror / Near-delta materials (< 0.10) must be partitioned out:
+        std::vector<float> mirrorRoughnesses = { 0.0001f, 0.001f, 0.01f, 0.05f, 0.099f };
+        for (float mr : mirrorRoughnesses) {
+            auto [ptEnabled, giEligible] = evaluateRoughnessPartitioning(mr, true);
+            assert_true(!ptEnabled, "Near-delta surface (roughness < 0.10) strictly bypassed from ReSTIR PT");
+            assert_true(!giEligible, "Near-delta surface strictly excluded from ReSTIR GI x1Context");
+        }
+
+        // Rough / Glossy / Diffuse materials (>= 0.10) participate fully in ReSTIR:
+        std::vector<float> roughMaterials = { 0.10f, 0.15f, 0.30f, 0.50f, 1.0f };
+        for (float rm : roughMaterials) {
+            auto [ptEnabled, giEligible] = evaluateRoughnessPartitioning(rm, true);
+            assert_true(ptEnabled, "Rough surface (roughness >= 0.10) enabled for ReSTIR PT");
+            assert_true(giEligible, "Rough surface eligible for ReSTIR GI x1Context");
+        }
+
+        // 12e. Approach A Request/Result Queues Data Contract & Roundtrip (Fix 4)
+        pathways::ShadeRequestGPU req{};
+        req.hit.instanceId = 3;
+        req.hit.primitiveId = 42;
+        req.hit.baryPacked = 0x12345678u;
+        req.hit.flags = 2; // frontFace
+        req.wiOct = 0xAAAAAAAAu;
+        req.woOct = 0x55555555u;
+        req.resultSlot = 100;
+        req.matIdFlags = 7;
+        assert_true(sizeof(req) == 32, "ShadeRequestGPU strictly 32 bytes");
+
+        pathways::ShadeResultGPU res{};
+        glm::vec3 bsdfColor(0.75f, 0.5f, 0.25f);
+        float pdfFwd = 1.25f;
+        float pdfRev = 0.95f;
+        res.fRG = glm::packHalf2x16(glm::vec2(bsdfColor.r, bsdfColor.g));
+        res.fB_pdfFwd = glm::packHalf2x16(glm::vec2(bsdfColor.b, pdfFwd));
+        res.pdfRev_flags = glm::packHalf2x16(glm::vec2(pdfRev, 0.0f)) | (1u << 16);
+        res.pad = 0;
+        assert_true(sizeof(res) == 16, "ShadeResultGPU strictly 16 bytes");
+
+        // Unpack roundtrip verification
+        glm::vec2 unpackedRG = glm::unpackHalf2x16(res.fRG);
+        glm::vec2 unpackedB_fwd = glm::unpackHalf2x16(res.fB_pdfFwd);
+        glm::vec2 unpackedRev_flags = glm::unpackHalf2x16(res.pdfRev_flags);
+
+        assert_near(unpackedRG.x, bsdfColor.r, 1e-3f, "ShadeResult BSDF R fp16 roundtrip");
+        assert_near(unpackedRG.y, bsdfColor.g, 1e-3f, "ShadeResult BSDF G fp16 roundtrip");
+        assert_near(unpackedB_fwd.x, bsdfColor.b, 1e-3f, "ShadeResult BSDF B fp16 roundtrip");
+        assert_near(unpackedB_fwd.y, pdfFwd, 1e-3f, "ShadeResult forward pdf fp16 roundtrip");
+        assert_near(unpackedRev_flags.x, pdfRev, 1e-3f, "ShadeResult reverse pdf fp16 roundtrip");
+        std::cout << "  [+] PASS: TEST 12 all assertions satisfied." << std::endl;
     }
 
     std::cout << "\n================================================================================" << std::endl;

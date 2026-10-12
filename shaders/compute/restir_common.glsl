@@ -484,6 +484,39 @@ struct ShadeResult {
     uint pad;           // 4 bytes: alignment / reserved
 };
 
+ShadeRequest invalidShadeRequest() {
+    ShadeRequest req;
+    req.hit = invalidHit();
+    req.wiOct = 0u;
+    req.woOct = 0u;
+    req.resultSlot = 0xFFFFFFFFu;
+    req.matIdFlags = 0xFFFFFFFFu;
+    return req;
+}
+
+ShadeResult invalidShadeResult() {
+    ShadeResult res;
+    res.fRG = 0u;
+    res.fB_pdfFwd = 0u;
+    res.pdfRev_flags = 0u;
+    res.pad = 0u;
+    return res;
+}
+
+vec3 unpackShadeResultBSDF(ShadeResult res) {
+    vec2 rg = unpackHalf2x16(res.fRG);
+    float b = unpackHalf2x16(res.fB_pdfFwd).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+float unpackShadeResultPdfFwd(ShadeResult res) {
+    return unpackHalf2x16(res.fB_pdfFwd).y;
+}
+
+float unpackShadeResultPdfRev(ShadeResult res) {
+    return unpackHalf2x16(res.pdfRev_flags).x;
+}
+
 struct X1Context {
     uint n1Oct;     // oct32(x1 normal)
     uint albedoRG;  // fp16 (albedo.r, albedo.g)

@@ -1525,6 +1525,9 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
             instGPU.numOpaqueTriangles = data.blasRanges[bIdx].numOpaqueTriangles;
             instGPU.materialOffset = 0;
             instGPU.flags = 0;
+            instGPU.transform = M;
+            float det = glm::determinant(M);
+            instGPU.invTransform = (std::abs(det) > 1e-8f) ? glm::inverse(M) : glm::mat4(1.0f);
             data.instanceData.push_back(instGPU);
             keptCount++;
         }

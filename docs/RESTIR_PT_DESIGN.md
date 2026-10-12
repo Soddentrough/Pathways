@@ -14,15 +14,16 @@ ReSTIR PT (*Path-Space Reservoir Spatio-Temporal Importance Resampling*) resampl
 
 Two major decoupled architectures exist for production-grade ReSTIR PT in Vulkan 1.4:
 
-1. **Approach A: Request / Result Wavefront Ping-Pong (Lin et al. 2022, GRIS)**
-   - **Premise:** Geometry kernels trace rays and evaluate shift mappings; when they reach a reconnected vertex, they emit a lightweight `ShadeRequest`. Specialized material kernels evaluate BSDF $(f, \text{pdf})$ binned by material class, and a resolve pass computes exact Jacobians and MIS weights.
-   - **Key Advantage:** Resampling operates on the **exact** target function $\hat{p}$ and true BSDF lobes at every step, maximizing convergence and maintaining mathematical unbiasedness.
+1. **Approach A: Request / Result Wavefront Ping-Pong (Lin et al. 2022, GRIS) — PRIMARY PRODUCTION ARCHITECTURE**
+   - **Premise:** Geometry kernels trace rays and evaluate shift mappings; when reaching a reconnected vertex, they emit a lightweight `ShadeRequest`. Specialized material kernels evaluate BSDF $(f, \text{pdf})$ binned by material class, and a resolve pass computes exact Jacobians and pairwise MIS weights.
+   - **Key Advantage & Statistical Correctness:** Resampling operates on the **exact** target function $\hat{p}$ and true multi-lobe BSDFs at every step. This prevents the **irreducible bias and M-dilution** that geometric proxies cause on rough conductors, coated dielectrics, and anisotropic lobes. Wavefront lane compaction (`subgroupBallot` + prefix sum) preserves 100% SIMD occupancy across waves.
 
-2. **Approach B: Fully Inverted / Deferred Gather Path-Database (Bitterli et al., Benty et al. 2023)**
-   - **Premise:** Treat the renderer as a **path-sampling database with a deferred material evaluator**. Reservoirs store pure geometric path topology and sampling provenance (seeds, vertices, hints). Resampling, shifting, and visibility-validation operate with **zero material code**, using geometric target proxies. Materials and spectral closures are evaluated **only on the surviving paths at the end of the frame**.
-   - **Key Advantage:** Maximum architectural purity and theoretical peak SIMD efficiency. Resampling kernels never load textures, evaluate closures, or ping-pong with material passes.
+2. **Approach B: Fully Inverted / Deferred Gather Path-Database (Bitterli et al., Benty et al. 2023) — CANDIDATE CULLING PROXY ONLY**
+   - **Premise:** Treat the renderer as a path-sampling database with a deferred material evaluator. Reservoirs store geometric path topology and PRNG seeds, shifting via geometric target proxies $\hat{p}_{\text{geom}}$.
+   - **Statistical Limitation:** ReSTIR PT is an MIS estimator in path space. Replacing the true BSDF with a conservative geometric proxy uncouples the sampling distribution from the true integrand, causing effective overlap between proposal $q$ and target $f$ to collapse. This severely dilutes $M$ for non-diffuse surfaces.
+   - **Hybrid Recommendation:** The geometric proxy is retained **strictly for spatial neighbor candidate culling** (early rejection of candidates below a coupling threshold before emitting shade requests), but **never for final reservoir combination or MIS weighting**.
 
-Below is the complete specification of both paradigms, followed by Pathways' progressive adoption path.
+Below is the complete specification of both paradigms, followed by the production adoption path.
 
 ---
 
@@ -287,8 +288,31 @@ Both architectures rely on standard, cross-vendor Vulkan 1.4 features:
   $$\|J\| = \frac{\cos\theta_{\text{rc}}'}{\cos\theta_{\text{rc}}} \cdot \frac{\|x_{k-1} - x_{\text{rc}}\|^2}{\|x_{k-1}' - x_{\text{rc}}\|^2}$$
 - **Outcome:** Full multi-bounce ReSTIR PT with exact BSDF targets and pairwise MIS.
 
-### Phase 3: Fully Inverted Path-Database Architecture (Approach B)
-- Transition reservoir storage to pure `PathSample` SoA records with RNG seeds and topology hashes.
-- Replace mid-frame material evaluation with geometric target proxies $\hat{p}$.
-- Defer all material BSDF closure evaluation to an end-of-frame gather pass.
-- **Outcome:** Ultimate theoretical ceiling of performance and architectural purity.
+### Phase 3: Production Wavefront Request/Result Scaling (Approach A Core)
+- Implement compacted, binned material queues consuming `ShadeRequest` records via DGC pipelines.
+- Evaluate exact multi-lobe BSDFs and pairwise MIS weights without inline rayQuery branching in material kernels.
+- Retain geometric coupling proxies strictly for candidate spatial pre-filtering.
+
+---
+
+## 7. Expert Rendering Principles & Production Invariants
+
+Based on rigorous statistical and SIMD architectural review, the following four implementation invariants are enforced across the engine:
+
+### 7.1 Occlusion Confidence Preservation (Non-Destructive Shadow Testing)
+- **Problem:** Destroying reservoirs (`r = invalidDiReservoir()`) when a direct illumination shadow ray is occluded discards accumulated confidence $M$ and weight sum $w_{\text{sum}}$, resetting the estimator to cold-start variance.
+- **Invariant:** When `traceShadowRayInline` detects an occluder, current-frame radiance contribution is zeroed (`secDirectL = f16vec3(0.0)`), but the candidate's reservoir state ($M$, $w_{\text{sum}}$, light index) is fully retained for subsequent temporal reuse.
+
+### 7.2 Kinematic Geometry & TLAS Instance Transform in Hit Reconstruction
+- **Problem:** Dynamic TLAS instances or point-instanced geometry evaluated in object coordinates drift and corrupt temporal reconnection vectors $\mathbf{x}_{i}\mathbf{x}_{k}$ and shift Jacobians.
+- **Invariant:** Path vertices in 16-byte `Hit` atoms are reconstructed at time slice $t$ using the current frame's TLAS instance matrix:
+  $$\mathbf{x}_{\text{world}} = M_t \mathbf{x}_{\text{local}}, \quad \mathbf{n}_{\text{world}} = \text{normalize}\left((M_t^{-1})^T \mathbf{n}_{\text{local}}\right)$$
+  `InstanceGPU` includes both `mat4 transform` and `mat4 invTransform` (144 bytes, std430 aligned). Screen-space reprojection is used strictly to locate the temporal neighbor pixel, while world-space reconstruction validates and shifts the subpath.
+
+### 7.3 Specular Mirror Partitioning (Roughness Gating $\tau = 0.10$)
+- **Problem:** Delta and near-delta specular surfaces (roughness $< 0.10$) represent measure-zero or near-singular manifolds in path space. Perturbing reflection rays during spatial/temporal shift mapping yields vanishingly small overlap, zero/infinite MIS weights, and severe firefly artifacts.
+- **Invariant:** Surfaces with `roughness < 0.10` are strictly partitioned out of ReSTIR DI and GI resampling. They run un-resampled 1-SPP path tracing without reservoir sharing and write `invalidDiReservoir()` / `invalidX1Context()` to prevent neighbor corruption.
+
+### 7.4 Approach A Primacy over Approach B Geometric Proxies
+- **Problem:** While Approach B (deferred gather) eliminates mid-frame material ping-pong, evaluating ReSTIR PT solely against a conservative geometric proxy uncouples the sampling distribution from the true integrand, creating irreducible bias and severe $M$-dilution on multi-lobe materials.
+- **Invariant:** Approach A (Request/Result Wavefront Ping-Pong with binned material queues) is the primary production architecture for multi-bounce ReSTIR PT. Geometric proxies are permitted strictly for coarse neighbor candidate culling prior to queue emission.
