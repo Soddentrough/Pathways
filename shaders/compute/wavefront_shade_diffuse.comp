@@ -808,7 +808,7 @@ void main() {
             }
 #else
             // Direct Lighting (Unified ReSTIR PT Inline Path Resampling & Stochastic NEE)
-            bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
+            bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0) && (roughness >= 0.10);
             if (!pathTerminated && !isDelta && enableDirect && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
@@ -893,8 +893,8 @@ void main() {
 
                     r = shadeR;
                     sel = shadeSel;
-                } else if (enableRestirPT && bounce == 0u) {
-                    currentReservoirs[pixelIndex] = r;
+                } else if (bounce == 0u && ((ubo.flags & (1 << 9)) != 0)) {
+                    currentReservoirs[pixelIndex] = enableRestirPT ? r : invalidDiReservoir();
                 }
 
                 // Local aliases consumed by the finalization block below
@@ -992,7 +992,6 @@ void main() {
                                             }
                                         } else {
                                             secDirectL = f16vec3(0.0);
-                                            r = invalidDiReservoir();
                                         }
                                     } else
 #endif
@@ -1012,7 +1011,7 @@ void main() {
                 }
 
             } else {
-                if (enableRestirPT && bounce == 0u) {
+                if (bounce == 0u && ((ubo.flags & (1 << 9)) != 0)) {
                     currentReservoirs[pixelIndex] = invalidDiReservoir();
                 }
             }
@@ -1136,7 +1135,10 @@ void main() {
                         }
 #if !IS_SECONDARY_BOUNCE
                         // ReSTIR GI context: diffuse cosine REFLECTION lobe only.
-                        giCtxEligible = !pickSpec && !isTrans;
+                        // Transmitted lobes carry a different BSDF branch and are
+                        // excluded from GI reuse for now. Specular mirrors (roughness < 0.10)
+                        // are strictly partitioned out of GI reservoir resampling.
+                        giCtxEligible = !pickSpec && !isTrans && (roughness >= 0.10);
 #endif
                     }
 
@@ -1151,8 +1153,18 @@ void main() {
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                             nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel, nextPdfCode);
 #if !IS_SECONDARY_BOUNCE
-                            if (giCtxEligible && bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
-                                x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
+                            if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+                                if (giCtxEligible) {
+                                    x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
+                                } else {
+                                    x1Contexts[pixelIndex] = invalidX1Context();
+                                }
+                            }
+#endif
+                        } else {
+#if !IS_SECONDARY_BOUNCE
+                            if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+                                x1Contexts[pixelIndex] = invalidX1Context();
                             }
 #endif
                         }

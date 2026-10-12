@@ -131,13 +131,15 @@ struct MeshRange {
     uint32_t triangleCount = 0;
 };
 
-struct InstanceGPU {
+struct alignas(16) InstanceGPU {
     uint32_t firstTriangle = 0;      // Start index in triangles[] buffer
     uint32_t numOpaqueTriangles = 0; // Number of opaque triangles in this prototype
     uint32_t materialOffset = 0;     // Optional material ID offset
     uint32_t flags = 0;              // Flags / metadata
+    glm::mat4 transform = glm::mat4(1.0f);    // Instance transform to world space
+    glm::mat4 invTransform = glm::mat4(1.0f); // Inverse transform for normals and un-projection
 };
-static_assert(sizeof(InstanceGPU) == 16, "InstanceGPU must be 16 bytes (std430 aligned)");
+static_assert(sizeof(InstanceGPU) == 144, "InstanceGPU must be 144 bytes (std430 aligned)");
 
 struct BlasGeometryRange {
     uint32_t firstTriangle = 0;
