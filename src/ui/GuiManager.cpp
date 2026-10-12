@@ -338,7 +338,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowPos(ImVec2(hudX, hudY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
 
-    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar;
+    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav;
     ImGui::SetNextWindowBgAlpha(0.76f);
     if (ImGui::Begin(hudTitle, nullptr, panelFlags)) {
         if (stats.mgpu_mode_str != "off" && stats.secondary_gpu_time_ms > 0.001) {
@@ -364,7 +364,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.55f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
-        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
 
             ImGui::BeginGroup();
             ImGui::SetWindowFontScale(2.0f);
@@ -1197,7 +1197,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 
-                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar)) {
                         int dotCount = static_cast<int>(ImGui::GetTime() * 4.0) % 4;
                         std::string dots(dotCount, '.');
                         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f),
