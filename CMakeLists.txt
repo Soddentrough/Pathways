@@ -324,7 +324,11 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
             endif()
         endif()
         find_package(Python3 COMPONENTS Development QUIET)
-        target_compile_definitions(pathways PRIVATE PATHWAYS_ENABLE_USD=1)
+        target_compile_definitions(pathways PRIVATE
+            PATHWAYS_ENABLE_USD=1
+            TBB_SUPPRESS_DEPRECATED_MESSAGES=1
+            TBB_INTERFACE_VERSION_MAJOR=12
+        )
         target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES})
         if(TARGET Python3::Python)
             target_link_libraries(pathways PRIVATE Python3::Python)
@@ -744,7 +748,11 @@ if(pxr_FOUND)
     target_include_directories(test_usd_loader SYSTEM PRIVATE
         ${PXR_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_usd_loader PRIVATE PATHWAYS_ENABLE_USD=1)
+    target_compile_definitions(test_usd_loader PRIVATE
+        PATHWAYS_ENABLE_USD=1
+        TBB_SUPPRESS_DEPRECATED_MESSAGES=1
+        TBB_INTERFACE_VERSION_MAJOR=12
+    )
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(test_usd_loader PRIVATE "-Wno-deprecated")
     endif()

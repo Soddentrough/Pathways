@@ -1,6 +1,7 @@
 #include "scene/UsdLoader.hpp"
 #include "core/Logger.hpp"
 
+#include <tbb/version.h>
 #include <pxr/pxr.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/prim.h>

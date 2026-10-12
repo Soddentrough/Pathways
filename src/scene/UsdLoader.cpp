@@ -24,6 +24,7 @@
 
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
 
+#include <tbb/version.h>
 #include <pxr/pxr.h>
 #include <pxr/usd/usd/primDefinition.h>
 #include <pxr/usd/usd/stage.h>
