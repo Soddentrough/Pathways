@@ -484,12 +484,16 @@ add_executable(test_gui_scroll
     ${THIRD_PARTY_DIR}/imgui/imgui_draw.cpp
     ${THIRD_PARTY_DIR}/imgui/imgui_tables.cpp
     ${THIRD_PARTY_DIR}/imgui/imgui_widgets.cpp
+    ${THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl3.cpp
 )
 target_include_directories(test_gui_scroll PRIVATE
     ${THIRD_PARTY_DIR}/imgui
+    ${THIRD_PARTY_DIR}/imgui/backends
 )
 if(UNIX)
-    target_link_libraries(test_gui_scroll PRIVATE m)
+    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3 m)
+else()
+    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3)
 endif()
 add_test(NAME GuiScroll COMMAND test_gui_scroll)
 

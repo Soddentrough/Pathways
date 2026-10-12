@@ -1,7 +1,10 @@
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <limits>
+#include <SDL3/SDL.h>
 #include "imgui.h"
+#include "imgui_impl_sdl3.h"
 
 void check_true(bool cond, const char* msg) {
     if (!cond) {
@@ -199,6 +202,154 @@ int main() {
     ImGui::Render();
 
     ImGui::DestroyContext(ctx);
+
+    // =========================================================================
+    // PART 2: SDL3 Backend Event Translation & Robustness Tests
+    // (Testing SDL_MOUSEWHEEL_FLIPPED, Dual-Axis Noise Filter #4559, and NaN Resilience #7546)
+    // =========================================================================
+    std::cout << "\n--- Testing SDL3 Platform Backend Wheel Handling & Normalization ---" << std::endl;
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
+    check_true(SDL_Init(SDL_INIT_VIDEO), "SDL_Init(SDL_INIT_VIDEO)");
+    SDL_Window* sdlWin = SDL_CreateWindow("ScrollTestWin", 800, 600, SDL_WINDOW_HIDDEN);
+    check_true(sdlWin != nullptr, "SDL_CreateWindow for backend test");
+    SDL_WindowID winId = SDL_GetWindowID(sdlWin);
+
+    ImGuiContext* ctx2 = ImGui::CreateContext();
+    check_true(ctx2 != nullptr, "ImGui second context created");
+    ImGuiIO& io2 = ImGui::GetIO();
+    io2.DisplaySize = ImVec2(800.0f, 600.0f);
+    io2.DeltaTime = 1.0f / 60.0f;
+    check_true(ImGui_ImplSDL3_InitForOther(sdlWin), "ImGui_ImplSDL3_InitForOther");
+
+    unsigned char* px2;
+    int w2, h2;
+    io2.Fonts->GetTexDataAsRGBA32(&px2, &w2, &h2);
+
+    auto renderPanelContent = [&]() {
+        for (int i = 0; i < 40; ++i) {
+            ImGui::Text("Backend Test Row #%d: Performance Metric = 123.45", i);
+        }
+    };
+
+    // Frame 9: Initial layout & sizing
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 9");
+    renderPanelContent();
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 10: Mouse motion to hover window
+    SDL_Event motionEv{};
+    motionEv.type = SDL_EVENT_MOUSE_MOTION;
+    motionEv.motion.windowID = winId;
+    motionEv.motion.x = 50.0f;
+    motionEv.motion.y = 50.0f;
+    ImGui_ImplSDL3_ProcessEvent(&motionEv);
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 10");
+    renderPanelContent();
+    check_true(ImGui::GetScrollMaxY() > 100.0f, "Content overflows window on frame 10");
+    check_true(ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows), "Window hovered on frame 10");
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 11: Normal SDL3 wheel scroll DOWN (SDL: y = -1.0f, NORMAL)
+    SDL_Event wheelNorm{};
+    wheelNorm.type = SDL_EVENT_MOUSE_WHEEL;
+    wheelNorm.wheel.windowID = winId;
+    wheelNorm.wheel.x = 0.0f;
+    wheelNorm.wheel.y = -1.0f;
+    wheelNorm.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    ImGui_ImplSDL3_ProcessEvent(&wheelNorm);
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 11");
+    renderPanelContent();
+    float sY_f11 = ImGui::GetScrollY();
+    check_true(sY_f11 > 0.0f, "Normal wheel scroll DOWN increased ScrollY");
+    std::cout << "[PASS] Frame 11: Normal wheel scroll DOWN verified! ScrollY: " << sY_f11 << " px." << std::endl;
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 12: FLIPPED SDL3 wheel scroll DOWN (SDL: y = +1.0f, FLIPPED - Wayland natural scrolling)
+    // SDL3 FLIPPED emits opposite signs; backend MUST invert to prevent snap-back to 0!
+    SDL_Event wheelFlip{};
+    wheelFlip.type = SDL_EVENT_MOUSE_WHEEL;
+    wheelFlip.wheel.windowID = winId;
+    wheelFlip.wheel.x = 0.0f;
+    wheelFlip.wheel.y = 1.0f;
+    wheelFlip.wheel.direction = SDL_MOUSEWHEEL_FLIPPED;
+    ImGui_ImplSDL3_ProcessEvent(&wheelFlip);
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 12");
+    renderPanelContent();
+    float sY_f12 = ImGui::GetScrollY();
+    check_true(sY_f12 > sY_f11, "FLIPPED wheel scroll DOWN correctly advanced ScrollY (did not snap back to 0)");
+    std::cout << "[PASS] Frame 12: FLIPPED natural wheel scroll DOWN verified (no snap-back)! ScrollY: " << sY_f12 << " px." << std::endl;
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 13: Dual-axis noise filter (Issue #4559: tiny x drift e.g. 0.05f alongside vertical wheel)
+    SDL_Event wheelDual{};
+    wheelDual.type = SDL_EVENT_MOUSE_WHEEL;
+    wheelDual.wheel.windowID = winId;
+    wheelDual.wheel.x = 0.05f;
+    wheelDual.wheel.y = -1.0f;
+    wheelDual.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    ImGui_ImplSDL3_ProcessEvent(&wheelDual);
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 13");
+    renderPanelContent();
+    float sY_f13 = ImGui::GetScrollY();
+    check_true(sY_f13 > sY_f12, "Dual-axis input successfully scrolled vertically without horizontal locking");
+    std::cout << "[PASS] Frame 13: Dual-axis noise filter (Issue #4559) verified! ScrollY: " << sY_f13 << " px." << std::endl;
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 14: NaN resilience (Issue #7546: NaN wheel values safely neutralized to 0.0f)
+    SDL_Event wheelNaN{};
+    wheelNaN.type = SDL_EVENT_MOUSE_WHEEL;
+    wheelNaN.wheel.windowID = winId;
+    wheelNaN.wheel.x = std::numeric_limits<float>::quiet_NaN();
+    wheelNaN.wheel.y = std::numeric_limits<float>::quiet_NaN();
+    wheelNaN.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    ImGui_ImplSDL3_ProcessEvent(&wheelNaN);
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 14");
+    renderPanelContent();
+    float sY_f14 = ImGui::GetScrollY();
+    check_true(sY_f14 == sY_f13, "NaN event safely neutralized; scroll position preserved without corruption");
+    std::cout << "[PASS] Frame 14: NaN resilience (Issue #7546) verified! ScrollY: " << sY_f14 << " px." << std::endl;
+    ImGui::End();
+    ImGui::Render();
+
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext(ctx2);
+    SDL_DestroyWindow(sdlWin);
+    SDL_Quit();
+
     std::cout << "==========================================================" << std::endl;
     std::cout << "[SUCCESS] ALL GUI MOUSE WHEEL & SCROLL TESTS PASSED!" << std::endl;
     std::cout << "==========================================================" << std::endl;
