@@ -173,6 +173,19 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
     GiReservoir giHistoryReservoirs[];
 };
 
+// ReSTIR PT Phase 3 (Approach B) state — docs/RESTIR_PT_DESIGN.md
+layout(std430, binding = 41) buffer PtCurrentReservoirsBuffer {
+    ReservoirPT ptReservoirs[];
+};
+
+layout(std430, binding = 42) readonly buffer PtHistoryReservoirsBuffer {
+    ReservoirPT ptHistoryReservoirs[];
+};
+
+layout(std430, binding = 43) buffer PathSamplesBuffer {
+    PathSample pathSamples[];
+};
+
 #ifndef ENABLE_INLINE_SHADOWS
 #define ENABLE_INLINE_SHADOWS 1
 #endif
@@ -929,6 +942,14 @@ void main() {
                 if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
                     if (giCtxEligible) {
                         x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
+                        Hit primaryHit = getRayHitAtom(hit);
+                        pathSamples[pixelIndex].vertexCount = 1u;
+                        pathSamples[pixelIndex].rcIndex = 1u;
+                        pathSamples[pixelIndex].rngSeedPrefix = seed;
+                        pathSamples[pixelIndex].rngSeedSuffix = 0u;
+                        pathSamples[pixelIndex].strategyId = 0u;
+                        pathSamples[pixelIndex].flags = 0u;
+                        pathSamples[pixelIndex].vertices[0] = makePathVertex(primaryHit, V, matId, 2u /* SURFACE_GLOSSY / COMPLEX */, 0u);
                     } else {
                         x1Contexts[pixelIndex] = invalidX1Context();
                     }

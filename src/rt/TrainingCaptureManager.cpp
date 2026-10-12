@@ -58,7 +58,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_engine->m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && m_engine->isRestirActive())) flags |= (1 << 7);
-    if (m_engine->isRestirActive()) flags |= (1 << 9);
+    if (m_engine->isRestirActive()) flags |= (1 << 9) | (1 << 24);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
 

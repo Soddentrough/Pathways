@@ -129,7 +129,8 @@ void RayTracingOrchestrator::createReSTIRResources() {
     // ReSTIR is actually enabled (Engine::renderFrame lazy-init path) to
     // avoid ~2 x W*H*28 B of idle VRAM when the feature is off.
     m_restirManager = std::make_unique<ReSTIRManager>(m_device, m_allocator);
-    Logger::info("ReSTIR DI subsystem initialized (28B reservoirs; inline temporal + spatial-tap reuse in wavefront shading).");
+    m_restirManager->setPhase3Enabled(true);
+    Logger::info("ReSTIR PT subsystem initialized (path-space reservoirs; inline temporal + spatial-tap reuse in wavefront shading).");
 }
 
 void RayTracingOrchestrator::destroyReSTIRResources() {

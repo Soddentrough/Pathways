@@ -286,11 +286,10 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--nrc-bounce` | `<int>` | Path bounce depth at which NRC terminates tracing | `2` |
 | `--nrc-train-ratio` | `<float>` | Fraction of paths that continue to ground truth for NRC training | `0.03` |
 | `--caustic-photons` | `<int>` | Photon count for the forward caustics pass | `1048576` |
-| `--restir` | *(flag)* | Enable ReSTIR: DI (direct-light reservoir resampling) + GI (bounce-1 secondary-vertex reuse) in wavefront shading. (`--restir-pt` is an alias that warns — full path-replay PT is not yet implemented; see `docs/RESTIR_PT_DESIGN.md`) | Disabled |
-| `--no-restir-gi` | *(flag)* | Disable the ReSTIR GI component only (keep DI) | GI on when `--restir` |
-| `--restir-min-lights` | `<int>` | *Deprecated, ignored* (kept for CLI compatibility) | — |
-| `--restir-m-cap` | `<int>` | ReSTIR temporal reuse M-cap for DI and GI (spatial taps additionally capped at 8 in-shader) | `60` |
-| `--debug-view` | `<name>` | Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap; requires `--restir`): `restir-di-m` / `restir-di-w` / `restir-di-light` / `restir-gi-m` / `restir-gi-w` / `restir-coverage` / `none` | `none` |
+| `--restir` | *(flag)* | Enable ReSTIR PT: unified spatiotemporal path-space reservoir resampling in wavefront shading | Disabled |
+| `--restir-m-cap` | `<int>` | ReSTIR PT temporal reuse M-cap (spatial taps additionally capped at 8 in-shader) | `60` |
+| `--debug-view` | `<name>` | Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap; requires `--restir`): `restir-m` / `restir-w` / `restir-light` / `restir-indirect-m` / `restir-indirect-w` / `restir-coverage` / `none` | `none` |
+| `--denoiser` | `svgf` \| `relax` \| `upways` \| `none` | Real-time spatiotemporal denoiser (or shortcut `--svgf` / `--relax` / `--asvgf` for In-House ReLAX/A-SVGF) | `none` |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |

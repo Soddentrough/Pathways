@@ -330,16 +330,20 @@ bool InputController::handleEvent(const SDL_Event& e) {
 
     // 9. In UI Mode: route events to ImGui
     if (m_gui) {
+        // Forward all events to Dear ImGui first so it maintains accurate input state and hover tracking
+        m_gui->processEvent(e);
+
         // If mouse wheel happened outside ImGui windows, adjust camera speed
         if (e.type == SDL_EVENT_MOUSE_WHEEL && !m_gui->wantCaptureMouse()) {
             if (m_camera) {
-                m_camera->adjustSpeedByWheel(e.wheel.y);
+                float wheelY = e.wheel.y;
+                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+                    wheelY = -wheelY;
+                }
+                m_camera->adjustSpeedByWheel(wheelY);
             }
             return true;
         }
-
-        // Process event with Dear ImGui
-        m_gui->processEvent(e);
 
         // If left click happened outside ImGui windows, capture mouse for FPS navigation
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {

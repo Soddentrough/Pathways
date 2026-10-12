@@ -157,7 +157,12 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // X1ContextsBuffer (ReSTIR GI)
         { 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiCurrentReservoirsBuffer
         { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiHistoryReservoirsBuffer
-        { 40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // VertexPositionsBuffer
+        { 40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // VertexPositionsBuffer
+        { 41, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PtCurrentReservoirsBuffer
+        { 42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PtHistoryReservoirsBuffer
+        { 43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PathSamplesBuffer
+        { 44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeRequestsBuffer
+        { 45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // ShadeResultsBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -174,7 +179,7 @@ void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 }
     };
@@ -352,7 +357,12 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer x1ContextBuffer,
                                                 VkBuffer giReservoirBuffer,
                                                 VkBuffer giHistoryReservoirBuffer,
-                                                VkBuffer positionBuffer) {
+                                                VkBuffer positionBuffer,
+                                                VkBuffer ptReservoirBuffer,
+                                                VkBuffer ptHistoryReservoirBuffer,
+                                                VkBuffer pathSampleBuffer,
+                                                VkBuffer shadeRequestBuffer,
+                                                VkBuffer shadeResultBuffer) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -421,6 +431,17 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkBuffer actualPosBuf = (positionBuffer != VK_NULL_HANDLE) ? positionBuffer : triangleBuffer;
     VkDescriptorBufferInfo posBufferInfo{ actualPosBuf, 0, VK_WHOLE_SIZE };
 
+    VkBuffer actualPt = (ptReservoirBuffer != VK_NULL_HANDLE) ? ptReservoirBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo ptInfo{ actualPt, 0, VK_WHOLE_SIZE };
+    VkBuffer actualPtHistory = (ptHistoryReservoirBuffer != VK_NULL_HANDLE) ? ptHistoryReservoirBuffer : actualPt;
+    VkDescriptorBufferInfo ptHistoryInfo{ actualPtHistory, 0, VK_WHOLE_SIZE };
+    VkBuffer actualPathSample = (pathSampleBuffer != VK_NULL_HANDLE) ? pathSampleBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo pathSampleInfo{ actualPathSample, 0, VK_WHOLE_SIZE };
+    VkBuffer actualShadeReq = (shadeRequestBuffer != VK_NULL_HANDLE) ? shadeRequestBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo shadeReqInfo{ actualShadeReq, 0, VK_WHOLE_SIZE };
+    VkBuffer actualShadeRes = (shadeResultBuffer != VK_NULL_HANDLE) ? shadeResultBuffer : m_dummyReservoir->getBuffer();
+    VkDescriptorBufferInfo shadeResInfo{ actualShadeRes, 0, VK_WHOLE_SIZE };
+
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
     asInfo.accelerationStructureCount = 1;
@@ -475,6 +496,11 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 38, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 39, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giHistoryInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 40, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &posBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 41, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ptInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 42, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ptHistoryInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 43, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pathSampleInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 44, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeReqInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 45, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeResInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -928,8 +954,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             // Determine if shadow and intersect passes are required
             bool hasInlineShadows = sceneData.inlineShadows && (sceneData.useHardwareRT == 1u) && ((sceneData.cameraFlags & (1u << 6)) != 0);
-            bool hasRestirGiShadow = ((sceneData.cameraFlags & (1u << 24)) != 0) && (b == 1);
-            bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirGiShadow) && (!hasInlineShadows || b > 0);
+            bool hasRestirPtIndirectShadow = ((sceneData.cameraFlags & (1u << 24)) != 0) && (b == 1);
+            bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirPtIndirectShadow) && (!hasInlineShadows || b > 0);
             bool needIntersect = (b + 1 < cutoffBounce);
 
             if (!needShadowDispatch && !needIntersect && !useTailMegakernel) {

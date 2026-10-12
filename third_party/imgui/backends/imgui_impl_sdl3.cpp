@@ -79,6 +79,7 @@
 // SDL
 #include <SDL3/SDL.h>
 #include <stdio.h>              // for snprintf()
+#include <math.h>               // for fabsf(), isnan(), isinf()
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -402,6 +403,26 @@ bool ImGui_ImplSDL3_ProcessEvent(const SDL_Event* event)
             //IMGUI_DEBUG_LOG("wheel %.2f %.2f, precise %.2f %.2f\n", (float)event->wheel.x, (float)event->wheel.y, event->wheel.preciseX, event->wheel.preciseY);
             float wheel_x = -event->wheel.x;
             float wheel_y = event->wheel.y;
+
+            // In SDL3, when direction is SDL_MOUSEWHEEL_FLIPPED (natural scrolling active in OS/desktop,
+            // e.g. GNOME Wayland), X and Y are opposite; negate them to normalize for Dear ImGui.
+            if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+            {
+                wheel_x = -wheel_x;
+                wheel_y = -wheel_y;
+            }
+
+            // Guard against NaN / Inf values (issue #7546)
+            if (isnan(wheel_x) || isinf(wheel_x)) wheel_x = 0.0f;
+            if (isnan(wheel_y) || isinf(wheel_y)) wheel_y = 0.0f;
+
+            // Axis filter to prevent dual-axis crosstalk / locking on single-axis scrollable windows (issue #4559).
+            // On Wayland libinput / touchpads, subtle non-zero drift on the minor axis locks ImGui's wheeling target.
+            if (fabsf(wheel_x) < 0.20f * fabsf(wheel_y) || fabsf(wheel_x) < 0.01f)
+                wheel_x = 0.0f;
+            else if (fabsf(wheel_y) < 0.20f * fabsf(wheel_x) || fabsf(wheel_y) < 0.01f)
+                wheel_y = 0.0f;
+
             io.AddMouseSourceEvent(event->wheel.which == SDL_TOUCH_MOUSEID ? ImGuiMouseSource_TouchScreen : ImGuiMouseSource_Mouse);
             io.AddMouseWheelEvent(wheel_x, wheel_y);
             return true;

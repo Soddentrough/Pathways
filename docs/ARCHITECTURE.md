@@ -178,15 +178,14 @@ quality guarantee.
 > integration was descoped by the project owner. Until then, no AMD/FSR branding is claimed anywhere
 > user-facing.
 
-## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR DI + GI)
+## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR PT)
 
-Pathways implements ReSTIR resampling of direct light (DI) and of the bounce-1 indirect
-term (GI, path-space secondary-vertex reuse; see `docs/RESTIR_PT_DESIGN.md`). All
-resampling runs **inline in the wavefront shade passes** (`shaders/compute/restir_common.glsl`,
+Pathways implements a unified ReSTIR PT path-space reservoir resampling pipeline (see `docs/RESTIR_PT_DESIGN.md`).
+All resampling runs **inline in the wavefront shade passes** (`shaders/compute/restir_common.glsl`,
 used by `wavefront_shade_diffuse/complex.comp`); `src/rt/ReSTIRManager.cpp` is a lean owner
-of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc).
+of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc). Enabled via `--restir`.
 
-- **Reservoir layout**: 28 B `DiReservoir` (light index + M, weight sum, scalar target p̂,
+- **Direct Lighting Resampling**: 28 B direct reservoir (light index + M, weight sum, scalar target p̂,
   age/valid/lobe flags, oct-encoded x1 & light normals, 8-bit-per-channel light UV,
   fp16 cosine & primary distance) — every field is read back during reuse.
 - **Temporal Reservoir Reuse**: The previous frame's grid is sampled at the
@@ -196,25 +195,20 @@ of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc).
   disocclusion checks plus a max-age cutoff.
 - **Spatial Reservoir Reuse**: Four additional taps read the previous frame's grid at a
   per-pixel randomly rotated cross offset (±2 px). Buffer-based taps keep reuse legal under
-  the wavefront's divergent per-material control flow (the previous shuffle-based scheme
-  was undefined behavior — see `docs/reports/restir_review_2026_10_10.md`).
+  the wavefront's divergent per-material control flow.
 - **Finalization**: Full GGX + diffuse BRDF evaluation of the winning light with a single
   inline shadow ray; an occluded winner zeroes its reservoir so bad history dies immediately.
-- **ReSTIR GI (bounce 1)**: the 2-bounce term `T1·L_direct(x1)` is estimated by resampling
-  cached secondary vertices at the primary hit x1. A 24 B per-pixel `X1Context` (normal,
-  albedo, wo, F0) is written at bounce 0; a 32 B `GiReservoir` (x2 world position, shadowed
-  L̂2 radiance, weight sum, p̂, d_src, age/M) is double-buffered like DI. Taps reconnect
+- **Indirect Path-Space Resampling (Secondary-Vertex Reconnection)**: The indirect path term
+  is estimated by resampling cached secondary vertices at the primary hit x1. A 24 B per-pixel
+  `X1Context` (normal, albedo, wo, F0) is written at bounce 0; a 32 B `GiReservoir` (x2 world position,
+  shadowed L̂2 radiance, weight sum, p̂, d_src, age/M) is double-buffered. Taps reconnect
   neighbors' x2 to the current x1 with the `(d_src/d_new)²` solid-angle Jacobian; the
   winner gets one replay visibility ray (skipped when the path's own candidate wins).
-  Requires material sort + hardware ray queries; toggle with `--no-restir-gi`.
 - **Debug views** (`--debug-view`, also a GUI combo): a post pass overwrites the output
-  image with live reservoir state — DI/GI sample-count M (log heatmap), finalized weight
-  w = wSum/(p̂·M) (log scale, firefly hunting), DI winner light index (golden-ratio hue),
-  and a validity coverage map (R = DI, G = GI, B = X1 context). Runs after accumulation &
+  image with live reservoir state — Direct/Indirect sample-count M (log heatmap), finalized weight
+  w = wSum/(p̂·M) (log scale, firefly hunting), winner light index (golden-ratio hue),
+  and a validity coverage map (R = Direct valid, G = Indirect valid, B = X1 context valid). Runs after accumulation &
   tonemap so the state is never temporal-blurred; see `shaders/compute/restir_debug_view.comp`.
-- **Path replay beyond x2 (Phase 2b)** — redirecting the bounce-2 continuation through the
-  reservoir winner — remains a roadmap item; continuations currently follow the path's own
-  x2, keeping deeper bounces unbiased without path storage.
 
 ---
 

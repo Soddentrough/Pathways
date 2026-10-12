@@ -904,9 +904,8 @@ void Engine::initPipelines() {
                     m_sceneData.dielectricBoundsMax
                 );
             }
-            // ReSTIR DI resampling is inline in the wavefront shade passes; no
-            // post-classify dispatch is required (the former dead "fused
-            // ReSTIR pass" hook was removed — review 2026-10-10 §6).
+            // ReSTIR PT resampling is inline in the wavefront shade passes; no
+            // post-classify dispatch is required.
         });
     }
 
@@ -1700,8 +1699,7 @@ void Engine::renderFrame() {
             }
         }
     }
-    if (isRestirActive()) flags |= (1 << 9);
-    if (isRestirActive() && m_config.restir_gi) flags |= (1 << 24); // ReSTIR GI (bounce-1 path-space reuse)
+    if (isRestirActive()) flags |= (1 << 9) | (1 << 24); // ReSTIR PT (path-space reservoir resampling)
     if (m_config.reference_mode) flags |= (1 << 25); // Ground truth: NEE weight 0 on hittable (MIS) lights
     if (m_config.transparent_shadows && !m_config.reference_mode) flags |= (1 << 26); // Fast mode: dielectrics do not occlude NEE
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
@@ -1719,6 +1717,7 @@ void Engine::renderFrame() {
     // enabled at least once, keeping ~144 B/pixel (DI 56B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
         vkDeviceWaitIdle(m_context->getDevice());
+        m_restirManager->setPhase3Enabled(true);
         m_restirManager->resize(m_config.width, m_config.height);
         updateWavefrontSceneDescriptors();
     }

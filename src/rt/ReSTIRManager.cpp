@@ -7,7 +7,7 @@ namespace pathways {
 
 ReSTIRManager::ReSTIRManager(VkDevice device, VmaAllocator allocator)
     : m_device(device), m_allocator(allocator) {
-    Logger::info("ReSTIRManager (inline ReSTIR DI/GI reservoir owner) constructed.");
+    Logger::info("ReSTIRManager (ReSTIR PT path-space reservoir subsystem) constructed.");
 }
 
 ReSTIRManager::~ReSTIRManager() {
@@ -84,7 +84,7 @@ void ReSTIRManager::resize(uint32_t width, uint32_t height) {
         2 * sizeof(DiReservoirGPU) + 2 * sizeof(GiReservoirGPU) + sizeof(X1ContextGPU)
         + (m_enablePhase3 ? (2 * sizeof(ReservoirPTGPU) + sizeof(PathSampleGPU) + sizeof(ShadeRequestGPU) + sizeof(ShadeResultGPU)) : 0));
     double totalMB = (static_cast<double>(m_width) * m_height * activeBytesPerPixel) / (1024.0 * 1024.0);
-    Logger::info("ReSTIRManager grids (re)allocated: {}x{} ({} B/pixel, {:.2f} MB) — DI 2x{}B, GI 2x{}B, X1 ctx {}B{}",
+    Logger::info("ReSTIRManager grids (re)allocated: {}x{} ({} B/pixel, {:.2f} MB) — Direct 2x{}B, Indirect 2x{}B, X1 ctx {}B{}",
                  m_width, m_height,
                  activeBytesPerPixel,
                  totalMB,

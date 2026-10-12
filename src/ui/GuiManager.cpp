@@ -338,7 +338,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     ImGui::SetNextWindowPos(ImVec2(hudX, hudY), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(hudW, hudH), layoutCond);
 
-    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar;
+    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav;
     ImGui::SetNextWindowBgAlpha(0.76f);
     if (ImGui::Begin(hudTitle, nullptr, panelFlags)) {
         if (stats.mgpu_mode_str != "off" && stats.secondary_gpu_time_ms > 0.001) {
@@ -364,7 +364,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.55f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
-        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
 
             ImGui::BeginGroup();
             ImGui::SetWindowFontScale(2.0f);
@@ -1197,7 +1197,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
                     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
 
-                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar)) {
                         int dotCount = static_cast<int>(ImGui::GetTime() * 4.0) % 4;
                         std::string dots(dotCount, '.');
                         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f),
@@ -1296,25 +1296,18 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("ReSTIR (Reservoir Resampling):");
-            if (ImGui::Checkbox("Enable ReSTIR", &config.enable_restir)) {
+            ImGui::TextDisabled("ReSTIR PT (Path-Space Reservoir Resampling):");
+            if (ImGui::Checkbox("Enable ReSTIR PT", &config.enable_restir)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("ReSTIR: inline spatiotemporal reservoir resampling. DI resamples direct light (28B reservoirs); GI resamples bounce-1 secondary vertices (32B reservoirs + 24B X1 context). Both use a MV-reprojected temporal tap + 4 spatial taps. Opt-in via --restir.");
+                ImGui::SetTooltip("ReSTIR PT: inline spatiotemporal path-space reservoir resampling combining direct light and secondary bounce path reuse with temporal reprojection and spatial resampling. Opt-in via --restir.");
             }
             if (config.enable_restir) {
                 ImGui::Indent();
-                if (ImGui::Checkbox("GI (bounce-1 path-space reuse)", &config.restir_gi)) {
-                    settingsChanged = true;
-                    if (actions) actions->resetAccumulation = true;
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("ReSTIR GI: resample cached secondary vertices at the primary hit (docs/RESTIR_PT_DESIGN.md). Requires inline ray queries. Disable with --no-restir-gi.");
-                }
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.4f, 1.0f));
-                ImGui::TextWrapped("Status: Active (DI%s)", config.restir_gi ? " + GI" : " only");
+                ImGui::TextWrapped("Status: Active (ReSTIR PT Path-Space Resampling)");
                 ImGui::PopStyleColor();
 
                 int mCap = static_cast<int>(config.restir_m_cap);
@@ -1324,12 +1317,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (actions) actions->resetAccumulation = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Maximum temporal history sample count M cap (DI and GI) to prevent lag and bias. Spatial taps are additionally capped at 8.");
+                    ImGui::SetTooltip("Maximum temporal history sample count M cap to prevent lag and bias. Spatial taps are additionally capped at 8.");
                 }
 
                 static const char* debugViewLabels[] = {
-                    "None", "DI: Sample Count M", "DI: Weight w", "DI: Light Index",
-                    "GI: Sample Count M", "GI: Weight w", "Coverage (R=DI G=GI B=X1)"
+                    "None",
+                    "ReSTIR PT: Direct Sample Count M",
+                    "ReSTIR PT: Direct Weight w",
+                    "ReSTIR PT: Winner Light Index",
+                    "ReSTIR PT: Indirect Sample Count M",
+                    "ReSTIR PT: Indirect Weight w",
+                    "ReSTIR PT: Path Validity Coverage"
                 };
                 int debugViewIdx = static_cast<int>(config.debug_view);
                 if (ImGui::Combo("Debug View", &debugViewIdx, debugViewLabels, IM_ARRAYSIZE(debugViewLabels))) {
@@ -1338,9 +1336,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap).\n"
-                                      "M: reuse depth (dark = taps failing / disocclusion, saturates ~64).\n"
-                                      "Weight: w = wSum/(p_hat*M), log scale centered at w=1 (bright = high-variance pixels).\n"
-                                      "Light Index: winner hue per light. Coverage: R=DI valid, G=GI valid, B=X1 context valid.");
+                                      "Direct/Indirect M: reuse depth (dark = taps failing / disocclusion, saturates ~64).\n"
+                                      "Weight w: w = wSum/(p_hat*M), log scale centered at w=1 (bright = high-variance pixels).\n"
+                                      "Light Index: winner hue per light. Coverage: R=Direct valid, G=Indirect valid, B=X1 context valid.");
                 }
                 ImGui::Unindent();
             }
@@ -1348,6 +1346,28 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 4. Post-Processing & Reconstruction
         if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
+            static const char* denoiserModeLabels[] = {
+                "Off (Pure Monte Carlo)",
+                "In-House ReLAX / A-SVGF",
+                "Upways Neural (Experimental)"
+            };
+            int denoiserIdx = 0;
+            if (config.denoiser_mode == DenoiserMode::Svgf) denoiserIdx = 1;
+            else if (config.denoiser_mode == DenoiserMode::Upways) denoiserIdx = 2;
+
+            if (ImGui::Combo("Denoiser Mode", &denoiserIdx, denoiserModeLabels, IM_ARRAYSIZE(denoiserModeLabels))) {
+                if (denoiserIdx == 1) config.denoiser_mode = DenoiserMode::Svgf;
+                else if (denoiserIdx == 2) config.denoiser_mode = DenoiserMode::Upways;
+                else config.denoiser_mode = DenoiserMode::None;
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
+                                  "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
+                                  "- In-House ReLAX / A-SVGF: Real-time spatiotemporal variance-guided wavelet filtering with edge-avoiding bilateral weights.\n"
+                                  "- Upways: Cooperative WMMA neural reconstruction.");
+            }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
                 // Tonemap toggle doesn't invalidate accumulation

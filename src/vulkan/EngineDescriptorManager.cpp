@@ -290,6 +290,11 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
         Buffer* giCurrBuf = params.restirManager ? params.restirManager->getGiReservoirBuffer(slot) : nullptr;
         Buffer* giPrevBuf = params.restirManager ? params.restirManager->getGiReservoirBuffer(1 - slot) : nullptr;
         Buffer* x1CtxBuf = params.restirManager ? params.restirManager->getX1ContextBuffer() : nullptr;
+        Buffer* ptCurrBuf = params.restirManager ? params.restirManager->getReservoirPTBuffer(slot) : nullptr;
+        Buffer* ptPrevBuf = params.restirManager ? params.restirManager->getReservoirPTBuffer(1 - slot) : nullptr;
+        Buffer* pathSampleBuf = params.restirManager ? params.restirManager->getPathSampleBuffer() : nullptr;
+        Buffer* shadeReqBuf = params.restirManager ? params.restirManager->getShadeRequestBuffer() : nullptr;
+        Buffer* shadeResBuf = params.restirManager ? params.restirManager->getShadeResultBuffer() : nullptr;
         params.wavefrontPipeline->updateSceneDescriptors(
             slot,
             params.frameImages[slot]->getImageView(),
@@ -324,7 +329,12 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            params.positionBuffer ? params.positionBuffer->getBuffer() : VK_NULL_HANDLE
+            params.positionBuffer ? params.positionBuffer->getBuffer() : VK_NULL_HANDLE,
+            ptCurrBuf ? ptCurrBuf->getBuffer() : VK_NULL_HANDLE,
+            ptPrevBuf ? ptPrevBuf->getBuffer() : VK_NULL_HANDLE,
+            pathSampleBuf ? pathSampleBuf->getBuffer() : VK_NULL_HANDLE,
+            shadeReqBuf ? shadeReqBuf->getBuffer() : VK_NULL_HANDLE,
+            shadeResBuf ? shadeResBuf->getBuffer() : VK_NULL_HANDLE
         );
     }
 

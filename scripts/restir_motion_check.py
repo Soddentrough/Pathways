@@ -40,8 +40,7 @@ SCENES = {
 
 CONFIGS = {
     "base": [],
-    "restir-di": ["--restir", "--no-restir-gi"],
-    "restir-di-gi": ["--restir"],
+    "restir": ["--restir"],
 }
 
 COMMON = ["--headless", "--no-validation", "--accum-format", "fp32",
@@ -90,7 +89,7 @@ def metrics(x, r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenes", default="living-room")
-    ap.add_argument("--configs", default="base,restir-di,restir-di-gi")
+    ap.add_argument("--configs", default="base,restir")
     ap.add_argument("--checkpoints", default="30,90", help="frame counts of motion before the dump")
     ap.add_argument("--ref-frames", type=int, default=4096)
     ap.add_argument("--res", default="960x540")

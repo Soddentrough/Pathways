@@ -324,7 +324,11 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
             endif()
         endif()
         find_package(Python3 COMPONENTS Development QUIET)
-        target_compile_definitions(pathways PRIVATE PATHWAYS_ENABLE_USD=1)
+        target_compile_definitions(pathways PRIVATE
+            PATHWAYS_ENABLE_USD=1
+            TBB_SUPPRESS_DEPRECATED_MESSAGES=1
+            TBB_INTERFACE_VERSION_MAJOR=12
+        )
         target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES})
         if(TARGET TBB::tbb)
             target_link_libraries(pathways PRIVATE TBB::tbb)
@@ -487,12 +491,16 @@ add_executable(test_gui_scroll
     ${THIRD_PARTY_DIR}/imgui/imgui_draw.cpp
     ${THIRD_PARTY_DIR}/imgui/imgui_tables.cpp
     ${THIRD_PARTY_DIR}/imgui/imgui_widgets.cpp
+    ${THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl3.cpp
 )
 target_include_directories(test_gui_scroll PRIVATE
     ${THIRD_PARTY_DIR}/imgui
+    ${THIRD_PARTY_DIR}/imgui/backends
 )
 if(UNIX)
-    target_link_libraries(test_gui_scroll PRIVATE m)
+    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3 m)
+else()
+    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3)
 endif()
 add_test(NAME GuiScroll COMMAND test_gui_scroll)
 
@@ -751,7 +759,11 @@ if(pxr_FOUND)
     target_include_directories(test_usd_loader SYSTEM PRIVATE
         ${PXR_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_usd_loader PRIVATE PATHWAYS_ENABLE_USD=1)
+    target_compile_definitions(test_usd_loader PRIVATE
+        PATHWAYS_ENABLE_USD=1
+        TBB_SUPPRESS_DEPRECATED_MESSAGES=1
+        TBB_INTERFACE_VERSION_MAJOR=12
+    )
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(test_usd_loader PRIVATE "-Wno-deprecated")
     endif()
