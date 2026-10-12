@@ -285,6 +285,10 @@ void Config::printUsage(const char* progName) {
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
               << "  --accum-cutoff <int>    Max progressive accumulation frames before freeze (default: 2048, alias: --max-accum-frames)\n"
               << "  --no-indirect           Disable indirect illumination (direct-only path tracing, alias: --direct-only)\n"
+              << "  --reference             Ground-truth mode: BSDF sampling only for hittable lights, NEE only for unhittable\n"
+              << "                          (delta / NEE-only) lights; no clamps/ReSTIR/approximations, FP32 accumulation.\n"
+              << "  --transparent-shadows   Fast (biased) mode: dielectric surfaces do not occlude shadow rays\n"
+              << "  --seed <0-4095>         RNG stream offset for statistically independent runs (default: 0)\n"
               << "  --render-scale <float>  Continuous internal render scale factor (e.g. 0.6667 for 1.5x, 0.5 for 2.0x)\n"
               << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
               << "  --nrc                   Enable Neural Direct-Light Caching (experimental) with Wave32 WMMA.\n"
@@ -359,6 +363,7 @@ void Config::printUsage(const char* progName) {
               << "  --camera-path <file>    Follow space/time camera trajectory JSON (waypoints/Catmull-Rom/Bezier)\n"
               << "  --camera-path-loop      Loop camera trajectory continuously\n"
               << "  --camera-path-speed <float> Speed multiplier for camera path playback (default: 1.0)\n"
+              << "  --camera-path-time <sec> Freeze the camera path at time <sec> (static pose; reference renders)\n"
               << "  --animate               Enable dynamic scene object animations [default: enabled]\n"
               << "  --no-animate            Disable scene object animations (freeze pose)\n"
               << "  --anim-speed <float>    Animation playback speed multiplier (default: 1.0)\n"
@@ -766,7 +771,10 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
-            if (mode == "upways") {
+            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf") {
+                cfg.denoiser_mode = DenoiserMode::Svgf;
+            } else if (mode == "upways") {
                 cfg.upways_superres = false;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
@@ -774,12 +782,17 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
+            } else {
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
             }
             continue;
         }
         if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
-            if (mode == "upways") {
+            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf") {
+                cfg.denoiser_mode = DenoiserMode::Svgf;
+            } else if (mode == "upways") {
                 cfg.upways_superres = false;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
@@ -787,6 +800,8 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
+            } else {
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
             }
             continue;
         }
@@ -865,6 +880,28 @@ Config Config::parse(int argc, char* argv[]) {
         // Standalone shortcuts:
         if (arg == "--upways") {
             cfg.denoiser_mode = DenoiserMode::Upways;
+            continue;
+        }
+        if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf") {
+            cfg.denoiser_mode = DenoiserMode::Svgf;
+            continue;
+        }
+        if (arg == "--denoiser" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf") cfg.denoiser_mode = DenoiserMode::Svgf;
+            else if (mode == "upways") cfg.denoiser_mode = DenoiserMode::Upways;
+            else if (mode == "none" || mode == "off") cfg.denoiser_mode = DenoiserMode::None;
+            else Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
+            continue;
+        }
+        if (arg.starts_with("--denoiser=")) {
+            std::string mode = arg.substr(11);
+            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf") cfg.denoiser_mode = DenoiserMode::Svgf;
+            else if (mode == "upways") cfg.denoiser_mode = DenoiserMode::Upways;
+            else if (mode == "none" || mode == "off") cfg.denoiser_mode = DenoiserMode::None;
+            else Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
             continue;
         }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
@@ -1209,6 +1246,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.camera_path_speed = std::max(std::stof(arg.substr(arg.find('=') + 1)), 0.01f);
             continue;
         }
+        if (arg == "--camera-path-time" && i + 1 < argc) {
+            cfg.camera_path_freeze_time = std::stof(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--camera-path-time=")) {
+            cfg.camera_path_freeze_time = std::stof(arg.substr(arg.find('=') + 1));
+            continue;
+        }
         if (arg == "--animate") {
             cfg.animate_objects = true;
             continue;
@@ -1526,6 +1571,18 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_indirect_light = false;
             continue;
         }
+        if (arg == "--reference") {
+            cfg.reference_mode = true;
+            continue;
+        }
+        if (arg == "--transparent-shadows") {
+            cfg.transparent_shadows = true;
+            continue;
+        }
+        if (arg == "--seed" && i + 1 < argc) {
+            cfg.rng_seed = static_cast<uint32_t>(std::stoul(argv[++i])) & 0xFFFu;
+            continue;
+        }
         if (arg == "--no-hdr") {
             cfg.enable_hdr = false;
             continue;
@@ -1567,6 +1624,27 @@ Config Config::parse(int argc, char* argv[]) {
 
     if (cfg.custom_resolution && !fullscreen_explicit) {
         cfg.fullscreen = false;
+    }
+
+    if (cfg.reference_mode) {
+        // Ground-truth integrator (plan P0.1): every biased shortcut off.
+        // NEE stays enabled, but UBO bit 25 makes the MIS code
+        // (shaders/compute/mis_common.glsl) give NEE weight 0 on hittable
+        // area lights, so they are integrated purely by BSDF sampling with
+        // full-weight emission. Lights BSDF sampling cannot reach (spot,
+        // directional, NEE-only quads) keep NEE at weight 1.
+        cfg.enable_direct_light = true;
+        cfg.indirect_clamp = 0.0f;
+        cfg.enable_restir = false;
+        cfg.streamline_secondary_shading = false;
+        cfg.distance_clamping = false;
+        cfg.enable_tail_megakernel = false;
+        cfg.enable_nrc = false;
+        cfg.enable_caustics = false;
+        cfg.enable_delta_unroll = false;
+        cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
+        cfg.explicit_accum_format = true;
+        Logger::info("Config: --reference ground-truth mode (BSDF-only for hittable lights, NEE only for unhittable lights, no clamps, no ReSTIR, FP32 accumulation)");
     }
 
     if (cfg.render_width > 0 && cfg.render_height > 0) {

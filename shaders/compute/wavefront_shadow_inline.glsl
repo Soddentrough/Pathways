@@ -1,18 +1,23 @@
 // Hybrid Inline Shadow Ray Evaluation for Primary Hit Points (Bounce 0)
 // Evaluates direct shadow occlusion via hardware rayQueryEXT directly on-chip.
+//
+// Occlusion semantics must match wavefront_shadow.comp: by default every surface
+// occludes except alpha cutouts (unbiased: BSDF-sampled paths refract through /
+// terminate on dielectrics and emitters). UBO bit 26 (--transparent-shadows) is the
+// biased fast mode in which dielectrics and emissives do not occlude NEE.
 
 bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numSpheres, uint numOpaqueTriangles) {
     bool occluded = false;
 
-    
+    bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (ubo.flags & (1u << 6)) != 0u; // approximate light check
     bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
 
-    if (!hasAlphaMask && !enableCaustics) {
+    if (!hasAlphaMask && (!transparentShadows || !enableCaustics)) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                              hasNonOpaque ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
+                              (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
                               origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         rayQueryProceedEXT(rq);
         occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
@@ -31,12 +36,14 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                 uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 uint arch = materialArchetypes[matId];
                 
-                if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
-                    continue;
-                }
-                if (enableCaustics && arch == 2u) {
-                    if (materials[matId].thickness <= 0.001) {
+                if (transparentShadows) {
+                    if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
                         continue;
+                    }
+                    if (enableCaustics && arch == 2u) {
+                        if (materials[matId].thickness <= 0.001) {
+                            continue;
+                        }
                     }
                 }
                 if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
@@ -67,8 +74,10 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
             uint sMatId = spheres[i].materialId;
             Material sMat = materials[sMatId];
             bool isDielectric = ((sMat.type & MATERIAL_TYPE_MASK) == 2u || sMat.transmission > 0.05);
-            if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
-            if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+            if (transparentShadows) {
+                if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
+                if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+            }
             float spT;
             vec3 spNorm;
             if (intersectSphere(origin, dir, spheres[i], EPSILON, maxDist - EPSILON * 2.0, spT, spNorm)) {

@@ -1,0 +1,117 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "denoise_common.glsl"
+
+layout(binding = 0, rgba16f) readonly uniform image2D uInDiffuse;
+layout(binding = 1, rgba16f) readonly uniform image2D uInSpecular;
+layout(binding = 2, rgba16f) readonly uniform image2D uInMoments;
+layout(binding = 3, r16f)    readonly uniform image2D uInHistoryLength;
+layout(binding = 4, rgba16f) readonly uniform image2D uNormalDepth;
+
+layout(binding = 5, rgba16f) writeonly uniform image2D uOutDiffuse;
+layout(binding = 6, rgba16f) writeonly uniform image2D uOutSpecular;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    vec4 curDiff = imageLoad(uInDiffuse, coord);
+    vec4 curSpec = imageLoad(uInSpecular, coord);
+    vec4 curMom = imageLoad(uInMoments, coord);
+    float histLen = imageLoad(uInHistoryLength, coord).r;
+    vec4 curND = imageLoad(uNormalDepth, coord);
+    vec3 curN = curND.xyz;
+    float curZ = curND.w;
+
+    float varDiff = max(curMom.y - curMom.x * curMom.x, 0.0);
+    float varSpec = max(curMom.w - curMom.z * curMom.z, 0.0);
+
+    vec3 outDiff = curDiff.rgb;
+    vec3 outSpec = curSpec.rgb;
+
+    if (histLen < 4.0) {
+        vec3 sumDiff = vec3(0.0);
+        vec3 sumSpec = vec3(0.0);
+        float sumLumDiff = 0.0;
+        float sumLumDiff2 = 0.0;
+        float sumLumSpec = 0.0;
+        float sumLumSpec2 = 0.0;
+        float sumW = 0.0;
+
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                ivec2 tapCoord = coord + ivec2(dx, dy);
+                if (tapCoord.x < 0 || tapCoord.y < 0 || tapCoord.x >= int(pc.width) || tapCoord.y >= int(pc.height)) continue;
+
+                vec4 tapND = imageLoad(uNormalDepth, tapCoord);
+                float wN = denoiseNormalWeight(curN, tapND.xyz, 32.0);
+                float wZ = denoiseDepthWeight(curZ, tapND.w, 0.1);
+                float w = wN * wZ;
+
+                vec4 tapDiff = imageLoad(uInDiffuse, tapCoord);
+                vec4 tapSpec = imageLoad(uInSpecular, tapCoord);
+                float lumD = denoiseLuminance(tapDiff.rgb);
+                float lumS = denoiseLuminance(tapSpec.rgb);
+
+                sumDiff += tapDiff.rgb * w;
+                sumSpec += tapSpec.rgb * w;
+                sumLumDiff += lumD * w;
+                sumLumDiff2 += (lumD * lumD) * w;
+                sumLumSpec += lumS * w;
+                sumLumSpec2 += (lumS * lumS) * w;
+                sumW += w;
+            }
+        }
+
+        if (sumW > 1e-4) {
+            float invW = 1.0 / sumW;
+            outDiff = sumDiff * invW;
+            outSpec = sumSpec * invW;
+            float m1D = sumLumDiff * invW;
+            float m2D = sumLumDiff2 * invW;
+            float m1S = sumLumSpec * invW;
+            float m2S = sumLumSpec2 * invW;
+            varDiff = max(m2D - m1D * m1D, 0.0);
+            varSpec = max(m2S - m1S * m1S, 0.0);
+        }
+    } else {
+        // Filter temporal variance with 3x3 cross-bilateral filter (SVGF §4.3)
+        float sumVarDiff = 0.0;
+        float sumVarSpec = 0.0;
+        float sumW = 0.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 tapCoord = coord + ivec2(dx, dy);
+                if (tapCoord.x < 0 || tapCoord.y < 0 || tapCoord.x >= int(pc.width) || tapCoord.y >= int(pc.height)) continue;
+
+                vec4 tapND = imageLoad(uNormalDepth, tapCoord);
+                float wN = denoiseNormalWeight(curN, tapND.xyz, 32.0);
+                float wZ = denoiseDepthWeight(curZ, tapND.w, 0.1);
+                float w = wN * wZ;
+
+                vec4 tapMom = imageLoad(uInMoments, tapCoord);
+                float tapVarD = max(tapMom.y - tapMom.x * tapMom.x, 0.0);
+                float tapVarS = max(tapMom.w - tapMom.z * tapMom.z, 0.0);
+
+                sumVarDiff += tapVarD * w;
+                sumVarSpec += tapVarS * w;
+                sumW += w;
+            }
+        }
+        if (sumW > 1e-4) {
+            varDiff = sumVarDiff / sumW;
+            varSpec = sumVarSpec / sumW;
+        }
+    }
+
+    imageStore(uOutDiffuse, coord, vec4(outDiff, varDiff));
+    imageStore(uOutSpecular, coord, vec4(outSpec, varSpec));
+}

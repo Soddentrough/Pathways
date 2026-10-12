@@ -107,17 +107,20 @@ void main() {
     bool occluded = false;
 
     bool isSpecularPath = (isSpecular > 0.5);
+    // UBO bit 26 (--transparent-shadows, biased fast mode): dielectrics and emissives
+    // do not occlude NEE. Default (unbiased): every surface occludes except alpha
+    // cutouts, consistent with BSDF-sampled paths, which refract through/terminate on them.
+    bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
 
-    // Fast path: When there are no alpha cutout masks and either caustics is disabled or ray is on a specular transmission path,
-    // dielectrics and emissives never occlude direct illumination.
-    // Culling dielectric instances via RAY_MASK_OPAQUE (0x01) at the hardware TLAS level
-    // and using gl_RayFlagsOpaqueEXT allows 100% of traversal to run in dedicated RT silicon,
-    // eliminating all shader ALU candidate loop interrupts and VRAM buffer fetches.
-    if (!hasAlphaMask && (!enableCaustics || isSpecularPath)) {
+    // Fast path: no alpha cutout masks. In the default mode all geometry occludes, so
+    // the whole TLAS is traversed with gl_RayFlagsOpaqueEXT (no candidate loop). In the
+    // transparent-shadow mode, dielectric instances are culled via RAY_MASK_OPAQUE (0x01)
+    // when caustics are off or the ray is on a specular transmission path.
+    if (!hasAlphaMask && (!transparentShadows || !enableCaustics || isSpecularPath)) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                              hasNonOpaque ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
+                              (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
                               origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         rayQueryProceedEXT(rq);
         occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
@@ -135,12 +138,14 @@ void main() {
                 uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
                 uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 uint arch = materialArchetypes[matId];
-                if (arch == 3u || (!enableCaustics && arch == 2u) || (isSpecularPath && arch == 2u)) {
-                    continue;
-                }
-                if (enableCaustics && arch == 2u) {
-                    if (materials[matId].thickness <= 0.001) {
+                if (transparentShadows) {
+                    if (arch == 3u || (!enableCaustics && arch == 2u) || (isSpecularPath && arch == 2u)) {
                         continue;
+                    }
+                    if (enableCaustics && arch == 2u) {
+                        if (materials[matId].thickness <= 0.001) {
+                            continue;
+                        }
                     }
                 }
 
@@ -172,8 +177,10 @@ void main() {
             uint sMatId = spheres[i].materialId;
             Material sMat = materials[sMatId];
             bool isDielectric = ((sMat.type & MATERIAL_TYPE_MASK) == 2u || sMat.transmission > 0.05);
-            if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
-            if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+            if (transparentShadows) {
+                if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
+                if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+            }
             float spT;
             vec3 spNorm;
             if (intersectSphere(origin, dir, spheres[i], EPSILON, maxDist - EPSILON * 2.0, spT, spNorm)) {

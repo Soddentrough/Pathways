@@ -66,6 +66,12 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
 
+layout(std430, binding = 25) readonly buffer LightTreeBuffer {
+    LightTreeNode lightNodes[];
+};
+
+#include "mis_common.glsl"
+
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
@@ -295,7 +301,10 @@ void main() {
                 emissive *= holoMod;
             }
 
-            vec3 emissiveContrib = throughput * emissive;
+            // MIS weight against NEE at the spawning vertex (mis_common.glsl).
+            float emitMisW = (pc.currentBounce == 0u) ? 1.0
+                : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, unpackRayPdfCode(state), pc.numLights);
+            vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (pc.currentBounce > 0u) {
                 emissiveContrib = clampIndirectRadiance(emissiveContrib, pc.indirectClamp);
             }

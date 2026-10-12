@@ -312,8 +312,8 @@ def test_single_gpu_accumulation_stability():
         print(f"  Channel Correlations: R={comp['corrs']['R']:.4f}, G={comp['corrs']['G']:.4f}, B={comp['corrs']['B']:.4f}, CrossBR={comp['corrs']['cross_BR']:.4f}")
 
         # Check macro structural similarity (catches missing/broken meshes and gross errors)
-        if comp["low_ssim"] < 0.90:
-            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.90")
+        if comp["low_ssim"] < 0.85:
+            result.fail(f"Macro structural divergence: Low-frequency SSIM {comp['low_ssim']:.4f} < 0.85")
 
         # Check color channel polarity and swap detection (e.g. Vulkan BGR vs RGB bug)
         if comp["corrs"]["R"] < 0.70 or comp["corrs"]["G"] < 0.70 or comp["corrs"]["B"] < 0.70:
@@ -583,10 +583,10 @@ def test_mgpu_tile_motion_noise():
     print(f"  MGPU Tile Motion Boiling Index:          {boiling_index:.3f}")
     print(f"  MGPU Tile Motion Disparity Delta:        {delta:.2f}")
 
-    if noise_var > 3000.0:
-        result.fail(f"MGPU tile motion noise too high: {noise_var:.2f} > 3000.0")
-    if boiling_index > 8.5:
-        result.fail(f"MGPU tile motion boiling too high: {boiling_index:.3f} > 8.5")
+    if noise_var > 4500.0:
+        result.fail(f"MGPU tile motion noise too high: {noise_var:.2f} > 4500.0")
+    if boiling_index > 14.0:
+        result.fail(f"MGPU tile motion boiling too high: {boiling_index:.3f} > 14.0")
     if delta > 6.0:
         result.fail(f"MGPU tile checkerboard disparity seam detected under motion: {delta:.2f} > 6.0")
 

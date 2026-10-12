@@ -207,4 +207,37 @@ inline void buildLightTree(const std::vector<LightGPU>& lights, std::vector<Ligh
     detail::buildSubtree(prims, 0, prims.size(), nodes);
 }
 
+// Writes each light's root-to-leaf descent into LightGPU::pad0:
+//   y: uintBitsToFloat(path bits, bit d = 1 -> right child at depth d)
+//   z: uintBitsToFloat(depth)
+// Shaders replay this path to evaluate the tree's selection pdf for a known
+// light index (MIS weight of BSDF-sampled emitter hits). Depth > 32 cannot be
+// encoded; such lights get depth 0xFFFFFFFF and the shader treats the tree pdf
+// as unavailable (the engine then falls back to alias sampling).
+inline bool computeLightTreePaths(const std::vector<LightTreeNodeGPU>& nodes, std::vector<LightGPU>& lights) {
+    if (nodes.empty() || lights.empty()) return true;
+    bool ok = true;
+    struct Item { uint32_t node, bits, depth; };
+    std::vector<Item> stack{{0u, 0u, 0u}};
+    while (!stack.empty()) {
+        Item it = stack.back();
+        stack.pop_back();
+        const auto& n = nodes[it.node];
+        if (n.children.z == 1u) {
+            uint32_t li = n.children.x;
+            if (li < lights.size()) {
+                lights[li].pad0.y = std::bit_cast<float>(it.bits);
+                lights[li].pad0.z = std::bit_cast<float>(it.depth <= 32u ? it.depth : 0xFFFFFFFFu);
+                if (it.depth > 32u) ok = false;
+            }
+            continue;
+        }
+        uint32_t d = it.depth;
+        uint32_t rightBit = (d < 32u) ? (1u << d) : 0u;
+        stack.push_back({n.children.x, it.bits, d + 1u});
+        stack.push_back({n.children.y, it.bits | rightBit, d + 1u});
+    }
+    return ok;
+}
+
 } // namespace pathways

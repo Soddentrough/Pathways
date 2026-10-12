@@ -1,0 +1,88 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "denoise_common.glsl"
+
+layout(binding = 0, rgba16f) readonly uniform image2D uCurrentDiffuse;
+layout(binding = 1, rgba16f) readonly uniform image2D uCurrentSpecular;
+layout(binding = 2, rg16f)   readonly uniform image2D uMotionVectors;
+layout(binding = 3, rgba16f) readonly uniform image2D uNormalDepth;
+layout(binding = 4, rgba16f) readonly uniform image2D uPrevNormalDepth;
+
+layout(binding = 5, rgba16f) readonly uniform image2D uHistoryDiffuse;
+layout(binding = 6, rgba16f) readonly uniform image2D uHistorySpecular;
+layout(binding = 7, rgba16f) readonly uniform image2D uHistoryMoments;
+layout(binding = 8, r16f)    readonly uniform image2D uHistoryLength;
+
+layout(binding = 9,  rgba16f) writeonly uniform image2D uOutDiffuse;
+layout(binding = 10, rgba16f) writeonly uniform image2D uOutSpecular;
+layout(binding = 11, rgba16f) writeonly uniform image2D uOutMoments;
+layout(binding = 12, r16f)    writeonly uniform image2D uOutHistoryLength;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint resetHistory;
+    float maxHistoryLength;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    vec4 curDiff = imageLoad(uCurrentDiffuse, coord);
+    vec4 curSpec = imageLoad(uCurrentSpecular, coord);
+    vec4 curND = imageLoad(uNormalDepth, coord);
+    vec3 curN = curND.xyz;
+    float curZ = curND.w;
+
+    float lumDiff = denoiseLuminance(curDiff.rgb);
+    float lumSpec = denoiseLuminance(curSpec.rgb);
+
+    vec3 accDiff = curDiff.rgb;
+    vec3 accSpec = curSpec.rgb;
+    vec4 accMom = vec4(lumDiff, lumDiff * lumDiff, lumSpec, lumSpec * lumSpec);
+    float histLen = 1.0;
+
+    bool reprojectValid = false;
+    if (pc.resetHistory == 0u) {
+        vec2 mv = imageLoad(uMotionVectors, coord).xy;
+        vec2 prevF = (vec2(coord) + 0.5) - mv * vec2(float(pc.width), float(pc.height));
+        ivec2 prevCoord = ivec2(round(prevF - 0.5));
+
+        if (prevCoord.x >= 0 && prevCoord.y >= 0 &&
+            prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
+            vec4 prevND = imageLoad(uPrevNormalDepth, prevCoord);
+            float normDot = dot(curN, prevND.xyz);
+            float relDepth = abs(curZ - prevND.w) / max(max(curZ, prevND.w), 1e-4);
+
+            if (normDot >= 0.70 && relDepth <= 0.15) {
+                reprojectValid = true;
+
+                vec4 prevDiff = imageLoad(uHistoryDiffuse, prevCoord);
+                vec4 prevSpec = imageLoad(uHistorySpecular, prevCoord);
+                vec4 prevMom = imageLoad(uHistoryMoments, prevCoord);
+                float prevLen = imageLoad(uHistoryLength, prevCoord).r;
+
+                histLen = min(prevLen + 1.0, pc.maxHistoryLength);
+                float alphaDiff = max(1.0 / histLen, 0.03);
+                float alphaSpec = max(1.0 / min(histLen, 16.0), 0.08);
+
+                accDiff = mix(prevDiff.rgb, curDiff.rgb, alphaDiff);
+                accSpec = mix(prevSpec.rgb, curSpec.rgb, alphaSpec);
+
+                accMom.x = mix(prevMom.x, lumDiff, alphaDiff);
+                accMom.y = mix(prevMom.y, lumDiff * lumDiff, alphaDiff);
+                accMom.z = mix(prevMom.z, lumSpec, alphaSpec);
+                accMom.w = mix(prevMom.w, lumSpec * lumSpec, alphaSpec);
+            }
+        }
+    }
+
+    imageStore(uOutDiffuse, coord, vec4(accDiff, curDiff.a));
+    imageStore(uOutSpecular, coord, vec4(accSpec, curSpec.a));
+    imageStore(uOutMoments, coord, accMom);
+    imageStore(uOutHistoryLength, coord, vec4(histLen, 0.0, 0.0, 0.0));
+}

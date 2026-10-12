@@ -47,7 +47,8 @@ enum class SecondarySortMode {
 
 enum class DenoiserMode {
     None,     // Raw stochastic path traced output (unfiltered progressive)
-    Upways    // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+    Upways,   // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+    Svgf      // ReLAX / A-SVGF Spatio-Temporal Variance-Guided Filtering
 };
 
 // EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
@@ -153,8 +154,11 @@ struct Config {
     bool enable_shadows = true;
     bool inline_primary_shadows = true;  // Hybrid direct shadow evaluation via hardware rayQueryEXT (Default: true)
     bool enable_direct_light = true;
+    bool reference_mode = false;   // --reference: ground-truth integrator (UBO flag bit 25)
+    bool transparent_shadows = false; // --transparent-shadows: dielectrics don't occlude NEE (biased fast mode, UBO bit 26)
+    uint32_t rng_seed = 0;         // --seed: RNG frame-counter offset (seed << 20) for independent runs
     bool enable_light_tree = false;      // Hierarchical Light Tree importance sampling for many-light scenes [Default: false]
-    bool enable_delta_unroll = true;     // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: true]
+    bool enable_delta_unroll = false;    // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: false]
     uint32_t max_delta_events = 2;       // Maximum internal delta events to unroll per dielectric vertex (default: 2)
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)
@@ -208,6 +212,7 @@ struct Config {
     std::string camera_path = "";  // Path to camera trajectory JSON file (waypoints, Catmull-Rom, Bézier)
     bool camera_path_loop = false; // Loop camera path indefinitely
     float camera_path_speed = 1.0f; // Speed multiplier for camera path playback
+    float camera_path_freeze_time = -1.0f; // >= 0: hold the camera path at this time (static pose)
     bool animate_objects = true;   // Animate dynamic scene objects (e.g. rotating torus in mirror scene) [Default: true]
     float animation_speed = 1.0f;  // Global animation playback speed multiplier
     float gamepad_deadzone = 0.15f; // Analog stick deadzone threshold [0.01 - 0.50] (default: 0.15)

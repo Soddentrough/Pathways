@@ -239,6 +239,7 @@ Engine::~Engine() {
     m_rtOrchestrator.reset();
     syncRayTracingPointers();
     destroyGBufferResources();
+    m_denoiser.reset();
     m_superResolution.reset();
     m_causticsPipeline.reset();
     m_renderTargets.reset();
@@ -606,8 +607,9 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
         m_inputController->setSceneTarget(m_sceneData.centralTarget, m_sceneData.focalRadius);
     }
 
-    // Reset frame accumulation
-    m_frameIndex = 0;
+    // Reset frame accumulation. --seed offsets the RNG frame counter so repeated
+    // headless runs are statistically independent (bias/variance harnesses).
+    m_frameIndex = m_config.rng_seed << 20;
     m_resetAccumulation = true;
     m_frameTimesMs.clear();
     if (m_rtOrchestrator) {
@@ -850,6 +852,22 @@ void Engine::initPipelines() {
     // 8. G-Buffer Resources (Direct Light & Surface Normals/Depth)
     createGBufferResources();
 
+    // 8b. In-House ReLAX / A-SVGF Denoiser Pipeline
+    try {
+        m_denoiser = std::make_unique<DenoiserPipeline>(
+            device, m_context->getPhysicalDevice(), allocator,
+            m_context->getGraphicsQueue(),
+            [this](const std::string& name) { return loadShaderSPIRV(name); }
+        );
+        m_denoiser->resize(m_config.width, m_config.height, m_config.accum_format, m_commandBuffers[0]);
+        m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+    } catch (const std::exception& e) {
+        if (m_config.denoiser_mode == DenoiserMode::Svgf) {
+            throw std::runtime_error(std::string("DenoiserPipeline requested but initialization failed: ") + e.what());
+        }
+        Logger::warn("DenoiserPipeline initialization failed: {}", e.what());
+    }
+
     // 9. Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR 3.1)
     m_superResolution = std::make_unique<SuperResolutionManager>(
         device, m_context->getPhysicalDevice(), allocator,
@@ -917,6 +935,10 @@ void Engine::updateAllImageDescriptors() {
             m_postProcess->updateRunningAvgDescriptors(m_renderTargets->getFrameImages(), m_accumImage);
             m_postProcess->updateFusedAccumTonemapDescriptors(m_renderTargets->getFrameImages(), m_accumImage, m_outputImage);
         }
+    }
+
+    if (m_denoiser) {
+        m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
     }
 
     updateWavefrontSceneDescriptors();
@@ -1550,9 +1572,11 @@ void Engine::renderFrame() {
             }
             m_cameraPathTime += dt * m_config.camera_path_speed;
             float simTime = m_config.headless ? (static_cast<float>(m_totalFramesRendered) * dt * m_config.camera_path_speed) : m_cameraPathTime;
+            const bool pathFrozen = (m_config.camera_path_freeze_time >= 0.0f);
+            if (pathFrozen) simTime = m_config.camera_path_freeze_time;
             CameraSample sample = m_cameraPath->evaluate(simTime, m_config.camera_path_loop);
             m_camera->setAnimatedPose(sample.position, sample.target, sample.up, sample.fov);
-            if (sample.isStationary) {
+            if (sample.isStationary || pathFrozen) {
                 m_camera->resetMoved();
                 pathMoving = false;
             } else {
@@ -1678,14 +1702,16 @@ void Engine::renderFrame() {
     }
     if (isRestirActive()) flags |= (1 << 9);
     if (isRestirActive() && m_config.restir_gi) flags |= (1 << 24); // ReSTIR GI (bounce-1 path-space reuse)
+    if (m_config.reference_mode) flags |= (1 << 25); // Ground truth: NEE weight 0 on hittable (MIS) lights
+    if (m_config.transparent_shadows && !m_config.reference_mode) flags |= (1 << 26); // Fast mode: dielectrics do not occlude NEE
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
     }
-    if (accumReset) {
-        // History reset flag for ReSTIR DI temporal taps. Camera motion no
-        // longer kills history: MV reprojection plus the reservoir's stored
-        // x1 normal/depth disocclusion gates handle it (review 2026-10-10 §4.6).
+    bool historyInvalidate = hardReset || sceneLoadingActive;
+    if (historyInvalidate) {
+        // Hard history reset flag for ReSTIR temporal taps. Camera motion
+        // does NOT kill history: MV reprojection plus normal/depth disocclusion gates handle it.
         flags |= (1 << 23);
     }
 
@@ -1830,11 +1856,12 @@ void Engine::renderFrame() {
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
-        bool needUpscaler = (m_config.denoiser_mode == DenoiserMode::Upways ||
-                             m_config.upscaler_mode == UpscalerMode::Upways ||
-                             m_config.upscaler_mode == UpscalerMode::FSR3);
+        bool needDecoupledPost = (m_config.denoiser_mode == DenoiserMode::Svgf ||
+                                  m_config.denoiser_mode == DenoiserMode::Upways ||
+                                  m_config.upscaler_mode == UpscalerMode::Upways ||
+                                  m_config.upscaler_mode == UpscalerMode::FSR3);
 
-        if (!needUpscaler && m_postProcess && m_postProcess->hasFusedPipeline() && !skipRayTracing) {
+        if (!needDecoupledPost && m_postProcess && m_postProcess->hasFusedPipeline() && !skipRayTracing) {
             // Fused Accumulation Running Average + ACES Tonemapping (Zero-Copy Register Pass Fusion)
             // Eliminates intermediate compute pipeline barrier and 132.7 MB round-trip VRAM read of m_accumImage.
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
@@ -1855,7 +1882,7 @@ void Engine::renderFrame() {
 
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         } else {
-            // Decoupled Path (Used when Upways or FSR3 is active or RT was skipped)
+            // Decoupled Path (Used when SVGF, Upways, or FSR3 is active or RT was skipped)
             // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
             if (!skipRayTracing && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
                 PostProcessPipeline::RunningAvgPushConstants avgPC{};
@@ -1878,11 +1905,27 @@ void Engine::renderFrame() {
                 vkCmdPipelineBarrier2(cmd, &avgDep);
             }
 
-            // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
             bool resetTemporal = hardReset || m_temporalResetRequested;
             m_temporalResetRequested = false;
+
+            // In-House ReLAX / A-SVGF Denoiser
+            bool svgfRun = false;
+            if (m_config.denoiser_mode == DenoiserMode::Svgf && m_denoiser && m_denoiser->isInitialized()) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+                m_denoiser->recordDenoise(
+                    cmd, m_currentFrame, resetTemporal,
+                    m_accumulatedSamples, -1.0f,
+                    m_mlDiffuseImage, m_mlSpecularImage,
+                    m_motionVectorImage, m_normalDepthImage,
+                    m_mlAlbedoRoughnessImage, m_accumImage
+                );
+                svgfRun = true;
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+            }
+
+            // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
             bool upwaysRun = false;
-            if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+            if (!svgfRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
                 if (m_superResolution) {
                     upwaysRun = m_superResolution->dispatchUpways(
@@ -1897,7 +1940,7 @@ void Engine::renderFrame() {
 
             // AMD FidelityFX Super Resolution 3.1
             bool fsr3Run = false;
-            if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+            if (!svgfRun && !upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
                 if (m_superResolution) {
                     fsr3Run = m_superResolution->dispatchFsr3(
                         cmd, resetTemporal, m_config, m_frameIndex,
@@ -1912,7 +1955,10 @@ void Engine::renderFrame() {
 
             // Tonemapping
             VkDescriptorSet tmSet = m_postProcess ? m_postProcess->getTonemapDescSet() : VK_NULL_HANDLE;
-            if (m_superResolution) {
+            if (svgfRun) {
+                tmSet = m_denoiser->getTonemapDescSet();
+                tonemapConstants.totalSamples = 1u;
+            } else if (m_superResolution) {
                 if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_superResolution->getFsr3Upscaler())) {
                     tmSet = m_superResolution->getTonemapFsr3DescSet();
                     tonemapConstants.totalSamples = 1u;
@@ -2029,11 +2075,27 @@ void Engine::renderFrame() {
             }
         }
 
-        // Post-processing passes on activeCmd: Upways / FSR3 / Tonemap
+        // Post-processing passes on activeCmd: SVGF / Upways / FSR3 / Tonemap
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
+
+        // In-House ReLAX / A-SVGF Denoiser
+        bool svgfRun = false;
+        if (m_config.denoiser_mode == DenoiserMode::Svgf && m_denoiser && m_denoiser->isInitialized()) {
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+            m_denoiser->recordDenoise(
+                activeCmd, m_currentFrame, resetTemporal,
+                m_accumulatedSamples, -1.0f,
+                m_mlDiffuseImage, m_mlSpecularImage,
+                m_motionVectorImage, m_normalDepthImage,
+                m_mlAlbedoRoughnessImage, m_accumImage
+            );
+            svgfRun = true;
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+        }
+
         bool upwaysRun = false;
-        if (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) {
+        if (!svgfRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
             if (m_superResolution) {
                 upwaysRun = m_superResolution->dispatchUpways(
@@ -2047,7 +2109,7 @@ void Engine::renderFrame() {
         }
 
         bool fsr3Run = false;
-        if (!upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+        if (!svgfRun && !upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
             if (m_superResolution) {
                 fsr3Run = m_superResolution->dispatchFsr3(
                     activeCmd, resetTemporal, m_config, m_frameIndex,
@@ -2061,7 +2123,10 @@ void Engine::renderFrame() {
         }
 
         VkDescriptorSet tmSet = m_postProcess ? m_postProcess->getTonemapDescSet() : VK_NULL_HANDLE;
-        if (m_superResolution) {
+        if (svgfRun) {
+            tmSet = m_denoiser->getTonemapDescSet();
+            tonemapConstants.totalSamples = 1u;
+        } else if (m_superResolution) {
             if (fsr3Run || (m_config.upscaler_mode == UpscalerMode::FSR3 && m_superResolution->getFsr3Upscaler())) {
                 tmSet = m_superResolution->getTonemapFsr3DescSet();
                 tonemapConstants.totalSamples = 1u;
@@ -2389,6 +2454,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
             m_postProcess.get(), m_commandBuffers[0]
         );
     }
+    if (m_denoiser) {
+        m_denoiser->resize(m_config.width, m_config.height, m_config.accum_format, m_commandBuffers[0]);
+        m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+    }
     if (m_causticsPipeline) {
         m_causticsPipeline->resize(m_config.width, m_config.height, [this](auto recordFn) {
             VkCommandBuffer cmd = m_commandBuffers[0];
@@ -2423,7 +2492,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     }
 
     // 9. Invalidate accumulation
-    m_frameIndex = 0;
+    m_frameIndex = m_config.rng_seed << 20;
     m_resetAccumulation = true;
 
     // 10. Prune transient startup tallies if window layout resizes during engine initialization settling phase

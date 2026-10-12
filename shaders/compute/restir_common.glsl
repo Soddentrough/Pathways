@@ -54,8 +54,8 @@ struct DiReservoir {
 const uint  RESTIR_MAX_AGE              = 255u;   // 8-bit age ceiling (disocclusion and motion handle invalidation)
 const float RESTIR_TAP_NORMAL_MIN_DOT   = 0.70f;  // disocclusion guard on stored x1 normal
 const float RESTIR_TAP_DEPTH_REL_GATE   = 0.15f;  // disocclusion guard on primary hit distance
-const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.33f;
-const float RESTIR_JACOBIAN_CLAMP_MAX   = 3.0f;
+const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.05f;
+const float RESTIR_JACOBIAN_CLAMP_MAX   = 10.0f;
 
 const ivec2 RESTIR_TAP_OFFSETS[32] = ivec2[32](
     ivec2( 2,  0), ivec2( 0,  2), ivec2(-2,  0), ivec2( 0, -2),
@@ -349,7 +349,14 @@ void restirDiFreshStream(
         r.flags = restirPackFlags(0u, true, sel.isTrans, hitNormal);
         r.x1Misc = restirPackF16Pair(sel.cosLight, min(hitT, 60000.0));
     } else {
-        r = invalidDiReservoir();
+        // Unlit / backfacing candidates evaluated this frame: carries 0 weight, but M trials
+        r.idxM = restirPackIdxM(0u, M);
+        r.wSum = 0.0;
+        r.targetPdf = 0.0;
+        r.hitDist = 0.0;
+        r.lightPacked = 0u;
+        r.flags = restirPackFlags(0u, true, false, hitNormal);
+        r.x1Misc = restirPackF16Pair(1.0, min(hitT, 60000.0));
     }
 }
 
@@ -370,9 +377,10 @@ void restirDiApplyTap(
     float diffTrans,
     uint mCap,
     uint ageNew,
+    bool isOccluded,
     inout uint seed
 ) {
-    if (!restirIsValid(src.flags) || src.targetPdf <= 0.0 || src.wSum <= 0.0) return;
+    if (!restirIsValid(src.flags)) return;
     if (restirGetAge(src.flags) >= RESTIR_MAX_AGE) return;
 
     uint mSrc = restirGetM(src.idxM);
@@ -388,25 +396,40 @@ void restirDiApplyTap(
     float relDepthDiff = abs(hitT - srcX1Dist) / max(max(hitT, srcX1Dist), 1e-4);
     if (relDepthDiff > RESTIR_TAP_DEPTH_REL_GATE) return;
 
+    uint mTap = min(mSrc, mCap);
+
+    // If source evaluated samples with 0 weight, it contributes 0 weight but carries mTap trials.
+    if (src.targetPdf <= 0.0 || src.wSum <= 0.0) {
+        uint combinedM = restirGetM(r.idxM) + mTap;
+        r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
+        return;
+    }
+
     Light srcLight = lights[srcLightIdx];
     vec2 srcLuv = restirUnpackUv8(src.lightPacked >> 16u);
     vec3 reconDir;
     float reconDist;
     vec3 reconEmission;
     float cosLightNew;
-    if (!reconnectDirectPath(hitPoint, srcLight, srcLuv, reconDir, reconDist, reconEmission, cosLightNew)) return;
+    bool reconOk = reconnectDirectPath(hitPoint, srcLight, srcLuv, reconDir, reconDist, reconEmission, cosLightNew);
 
-    float rawNdotL = dot(hitNormal, reconDir);
+    float rawNdotL = reconOk ? dot(hitNormal, reconDir) : 0.0;
     bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
     float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
-    if (NdotL <= 0.0 || !(rawNdotL > 0.0 || isTrans)) return;
+    bool validGeom = !isOccluded && reconOk && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans);
+
+    if (!validGeom) {
+        // Sample lands behind horizon or is occluded from current surface: carries 0 weight, but increments M
+        uint combinedM = restirGetM(r.idxM) + mTap;
+        r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
+        return;
+    }
 
     float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
     float pHat = max(dot(reconEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
 
     float J = evalDirectReuseJacobian(uint(srcLight.position.w), cosLightNew, reconDist, srcMisc.x, src.hitDist);
 
-    uint mTap = min(mSrc, mCap);
     // History M-truncation scales the stored sum by mTap/mSrc before re-weighting.
     float weight = (src.wSum / float(mSrc)) * float(mTap) * (pHat / max(src.targetPdf, 1e-6)) * J;
 
@@ -418,7 +441,7 @@ void restirDiApplyTap(
         sel.dir = reconDir;
         sel.dist = reconDist;
         sel.emission = reconEmission;
-        sel.selectPdf = 1.0;
+        sel.selectPdf = (numLights <= 1u) ? 1.0 : lights[srcLightIdx].sampling.z;
         sel.cosLight = cosLightNew;
         sel.ndotL = NdotL;
         sel.target = pHat;
@@ -661,7 +684,7 @@ bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
                         cosRcNew = clamp(abs(dot(n2c, -dirNew)), 0.0, 1.0);
                         float cosRcSrc = giGetCosSrc(tap);
                         float jac = evalGIJacobian(dSrc, dNew, cosRcSrc, cosRcNew);
-                        float targetRatio = clamp(pHat / max(pTap, 1e-6), 0.0, 2.5);
+                        float targetRatio = pHat / max(pTap, 1e-6);
                         weight = (giGetWSum(tap) / float(giGetM(tap))) *
                                  float(mTap) *
                                  targetRatio * jac;

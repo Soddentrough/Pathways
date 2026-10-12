@@ -23,6 +23,7 @@
 #include "rt/CausticsPipeline.hpp"
 #include "rt/RayTracingOrchestrator.hpp"
 #include "rt/PostProcessPipeline.hpp"
+#include "rt/DenoiserPipeline.hpp"
 #include "core/InputController.hpp"
 #include "core/HwMonitor.hpp"
 #include "rt/TrainingCaptureManager.hpp"
@@ -294,6 +295,9 @@ private:
     std::unique_ptr<SuperResolutionManager> m_superResolution;
     void updateUpwaysDescriptors();
     void updateFsr3Descriptors();
+
+    // In-House ReLAX / A-SVGF Denoiser Subsystem
+    std::unique_ptr<DenoiserPipeline> m_denoiser;
 
     // Real-Time Caustics Subsystem
     std::unique_ptr<CausticsPipeline> m_causticsPipeline;

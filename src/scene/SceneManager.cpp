@@ -1,6 +1,8 @@
 #include "scene/SceneManager.hpp"
 #include "core/Logger.hpp"
 #include "scene/SceneGeometryPipeline.hpp"
+#include "scene/LightMapping.hpp"
+#include "scene/LightTree.hpp"
 
 #include <algorithm>
 #include <system_error>
@@ -355,11 +357,22 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     std::vector<TriangleShadeGPU> shadeTriangles;
     shadeTriangles.reserve(numTris);
 
-    for (const auto& tri : m_sceneData.triangles) {
+    // Emissive triangle <-> light correspondence for unbiased NEE/BSDF MIS.
+    std::vector<uint32_t> triLightMap;
+    LightMappingStats lmStats = buildEmissiveLightMapping(m_sceneData, triLightMap);
+    Logger::info("Light/MIS mapping: {} emissive triangles ({} matched to MIS lights, {} NEE-only), "
+                 "{} MIS area lights, {} NEE-only area lights",
+                 lmStats.emissiveTriangles, lmStats.matchedTriangles, lmStats.neeOnlyTriangles,
+                 lmStats.misLights, lmStats.neeOnlyAreaLights);
+
+    for (size_t t = 0; t < numTris; ++t) {
+        const auto& tri = m_sceneData.triangles[t];
         positions.push_back(glm::vec4(glm::vec3(tri.v0.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
-        shadeTriangles.push_back(createTriangleShadeGPU(tri));
+        TriangleShadeGPU s = createTriangleShadeGPU(tri);
+        s.padding0 = triLightMap[t]; // light index + 1, 0 = none, 0xFFFFFFFF = NEE-only
+        shadeTriangles.push_back(s);
     }
 
     VkDeviceSize posSize = std::max(sizeof(glm::vec4) * positions.size(), sizeof(glm::vec4) * 3);
@@ -448,6 +461,9 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     if (!m_sceneData.lights.empty()) {
         buildLightAliasTable(m_sceneData.lights);
         buildLightTree(m_sceneData.lights, m_sceneData.lightTreeNodes);
+        if (!computeLightTreePaths(m_sceneData.lightTreeNodes, m_sceneData.lights)) {
+            Logger::warn("Light tree deeper than 32 levels: tree pdf evaluation unavailable for some lights");
+        }
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 

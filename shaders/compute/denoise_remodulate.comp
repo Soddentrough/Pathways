@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_image_load_formatted : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) readonly uniform image2D uInDenoisedDiffuse;
+layout(binding = 1, rgba16f) readonly uniform image2D uInDenoisedSpecular;
+layout(binding = 2, rgba16f) readonly uniform image2D uAlbedoRoughness;
+layout(binding = 3) readonly uniform image2D uAccumImage;
+
+layout(binding = 4) writeonly uniform image2D uOutRadiance;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint accumulatedSamples;
+    float crossfadeBlend;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    vec3 diff = imageLoad(uInDenoisedDiffuse, coord).rgb;
+    vec3 spec = imageLoad(uInDenoisedSpecular, coord).rgb;
+    vec4 albedoR = imageLoad(uAlbedoRoughness, coord);
+    vec3 albedo = max(albedoR.rgb, vec3(0.0));
+    if (dot(albedo, vec3(1.0)) < 1e-4) {
+        albedo = vec3(1.0);
+    }
+
+    // Combine denoised diffuse and specular radiance
+    vec3 denoisedRadiance = diff + spec;
+
+    vec4 rawAccum = imageLoad(uAccumImage, coord);
+
+    // Dynamic Progressive Crossfade (Roadmap §6.5):
+    // In real-time motion (accumulatedSamples <= 1), display 100% clean denoised image.
+    // As stationary progressive frames accumulate, crossfade smoothly to the raw
+    // accumulated Monte Carlo signal so converged ground truth stays strictly unbiased.
+    float blendWeight = 0.0;
+    if (pc.accumulatedSamples > 1u) {
+        const float kCrossfade = 8.0;
+        blendWeight = float(pc.accumulatedSamples) / (float(pc.accumulatedSamples) + kCrossfade);
+    }
+    if (pc.crossfadeBlend >= 0.0) {
+        // Manual override if set
+        blendWeight = clamp(pc.crossfadeBlend, 0.0, 1.0);
+    }
+
+    vec3 finalColor = mix(denoisedRadiance, rawAccum.rgb, blendWeight);
+    imageStore(uOutRadiance, coord, vec4(finalColor, rawAccum.a));
+}

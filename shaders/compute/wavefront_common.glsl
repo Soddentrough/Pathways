@@ -233,7 +233,10 @@ struct LightTreeNode {
     uvec4 children; // x: leftChild (or lightIdx if leaf), y: rightChild, z: isLeaf, w: padding
 };
 
-// Evaluate spatial importance metric of a LightTree node from surface hit point x with normal n
+// Evaluate spatial importance metric of a LightTree node from surface point x.
+// Position-only by design (plan P1a): MIS needs the selection pdf at emitter
+// hits found by BSDF sampling, where the previous vertex normal is unknown, so
+// the importance must not depend on it. hitNormal is kept for the signature.
 float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode node) {
     float flux = node.bboxMin.w;
     if (flux <= 1e-7) return 0.0;
@@ -250,21 +253,18 @@ float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode n
     vec3 boxCentroid = 0.5 * (bMin + bMax);
     vec3 toNode = boxCentroid - hitPoint;
     float centerDist = length(toNode);
-    vec3 dir = (centerDist > 1e-4) ? (toNode / centerDist) : hitNormal;
-
-    // Surface normal orientation: clamp to small positive floor to allow grazing lights
-    float cosTheta = max(dot(hitNormal, dir), 0.05);
 
     // Light orientation bounding cone weighting
     float coneCos = node.bboxMax.w;
     float cosCone = 1.0;
-    if (coneCos > -0.99) {
+    if (coneCos > -0.99 && centerDist > 1e-4) {
+        vec3 dir = toNode / centerDist;
         vec3 coneAxis = node.coneAxis.xyz;
         float cosLightDir = dot(coneAxis, -dir);
         cosCone = clamp((cosLightDir - coneCos) / max(1.0 - coneCos, 1e-3), 0.05, 1.0);
     }
 
-    return (flux * cosTheta * cosCone) / distSq;
+    return (flux * cosCone) / distSq;
 }
 
 // O(log N) stochastic descent down the 3D Light Tree (FEAT-02)
@@ -485,7 +485,8 @@ Hit getRayHitAtom(RayHit hit) {
 struct RayState {
     uvec4 stateData;
     // x: packHalf2x16(throughput.rg)
-    // y: packHalf2x16(vec2(throughput.b, 0.0)) | (flags << 16u)
+    // y: [15:0] half(throughput.b), [19:16] flags, [31:20] BSDF pdf code of the
+    //    vertex that spawned this ray (mis_common.glsl; 0 = no MIS, full weight)
     // z: seed
     // w: pixelIndex | specularFlag
 };
@@ -494,18 +495,26 @@ struct RayState {
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
 #define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
 
-RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel) {
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode) {
     RayState s;
     s.stateData.x = packHalf2x16(vec2(throughput.rg));
     uint flags = (isSpecularPath ? 1u : 0u) | (causticApplied ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
-    s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u);
+    s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u) | ((pdfCode & 0xFFFu) << 20u);
     s.stateData.z = seed;
     s.stateData.w = (pixelIndex & PIXEL_INDEX_MASK) | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u) | (causticApplied ? CAUSTIC_APPLIED_BIT : 0u);
     return s;
 }
 
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel) {
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, 0u);
+}
+
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u, 0u);
+}
+
+uint unpackRayPdfCode(RayState s) {
+    return (s.stateData.y >> 20u) & 0xFFFu;
 }
 
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied, out uint dispersionChannel) {
@@ -517,7 +526,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     pixelIndex = rawPixel & PIXEL_INDEX_MASK;
     isSpecularPath = (rawPixel & SPECULAR_FLAG_BIT) != 0u;
     causticApplied = (rawPixel & CAUSTIC_APPLIED_BIT) != 0u;
-    uint flags = s.stateData.y >> 16u;
+    uint flags = (s.stateData.y >> 16u) & 0xFu;
     dispersionChannel = (flags >> 2u) & 3u;
 }
 
@@ -1119,7 +1128,7 @@ f16vec3 clampIndirectRadiance(f16vec3 rad, float maxLum) {
 // Progressive depth-aware Russian Roulette for unbiased path termination
 bool applyRussianRoulette(inout vec3 throughput, float pathLum, uint bounce, inout uint seed) {
     float maxThresh = max(pathLum, max(throughput.x, max(throughput.y, throughput.z)));
-    if (maxThresh < 0.001) {
+    if (!(maxThresh > 0.0)) { // only zero-throughput paths die uncompensated
         return true;
     }
     if (bounce >= 1u) {
@@ -1137,7 +1146,7 @@ bool applyRussianRoulette(inout vec3 throughput, float pathLum, uint bounce, ino
 #ifdef GL_EXT_shader_explicit_arithmetic_types_float16
 bool applyRussianRoulette16(inout f16vec3 throughput, float pathLum, uint bounce, inout uint seed) {
     float maxThresh = max(pathLum, float(max(throughput.x, max(throughput.y, throughput.z))));
-    if (maxThresh < 0.001) {
+    if (!(maxThresh > 0.0)) { // only zero-throughput paths die uncompensated
         return true;
     }
     if (bounce >= 1u) {

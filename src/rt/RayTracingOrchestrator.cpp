@@ -348,8 +348,11 @@ void RayTracingOrchestrator::recordRayTracing(
         }
 
         bool needAccumReset = params.accumReset || !config.progressive_accumulation;
-        bool isUpwaysSuperResActive = (config.upscaler_mode == UpscalerMode::Upways || config.upways_superres);
-        if (needAccumReset || isUpwaysSuperResActive) {
+        bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::Svgf ||
+                                  config.denoiser_mode == DenoiserMode::Upways ||
+                                  config.upscaler_mode == UpscalerMode::Upways ||
+                                  config.upways_superres);
+        if (needAccumReset || isDenoisingActive) {
             if (needAccumReset && accumImage) {
                 vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
             }
@@ -378,6 +381,8 @@ void RayTracingOrchestrator::recordRayTracing(
         addClearBarrier(frameImage);
         if (needAccumReset) {
             addClearBarrier(accumImage);
+        }
+        if (needAccumReset || isDenoisingActive) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
         }
@@ -452,9 +457,11 @@ void RayTracingOrchestrator::recordRayTracing(
         bool needGbuffers = (config.upscaler_mode == UpscalerMode::FSR3 ||
                              config.upscaler_mode == UpscalerMode::Upways ||
                              config.denoiser_mode == DenoiserMode::Upways ||
+                             config.denoiser_mode == DenoiserMode::Svgf ||
                              params.isRestirActive ||
                              config.enable_caustics);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
+                          config.denoiser_mode == DenoiserMode::Svgf ||
                           config.upscaler_mode == UpscalerMode::Upways ||
                           config.upways_superres ||
                           !config.capture_training_data_dir.empty());

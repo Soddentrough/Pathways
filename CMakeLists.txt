@@ -169,6 +169,10 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
     ${SHADER_DIR}/compute/restir_debug_view.comp
+    ${SHADER_DIR}/compute/denoise_temporal.comp
+    ${SHADER_DIR}/compute/denoise_variance.comp
+    ${SHADER_DIR}/compute/denoise_atrous.comp
+    ${SHADER_DIR}/compute/denoise_remodulate.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -176,6 +180,9 @@ set(SHADER_FILES
 )
 
 set(SPV_FILES "")
+# Every shared include is a dependency of every shader (cheap, and robust
+# against missing hand-maintained lists when headers are added).
+file(GLOB SHADER_INCLUDE_DEPS CONFIGURE_DEPENDS ${SHADER_DIR}/compute/*.glsl)
 foreach(SHADER ${SHADER_FILES})
     if(EXISTS ${SHADER})
         get_filename_component(SHADER_NAME ${SHADER} NAME)
@@ -185,7 +192,7 @@ foreach(SHADER ${SHADER_FILES})
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -O ${SHADER} -o ${SPV_FILE}
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_FILE} ${BIN_SPV_FILE}
-            DEPENDS ${SHADER} ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/upways_common.glsl ${SHADER_DIR}/compute/upways_common_v3.glsl ${SHADER_DIR}/compute/restir_common.glsl
+            DEPENDS ${SHADER} ${SHADER_INCLUDE_DEPS}
             COMMENT "Compiling shader ${SHADER_NAME} to SPIR-V"
         )
         list(APPEND SPV_FILES ${SPV_FILE})
@@ -199,7 +206,7 @@ add_custom_command(
     OUTPUT ${SEC_DIFFUSE_SPV}
     COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DIS_SECONDARY_BOUNCE=1 -O ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp -o ${SEC_DIFFUSE_SPV}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SEC_DIFFUSE_SPV} ${BIN_SEC_DIFFUSE_SPV}
-    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/restir_common.glsl
+    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp ${SHADER_INCLUDE_DEPS}
     COMMENT "Compiling streamlined secondary shader wavefront_shade_diffuse_sec.comp to SPIR-V"
 )
 list(APPEND SPV_FILES ${SEC_DIFFUSE_SPV})
@@ -210,7 +217,7 @@ add_custom_command(
     OUTPUT ${SEC_COMPLEX_SPV}
     COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DIS_SECONDARY_BOUNCE=1 -O ${SHADER_DIR}/compute/wavefront_shade_complex.comp -o ${SEC_COMPLEX_SPV}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SEC_COMPLEX_SPV} ${BIN_SEC_COMPLEX_SPV}
-    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_complex.comp ${SHADER_DIR}/compute/wavefront_common.glsl ${SHADER_DIR}/compute/nrc_common.glsl ${SHADER_DIR}/compute/wavefront_shadow_inline.glsl ${SHADER_DIR}/compute/restir_common.glsl
+    DEPENDS ${SHADER_DIR}/compute/wavefront_shade_complex.comp ${SHADER_INCLUDE_DEPS}
     COMMENT "Compiling streamlined secondary shader wavefront_shade_complex_sec.comp to SPIR-V"
 )
 list(APPEND SPV_FILES ${SEC_COMPLEX_SPV})

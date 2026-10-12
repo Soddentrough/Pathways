@@ -60,6 +60,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && m_engine->isRestirActive())) flags |= (1 << 7);
     if (m_engine->isRestirActive()) flags |= (1 << 9);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
+    if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
 
     VkClearColorValue clearZero{};
     clearZero.float32[0] = 0.0f; clearZero.float32[1] = 0.0f; clearZero.float32[2] = 0.0f; clearZero.float32[3] = 0.0f;

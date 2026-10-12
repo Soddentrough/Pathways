@@ -38,8 +38,10 @@ PATHWAYS_BIN="./${BUILD_DIR}/bin/pathways"
 
 # 2. Build / ensure binaries are up to date
 echo ""
-echo "[2/4] Verifying build with ninja (-j$(nproc))..."
-ninja -C "${BUILD_DIR}" -j"$(nproc)"
+# Capped job count: 64 threads of C++/shader compilation can exhaust 64 GB RAM.
+BUILD_JOBS="${BUILD_JOBS:-16}"
+echo "[2/4] Verifying build with ninja (-j${BUILD_JOBS})..."
+ninja -C "${BUILD_DIR}" -j"${BUILD_JOBS}"
 
 # Create output directory
 mkdir -p output
