@@ -304,7 +304,7 @@ private:
     void initCaustics();
     void updateCausticsDescriptors();
 
-    // ReSTIR DI Subsystem
+    // ReSTIR PT Subsystem
     ReSTIRManager* m_restirManager = nullptr;
     void createReSTIRResources();
     void destroyReSTIRResources();

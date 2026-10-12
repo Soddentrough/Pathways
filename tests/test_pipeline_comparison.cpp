@@ -118,6 +118,18 @@ int main() {
         Config cMCapEq = Config::parse(2, const_cast<char**>(argvMCapEq));
         check_true(cMCapEq.restir_m_cap == 80, "--restir-m-cap=val sets custom M-cap");
 
+        const char* argvRestir[] = { "pathways", "--restir" };
+        Config cRestir = Config::parse(2, const_cast<char**>(argvRestir));
+        check_true(cRestir.enable_restir, "--restir enables unified ReSTIR PT");
+
+        const char* argvDbgView[] = { "pathways", "--debug-view", "restir-m" };
+        Config cDbgView = Config::parse(3, const_cast<char**>(argvDbgView));
+        check_true(cDbgView.debug_view == DebugViewMode::RestirM, "--debug-view restir-m sets DebugViewMode::RestirM");
+
+        const char* argvDenoiser[] = { "pathways", "--relax" };
+        Config cDenoiser = Config::parse(2, const_cast<char**>(argvDenoiser));
+        check_true(cDenoiser.denoiser_mode == DenoiserMode::Svgf, "--relax sets DenoiserMode::Svgf");
+
         check_true(cfgDef.capture_reference_spp == 256, "Default capture_reference_spp must be 256");
         const char* argvRefSpp[] = { "pathways", "--capture-reference-spp", "128" };
         Config cRefSpp = Config::parse(3, const_cast<char**>(argvRefSpp));

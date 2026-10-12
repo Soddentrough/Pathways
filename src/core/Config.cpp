@@ -298,13 +298,12 @@ void Config::printUsage(const char* progName) {
               << "  --nrc-train-ratio <float> Ratio of paths continuing to ground truth for training (default: 0.03)\n"
               << "  --caustics              Enable real-time forward ray-traced caustics [default: disabled]\n"
               << "  --caustic-photons <int> Number of caustic photons traced per frame (default: 1048576)\n"
-              << "  --restir                Enable ReSTIR: DI (direct light) + GI (bounce-1 secondary-vertex reuse) [default: disabled]\n"
-              << "  --restir-di             Alias for --restir\n"
-              << "  --no-restir-gi          Disable the ReSTIR GI component only (keep DI)\n"
-              << "  --restir-pt             Alias for --restir (full path replay PT is NOT yet implemented; emits a warning)\n"
-              << "  --restir-m-cap <int>    ReSTIR temporal reuse M-cap for DI and GI (default: 60)\n"
-              << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-di-m | restir-di-w |\n"
-              << "                          restir-di-light | restir-gi-m | restir-gi-w | restir-coverage | none\n\n"
+              << "  --restir                Enable ReSTIR PT: unified spatiotemporal path-space reservoir resampling [default: disabled]\n"
+              << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
+              << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
+              << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (In-House ReLAX/A-SVGF), 'upways', or 'none' [default: none]\n"
+              << "  --relax, --svgf, --asvgf Shortcut to enable In-House ReLAX / A-SVGF real-time denoiser\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -977,18 +976,9 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.caustic_photons = static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1)));
             continue;
         }
-        if (arg == "--restir" || arg == "--restir-di") {
+        if (arg == "--restir" || arg == "--restir-pt") {
             cfg.enable_restir = true;
-            Logger::info("ReSTIR enabled: inline temporal + spatial reservoir reuse of direct light (DI) plus path-space secondary-vertex reuse at bounce 1 (GI).");
-            continue;
-        }
-        if (arg == "--no-restir-gi") {
-            cfg.restir_gi = false;
-            continue;
-        }
-        if (arg == "--restir-pt") {
-            Logger::warn("--restir-pt: path-space ReSTIR PT is not implemented yet (roadmap: docs/RESTIR_PT_DESIGN.md); enabling ReSTIR DI for direct light instead.");
-            cfg.enable_restir = true;
+            Logger::info("ReSTIR PT enabled: unified spatiotemporal path-space reservoir resampling.");
             continue;
         }
         if (arg == "--restir-m-cap" && i + 1 < argc) {
@@ -1010,13 +1000,13 @@ Config Config::parse(int argc, char* argv[]) {
             std::string v = (arg == "--debug-view") ? (i + 1 < argc ? argv[++i] : "none")
                                                     : arg.substr(arg.find('=') + 1);
             if (v == "none") cfg.debug_view = DebugViewMode::None;
-            else if (v == "restir-di-m") cfg.debug_view = DebugViewMode::RestirDiM;
-            else if (v == "restir-di-w") cfg.debug_view = DebugViewMode::RestirDiW;
-            else if (v == "restir-di-light") cfg.debug_view = DebugViewMode::RestirDiLight;
-            else if (v == "restir-gi-m") cfg.debug_view = DebugViewMode::RestirGiM;
-            else if (v == "restir-gi-w") cfg.debug_view = DebugViewMode::RestirGiW;
+            else if (v == "restir-m" || v == "restir-di-m") cfg.debug_view = DebugViewMode::RestirM;
+            else if (v == "restir-w" || v == "restir-di-w") cfg.debug_view = DebugViewMode::RestirW;
+            else if (v == "restir-light" || v == "restir-di-light") cfg.debug_view = DebugViewMode::RestirLight;
+            else if (v == "restir-indirect-m" || v == "restir-gi-m") cfg.debug_view = DebugViewMode::RestirIndirectM;
+            else if (v == "restir-indirect-w" || v == "restir-gi-w") cfg.debug_view = DebugViewMode::RestirIndirectW;
             else if (v == "restir-coverage") cfg.debug_view = DebugViewMode::RestirCoverage;
-            else Logger::warn("Unknown --debug-view '{}': using none. Options: none, restir-di-m, restir-di-w, restir-di-light, restir-gi-m, restir-gi-w, restir-coverage", v);
+            else Logger::warn("Unknown --debug-view '{}': using none. Options: none, restir-m, restir-w, restir-light, restir-indirect-m, restir-indirect-w, restir-coverage", v);
             continue;
         }
         if ((arg == "--tile-size" || arg == "--checker-tile-size") && i + 1 < argc) {

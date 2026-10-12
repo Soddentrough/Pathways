@@ -66,13 +66,19 @@ enum class UpscalerMode {
 // Post-mortem visualization overlays written directly over the output image
 // (bypass accumulation & tonemap). ReSTIR views require --restir.
 enum class DebugViewMode {
-    None = 0,       // Normal rendering [Default]
-    RestirDiM = 1,  // DI reservoir temporal sample count M (heatmap)
-    RestirDiW = 2,  // DI finalized RIS weight w = wSum/(pr*M) (log scale)
-    RestirDiLight = 3, // DI winner light index (golden-ratio hue)
-    RestirGiM = 4,  // GI reservoir temporal sample count M (heatmap)
-    RestirGiW = 5,  // GI finalized weight (log scale)
-    RestirCoverage = 6 // R = DI valid, G = GI valid, B = X1 context valid
+    None = 0,               // Normal rendering [Default]
+    RestirM = 1,            // Direct reservoir temporal sample count M (heatmap)
+    RestirW = 2,            // Direct finalized RIS weight w = wSum/(pr*M) (log scale)
+    RestirLight = 3,        // Direct winner light index (golden-ratio hue)
+    RestirIndirectM = 4,    // Indirect path reservoir temporal sample count M (heatmap)
+    RestirIndirectW = 5,    // Indirect path finalized weight (log scale)
+    RestirCoverage = 6,     // Path reservoir validity coverage
+    // Aliases
+    RestirDiM = RestirM,
+    RestirDiW = RestirW,
+    RestirDiLight = RestirLight,
+    RestirGiM = RestirIndirectM,
+    RestirGiW = RestirIndirectW
 };
 
 enum class CaptureCameraMode {
@@ -186,10 +192,9 @@ struct Config {
     bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]
     uint32_t caustic_photons = 1048576;   // Number of caustic photons traced per frame (default: 1048576 = 1024x1024)
 
-    // ReSTIR DI Spatio-Temporal Reservoir Resampling (Direct Light)
-    bool enable_restir = false;           // ReSTIR DI: inline spatiotemporal reservoir resampling of direct light [Default: false, opt-in via --restir]
-    uint32_t restir_m_cap = 60;           // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 60)
-    bool restir_gi = true;                // ReSTIR GI (path-space secondary-vertex reuse at bounce 1) [Default: true, applies only when ReSTIR is enabled]
+    // ReSTIR PT Spatio-Temporal Reservoir Resampling
+    bool enable_restir = false;           // ReSTIR PT: inline spatiotemporal path-space reservoir resampling [Default: false, opt-in via --restir]
+    uint32_t restir_m_cap = 60;           // ReSTIR PT temporal reuse M-cap (spatial taps additionally capped at 8 in-shader; default: 60)
     DebugViewMode debug_view = DebugViewMode::None; // Reservoir debug overlay (requires --restir; see --debug-view)
 
     uint32_t gpu_index = 0;

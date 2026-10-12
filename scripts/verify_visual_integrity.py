@@ -777,15 +777,15 @@ def test_restir_many_lights_variance_and_gating():
 
     return result
 
-def test_restir_gi_energy_and_stability():
-    """ReSTIR GI (bounce-1 secondary-vertex reuse) regression guard.
+def test_restir_energy_and_stability():
+    """ReSTIR PT path-space reservoir reuse regression guard.
 
-    Energy: GI replaces the 2-bounce estimator; converged GI must match the
+    Energy: ReSTIR PT replaces the path estimator; converged ReSTIR PT must match the
     plain path within tolerance (measured +1.7% at 512 frames on cornell-box;
     threshold 5% catches estimator breakage, not sampling noise).
-    Stability: no NaN/Inf/fireflies with GI active.
+    Stability: no NaN/Inf/fireflies with ReSTIR PT active.
     """
-    result = TestResult("ReSTIR GI Energy Conservation & Stability")
+    result = TestResult("ReSTIR PT Energy Conservation & Stability")
     print(f"\n--- Running: {result.name} ---")
 
     common = ["--scene", "cornell-box", "--res", "512x512", "--spp", "1",
@@ -800,19 +800,19 @@ def test_restir_gi_energy_and_stability():
     out_gi = os.path.join(OUTPUT_DIR, "gi_energy_restir.png")
     rc, _, stderr = run_pathways(common + ["--restir", "--dump-frame", out_gi])
     if rc != 0:
-        result.fail(f"ReSTIR GI run failed with code {rc}: {stderr.strip()[:200]}")
+        result.fail(f"ReSTIR PT run failed with code {rc}: {stderr.strip()[:200]}")
         return result
 
     img_plain = cv2.imread(out_plain, cv2.IMREAD_UNCHANGED)
     img_gi = cv2.imread(out_gi, cv2.IMREAD_UNCHANGED)
     if img_plain is None or img_gi is None:
-        result.fail("Failed to load GI energy test outputs")
+        result.fail("Failed to load ReSTIR PT energy test outputs")
         return result
 
     if np.isnan(img_plain).any() or np.isinf(img_plain).any():
         result.fail("NaN/Inf detected in plain baseline output")
     if np.isnan(img_gi).any() or np.isinf(img_gi).any():
-        result.fail("NaN/Inf detected in ReSTIR GI output")
+        result.fail("NaN/Inf detected in ReSTIR PT output")
 
     # Energy check on LINEAR samples (dump may be 16-bit; mean over scene energy).
     mean_plain = float(np.mean(img_plain[..., :3].astype(np.float64)))
@@ -827,14 +827,14 @@ def test_restir_gi_energy_and_stability():
         return result
     energy_err = abs(mean_gi - mean_plain) / mean_plain
     result.record("gi_energy_error_pct", energy_err * 100.0)
-    print(f"  Plain energy={mean_plain:.1f}  GI energy={mean_gi:.1f}  "
+    print(f"  Plain energy={mean_plain:.1f}  ReSTIR PT energy={mean_gi:.1f}  "
           f"energy error={energy_err * 100:.2f}%  "
-          f"(8bit clip: plain={st_plain['clipped_pct']:.2f}%, gi={st_gi['clipped_pct']:.2f}%)")
+          f"(8bit clip: plain={st_plain['clipped_pct']:.2f}%, restir={st_gi['clipped_pct']:.2f}%)")
     if energy_err > 0.05:
-        result.fail(f"ReSTIR GI energy deviation {energy_err * 100:.2f}% > 5% — estimator bias regression")
-    # Firefly guard: GI must not clip substantially more than the plain baseline.
+        result.fail(f"ReSTIR PT energy deviation {energy_err * 100:.2f}% > 5% — estimator bias regression")
+    # Firefly guard: ReSTIR PT must not clip substantially more than the plain baseline.
     if st_gi["clipped_pct"] > st_plain["clipped_pct"] + 5.0:
-        result.fail(f"ReSTIR GI firefly blowout: clipped {st_gi['clipped_pct']:.2f}% vs "
+        result.fail(f"ReSTIR PT firefly blowout: clipped {st_gi['clipped_pct']:.2f}% vs "
                     f"plain {st_plain['clipped_pct']:.2f}%")
 
     return result
@@ -1245,7 +1245,7 @@ def main():
         test_mgpu_tile_motion_noise,
         test_breakfast_room_motion_noise,
         test_restir_many_lights_variance_and_gating,
-        test_restir_gi_energy_and_stability,
+        test_restir_energy_and_stability,
         test_specular_vmv_integrity,
         test_restir_pt_veach_ajar_indirect_integrity,
         test_caustics_differential_energy_and_stability

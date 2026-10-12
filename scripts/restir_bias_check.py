@@ -51,8 +51,7 @@ CONFIGS = {
     "base": ["--no-streamlined-secondary"],
     "base-no-unroll": ["--no-streamlined-secondary", "--no-delta-unroll"],
     "base-streamlined": [],
-    "restir-di": ["--restir", "--no-restir-gi"],
-    "restir-di-gi": ["--restir"],
+    "restir": ["--restir"],
 }
 
 # Unbiased-comparison settings for tested configs (clamps off, FP32).
@@ -112,7 +111,7 @@ def render_set(tag, sargs, cargs, frames, seeds, res, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenes", default="cornell,many-lights,veach-ajar,living-room,kitchen-instanced")
-    ap.add_argument("--configs", default="base,restir-di,restir-di-gi")
+    ap.add_argument("--configs", default="base,restir")
     ap.add_argument("--frames", type=int, default=256)
     ap.add_argument("--runs", type=int, default=4, help="independent renders per config (K)")
     ap.add_argument("--ref-frames", type=int, default=16384)

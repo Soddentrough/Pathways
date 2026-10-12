@@ -928,8 +928,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             // Determine if shadow and intersect passes are required
             bool hasInlineShadows = sceneData.inlineShadows && (sceneData.useHardwareRT == 1u) && ((sceneData.cameraFlags & (1u << 6)) != 0);
-            bool hasRestirGiShadow = ((sceneData.cameraFlags & (1u << 24)) != 0) && (b == 1);
-            bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirGiShadow) && (!hasInlineShadows || b > 0);
+            bool hasRestirPtIndirectShadow = ((sceneData.cameraFlags & (1u << 24)) != 0) && (b == 1);
+            bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirPtIndirectShadow) && (!hasInlineShadows || b > 0);
             bool needIntersect = (b + 1 < cutoffBounce);
 
             if (!needShadowDispatch && !needIntersect && !useTailMegakernel) {

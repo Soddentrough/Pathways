@@ -82,7 +82,7 @@ struct WavefrontSceneData {
     bool enableTailMegakernel = false;    // Hybrid Wavefront-to-Megakernel transition for late bounces
     uint32_t tailMegakernelBounce = 2;    // Cutoff bounce to switch to Tail Megakernel (default: 2)
     uint32_t deltaUnroll = 0;             // Max delta-chain unroll depth for smooth dielectrics (default: 0 = Pure Wavefront)
-    uint32_t restirMCap = 30;             // ReSTIR DI temporal reuse M-cap (spatial taps additionally capped at 8 in-shader)
+    uint32_t restirMCap = 30;             // ReSTIR PT temporal reuse M-cap (spatial taps additionally capped at 8 in-shader)
 };
 
 class WavefrontPipeline {
@@ -255,7 +255,7 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_queueCounters;
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;   // Double-buffered per in-flight frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_dgcStream;
-    std::array<std::unique_ptr<Buffer>, 2> m_pixelToRayQueue; // 4B pixel-to-ray mapping for ReSTIR DI
+    std::array<std::unique_ptr<Buffer>, 2> m_pixelToRayQueue; // 4B pixel-to-ray mapping for ReSTIR PT
 
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
