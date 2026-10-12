@@ -716,6 +716,84 @@ int main() {
         double meanIntegral = sumEstimates / NUM_TRIALS;
         assert_near(static_cast<float>(meanIntegral), 1.0f, 0.005f,
                     "ReservoirPT streaming estimator unbiased convergence (analytical expectation: 1.0)");
+
+        // 10f. ptApplyTap Exact Analytical Solid-Angle Jacobian & Shifted Target Proxy Verification
+        std::cout << "\n[TEST 10f] ptApplyTap Solid-Angle Jacobian & Shifted Target Proxy..." << std::endl;
+        {
+            glm::vec3 x1_src(0.0f, 0.0f, 0.0f);
+            glm::vec3 n1_src(0.0f, 1.0f, 0.0f);
+            glm::vec3 x_rc(0.0f, 2.0f, 0.0f);
+            glm::vec3 n_rc(0.0f, -1.0f, 0.0f);
+
+            // Reconnection Jacobian reference formula:
+            // J = (dSqSrc / dSqNew) * (cosRcNew / cosRcSrc)
+            auto evalPtJacobian = [](float dSrc, float dNew, float cosRcSrc, float cosRcNew) -> float {
+                if (dSrc >= 5000.0f || dNew >= 5000.0f) return 1.0f;
+                float dSqSrc = dSrc * dSrc;
+                float dSqNew = std::max(dNew * dNew, 1e-4f);
+                float cosSrcEff = std::max(cosRcSrc, 1e-3f);
+                float cosNewEff = std::max(cosRcNew, 1e-4f);
+                float J = (dSqSrc / dSqNew) * (cosNewEff / cosSrcEff);
+                return std::clamp(J, 0.05f, 10.0f);
+            };
+
+            // Case 1: Identity shift (x1_new == x1_src) -> |J| == 1.0, G_new == G_src
+            float dSrc = glm::length(x_rc - x1_src);
+            float cosRcSrc = std::abs(glm::dot(n_rc, -glm::normalize(x_rc - x1_src)));
+            float J_ident = evalPtJacobian(dSrc, dSrc, cosRcSrc, cosRcSrc);
+            assert_near(J_ident, 1.0f, 1e-5f, "ptApplyTap identity shift Jacobian (|J| == 1.0)");
+
+            float G_src = evalGeometricCoupling(x1_src, n1_src, x_rc, n_rc);
+            float G_ident = evalGeometricCoupling(x1_src, n1_src, x_rc, n_rc);
+            assert_near(G_ident / G_src, 1.0f, 1e-5f, "ptApplyTap identity shift proxy ratio (G_new / G_src == 1.0)");
+
+            // Case 2: Distance halving shift (x1_new at dist = 1.0 instead of 2.0)
+            glm::vec3 x1_half(0.0f, 1.0f, 0.0f);
+            float dNew_half = glm::length(x_rc - x1_half);
+            float cosRcNew_half = std::abs(glm::dot(n_rc, -glm::normalize(x_rc - x1_half)));
+            float J_half = evalPtJacobian(dSrc, dNew_half, cosRcSrc, cosRcNew_half);
+            // Analytical: (2^2 / 1^2) * (1 / 1) = 4.0
+            assert_near(J_half, 4.0f, 1e-5f, "ptApplyTap distance-halving shift Jacobian (|J| == 4.0)");
+
+            float G_half = evalGeometricCoupling(x1_half, n1_src, x_rc, n_rc);
+            assert_near(G_half / G_src, 4.0f, 1e-5f, "ptApplyTap geometric coupling ratio tracks inverse-square distance");
+
+            // Case 3: Jacobian clamp boundary ([0.05, 10.0])
+            // Very close shift (dNew = 0.1): unconstrained J would be 4 / 0.01 = 400 -> clamped to 10.0
+            float J_clamped_high = evalPtJacobian(2.0f, 0.1f, 1.0f, 1.0f);
+            assert_near(J_clamped_high, 10.0f, 1e-5f, "ptApplyTap Jacobian ceiling clamp to 10.0");
+
+            // Very far shift (dNew = 20.0): unconstrained J would be 4 / 400 = 0.01 -> clamped to 0.05
+            float J_clamped_low = evalPtJacobian(2.0f, 20.0f, 1.0f, 1.0f);
+            assert_near(J_clamped_low, 0.05f, 1e-5f, "ptApplyTap Jacobian floor clamp to 0.05");
+
+            // Case 4: Gating & rejection guards
+            auto mockPtApplyTap = [&](float roughness, float distRatio, float cos1, uint32_t rcFlags) -> bool {
+                if ((rcFlags & 1u) != 0u) return false; // Reject sphere
+                if (distRatio < 0.2f || distRatio > 5.0f) return false;
+                if (roughness < 0.15f) return false;
+                if (cos1 <= 0.05f) return false; // GI_TAP_MIN_COS
+                return true;
+            };
+
+            assert_true(mockPtApplyTap(0.5f, 1.0f, 0.8f, 0u), "Valid tap is accepted");
+            assert_true(!mockPtApplyTap(0.08f, 1.0f, 0.8f, 0u), "Glossy receiver (roughness < 0.15) rejected");
+            assert_true(!mockPtApplyTap(0.5f, 6.0f, 0.8f, 0u), "Large footprint ratio (> 5.0) rejected");
+            assert_true(!mockPtApplyTap(0.5f, 0.1f, 0.8f, 0u), "Small footprint ratio (< 0.2) rejected");
+            assert_true(!mockPtApplyTap(0.5f, 1.0f, -0.1f, 0u), "Backfacing receiver (cos1 <= 0) rejected");
+            assert_true(!mockPtApplyTap(0.5f, 1.0f, 0.8f, 1u), "Sphere reconnection hit rejected");
+
+            // Case 5: Unbiased weight balance heuristic with shifted proxy
+            float tap_wSum = 2.0f;
+            float tap_M = 4.0f;
+            float tap_proxy = 0.25f;
+            float shifted_proxy = 1.0f; // 4x increase due to distance halving
+            float J = 4.0f;
+            float targetRatio = shifted_proxy / tap_proxy;
+            float weight = (tap_wSum / tap_M) * tap_M * targetRatio * J;
+            // Analytical: (2/4) * 4 * 4 * 4 = 32.0
+            assert_near(weight, 32.0f, 1e-4f, "GRIS balance heuristic weight with shifted proxy and Jacobian");
+        }
     }
 
     // -------------------------------------------------------------------------

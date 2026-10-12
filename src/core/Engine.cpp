@@ -1717,6 +1717,7 @@ void Engine::renderFrame() {
     // enabled at least once, keeping ~144 B/pixel (DI 56B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
         vkDeviceWaitIdle(m_context->getDevice());
+        m_restirManager->setPhase3Enabled(true);
         m_restirManager->resize(m_config.width, m_config.height);
         updateWavefrontSceneDescriptors();
     }

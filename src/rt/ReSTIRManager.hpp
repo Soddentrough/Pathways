@@ -70,7 +70,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
-    bool m_enablePhase3 = false;
+    bool m_enablePhase3 = true;
     bool m_clearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_giClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_ptClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };

@@ -890,9 +890,97 @@ bool ptUpdate(inout ReservoirPT r, uint candidatePathIdx, float candidateWeight,
     if (candidateWeight > 0.0 && (randFloat(seed) * combinedWeight < candidateWeight)) {
         r.pathIndex = candidatePathIdx;
         r.targetProxy = candidateProxy;
+        r.flags |= 1u;
         return true;
     }
     return false;
+}
+
+// Unbiased deferred gather weight finalization:
+// W = w_sum / (M * targetProxy)
+void ptFinalize(inout ReservoirPT r) {
+    if (r.targetProxy > 1e-6 && r.M > 0.0) {
+        r.W = r.weightSum / (r.M * r.targetProxy);
+        if (isnan(r.W) || isinf(r.W) || !(r.W > 0.0)) {
+            r.W = 0.0;
+        }
+    } else {
+        r.W = 0.0;
+    }
+}
+
+// Reconnects a tap path skeleton to the current receiver x1, evaluates exact
+// analytical solid-angle Jacobian |J| in [0.05, 10.0] and shifted geometric
+// target proxy pHatShifted, and stream-combines candidate into r.
+// Returns true when tap wins the reservoir.
+bool ptApplyTap(inout ReservoirPT r, in ReservoirPT tap, in PathSample tapPath,
+                vec3 x1, vec3 n1, float roughness, float mCap, uint ageNew, inout uint seed) {
+    if (!ptIsValid(tap) || tap.M <= 0.0 || tap.targetProxy <= 1e-9) return false;
+    float mTap = min(tap.M, mCap);
+    if (mTap <= 0.0) return false;
+    if (tapPath.vertexCount < 2u) return false;
+
+    uint rcIdx = clamp(tapPath.rcIndex > 0u ? tapPath.rcIndex : 1u, 1u, tapPath.vertexCount - 1u);
+    Hit rcHit = tapPath.vertices[rcIdx].hit;
+    // Reject procedural spheres as reconnection vertex (flags bit 0 set for spheres)
+    if ((rcHit.flags & 1u) != 0u) return false;
+
+    vec3 x1Src, n1Src;
+    reconstructHitPositionAndNormal(tapPath.vertices[0].hit, x1Src, n1Src);
+    vec3 xRc, nRc;
+    reconstructHitPositionAndNormal(rcHit, xRc, nRc);
+
+    vec3 toNew = xRc - x1;
+    float dNew = length(toNew);
+    if (dNew < 1e-3 || dNew >= 5000.0) return false;
+    vec3 dirNew = toNew / dNew;
+    float cos1New = dot(n1, dirNew);
+    if (cos1New <= GI_TAP_MIN_COS) return false;
+
+    vec3 toSrc = xRc - x1Src;
+    float dSrc = length(toSrc);
+    if (dSrc < 1e-3 || dSrc >= 5000.0) return false;
+    vec3 dirSrc = toSrc / dSrc;
+    float cos1Src = dot(n1Src, dirSrc);
+    if (cos1Src <= GI_TAP_MIN_COS) return false;
+
+    float distRatio = dSrc / max(dNew, 1e-3);
+    if (distRatio < 0.2 || distRatio > 5.0) return false;
+    if (roughness < 0.15) return false;
+
+    float cosRcSrc = clamp(abs(dot(nRc, -dirSrc)), 0.0, 1.0);
+    float cosRcNew = clamp(abs(dot(nRc, -dirNew)), 0.0, 1.0);
+
+    float GNew = evalGeometricCoupling(x1, n1, xRc, nRc);
+    float GSrc = evalGeometricCoupling(x1Src, n1Src, xRc, nRc);
+    if (GSrc <= 1e-7 || GNew <= 1e-7) return false;
+
+    float pHatShifted = tap.targetProxy * (GNew / GSrc);
+    if (pHatShifted <= 1e-9) return false;
+
+    float jac = evalGIJacobian(dSrc, dNew, cosRcSrc, cosRcNew);
+    float targetRatio = pHatShifted / max(tap.targetProxy, 1e-9);
+    float weight = (tap.weightSum / max(tap.M, 1e-4)) * mTap * targetRatio * jac;
+    if (isnan(weight) || isinf(weight) || !(weight > 0.0)) return false;
+
+    float wSelf = (ptIsValid(r) && r.targetProxy > 0.0) ? r.weightSum : 0.0;
+    float mSelf = ptIsValid(r) ? r.M : 0.0;
+    float combinedM = mSelf + mTap;
+    float combinedWeight = wSelf + weight;
+
+    if (randFloat(seed) * combinedWeight < weight) {
+        r.weightSum = combinedWeight;
+        r.M = combinedM;
+        r.targetProxy = pHatShifted;
+        r.pathIndex = tap.pathIndex;
+        r.age = ageNew;
+        r.flags = tap.flags | 1u;
+        return true;
+    } else {
+        r.weightSum = combinedWeight;
+        r.M = combinedM;
+        return false;
+    }
 }
 
 #endif // RESTIR_COMMON_GLSL
