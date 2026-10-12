@@ -2943,72 +2943,62 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     const float pedR = 0.40f;
     const float pedH = 0.20f;
 
-    // 3b. Focused Theatrical Caustic Projector (Targeting Glass Crystal Sphere at Z = 4.0)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    glm::vec3 spotMountPos(0.0f, frameH - barThick, 3.0f);
-    glm::vec3 spotLensPos(0.0f, 3.10f, 3.08f);
-    glm::vec3 glassSphereTarget(0.0f, pedH + 0.42f, 4.0f);
-    glm::vec3 spotDir = glm::normalize(glassSphereTarget - spotLensPos);
+    // 3b. Freestanding Architectural Standing Spotlight Luminaires
+    // Authentic museum-grade floor-standing spotlight fixtures with heavy cast base,
+    // slender vertical stanchion mast, articulated gold knuckle, and aimed lamp cowl.
+    auto addStandingSpotlight = [&](const glm::vec3& basePos, const glm::vec3& targetPos,
+                                   const glm::vec4& emission, const std::string& name) {
+        tStart = static_cast<uint32_t>(scene.triangles.size());
+        // Heavy circular weighted floor base
+        addCylinder(scene.triangles, glm::vec3(basePos.x, 0.015f, basePos.z), 0.18f, 0.03f, 1 /* matFrame */, 24);
+        // Beveled gold collar accent
+        addCylinder(scene.triangles, glm::vec3(basePos.x, 0.035f, basePos.z), 0.06f, 0.02f, 4 /* matGold */, 16);
 
-    // Projector bracket and barrel
-    addBeam(scene.triangles, spotMountPos, spotLensPos - spotDir * 0.16f, 0.05f, 0.05f, 1 /* matFrame */);
-    addBeam(scene.triangles, spotLensPos - spotDir * 0.16f, spotLensPos, 0.16f, 0.16f, 1 /* matFrame */);
+        // Vertical slender stanchion mast
+        const float mastHeight = 2.10f;
+        addBeam(scene.triangles, glm::vec3(basePos.x, 0.04f, basePos.z),
+                glm::vec3(basePos.x, mastHeight, basePos.z), 0.030f, 0.030f, 1 /* matFrame */);
 
-    // Emissive spotlight lens quad facing along spotDir
-    glm::vec3 upRef(0.0f, 1.0f, 0.0f);
-    glm::vec3 spotRight = glm::normalize(glm::cross(spotDir, upRef));
-    glm::vec3 spotUp = glm::cross(spotRight, spotDir);
-    float lensR = 0.075f;
-    addQuad(scene.triangles,
-            spotLensPos - spotRight * lensR - spotUp * lensR,
-            spotLensPos + spotRight * lensR - spotUp * lensR,
-            spotLensPos + spotRight * lensR + spotUp * lensR,
-            spotLensPos - spotRight * lensR + spotUp * lensR,
-            spotDir, 14 /* matSpotLens */);
+        // Mid-height adjustment screw / knob
+        addSphere(scene.triangles, glm::vec3(basePos.x + 0.025f, 1.20f, basePos.z), 0.022f, 4 /* matGold */, 12, 12);
 
-    // Analytical LightGPU: High-flux focused spotlight aimed at dielectric crystal for photon caustics
-    LightGPU spotLight{};
-    spotLight.position = glm::vec4(spotLensPos, LIGHT_SPOT);
-    spotLight.normal = glm::vec4(spotDir, 0.0f);
-    spotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(12.0f)));
-    spotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(18.0f)));
-    spotLight.emission = glm::vec4(130.0f, 135.0f, 155.0f, 1.0f);
-    scene.lights.push_back(spotLight);
-    recordRange("Caustic_Spotlight", tStart);
+        // Articulated swivel hinge knuckle at mast top
+        addSphere(scene.triangles, glm::vec3(basePos.x, mastHeight, basePos.z), 0.038f, 4 /* matGold */, 16, 16);
 
-    // 3c. Overhead Theatrical Spotlight (Targeting Multi-Ring Gyroscopic Sculpture at X = 1.3, Z = -2.2)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    glm::vec3 gyroSpotMountPos(1.3f, frameH - barThick, -3.0f);
-    glm::vec3 gyroSpotLensPos(1.3f, 3.10f, -2.85f);
-    glm::vec3 gyroSculptureTarget(1.3f, pedH + 0.52f, -2.2f);
-    glm::vec3 gyroSpotDir = glm::normalize(gyroSculptureTarget - gyroSpotLensPos);
+        // Cantilever boom arm extending toward the target
+        glm::vec3 boomDir = glm::normalize(glm::vec3(targetPos.x - basePos.x, 0.0f, targetPos.z - basePos.z));
+        glm::vec3 headPos = glm::vec3(basePos.x, mastHeight, basePos.z) + boomDir * 0.30f + glm::vec3(0.0f, 0.12f, 0.0f);
+        addBeam(scene.triangles, glm::vec3(basePos.x, mastHeight, basePos.z), headPos, 0.026f, 0.026f, 1 /* matFrame */);
 
-    // Projector bracket and barrel
-    addBeam(scene.triangles, gyroSpotMountPos, gyroSpotLensPos - gyroSpotDir * 0.16f, 0.05f, 0.05f, 1 /* matFrame */);
-    addBeam(scene.triangles, gyroSpotLensPos - gyroSpotDir * 0.16f, gyroSpotLensPos, 0.16f, 0.16f, 1 /* matFrame */);
+        // Spotlight cowl / head barrel aimed at targetPos
+        glm::vec3 spotDir = glm::normalize(targetPos - headPos);
+        glm::vec3 lensPos = headPos + spotDir * 0.14f;
+        addBeam(scene.triangles, headPos - spotDir * 0.06f, lensPos, 0.12f, 0.12f, 1 /* matFrame */);
 
-    // Emissive spotlight lens quad facing along gyroSpotDir
-    glm::vec3 gyroSpotRight = glm::normalize(glm::cross(gyroSpotDir, upRef));
-    glm::vec3 gyroSpotUp = glm::cross(gyroSpotRight, gyroSpotDir);
-    float gyroLensR = 0.075f;
-    addQuad(scene.triangles,
-            gyroSpotLensPos - gyroSpotRight * gyroLensR - gyroSpotUp * gyroLensR,
-            gyroSpotLensPos + gyroSpotRight * gyroLensR - gyroSpotUp * gyroLensR,
-            gyroSpotLensPos + gyroSpotRight * gyroLensR + gyroSpotUp * gyroLensR,
-            gyroSpotLensPos - gyroSpotRight * gyroLensR + gyroSpotUp * gyroLensR,
-            gyroSpotDir, 14 /* matSpotLens */);
+        // Emissive lens quad
+        glm::vec3 upRef(0.0f, 1.0f, 0.0f);
+        glm::vec3 spotRight = glm::normalize(glm::cross(spotDir, upRef));
+        glm::vec3 spotUp = glm::cross(spotRight, spotDir);
+        float lensR = 0.060f;
+        addQuad(scene.triangles,
+                lensPos - spotRight * lensR - spotUp * lensR,
+                lensPos + spotRight * lensR - spotUp * lensR,
+                lensPos + spotRight * lensR + spotUp * lensR,
+                lensPos - spotRight * lensR + spotUp * lensR,
+                spotDir, 14 /* matSpotLens */);
 
-    // Analytical LightGPU: High-flux focused spotlight aimed at the multi-ring gyroscope
-    LightGPU gyroSpotLight{};
-    gyroSpotLight.position = glm::vec4(gyroSpotLensPos, LIGHT_SPOT);
-    gyroSpotLight.normal = glm::vec4(gyroSpotDir, 0.0f);
-    gyroSpotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(14.0f)));
-    gyroSpotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(22.0f)));
-    gyroSpotLight.emission = glm::vec4(165.0f, 170.0f, 195.0f, 1.0f);
-    scene.lights.push_back(gyroSpotLight);
-    recordRange("Gyroscope_Spotlight", tStart);
+        // Analytical spotlight emitter
+        LightGPU spotLight{};
+        spotLight.position = glm::vec4(lensPos, LIGHT_SPOT);
+        spotLight.normal = glm::vec4(spotDir, 0.0f);
+        spotLight.u = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(15.0f)));
+        spotLight.v = glm::vec4(0.0f, 0.0f, 0.0f, std::cos(glm::radians(24.0f)));
+        spotLight.emission = emission;
+        scene.lights.push_back(spotLight);
+        recordRange("StandingSpot_" + name, tStart);
+    };
 
-    // 4. Center Runway Sculptures
+    // 4. Center Runway Sculptures (Spacious 3.5m rhythmic spacing from Z = -7.0 to +10.0)
 
     auto addPedestal = [&](float x, float z, const std::string& name) {
         tStart = static_cast<uint32_t>(scene.triangles.size());
@@ -3016,46 +3006,40 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
         recordRange("Pedestal_" + name, tStart);
     };
 
-    // Item 1: Red Sphere (Z = -6.0)
-    addPedestal(0.0f, -6.0f, "RedSphere_1");
+    // Item 1: Red Sphere (Z = -7.0)
+    addPedestal(0.0f, -7.0f, "RedSphere_1");
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, -6.0f), 0.42f, 5, 32, 32);
+    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, -7.0f), 0.42f, 5, 32, 32);
     recordRange("Art_RedSphere_1", tStart);
 
     // Item 2: Pedestal for Rotating Reflective Torus (Z = -3.5)
     addPedestal(0.0f, -3.5f, "ReflectiveTorus_1");
 
-    // Item 3: Yellow Cube (Z = -1.0)
-    addPedestal(0.0f, -1.0f, "YellowCube_1");
+    // Item 3: Yellow Cube (Z = 0.0)
+    addPedestal(0.0f, 0.0f, "YellowCube_1");
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addBox(scene.triangles, glm::vec3(0.0f, pedH + 0.35f, -1.0f), glm::vec3(0.70f, 0.70f, 0.70f), 25.0f, 7);
+    addBox(scene.triangles, glm::vec3(0.0f, pedH + 0.35f, 0.0f), glm::vec3(0.70f, 0.70f, 0.70f), 25.0f, 7);
     recordRange("Art_YellowCube_1", tStart);
 
-    // Item 4: Blue Cylinder (Z = 1.5)
-    addPedestal(0.0f, 1.5f, "BlueCyl_1");
+    // Item 4: Glass Sphere / Crystal (Z = 3.5)
+    addPedestal(0.0f, 3.5f, "GlassSphere");
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addCylinder(scene.triangles, glm::vec3(0.0f, pedH + 0.85f * 0.5f, 1.5f), 0.34f, 0.85f, 8, 28);
-    recordRange("Art_BlueCyl_1", tStart);
-
-    // Item 5: Glass Sphere / Crystal (Z = 4.0)
-    addPedestal(0.0f, 4.0f, "GlassSphere");
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, 4.0f), 0.42f, 11, 32, 32);
+    addSphere(scene.triangles, glm::vec3(0.0f, pedH + 0.42f, 3.5f), 0.42f, 11, 32, 32);
     recordRange("Art_GlassSphere", tStart);
 
-    // Item 6: Green Torus (Z = 6.5)
-    addPedestal(0.0f, 6.5f, "GreenTorus_2");
+    // Item 5: Blue Cylinder (Z = 7.0)
+    addPedestal(0.0f, 7.0f, "BlueCyl_1");
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addTorus(scene.triangles, glm::vec3(0.0f, pedH + 0.45f, 6.5f), 0.40f, 0.13f, 6, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
+    addCylinder(scene.triangles, glm::vec3(0.0f, pedH + 0.85f * 0.5f, 7.0f), 0.34f, 0.85f, 8, 28);
+    recordRange("Art_BlueCyl_1", tStart);
+
+    // Item 6: Green Torus (Z = 10.0)
+    addPedestal(0.0f, 10.0f, "GreenTorus_2");
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    addTorus(scene.triangles, glm::vec3(0.0f, pedH + 0.45f, 10.0f), 0.40f, 0.13f, 6, 40, 20, glm::vec3(0.0f, 0.0f, 1.0f));
     recordRange("Art_GreenTorus_2", tStart);
 
-    // Item 7: Yellow Cube (Z = 9.0)
-    addPedestal(0.0f, 9.0f, "YellowCube_2");
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    addBox(scene.triangles, glm::vec3(0.0f, pedH + 0.35f, 9.0f), glm::vec3(0.70f, 0.70f, 0.70f), 25.0f, 7);
-    recordRange("Art_YellowCube_2", tStart);
-
-    // 5. Off-Axis Accent Sculptures
+    // 5. Off-Axis Accent Sculptures & Standing Spotlight Luminaires
     // Right (screen-right): Prominent Polished Chrome Mirror Sphere (X = -1.3, Z = -5.0)
     tStart = static_cast<uint32_t>(scene.triangles.size());
     addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, -5.0f), 0.50f, pedH, 9, 28);
@@ -3065,26 +3049,54 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.0f), 0.70f, 3, 48, 48);
     recordRange("Art_ChromeSphere", tStart);
 
-    // Right Midground: Pedestal & Emissive Area Light for Gold Accent Ring (X = -1.3, Z = 0.25)
+    // Left Mid-Foreground: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -1.5)
+    tStart = static_cast<uint32_t>(scene.triangles.size());
+    // Glowing base plinth at floor level (Ice blue neon trim)
+    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -1.5f), 0.48f, 0.03f, 13 /* matNeon */, 28);
+    // Dark pedestal column
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -1.5f), 0.44f, pedH, 9 /* matPed */, 24);
+    // Metallic bezel platform
+    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -1.5f), 0.40f, 0.01f, 1 /* matFrame */, 24);
+
+    // Support cradle fork arms elevating the gimbal
+    const glm::vec3 gyroPos(1.3f, pedH + 0.52f, -1.5f);
+    const float forkSpan = 0.48f;
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.01f, -1.5f),
+            glm::vec3(1.3f - forkSpan, gyroPos.y, -1.5f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f + forkSpan, pedH + 0.01f, -1.5f),
+            glm::vec3(1.3f + forkSpan, gyroPos.y, -1.5f), 0.03f, 0.045f, 1 /* matFrame */);
+    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.02f, -1.5f),
+            glm::vec3(1.3f + forkSpan, pedH + 0.02f, -1.5f), 0.04f, 0.035f, 1 /* matFrame */);
+
+    // Gold gimbal pivot bearing nodes
+    addSphere(scene.triangles, glm::vec3(1.3f - forkSpan, gyroPos.y, -1.5f), 0.035f, 4 /* matGold */, 16, 16);
+    addSphere(scene.triangles, glm::vec3(1.3f + forkSpan, gyroPos.y, -1.5f), 0.035f, 4 /* matGold */, 16, 16);
+    recordRange("Pedestal_Gyroscope", tStart);
+
+    // Architectural Freestanding Spotlight illuminating the Multi-Ring Gyroscope
+    addStandingSpotlight(glm::vec3(1.60f, 0.0f, -2.10f), gyroPos,
+                         glm::vec4(175.0f, 180.0f, 205.0f, 1.0f), "Gyroscope");
+
+    // Right Midground: Pedestal & Emissive Area Light for Gold Accent Ring (X = -1.3, Z = 1.75)
     tStart = static_cast<uint32_t>(scene.triangles.size());
     // Glowing base plinth at floor level
-    addCylinder(scene.triangles, glm::vec3(-1.3f, 0.015f, 0.25f), 0.44f, 0.03f, 12 /* matGoldLight */, 28);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, 0.015f, 1.75f), 0.44f, 0.03f, 12 /* matGoldLight */, 28);
     // Dark pedestal column
-    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, 0.25f), 0.40f, pedH, 9, 24);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, 1.75f), 0.40f, pedH, 9, 24);
     // Luminaire fixture bezel atop platform
-    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH + 0.005f, 0.25f), 0.34f, 0.01f, 1 /* matFrame */, 24);
+    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH + 0.005f, 1.75f), 0.34f, 0.01f, 1 /* matFrame */, 24);
     // Emissive area light pad directly underneath the gold torus (facing +Y upwards)
     const float goldLightPadW = 0.22f; // 44cm x 44cm square area emitter
     addQuad(scene.triangles,
-            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 0.25f - goldLightPadW),
-            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 0.25f - goldLightPadW),
-            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 0.25f + goldLightPadW),
-            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 0.25f + goldLightPadW),
+            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 1.75f - goldLightPadW),
+            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 1.75f - goldLightPadW),
+            glm::vec3(-1.3f + goldLightPadW, pedH + 0.011f, 1.75f + goldLightPadW),
+            glm::vec3(-1.3f - goldLightPadW, pedH + 0.011f, 1.75f + goldLightPadW),
             glm::vec3(0.0f, 1.0f, 0.0f), 12 /* matGoldLight */);
 
     // Analytical LightGPU: Upward-facing warm amber/golden area light quad illuminating the gold torus
     LightGPU goldLight{};
-    goldLight.position = glm::vec4(-1.3f - goldLightPadW, pedH + 0.012f, 0.25f - goldLightPadW, LIGHT_AREA_QUAD);
+    goldLight.position = glm::vec4(-1.3f - goldLightPadW, pedH + 0.012f, 1.75f - goldLightPadW, LIGHT_AREA_QUAD);
     goldLight.u = glm::vec4(2.0f * goldLightPadW, 0.0f, 0.0f, 0.0f);
     goldLight.v = glm::vec4(0.0f, 0.0f, 2.0f * goldLightPadW, 0.0f);
     goldLight.normal = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
@@ -3092,29 +3104,9 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     scene.lights.push_back(goldLight);
     recordRange("Pedestal_GoldRing", tStart);
 
-    // Left Foreground: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -2.2)
-    tStart = static_cast<uint32_t>(scene.triangles.size());
-    // Glowing base plinth at floor level (Ice blue neon trim)
-    addCylinder(scene.triangles, glm::vec3(1.3f, 0.015f, -2.2f), 0.48f, 0.03f, 13 /* matNeon */, 28);
-    // Dark pedestal column
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH * 0.5f, -2.2f), 0.44f, pedH, 9 /* matPed */, 24);
-    // Metallic bezel platform
-    addCylinder(scene.triangles, glm::vec3(1.3f, pedH + 0.005f, -2.2f), 0.40f, 0.01f, 1 /* matFrame */, 24);
-
-    // Support cradle fork arms elevating the gimbal
-    const glm::vec3 gyroPos(1.3f, pedH + 0.52f, -2.2f);
-    const float forkSpan = 0.48f;
-    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.01f, -2.2f),
-            glm::vec3(1.3f - forkSpan, gyroPos.y, -2.2f), 0.03f, 0.045f, 1 /* matFrame */);
-    addBeam(scene.triangles, glm::vec3(1.3f + forkSpan, pedH + 0.01f, -2.2f),
-            glm::vec3(1.3f + forkSpan, gyroPos.y, -2.2f), 0.03f, 0.045f, 1 /* matFrame */);
-    addBeam(scene.triangles, glm::vec3(1.3f - forkSpan, pedH + 0.02f, -2.2f),
-            glm::vec3(1.3f + forkSpan, pedH + 0.02f, -2.2f), 0.04f, 0.035f, 1 /* matFrame */);
-
-    // Gold gimbal pivot bearing nodes
-    addSphere(scene.triangles, glm::vec3(1.3f - forkSpan, gyroPos.y, -2.2f), 0.035f, 4 /* matGold */, 16, 16);
-    addSphere(scene.triangles, glm::vec3(1.3f + forkSpan, gyroPos.y, -2.2f), 0.035f, 4 /* matGold */, 16, 16);
-    recordRange("Pedestal_Gyroscope", tStart);
+    // Architectural Freestanding Spotlight illuminating the Glass Crystal Sphere for Caustics
+    addStandingSpotlight(glm::vec3(-1.60f, 0.0f, 2.80f), glm::vec3(0.0f, pedH + 0.42f, 3.5f),
+                         glm::vec4(140.0f, 145.0f, 165.0f, 1.0f), "GlassSphere");
 
     // =========================================================================
     // 6. BLAS Geometry Prototypes & Hardware TLAS Instancing
@@ -3225,8 +3217,8 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animTorus.baseTransform = baseTilt;
     scene.animatedInstances.push_back(animTorus);
 
-    // Instance 2: Gold Torus atop Pedestal (X = -1.3, Z = 0.25)
-    glm::vec3 goldTorusPos(-1.3f, pedH + 0.42f, 0.25f);
+    // Instance 2: Gold Torus atop Pedestal (X = -1.3, Z = 1.75)
+    glm::vec3 goldTorusPos(-1.3f, pedH + 0.42f, 1.75f);
     glm::mat4 goldInitialTransform = glm::translate(glm::mat4(1.0f), goldTorusPos);
 
     SceneInstance instGoldTorus{};
@@ -3251,7 +3243,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGoldTorus.baseTransform = glm::mat4(1.0f);
     scene.animatedInstances.push_back(animGoldTorus);
 
-    // Instance 3: Gyroscope Outer Ring (X = 1.3, Z = -2.2)
+    // Instance 3: Gyroscope Outer Ring (X = 1.3, Z = -1.5)
     SceneInstance instGyroOuter{};
     instGyroOuter.blasIndex = 3;
     instGyroOuter.transform = glm::translate(glm::mat4(1.0f), gyroPos);
@@ -3273,7 +3265,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGyroOuter.baseTransform = glm::mat4(1.0f);
     scene.animatedInstances.push_back(animGyroOuter);
 
-    // Instance 4: Gyroscope Middle Ring (X = 1.3, Z = -2.2)
+    // Instance 4: Gyroscope Middle Ring (X = 1.3, Z = -1.5)
     glm::mat4 midInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(35.0f), glm::vec3(0.0f, 0.0f, 1.0f));
     SceneInstance instGyroMid{};
     instGyroMid.blasIndex = 4;
@@ -3296,7 +3288,7 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     animGyroMid.baseTransform = midInitialTilt;
     scene.animatedInstances.push_back(animGyroMid);
 
-    // Instance 5: Gyroscope Inner Ring & Core (X = 1.3, Z = -2.2)
+    // Instance 5: Gyroscope Inner Ring & Core (X = 1.3, Z = -1.5)
     glm::vec3 innerAxis = glm::normalize(glm::vec3(0.0f, 0.7071f, 0.7071f));
     glm::mat4 innerInitialTilt = glm::rotate(glm::mat4(1.0f), glm::radians(-25.0f), glm::vec3(1.0f, 0.0f, 0.0f));
     SceneInstance instGyroInner{};
@@ -3338,8 +3330,8 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     scene.centralTarget = glm::vec3(0.0f, 1.2f, 0.0f);
 
     scene.hasDielectrics = true;
-    scene.dielectricBoundsMin = glm::vec3(-0.5f, 0.2f, 3.5f);
-    scene.dielectricBoundsMax = glm::vec3(0.5f, 1.1f, 4.5f);
+    scene.dielectricBoundsMin = glm::vec3(-0.5f, 0.2f, 3.0f);
+    scene.dielectricBoundsMax = glm::vec3(0.5f, 1.1f, 4.0f);
 
     return scene;
 }
