@@ -248,27 +248,29 @@ bool PresentationManager::recordPresentation(
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
     );
 
-    // Transition swapImage to COLOR_ATTACHMENT_OPTIMAL for ImGui
-    VkImageMemoryBarrier2 toColor{};
-    toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    toColor.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    toColor.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toColor.image = swapImage;
-    toColor.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo depToColor{};
-    depToColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    depToColor.imageMemoryBarrierCount = 1;
-    depToColor.pImageMemoryBarriers = &toColor;
-    vkCmdPipelineBarrier2(cmd, &depToColor);
-
     bool resetAccum = false;
-    // Render ImGui overlay
-    if (gui) {
+    const bool hasGui = (gui != nullptr && config.enable_gui);
+
+    if (hasGui) {
+        // Transition swapImage to COLOR_ATTACHMENT_OPTIMAL for ImGui
+        VkImageMemoryBarrier2 toColor{};
+        toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toColor.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toColor.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toColor.image = swapImage;
+        toColor.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        VkDependencyInfo depToColor{};
+        depToColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depToColor.imageMemoryBarrierCount = 1;
+        depToColor.pImageMemoryBarriers = &toColor;
+        vkCmdPipelineBarrier2(cmd, &depToColor);
+
+        // Render ImGui overlay
         gui->newFrame();
         bool camMode = isCameraActive;
         if (gui->render(cmd, swapView, m_swapchain->getExtent().width, m_swapchain->getExtent().height,
@@ -285,11 +287,11 @@ bool PresentationManager::recordPresentation(
     if (!config.dump_ui_path.empty()) {
         VkImageMemoryBarrier2 toSrc{};
         toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        toSrc.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        toSrc.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toSrc.srcStageMask = hasGui ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toSrc.srcAccessMask = hasGui ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT;
         toSrc.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         toSrc.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-        toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toSrc.oldLayout = hasGui ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         toSrc.image = swapImage;
         toSrc.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -333,11 +335,11 @@ bool PresentationManager::recordPresentation(
     } else {
         VkImageMemoryBarrier2 toPresent{};
         toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toPresent.srcStageMask = hasGui ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toPresent.srcAccessMask = hasGui ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT;
         toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
         toPresent.dstAccessMask = VK_ACCESS_2_NONE;
-        toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toPresent.oldLayout = hasGui ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         toPresent.image = swapImage;
         toPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };

@@ -131,6 +131,18 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return false;
     }
 
+    // 0. F1 key: toggle GUI overlay visibility (intercepted first so ImGui never swallows F1)
+    if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F1 && !e.key.repeat) {
+        Logger::info("Received SDLK_F1 -> toggling GUI overlay visibility.");
+        if (m_onToggleGui) {
+            m_onToggleGui();
+        }
+        return true;
+    }
+    if (e.type == SDL_EVENT_KEY_UP && e.key.key == SDLK_F1) {
+        return true;
+    }
+
     // 1. F11 key: toggle fullscreen (intercepted first so ImGui never swallows F11)
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F11 && !e.key.repeat) {
         Logger::info("Received SDLK_F11 -> queueing fullscreen toggle.");
@@ -162,7 +174,7 @@ bool InputController::handleEvent(const SDL_Event& e) {
                 setCameraMode(false);
             }
         }
-        if (m_gui) {
+        if (m_gui && m_config.enable_gui) {
             m_gui->processEvent(e);
         }
         return false;
@@ -198,14 +210,14 @@ bool InputController::handleEvent(const SDL_Event& e) {
     // 6. Gamepad Hotplug Events (Universal across UI and Camera modes)
     if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
         handleGamepadAdded(e.gdevice.which);
-        if (m_gui) {
+        if (m_gui && m_config.enable_gui) {
             m_gui->processEvent(e);
         }
         return true;
     }
     if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
         handleGamepadRemoved(e.gdevice.which);
-        if (m_gui) {
+        if (m_gui && m_config.enable_gui) {
             m_gui->processEvent(e);
         }
         return true;
@@ -328,8 +340,8 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return false;
     }
 
-    // 9. In UI Mode: route events to ImGui
-    if (m_gui) {
+    // 9. In UI Mode: route events to ImGui if GUI is enabled
+    if (m_gui && m_config.enable_gui) {
         // Forward all events to Dear ImGui first so it maintains accurate input state and hover tracking
         m_gui->processEvent(e);
 
@@ -364,6 +376,26 @@ bool InputController::handleEvent(const SDL_Event& e) {
         }
 
         if (m_gui->wantCaptureMouse() || m_gui->wantCaptureKeyboard()) {
+            return true;
+        }
+    } else {
+        // GUI overlay disabled/hidden: handle camera speed and click-to-navigate directly
+        if (e.type == SDL_EVENT_MOUSE_WHEEL) {
+            if (m_camera) {
+                float wheelY = e.wheel.y;
+                if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+                    wheelY = -wheelY;
+                }
+                m_camera->adjustSpeedByWheel(wheelY);
+            }
+            return true;
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
+            setCameraMode(true);
+            return true;
+        }
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
+            setCameraMode(true);
             return true;
         }
     }

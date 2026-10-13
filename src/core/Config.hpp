@@ -151,6 +151,7 @@ struct Config {
     bool benchmark = false;
     bool validation_layers = true;
     bool aces_tonemap = true;
+    bool enable_gui = true;              // Show Dear ImGui HUD & control panel overlay [Default: true, disable with --no-gui]
     // High Dynamic Range (HDR) Display
     bool enable_hdr = true;              // Auto-negotiate HDR display formats (scRGB Linear / HDR10 PQ) [Default: true]
     float hdr_peak_nits = 1000.0f;       // Display peak luminance in cd/m^2 (nits) [Default: 1000.0]

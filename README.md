@@ -158,6 +158,7 @@ Load any OpenUSD stage (`.usd`, `.usdc`, `.usda`), glTF 2.0 model (`.glb`, `.glt
 | **Triangle △ / Y** | Level camera pitch to horizon |
 | **D-Pad / Left Stick** (UI Mode) | Navigate Dear ImGui menu controls and sliders |
 | **Cross ✕ / A** (UI Mode) | Activate UI widget / Enter 3D scene navigation if clicked on viewport |
+| **F1** | Toggle GUI overlay visibility (Dear ImGui HUD & Control Panel) |
 | **F11** | Toggle Fullscreen |
 | **ESC** | Return to UI mode from FPS camera navigation (or exit if in UI) |
 | **Alt+F4 / ESC** | Exit Pathways |
@@ -271,6 +272,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--width`, `--height` | `<int>` | Explicit viewport dimensions in pixels | Native display |
 | `--fullscreen` | *(flag)* | Launch in fullscreen mode | Fullscreen (default) |
 | `--windowed` | *(flag)* | Launch in windowed mode (`--no-fullscreen`) | Fullscreen |
+| `--no-gui` | *(flag)* | Disable Dear ImGui HUD and control panel overlay | Overlay enabled |
 | `--spp` | `<int>` | Samples per pixel accumulated per frame | `1` |
 | `--max-bounces` | `<int>` | Maximum path depth / ray bounces (or `--bounces`) | `4` |
 | `--no-accumulation` | *(flag)* | Disable progressive static accumulation (evaluate real-time noise; `--realtime`) | Accumulation on |
@@ -470,4 +472,6 @@ Pathways maintains an extensive documentation directory in [`docs/`](docs/):
 - [AMD RDNA4 Instruction Set Architecture (ISA)](https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture)
 - [AMD RDNA Performance Guide](https://gpuopen.com/learn/rdna-performance-guide/)
 - [Improving Ray Tracing Performance with RRA](https://gpuopen.com/learn/improving-rt-perf-with-rra/)
-
+- https://www.lalber.org/2025/06/percentile-based-adaptive-svgf/
+- https://www.mysimulator.uk/content/articles/realtime-denoising.html
+- https://www.sciencedirect.com/science/article/pii/S1524070325000487

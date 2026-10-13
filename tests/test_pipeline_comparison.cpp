@@ -122,6 +122,24 @@ int main() {
         Config cRestir = Config::parse(2, const_cast<char**>(argvRestir));
         check_true(cRestir.enable_restir, "--restir enables unified ReSTIR PT");
 
+        // GUI overlay toggle verification
+        check_true(cfgDef.enable_gui, "Default enable_gui must be true");
+        const char* argvNoGui[] = { "pathways", "--no-gui" };
+        Config cNoGui = Config::parse(2, const_cast<char**>(argvNoGui));
+        check_true(!cNoGui.enable_gui, "--no-gui disables GUI overlay");
+
+        const char* argvNoUi[] = { "pathways", "--no-ui" };
+        Config cNoUi = Config::parse(2, const_cast<char**>(argvNoUi));
+        check_true(!cNoUi.enable_gui, "--no-ui disables GUI overlay");
+
+        const char* argvNoOverlay[] = { "pathways", "--no-overlay" };
+        Config cNoOverlay = Config::parse(2, const_cast<char**>(argvNoOverlay));
+        check_true(!cNoOverlay.enable_gui, "--no-overlay disables GUI overlay");
+
+        const char* argvGui[] = { "pathways", "--no-gui", "--gui" };
+        Config cGui = Config::parse(3, const_cast<char**>(argvGui));
+        check_true(cGui.enable_gui, "--gui re-enables GUI overlay");
+
         const char* argvDbgView[] = { "pathways", "--debug-view", "restir-m" };
         Config cDbgView = Config::parse(3, const_cast<char**>(argvDbgView));
         check_true(cDbgView.debug_view == DebugViewMode::RestirM, "--debug-view restir-m sets DebugViewMode::RestirM");

@@ -262,6 +262,7 @@ void Config::printUsage(const char* progName) {
               << "  --headless              Run in headless offscreen mode (no window)\n"
               << "  --fullscreen            Run in fullscreen mode [default]\n"
               << "  --windowed              Run in windowed / non-fullscreen mode\n"
+              << "  --no-gui                Disable Dear ImGui HUD and control panel overlay\n"
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
               << "  --height <int>          Viewport height in pixels (default: native display, or 2160 in headless)\n"
@@ -419,6 +420,14 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--windowed" || arg == "--no-fullscreen") {
             cfg.fullscreen = false;
             fullscreen_explicit = true;
+            continue;
+        }
+        if (arg == "--no-gui" || arg == "--disable-gui" || arg == "--no-ui" || arg == "--no-overlay") {
+            cfg.enable_gui = false;
+            continue;
+        }
+        if (arg == "--gui" || arg == "--enable-gui") {
+            cfg.enable_gui = true;
             continue;
         }
         if ((arg == "-r" || arg == "--res" || arg == "--resolution") && i + 1 < argc) {

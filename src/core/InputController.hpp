@@ -38,6 +38,7 @@ public:
     }
     void setFullscreenToggleCallback(std::function<void()> cb) { m_onToggleFullscreen = std::move(cb); }
     void setScreenshotCallback(std::function<void()> cb) { m_onScreenshot = std::move(cb); }
+    void setGuiToggleCallback(std::function<void()> cb) { m_onToggleGui = std::move(cb); }
 
     /**
      * @brief Process an incoming SDL event.
@@ -73,6 +74,7 @@ private:
     float m_focalRadius = 1.0f;
     std::function<void()> m_onToggleFullscreen;
     std::function<void()> m_onScreenshot;
+    std::function<void()> m_onToggleGui;
 
     bool m_cameraMode = false;
 

@@ -175,8 +175,15 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_inputController->setScreenshotCallback([this]() {
         m_pendingScreenshot = true;
     });
+    m_inputController->setGuiToggleCallback([this]() {
+        m_config.enable_gui = !m_config.enable_gui;
+        Logger::info("GUI Overlay: {}", m_config.enable_gui ? "ENABLED" : "DISABLED");
+    });
     if (!m_config.headless && m_swapchain) {
         m_inputController->init();
+        if (!m_config.enable_gui) {
+            m_inputController->setCameraMode(true);
+        }
     }
 
     m_hwMonitor = std::make_unique<HwMonitor>(m_context.get(), [this]() -> VulkanContext* {
