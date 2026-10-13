@@ -343,7 +343,7 @@ void main() {
                 queueCounters.currentMaterialCounts[3] = emisCnt;
 
                 uint totalRays = stdCnt + compCnt + dielCnt + emisCnt;
-                bool skipNextBounce = (pc.minRayThreshold > 0u && totalRays <= pc.minRayThreshold);
+                bool skipNextBounce = (b > 0u && pc.minRayThreshold > 0u && totalRays <= pc.minRayThreshold);
 
                 uint stdGroups  = skipNextBounce ? 0u : ((stdCnt + 31u) / 32u);
                 uint compGroups = skipNextBounce ? 0u : ((compCnt + 31u) / 32u);

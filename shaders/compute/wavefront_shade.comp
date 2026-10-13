@@ -847,7 +847,7 @@ void main() {
             dgcStream.bounceDGC[b].shadowCmd.z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            bool skipNextBounce = (pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            bool skipNextBounce = (b > 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
             uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
             indirect.bounceDispatches[b].intersectDispatch.x = intersectGroups;
             indirect.bounceDispatches[b].intersectDispatch.y = 1u;

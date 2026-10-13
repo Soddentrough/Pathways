@@ -895,7 +895,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         uint32_t totalPrimaryRays = fw * fh;
         uint32_t batchPixels = curBatchW * curBatchH;
         uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
-            ? std::min(batchPixels > 0 ? batchPixels - 1u : 0u, static_cast<uint32_t>(std::round(totalPrimaryRays * sceneData.earlyBounceCutoffThreshold))) : 0u;
+            ? std::min(batchPixels > 0 ? batchPixels - 1u : 0u, static_cast<uint32_t>(std::round(batchPixels * sceneData.earlyBounceCutoffThreshold))) : 0u;
 
         // 4. Multi-Bounce Loop for this Frame
         for (uint32_t b = 0; b < cutoffBounce; ++b) {
@@ -1414,6 +1414,7 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     for (uint32_t b = 0; b < effectiveBounces; ++b) {
         BounceProfilingData bp{};
         bp.bounce = b;
+        uint32_t totalIntersectGroups = 0;
 
         for (uint32_t batch = 0; batch < numBatches; ++batch) {
             uint32_t batchQueryOffset = 1u + batch * queriesPerBatch;
@@ -1445,15 +1446,20 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
                     bp.emisCount += matDispatches[b].emisCount;
                     bp.shadowCount += matDispatches[b].shadowCount;
                     if (m_secondarySortMode == 1) {
-                        for (int k = 0; k < 8; ++k) bp.nextCount += matDispatches[b].octants[k].count;
+                        for (int k = 0; k < 8; ++k) {
+                            bp.nextCount += matDispatches[b].octants[k].count;
+                            totalIntersectGroups += matDispatches[b].octants[k].x;
+                        }
                     } else {
                         bp.nextCount += matDispatches[b].nextCount;
+                        totalIntersectGroups += matDispatches[b].intersectX;
                     }
                 } else {
                     const BounceDispatchCPU* dispatches = reinterpret_cast<const BounceDispatchCPU*>(pSlice);
                     bp.activeCount += dispatches[b].activeCount;
                     bp.shadowCount += dispatches[b].shadowCount;
                     bp.nextCount += dispatches[b].nextCount;
+                    totalIntersectGroups += dispatches[b].intersectX;
                 }
             }
         }
@@ -1464,7 +1470,11 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
             bp.diffCount = bp.activeCount;
         }
 
-        bp.bounceTotalMs = bp.shadeMs + bp.shadowMs + bp.intersectMs + bp.gapBeforeShadeMs + bp.gapBeforeShadowMs + bp.gapBeforeIntersectMs;
+        if (pMapped && totalIntersectGroups == 0 && (b + 1 < effectiveBounces)) {
+            bp.intersectMs = -1.0;
+        }
+        double validIntersectMs = (bp.intersectMs >= 0.0) ? bp.intersectMs : 0.0;
+        bp.bounceTotalMs = bp.shadeMs + bp.shadowMs + validIntersectMs + bp.gapBeforeShadeMs + bp.gapBeforeShadowMs + bp.gapBeforeIntersectMs;
 
         if (b > 0 && bp.activeCount == 0 && bp.shadowCount == 0 && bp.nextCount == 0) {
             break;

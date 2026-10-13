@@ -534,7 +534,7 @@ void main() {
             dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            bool skipNextBounce = (pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            bool skipNextBounce = (b > 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
             uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
 
             // Slot 7: Standard monolithic / Option 2 intersect dispatch
