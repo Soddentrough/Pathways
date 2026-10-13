@@ -332,8 +332,8 @@ void Config::printUsage(const char* progName) {
               << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
-              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (In-House ReLAX/A-SVGF) or 'none' [default: none]\n"
-              << "  --relax, --svgf, --asvgf Shortcut to enable In-House ReLAX / A-SVGF real-time denoiser\n\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (Adaptive Edge-Aware SVGF, 5-dispatch dilated E-SVGF) or 'none' [default: none]\n"
+              << "  --relax, --svgf, --asvgf Shortcut to enable the Adaptive E-SVGF real-time denoiser\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -827,7 +827,7 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf") {
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
                 cfg.upways_superres = false;
@@ -838,14 +838,14 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, or none.", mode);
             }
             continue;
         }
         if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf") {
+            if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
                 cfg.upways_superres = false;
@@ -856,7 +856,7 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, or none.", mode);
             }
             continue;
         }
@@ -937,7 +937,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.denoiser_mode = DenoiserMode::Upways;
             continue;
         }
-        if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf") {
+        if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf" || arg == "--esvgf") {
             cfg.denoiser_mode = DenoiserMode::Svgf;
             continue;
         }

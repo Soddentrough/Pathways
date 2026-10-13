@@ -407,6 +407,12 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"pcie_transfer_time_ms\": {:.3f}\n", stats.pcie_transfer_time_ms)
         << "    },\n";
 
+    out << "    \"denoise_pass_ms\": ["
+        << std::format("{:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}],\n",
+                       stats.denoise_pass_ms[0], stats.denoise_pass_ms[1], stats.denoise_pass_ms[2],
+                       stats.denoise_pass_ms[3], stats.denoise_pass_ms[4])
+        << "    \"denoise_pass_names\": [\"fusedTemporal\", \"atrousStep1\", \"atrousStep2\", \"atrousStep3\", \"coarseRemodulate\"],\n";
+
     if (stats.wavefront_stats.valid) {
         out << "    \"wavefront_profiler_breakdown\": {\n"
             << std::format("      \"total_wavefront_time_ms\": {:.3f},\n", stats.wavefront_stats.total_ms)

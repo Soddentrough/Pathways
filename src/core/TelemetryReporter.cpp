@@ -402,6 +402,10 @@ FrameStats TelemetryReporter::getStats() const {
     stats.secondary_gpu_time_ms = m_engine->m_lastSecGpuMs;
     stats.tonemap_time_ms = m_engine->m_lastTonemapMs;
     stats.upways_time_ms = m_engine->m_lastUpwaysMs;
+    if (m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
+        const auto& passMs = m_engine->m_denoiser->getPassTimingsMs();
+        for (int p = 0; p < 5; ++p) stats.denoise_pass_ms[p] = passMs[p];
+    }
     stats.num_triangles = m_engine->m_numTriangles;
     stats.num_instanced_triangles = m_engine->m_numInstancedTriangles;
     stats.num_instances = m_engine->m_numInstances;

@@ -3040,13 +3040,13 @@ SceneData ProceduralScene::createInfinityMirrorScene() {
     recordRange("Art_GreenTorus_2", tStart);
 
     // 5. Off-Axis Accent Sculptures & Standing Spotlight Luminaires
-    // Right (screen-right): Prominent Polished Chrome Mirror Sphere (X = -1.3, Z = -5.0)
+    // Right (screen-right): Prominent Polished Chrome Mirror Sphere (X = -0.92, Z = -5.0)
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addCylinder(scene.triangles, glm::vec3(-1.3f, pedH * 0.5f, -5.0f), 0.50f, pedH, 9, 28);
+    addCylinder(scene.triangles, glm::vec3(-0.92f, pedH * 0.5f, -5.0f), 0.50f, pedH, 9, 28);
     recordRange("Pedestal_ChromeSphere", tStart);
 
     tStart = static_cast<uint32_t>(scene.triangles.size());
-    addSphere(scene.triangles, glm::vec3(-1.3f, pedH + 0.70f, -5.0f), 0.70f, 3, 48, 48);
+    addSphere(scene.triangles, glm::vec3(-0.92f, pedH + 0.70f, -5.0f), 0.70f, 3, 48, 48);
     recordRange("Art_ChromeSphere", tStart);
 
     // Left Mid-Foreground: Pedestal & Precision Gimbal Fork for Multi-Ring Gyroscopic Sculpture (X = 1.3, Z = -1.5)

@@ -48,7 +48,8 @@ enum class SecondarySortMode {
 enum class DenoiserMode {
     None,     // Raw stochastic path traced output (unfiltered progressive)
     Upways,   // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    Svgf      // ReLAX / A-SVGF Spatio-Temporal Variance-Guided Filtering
+    Svgf      // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
+            //         (docs/design/adaptive_svgf_denoiser_proposal.md)
 };
 
 // EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and

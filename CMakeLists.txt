@@ -173,6 +173,11 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/denoise_variance.comp
     ${SHADER_DIR}/compute/denoise_atrous.comp
     ${SHADER_DIR}/compute/denoise_remodulate.comp
+    ${SHADER_DIR}/compute/denoise_fused_temporal.comp
+    ${SHADER_DIR}/compute/denoise_atrous_step1.comp
+    ${SHADER_DIR}/compute/denoise_atrous_step2.comp
+    ${SHADER_DIR}/compute/denoise_atrous_step3.comp
+    ${SHADER_DIR}/compute/denoise_atrous_coarse_remodulate.comp
     ${SHADER_DIR}/rt/raytrace.rgen
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
@@ -607,6 +612,21 @@ target_include_directories(test_upways_pipeline PRIVATE
 target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
 add_dependencies(test_upways_pipeline package_upways_weights)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
+
+
+# Adaptive E-SVGF Denoiser Pipeline Contract Test (5-Dispatch Dilated Architecture)
+add_executable(test_denoiser_pipeline
+    tests/test_denoiser_pipeline.cpp
+)
+target_compile_definitions(test_denoiser_pipeline PRIVATE
+    PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
+)
+target_include_directories(test_denoiser_pipeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+)
+target_link_libraries(test_denoiser_pipeline PRIVATE Vulkan::Vulkan)
+add_test(NAME DenoiserPipeline COMMAND test_denoiser_pipeline)
 
 # ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
 add_executable(test_restir_pt_math

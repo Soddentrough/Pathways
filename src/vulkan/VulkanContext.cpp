@@ -675,6 +675,8 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     requireFeat(feat2.features.shaderInt64, "Vulkan 1.0: shaderInt64");
     requireFeat(feat2.features.shaderStorageImageWriteWithoutFormat, "Vulkan 1.0: shaderStorageImageWriteWithoutFormat");
     requireFeat(feat2.features.shaderStorageImageReadWithoutFormat, "Vulkan 1.0: shaderStorageImageReadWithoutFormat");
+    // Required for VK_FORMAT_R8G8_UNORM dual-channel edge density storage images (E-SVGF)
+    requireFeat(feat2.features.shaderStorageImageExtendedFormats, "Vulkan 1.0: shaderStorageImageExtendedFormats");
 
     // Hardware Ray Tracing Features
     requireFeat(featAS.accelerationStructure, "Ray Tracing: accelerationStructure");
@@ -1065,6 +1067,8 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    // E-SVGF denoiser writes dual-channel edge density to VK_FORMAT_R8G8_UNORM storage images
+    deviceFeatures2.features.shaderStorageImageExtendedFormats = VK_TRUE;
     deviceFeatures2.pNext = &features11;
 
     VkDeviceCreateInfo deviceCreateInfo{};

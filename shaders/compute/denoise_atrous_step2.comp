@@ -1,0 +1,71 @@
+#version 460
+
+// =============================================================================
+// PASS 3: Fine-Scale Wavelet Iteration 2 (s = 2, accumulated radius 6,
+//         accumulated diameter 13, covering Fu et al. k = 9)
+// Reference: docs/design/adaptive_svgf_denoiser_proposal.md Section 4.2 / Pass 3
+//
+//  * Dense edge pixels (rho_effective >= 0.55) obtain their COMPLETE spatial
+//    filtering here (50 taps total) and bypass subsequent filtering taps in
+//    Passes 4 and 5. This dispatch itself filters all pixels uniformly.
+//  * Filters radiance AND variance (w^2) alongside each other
+// =============================================================================
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInDiffuse;    // from m_pingPongDiffuse[0]
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uInSpecular;   // from m_pingPongSpecular[0]
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughness;
+layout(set = 0, binding = 4, rg8) readonly uniform image2D uEdgeDensity;  // G: rho_effective (reserved for adaptive masking)
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D uOutDiffuse;  // -> m_pingPongDiffuse[1]
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D uOutSpecular; 
+
+#include "denoise_atrous_common.glsl"
+
+// -> m_pingPongSpecular[1]
+
+layout(push_constant) uniform AtrousPushConstants {
+    uint  width;
+    uint  height;
+    int   stepSize;          // 2
+    float phiNormal;         // 32.0
+    float phiPlaneDepth;     // 2.00
+    float phiLuminance;      // 4.00
+    float tanHalfFovY;
+    float aspectRatio;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    vec4 nd = imageLoad(uNormalDepth, coord);
+    vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
+
+    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
+    vec4 inSpecular = imageLoad(uInSpecular, coord);
+
+    float centerLumD = denoiseLuminance(inDiffuse.rgb);
+    float centerLumS = denoiseLuminance(inSpecular.rgb);
+
+    vec4 filteredDiffuse = atrousFilterDiffuse(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
+        pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    float roughness = imageLoad(uAlbedoRoughness, coord).a;
+    vec4 filteredSpecular = atrousFilterSpecular(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
+        roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    imageStore(uOutDiffuse, coord, vec4(clamp(filteredDiffuse.rgb, 0.0, 65000.0), clamp(filteredDiffuse.a, 0.0, 65000.0)));
+    imageStore(uOutSpecular, coord, vec4(clamp(filteredSpecular.rgb, 0.0, 65000.0), clamp(filteredSpecular.a, 0.0, 65000.0)));
+}

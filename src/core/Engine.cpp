@@ -900,7 +900,8 @@ void Engine::initPipelines() {
         m_denoiser = std::make_unique<DenoiserPipeline>(
             device, m_context->getPhysicalDevice(), allocator,
             m_context->getGraphicsQueue(),
-            [this](const std::string& name) { return loadShaderSPIRV(name); }
+            [this](const std::string& name) { return loadShaderSPIRV(name); },
+            m_context->hasSubgroupSizeControl()
         );
         m_denoiser->resize(m_config.width, m_config.height, m_config.accum_format, m_commandBuffers[0]);
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
@@ -1799,9 +1800,24 @@ void Engine::renderFrame() {
     uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
         static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
 
+    if (hardReset && m_camera) {
+        m_camera->resetPrevViewProj();
+    }
     CameraUniform ubo = m_camera->getUniformData(m_frameIndex, activeSpp, activeBounces, flags,
                                                  enableJitter, renderW, renderH, 0, /*updatePrev=*/false);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
+
+    // Track sub-pixel camera jitter in UV units for the E-SVGF denoiser
+    // (motion vectors are jitter-free; the denoiser cancels jitter explicitly)
+    if (enableJitter && renderW > 0 && renderH > 0) {
+        m_denoiseJitterUv = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y) / glm::vec2(renderW, renderH);
+        m_prevDenoiseJitterUv = (m_frameIndex > 0)
+            ? getHaltonJitter(m_frameIndex - 1) / glm::vec2(renderW, renderH)
+            : glm::vec2(0.0f);
+    } else {
+        m_denoiseJitterUv = glm::vec2(0.0f);
+        m_prevDenoiseJitterUv = glm::vec2(0.0f);
+    }
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -1978,7 +1994,9 @@ void Engine::renderFrame() {
                     m_accumulatedSamples, -1.0f,
                     m_mlDiffuseImage, m_mlSpecularImage,
                     m_motionVectorImage, m_normalDepthImage,
-                    m_mlAlbedoRoughnessImage, m_accumImage
+                    m_mlAlbedoRoughnessImage, m_accumImage,
+                    m_mlSpecularMotionImage,
+                    buildDenoiserCameraMatrices(renderW, renderH)
                 );
                 svgfRun = true;
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
@@ -2167,7 +2185,9 @@ void Engine::renderFrame() {
                 m_accumulatedSamples, -1.0f,
                 m_mlDiffuseImage, m_mlSpecularImage,
                 m_motionVectorImage, m_normalDepthImage,
-                m_mlAlbedoRoughnessImage, m_accumImage
+                m_mlAlbedoRoughnessImage, m_accumImage,
+                m_mlSpecularMotionImage,
+                buildDenoiserCameraMatrices(m_config.width, m_config.height)
             );
             svgfRun = true;
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
@@ -2413,6 +2433,10 @@ void Engine::renderFrame() {
         m_screenshotNotificationTimer = std::max(0.0f, m_screenshotNotificationTimer - dt);
     }
 
+    if (m_camera && !sceneLoadingActive) {
+        m_camera->advanceFrame();
+    }
+
     m_frameIndex++;
     m_totalFramesRendered++;
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -2478,6 +2502,50 @@ std::string Engine::exportTelemetry(const std::string& customPath) {
         return m_hwMonitor->exportTelemetry(customPath, getStats());
     }
     return "";
+}
+
+// Builds the std140 CameraMatricesUBO payload for the E-SVGF fused temporal pass.
+//   currViewToPrevView     = S * (V_prev * V_curr^-1) * S   (Vulkan +Z/+Y-down view-space -> prev view-space affine)
+//   prevViewToCurrViewRot  = mat3(V_curr * V_prev^-1)       (GLM prev view normal -> GLM curr view space)
+//   camera jitter in UV units (jitter-free motion vector convention)
+DenoiserPipeline::CameraMatrices Engine::buildDenoiserCameraMatrices(uint32_t width, uint32_t height) const {
+    DenoiserPipeline::CameraMatrices cm{};
+    if (!m_camera) return cm;
+
+    const glm::mat4 view = m_camera->getViewMatrix();
+    const glm::mat4 prevView = m_camera->getPrevViewMatrix();
+
+    // unprojectToView() reconstructs positions in Vulkan-NDC positive-depth view space
+    // x_c = (ndc.x * aspect * tanHalfFovY * z, ndc.y * tanHalfFovY * z, +z) = S * x_glm,
+    // where S = diag(1, -1, -1, 1) flips Y (Vulkan NDC +Y down vs GLM +Y up) and Z (+z vs -z).
+    glm::mat4 S(1.0f);
+    S[1][1] = -1.0f;
+    S[2][2] = -1.0f;
+    const glm::mat4 viewToPrev = S * (prevView * glm::inverse(view)) * S;
+    const glm::mat4 currFromPrev = view * glm::inverse(prevView);
+
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r)
+            cm.currViewToPrevView[c * 4 + r] = viewToPrev[c][r]; // column-major
+
+    for (int c = 0; c < 3; ++c) {
+        cm.rotCols[c].x = currFromPrev[c][0];
+        cm.rotCols[c].y = currFromPrev[c][1];
+        cm.rotCols[c].z = currFromPrev[c][2];
+        cm.rotCols[c].pad = 0.0f;
+    }
+
+    cm.currCameraJitter[0] = m_denoiseJitterUv.x;
+    cm.currCameraJitter[1] = m_denoiseJitterUv.y;
+    cm.prevCameraJitter[0] = m_prevDenoiseJitterUv.x;
+    cm.prevCameraJitter[1] = m_prevDenoiseJitterUv.y;
+
+    const float fovY = m_camera->getFov();
+    cm.tanHalfFovY = std::tan(glm::radians(fovY) * 0.5f);
+    cm.aspectRatio = (height > 0) ? (static_cast<float>(width) / static_cast<float>(height)) : m_camera->getAspect();
+    cm.prevTanHalfFovY = cm.tanHalfFovY;
+    cm.prevAspectRatio = cm.aspectRatio;
+    return cm;
 }
 
 void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate) {

@@ -4,6 +4,7 @@
 
 #include <stdexcept>
 #include <vector>
+#include <cstring>
 
 namespace pathways {
 
@@ -12,100 +13,110 @@ DenoiserPipeline::DenoiserPipeline(
     VkPhysicalDevice physicalDevice,
     VmaAllocator allocator,
     VkQueue queue,
-    ShaderLoaderFunc shaderLoader
+    ShaderLoaderFunc shaderLoader,
+    bool forceWave32
 ) : m_device(device),
     m_physDevice(physicalDevice),
     m_allocator(allocator),
     m_queue(queue),
-    m_shaderLoader(std::move(shaderLoader))
+    m_shaderLoader(std::move(shaderLoader)),
+    m_forceWave32(forceWave32)
 {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(m_physDevice, &props);
+    m_timestampPeriodNs = props.limits.timestampPeriod;
+
     createDescriptorSetLayouts();
     initPipelines();
-    Logger::info("DenoiserPipeline (In-House ReLAX/A-SVGF) initialized successfully.");
+
+    // Internal 20-query timestamp pool (10 x MAX_FRAMES_IN_FLIGHT):
+    // frame slot s uses queries [s*10, s*10+9], two per dispatch.
+    VkQueryPoolCreateInfo queryPoolInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = NUM_PASSES * 2 * MAX_FRAMES_IN_FLIGHT;
+    if (vkCreateQueryPool(m_device, &queryPoolInfo, nullptr, &m_queryPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create denoiser timestamp query pool");
+    }
+
+    Logger::info("DenoiserPipeline (Adaptive E-SVGF, 5-dispatch dilated) initialized successfully.");
 }
 
 DenoiserPipeline::~DenoiserPipeline() {
     if (m_device != VK_NULL_HANDLE) {
-        if (m_temporalPipeline) vkDestroyPipeline(m_device, m_temporalPipeline, nullptr);
-        if (m_temporalPipelineLayout) vkDestroyPipelineLayout(m_device, m_temporalPipelineLayout, nullptr);
-        if (m_temporalDescLayout) vkDestroyDescriptorSetLayout(m_device, m_temporalDescLayout, nullptr);
+        auto destroyPipe = [this](VkPipelineLayout layout, VkPipeline pipe, VkDescriptorSetLayout desc) {
+            if (pipe) vkDestroyPipeline(m_device, pipe, nullptr);
+            if (layout) vkDestroyPipelineLayout(m_device, layout, nullptr);
+            if (desc) vkDestroyDescriptorSetLayout(m_device, desc, nullptr);
+        };
+        destroyPipe(m_fusedTemporalPipelineLayout, m_fusedTemporalPipeline, m_fusedTemporalDescSetLayout);
+        destroyPipe(m_atrousStep1PipelineLayout, m_atrousStep1Pipeline, m_atrousStep1DescSetLayout);
+        destroyPipe(m_atrousStep2PipelineLayout, m_atrousStep2Pipeline, m_atrousStep2DescSetLayout);
+        destroyPipe(m_atrousStep3PipelineLayout, m_atrousStep3Pipeline, m_atrousStep3DescSetLayout);
+        destroyPipe(m_coarseRemodulatePipelineLayout, m_coarseRemodulatePipeline, m_atrousCoarseRemodulateDescSetLayout);
 
-        if (m_variancePipeline) vkDestroyPipeline(m_device, m_variancePipeline, nullptr);
-        if (m_variancePipelineLayout) vkDestroyPipelineLayout(m_device, m_variancePipelineLayout, nullptr);
-        if (m_varianceDescLayout) vkDestroyDescriptorSetLayout(m_device, m_varianceDescLayout, nullptr);
-
-        if (m_atrousPipeline) vkDestroyPipeline(m_device, m_atrousPipeline, nullptr);
-        if (m_atrousPipelineLayout) vkDestroyPipelineLayout(m_device, m_atrousPipelineLayout, nullptr);
-        if (m_atrousDescLayout) vkDestroyDescriptorSetLayout(m_device, m_atrousDescLayout, nullptr);
-
-        if (m_remodulatePipeline) vkDestroyPipeline(m_device, m_remodulatePipeline, nullptr);
-        if (m_remodulatePipelineLayout) vkDestroyPipelineLayout(m_device, m_remodulatePipelineLayout, nullptr);
-        if (m_remodulateDescLayout) vkDestroyDescriptorSetLayout(m_device, m_remodulateDescLayout, nullptr);
-
+        if (m_queryPool) vkDestroyQueryPool(m_device, m_queryPool, nullptr);
         if (m_descPool) vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
     }
 }
 
 void DenoiserPipeline::createDescriptorSetLayouts() {
-    auto makeBinding = [](uint32_t b) -> VkDescriptorSetLayoutBinding {
+    auto makeImageBinding = [](uint32_t b, VkDescriptorType type) -> VkDescriptorSetLayoutBinding {
         VkDescriptorSetLayoutBinding binding{};
         binding.binding = b;
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        binding.descriptorType = type;
         binding.descriptorCount = 1;
         binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         return binding;
     };
 
-    // 1. Temporal descriptor set layout (13 storage images: 5 in, 4 hist in, 4 hist out)
-    std::vector<VkDescriptorSetLayoutBinding> tempBindings;
-    for (uint32_t b = 0; b < 13; ++b) tempBindings.push_back(makeBinding(b));
-    VkDescriptorSetLayoutCreateInfo tempInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    tempInfo.bindingCount = static_cast<uint32_t>(tempBindings.size());
-    tempInfo.pBindings = tempBindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &tempInfo, nullptr, &m_temporalDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create temporal denoiser descriptor set layout");
+    auto createLayout = [&](const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+                            VkDescriptorSetLayout& out, const char* name) {
+        VkDescriptorSetLayoutCreateInfo info{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        info.bindingCount = static_cast<uint32_t>(bindings.size());
+        info.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(m_device, &info, nullptr, &out) != VK_SUCCESS) {
+            throw std::runtime_error(std::string("Failed to create denoiser descriptor set layout: ") + name);
+        }
+    };
+
+    // Pass 1: Fused temporal (Binding 0 CameraMatricesUBO + Bindings 1-18 storage images)
+    {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        bindings.push_back(makeImageBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER));
+        for (uint32_t b = 1; b <= 18; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+        createLayout(bindings, m_fusedTemporalDescSetLayout, "fused_temporal");
+    }
+    // Pass 2: A-Trous s=1 (6 image bindings; uEdgeDensity intentionally omitted)
+    {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (uint32_t b = 0; b < 6; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+        createLayout(bindings, m_atrousStep1DescSetLayout, "atrous_step1");
+    }
+    // Pass 3: A-Trous s=2 (7 image bindings incl. uEdgeDensity)
+    // Pass 4: A-Trous s=4 (7 image bindings incl. uEdgeDensity)
+    {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (uint32_t b = 0; b < 7; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+        createLayout(bindings, m_atrousStep2DescSetLayout, "atrous_step2");
+        createLayout(bindings, m_atrousStep3DescSetLayout, "atrous_step3");
+    }
+    // Pass 5: Coarse s=8 + fused remodulate (6 image bindings in production)
+    {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (uint32_t b = 0; b < 6; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+        createLayout(bindings, m_atrousCoarseRemodulateDescSetLayout, "atrous_coarse_remodulate");
     }
 
-    // 2. Variance descriptor set layout (7 storage images: 4 hist in, 1 normalDepth in, 2 pingPong out)
-    std::vector<VkDescriptorSetLayoutBinding> varBindings;
-    for (uint32_t b = 0; b < 7; ++b) varBindings.push_back(makeBinding(b));
-    VkDescriptorSetLayoutCreateInfo varInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    varInfo.bindingCount = static_cast<uint32_t>(varBindings.size());
-    varInfo.pBindings = varBindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &varInfo, nullptr, &m_varianceDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create variance denoiser descriptor set layout");
-    }
-
-    // 3. Atrous descriptor set layout (5 storage images: 2 in, 1 normalDepth in, 2 out)
-    std::vector<VkDescriptorSetLayoutBinding> atrBindings;
-    for (uint32_t b = 0; b < 5; ++b) atrBindings.push_back(makeBinding(b));
-    VkDescriptorSetLayoutCreateInfo atrInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    atrInfo.bindingCount = static_cast<uint32_t>(atrBindings.size());
-    atrInfo.pBindings = atrBindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &atrInfo, nullptr, &m_atrousDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create atrous denoiser descriptor set layout");
-    }
-
-    // 4. Remodulate descriptor set layout (5 storage images: 2 in filtered, 1 albedo in, 1 accum in, 1 out radiance)
-    std::vector<VkDescriptorSetLayoutBinding> remBindings;
-    for (uint32_t b = 0; b < 5; ++b) remBindings.push_back(makeBinding(b));
-    VkDescriptorSetLayoutCreateInfo remInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    remInfo.bindingCount = static_cast<uint32_t>(remBindings.size());
-    remInfo.pBindings = remBindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &remInfo, nullptr, &m_remodulateDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create remodulate denoiser descriptor set layout");
-    }
-
-    // Descriptor pool
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSize.descriptorCount = 128;
-
+    // Descriptor pool: ~88 storage image descriptors + UBOs + tonemap set
+    std::array<VkDescriptorPoolSize, 2> poolSizes = {
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8 },
+    };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolInfo.maxSets = 16;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 64;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create denoiser descriptor pool");
     }
@@ -117,31 +128,24 @@ void DenoiserPipeline::allocateDescriptorSets() {
     VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     allocInfo.descriptorPool = m_descPool;
 
-    // Temporal sets (2 slots)
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &m_temporalDescLayout;
-        vkAllocateDescriptorSets(m_device, &allocInfo, &m_temporalDescSets[i]);
-    }
+    struct Slot { VkDescriptorSetLayout layout; std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>* sets; };
+    std::array<Slot, 5> slots = {{
+        { m_fusedTemporalDescSetLayout, &m_fusedTemporalDescSets },
+        { m_atrousStep1DescSetLayout,   &m_atrousStep1DescSets },
+        { m_atrousStep2DescSetLayout,   &m_atrousStep2DescSets },
+        { m_atrousStep3DescSetLayout,   &m_atrousStep3DescSets },
+        { m_atrousCoarseRemodulateDescSetLayout, &m_coarseRemodulateDescSets },
+    }};
 
-    // Variance sets (2 slots)
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &m_varianceDescLayout;
-        vkAllocateDescriptorSets(m_device, &allocInfo, &m_varianceDescSets[i]);
+    for (auto& slot : slots) {
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &slot.layout;
+            if (vkAllocateDescriptorSets(m_device, &allocInfo, &(*slot.sets)[i]) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to allocate denoiser descriptor sets");
+            }
+        }
     }
-
-    // Atrous sets (Ping-pong A and B)
-    for (uint32_t i = 0; i < 2; ++i) {
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &m_atrousDescLayout;
-        vkAllocateDescriptorSets(m_device, &allocInfo, &m_atrousDescSets[i]);
-    }
-
-    // Remodulate set
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_remodulateDescLayout;
-    vkAllocateDescriptorSets(m_device, &allocInfo, &m_remodulateDescSet);
 }
 
 void DenoiserPipeline::initPipelines() {
@@ -176,12 +180,22 @@ void DenoiserPipeline::initPipelines() {
             throw std::runtime_error("Failed to create denoiser pipeline layout for: " + shaderName);
         }
 
+        // Wave32 enforcement (guarded by device capability at construction site to
+        // avoid VUID-VkPipelineShaderStageCreateInfo-pNext-02755)
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSizeInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+        };
+        subgroupSizeInfo.requiredSubgroupSize = 32;
+
         VkComputePipelineCreateInfo compInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         compInfo.layout = outLayout;
         compInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         compInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         compInfo.stage.module = module;
         compInfo.stage.pName = "main";
+        if (m_forceWave32) {
+            compInfo.stage.pNext = &subgroupSizeInfo;
+        }
 
         if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &outPipeline) != VK_SUCCESS) {
             vkDestroyShaderModule(m_device, module, nullptr);
@@ -190,10 +204,16 @@ void DenoiserPipeline::initPipelines() {
         vkDestroyShaderModule(m_device, module, nullptr);
     };
 
-    createComputePipeline("denoise_temporal.comp.spv", m_temporalDescLayout, sizeof(TemporalPushConstants), m_temporalPipelineLayout, m_temporalPipeline);
-    createComputePipeline("denoise_variance.comp.spv", m_varianceDescLayout, sizeof(VariancePushConstants), m_variancePipelineLayout, m_variancePipeline);
-    createComputePipeline("denoise_atrous.comp.spv", m_atrousDescLayout, sizeof(AtrousPushConstants), m_atrousPipelineLayout, m_atrousPipeline);
-    createComputePipeline("denoise_remodulate.comp.spv", m_remodulateDescLayout, sizeof(RemodulatePushConstants), m_remodulatePipelineLayout, m_remodulatePipeline);
+    createComputePipeline("denoise_fused_temporal.comp.spv", m_fusedTemporalDescSetLayout,
+                          sizeof(FusedTemporalPushConstants), m_fusedTemporalPipelineLayout, m_fusedTemporalPipeline);
+    createComputePipeline("denoise_atrous_step1.comp.spv", m_atrousStep1DescSetLayout,
+                          sizeof(AtrousPushConstants), m_atrousStep1PipelineLayout, m_atrousStep1Pipeline);
+    createComputePipeline("denoise_atrous_step2.comp.spv", m_atrousStep2DescSetLayout,
+                          sizeof(AtrousPushConstants), m_atrousStep2PipelineLayout, m_atrousStep2Pipeline);
+    createComputePipeline("denoise_atrous_step3.comp.spv", m_atrousStep3DescSetLayout,
+                          sizeof(AtrousPushConstants), m_atrousStep3PipelineLayout, m_atrousStep3Pipeline);
+    createComputePipeline("denoise_atrous_coarse_remodulate.comp.spv", m_atrousCoarseRemodulateDescSetLayout,
+                          sizeof(AtrousCoarseRemodulatePushConstants), m_coarseRemodulatePipelineLayout, m_coarseRemodulatePipeline);
 }
 
 void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accumFormat, VkCommandBuffer cmd) {
@@ -210,20 +230,36 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-        m_historyDiffuse[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
-        m_historySpecular[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
-        m_historyMoments[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
-        m_historyLength[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16_SFLOAT, usage);
+        m_edgeDensity[i]        = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R8G8_UNORM, usage);
+        m_historyDiffuse[i]     = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
+        m_historySpecular[i]    = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
+        m_historyMoments[i]     = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
+        m_historyLength[i]      = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
         m_historyNormalDepth[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
     }
 
     for (uint32_t i = 0; i < 2; ++i) {
-        m_pingPongDiffuse[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
+        m_pingPongDiffuse[i]  = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
         m_pingPongSpecular[i] = std::make_unique<Image>(m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
     }
 
     VkFormat outFmt = (accumFormat == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
     m_denoisedImage = std::make_unique<Image>(m_device, m_allocator, width, height, outFmt, usage);
+
+    // 1x1 zeroed fallback for the specular VMV binding (format-compatible RGBA16F)
+    m_specMotionFallback = std::make_unique<Image>(m_device, m_allocator, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, usage);
+
+    // Camera matrices UBOs (per frame in flight, std140-compatible 160 bytes)
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (!m_cameraMatricesUBO[i]) {
+            m_cameraMatricesUBO[i] = std::make_unique<Buffer>(
+                m_allocator, sizeof(CameraMatrices),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+            );
+        }
+    }
 
     if (cmd != VK_NULL_HANDLE) {
         VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -234,24 +270,28 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
         // Initial transition to VK_IMAGE_LAYOUT_GENERAL and clear history to zero
         VkClearColorValue clearZero = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-            m_historyDiffuse[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-            m_historySpecular[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-            m_historyMoments[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-            m_historyLength[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-            m_historyNormalDepth[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
-            vkCmdClearColorImage(cmd, m_historyDiffuse[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            vkCmdClearColorImage(cmd, m_historySpecular[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            vkCmdClearColorImage(cmd, m_historyMoments[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            vkCmdClearColorImage(cmd, m_historyLength[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            vkCmdClearColorImage(cmd, m_historyNormalDepth[i]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+        auto transitionAndClear = [&](Image* img) {
+            img->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            vkCmdClearColorImage(cmd, img->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+        };
+
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            transitionAndClear(m_edgeDensity[i].get());
+            transitionAndClear(m_historyDiffuse[i].get());
+            transitionAndClear(m_historySpecular[i].get());
+            transitionAndClear(m_historyMoments[i].get());
+            transitionAndClear(m_historyLength[i].get());
+            transitionAndClear(m_historyNormalDepth[i].get());
         }
         for (uint32_t i = 0; i < 2; ++i) {
-            m_pingPongDiffuse[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-            m_pingPongSpecular[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            transitionAndClear(m_pingPongDiffuse[i].get());
+            transitionAndClear(m_pingPongSpecular[i].get());
         }
-        m_denoisedImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        m_denoisedImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        transitionAndClear(m_specMotionFallback.get());
 
         vkEndCommandBuffer(cmd);
 
@@ -265,7 +305,8 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
         vkQueueWaitIdle(m_queue);
     }
 
-    Logger::info("DenoiserPipeline allocated images ({}x{}, format {})", width, height, static_cast<int>(accumFormat));
+    Logger::info("DenoiserPipeline (E-SVGF) allocated 17 internal storage images ({}x{}, format {})",
+                 width, height, static_cast<int>(accumFormat));
 }
 
 void DenoiserPipeline::initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage) {
@@ -291,11 +332,17 @@ void DenoiserPipeline::updateDescriptors(
     Image* motionVectors,
     Image* normalDepth,
     Image* albedoRoughness,
-    Image* accumImage
+    Image* accumImage,
+    Image* specularMotion
 ) {
+    // Specular VMV falls back to a 1x1 zeroed RGBA16F image when unavailable
+    Image* specMotion = specularMotion ? specularMotion : m_specMotionFallback.get();
+
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorImageInfo> imgInfos;
-    imgInfos.reserve(64);
+    std::vector<VkDescriptorBufferInfo> bufInfos;
+    imgInfos.reserve(96);
+    bufInfos.reserve(MAX_FRAMES_IN_FLIGHT);
 
     auto addImageWrite = [&](VkDescriptorSet dstSet, uint32_t dstBinding, VkImageView view) {
         imgInfos.push_back({ VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL });
@@ -307,61 +354,124 @@ void DenoiserPipeline::updateDescriptors(
         w.pImageInfo = &imgInfos.back();
         writes.push_back(w);
     };
+    auto addBufferWrite = [&](VkDescriptorSet dstSet, uint32_t dstBinding, VkBuffer buffer, VkDeviceSize size) {
+        bufInfos.push_back({ buffer, 0, size });
+        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w.dstSet = dstSet;
+        w.dstBinding = dstBinding;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w.pBufferInfo = &bufInfos.back();
+        writes.push_back(w);
+    };
 
-    // 1. Temporal sets (slot 0 reads hist 1, writes hist 0; slot 1 reads hist 0, writes hist 1)
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         uint32_t prevSlot = 1 - slot;
-        VkDescriptorSet set = m_temporalDescSets[slot];
-        addImageWrite(set, 0, currentDiffuse->getImageView());
-        addImageWrite(set, 1, currentSpecular->getImageView());
-        addImageWrite(set, 2, motionVectors->getImageView());
-        addImageWrite(set, 3, normalDepth->getImageView());
-        addImageWrite(set, 4, m_historyNormalDepth[prevSlot]->getImageView());
 
-        addImageWrite(set, 5, m_historyDiffuse[prevSlot]->getImageView());
-        addImageWrite(set, 6, m_historySpecular[prevSlot]->getImageView());
-        addImageWrite(set, 7, m_historyMoments[prevSlot]->getImageView());
-        addImageWrite(set, 8, m_historyLength[prevSlot]->getImageView());
+        // ---- Pass 1: Fused temporal (19 bindings) ----
+        {
+            VkDescriptorSet set = m_fusedTemporalDescSets[slot];
+            addBufferWrite(set, 0, m_cameraMatricesUBO[slot]->getBuffer(), sizeof(CameraMatrices));
+            addImageWrite(set, 1, currentDiffuse->getImageView());
+            addImageWrite(set, 2, currentSpecular->getImageView());
+            addImageWrite(set, 3, motionVectors->getImageView());
+            addImageWrite(set, 4, specMotion->getImageView());
+            addImageWrite(set, 5, normalDepth->getImageView());
+            addImageWrite(set, 6, m_historyNormalDepth[prevSlot]->getImageView());
+            addImageWrite(set, 7, albedoRoughness->getImageView());
+            addImageWrite(set, 8, m_historyDiffuse[prevSlot]->getImageView());
+            addImageWrite(set, 9, m_historySpecular[prevSlot]->getImageView());
+            addImageWrite(set, 10, m_historyMoments[prevSlot]->getImageView());
+            addImageWrite(set, 11, m_historyLength[prevSlot]->getImageView());
+            addImageWrite(set, 12, m_edgeDensity[prevSlot]->getImageView());
+            addImageWrite(set, 13, m_historyDiffuse[slot]->getImageView());
+            addImageWrite(set, 14, m_historySpecular[slot]->getImageView());
+            addImageWrite(set, 15, m_historyMoments[slot]->getImageView());
+            addImageWrite(set, 16, m_historyLength[slot]->getImageView());
+            addImageWrite(set, 17, m_edgeDensity[slot]->getImageView());
+            addImageWrite(set, 18, m_historyNormalDepth[slot]->getImageView());
+        }
 
-        addImageWrite(set, 9, m_historyDiffuse[slot]->getImageView());
-        addImageWrite(set, 10, m_historySpecular[slot]->getImageView());
-        addImageWrite(set, 11, m_historyMoments[slot]->getImageView());
-        addImageWrite(set, 12, m_historyLength[slot]->getImageView());
+        // ---- Pass 2: A-Trous s=1 (reads pre-spatial history of this slot) ----
+        {
+            VkDescriptorSet set = m_atrousStep1DescSets[slot];
+            addImageWrite(set, 0, m_historyDiffuse[slot]->getImageView());
+            addImageWrite(set, 1, m_historySpecular[slot]->getImageView());
+            addImageWrite(set, 2, normalDepth->getImageView());
+            addImageWrite(set, 3, albedoRoughness->getImageView());
+            addImageWrite(set, 4, m_pingPongDiffuse[0]->getImageView());
+            addImageWrite(set, 5, m_pingPongSpecular[0]->getImageView());
+        }
+
+        // ---- Pass 3: A-Trous s=2 (pingPong 0 -> 1) ----
+        {
+            VkDescriptorSet set = m_atrousStep2DescSets[slot];
+            addImageWrite(set, 0, m_pingPongDiffuse[0]->getImageView());
+            addImageWrite(set, 1, m_pingPongSpecular[0]->getImageView());
+            addImageWrite(set, 2, normalDepth->getImageView());
+            addImageWrite(set, 3, albedoRoughness->getImageView());
+            addImageWrite(set, 4, m_edgeDensity[slot]->getImageView());
+            addImageWrite(set, 5, m_pingPongDiffuse[1]->getImageView());
+            addImageWrite(set, 6, m_pingPongSpecular[1]->getImageView());
+        }
+
+        // ---- Pass 4: A-Trous s=4 (pingPong 1 -> 0) ----
+        {
+            VkDescriptorSet set = m_atrousStep3DescSets[slot];
+            addImageWrite(set, 0, m_pingPongDiffuse[1]->getImageView());
+            addImageWrite(set, 1, m_pingPongSpecular[1]->getImageView());
+            addImageWrite(set, 2, normalDepth->getImageView());
+            addImageWrite(set, 3, albedoRoughness->getImageView());
+            addImageWrite(set, 4, m_edgeDensity[slot]->getImageView());
+            addImageWrite(set, 5, m_pingPongDiffuse[0]->getImageView());
+            addImageWrite(set, 6, m_pingPongSpecular[0]->getImageView());
+        }
+
+        // ---- Pass 5: Coarse s=8 + fused remodulate (pingPong 0 -> final) ----
+        {
+            VkDescriptorSet set = m_coarseRemodulateDescSets[slot];
+            addImageWrite(set, 0, m_pingPongDiffuse[0]->getImageView());
+            addImageWrite(set, 1, m_pingPongSpecular[0]->getImageView());
+            addImageWrite(set, 2, normalDepth->getImageView());
+            addImageWrite(set, 3, albedoRoughness->getImageView());
+            addImageWrite(set, 4, m_edgeDensity[slot]->getImageView());
+            addImageWrite(set, 5, m_denoisedImage->getImageView());
+        }
+        (void)accumImage; // Stationary preview path is compile-time only (ENABLE_STATIONARY_PREVIEW)
     }
-
-    // 2. Variance sets (slot reads history[slot], writes to pingPong[0])
-    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
-        VkDescriptorSet set = m_varianceDescSets[slot];
-        addImageWrite(set, 0, m_historyDiffuse[slot]->getImageView());
-        addImageWrite(set, 1, m_historySpecular[slot]->getImageView());
-        addImageWrite(set, 2, m_historyMoments[slot]->getImageView());
-        addImageWrite(set, 3, m_historyLength[slot]->getImageView());
-        addImageWrite(set, 4, normalDepth->getImageView());
-        addImageWrite(set, 5, m_pingPongDiffuse[0]->getImageView());
-        addImageWrite(set, 6, m_pingPongSpecular[0]->getImageView());
-    }
-
-    // 3. Atrous sets: Set 0 (in: pingPong 0, out: pingPong 1); Set 1 (in: pingPong 1, out: pingPong 0)
-    for (uint32_t s = 0; s < 2; ++s) {
-        uint32_t inIdx = s;
-        uint32_t outIdx = 1 - s;
-        VkDescriptorSet set = m_atrousDescSets[s];
-        addImageWrite(set, 0, m_pingPongDiffuse[inIdx]->getImageView());
-        addImageWrite(set, 1, m_pingPongSpecular[inIdx]->getImageView());
-        addImageWrite(set, 2, normalDepth->getImageView());
-        addImageWrite(set, 3, m_pingPongDiffuse[outIdx]->getImageView());
-        addImageWrite(set, 4, m_pingPongSpecular[outIdx]->getImageView());
-    }
-
-    // 4. Remodulate set: reads pingPong[0], albedoRoughness, accumImage, writes m_denoisedImage
-    addImageWrite(m_remodulateDescSet, 0, m_pingPongDiffuse[0]->getImageView());
-    addImageWrite(m_remodulateDescSet, 1, m_pingPongSpecular[0]->getImageView());
-    addImageWrite(m_remodulateDescSet, 2, albedoRoughness->getImageView());
-    addImageWrite(m_remodulateDescSet, 3, accumImage->getImageView());
-    addImageWrite(m_remodulateDescSet, 4, m_denoisedImage->getImageView());
 
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     m_descriptorsBound = true;
+}
+
+void DenoiserPipeline::collectQueryResults() {
+    if (m_queryPool == VK_NULL_HANDLE) return;
+
+    // Non-blocking collection of previously completed pass timestamps.
+    // Each frame slot owns 10 queries; results are from 2 frames ago and
+    // typically already retired. DONT_WAIT avoids any pipeline stall.
+    // With VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT each
+    // query yields two uint64_t entries: {timestamp, availability}.
+    uint64_t results[10 * 2]{};
+    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
+        if (!m_slotQueriesRecorded[slot]) continue; // Queries must be recorded by the GPU before reading
+        VkResult r = vkGetQueryPoolResults(
+            m_device, m_queryPool, slot * 10, 10,
+            sizeof(results), results, sizeof(uint64_t) * 2,
+            VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_64_BIT);
+        if (r == VK_NOT_READY) continue;
+
+        for (uint32_t pass = 0; pass < NUM_PASSES; ++pass) {
+            uint64_t beginTicks = results[pass * 4 + 0];
+            uint64_t beginAvail = results[pass * 4 + 1];
+            uint64_t endTicks   = results[pass * 4 + 2];
+            uint64_t endAvail   = results[pass * 4 + 3];
+            if (beginAvail && endAvail && endTicks > beginTicks) {
+                m_passTimingsMs[pass] = static_cast<float>(
+                    static_cast<double>(endTicks - beginTicks) * m_timestampPeriodNs / 1.0e6);
+            }
+        }
+    }
 }
 
 void DenoiserPipeline::recordDenoise(
@@ -375,27 +485,42 @@ void DenoiserPipeline::recordDenoise(
     Image* motionVectors,
     Image* normalDepth,
     Image* albedoRoughness,
-    Image* accumImage
+    Image* accumImage,
+    Image* specularMotion,
+    const CameraMatrices& cameraMatrices
 ) {
     if (!isInitialized() || !currentDiffuse || !currentSpecular || !motionVectors ||
-        !normalDepth || !albedoRoughness || !accumImage) {
+        !normalDepth || !albedoRoughness) {
         return;
     }
+    (void)accumImage;
+    (void)crossfadeBlend;
 
     if (!m_descriptorsBound) {
         updateDescriptors(currentDiffuse, currentSpecular, motionVectors, normalDepth,
-                          albedoRoughness, accumImage);
+                          albedoRoughness, accumImage, specularMotion);
     }
 
-    uint32_t gx = (m_width + 7) / 8;
-    uint32_t gy = (m_height + 7) / 8;
+    // Upload per-frame camera matrices for Pass 1 (std140 binary compatible)
+    m_cameraMatricesUBO[frameSlot]->copyFrom(&cameraMatrices, sizeof(CameraMatrices));
+
+    // Asynchronously harvest previous GPU pass timings, then reset this slot's queries
+    collectQueryResults();
+    uint32_t qBase = frameSlot * 10;
+    vkCmdResetQueryPool(cmd, m_queryPool, qBase, 10);
+
+    auto writeTimestamp = [&](uint32_t queryIndex) {
+        if (m_queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, queryIndex);
+        }
+    };
 
     auto insertComputeBarrier = [&cmd]() {
         VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 
         VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         dep.memoryBarrierCount = 1;
@@ -403,148 +528,166 @@ void DenoiserPipeline::recordDenoise(
         vkCmdPipelineBarrier2(cmd, &dep);
     };
 
-    // -------------------------------------------------------------------------
-    // Pass 1: Temporal Reprojection & Accumulation
-    // -------------------------------------------------------------------------
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_temporalPipelineLayout,
-                            0, 1, &m_temporalDescSets[frameSlot], 0, nullptr);
+    const float phiNormal = 32.0f;
+    const float phiPlaneDepth = 2.0f;
+    const float phiLuminance = 4.0f;
 
-    TemporalPushConstants tempPC{};
-    tempPC.width = m_width;
-    tempPC.height = m_height;
-    tempPC.resetHistory = resetHistory ? 1u : 0u;
-    tempPC.maxHistoryLength = 32.0f;
-    vkCmdPushConstants(cmd, m_temporalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(TemporalPushConstants), &tempPC);
+    // =========================================================================
+    // Pass 1: Fused Edge-Aware Spatiotemporal Accumulator (16x16 workgroups)
+    // =========================================================================
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedTemporalPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_fusedTemporalPipelineLayout,
+                                0, 1, &m_fusedTemporalDescSets[frameSlot], 0, nullptr);
 
-    vkCmdDispatch(cmd, gx, gy, 1);
-    insertComputeBarrier();
+        FusedTemporalPushConstants pc{};
+        pc.width = m_width;
+        pc.height = m_height;
+        pc.resetHistory = resetHistory ? 1u : 0u;
+        pc.maxHistoryLength = 32.0f;
+        pc.weightAlbedo = 0.50f;
+        pc.weightDepth = 0.30f;
+        pc.weightNormal = 0.20f;
+        pc.sigmaMultiplier = 1.20f;
+        pc.noiseFloor = 0.05f;
+        pc.contrastFloor = 0.02f;
+        pc.sigmaMin = 0.02f;
+        pc.temporalAlpha = 0.15f;
+        pc.normalThreshold = 0.85f;
+        pc.normalThresholdDynamic = 0.50f;
+        pc.depthThreshold = 0.08f;
+        pc.dynamicDepthThreshold = 0.15f;
+        pc.mvDiscrepancyThreshold = 2.0f;
+        vkCmdPushConstants(cmd, m_fusedTemporalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(FusedTemporalPushConstants), &pc);
 
-    // -------------------------------------------------------------------------
-    // Pass 2: Spatial Variance Estimation & Disocclusion History Fix
-    // -------------------------------------------------------------------------
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_variancePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_variancePipelineLayout,
-                            0, 1, &m_varianceDescSets[frameSlot], 0, nullptr);
-
-    VariancePushConstants varPC{};
-    varPC.width = m_width;
-    varPC.height = m_height;
-    vkCmdPushConstants(cmd, m_variancePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(VariancePushConstants), &varPC);
-
-    vkCmdDispatch(cmd, gx, gy, 1);
-    insertComputeBarrier();
-
-    // -------------------------------------------------------------------------
-    // Pass 3: Multi-Iteration À-Trous Wavelet Filter (4 iterations: 1, 2, 4, 8)
-    // -------------------------------------------------------------------------
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipeline);
-
-    const int32_t stepSizes[4] = { 1, 2, 4, 8 };
-    for (uint32_t it = 0; it < 4; ++it) {
-        uint32_t setIdx = it % 2; // Even it: read 0 -> write 1; Odd it: read 1 -> write 0
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipelineLayout,
-                                0, 1, &m_atrousDescSets[setIdx], 0, nullptr);
-
-        AtrousPushConstants atrPC{};
-        atrPC.width = m_width;
-        atrPC.height = m_height;
-        atrPC.stepSize = stepSizes[it];
-        atrPC.phiNormal = 32.0f;
-        atrPC.phiDepth = 0.1f;
-        atrPC.phiLuminance = 4.0f;
-        atrPC.iteration = it;
-        vkCmdPushConstants(cmd, m_atrousPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(AtrousPushConstants), &atrPC);
-
-        vkCmdDispatch(cmd, gx, gy, 1);
+        writeTimestamp(qBase + 0);
+        vkCmdDispatch(cmd, (m_width + 15) / 16, (m_height + 15) / 16, 1);
+        writeTimestamp(qBase + 1);
         insertComputeBarrier();
     }
-    // After 4 iterations (it=0..3), the final result is in pingPong[0]!
 
-    // -------------------------------------------------------------------------
-    // Pass 4: Albedo Remodulation & Unbiased Accumulation Crossfade
-    // -------------------------------------------------------------------------
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_remodulatePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_remodulatePipelineLayout,
-                            0, 1, &m_remodulateDescSet, 0, nullptr);
+    // Passes 2-5 run on 8x8 workgroup grids
+    const uint32_t gx = (m_width + 7) / 8;
+    const uint32_t gy = (m_height + 7) / 8;
 
-    RemodulatePushConstants remPC{};
-    remPC.width = m_width;
-    remPC.height = m_height;
-    remPC.accumulatedSamples = accumulatedSamples;
-    remPC.crossfadeBlend = crossfadeBlend;
-    vkCmdPushConstants(cmd, m_remodulatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(RemodulatePushConstants), &remPC);
+    // =========================================================================
+    // Pass 2: Fine-Scale Wavelet Iteration 1 (s = 1, diameter 5)
+    // =========================================================================
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep1Pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep1PipelineLayout,
+                                0, 1, &m_atrousStep1DescSets[frameSlot], 0, nullptr);
 
-    vkCmdDispatch(cmd, gx, gy, 1);
+        AtrousPushConstants pc{};
+        pc.width = m_width;
+        pc.height = m_height;
+        pc.stepSize = 1;
+        pc.phiNormal = phiNormal;
+        pc.phiPlaneDepth = phiPlaneDepth;
+        pc.phiLuminance = phiLuminance;
+        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+        pc.aspectRatio = cameraMatrices.aspectRatio;
+        vkCmdPushConstants(cmd, m_atrousStep1PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(AtrousPushConstants), &pc);
 
-    // Final barrier to guarantee tonemapping reads the finished denoised image
-    VkMemoryBarrier2 finalBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    finalBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    finalBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        writeTimestamp(qBase + 2);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        writeTimestamp(qBase + 3);
+        insertComputeBarrier();
+    }
 
-    VkDependencyInfo finalDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    finalDep.memoryBarrierCount = 1;
-    finalDep.pMemoryBarriers = &finalBarrier;
-    vkCmdPipelineBarrier2(cmd, &finalDep);
+    // =========================================================================
+    // Pass 3: Fine-Scale Wavelet Iteration 2 (s = 2, diameter 13, covers k=9)
+    // =========================================================================
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2Pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2PipelineLayout,
+                                0, 1, &m_atrousStep2DescSets[frameSlot], 0, nullptr);
 
-    // Copy current normalDepth into history for next frame's reprojection
-    VkImageCopy copyRegion{};
-    copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    copyRegion.extent = { m_width, m_height, 1 };
+        AtrousPushConstants pc{};
+        pc.width = m_width;
+        pc.height = m_height;
+        pc.stepSize = 2;
+        pc.phiNormal = phiNormal;
+        pc.phiPlaneDepth = phiPlaneDepth;
+        pc.phiLuminance = phiLuminance;
+        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+        pc.aspectRatio = cameraMatrices.aspectRatio;
+        vkCmdPushConstants(cmd, m_atrousStep2PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(AtrousPushConstants), &pc);
 
-    VkImageMemoryBarrier2 imgBarriers[2]{};
-    imgBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    imgBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    imgBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    imgBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    imgBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    imgBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgBarriers[0].image = normalDepth->getImage();
-    imgBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        writeTimestamp(qBase + 4);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        writeTimestamp(qBase + 5);
+        insertComputeBarrier();
+    }
 
-    imgBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    imgBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    imgBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    imgBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    imgBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    imgBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgBarriers[1].image = m_historyNormalDepth[frameSlot]->getImage();
-    imgBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    // =========================================================================
+    // Pass 4: Mid-Scale Wavelet Iteration 3 (s = 4, diameter 29, covers k=17)
+    // =========================================================================
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3Pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3PipelineLayout,
+                                0, 1, &m_atrousStep3DescSets[frameSlot], 0, nullptr);
 
-    VkDependencyInfo copyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    copyDep.imageMemoryBarrierCount = 2;
-    copyDep.pImageMemoryBarriers = imgBarriers;
-    vkCmdPipelineBarrier2(cmd, &copyDep);
+        AtrousPushConstants pc{};
+        pc.width = m_width;
+        pc.height = m_height;
+        pc.stepSize = 4;
+        pc.phiNormal = phiNormal;
+        pc.phiPlaneDepth = phiPlaneDepth;
+        pc.phiLuminance = phiLuminance;
+        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+        pc.aspectRatio = cameraMatrices.aspectRatio;
+        vkCmdPushConstants(cmd, m_atrousStep3PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(AtrousPushConstants), &pc);
 
-    vkCmdCopyImage(cmd,
-                   normalDepth->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                   m_historyNormalDepth[frameSlot]->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                   1, &copyRegion);
+        writeTimestamp(qBase + 6);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        writeTimestamp(qBase + 7);
+        insertComputeBarrier();
+    }
 
-    VkImageMemoryBarrier2 postBarrier{};
-    postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    postBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.image = m_historyNormalDepth[frameSlot]->getImage();
-    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    // =========================================================================
+    // Pass 5: Coarse Wavelet (s = 8, diameter 61, covers k=33) & Remodulation
+    // =========================================================================
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_coarseRemodulatePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_coarseRemodulatePipelineLayout,
+                                0, 1, &m_coarseRemodulateDescSets[frameSlot], 0, nullptr);
 
-    VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    postDep.imageMemoryBarrierCount = 1;
-    postDep.pImageMemoryBarriers = &postBarrier;
-    vkCmdPipelineBarrier2(cmd, &postDep);
+        AtrousCoarseRemodulatePushConstants pc{};
+        pc.width = m_width;
+        pc.height = m_height;
+        pc.stepSize = 8;
+        pc.phiNormal = phiNormal;
+        pc.phiPlaneDepth = phiPlaneDepth;
+        pc.phiLuminance = phiLuminance;
+        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+        pc.aspectRatio = cameraMatrices.aspectRatio;
+        pc.edgeThresholdLow = 0.35f;
+        pc.accumulatedSamples = accumulatedSamples;
+        vkCmdPushConstants(cmd, m_coarseRemodulatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(AtrousCoarseRemodulatePushConstants), &pc);
+
+        writeTimestamp(qBase + 8);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        writeTimestamp(qBase + 9);
+        m_slotQueriesRecorded[frameSlot] = true;
+    }
+
+    // Output barrier: guarantee tonemapping reads the finished denoised image
+    VkMemoryBarrier2 outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    outputBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+    VkDependencyInfo outputDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    outputDep.memoryBarrierCount = 1;
+    outputDep.pMemoryBarriers = &outputBarrier;
+    vkCmdPipelineBarrier2(cmd, &outputDep);
 }
 
 } // namespace pathways

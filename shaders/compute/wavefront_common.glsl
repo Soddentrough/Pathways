@@ -539,20 +539,25 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
 }
 
 // Record First-Bounce Specular Virtual Motion Vector & Disparity (VMV)
-// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage for NRD/Upways.
+// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage for E-SVGF/Upways.
+// Projects the planar virtual image point x_virt = x_primary + d_refl * r_primary along the primary viewing ray.
 #define RECORD_SPECULAR_VMV(pixelIdx, pt, hitDist, isMiss) \
     do { \
         if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
-            vec3 pt_ = (pt); \
-            vec4 cClip_ = ubo.unjitteredViewProj * vec4(pt_, 1.0); \
-            vec4 pClip_ = ubo.prevViewProj * vec4(pt_, 1.0); \
+            float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
+            vec3 toSurf_ = origin - ubo.position.xyz; \
+            float surfDist_ = length(toSurf_); \
+            vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
+            vec3 xVirt_ = origin + primDir_ * reflDist_; \
+            vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
+            vec4 pClip_ = ubo.prevViewProj * vec4(xVirt_, 1.0); \
             vec2 vS_ = vec2(0.0); \
             if (cClip_.w > 1e-4 && pClip_.w > 1e-4) { \
                 vS_ = (cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5; \
             } \
-            float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + max(float(hitDist), 0.0))); \
-            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, 0.0)); \
+            float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
+            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \
         } \
     } while(false)
 

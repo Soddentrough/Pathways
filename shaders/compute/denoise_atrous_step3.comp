@@ -1,0 +1,93 @@
+#version 460
+
+// =============================================================================
+// PASS 4: Mid-Scale Wavelet Iteration 3 (s = 4, accumulated radius 14,
+//         accumulated diameter 29, covering Fu et al. k = 17)
+// Reference: docs/design/adaptive_svgf_denoiser_proposal.md Section 4.2 / Pass 4
+//
+//  * Dense edge pixels (rho_eff >= 0.55) already finished filtering in Pass 3;
+//    coherent wavefronts bypass all 25 mid-scale taps via subgroupAll() voting
+//    keyed strictly to the RAMP TOP to avoid block divergence artifacts.
+//  * Continuous smoothstep crossfade w_blend1 = smoothstep(0.45, 0.55, rho_eff)
+//    prevents spatial seams on boundary wavefronts.
+//  * Wavefronts covering moderate curvature complete spatial convolution here
+//    and skip Pass 5 taps (remodulation evaluates in Pass 5).
+// =============================================================================
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInDiffuse;    // from m_pingPongDiffuse[1]
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uInSpecular;   // from m_pingPongSpecular[1]
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughness;
+layout(set = 0, binding = 4, rg8) readonly uniform image2D uEdgeDensity;  // G: rho_effective
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D uOutDiffuse;  // -> m_pingPongDiffuse[0]
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D uOutSpecular; 
+
+#include "denoise_atrous_common.glsl"
+
+// -> m_pingPongSpecular[0]
+
+layout(push_constant) uniform AtrousPushConstants {
+    uint  width;
+    uint  height;
+    int   stepSize;          // 4
+    float phiNormal;         // 32.0
+    float phiPlaneDepth;     // 2.00
+    float phiLuminance;      // 4.00
+    float tanHalfFovY;
+    float aspectRatio;
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    // Effective spatial density (history-modulated) from Channel G
+    float effectiveRho = imageLoad(uEdgeDensity, coord).g;
+
+    // 1. Fast wavefront early-exit: coherent 32-lane wave in dense edges skips
+    //    all 25 mid-scale taps and passes through already-converged radiance
+    if (subgroupAll(effectiveRho >= 0.55)) {
+        imageStore(uOutDiffuse, coord, imageLoad(uInDiffuse, coord));
+        imageStore(uOutSpecular, coord, imageLoad(uInSpecular, coord));
+        return;
+    }
+
+    // 2. Spatial convolution across divergent / flat wavefronts (25 taps, s = 4)
+    vec4 nd = imageLoad(uNormalDepth, coord);
+    vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
+
+    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
+    vec4 inSpecular = imageLoad(uInSpecular, coord);
+
+    float centerLumD = denoiseLuminance(inDiffuse.rgb);
+    float centerLumS = denoiseLuminance(inSpecular.rgb);
+
+    vec4 filteredDiffuse = atrousFilterDiffuse(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
+        pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    float roughness = imageLoad(uAlbedoRoughness, coord).a;
+    vec4 filteredSpecular = atrousFilterSpecular(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
+        roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    // 3. Continuous smoothstep crossfade prevents spatial boundary seams:
+    //    dense-edge pixels fade back to their Pass-3 converged radiance
+    float edgeBlend = smoothstep(0.45, 0.55, effectiveRho);
+    vec4 finalDiffuse = mix(filteredDiffuse, inDiffuse, edgeBlend);
+    vec4 finalSpecular = mix(filteredSpecular, inSpecular, edgeBlend);
+
+    imageStore(uOutDiffuse, coord, vec4(clamp(finalDiffuse.rgb, 0.0, 65000.0), clamp(finalDiffuse.a, 0.0, 65000.0)));
+    imageStore(uOutSpecular, coord, vec4(clamp(finalSpecular.rgb, 0.0, 65000.0), clamp(finalSpecular.a, 0.0, 65000.0)));
+}

@@ -152,6 +152,12 @@ private:
     void syncPresentationPointers();
     std::unique_ptr<Camera> m_camera;
     std::unique_ptr<CameraPath> m_cameraPath;
+
+    // E-SVGF denoiser camera jitter state (UV units), refreshed each frame from
+    // the Halton sub-pixel jitter applied by Camera::getUniformData()
+    glm::vec2 m_denoiseJitterUv{0.0f, 0.0f};
+    glm::vec2 m_prevDenoiseJitterUv{0.0f, 0.0f};
+    DenoiserPipeline::CameraMatrices buildDenoiserCameraMatrices(uint32_t width, uint32_t height) const;
     float m_cameraPathTime = 0.0f;
     std::unique_ptr<class GuiManager> m_gui;
     std::unique_ptr<class MultiGpuManager> m_mgpu;

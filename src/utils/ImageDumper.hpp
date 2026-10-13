@@ -170,6 +170,9 @@ struct FrameStats {
     double secondary_gpu_time_ms = 0.0;
     double tonemap_time_ms = 0.0;
     double upways_time_ms = 0.0;
+    // Adaptive E-SVGF per-dispatch GPU timings (ms):
+    // [0] fused temporal, [1] atrous s=1, [2] atrous s=2, [3] atrous s=4, [4] coarse s=8 + remodulate
+    double denoise_pass_ms[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
     double pcie_transfer_time_ms = 0.0;
 
     // Multi-GPU Interconnect & Async Queue Telemetry

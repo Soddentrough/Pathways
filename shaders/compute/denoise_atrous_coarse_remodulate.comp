@@ -1,0 +1,129 @@
+#version 460
+
+// =============================================================================
+// PASS 5: Coarse Wavelet Iteration 4 (s = 8, accumulated radius 30,
+//         accumulated diameter 61, covering Fu et al. k = 33)
+//         & FUSED ALBEDO REMODULATION
+// Reference: docs/design/adaptive_svgf_denoiser_proposal.md Section 4.2 / Pass 5
+//
+//  * Coarse dilation executes exclusively for smooth/homogeneous regions
+//    (rho_effective < 0.35), eliminating 1-SPP low-frequency blotches and
+//    restoring the full 61-px receptive field of classic SVGF.
+//  * Coherent wavefronts of moderate curvature bypass all 25 coarse taps via
+//    subgroupAll(effectiveRho >= 0.35) and evaluate remodulation directly.
+//  * Continuous smoothstep crossfade w_blend2 = smoothstep(0.25, 0.35, rho_eff).
+//  * In-register diffuse albedo remodulation:
+//      L_final = L_diffuse * max(c_albedo, 0.001) + L_specular
+//  * Optional motion-gated stationary progressive preview (compile-time,
+//    strictly excluded from the real-time production contract).
+// =============================================================================
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInDiffuse;    // from m_pingPongDiffuse[0]
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uInSpecular;   // from m_pingPongSpecular[0]
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughness;
+layout(set = 0, binding = 4, rg8) readonly uniform image2D uEdgeDensity;  // G: rho_effective
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D uFinalDenoised; // -> m_denoisedImage
+
+#ifdef ENABLE_STATIONARY_PREVIEW
+layout(set = 0, binding = 6, rg16f) readonly uniform image2D uMotionVectors;
+layout(set = 0, binding = 7, rgba16f) readonly uniform image2D uAccumImage;
+
+
+#endif
+
+#include "denoise_atrous_common.glsl"
+
+layout(push_constant) uniform AtrousCoarseRemodulatePushConstants {
+    uint  width;
+    uint  height;
+    int   stepSize;              // 8
+    float phiNormal;             // 32.0
+    float phiPlaneDepth;         // 2.00
+    float phiLuminance;          // 4.00
+    float tanHalfFovY;
+    float aspectRatio;
+    float edgeThresholdLow;      // 0.35 (ramp top)
+    uint  accumulatedSamples;    // Used only if ENABLE_STATIONARY_PREVIEW
+    float padding[2];
+} pc;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
+
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    float effectiveRho = imageLoad(uEdgeDensity, coord).g;
+    vec4 nd = imageLoad(uNormalDepth, coord);
+    vec4 albRough = imageLoad(uAlbedoRoughness, coord);
+    // Matched albedo remodulation (pairing with denoiseDemodulationFactor in Pass 1
+    // so temporal reprojection and 61-px À-Trous filtering operate on demodulated
+    // irradiance while preserving crisp high-frequency surface albedo textures).
+    vec3 modulate = denoiseDemodulationFactor(albRough.rgb, nd.w);
+
+    // Wavefront uniform voting: moderate curvature waves bypass the 25 coarse
+    // s = 8 taps and evaluate remodulation directly from converged radiance
+    bool bypassCoarseTaps = subgroupAll(effectiveRho >= pc.edgeThresholdLow);
+    if (bypassCoarseTaps) {
+        vec4 diff = imageLoad(uInDiffuse, coord);
+        vec4 spec = imageLoad(uInSpecular, coord);
+        vec3 L_remod = diff.rgb * modulate + spec.rgb;
+        L_remod = clamp(L_remod, 0.0, 65000.0);
+        imageStore(uFinalDenoised, coord, vec4(L_remod, 1.0));
+        return;
+    }
+
+    // Coarse dilated convolution (25 taps, s = 8) for smooth / flat regions
+    vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
+
+    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
+    vec4 inSpecular = imageLoad(uInSpecular, coord);
+
+    float centerLumD = denoiseLuminance(inDiffuse.rgb);
+    float centerLumS = denoiseLuminance(inSpecular.rgb);
+
+    vec4 filteredDiffuse = atrousFilterDiffuse(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
+        pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    float roughness = albRough.a;
+    vec4 filteredSpecular = atrousFilterSpecular(
+        coord, pc.stepSize,
+        nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
+        roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        pc.tanHalfFovY, pc.aspectRatio, imgMax);
+
+    // Continuous smoothstep crossfade prevents boundary ringing between dense
+    // edge partitions and flat surfaces (both radiance and variance alpha)
+    float edgeBlend = smoothstep(0.25, 0.35, effectiveRho);
+    vec4 finalDiffuse = mix(filteredDiffuse, inDiffuse, edgeBlend);
+    vec4 finalSpecular = mix(filteredSpecular, inSpecular, edgeBlend);
+
+    // Remodulation in-register: zero intermediate global memory writes
+    vec3 L_final = finalDiffuse.rgb * modulate + finalSpecular.rgb;
+
+#ifdef ENABLE_STATIONARY_PREVIEW
+    // Optional preview mode variant (strictly excluded from real-time production):
+    // Gated per-pixel by sub-pixel motion threshold to prevent ghost smears
+    vec2 mv = imageLoad(uMotionVectors, coord).xy;
+    float pixelMotion = dot(mv, mv);
+    float subpixelThreshold = (0.5 / float(pc.width)) * (0.5 / float(pc.width));
+    if (pixelMotion < subpixelThreshold && pc.accumulatedSamples > 1u) {
+        float wBlend = float(pc.accumulatedSamples) / (float(pc.accumulatedSamples) + 8.0);
+        vec3 accumColor = imageLoad(uAccumImage, coord).rgb;
+        L_final = mix(L_final, accumColor, wBlend);
+    }
+#endif
+
+    // Finite FP16 range clamp prevents Inf overflow on extreme HDR highlights
+    L_final = clamp(L_final, 0.0, 65000.0);
+    imageStore(uFinalDenoised, coord, vec4(L_final, 1.0));
+}
