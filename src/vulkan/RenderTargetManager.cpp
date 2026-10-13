@@ -12,6 +12,9 @@ RenderTargetManager::~RenderTargetManager() {
 }
 
 void RenderTargetManager::destroy() {
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     destroyGBufferResources();
     for (auto& img : m_frameImages) img.reset();
     m_accumImage.reset();

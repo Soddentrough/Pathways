@@ -27,6 +27,7 @@ NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
 
 NRCManager::~NRCManager() {
     if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
         if (m_inferPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_inferPipeline, nullptr);
         if (m_inferPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_inferPipelineLayout, nullptr);
         if (m_inferDescLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_device, m_inferDescLayout, nullptr);
@@ -367,6 +368,9 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
 
 void NRCManager::resize(uint32_t width, uint32_t height) {
     if (m_width == width && m_height == height) return;
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     Logger::info("NRCManager resized: updating cache resolution to {}x{}", width, height);
     m_width = width;
     m_height = height;

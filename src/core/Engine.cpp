@@ -206,6 +206,8 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_lastRenderScale = m_config.render_scale;
     m_lastUpscalerMode = m_config.upscaler_mode;
     m_lastTileSize = m_config.tile_size;
+    m_lastBatchCount = m_config.batch_count;
+    m_lastBatchPixels = m_config.batch_pixels;
     m_dynamicWavefrontBounces = m_config.max_bounces;
 
     // Initialize Dynamic Quality Governor
@@ -835,6 +837,8 @@ void Engine::initPipelines() {
     }
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
+    m_lastBatchCount = m_config.batch_count;
+    m_lastBatchPixels = m_config.batch_pixels;
 
     bool enableExecSet = m_context->supportsDgcExecutionSet() && Config::dgcExecSetRequested();
     m_dgcPreprocessEnabled = m_config.dgc_preprocess && m_context->supportsDgcPreprocess();
@@ -1481,9 +1485,11 @@ void Engine::renderFrame() {
     bool scalingOrUpscalerChanged = (m_config.render_scale != m_lastRenderScale) ||
                                     (m_config.upscaler_mode != m_lastUpscalerMode) ||
                                     (m_config.tile_size != m_lastTileSize);
+    bool batchingChanged = (m_config.batch_count != m_lastBatchCount) ||
+                           (m_config.batch_pixels != m_lastBatchPixels);
 
     if (m_pendingMgpuModeChange || m_pendingMgpuUpscaleModeChange || m_pendingAccumFormatChange ||
-        m_pendingDoubleBufferChange || m_pendingTileSizeChange || scalingOrUpscalerChanged) {
+        m_pendingDoubleBufferChange || m_pendingTileSizeChange || scalingOrUpscalerChanged || batchingChanged) {
         VkDevice dev = m_context->getDevice();
         VmaAllocator alloc = m_context->getAllocator();
         vkDeviceWaitIdle(dev);
@@ -1494,6 +1500,8 @@ void Engine::renderFrame() {
         m_lastRenderScale = m_config.render_scale;
         m_lastUpscalerMode = m_config.upscaler_mode;
         m_lastTileSize = m_config.tile_size;
+        m_lastBatchCount = m_config.batch_count;
+        m_lastBatchPixels = m_config.batch_pixels;
 
         if (m_pendingMgpuUpscaleModeChange) {
             m_config.mgpu_upscale_mode = m_newMgpuUpscaleMode;
@@ -1590,6 +1598,17 @@ void Engine::renderFrame() {
                     m_postProcess.get(), m_commandBuffers[0]
                 );
             }
+        }
+
+        if (m_rtOrchestrator && (batchingChanged || scalingOrUpscalerChanged)) {
+            uint32_t traceW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
+            uint32_t traceH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
+                static_cast<uint32_t>(m_config.height * m_config.render_scale) : m_config.height;
+            m_rtOrchestrator->resize(traceW, traceH, m_config);
+            m_currentBatchCount = m_rtOrchestrator->getCurrentBatchCount();
+            m_currentBatchPixels = m_rtOrchestrator->getCurrentBatchPixels();
+            updateWavefrontSceneDescriptors();
         }
 
         updateMergeDescriptors();
@@ -2518,6 +2537,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_rtOrchestrator->resize(m_config.width, m_config.height, m_config);
         m_currentBatchCount = m_rtOrchestrator->getCurrentBatchCount();
         m_currentBatchPixels = m_rtOrchestrator->getCurrentBatchPixels();
+        m_lastBatchCount = m_config.batch_count;
+        m_lastBatchPixels = m_config.batch_pixels;
     }
 
     updateAllImageDescriptors();

@@ -131,6 +131,16 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) engine.renderFrame();
             pathways::Logger::info("[PASS] Switched back to Single-GPU and rendered 3 frames cleanly.");
 
+            // Dynamically switch wavefront batch partitioning modes across all configurations
+            pathways::Logger::info("Dynamically testing wavefront batching mode changes (1, 2, 4, 8, 16, Auto)...");
+            const uint32_t testBatchCounts[] = { 1, 2, 4, 8, 16, 0 };
+            for (uint32_t batchCount : testBatchCounts) {
+                pathways::Logger::info("  Switching to batch_count = {}...", batchCount);
+                engine.setBatchCount(batchCount);
+                for (int i = 0; i < 4; ++i) engine.renderFrame();
+            }
+            pathways::Logger::info("[PASS] Dynamic wavefront batching mode switching rendered all configurations cleanly.");
+
             // Switch to scene 8: Point Instanced Med City (OpenUSD Scene)
             if (std::filesystem::exists("scenes/PointInstancedMedCity/PointInstancedMedCity.usd")) {
                 if (!engine.loadScene("scenes/PointInstancedMedCity/PointInstancedMedCity.usd")) {

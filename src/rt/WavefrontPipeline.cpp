@@ -75,6 +75,9 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
 }
 
 WavefrontPipeline::~WavefrontPipeline() {
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     m_dummyStorageImage.reset();
     m_dgcManager.reset();
 
@@ -397,19 +400,19 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDeviceSize actualShadeMatSize = (shadeMaterialBuffer != VK_NULL_HANDLE && shadeMaterialSize > 0) ? shadeMaterialSize : matSize;
     VkDescriptorBufferInfo shadeMatInfo{ actualShadeMat, 0, actualShadeMatSize };
 
-    VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_queueCounters[frameSlot]->getBuffer();
-    VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_queueCounters[frameSlot]->getBuffer();
-    VkBuffer actualNrcCounters = (nrcCountersBuffer != VK_NULL_HANDLE) ? nrcCountersBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualNrcQuery = (nrcQueryBuffer != VK_NULL_HANDLE) ? nrcQueryBuffer : m_dummyReservoir->getBuffer();
+    VkBuffer actualNrcTrain = (nrcTrainBuffer != VK_NULL_HANDLE) ? nrcTrainBuffer : m_dummyReservoir->getBuffer();
+    VkBuffer actualNrcCounters = (nrcCountersBuffer != VK_NULL_HANDLE) ? nrcCountersBuffer : m_dummyReservoir->getBuffer();
 
     VkDescriptorBufferInfo nrcQueryInfo{ actualNrcQuery, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo nrcTrainInfo{ actualNrcTrain, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo nrcCountersInfo{ actualNrcCounters, 0, VK_WHOLE_SIZE };
 
-    VkBuffer actualLightTree = (lightTreeBuffer != VK_NULL_HANDLE) ? lightTreeBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualLightTree = (lightTreeBuffer != VK_NULL_HANDLE) ? lightTreeBuffer : m_dummyReservoir->getBuffer();
     VkDeviceSize actualLightTreeSize = (lightTreeBuffer != VK_NULL_HANDLE && lightTreeSize > 0) ? lightTreeSize : VK_WHOLE_SIZE;
     VkDescriptorBufferInfo lightTreeInfo{ actualLightTree, 0, actualLightTreeSize };
 
-    VkBuffer actualInstanceBuffer = (instanceBuffer != VK_NULL_HANDLE) ? instanceBuffer : m_queueCounters[frameSlot]->getBuffer();
+    VkBuffer actualInstanceBuffer = (instanceBuffer != VK_NULL_HANDLE) ? instanceBuffer : m_dummyReservoir->getBuffer();
     VkDeviceSize actualInstanceSize = (instanceBuffer != VK_NULL_HANDLE && instanceSize > 0) ? instanceSize : VK_WHOLE_SIZE;
     VkDescriptorBufferInfo instanceInfo{ actualInstanceBuffer, 0, actualInstanceSize };
 
@@ -509,6 +512,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
 
 void WavefrontPipeline::resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels) {
     if (m_width == width && m_height == height && m_maxBatchPixels == maxBatchPixels) return;
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     m_width = width;
     m_height = height;
     m_maxBatchPixels = maxBatchPixels;

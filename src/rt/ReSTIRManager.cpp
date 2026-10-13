@@ -11,6 +11,9 @@ ReSTIRManager::ReSTIRManager(VkDevice device, VmaAllocator allocator)
 }
 
 ReSTIRManager::~ReSTIRManager() {
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     for (auto& b : m_reservoirBuffers) b.reset();
     for (auto& b : m_giReservoirBuffers) b.reset();
     for (auto& b : m_reservoirPTBuffers) b.reset();
@@ -77,6 +80,9 @@ void ReSTIRManager::initBuffers() {
 
 void ReSTIRManager::resize(uint32_t width, uint32_t height) {
     if (m_width == width && m_height == height) return;
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     m_width = width;
     m_height = height;
     initBuffers();

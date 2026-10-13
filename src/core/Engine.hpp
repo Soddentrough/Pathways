@@ -119,6 +119,8 @@ public:
     bool saveScreenshot(const std::string& customPath = "");
     std::string generateScreenshotFilename() const;
     void requestScreenshot() noexcept { m_pendingScreenshot = true; }
+    void setBatchCount(uint32_t count) noexcept { m_config.batch_count = count; }
+    void setBatchPixels(uint32_t pixels) noexcept { m_config.batch_pixels = pixels; }
 
 private:
     void initVulkan();
@@ -336,6 +338,8 @@ private:
     float m_lastRenderScale = 1.0f;
     UpscalerMode m_lastUpscalerMode = UpscalerMode::None;
     uint32_t m_lastTileSize = 64;
+    uint32_t m_lastBatchCount = 0;
+    uint32_t m_lastBatchPixels = 0;
 
     // Available scenes and dynamic selection
     std::vector<SceneEntry> m_availableScenes;

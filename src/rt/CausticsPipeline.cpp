@@ -37,6 +37,9 @@ CausticsPipeline::CausticsPipeline(VkDevice device,
 }
 
 CausticsPipeline::~CausticsPipeline() {
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     destroyResources();
 
     if (m_tracePipeline)  { vkDestroyPipeline(m_device, m_tracePipeline, nullptr); m_tracePipeline = VK_NULL_HANDLE; }
@@ -295,6 +298,9 @@ void CausticsPipeline::destroyResources() {
 
 void CausticsPipeline::resize(uint32_t width, uint32_t height, ImmediateSubmitFn immediateSubmit) {
     if (m_width == width && m_height == height) return;
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
     m_width = width;
     m_height = height;
     destroyResources();
