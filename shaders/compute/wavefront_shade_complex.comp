@@ -1115,6 +1115,8 @@ void main() {
                 for (uint c = 0u; c < 4u; ++c) {
                     dgcStream.commands[nextB * 16u + c].x = 0u;
                 }
+                queueCounters.activeMaterialSequenceCount = 0u;
+                queueCounters.totalShadeWorkgroups = 0u;
             }
 
             queueCounters.currentShadowCount = shadowCount;
