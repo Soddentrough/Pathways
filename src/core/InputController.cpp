@@ -186,15 +186,7 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return true; // Consume event so ImGui navigation does not swallow TAB
     }
 
-    // 4. Release mouse if window focus is lost while in camera mode
-    if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
-        if (m_cameraMode) {
-            setCameraMode(false);
-        }
-        return false;
-    }
-
-    // 5. ESC key: if in camera mode, return to UI mode; if already in UI mode, exit the application
+    // 4. ESC key: if in camera mode, return to UI mode; if already in UI mode, exit the application
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
         if (m_cameraMode) {
             setCameraMode(false);
@@ -282,7 +274,10 @@ bool InputController::handleEvent(const SDL_Event& e) {
         }
         if (e.type == SDL_EVENT_MOUSE_WHEEL) {
             if (m_camera) {
-                m_camera->adjustSpeedByWheel(e.wheel.y);
+                float wheelY = (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -e.wheel.y : e.wheel.y;
+                if (!std::isnan(wheelY)) {
+                    m_camera->adjustSpeedByWheel(wheelY);
+                }
             }
             return true;
         }

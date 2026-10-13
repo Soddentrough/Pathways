@@ -892,7 +892,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
 
-        uint32_t totalPrimaryRays = fw * fh;
         uint32_t batchPixels = curBatchW * curBatchH;
         uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
             ? std::min(batchPixels > 0 ? batchPixels - 1u : 0u, static_cast<uint32_t>(std::round(batchPixels * sceneData.earlyBounceCutoffThreshold))) : 0u;

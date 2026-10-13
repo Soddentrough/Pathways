@@ -187,6 +187,8 @@ layout(binding = 1) uniform CameraUBO {
     uint spp;
     uint maxBounces;
     uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
 } ubo;
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
@@ -464,8 +466,9 @@ void main() {
     float w = 1.0 - u - v;
 
     vec3 hitPoint = gl_WorldRayOriginEXT + gl_HitTEXT * gl_WorldRayDirectionEXT;
-    vec3 normal = getTriangleNormal(tri, attribs);
+    vec3 normal = normalize(transpose(mat3(gl_WorldToObjectEXT)) * getTriangleNormal(tri, attribs));
     vec2 hitUv = getTriangleUV(tri, attribs);
+    uint fullW = (pc.tileWidth > 0u) ? pc.tileWidth : gl_LaunchSizeEXT.x;
 
     bool frontFace = dot(gl_WorldRayDirectionEXT, normal) < 0.0;
     vec3 geomNormal = frontFace ? normal : -normal;
@@ -501,7 +504,7 @@ void main() {
 
     // Normal mapping
     if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-        vec3 geomTan = getTriangleTangent(tri, attribs);
+        vec3 geomTan = normalize(mat3(gl_ObjectToWorldEXT) * getTriangleTangent(tri, attribs));
         float tanSign = getTriangleTangentSign(tri);
 
         vec3 normalMap = texture(sceneTextures[nonuniformEXT(mat.normalTex - 1u)], hitUv).rgb * 2.0 - 1.0;
@@ -614,8 +617,8 @@ void main() {
         if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* Emissive */) {
             bool isPrimary = ((prd.packedThroughputB_Flags >> 16u) & 4u) != 0u;
             if (isPrimary) {
-                int currentPx = int(prd.pad % pc.tileWidth);
-                int currentPy = int(prd.pad / pc.tileWidth);
+                int currentPx = int(prd.pad % fullW);
+                int currentPy = int(prd.pad / fullW);
                 ivec2 baseCoord = ivec2(currentPx, currentPy);
                 vec3 viewGeomNormal = normalize(transpose(mat3(ubo.viewInverse)) * geomNormal);
                 vec3 camForward = -ubo.viewInverse[2].xyz;
@@ -673,7 +676,7 @@ void main() {
     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
     vec3 clearcoatNormal = geomNormal;
     if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
-        vec3 cGeomTan = getTriangleTangent(tri, attribs);
+        vec3 cGeomTan = mat3(gl_ObjectToWorldEXT) * getTriangleTangent(tri, attribs);
         float cTanSign = getTriangleTangentSign(tri);
         if (length(cGeomTan) < 0.1) {
             vec3 up = abs(geomNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
@@ -778,8 +781,8 @@ void main() {
                 vec3 directSpecular = lightEmission * specBRDF * NdotL * misWeightLight / lightPdf;
                 vec3 directUnshadowed = directDiffuse + directSpecular;
                 if (enableShadowDenoiser && isPrimary) {
-                    int currentPx = int(prd.pad % pc.tileWidth);
-                    int currentPy = int(prd.pad / pc.tileWidth);
+                    int currentPx = int(prd.pad % fullW);
+                    int currentPy = int(prd.pad / fullW);
                     ivec2 baseCoord = ivec2(currentPx, currentPy);
                     float rawShadow = inShadow ? 0.0 : 1.0;
                     imageStore(uDirectLightImage, baseCoord, vec4(directUnshadowed, rawShadow));
@@ -795,8 +798,8 @@ void main() {
 
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
     if (enableCaustics && (mat.type & MATERIAL_TYPE_MASK) != 3u && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && metallic < 0.2) {
-        int currentPx = int(prd.pad % pc.tileWidth);
-        int currentPy = int(prd.pad / pc.tileWidth);
+        int currentPx = int(prd.pad % fullW);
+        int currentPy = int(prd.pad / fullW);
         ivec2 baseCoord = ivec2(currentPx, currentPy);
         vec3 causticIrr = imageLoad(uCausticImage, baseCoord).rgb;
         if (dot(causticIrr, causticIrr) > 1e-8) {
@@ -841,8 +844,8 @@ void main() {
                 throughputMod = baseColor.rgb * transmittance;
             }
             if (isPrimary) {
-                int currentPx = int(prd.pad % pc.tileWidth);
-                int currentPy = int(prd.pad / pc.tileWidth);
+                int currentPx = int(prd.pad % fullW);
+                int currentPy = int(prd.pad / fullW);
                 ivec2 baseCoord = ivec2(currentPx, currentPy);
                 imageStore(uNormalDepthImage, baseCoord, vec4(viewNormal, hitDepth));
             }
@@ -916,8 +919,8 @@ void main() {
     }
 
     if (isPrimary) {
-        int currentPx = int(prd.pad % pc.tileWidth);
-        int currentPy = int(prd.pad / pc.tileWidth);
+        int currentPx = int(prd.pad % fullW);
+        int currentPy = int(prd.pad / fullW);
         ivec2 baseCoord = ivec2(currentPx, currentPy);
         imageStore(uNormalDepthImage, baseCoord, vec4(viewNormal, hitDepth));
         prd.packedAlbedoRG = packHalf2x16(baseColor.rg);

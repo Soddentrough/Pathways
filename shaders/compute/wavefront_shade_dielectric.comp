@@ -233,7 +233,7 @@ void main() {
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
@@ -306,19 +306,12 @@ void main() {
             if (!pathTerminated) {
                 float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
 
-                // KHR_materials_dispersion: Spectral wavelength sampling
-                if (mat.dispersion > 0.001) {
-                    bool alreadyDispersed = (throughput.r > 0.0 && throughput.g == 0.0 && throughput.b == 0.0) ||
-                                            (throughput.g > 0.0 && throughput.r == 0.0 && throughput.b == 0.0) ||
-                                            (throughput.b > 0.0 && throughput.r == 0.0 && throughput.g == 0.0);
-                    uint channel;
-                    if (alreadyDispersed) {
-                        channel = (throughput.r > 0.0) ? 0u : ((throughput.g > 0.0) ? 1u : 2u);
-                    } else {
-                        channel = min(uint(randFloat(seed) * 3.0), 2u);
-                        vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
-                        throughput *= mask;
-                    }
+                // KHR_materials_dispersion: If this ray already selected a spectral wavelength
+                // on an earlier refraction bounce, shift IOR for that wavelength channel (1=R, 2=G, 3=B).
+                // Initial channel selection happens only upon entering a dispersive medium via refraction
+                // below, so exterior Fresnel reflections remain achromatic.
+                if (mat.dispersion > 0.001 && dispersionChannel != 0u) {
+                    uint channel = dispersionChannel - 1u;
                     float dispDelta = (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
                     iorVal += dispDelta;
                 }

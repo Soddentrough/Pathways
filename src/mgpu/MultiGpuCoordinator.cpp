@@ -182,7 +182,8 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
         bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Upways);
+                             params.config.denoiser_mode == DenoiserMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Svgf);
         if (plan.tileOffsetX_sec == 2u && needGbuffers) {
             plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 12; // 4 MV + 8 NormDepth
         }
@@ -341,7 +342,8 @@ void MultiGpuCoordinator::recordMergePass(
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
         bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Upways);
+                             params.config.denoiser_mode == DenoiserMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Svgf);
         PostProcessPipeline::MergePushConstants mergePC{
             plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp,
             plan.secDispatchWidth, needGbuffers ? 1u : 0u
@@ -363,9 +365,11 @@ void MultiGpuCoordinator::recordMergePass(
     mergeDep.pMemoryBarriers = &mergeBarrier;
     vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-    // Copy merged FP16 radiance into mlDiffuseImage for Upways neural reconstruction
+    // Copy merged FP16 radiance into mlDiffuseImage for Upways neural reconstruction / ReLAX SVGF denoiser
     if (!params.skipRayTracing && mlDiffuseImage && frameImage && 
-        (params.config.upscaler_mode == UpscalerMode::Upways || params.config.denoiser_mode == DenoiserMode::Upways)) {
+        (params.config.upscaler_mode == UpscalerMode::Upways ||
+         params.config.denoiser_mode == DenoiserMode::Upways ||
+         params.config.denoiser_mode == DenoiserMode::Svgf)) {
         VkImageCopy copyRegion{};
         copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };

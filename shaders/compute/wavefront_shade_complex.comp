@@ -283,7 +283,7 @@ void main() {
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
             if (enableRestirPT && bounce == 0u) {
                 currentReservoirs[pixelIndex] = invalidDiReservoir();
@@ -551,7 +551,7 @@ void main() {
                                         if (!occluded) {
                                             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
+                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                                             if (pc.captureMlData != 0u) {
                                                 if (isSpecularPath) {
                                                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);

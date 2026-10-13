@@ -51,10 +51,12 @@ public:
 
     void resize(uint32_t width, uint32_t height);
     void updateDescriptors(VkImageView accumImageView);
+    void updateDescriptors(uint32_t slot, VkImageView accumImageView);
 
     void resetCounters(VkCommandBuffer cmd);
     void recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                         glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride = 0);
+                         glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride = 0,
+                         uint32_t frameSlot = 0);
     void recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
                         glm::vec3 worldMin, glm::vec3 worldMax, float learningRate = 1e-3f,
                         uint32_t batchSize = 8192);
@@ -108,7 +110,7 @@ private:
     VkPipeline m_trainPipeline = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout m_resolveDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_resolveDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_resolveDescSets{ VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout m_resolvePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
 };

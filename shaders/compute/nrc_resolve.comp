@@ -49,7 +49,7 @@ void main() {
         vec3 radiance = vec3(float(fixedR), float(fixedG), float(fixedB)) / 65536.0;
         vec4 prev = imageLoad(uAccumImage, pixelCoord);
         uint seed = uint(pixelIdx * 1973u) | 1u;
-        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), 0.0));
+        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
 
         // Reset accumulator back to zero for the next frame
         nrcAtomicBuffer[base + 0u] = 0u;

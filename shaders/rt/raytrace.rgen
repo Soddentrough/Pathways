@@ -192,7 +192,7 @@ void main() {
             prd.packedThroughputB_Flags = prdFlags << 16u;
             prd.seed = seed;
             prd.lastBsdfPdf = lastBsdfPdf;
-            prd.pad = uint(pixelCoord.y * int(pc.tileWidth) + pixelCoord.x);
+            prd.pad = uint(pixelCoord.y * imageSize.x + pixelCoord.x);
             prd.packedAlbedoRG = 0u;
             prd.packedAlbedoB_Roughness = 0u;
 

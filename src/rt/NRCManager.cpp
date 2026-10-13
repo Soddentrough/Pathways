@@ -210,12 +210,13 @@ void NRCManager::allocateDescriptorSets() {
         throw std::runtime_error("NRCManager: Failed to allocate training descriptor set!");
     }
 
+    std::array<VkDescriptorSetLayout, 2> resolveLayouts = { m_resolveDescLayout, m_resolveDescLayout };
     VkDescriptorSetAllocateInfo allocResolve{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     allocResolve.descriptorPool = m_descriptorPool;
-    allocResolve.descriptorSetCount = 1;
-    allocResolve.pSetLayouts = &m_resolveDescLayout;
-    if (vkAllocateDescriptorSets(m_device, &allocResolve, &m_resolveDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("NRCManager: Failed to allocate resolve descriptor set!");
+    allocResolve.descriptorSetCount = 2;
+    allocResolve.pSetLayouts = resolveLayouts.data();
+    if (vkAllocateDescriptorSets(m_device, &allocResolve, m_resolveDescSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("NRCManager: Failed to allocate resolve descriptor sets!");
     }
 
     // Write persistent buffer bindings for inference descriptor set (0: AtomicBuffer)
@@ -244,23 +245,28 @@ void NRCManager::allocateDescriptorSets() {
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(trainWrites.size()), trainWrites.data(), 0, nullptr);
 
-    // Write persistent buffer binding for resolve descriptor set (binding 1: AtomicBuffer)
-    VkWriteDescriptorSet resolveBufWrite{
-        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr
-    };
-    vkUpdateDescriptorSets(m_device, 1, &resolveBufWrite, 0, nullptr);
+    // Write persistent buffer binding for resolve descriptor sets (binding 1: AtomicBuffer)
+    std::array<VkWriteDescriptorSet, 2> resolveBufWrites = {{
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
+    }};
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(resolveBufWrites.size()), resolveBufWrites.data(), 0, nullptr);
 }
 
 void NRCManager::updateDescriptors(VkImageView accumImageView) {
-    if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer) return;
+    updateDescriptors(0, accumImageView);
+    updateDescriptors(1, accumImageView);
+}
+
+void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView) {
+    if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer || slot >= m_resolveDescSets.size()) return;
     // Update resolve descriptor set image binding (0) and buffer binding (1)
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -396,7 +402,8 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
 
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -420,7 +427,8 @@ void NRCManager::resetCounters(VkCommandBuffer cmd) {
 }
 
 void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                                glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride)
+                                glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride,
+                                uint32_t frameSlot)
 {
     if (!m_initialized || m_inferPipeline == VK_NULL_HANDLE) return;
 
@@ -495,8 +503,9 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
 
         // Resolve: Single-thread-per-pixel atomic buffer -> uAccumImage (CRIT-05)
         if (m_resolvePipeline != VK_NULL_HANDLE) {
+            uint32_t slot = frameSlot % 2u;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSet, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSets[slot], 0, nullptr);
 
             struct ResolvePushConstants {
                 uint32_t width;

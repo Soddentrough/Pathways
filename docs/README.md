@@ -15,7 +15,9 @@ docs/
 ├── PROFILING.md                        # Performance Profiling & Hardware Telemetry Guide
 ├── VULKAN_API_AUDIT.md                 # Complete Vulkan 1.4 API Call Audit & Platform Coverage
 ├── reports/                            # Empirical Benchmarking & Deep Technical Audits
-│   ├── codebase_review_2026_10_07.md   # Full Project Review (Oct 7 2026): current source of truth — DGC exec-set inversion, FSR 3.1 feasibility, gate fixes
+│   ├── codebase_review_2026_10_14.md   # Full Project Review (Oct 14 2026): current source of truth — ReSTIR PT, ReLAX/A-SVGF, dispersion, multi-GPU, NRC, RTP audits
+│   ├── restir_review_2026_10_10.md     # ReSTIR DI/GI Deep Review & Unbiasedness Audit (Oct 10 2026)
+│   ├── codebase_review_2026_10_07.md   # Full Project Review (Oct 7 2026, superseded): DGC exec-set inversion, FSR 3.1 feasibility, gate fixes
 │   ├── codebase_review_2026_10_05.md   # Full Project Review (Oct 5 2026, superseded): SOTA verification, quick wins & roadmap
 │   ├── codebase_sota_review.md         # SOTA Architectural & Performance Review (Sept 27 2026, superseded)
 │   ├── wavefront_batching_head_to_head.md # 2D Macro-Tile Partitioning & Queue Scaling Report
@@ -32,7 +34,7 @@ docs/
 ## 1. Architecture & Engineering Specifications
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)**:
-  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), ReSTIR DI reservoir sampling, and OpenUSD stage ingestion. (Experimental reconstruction/upscaler paths exist in code but are intentionally undocumented — see ARCHITECTURE §5.)
+  Comprehensive technical specification detailing Pathways' wavefront path tracing architecture, GPU-autonomous Device-Generated Commands (DGC), 64-byte cache-line-packed geometry buffers (`TriangleShadeGPU`, 2 triangles per 128-byte RDNA vector cache line), 64-byte compact shading materials (`ShadeMaterialGPU`), 3D Morton + Material dual-binning, zero-copy multi-GPU scaling (`VK_EXT_external_memory_host`), unified ReSTIR PT spatiotemporal reservoir resampling, in-house ReLAX / A-SVGF denoising, and OpenUSD stage ingestion. (Experimental reconstruction/upscaler paths exist in code but are intentionally undocumented — see ARCHITECTURE §5.)
 
 ---
 
@@ -58,8 +60,12 @@ docs/
 
 The [`reports/`](reports/) directory contains formal research reports, architectural audits, and hardware profiling studies:
 
+- **[reports/codebase_review_2026_10_14.md](reports/codebase_review_2026_10_14.md)**:
+  Full project review (October 14, 2026) — **current source of truth**. Audits all 46 commits since October 7, covering unified ReSTIR PT, the in-house ReLAX / A-SVGF denoiser, chromatic dispersion sampling, Multi-GPU secondary device parity, early bounce cutoff batch scaling, NRC cooperative matrix & backprop fixes, and hardware RTP pipeline synchronization.
+- **[reports/restir_review_2026_10_10.md](reports/restir_review_2026_10_10.md)**:
+  Deep mathematical and implementation review of the ReSTIR DI and GI reservoir pipelines (October 10, 2026), documenting unbiasedness invariants, pairwise MIS, and reconnection Jacobians.
 - **[reports/codebase_review_2026_10_07.md](reports/codebase_review_2026_10_07.md)**:
-  Full project review (October 7, 2026) — **current source of truth**. Verifies the Oct 5 remediations survived the Oct 6 merge, documents the DGC execution-set default inversion (fixed), a FidelityFX-SDK Vulkan feasibility study for FSR 3.1 (integration descoped by the owner — the `fsr3` pass remains a custom filter, finding A3), the performance-matrix gate failure on non-RDNA4 hosts, and the prioritized roadmap.
+  Full project review (October 7, 2026, superseded by Oct 14 review). Verifies the Oct 5 remediations survived the Oct 6 merge, documents the DGC execution-set default inversion (fixed), a FidelityFX-SDK Vulkan feasibility study for FSR 3.1 (integration descoped by the owner — the `fsr3` pass remains a custom filter, finding A3), the performance-matrix gate failure on non-RDNA4 hosts, and the prioritized roadmap.
 - **[reports/codebase_review_2026_10_05.md](reports/codebase_review_2026_10_05.md)**:
   Full project review (October 5, 2026). Re-verifies every finding from the September 27 SOTA review against current code, documents documentation/code drift, and provides the current prioritized action plan (quick wins through long-term SOTA roadmap).
 - **[reports/codebase_sota_review.md](reports/codebase_sota_review.md)**:

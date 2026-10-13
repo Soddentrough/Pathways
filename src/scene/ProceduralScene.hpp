@@ -100,7 +100,7 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
     s.tanSigns   = signs;
 
     s.materialId = tri.materialId;
-    s.padding0   = 0;
+    s.padding0   = tri.padding[0];
     s.reserved[0] = 0;
     s.reserved[1] = 0;
     s.reserved[2] = 0;

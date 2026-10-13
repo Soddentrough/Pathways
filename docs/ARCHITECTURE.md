@@ -329,17 +329,17 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | Binding | Resource Type | Name | Stride / Size | Purpose |
 | :---: | :--- | :--- | :---: | :--- |
 | **0** | `storageImage` | `accumImage` | RGBA32F / RGBA16F | Progressive accumulation & render target |
-| **1** | `uniformBuffer` | `cameraUBO` | 256 B | Camera projection, view matrices, resolution |
+| **1** | `uniformBuffer` | `cameraUBO` | 320 B | Camera projection, view matrices, unjittered VP, jitter offset, resolution |
 | **2** | `storageBuffer` | `triangles` | **64 B** | Cache-line-packed shading geometry (`TriangleShadeGPU`, 2 triangles per 128 B vector cache line) |
 | **3** | `storageBuffer` | `spheres` | 32 B | Procedural analytic spheres (`SphereGPU`) |
 | **4** | `storageBuffer` | `materials` | 208 B | Full glTF 2.0 extended PBR materials (`MaterialGPU`) |
-| **5** | `storageBuffer` | `lights` | 64 B | Analytical & directional scene lights |
+| **5** | `storageBuffer` | `lights` | 128 B | Analytical & emissive scene lights (1 cache line per light) |
 | **6** | `accelerationStructure` | `topLevelAS` | — | Hardware Top-Level Acceleration Structure (TLAS) |
 | **7** | `combinedSampler` | `environmentMap` | — | HDR/EXR equirectangular environment texture |
 | **8** | `combinedSampler[512]` | `sceneTextures` | — | Bindless/descriptor array of glTF/USD textures |
-| **9** | `storageBuffer` | `inStates` | 32 B | Input ray state queue (throughput, seed, radiance) |
-| **10** | `storageBuffer` | `outStates` | 32 B | Output ray state queue for next bounce |
-| **11** | `storageBuffer` | `queueCounters` | 64 B | Atomic workgroup and ray queue counters |
+| **9** | `storageBuffer` | `inStates` | 16 B | Input ray state queue (throughput, seed, pixel index, flags) |
+| **10** | `storageBuffer` | `outStates` | 16 B | Output ray state queue for next bounce |
+| **11** | `storageBuffer` | `queueCounters` | 256 B | Atomic workgroup and ray queue counters |
 | **20–22** | `storageBuffer` | `nrcQueue/Counters` | Variable | Neural direct-light caching query, train, and counter buffers |
 | **23–24** | `storageImage` | `motionVectors / normalDepth` | RG16F / RGBA16F | Temporal motion vectors and G-Buffer normal/depth |
 | **25** | `storageBuffer` | `lightTree` | Variable | Hierarchical 3D Light Tree nodes |
@@ -347,9 +347,12 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | **30** | `storageBuffer` | `instances` | 64 B | Scene mesh instance transforms and material offsets |
 | **31** | `storageImage` | `causticImage` | RGBA16F | Forward photon-traced caustic splat target |
 | **32** | `storageBuffer` | `restirReservoirs` | **28 B**/px | ReSTIR DI reservoirs, current frame slot (write) |
+| **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
+| **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |
 | **36** | `storageBuffer` | `restirHistory` | **28 B**/px | ReSTIR DI reservoirs, previous frame slot (temporal/spatial taps, read-only) |
 | **37** | `storageBuffer` | `x1Contexts` | **24 B**/px | ReSTIR GI: BRDF context at primary hit (written bounce 0, read bounce 1, single-buffered) |
 | **38** | `storageBuffer` | `giReservoirs` | **32 B**/px | ReSTIR GI reservoirs, current frame slot (write) |
 | **39** | `storageBuffer` | `giHistory` | **32 B**/px | ReSTIR GI reservoirs, previous frame slot (taps, read-only) |
-| **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
-| **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |
+| **40** | `storageBuffer` | `positions` | **48 B**/tri | Segregated vertex positions (`3 x vec4`) for triangle reconstruction |
+| **41–45** | `storageBuffer` | `ptReservoirs / pathSamples / shadeReq` | **32–144 B**/px | ReSTIR PT path reservoirs, path samples, and reconnection request/result buffers |
+| **47** | `storageImage` | `prevNormalDepthImage` | RGBA16F | Previous frame G-Buffer normal/depth for temporal reprojection |

@@ -366,12 +366,12 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
                  lmStats.misLights, lmStats.neeOnlyAreaLights);
 
     for (size_t t = 0; t < numTris; ++t) {
-        const auto& tri = m_sceneData.triangles[t];
+        auto& tri = m_sceneData.triangles[t];
+        tri.padding[0] = triLightMap[t]; // light index + 1, 0 = none, 0xFFFFFFFF = NEE-only
         positions.push_back(glm::vec4(glm::vec3(tri.v0.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v1.position), 1.0f));
         positions.push_back(glm::vec4(glm::vec3(tri.v2.position), 1.0f));
         TriangleShadeGPU s = createTriangleShadeGPU(tri);
-        s.padding0 = triLightMap[t]; // light index + 1, 0 = none, 0xFFFFFFFF = NEE-only
         shadeTriangles.push_back(s);
     }
 

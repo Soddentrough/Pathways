@@ -24,11 +24,6 @@ void main() {
 
     vec3 diff = imageLoad(uInDenoisedDiffuse, coord).rgb;
     vec3 spec = imageLoad(uInDenoisedSpecular, coord).rgb;
-    vec4 albedoR = imageLoad(uAlbedoRoughness, coord);
-    vec3 albedo = max(albedoR.rgb, vec3(0.0));
-    if (dot(albedo, vec3(1.0)) < 1e-4) {
-        albedo = vec3(1.0);
-    }
 
     // Combine denoised diffuse and specular radiance
     vec3 denoisedRadiance = diff + spec;

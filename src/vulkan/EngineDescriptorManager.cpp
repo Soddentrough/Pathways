@@ -338,8 +338,12 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
         );
     }
 
-    if (params.nrcManager && params.frameImages[0]) {
-        params.nrcManager->updateDescriptors(params.frameImages[0]->getImageView());
+    if (params.nrcManager) {
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            if (params.frameImages[slot]) {
+                params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView());
+            }
+        }
     }
 }
 

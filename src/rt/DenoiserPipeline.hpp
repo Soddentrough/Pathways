@@ -83,6 +83,7 @@ public:
     );
 
     void initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage);
+    void invalidateDescriptors() { m_descriptorsBound = false; }
 
     [[nodiscard]] Image* getDenoisedImage() const { return m_denoisedImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapDescSet() const { return m_tonemapDescSet; }

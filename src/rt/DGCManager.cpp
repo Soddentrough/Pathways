@@ -315,7 +315,8 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
     const bool enableMaterialDGC = Config::dgcExecSetRequested();
     if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || primaryPipelines.empty()) {
         m_materialDGCSupported = false;
-        Logger::info("Material microkernels active via GPU multi-dispatch indirect queues (6 specialized pipelines).");
+        Logger::info("Material microkernels active via GPU multi-dispatch indirect queues ({} specialized pipelines).",
+                     primaryPipelines.size());
         return;
     }
 
@@ -368,7 +369,7 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
     } else {
         Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", primaryPipelines.size());
     }
-    Logger::info("DGC Material Execution Set active (default path on drivers with compute execution-set support). If a driver mis-handles indirect pipeline switching, use --no-dgc-execset to force multi-dispatch indirect.");
+    Logger::info("DGC Material Execution Set active (enabled via --dgc-execset / PATHWAYS_DGC_EXECSET). Use --no-dgc-execset to return to default multi-dispatch indirect.");
 
     ensureMaterialPreprocessBuffer(static_cast<uint32_t>(primaryPipelines.size()));
 }

@@ -980,6 +980,7 @@ void Engine::updateAllImageDescriptors() {
     }
 
     if (m_denoiser) {
+        m_denoiser->invalidateDescriptors();
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
     }
 
@@ -995,6 +996,9 @@ void Engine::createGBufferResources() {
         m_renderTargets->createGBufferResources(m_config.width, m_config.height, concurrentQueues, m_commandBuffers[0]);
     }
     syncRenderTargetPointers();
+    if (m_denoiser) {
+        m_denoiser->invalidateDescriptors();
+    }
     updateMergeDescriptors();
 }
 
@@ -1700,7 +1704,7 @@ void Engine::renderFrame() {
     uint32_t activeSpp = m_config.spp;
     float activeFractionalSpp = 0.0f;
     uint32_t activeBounces = m_config.max_bounces;
-    if (m_config.pipeline_type == PipelineType::Wavefront && m_dynamicWavefrontBounces > 0 && m_totalFramesRendered >= m_config.warmup_frames) {
+    if (m_config.early_bounce_cutoff && m_config.pipeline_type == PipelineType::Wavefront && m_dynamicWavefrontBounces > 0 && m_totalFramesRendered >= m_config.warmup_frames) {
         activeBounces = std::clamp(m_dynamicWavefrontBounces + 1u, std::min(1u, m_config.max_bounces), m_config.max_bounces);
     }
     if (m_governor && (m_config.adaptive_spp || m_config.target_fps > 0) && m_governor->getState().active) {
@@ -2140,6 +2144,24 @@ void Engine::renderFrame() {
         bool svgfRun = false;
         if (m_config.denoiser_mode == DenoiserMode::Svgf && m_denoiser && m_denoiser->isInitialized()) {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+            if (m_mlSpecularImage) {
+                VkClearColorValue zeroClear{};
+                VkImageSubresourceRange clearRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(activeCmd, m_mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &clearRange);
+                VkImageMemoryBarrier2 specClearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                specClearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                specClearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                specClearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                specClearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                specClearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                specClearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                specClearBarrier.image = m_mlSpecularImage->getImage();
+                specClearBarrier.subresourceRange = clearRange;
+                VkDependencyInfo specClearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                specClearDep.imageMemoryBarrierCount = 1;
+                specClearDep.pImageMemoryBarriers = &specClearBarrier;
+                vkCmdPipelineBarrier2(activeCmd, &specClearDep);
+            }
             m_denoiser->recordDenoise(
                 activeCmd, m_currentFrame, resetTemporal,
                 m_accumulatedSamples, -1.0f,

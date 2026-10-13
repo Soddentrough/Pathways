@@ -1373,25 +1373,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
-                "In-House ReLAX / A-SVGF",
-                "Upways Neural (Experimental)"
+                "In-House ReLAX / A-SVGF"
             };
-            int denoiserIdx = 0;
-            if (config.denoiser_mode == DenoiserMode::Svgf) denoiserIdx = 1;
-            else if (config.denoiser_mode == DenoiserMode::Upways) denoiserIdx = 2;
+            int denoiserIdx = (config.denoiser_mode == DenoiserMode::Svgf) ? 1 : 0;
 
             if (ImGui::Combo("Denoiser Mode", &denoiserIdx, denoiserModeLabels, IM_ARRAYSIZE(denoiserModeLabels))) {
-                if (denoiserIdx == 1) config.denoiser_mode = DenoiserMode::Svgf;
-                else if (denoiserIdx == 2) config.denoiser_mode = DenoiserMode::Upways;
-                else config.denoiser_mode = DenoiserMode::None;
+                config.denoiser_mode = (denoiserIdx == 1) ? DenoiserMode::Svgf : DenoiserMode::None;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
-                                  "- In-House ReLAX / A-SVGF: Real-time spatiotemporal variance-guided wavelet filtering with edge-avoiding bilateral weights.\n"
-                                  "- Upways: Cooperative WMMA neural reconstruction.");
+                                  "- In-House ReLAX / A-SVGF: Real-time spatiotemporal variance-guided wavelet filtering with edge-avoiding bilateral weights.");
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {

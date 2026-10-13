@@ -121,14 +121,13 @@ void main() {
             c0 = coopMatMulAdd(aTile, bTile, c0);
         }
 
-        // LeakyReLU activation + store directly to s_layer1
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
-        for (int i = 0; i < c0.length(); ++i) {
-            float16_t v = c0[i];
-            v = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
-            outTile[i] = v;
-        }
-        coopMatStore(outTile, s_layer1, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c0, s_layer1, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint i = tid; i < 16u * 64u; i += 32u) {
+        float16_t b0 = weights[NRC_B0_OFFSET + (i & 63u)];
+        float16_t v = s_layer1[i] + b0;
+        s_layer1[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
     }
     barrier();
 
@@ -149,14 +148,13 @@ void main() {
             c1 = coopMatMulAdd(aTile, bTile, c1);
         }
 
-        // LeakyReLU activation + store directly back to s_layer0
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> outTile;
-        for (int i = 0; i < c1.length(); ++i) {
-            float16_t v = c1[i];
-            v = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
-            outTile[i] = v;
-        }
-        coopMatStore(outTile, s_layer0, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c1, s_layer0, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint i = tid; i < 16u * 64u; i += 32u) {
+        float16_t b1 = weights[NRC_B1_OFFSET + (i & 63u)];
+        float16_t v = s_layer0[i] + b1;
+        s_layer0[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
     }
     barrier();
 
@@ -183,7 +181,11 @@ void main() {
 
     // 6. Write final predicted radiance to 32-bit fixed-point atomic buffer (CRIT-05)
     if (tid < 16u && s_valid[tid]) {
-        vec3 rawPred = vec3(float(s_output[tid * 16u + 0u]), float(s_output[tid * 16u + 1u]), float(s_output[tid * 16u + 2u]));
+        vec3 rawPred = vec3(
+            float(s_output[tid * 16u + 0u] + weights[NRC_B2_OFFSET + 0u]),
+            float(s_output[tid * 16u + 1u] + weights[NRC_B2_OFFSET + 1u]),
+            float(s_output[tid * 16u + 2u] + weights[NRC_B2_OFFSET + 2u])
+        );
         if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
         if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
         if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;

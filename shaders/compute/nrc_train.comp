@@ -12,7 +12,8 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 shared float16_t s_act0[32 * 64];   // 4 KB: input features x
 shared float16_t s_act1[32 * 64];   // 4 KB: hidden layer 0 activations h0
 shared float16_t s_act2[32 * 64];   // 4 KB: hidden layer 1 activations h1 (reused for delta0)
-shared float16_t s_delta[32 * 64];  // 4 KB: deltas (delta2 first 3 elements, then delta1)
+shared float16_t s_delta[32 * 64];  // 4 KB: delta1
+shared float16_t s_delta2[32 * 3];  // 192 B: output layer delta2 (3 channels per lane)
 
 layout(std430, set = 0, binding = 0) readonly buffer InTrainQueue {
     NRCTrainingRecord records[];
@@ -124,9 +125,19 @@ void main() {
     vec3 denom = L_target + vec3(0.01);
     vec3 dL_dy = valid ? (sign(diff) / denom) : vec3(0.0);
 
-    s_delta[lane * 64u + 0u] = float16_t(dL_dy.x);
-    s_delta[lane * 64u + 1u] = float16_t(dL_dy.y);
-    s_delta[lane * 64u + 2u] = float16_t(dL_dy.z);
+    s_delta2[lane * 3u + 0u] = float16_t(dL_dy.x);
+    s_delta2[lane * 3u + 1u] = float16_t(dL_dy.y);
+    s_delta2[lane * 3u + 2u] = float16_t(dL_dy.z);
+
+    // Compute delta1 into s_delta BEFORE mutating W2 weights in-place:
+    // Backprop to Layer 1: delta1 = (W2 * delta2) * LeakyReLU'(h1)
+    for (uint i = 0u; i < 64u; ++i) {
+        float sum = dL_dy.x * float(weights[NRC_W2_OFFSET + i * 16u + 0u])
+                  + dL_dy.y * float(weights[NRC_W2_OFFSET + i * 16u + 1u])
+                  + dL_dy.z * float(weights[NRC_W2_OFFSET + i * 16u + 2u]);
+        float h1_val = float(s_act2[lane * 64u + i]);
+        s_delta[lane * 64u + i] = float16_t((h1_val > 0.0) ? sum : (0.01 * sum));
+    }
     barrier();
 
     float lr = pc.learningRate;
@@ -140,7 +151,7 @@ void main() {
         uint j = lane;
         float g_b = 0.0;
         for (uint s = 0u; s < numSamples; ++s) {
-            g_b += float(s_delta[s * 64u + j]);
+            g_b += float(s_delta2[s * 3u + j]);
         }
         g_b = clamp(g_b * invBatch, -10.0, 10.0);
         uint bIdx = NRC_B2_OFFSET + j;
@@ -154,7 +165,7 @@ void main() {
         for (uint i = 0u; i < 64u; ++i) {
             float g_w = 0.0;
             for (uint s = 0u; s < numSamples; ++s) {
-                g_w += float(s_delta[s * 64u + j]) * float(s_act2[s * 64u + i]);
+                g_w += float(s_delta2[s * 3u + j]) * float(s_act2[s * 64u + i]);
             }
             g_w = clamp(g_w * invBatch, -10.0, 10.0);
             uint wIdx = NRC_W2_OFFSET + i * 16u + j;
@@ -165,24 +176,6 @@ void main() {
             float new_w = float(weights[wIdx]) - (lr / (sqrt(vw) + EPSILON_ADAM)) * mw;
             weights[wIdx] = float16_t(clamp(new_w, -65000.0, 65000.0));
         }
-    }
-    barrier();
-
-    // Now compute delta1 into s_delta (overwriting delta2)
-    // Backprop to Layer 1: delta1 = (W2 * delta2) * LeakyReLU'(h1)
-    for (uint i = 0u; i < 64u; ++i) {
-        float sum = 0.0;
-        for (uint j = 0u; j < 3u; ++j) {
-            sum += float(s_delta[lane * 64u + j]) * float(weights[NRC_W2_OFFSET + i * 16u + j]);
-        }
-        float h1_val = float(s_act2[lane * 64u + i]);
-        s_act2[lane * 64u + i] = float16_t((h1_val > 0.0) ? sum : (0.01 * sum));
-    }
-    barrier();
-
-    // Copy delta1 from s_act2 into s_delta:
-    for (uint i = 0u; i < 64u; ++i) {
-        s_delta[lane * 64u + i] = s_act2[lane * 64u + i];
     }
     barrier();
 

@@ -35,6 +35,10 @@ layout(push_constant) uniform PushConstants {
     uint hasEnvMap;
     float envMapIntensity;
     uint accumulateHistory;
+    float fractionalSpp;
+    uint totalCompositeSpp;
+    uint numOpaqueTriangles;
+    float indirectClamp;
 } pc;
 
 vec2 directionToEquirectangular(vec3 dir) {

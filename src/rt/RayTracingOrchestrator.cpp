@@ -500,15 +500,19 @@ void RayTracingOrchestrator::recordRayTracing(
         if (enableNrcThisFrame && m_nrcManager) {
             uint32_t nrcW = params.isMultiGpu ? params.fullWidth : params.dispatchWidth;
             uint32_t nrcH = params.isMultiGpu ? params.fullHeight : params.dispatchHeight;
-            m_nrcManager->recordInference(cmd, nrcW, nrcH, sceneData.boundsMin, sceneData.boundsMax);
+            m_nrcManager->recordInference(cmd, nrcW, nrcH, sceneData.boundsMin, sceneData.boundsMax, 0, params.frameSlot);
             m_nrcManager->recordTraining(cmd, params.frameIndex, sceneData.boundsMin, sceneData.boundsMax, 1e-3f, 1024);
         }
 
-        if (!params.isMultiGpu && params.isRestirActive && normalDepthImage && prevNormalDepthImage) {
+        if (params.isRestirActive && normalDepthImage && prevNormalDepthImage) {
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copyRegion.extent = { params.dispatchWidth, params.dispatchHeight, 1 };
+            copyRegion.extent = {
+                params.isMultiGpu ? params.fullWidth : params.dispatchWidth,
+                params.isMultiGpu ? params.fullHeight : params.dispatchHeight,
+                1
+            };
 
             VkImageMemoryBarrier2 imgBarriers[2]{};
             imgBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;

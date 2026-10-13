@@ -1761,6 +1761,11 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
         Buffer* giCurrBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(slot) : nullptr;
         Buffer* giPrevBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(1 - slot) : nullptr;
         Buffer* x1CtxBuf = secNode->restirManager ? secNode->restirManager->getX1ContextBuffer() : nullptr;
+        Buffer* ptCurrBuf = secNode->restirManager ? secNode->restirManager->getReservoirPTBuffer(slot) : nullptr;
+        Buffer* ptPrevBuf = secNode->restirManager ? secNode->restirManager->getReservoirPTBuffer(1 - slot) : nullptr;
+        Buffer* pathSampleBuf = secNode->restirManager ? secNode->restirManager->getPathSampleBuffer() : nullptr;
+        Buffer* shadeReqBuf = secNode->restirManager ? secNode->restirManager->getShadeRequestBuffer() : nullptr;
+        Buffer* shadeResBuf = secNode->restirManager ? secNode->restirManager->getShadeResultBuffer() : nullptr;
 
         secNode->wavefrontPipeline->updateSceneDescriptors(
             slot,
@@ -1791,7 +1796,12 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE
+            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE,
+            ptCurrBuf ? ptCurrBuf->getBuffer() : VK_NULL_HANDLE,
+            ptPrevBuf ? ptPrevBuf->getBuffer() : VK_NULL_HANDLE,
+            pathSampleBuf ? pathSampleBuf->getBuffer() : VK_NULL_HANDLE,
+            shadeReqBuf ? shadeReqBuf->getBuffer() : VK_NULL_HANDLE,
+            shadeResBuf ? shadeResBuf->getBuffer() : VK_NULL_HANDLE
         );
     }
 }
@@ -1969,6 +1979,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.inlineShadows = m_config.inline_primary_shadows;
         wfSceneData.earlyBounceCutoff = m_config.early_bounce_cutoff;
         wfSceneData.earlyBounceCutoffThreshold = m_config.early_bounce_cutoff_threshold;
+        wfSceneData.restirMCap = m_config.restir_m_cap;
         wfSceneData.tileOffsetX = packet.tileOffsetX;
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
@@ -1976,6 +1987,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
                              m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Svgf ||
                              m_config.enable_restir ||
                              m_config.enable_caustics ||
                              m_config.upways_superres ||
@@ -2077,7 +2089,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
-                             m_config.denoiser_mode == DenoiserMode::Upways);
+                             m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Svgf);
         bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage && needGbuffers);
 
         // Batched transition of images to TRANSFER_SRC_OPTIMAL
@@ -2730,9 +2743,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
 
     VkDescriptorImageInfo directLightInfo{};
     VkDescriptorImageInfo normDepthInfo{};
+    VkDescriptorImageInfo mvInfo{};
     if (secNode->directLightImage && secNode->normalDepthImage) {
         directLightInfo = { VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         normDepthInfo = { VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    }
+    if (secNode->motionVectorImage) {
+        mvInfo = { VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     }
     VkDescriptorImageInfo blueNoiseInfo = secNode->blueNoiseTexture ? secNode->blueNoiseTexture->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
 
@@ -2758,6 +2775,10 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
             writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
         }
         writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr });
+        if (secNode->motionVectorImage) {
+            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
+        }
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
     if (secNode->wavefrontPipeline) {

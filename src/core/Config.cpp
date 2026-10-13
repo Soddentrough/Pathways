@@ -306,7 +306,7 @@ void Config::printUsage(const char* progName) {
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene-bounces         Adopt scene metadata default max bounces if present [default: disabled]\n"
-              << "  --no-scene-bounces      Disable adopting scene metadata default max bounces (enforce 4 bounces) [default: enabled]\n"
+              << "  --no-scene-bounces      Disable adopting scene metadata default max bounces [default: enabled]\n"
               << "  --early-bounce-cutoff   Terminate remaining ray bounces when active rays fall below threshold [default: enabled]\n"
               << "  --no-early-bounce-cutoff Disable early bounce cutoff (force all bounces to completion)\n"
               << "  --early-bounce-threshold <val> Ray fraction threshold for early bounce cutoff (default: 0.5% / 0.005)\n"
@@ -332,7 +332,7 @@ void Config::printUsage(const char* progName) {
               << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
-              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (In-House ReLAX/A-SVGF), 'upways', or 'none' [default: none]\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (In-House ReLAX/A-SVGF) or 'none' [default: none]\n"
               << "  --relax, --svgf, --asvgf Shortcut to enable In-House ReLAX / A-SVGF real-time denoiser\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
@@ -413,15 +413,6 @@ void Config::printUsage(const char* progName) {
               << "  --inline-shadows        Enable hybrid inline hardware shadow queries on primary bounce (default: enabled)\n"
               << "  --no-inline-shadows     Enforce detached shadow queue evaluation\n"
               << "  --diagnostic-half-tiles Benchmark diagnostic: trace only even 64x64 checkerboard tiles on single GPU\n"
-              << "  --capture-training-data <dir> Save Upways neural reconstruction dataset to directory\n"
-              << "  --capture-frames <int>  Number of continuous sequence frames to capture for ML dataset\n"
-              << "  --capture-reference-spp <int> Accumulated SPP for ground truth reference (default: 256)\n"
-              << "  --capture-channels <int> Number of channels: 16, 19, or 20 (default: 20 PTTD v3)\n"
-              << "  --no-capture-normals    Legacy 16-channel export without surface normals\n"
-              << "  --capture-camera-mode <mode> Camera trajectory: 'gaming' [default], 'static', 'rotate', 'translate', 'orbit'\n"
-              << "  --capture-halton-length <int> Halton jitter sequence cycle length (default: 32)\n"
-              << "  --capture-input-res <res> Internal render resolution for dataset capture (default: render scale resolution)\n"
-              << "  --capture-ref-res <res>   Ground truth reference resolution for dataset capture (default: target resolution)\n"
               << "  --test-scene-switching  Run headless dynamic scene switching verification test\n"
               << "  --no-validation         Disable Vulkan validation layers\n"
               << "  --debug                 Enable verbose debug logging\n"
@@ -948,24 +939,6 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf") {
             cfg.denoiser_mode = DenoiserMode::Svgf;
-            continue;
-        }
-        if (arg == "--denoiser" && i + 1 < argc) {
-            std::string mode = argv[++i];
-            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf") cfg.denoiser_mode = DenoiserMode::Svgf;
-            else if (mode == "upways") cfg.denoiser_mode = DenoiserMode::Upways;
-            else if (mode == "none" || mode == "off") cfg.denoiser_mode = DenoiserMode::None;
-            else Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
-            continue;
-        }
-        if (arg.starts_with("--denoiser=")) {
-            std::string mode = arg.substr(11);
-            std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf") cfg.denoiser_mode = DenoiserMode::Svgf;
-            else if (mode == "upways") cfg.denoiser_mode = DenoiserMode::Upways;
-            else if (mode == "none" || mode == "off") cfg.denoiser_mode = DenoiserMode::None;
-            else Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, upways, or none.", mode);
             continue;
         }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
