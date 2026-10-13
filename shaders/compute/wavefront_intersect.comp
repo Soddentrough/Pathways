@@ -108,6 +108,7 @@ layout(push_constant) uniform PushConstants {
     uint secondarySortMode;
     uint octantBin;
     float maxRayDistance;
+    uint minRayThreshold;
 } pc;
 
 void main() {
@@ -341,30 +342,33 @@ void main() {
                 queueCounters.currentMaterialCounts[2] = dielCnt;
                 queueCounters.currentMaterialCounts[3] = emisCnt;
 
-                uint stdGroups  = (stdCnt + 31u) / 32u;
-                uint compGroups = (compCnt + 31u) / 32u;
-                uint dielGroups = (dielCnt + 31u) / 32u;
-                uint emisGroups = (emisCnt + 31u) / 32u;
+                uint totalRays = stdCnt + compCnt + dielCnt + emisCnt;
+                bool skipNextBounce = (pc.minRayThreshold > 0u && totalRays <= pc.minRayThreshold);
+
+                uint stdGroups  = skipNextBounce ? 0u : ((stdCnt + 31u) / 32u);
+                uint compGroups = skipNextBounce ? 0u : ((compCnt + 31u) / 32u);
+                uint dielGroups = skipNextBounce ? 0u : ((dielCnt + 31u) / 32u);
+                uint emisGroups = skipNextBounce ? 0u : ((emisCnt + 31u) / 32u);
 
                 indirect.commands[nextB * 16u + 0u].x = stdGroups;
                 indirect.commands[nextB * 16u + 0u].y = 1u;
                 indirect.commands[nextB * 16u + 0u].z = 1u;
-                indirect.commands[nextB * 16u + 0u].pad = stdCnt;
+                indirect.commands[nextB * 16u + 0u].pad = skipNextBounce ? 0u : stdCnt;
 
                 indirect.commands[nextB * 16u + 1u].x = compGroups;
                 indirect.commands[nextB * 16u + 1u].y = 1u;
                 indirect.commands[nextB * 16u + 1u].z = 1u;
-                indirect.commands[nextB * 16u + 1u].pad = compCnt;
+                indirect.commands[nextB * 16u + 1u].pad = skipNextBounce ? 0u : compCnt;
 
                 indirect.commands[nextB * 16u + 2u].x = dielGroups;
                 indirect.commands[nextB * 16u + 2u].y = 1u;
                 indirect.commands[nextB * 16u + 2u].z = 1u;
-                indirect.commands[nextB * 16u + 2u].pad = dielCnt;
+                indirect.commands[nextB * 16u + 2u].pad = skipNextBounce ? 0u : dielCnt;
 
                 indirect.commands[nextB * 16u + 3u].x = emisGroups;
                 indirect.commands[nextB * 16u + 3u].y = 1u;
                 indirect.commands[nextB * 16u + 3u].z = 1u;
-                indirect.commands[nextB * 16u + 3u].pad = emisCnt;
+                indirect.commands[nextB * 16u + 3u].pad = skipNextBounce ? 0u : emisCnt;
 
                 indirect.commands[nextB * 16u + 4u].x = 0u;
                 indirect.commands[nextB * 16u + 5u].x = 0u;

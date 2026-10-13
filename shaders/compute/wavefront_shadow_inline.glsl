@@ -6,6 +6,14 @@
 // terminate on dielectrics and emitters). UBO bit 26 (--transparent-shadows) is the
 // biased fast mode in which dielectrics and emissives do not occlude NEE.
 
+#ifdef USE_GLOBAL_RAY_QUERY
+#define LOCAL_RQ_DECL /* reuse g_rq */
+#define RQ_OBJ g_rq
+#else
+#define LOCAL_RQ_DECL rayQueryEXT rq;
+#define RQ_OBJ rq
+#endif
+
 bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numSpheres, uint numOpaqueTriangles) {
     bool occluded = false;
 
@@ -14,23 +22,23 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
     bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
 
     if (!hasAlphaMask && (!transparentShadows || !enableCaustics)) {
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS,
+        LOCAL_RQ_DECL
+        rayQueryInitializeEXT(RQ_OBJ, topLevelAS,
                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                               (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
                               origin, EPSILON, dir, maxDist - EPSILON * 2.0);
-        rayQueryProceedEXT(rq);
-        occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+        rayQueryProceedEXT(RQ_OBJ);
+        occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     } else {
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS,
+        LOCAL_RQ_DECL
+        rayQueryInitializeEXT(RQ_OBJ, topLevelAS,
                               gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                               RAY_MASK_ALL, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
-        while (rayQueryProceedEXT(rq)) {
-            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
-                uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
-                uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+        while (rayQueryProceedEXT(RQ_OBJ)) {
+            if (rayQueryGetIntersectionTypeEXT(RQ_OBJ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(RQ_OBJ, false);
+                uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(RQ_OBJ, false);
+                uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(RQ_OBJ, false);
                 InstanceGPU inst = instances[instIdx];
                 uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
                 uint matId = triangles[triIdx].materialId + inst.materialOffset;
@@ -48,7 +56,7 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                 }
                 if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     Material mat = materials[matId];
-                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(RQ_OBJ, false);
                     Triangle ctri = triangles[triIdx];
                     vec2 cuv = getTriangleUV(ctri, bary);
                     float calpha = mat.albedo.a;
@@ -60,11 +68,11 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                         continue;
                     }
                 }
-                rayQueryConfirmIntersectionEXT(rq);
-                rayQueryTerminateEXT(rq);
+                rayQueryConfirmIntersectionEXT(RQ_OBJ);
+                rayQueryTerminateEXT(RQ_OBJ);
             }
         }
-        occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+        occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     }
 
 

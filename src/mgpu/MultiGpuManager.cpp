@@ -1967,6 +1967,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tailMegakernelBounce = m_config.tail_megakernel_bounce;
         wfSceneData.deltaUnroll = m_config.delta_unroll;
         wfSceneData.inlineShadows = m_config.inline_primary_shadows;
+        wfSceneData.earlyBounceCutoff = m_config.early_bounce_cutoff;
+        wfSceneData.earlyBounceCutoffThreshold = m_config.early_bounce_cutoff_threshold;
         wfSceneData.tileOffsetX = packet.tileOffsetX;
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;

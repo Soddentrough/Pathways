@@ -25,20 +25,21 @@
 
 // 32-bit Octahedral normal/direction encoding (Cigolle et al.)
 vec2 octSign(vec2 v) {
-    return vec2((v.x >= 0.0) ? 1.0 : -1.0, (v.y >= 0.0) ? 1.0 : -1.0);
+    return mix(vec2(-1.0), vec2(1.0), greaterThanEqual(v, vec2(0.0)));
 }
 
 vec2 octEncode(vec3 v) {
-    v /= (abs(v.x) + abs(v.y) + abs(v.z));
-    return (v.z >= 0.0) ? v.xy : (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
+    float invL1 = 1.0 / (abs(v.x) + abs(v.y) + abs(v.z));
+    vec2 p = v.xy * invL1;
+    vec2 wrapped = (vec2(1.0) - abs(p.yx)) * octSign(p);
+    return mix(wrapped, p, greaterThanEqual(vec2(v.z), vec2(0.0)));
 }
 
 vec3 octDecode(vec2 f) {
-    vec3 v = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
-    if (v.z < 0.0) {
-        v.xy = (vec2(1.0) - abs(v.yx)) * octSign(v.xy);
-    }
-    return normalize(v);
+    float z = 1.0 - abs(f.x) - abs(f.y);
+    vec2 wrapped = (vec2(1.0) - abs(f.yx)) * octSign(f);
+    vec2 xy = mix(wrapped, f, greaterThanEqual(vec2(z), vec2(0.0)));
+    return normalize(vec3(xy, z));
 }
 
 uint packOct32(vec3 v) {

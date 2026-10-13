@@ -161,6 +161,9 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint captureMlData;
     float indirectClamp;
+    uint deltaUnroll;
+    uint restirMCap;
+    uint minRayThreshold;
 } pc;
 
 void main() {
@@ -844,7 +847,8 @@ void main() {
             dgcStream.bounceDGC[b].shadowCmd.z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            uint intersectGroups = (nextCount + 31u) / 32u;
+            bool skipNextBounce = (pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
             indirect.bounceDispatches[b].intersectDispatch.x = intersectGroups;
             indirect.bounceDispatches[b].intersectDispatch.y = 1u;
             indirect.bounceDispatches[b].intersectDispatch.z = 1u;
@@ -859,7 +863,7 @@ void main() {
                 indirect.bounceDispatches[b + 1u].shadeDispatch.x = intersectGroups;
                 indirect.bounceDispatches[b + 1u].shadeDispatch.y = 1u;
                 indirect.bounceDispatches[b + 1u].shadeDispatch.z = 1u;
-                indirect.bounceDispatches[b + 1u].shadeDispatch.pad = nextCount;
+                indirect.bounceDispatches[b + 1u].shadeDispatch.pad = skipNextBounce ? 0u : nextCount;
 
                 dgcStream.bounceDGC[b + 1u].shadeCmd.pipelineIndex = 2u;
                 dgcStream.bounceDGC[b + 1u].shadeCmd.x = intersectGroups;
@@ -869,7 +873,7 @@ void main() {
 
             queueCounters.totalIntersectWorkgroups = intersectGroups;
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? nextCount : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces && !skipNextBounce) ? nextCount : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;

@@ -116,6 +116,8 @@ struct Config {
     uint32_t max_bounces = 4;
     bool custom_bounces = false;    // Set to true when --max-bounces or --bounces is passed explicitly on CLI
     bool adopt_scene_bounces = false; // Adopt sceneDefaultMaxBounces from scene metadata via --scene-bounces (default: false)
+    bool early_bounce_cutoff = true;  // Terminate ray tracing passes when remaining active rays fall below threshold [Default: true]
+    float early_bounce_cutoff_threshold = 0.005f; // Fraction of initial ray pool for cutoff termination (0.005 = 0.5%) [Default: 0.005]
     uint32_t frame_limit = 0; // 0 = continuous (until window closed or interactive exit)
     uint32_t warmup_frames = 0; // Number of initial frames to discard from benchmark statistics
     float render_scale = 1.0f;

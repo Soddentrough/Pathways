@@ -83,6 +83,8 @@ struct WavefrontSceneData {
     uint32_t tailMegakernelBounce = 2;    // Cutoff bounce to switch to Tail Megakernel (default: 2)
     uint32_t deltaUnroll = 0;             // Max delta-chain unroll depth for smooth dielectrics (default: 0 = Pure Wavefront)
     uint32_t restirMCap = 30;             // ReSTIR PT temporal reuse M-cap (spatial taps additionally capped at 8 in-shader)
+    bool earlyBounceCutoff = true;        // Terminate ray passes when remaining active rays fall below threshold
+    float earlyBounceCutoffThreshold = 0.005f; // Fraction of ray pool for cutoff termination (0.005 = 0.5%)
 };
 
 class WavefrontPipeline {

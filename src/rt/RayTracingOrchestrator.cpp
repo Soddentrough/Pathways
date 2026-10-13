@@ -429,6 +429,8 @@ void RayTracingOrchestrator::recordRayTracing(
         wfSceneData.deltaUnroll = config.delta_unroll;
         wfSceneData.inlineShadows = config.inline_primary_shadows;
         wfSceneData.restirMCap = config.restir_m_cap;
+        wfSceneData.earlyBounceCutoff = config.early_bounce_cutoff;
+        wfSceneData.earlyBounceCutoffThreshold = config.early_bounce_cutoff_threshold;
 
         if (params.isMultiGpu) {
             wfSceneData.tileOffsetX = params.tileOffsetX;

@@ -886,13 +886,17 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
 
+        uint32_t totalPrimaryRays = fw * fh;
+        uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
+            ? static_cast<uint32_t>(std::round(totalPrimaryRays * sceneData.earlyBounceCutoffThreshold)) : 0u;
+
         // 4. Multi-Bounce Loop for this Frame
         for (uint32_t b = 0; b < cutoffBounce; ++b) {
             VkDescriptorSet shadeSet = (b % 2 == 0) ? m_descSetsEven[frameSlot] : m_descSetsOdd[frameSlot];
             VkDescriptorSet intersectSet = (b % 2 == 0) ? m_descSetsOdd[frameSlot] : m_descSetsEven[frameSlot];
 
             // 4a. Shading microkernel(s)
-            uint32_t shadePC[23] = {
+            uint32_t shadePC[24] = {
                 sceneData.numTriangles,
                 sceneData.numSpheres,
                 sceneData.numMaterials,
@@ -915,7 +919,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.captureMlData,
                 std::bit_cast<uint32_t>(sceneData.indirectClamp),
                 sceneData.deltaUnroll,
-                sceneData.restirMCap
+                sceneData.restirMCap,
+                minRayThreshold
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), shadePC);
 
@@ -924,7 +929,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (canProfileBounce) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPools[frameSlot], qBase + 0);
 
             if (useMaterialSort) {
-                bool isSecondary = (b >= 1 && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty());
+                bool isRestirGI = (sceneData.cameraFlags & (1u << 24)) != 0;
+                bool isSecondary = (b >= 1 && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty() && !(b == 1 && isRestirGI));
                 const auto& matPipelines = isSecondary ? m_secondaryMatPipelines : m_primaryMatPipelines;
 
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &shadeSet, 0, nullptr);
@@ -1054,7 +1060,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 }
             }
 
-            uint32_t intersectPC[18] = {
+            uint32_t intersectPC[19] = {
                 sceneData.numTriangles,
                 sceneData.numSpheres,
                 sceneData.numMaterials,
@@ -1072,7 +1078,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.numOpaqueTriangles,
                 sceneData.secondarySortMode,
                 0, // octantBin
-                std::bit_cast<uint32_t>(maxRayDist)
+                std::bit_cast<uint32_t>(maxRayDist),
+                minRayThreshold
             };
 
             if (m_dgcManager->isSupported() && m_dgcManager->isExplicitPreprocessEnabled()) {
@@ -1135,6 +1142,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     for (uint32_t oct = 0; oct < 8; ++oct) {
                         intersectPC[16] = oct;
                         intersectPC[17] = std::bit_cast<uint32_t>(maxRayDist);
+                        intersectPC[18] = minRayThreshold;
                         vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), intersectPC);
                         VkDeviceSize octOffset = static_cast<VkDeviceSize>(b * 16 + 8 + oct) * 16;
                         vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), octOffset);

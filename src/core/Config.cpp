@@ -145,6 +145,32 @@ bool parseUpscaleRatioOrResolution(std::string_view val, float& outScale, uint32
     return false;
 }
 
+bool parseCutoffThreshold(std::string_view str, float& outThreshold) {
+    while (!str.empty() && (str.front() == ' ' || str.front() == '\t')) str.remove_prefix(1);
+    while (!str.empty() && (str.back() == ' ' || str.back() == '\t')) str.remove_suffix(1);
+    if (str.empty()) return false;
+    bool isPercent = false;
+    if (str.back() == '%') {
+        isPercent = true;
+        str.remove_suffix(1);
+        while (!str.empty() && (str.back() == ' ' || str.back() == '\t')) str.remove_suffix(1);
+    }
+    try {
+        size_t idx = 0;
+        float val = std::stof(std::string(str), &idx);
+        if (idx == 0) return false;
+        if (isPercent || val > 1.0f) {
+            val /= 100.0f;
+        }
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+        outThreshold = val;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}) {
     std::string a;
     a.reserve(algo.size());
@@ -281,6 +307,9 @@ void Config::printUsage(const char* progName) {
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene-bounces         Adopt scene metadata default max bounces if present [default: disabled]\n"
               << "  --no-scene-bounces      Disable adopting scene metadata default max bounces (enforce 4 bounces) [default: enabled]\n"
+              << "  --early-bounce-cutoff   Terminate remaining ray bounces when active rays fall below threshold [default: enabled]\n"
+              << "  --no-early-bounce-cutoff Disable early bounce cutoff (force all bounces to completion)\n"
+              << "  --early-bounce-threshold <val> Ray fraction threshold for early bounce cutoff (default: 0.5% / 0.005)\n"
               << "  --scene <path>          Path to glTF 2.0 scene (default: procedural Cornell box)\n"
               << "  --hdri <path>           Path to HDR/EXR environment map\n"
               << "  --no-accumulation, --realtime  Disable progressive static frame accumulation (evaluate real-time noise)\n"
@@ -502,6 +531,33 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--no-scene-bounces") {
             cfg.adopt_scene_bounces = false;
+            continue;
+        }
+        if (arg == "--early-bounce-cutoff") {
+            cfg.early_bounce_cutoff = true;
+            continue;
+        }
+        if (arg == "--no-early-bounce-cutoff" || arg == "--disable-early-bounce-cutoff") {
+            cfg.early_bounce_cutoff = false;
+            continue;
+        }
+        if ((arg == "--early-bounce-threshold" || arg == "--early-bounce-cutoff-threshold") && i + 1 < argc) {
+            float thresh = 0.005f;
+            if (parseCutoffThreshold(argv[++i], thresh)) {
+                cfg.early_bounce_cutoff_threshold = thresh;
+            } else {
+                Logger::warn("Invalid cutoff threshold '{}'. Expected decimal (e.g. 0.005) or percentage (e.g. 0.5%).", argv[i]);
+            }
+            continue;
+        }
+        if (arg.starts_with("--early-bounce-threshold=") || arg.starts_with("--early-bounce-cutoff-threshold=")) {
+            std::string_view val = std::string_view(arg).substr(arg.find('=') + 1);
+            float thresh = 0.005f;
+            if (parseCutoffThreshold(val, thresh)) {
+                cfg.early_bounce_cutoff_threshold = thresh;
+            } else {
+                Logger::warn("Invalid cutoff threshold '{}'. Expected decimal (e.g. 0.005) or percentage (e.g. 0.5%).", val);
+            }
             continue;
         }
         if ((arg == "--frames" || arg == "--frame-limit") && i + 1 < argc) {

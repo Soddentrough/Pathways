@@ -184,8 +184,20 @@ layout(std430, binding = 43) buffer PathSamplesBuffer {
     PathSample pathSamples[];
 };
 
+#ifndef ENABLE_RESTIR_GI
+#if IS_SECONDARY_BOUNCE
+#define ENABLE_RESTIR_GI 0
+#else
+#define ENABLE_RESTIR_GI 1
+#endif
+#endif
+
 #ifndef ENABLE_INLINE_SHADOWS
+#if IS_SECONDARY_BOUNCE
+#define ENABLE_INLINE_SHADOWS 0
+#else
 #define ENABLE_INLINE_SHADOWS 1
+#endif
 #endif
 
 #if ENABLE_INLINE_SHADOWS
@@ -216,6 +228,7 @@ layout(push_constant) uniform PushConstants {
     float indirectClamp;
     uint deltaUnrollPC;
     uint restirMCap;
+    uint minRayThreshold;
 } pc;
 
 void main() {
@@ -224,12 +237,16 @@ void main() {
     bool inRange = (idx < activeCount);
     bool survivesToNext = false;
     bool hasShadowRay = false;
+#if ENABLE_RESTIR_GI
     bool hasGiShadowRay = false;
+#endif
     vec3 nextDirection = vec3(0.0);
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
+#if ENABLE_RESTIR_GI
     PackedShadowRay giShadowCandidate;
+#endif
 
     if (inRange) {
         uint rayIdx = materialIndices[0u * pc.maxQueueCapacity + idx];
@@ -286,11 +303,13 @@ void main() {
             if (enableRestirPT && bounce == 0u) {
                 currentReservoirs[pixelIndex] = invalidDiReservoir();
             }
+#if ENABLE_RESTIR_GI
             if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
                 // Bounce-1 ray escaped to the sky: no secondary vertex exists,
                 // so this pixel contributes no GI candidate this frame.
                 giReservoirs[pixelIndex] = invalidGiReservoir();
             }
+#endif
 
 
             if (pc.captureMlData != 0u) {
@@ -336,6 +355,7 @@ void main() {
             bool isTerrain = ((matType & MATERIAL_FLAG_PROCEDURAL_TERRAIN) != 0u);
             bool isPuddle = ((matType & MATERIAL_FLAG_PROCEDURAL_PUDDLE) != 0u);
             float procRoughness = mat.pbrParams.x;
+#if !IS_SECONDARY_BOUNCE
             if (isTerrain) {
                 float slope = 1.0 - clamp(abs(hitNormal.y), 0.0, 1.0);
                 vec3 dummyG;
@@ -377,7 +397,9 @@ void main() {
                 // Fine asphalt micro-texture normal perturbation outside of puddles
                 vec3 gradProj = gradBump - dot(gradBump, hitNormal) * hitNormal;
                 hitNormal = normalize(hitNormal - gradProj * (0.12 * (1.0 - puddleMask)));
-            } else if (albedoTex > 0u && albedoTex <= 512u) {
+            } else
+#endif
+            if (albedoTex > 0u && albedoTex <= 512u) {
                 baseColor *= SAMPLE_SCENE_TEXTURE(albedoTex, hitUv);
             }
 
@@ -385,11 +407,13 @@ void main() {
             bool isCutout = (alphaMode == 1u && baseColor.a < materials[matId].alphaCutoff) ||
                             (alphaMode == 2u && randFloat(seed) > baseColor.a);
             if (isCutout) {
+#if ENABLE_RESTIR_GI
                 if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
                     // Cutout pass-through: the shaded x2 belongs to the next
                     // vertex; this pixel's GI slot must not reuse stale data.
                     giReservoirs[pixelIndex] = invalidGiReservoir();
                 }
+#endif
                 if (bounce + 1u < pc.maxBounces) {
                     survivesToNext = true;
                     nextDirection = rayDir;
@@ -401,6 +425,7 @@ void main() {
             vec3 emissive = mat.emissive_spec.rgb;
             if (emissiveTex > 0u && emissiveTex <= 512u && (matType & MATERIAL_FLAG_PROCEDURAL_HOLO) == 0u) {
                 emissive *= SAMPLE_SCENE_TEXTURE(emissiveTex, hitUv).rgb;
+#if !IS_SECONDARY_BOUNCE
             } else if ((matType & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {
                 float time = float(ubo.frameIndex) * 0.01666667;
                 float scanline = sin(hitPoint.y * 24.0 - time * 8.0) * 0.5 + 0.5;
@@ -414,6 +439,7 @@ void main() {
                     0.90 + 0.45 * scanline + 0.50 * glitchBand
                 );
                 emissive *= holoMod;
+#endif
             }
             // Emissive hit accumulation, MIS-weighted against the NEE performed
             // at the vertex that spawned this ray (mis_common.glsl). Camera rays
@@ -522,6 +548,7 @@ void main() {
 
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Pure Lambertian Diffuse) ---
+#if ENABLE_RESTIR_GI
             // ReSTIR GI (docs/RESTIR_PT_DESIGN.md): for bounce-1 rays the 2-bounce
             // term T1·L_direct(x1) is estimated by resampling cached secondary
             // vertices at the primary hit x1 (this ray's origin) instead of the
@@ -538,6 +565,7 @@ void main() {
             float giLightDist = 0.0;
             vec3 giShadowOrigin = vec3(0.0);
             bool giLightSampled = false;
+#endif
             if (!pathTerminated && !isDelta && enableDirect && pc.numLights > 0u) {
                 uint lightIdx = 0u;
                 float lightSelectPdf = 1.0;
@@ -592,6 +620,7 @@ void main() {
                     float factor = misWeight / lightPdfEff;
                     secDirectL = f16vec3(clamp(neeFCos * lightEmission * factor, vec3(0.0), vec3(65500.0)));
 
+#if ENABLE_RESTIR_GI
                     if (giActive) {
                         // Candidate data for this frame's own secondary vertex.
                         giL2 = clampIndirectRadiance(vec3(secDirectL), pc.indirectClamp * 2.0);
@@ -599,7 +628,9 @@ void main() {
                         giLightDist = lightDist;
                         giShadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
                         giLightSampled = true;
-                    } else {
+                    } else
+#endif
+                    {
                     f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, pc.indirectClamp);
 
                     if (length(unshadowed) > float16_t(1e-5)) {
@@ -655,6 +686,7 @@ void main() {
                 }
             }
 
+#if ENABLE_RESTIR_GI
             if (giActive) {
                 // Shadow-test this frame's own L̂2 inline (synchronous: the
                 // reservoir must store the shadowed estimate; the deferred
@@ -855,6 +887,7 @@ void main() {
                     }
                 }
             }
+#endif
 #else
             // Direct Lighting (Unified ReSTIR PT Inline Path Resampling & Stochastic NEE)
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0) && (roughness >= 0.10);
@@ -1302,7 +1335,7 @@ void main() {
         }
     }
 
-#if IS_SECONDARY_BOUNCE
+#if ENABLE_RESTIR_GI
     // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
     uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
     uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
@@ -1344,7 +1377,8 @@ void main() {
             dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            uint intersectGroups = (nextCount + 31u) / 32u;
+            bool skipNextBounce = (pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
 
             // Slot 7: Standard monolithic / Option 2 intersect dispatch
             indirect.commands[b * 16u + 7u].x = intersectGroups;
@@ -1364,7 +1398,7 @@ void main() {
                 for (uint k = 0u; k < 8u; ++k) {
                     uint octCnt = queueCounters.octantCounts[k];
                     queueCounters.currentOctantCounts[k] = octCnt;
-                    uint octGroups = (octCnt + 31u) / 32u;
+                    uint octGroups = skipNextBounce ? 0u : ((octCnt + 31u) / 32u);
                     totalIntersectWgs += octGroups;
                     totalOctantRays += octCnt;
 
@@ -1394,8 +1428,21 @@ void main() {
                 indirect.commands[b * 16u + 8u].pad = nextCount;
             }
 
+            if (skipNextBounce && b + 1u < pc.maxBounces) {
+                uint nextB = b + 1u;
+                for (uint c = 0u; c < 8u; ++c) {
+                    indirect.commands[nextB * 16u + c].x = 0u;
+                }
+                for (uint k = 0u; k < 8u; ++k) {
+                    indirect.commands[nextB * 16u + 8u + k].x = 0u;
+                }
+                for (uint c = 0u; c < 4u; ++c) {
+                    dgcStream.commands[nextB * 16u + c].x = 0u;
+                }
+            }
+
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? totalOctantRays : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces && !skipNextBounce) ? totalOctantRays : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;

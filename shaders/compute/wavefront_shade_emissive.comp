@@ -167,6 +167,9 @@ layout(push_constant) uniform PushConstants {
     uint numOpaqueTriangles;
     uint captureMlData;
     float indirectClamp;
+    uint deltaUnroll;
+    uint restirMCap;
+    uint minRayThreshold;
 } pc;
 
 void main() {
@@ -346,7 +349,8 @@ void main() {
             dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            uint intersectGroups = (nextCount + 31u) / 32u;
+            bool skipNextBounce = (pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
 
             // Slot 7: Standard monolithic / Option 2 intersect dispatch
             indirect.commands[b * 16u + 7u].x = intersectGroups;
@@ -366,7 +370,7 @@ void main() {
                 for (uint k = 0u; k < 8u; ++k) {
                     uint octCnt = queueCounters.octantCounts[k];
                     queueCounters.currentOctantCounts[k] = octCnt;
-                    uint octGroups = (octCnt + 31u) / 32u;
+                    uint octGroups = skipNextBounce ? 0u : ((octCnt + 31u) / 32u);
                     totalIntersectWgs += octGroups;
                     totalOctantRays += octCnt;
 
@@ -396,8 +400,21 @@ void main() {
                 indirect.commands[b * 16u + 8u].pad = nextCount;
             }
 
+            if (skipNextBounce && b + 1u < pc.maxBounces) {
+                uint nextB = b + 1u;
+                for (uint c = 0u; c < 8u; ++c) {
+                    indirect.commands[nextB * 16u + c].x = 0u;
+                }
+                for (uint k = 0u; k < 8u; ++k) {
+                    indirect.commands[nextB * 16u + 8u + k].x = 0u;
+                }
+                for (uint c = 0u; c < 4u; ++c) {
+                    dgcStream.commands[nextB * 16u + c].x = 0u;
+                }
+            }
+
             queueCounters.currentShadowCount = shadowCount;
-            queueCounters.activeRayCount = (b + 1u < pc.maxBounces) ? totalOctantRays : 0u;
+            queueCounters.activeRayCount = (b + 1u < pc.maxBounces && !skipNextBounce) ? totalOctantRays : 0u;
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;
