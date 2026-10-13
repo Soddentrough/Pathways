@@ -39,6 +39,8 @@ public:
     void setFullscreenToggleCallback(std::function<void()> cb) { m_onToggleFullscreen = std::move(cb); }
     void setScreenshotCallback(std::function<void()> cb) { m_onScreenshot = std::move(cb); }
     void setGuiToggleCallback(std::function<void()> cb) { m_onToggleGui = std::move(cb); }
+    void setNextSceneCallback(std::function<void()> cb) { m_onNextScene = std::move(cb); }
+    void setPrevSceneCallback(std::function<void()> cb) { m_onPrevScene = std::move(cb); }
 
     /**
      * @brief Process an incoming SDL event.
@@ -75,6 +77,8 @@ private:
     std::function<void()> m_onToggleFullscreen;
     std::function<void()> m_onScreenshot;
     std::function<void()> m_onToggleGui;
+    std::function<void()> m_onNextScene;
+    std::function<void()> m_onPrevScene;
 
     bool m_cameraMode = false;
 

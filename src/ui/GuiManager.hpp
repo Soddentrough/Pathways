@@ -53,6 +53,7 @@ public:
 
     bool wantCaptureMouse() const;
     bool wantCaptureKeyboard() const;
+    bool wantTextInput() const;
     void resetHistory();
 
 private:

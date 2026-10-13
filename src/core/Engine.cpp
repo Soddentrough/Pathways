@@ -178,6 +178,15 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_inputController->setGuiToggleCallback([this]() {
         m_config.enable_gui = !m_config.enable_gui;
         Logger::info("GUI Overlay: {}", m_config.enable_gui ? "ENABLED" : "DISABLED");
+        if (!m_config.enable_gui && m_inputController) {
+            m_inputController->setCameraMode(true);
+        }
+    });
+    m_inputController->setNextSceneCallback([this]() {
+        cycleScene(1);
+    });
+    m_inputController->setPrevSceneCallback([this]() {
+        cycleScene(-1);
     });
     if (!m_config.headless && m_swapchain) {
         m_inputController->init();
@@ -548,6 +557,29 @@ void Engine::requestSceneChange(const std::string& filepath) {
     if (m_sceneManager) {
         m_sceneManager->requestSceneChange(filepath, m_config);
     }
+}
+
+void Engine::cycleScene(int step) {
+    if (!m_sceneManager || m_availableScenes.empty()) {
+        return;
+    }
+    if (m_sceneManager->isSceneLoading() || m_pendingSceneChange) {
+        Logger::debug("Scene loading already in progress; ignoring scene cycle request.");
+        return;
+    }
+    int totalScenes = static_cast<int>(m_availableScenes.size());
+    int curIdx = m_currentSceneIndex >= 0 ? m_currentSceneIndex : 0;
+    int newIdx = (curIdx + step) % totalScenes;
+    if (newIdx < 0) {
+        newIdx += totalScenes;
+    }
+    if (newIdx == m_currentSceneIndex && totalScenes > 1) {
+        return;
+    }
+    m_pendingSceneChange = true;
+    m_pendingScenePath = m_availableScenes[newIdx].filepath;
+    Logger::info("Cycling scene ({:+d}) -> Index {}: '{}' ({})",
+                 step, newIdx, m_availableScenes[newIdx].label, m_availableScenes[newIdx].filepath);
 }
 
 bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {

@@ -76,6 +76,7 @@ public:
     bool loadScene(const std::string& filepath);
     bool applyLoadedScene(SceneData newScene, const std::string& filepath);
     void requestSceneChange(const std::string& filepath);
+    void cycleScene(int step);
     bool isSceneLoading() const { return m_sceneManager ? m_sceneManager->isSceneLoading() : false; }
     const std::string& getLoadingSceneName() const {
         static const std::string s_empty;

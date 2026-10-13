@@ -129,6 +129,11 @@ bool GuiManager::wantCaptureKeyboard() const {
     return ImGui::GetIO().WantCaptureKeyboard;
 }
 
+bool GuiManager::wantTextInput() const {
+    if (!m_initialized) return false;
+    return ImGui::GetIO().WantTextInput;
+}
+
 void GuiManager::resetHistory() {
     for (size_t i = 0; i < HISTORY_SIZE; ++i) {
         m_frameTimeHistory[i] = 0.0f;
@@ -862,6 +867,26 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::NewLine();
 
             ImGui::Spacing();
+            if (ImGui::Checkbox("Early Bounce Cutoff", &config.early_bounce_cutoff)) {
+                settingsChanged = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Terminate remaining ray bounces when active surviving rays fall below a fractional threshold (e.g. <0.5%% rays remaining). Avoids dispatching underpopulated GPU queues.");
+            }
+            if (config.early_bounce_cutoff) {
+                ImGui::Indent();
+                float cutoffPct = config.early_bounce_cutoff_threshold * 100.0f;
+                if (ImGui::SliderFloat("Cutoff Threshold", &cutoffPct, 0.05f, 5.0f, "%.2f%%")) {
+                    config.early_bounce_cutoff_threshold = cutoffPct / 100.0f;
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Fractional ray threshold (percentage of total initial rays) below which subsequent ray passes are skipped. Default: 0.50%%.");
+                }
+                ImGui::Unindent();
+            }
+
+            ImGui::Spacing();
             ImGui::SeparatorText("Stationary Frame Accumulation");
 
             if (ImGui::Checkbox("Progressive Accumulation", &config.progressive_accumulation)) {
@@ -1443,6 +1468,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::Spacing();
             if (ImGui::TreeNode("Navigation Keybindings Reference")) {
+                ImGui::BulletText("F1 or G: Toggle UI Overlay On / Off");
                 ImGui::BulletText("TAB: Toggle UI Options / FPS Navigation");
                 ImGui::BulletText("W / A / S / D: Forward / Left / Back / Right");
                 ImGui::BulletText("Space / C (or E / Q): Move Up / Down");
@@ -1454,23 +1480,28 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BulletText("Alt (Hold): Precision Crawl (0.25x Speed for Object Centering)");
                 ImGui::BulletText("Shift (Hold): Sprint Boost (3.0x Speed for Fast Relocation)");
                 ImGui::BulletText("F Key: Focus on Central Object");
+                ImGui::BulletText("N / P: Next / Previous Scene");
                 ImGui::BulletText("Mouse Wheel: Continuously Scale Camera Speed");
                 ImGui::BulletText("Mouse: Freelook Orientation (FPS Mode)");
                 ImGui::BulletText("ESC: Release Mouse (FPS Mode) / Exit (UI)");
                 ImGui::TreePop();
             }
             if (ImGui::TreeNode("Gamepad Controls Reference")) {
-                ImGui::BulletText("Start / Options (or Touchpad): Toggle UI / Scene Navigation");
+                ImGui::BulletText("Start / Options: Toggle UI / Scene Navigation");
+                ImGui::BulletText("Back / Select / Touchpad: Toggle UI Overlay On / Off");
                 ImGui::BulletText("Left Stick: Fly Forward / Backward, Strafe Left / Right");
                 ImGui::BulletText("Right Stick: Look / Turn Freelook Camera (3x Yaw Speed)");
                 ImGui::BulletText("Right Trigger (RT / R2): Sprint Boost (3.0x speed)");
                 ImGui::BulletText("Left Trigger (LT / L2): Precision Crawl (0.25x speed)");
-                ImGui::BulletText("Cross / A or Right Bumper (RB / R1 / R4): Fly Up (or Enter Flight Mode from UI)");
-                ImGui::BulletText("Circle / B or Left Bumper (LB / L1 / L4): Fly Down (or Cancel in UI)");
+                ImGui::BulletText("Cross / A: Fly Up (or Enter Flight Mode from UI)");
+                ImGui::BulletText("Circle / B: Release Camera to UI Mode (or Cancel in UI)");
+                ImGui::BulletText("Right Bumper (RB / R1 / R4): Fly Up");
+                ImGui::BulletText("Left Bumper (LB / L1 / L4): Fly Down");
                 ImGui::BulletText("Right Stick Click (R3): Focus on Targeted Object");
                 ImGui::BulletText("Left Stick Click (L3) / Square / X: Hold to Orbit around Target");
                 ImGui::BulletText("D-Pad Up: Increase Camera Fly Speed");
                 ImGui::BulletText("D-Pad Down: Decrease Camera Fly Speed");
+                ImGui::BulletText("D-Pad Left / Right: Previous / Next Scene");
                 ImGui::BulletText("Triangle / Y: Level Horizon / Camera Pitch");
                 ImGui::BulletText("D-Pad / Left Stick (in UI): Navigate Controls & Menus");
                 ImGui::TreePop();

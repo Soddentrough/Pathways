@@ -223,22 +223,53 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return true;
     }
 
-    // 7. Universal Mode Toggle Gamepad Buttons (Start / Options / Touchpad / Back)
+    // 7. Universal Mode & Overlay Gamepad Buttons
     if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START ||
-            e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK ||
-            e.gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+        // Start / Options: Toggle Interaction Mode (Camera navigation vs UI cursor)
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START) {
             setCameraMode(!m_cameraMode);
+            return true;
+        }
+        // Back / Select / View / Touchpad: Toggle GUI Overlay visibility on / off
+        if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK ||
+            e.gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+            if (m_onToggleGui) {
+                m_onToggleGui();
+                rumble(0x2500, 0x4000, 70);
+            }
             return true;
         }
     }
 
     // 8. In Camera Mode (FPS navigation)
     if (m_cameraMode) {
-        if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F) {
-            if (m_camera) {
-                m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+            if (e.key.key == SDLK_F) {
+                if (m_camera) {
+                    m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+                }
+                return true;
             }
+            if (e.key.key == SDLK_G) {
+                if (m_onToggleGui) {
+                    m_onToggleGui();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_N) {
+                if (m_onNextScene) {
+                    m_onNextScene();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_P) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                }
+                return true;
+            }
+        }
+        if (e.type == SDL_EVENT_KEY_UP && (e.key.key == SDLK_N || e.key.key == SDLK_P || e.key.key == SDLK_G)) {
             return true;
         }
         if (e.type == SDL_EVENT_MOUSE_MOTION) {
@@ -283,7 +314,9 @@ bool InputController::handleEvent(const SDL_Event& e) {
             if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
                 m_gamepadBtnA = true;
             } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) {
-                m_gamepadBtnB = true;
+                // Circle / B: Exit Camera Navigation Mode and return to UI Mode (gamepad equivalent of ESC)
+                setCameraMode(false);
+                return true;
             } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_WEST) {
                 m_gamepadBtnOrbit = true;
             } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK) {
@@ -312,11 +345,22 @@ bool InputController::handleEvent(const SDL_Event& e) {
                     m_camera->adjustSpeedByWheel(-1.0f);
                     rumble(0x1500, 0x2500, 40);
                 }
-            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) {
-                if (m_camera) {
-                    m_camera->setPose(m_camera->getPosition(), 0.0f, m_camera->getYaw());
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
+                if (m_onNextScene) {
+                    m_onNextScene();
                     rumble(0x2000, 0x3000, 60);
                 }
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                    rumble(0x2000, 0x3000, 60);
+                }
+            } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) {
+                if (m_camera) {
+                    m_camera->setPose(m_camera->getPosition(), m_camera->getYaw(), 0.0f);
+                    rumble(0x2000, 0x3000, 60);
+                }
+                return true;
             }
             return true;
         }
@@ -375,6 +419,49 @@ bool InputController::handleEvent(const SDL_Event& e) {
             return true;
         }
 
+        // Gamepad D-pad scene navigation outside ImGui controls
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && (!m_gui->wantCaptureKeyboard() && !m_gui->wantCaptureMouse())) {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
+                if (m_onNextScene) {
+                    m_onNextScene();
+                    rumble(0x2000, 0x3000, 60);
+                }
+                return true;
+            }
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                    rumble(0x2000, 0x3000, 60);
+                }
+                return true;
+            }
+        }
+
+        // G key toggles GUI overlay, N / P key scene navigation when not actively typing into an ImGui text input field
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && !m_gui->wantTextInput()) {
+            if (e.key.key == SDLK_G) {
+                if (m_onToggleGui) {
+                    m_onToggleGui();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_N) {
+                if (m_onNextScene) {
+                    m_onNextScene();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_P) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                }
+                return true;
+            }
+        }
+        if (e.type == SDL_EVENT_KEY_UP && (e.key.key == SDLK_N || e.key.key == SDLK_P || e.key.key == SDLK_G) && !m_gui->wantTextInput()) {
+            return true;
+        }
+
         if (m_gui->wantCaptureMouse() || m_gui->wantCaptureKeyboard()) {
             return true;
         }
@@ -396,6 +483,45 @@ bool InputController::handleEvent(const SDL_Event& e) {
         }
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
             setCameraMode(true);
+            return true;
+        }
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
+                if (m_onNextScene) {
+                    m_onNextScene();
+                    rumble(0x2000, 0x3000, 60);
+                }
+                return true;
+            }
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                    rumble(0x2000, 0x3000, 60);
+                }
+                return true;
+            }
+        }
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+            if (e.key.key == SDLK_G) {
+                if (m_onToggleGui) {
+                    m_onToggleGui();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_N) {
+                if (m_onNextScene) {
+                    m_onNextScene();
+                }
+                return true;
+            }
+            if (e.key.key == SDLK_P) {
+                if (m_onPrevScene) {
+                    m_onPrevScene();
+                }
+                return true;
+            }
+        }
+        if (e.type == SDL_EVENT_KEY_UP && (e.key.key == SDLK_N || e.key.key == SDLK_P || e.key.key == SDLK_G)) {
             return true;
         }
     }
@@ -466,7 +592,7 @@ void InputController::update(float dt, float gpuCenterDepth, bool hasGpuCenterDe
     float strafe = kbdStrafe + m_gamepadLeftX;
     float vertical = kbdVertical;
     if (m_gamepadBtnA || m_gamepadBtnBumperUp) vertical += 1.0f;
-    if (m_gamepadBtnB || m_gamepadBtnBumperDown) vertical -= 1.0f;
+    if (m_gamepadBtnBumperDown) vertical -= 1.0f;
 
     // Analog trigger progressive gear multiplier:
     // Right trigger (RT / R2) progressively sprints from 1.0x up to 3.0x speed
