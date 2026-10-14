@@ -135,7 +135,7 @@ Engine::Engine(const Config& config) : m_config(config) {
             hwDeviceCount++;
         }
     }
-    if (hwDeviceCount >= 2) {
+    if (hwDeviceCount >= 2 && (!m_config.headless || m_config.mgpu_mode != MultiGpuMode::Off || m_config.benchmark)) {
         m_mgpu = std::make_unique<MultiGpuManager>(m_config, m_context.get(), m_sceneData);
     }
     // Reclaim host memory used for scene geometry ingestion (now safely resident in device VRAM)
@@ -1401,11 +1401,17 @@ void Engine::renderFrame() {
 
 
         double secGpuMs = 0.0;
+        double secXferMs = 0.0;
+        double asyncMergeMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
+            secXferMs = m_mgpu->getSecondaryTransferTimeMs();
+            if (m_mgpuCoordinator && m_mgpuCoordinator->hasDedicatedAsyncCompute()) {
+                asyncMergeMs = m_mgpuCoordinator->getLastAsyncMergeTimeMs();
+            }
         }
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
+            ? (std::max(gpuRtMs, secGpuMs + secXferMs) + asyncMergeMs + gpuTonemapMs + gpuUpwaysMs)
             : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];

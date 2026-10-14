@@ -60,11 +60,17 @@ void TelemetryReporter::dumpOutputFiles() {
         if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
 
         double secGpuMs = 0.0;
+        double secXferMs = 0.0;
+        double asyncMergeMs = 0.0;
         if (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_engine->m_mgpu->getSecondaryGpuTimeMs();
+            secXferMs = m_engine->m_mgpu->getSecondaryTransferTimeMs();
+            if (m_engine->m_mgpuCoordinator && m_engine->m_mgpuCoordinator->hasDedicatedAsyncCompute()) {
+                asyncMergeMs = m_engine->m_mgpuCoordinator->getLastAsyncMergeTimeMs();
+            }
         }
         double totalGpuMs = (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
+            ? (std::max(gpuRtMs, secGpuMs + secXferMs) + asyncMergeMs + gpuTonemapMs + gpuUpwaysMs)
             : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         uint32_t lastCompletedSlot = (m_engine->m_totalFramesRendered - 1) % Engine::MAX_FRAMES_IN_FLIGHT;
@@ -383,7 +389,7 @@ FrameStats TelemetryReporter::getStats() const {
                 bProf.bounce = bp.bounce;
                 bProf.shade_ms = bp.shadeMs;
                 bProf.shadow_ms = bp.shadowMs;
-                bProf.intersect_ms = bp.intersectMs;
+                bProf.intersect_ms = std::max(0.0, bp.intersectMs);
                 bProf.active_rays = bp.activeCount;
                 bProf.shadow_rays = bp.shadowCount;
                 bProf.next_rays = bp.nextCount;
@@ -681,7 +687,7 @@ FrameStats TelemetryReporter::getStats() const {
                 sb.bounce = b.bounce;
                 sb.shade_ms = b.shadeMs;
                 sb.shadow_ms = b.shadowMs;
-                sb.intersect_ms = b.intersectMs;
+                sb.intersect_ms = std::max(0.0, b.intersectMs);
                 sb.total_bounce_ms = b.totalMs;
                 sb.active_rays = b.activeCount;
                 sb.rays_left = b.nextCount;
@@ -888,7 +894,7 @@ void TelemetryReporter::printExecutionSummary() const {
                          tally.getAvgClassifyMs(), tally.getAvgPrimaryRays());
             auto avgBounces = tally.getAvgBounces();
             for (const auto& b : avgBounces) {
-                double bounceTotalMs = b.shadeMs + b.shadowMs + b.intersectMs + b.gapBeforeShadeMs + b.gapBeforeShadowMs + b.gapBeforeIntersectMs;
+                double bounceTotalMs = b.shadeMs + b.shadowMs + std::max(0.0, b.intersectMs) + b.gapBeforeShadeMs + b.gapBeforeShadowMs + b.gapBeforeIntersectMs;
                 double rayPercent = tally.getAvgPrimaryRays() > 0 ? (static_cast<double>(b.nextCount) / tally.getAvgPrimaryRays()) * 100.0 : 0.0;
                 if (b.intersectMs >= 0.0) {
                     Logger::info("      - Bounce {}: Gap1: {:.3f}ms | Shade: {:.3f} ms | Gap2: {:.3f}ms | Shadow: {:.3f} ms | Gap3: {:.3f}ms | Intersect: {:.3f} ms (Total: {:.3f} ms) | {:12L} rays left ({:5.1f}%)",

@@ -271,12 +271,12 @@ WavefrontSortMode RayTracingOrchestrator::getEffectiveWavefrontSortMode(const Co
 
     float divergentRatio = getDivergentAreaRatio(sceneData);
     if (divergentRatio < 0.001f) {
-        return WavefrontSortMode::None;
+        return WavefrontSortMode::Archetype;
     }
 
     if (m_deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
         if (divergentRatio < 0.12f) {
-            return WavefrontSortMode::None;
+            return WavefrontSortMode::Archetype;
         }
     }
 

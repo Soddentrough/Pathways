@@ -290,7 +290,7 @@ struct ConfigStatsTally {
             bAvg.gapBeforeShadeMs = bt.sumGapBeforeShadeMs / bt.count;
             bAvg.gapBeforeShadowMs = bt.sumGapBeforeShadowMs / bt.count;
             bAvg.gapBeforeIntersectMs = bt.sumGapBeforeIntersectMs / bt.count;
-            bAvg.totalMs = bAvg.shadeMs + bAvg.shadowMs + bAvg.intersectMs + bAvg.gapBeforeShadeMs + bAvg.gapBeforeShadowMs + bAvg.gapBeforeIntersectMs;
+            bAvg.totalMs = bAvg.shadeMs + bAvg.shadowMs + std::max(0.0, bAvg.intersectMs) + bAvg.gapBeforeShadeMs + bAvg.gapBeforeShadowMs + bAvg.gapBeforeIntersectMs;
             bAvg.activeCount = bt.sumActiveCount / bt.count;
             bAvg.nextCount = bt.sumNextCount / bt.count;
             bAvg.shadowCount = bt.sumShadowCount / bt.count;

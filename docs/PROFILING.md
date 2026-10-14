@@ -4,21 +4,25 @@ This document defines the comprehensive performance profiling methodology, telem
 
 ---
 
-## 1. The Three-Tier Profiling Strategy
+## 1. The Four-Tier Profiling Strategy
 
-Diagnosing rendering and compute performance bottlenecks requires analyzing the system at three distinct abstraction layers:
+Diagnosing rendering and compute performance bottlenecks requires analyzing the system across four distinct abstraction layers:
 
 ```
 +----------------------------------------------------------------------------------------------------+
 |                                    PROFILING ABSTRACTION LAYERS                                    |
 +----------------------------------------------------------------------------------------------------+
+  0. Application & Pipeline Telemetry (In-Engine Timers & `--dump-stats`)
+     - Scope: Stage breakdown (classify, bounce shade, intersect, shadow, denoise, resolve), ray survival
+     - Answers: "Which specific bounce, queue compaction pass, or pipeline stage consumes the frame time?"
+
   1. System & Board Telemetry (`amd-smi`)
      - Scope: Macro hardware limits, clocks, power, thermals, memory controllers, PCIe bus, multi-GPU
      - Answers: "Is the GPU compute-bound, memory-bandwidth-bound, PCIe-bound, CPU-starved, or throttled?"
 
-  2. Driver & API Diagnostics (`RADV_PERFEST`, `RADV_DEBUG`)
-     - Scope: Mesa RADV driver implementation, ACO compiler stats, API validation, shader pipeline layouts
-     - Answers: "Are shaders spilling registers? Are render targets uncompressed? Is the API used optimally?"
+  2. Driver, Host & API Diagnostics (`RADV_PERFTEST`, `RADV_DEBUG`, Linux `perf`)
+     - Scope: Mesa RADV driver implementation, ACO compiler stats, API validation, host dispatch & sync
+     - Answers: "Are shaders spilling registers? Are barriers stalling waves? Is CPU recording lagging?"
 
   3. GPU Microarchitecture & Instruction Tracing (RGP, RRA, RGA)
      - Scope: Wavefront occupancy, SIMD lane divergence, VALU/SALU/VMEM latency, LDS bank conflicts, BVH
@@ -28,9 +32,41 @@ Diagnosing rendering and compute performance bottlenecks requires analyzing the 
 
 ---
 
-## 2. Hardware Bottleneck Identification with AMD-SMI
+## 2. In-Engine Diagnostics & Pipeline Telemetry (Tier 0)
 
-While **Radeon GPU Profiler (RGP)** provides microsecond-level instruction traces and **`RADV_PERFEST`** flags driver-level optimization gaps, `/opt/rocm/core-10.0/bin/amd-smi` provides real-time operational telemetry from the kernel driver (`amdgpu`) and hardware System Management Unit (SMU).
+Before launching external hardware profilers, use Pathways' built-in high-precision Vulkan timestamp queries and telemetry harness to establish baseline timings and isolate the slowest pipeline stages.
+
+### 2.1 Headless Benchmarking & Telemetry Export
+
+Run repeatable headless benchmarks with warmup frame exclusion and structured JSON telemetry dumps:
+
+```bash
+# 100 benchmark frames with 20 warmup frames discarded, dumping full telemetry JSON:
+./build/bin/pathways --headless --frames 120 --warmup-frames 20 --dump-stats /tmp/benchmark_stats.json
+
+# Stream per-second console throughput and stage breakdowns:
+./build/bin/pathways --log-interval 1.0
+```
+
+### 2.2 Interpreting In-Engine Pipeline Breakdown
+
+The engine queries individual hardware execution timestamps for each stage of wavefront path tracing:
+
+| Stage / Metric | Description | What a Spike Indicates & Actionable Remedy |
+| :--- | :--- | :--- |
+| **`classifyMs`** | Primary ray generation and material queue classification | Saturated by high resolution or slow camera generation. Check primary threadgroup tile sizing. |
+| **Bounce `intersectMs`** | Hardware ray query traversal against TLAS/BLAS | Scene BVH traversal bound. Inefficient bounding boxes, overlapping geometry instances, or poor SAH. Test `--macro-blas` or audit via RRA. |
+| **Bounce `shadeMs`** | Wavefront material evaluation (Diffuse, Conductor, Dielectric, Complex) | Compute / register pressure bound in material evaluation. Test `--streamline-secondary` or check VGPR spill in ACO stats. |
+| **Bounce `shadowMs`** | Next Event Estimation (NEE) shadow ray traversal | Occlusion testing bound. Ensure `--inline-shadows` is active for primary rays, or enable `--transparent-shadows` / `--light-tree`. |
+| **`gapBefore*Ms` / Barriers** | Pipeline barriers (`VkDependencyInfo`) between passes | Queue bubbles and GPU synchronization stalls. High gap times on late bounces indicate wavefront under-occupancy; enable `--tail-megakernel` or `--early-bounce-cutoff`. |
+| **Ray Survival Curve** | `activeCount` across bounces (e.g. B0 $\rightarrow$ B1 $\rightarrow$ B2...) | Ray termination rate. If >95% of rays terminate by bounce 2, tracing deep bounces in separate dispatches is inefficient; lower `--max-bounces` or enable `--early-bounce-cutoff`. |
+| **`resolveMs` / Tonemap** | Temporal accumulation, tone mapping, or denoising | Framebuffer bandwidth saturation. Test `--accum-format=r11g11b10f` (32 bpp) instead of `rgba16f` (64 bpp). |
+
+---
+
+## 3. Hardware Bottleneck Identification with AMD-SMI (Tier 1)
+
+While microarchitectural tools provide instruction traces, `/opt/rocm/core-10.0/bin/amd-smi` provides real-time operational telemetry directly from the kernel driver (`amdgpu`) and hardware System Management Unit (SMU).
 
 ### Quick Telemetry Commands
 
@@ -51,7 +87,7 @@ While **Radeon GPU Profiler (RGP)** provides microsecond-level instruction trace
 
 ---
 
-### 2.1 Engine Activity: Distinguishing CPU, Memory & Compute Bottlenecks
+### 3.1 Engine Activity: Distinguishing CPU, Memory & Compute Bottlenecks
 
 Inspect using:
 ```bash
@@ -62,15 +98,15 @@ Inspect using:
 
 | Metric | Telemetry Pattern | Root Cause / Diagnosis | Actionable Next Step |
 | :--- | :--- | :--- | :--- |
-| **`GFX_ACTIVITY`** | Low (<85–90%) during uncapped frames | **CPU Bottleneck or Host Stall**: GPU is starved waiting for draw/dispatch submission, host sync (`vkWaitForFences`), descriptor updates, or swapchain presentation (`vkQueuePresentKHR`). | Profile host CPU loop; verify async worker thread dispatch; ensure double/triple buffering in-flight frames. |
+| **`GFX_ACTIVITY`** | Low (<85–90%) during uncapped frames | **CPU Bottleneck or Host Stall**: GPU is starved waiting for draw/dispatch submission, host sync (`vkWaitForFences`), descriptor updates, or swapchain presentation (`vkQueuePresentKHR`). | Profile host CPU loop with Linux `perf`; verify command buffer recording; verify multi-frame buffering in-flight. |
 | **`GFX_ACTIVITY`** | Sustained ~100% | **GPU-Bound**: Workload fully saturates GPU execution resources. | Inspect `UMC_ACTIVITY` and RGP wave occupancy to isolate ALU vs. memory constraints. |
-| **`UMC_ACTIVITY`** | High (>75–85%) with moderate GFX% | **External VRAM Bandwidth Bound**: Unified Memory Controller bus is saturated by off-chip GDDR6 traffic (textures, 4K ray payload queues, uncompressed framebuffers). | Compact payload structures (e.g. SoA queues), enable DCC / texture compression, or improve spatial cache locality. |
+| **`UMC_ACTIVITY`** | High (>75–85%) with moderate GFX% | **External VRAM Bandwidth Bound**: Unified Memory Controller bus is saturated by off-chip GDDR6 traffic (textures, ray payload queues, uncompressed framebuffers). | Compact payload structures (SoA queues), use `--accum-format=r11g11b10f`, or improve spatial cache locality. |
 | **`UMC_ACTIVITY`** | Low (<30%) with ~100% GFX% | **Compute / ALU Bound**: Core shader execution units are saturated with math instructions, ray traversal loops, or transcendental operations. | Inspect ACO shader stats; optimize VALU instructions; check for loop unrolling and dual-issue VOPD opportunities. |
 | **`VCN_ACTIVITY` / `DMA`** | Stalled or alternating | **Queue Serialization**: Async compute or DMA transfer queues are blocking behind graphics barriers rather than running concurrently. | Review `VkDependencyInfo` / pipeline barriers; decouple async transfer queues from the primary render queue. |
 
 ---
 
-### 2.2 VRAM Subsystem, ReBAR & System Memory Spilling
+### 3.2 VRAM Subsystem, ReBAR & System Memory Spilling
 
 Inspect using:
 ```bash
@@ -87,7 +123,7 @@ Inspect using:
 
 ---
 
-### 2.3 Dynamic Clock Scaling & DPM Performance States
+### 3.3 Dynamic Clock Scaling & DPM Performance States
 
 Inspect using:
 ```bash
@@ -108,7 +144,7 @@ Inspect using:
 
 ---
 
-### 2.4 Thermal and Power Throttling
+### 3.4 Thermal and Power Throttling
 
 Inspect using:
 ```bash
@@ -128,7 +164,7 @@ Inspect using:
 
 ---
 
-### 2.5 PCIe Link Health and Bus Saturation
+### 3.5 PCIe Link Health and Bus Saturation
 
 Inspect using:
 ```bash
@@ -144,7 +180,7 @@ Inspect using:
 
 ---
 
-### 2.6 Multi-GPU Interconnect & P2P Topology
+### 3.6 Multi-GPU Interconnect & P2P Topology
 
 Inspect using:
 ```bash
@@ -159,7 +195,7 @@ Inspect using:
 
 ---
 
-### 2.7 Process Contention and Engine Sharing
+### 3.7 Process Contention and Engine Sharing
 
 Inspect using:
 ```bash
@@ -171,20 +207,20 @@ Inspect using:
 
 ---
 
-## 3. Driver Diagnostics: Mesa RADV Controls
+## 4. Driver Diagnostics & Host Profiling (Tier 2)
+
+### 4.1 Mesa RADV Performance Hints (`RADV_PERFTEST`)
 
 Mesa RADV provides driver-level environment variables to diagnose compilation, memory layout, and execution pipeline issues:
 
-### 3.1 Driver Performance Hints (`RADV_PERFTEST`)
-
 | Variable | Target & Purpose | Bottleneck Diagnosed |
 | :--- | :--- | :--- |
-| **`RADV_PERFEST=1`** | Prints driver-level performance warnings to `stderr`. | Flags uncompressed DCC fallback, non-optimal image layouts, sub-optimal blits, and excessive descriptor updates. |
+| **`RADV_PERFTEST=1`** | Prints driver-level performance warnings to `stderr`. | Flags uncompressed DCC fallback, non-optimal image layouts, sub-optimal blits, and excessive descriptor updates. |
 | **`RADV_PERFTEST=rtcps`** | Toggles Continuation-Passing Style (CPS) lowering for ray tracing. | Compares monolithic function inlining against CPS shader scheduling on complex ray-tracing pipelines. |
 | **`RADV_PERFTEST=cswave32`** | Forces Wave32 execution for compute shaders. | Compares Wave32 vs. Wave64 register pressure and SIMD utilization. |
 | **`RADV_PERFTEST=nogttspill`** | Restricts allocations strictly to VRAM. | Isolates whether performance drops are caused by transparent GTT system memory spilling. |
 
-### 3.2 Compiler & Register Diagnostics (`RADV_DEBUG`)
+### 4.2 Compiler & Register Diagnostics (`RADV_DEBUG`)
 
 ```bash
 # Dump ACO compiler statistics for all compiled pipelines:
@@ -197,17 +233,34 @@ Key compiler metrics to examine:
   * If VGPRs exceed 104–128, wave occupancy drops to 8 or fewer subgroups per SIMD.
 * **`Scratch Size (Spill)`**:
   * **Target: 0 Bytes**.
-  * Any non-zero scratch allocation means VGPR pressure forced register contents to spill into VRAM scratch memory, introducing memory latency into ALU loops.
+  * Any non-zero scratch allocation means VGPR pressure forced register contents to spill into VRAM scratch memory, introducing massive memory latency into ALU loops.
 * **`VOPD (Dual-Issue)`**:
   * Measures RDNA dual-issue ALU instruction generation. Higher VOPD counts indicate optimal instruction scheduling by ACO.
 
+### 4.3 Host CPU Profiling with Linux `perf`
+
+When `GFX_ACTIVITY` is low or frame pacing exhibits irregular jitter, isolate CPU-side bottlenecks (command recording, descriptor pooling, swapchain presentation, or thread synchronization):
+
+```bash
+# Profile CPU call graph with 99Hz sampling:
+perf record -F 99 -g -- ./build/bin/pathways --headless --frames 300
+
+# View interactive terminal flamegraph/calltree:
+perf report -g 'graph,0.5,caller'
+```
+
+Common CPU hotspots to diagnose:
+* `vkQueueSubmit` / `vkQueueSubmit2`: Stalling on in-flight fences or command buffer mutex contention.
+* `vkUpdateDescriptorSets`: Redundant descriptor writes instead of persistent bindless buffers.
+* `vkWaitForFences`: CPU-GPU sync stalls (ensure 2+ frames in flight).
+
 ---
 
-## 4. Hardware Instruction & Ray Tracing Profilers (RDTS)
+## 5. Hardware Instruction & Ray Tracing Profilers (Tier 3 - RDTS)
 
 Tool binaries located at `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/`:
 
-### 4.1 Radeon GPU Profiler (RGP) via Mesa RADV
+### 5.1 Radeon GPU Profiler (RGP) via Mesa RADV
 
 Capture SQTT wave execution traces:
 ```bash
@@ -220,9 +273,10 @@ RADV_THREAD_TRACE_CACHE_COUNTERS=1 \
 ```
 Open the generated `/tmp/pathways_*.rgp` trace in `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/RadeonGPUProfiler`:
 * **Wavefront Occupancy Tab**: Identify compute unit idling, pipeline barrier stalls, and queue bubbles.
+* **Event Timing / Barriers**: Pinpoint execution gaps between wavefront passes.
 * **Instruction Details Tab**: Pinpoint high-latency VMEM clauses, LDS bank conflicts, and branch divergence.
 
-### 4.2 Radeon Raytracing Analyzer (RRA)
+### 5.2 Radeon Raytracing Analyzer (RRA)
 
 Capture acceleration structure and ray query traces:
 ```bash
@@ -233,8 +287,9 @@ MESA_VK_TRACE_FRAME=50 \
 Open `/tmp/pathways_*.rra` in `/opt/RadeonDeveloperToolSuite-2026-05-28-1806/RadeonRaytracingAnalyzer`:
 * Inspect BLAS/TLAS box node counts, primitive surface area heuristics (SAH), and memory footprints.
 * Analyze ray traversal depth and candidate testing costs.
+* Evaluate if `--macro-blas` or re-clustering reduces BVH depth and traversal steps.
 
-### 4.3 Radeon GPU Analyzer (RGA)
+### 5.3 Radeon GPU Analyzer (RGA)
 
 Perform static offline ISA disassembly and VGPR auditing:
 ```bash
@@ -247,17 +302,19 @@ Perform static offline ISA disassembly and VGPR auditing:
 
 ---
 
-## 5. Diagnostic Decision Matrix
+## 6. Diagnostic Decision Matrix
 
 Use this matrix to rapidly isolate the root cause when performance targets are missed:
 
-| Observation / Symptom | Primary Telemetry Indicator | Secondary Diagnostic Tool | Root Cause | Remediation Strategy |
+| Observation / Symptom | Primary Telemetry Indicator | Secondary Diagnostic Tool | Root Cause | Pathways Remediation Flag / Strategy |
 | :--- | :--- | :--- | :--- | :--- |
-| Low framerate, GPU clocks drop, power low (<100W) | `GFX_ACTIVITY` < 80% in `amd-smi` | CPU flamegraph / OS trace | **CPU-Bound or Sync Stall**: Host draw submission or fence wait blocking GPU. | Migrate to async workers; use Synchronization 2 (`vkQueueSubmit2`); pipeline multiple frames in flight. |
-| GPU at 100% GFX, but frame time higher than expected | `UMC_ACTIVITY` > 80% in `amd-smi` | RGP Memory Stalls counter | **Memory Bandwidth Bottleneck**: Excessive GDDR6 traffic. | Structure-of-Arrays (SoA) ray payload compaction; enable DCC image compression; optimize cache locality. |
+| Low framerate, GPU clocks drop, power low (<100W) | `GFX_ACTIVITY` < 80% in `amd-smi` | `perf record` / OS trace | **CPU-Bound or Sync Stall**: Host draw submission or fence wait blocking GPU. | Check descriptor updates; ensure double/triple buffering; streamline host render loop. |
+| GPU at 100% GFX, but frame time higher than expected | `UMC_ACTIVITY` > 80% in `amd-smi` | RGP Memory Stalls counter | **Memory Bandwidth Bottleneck**: Excessive GDDR6 traffic. | Test `--accum-format=r11g11b10f`; enable `--streamline-secondary`; verify DCC image compression. |
 | GPU at 100% GFX, UMC% low (<30%), low framerate | `UMC_ACTIVITY` < 30%, `GFX%` 100% | `RADV_DEBUG=shaderstats` | **Compute / ALU Bottleneck**: Math or register pressure stall. | Reduce VGPR usage; eliminate scratch memory spilling; leverage Wave32 SIMD compaction. |
+| High execution time in `gapBefore*Ms` or barrier bubbles in RGP | High barrier time in `--dump-stats` | RGP Wavefront Occupancy | **Wavefront Under-Occupancy / Barrier Overhead**: Late bounces have few active rays but incur full barrier dispatches. | Enable `--tail-megakernel --tail-bounce 2` or `--early-bounce-cutoff 0.005`. |
+| Excessive ray traversal time in `intersectMs` | `intersectMs` dominates frame | RRA Traversal Cost Map | **BVH Traversal Inefficiency**: Over-complex TLAS or fragmented BLAS instances. | Test `--macro-blas` to merge static prop clusters into spatial macro-BLASes. |
 | Sudden frame hitching during buffer/texture updates | `USED_VISIBLE_VRAM` at 256 MB cap | `amd-smi metric -m` | **ReBAR Disabled**: Staging buffers spilling out of 256MB aperture. | Enable Resizable BAR in UEFI firmware; throttle concurrent host-visible staging allocations. |
-| Massive frame drop (>50%) on high-resolution scenes | `USED_GTT` non-zero & increasing | `amd-smi metric -m` | **VRAM Oversubscription**: Textures or BVHs spilled to host RAM. | Implement texture streaming, mip clamping, or geometry LOD; verify allocation sizes. |
+| Massive frame drop (>50%) on high-resolution scenes | `USED_GTT` non-zero & increasing | `amd-smi metric -m` | **VRAM Oversubscription**: Textures or BVHs spilled to host RAM. | Use `--render-scale 0.5 --upscaler fsr` or `--upscaler upways`; implement texture streaming. |
 | Inconsistent frame times during sustained benchmark runs | `HOTSPOT` > 100°C or `PPT_ACCUMULATED` incrementing | `amd-smi metric -p -t -v` | **Thermal or Power Throttling**: Clock clamped by SMU. | Pin DPM clock state via `amd-smi set -l high`; verify chassis cooling and fan profiles. |
 | Micro-stutters during host-device asset streaming | `REPLAY_COUNT` incrementing in `amd-smi -P` | `dmesg \| grep amdgpu` | **PCIe Link Signal Degradation**: Bus packet retransmissions. | Inspect PCIe riser cable, motherboard PCIe slot configuration, or bifurcation settings. |
-| Poor Dual-GPU scaling (<1.5x on 2 GPUs) | Clock asymmetry (GPU 0 at 3300MHz, GPU 1 at 1600MHz) | `amd-smi topology -d` | **Inter-Frame Idle Bubble**: Secondary GPU idling during present/pacing. | Implement cross-GPU hardware semaphores (`VK_KHR_external_semaphore_fd`) and inter-frame pipelining. |
+| Poor Dual-GPU scaling (<1.5x on 2 GPUs) | Clock asymmetry (GPU 0 at 3300MHz, GPU 1 at 1600MHz) | `amd-smi topology -d` | **Inter-Frame Idle Bubble**: Secondary GPU idling during present/pacing. | Test `--mgpu-mode checkerboard` with tuned `--tile-size 64` or `--mgpu-mode sample`; verify P2P direct BAR. |

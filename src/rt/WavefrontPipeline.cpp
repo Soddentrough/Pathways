@@ -891,6 +891,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             }
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
+        uint32_t effectiveSecondarySortMode = (!useMaterialSort && sceneData.secondarySortMode == 1u) ? 0u : sceneData.secondarySortMode;
 
         uint32_t batchPixels = curBatchW * curBatchH;
         uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
@@ -916,7 +917,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.hasEnvMap,
                 std::bit_cast<uint32_t>(sceneData.envMapIntensity),
                 sceneData.useHardwareRT,
-                sceneData.secondarySortMode,
+                effectiveSecondarySortMode,
                 sceneData.enableNrc ? 1u : 0u,
                 sceneData.nrcBounce,
                 std::bit_cast<uint32_t>(sceneData.nrcTrainRatio),
@@ -1006,7 +1007,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 s2dBarriers[s2dCount++] = (makeBufferBarrier2(currentOutGeom->getBuffer(),
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
-                if (sceneData.secondarySortMode == 1 && needIntersect) {
+                if (effectiveSecondarySortMode == 1 && needIntersect) {
                     s2dBarriers[s2dCount++] = (makeBufferBarrier2(m_secondaryIndexQueue[frameSlot]->getBuffer(),
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT));
@@ -1037,7 +1038,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                                            : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
             uint32_t shadowSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassShadow);
             uint32_t intersectSlice = DGCManager::getSliceIndex(frameSlot, b, DGCManager::PassIntersect);
-            bool needIntersectDgc = needIntersect && !(sceneData.secondarySortMode == 1 && useMaterialSort);
+            bool needIntersectDgc = needIntersect && !(effectiveSecondarySortMode == 1 && useMaterialSort);
             bool batchPreprocess = (getenv("PATHWAYS_DISABLE_DGC_BATCH_PREPROCESS") == nullptr);
 
             uint32_t shadowPC[10] = {
@@ -1082,7 +1083,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 sceneData.useHardwareRT,
                 sceneData.sortMode,
                 sceneData.numOpaqueTriangles,
-                sceneData.secondarySortMode,
+                effectiveSecondarySortMode,
                 0, // octantBin
                 std::bit_cast<uint32_t>(maxRayDist),
                 minRayThreshold

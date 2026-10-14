@@ -187,7 +187,11 @@ layout(std430, binding = 43) buffer PathSamplesBuffer {
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
+#if IS_SECONDARY_BOUNCE
+#define ENABLE_INLINE_SHADOWS 0
+#else
 #define ENABLE_INLINE_SHADOWS 1
+#endif
 #endif
 
 #if ENABLE_INLINE_SHADOWS
