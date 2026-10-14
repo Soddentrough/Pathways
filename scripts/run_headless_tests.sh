@@ -308,9 +308,9 @@ python3 scripts/verify_frame.py output/test_breakfast_room.png output/stats_brea
 
 python3 scripts/verify_frame.py output/test_veach_ajar.png output/stats_veach_ajar.json 1920 1080 30.0 --max-mean-lum 0.85 --max-blown-pct 25.0
 
-# 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Alias Table & Local RIS)
+# 9b. Test Suite 6d: Many-Lights (64 Lights) Procedural Cornell Box (Hierarchical Light Tree default)
 echo ""
-echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights)..."
+echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights, Hierarchical Light Tree default)..."
 "${PATHWAYS_BIN}" \
     --headless \
     --width 1920 \
@@ -318,26 +318,26 @@ echo "[6d] Running Test Suite 6d: Many-Lights Scene (64 Lights)..."
     --spp 4 \
     --max-bounces 4 \
     --scene many-lights \
-    --dump-frame output/test_many_lights.png \
-    --dump-stats output/stats_many_lights.json
-
-python3 scripts/verify_frame.py output/test_many_lights.png output/stats_many_lights.json 1920 1080 40.0
-
-# 9c. Test Suite 6e: Hierarchical Light Tree (FEAT-02) Many-Lights Verification
-echo ""
-echo "[6e] Running Test Suite 6e: Many-Lights Scene with Hierarchical Light Tree (--light-tree)..."
-"${PATHWAYS_BIN}" \
-    --headless \
-    --width 1920 \
-    --height 1080 \
-    --spp 4 \
-    --max-bounces 4 \
-    --scene many-lights \
-    --light-tree \
     --dump-frame output/test_many_lights_tree.png \
     --dump-stats output/stats_many_lights_tree.json
 
 python3 scripts/verify_frame.py output/test_many_lights_tree.png output/stats_many_lights_tree.json 1920 1080 40.0
+
+# 9c. Test Suite 6e: Vose Alias Table Fallback (--no-light-tree) Many-Lights Verification
+echo ""
+echo "[6e] Running Test Suite 6e: Many-Lights Scene with Alias Table Fallback (--no-light-tree)..."
+"${PATHWAYS_BIN}" \
+    --headless \
+    --width 1920 \
+    --height 1080 \
+    --spp 4 \
+    --max-bounces 4 \
+    --scene many-lights \
+    --no-light-tree \
+    --dump-frame output/test_many_lights.png \
+    --dump-stats output/stats_many_lights.json
+
+python3 scripts/verify_frame.py output/test_many_lights.png output/stats_many_lights.json 1920 1080 40.0
 
 # 9d. Test Suite 6f: OpenUSD Scene Ingestion & Regression Verification (Buick Riviera)
 if [ -f "scenes/BuickRiviera/BuickRiviera.usdc" ]; then

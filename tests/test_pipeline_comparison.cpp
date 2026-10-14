@@ -172,6 +172,11 @@ int main() {
         Config cSceneBnc = Config::parse(2, const_cast<char**>(argvSceneBnc));
         check_true(cSceneBnc.adopt_scene_bounces, "--scene-bounces enables adopt_scene_bounces");
 
+        check_true(cfgDef.enable_light_tree, "Default enable_light_tree must be true");
+        const char* argvNoLt[] = { "pathways", "--no-light-tree" };
+        Config cNoLt = Config::parse(2, const_cast<char**>(argvNoLt));
+        check_true(!cNoLt.enable_light_tree, "--no-light-tree disables enable_light_tree");
+
         check_true(!Config::dgcExecSetRequested(), "Default DGC execution set policy must be disabled (multi-dispatch default)");
 
         std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, and frame budget successfully verified." << std::endl;

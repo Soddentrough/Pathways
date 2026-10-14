@@ -320,7 +320,7 @@ void Config::printUsage(const char* progName) {
               << "  --transparent-shadows   Fast (biased) mode: dielectric surfaces do not occlude shadow rays\n"
               << "  --seed <0-4095>         RNG stream offset for statistically independent runs (default: 0)\n"
               << "  --render-scale <float>  Continuous internal render scale factor (e.g. 0.6667 for 1.5x, 0.5 for 2.0x)\n"
-              << "  --light-tree            Enable Hierarchical Light Tree importance sampling for many-light scenes [default: disabled]\n"
+              << "  --no-light-tree         Disable Hierarchical Light Tree importance sampling (fallback to flat Vose alias table)\n"
               << "  --nrc                   Enable Neural Direct-Light Caching (experimental) with Wave32 WMMA.\n"
               << "                            Caches UNSHADOWED DIRECT-LIGHT radiance only (indirect GI is not\n"
               << "                            cached; full-radiance roadmap: docs/NRC.md) [default: disabled]\n"

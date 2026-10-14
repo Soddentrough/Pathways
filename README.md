@@ -228,8 +228,8 @@ ctest --test-dir build --output-on-failure
 # Launch OpenUSD scene with Multi-GPU load balancing enabled
 ./build/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
 
-# Launch glTF scene with real-time forward caustics and the light tree
-./build/bin/pathways --scene scenes/cornell-caustic/cornell_caustic_extended.glb --caustics --light-tree
+# Launch glTF scene with real-time forward caustics
+./build/bin/pathways --scene scenes/cornell-caustic/cornell_caustic_extended.glb --caustics
 
 # Launch in windowed mode with target frame pacing at 1440p
 ./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
@@ -283,7 +283,7 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--dgc-execset` | *(flag)* | Force-enable DGC Execution Sets (`VkIndirectExecutionSetEXT`) for material microkernels. Multi-dispatch indirect is the default; opt-in via `--dgc-execset` | Disabled (multi-dispatch default) |
 
 | `--caustics` | *(flag)* | Enable real-time forward ray-traced caustics via hardware `rayQueryEXT` | Disabled |
-| `--light-tree` | *(flag)* | Enable Hierarchical 3D Light Tree importance sampling for many-light scenes | Disabled |
+| `--no-light-tree` | *(flag)* | Disable Hierarchical 3D Light Tree importance sampling (fallback to flat Vose alias table) | Light Tree enabled |
 | `--nrc` | *(flag)* | Enable Neural **Direct-Light** Caching with Wave32 WMMA — a neural cache of unshadowed direct-light radiance only (indirect GI is not cached; see `docs/NRC.md` for the full-radiance roadmap) | Disabled |
 | `--nrc-bounce` | `<int>` | Path bounce depth at which NRC terminates tracing | `2` |
 | `--nrc-train-ratio` | `<float>` | Fraction of paths that continue to ground truth for NRC training | `0.03` |
