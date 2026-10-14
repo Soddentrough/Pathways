@@ -214,7 +214,7 @@ void main() {
     uint pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
 
     if (inBounds) {
-        uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex + pc.sppSampleIndex) * 26699) | 1u;
+        uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (ubo.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
         bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
         vec2 jitter = enableTaa ? vec2(0.0) : (randVec2(seed) - vec2(0.5));
         vec2 uv = (vec2(pixelCoord) + vec2(0.5) + jitter) / vec2(float(fw), float(fh));
@@ -361,6 +361,7 @@ void main() {
             vec3 albedoVal = vec3(0.0);
             float roughnessVal = 1.0;
             float metallicVal = 0.0;
+            float transmissionVal = 0.0;
 
             if (closestTri >= 0 || closestSphere >= 0) {
                 vec3 primaryHitPoint = origin + direction * closestT;
@@ -381,6 +382,7 @@ void main() {
                     }
                     roughnessVal = mat.roughness;
                     metallicVal = mat.metallic;
+                    transmissionVal = mat.transmission;
                     if (mat.mrTex > 0u && mat.mrTex <= 512u) {
                         vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
                         roughnessVal *= mrSample.g;
@@ -388,6 +390,9 @@ void main() {
                     }
                     if ((mat.type & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
                         metallicVal = max(metallicVal, 1.0);
+                    }
+                    if ((mat.type & MATERIAL_TYPE_MASK) == 2u /* MATERIAL_DIELECTRIC */) {
+                        transmissionVal = max(transmissionVal, 1.0);
                     }
                 }
             } else {
@@ -410,10 +415,17 @@ void main() {
             // without blocking primary classification on synchronous inline ray queries.
             if (pc.captureMlData != 0u) {
                 float dSpec = 1.0 / (1.0 + max(primaryDepth, 0.0));
-                imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, roughnessVal));
+                float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE) ? 1.0 : 0.0;
+                // Opaque non-metallic surfaces use stochastic lobe selection (only ~4-28% of primary
+                // rays sample the specular/clearcoat lobe); floor their denoiser roughness above the
+                // deterministic mirror bypass range [0.02, 0.08] while keeping pure metals and glass untouched.
+                float denoiseRoughness = (transmissionVal < 0.5)
+                    ? mix(max(roughnessVal, 0.25), roughnessVal, clamp(metallicVal, 0.0, 1.0))
+                    : roughnessVal;
+                imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, denoiseRoughness));
                 imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, dSpec, 0.0));
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, metallicVal));
+                imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, isPrimaryEmissive));
             }
         }
     }

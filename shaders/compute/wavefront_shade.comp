@@ -732,7 +732,7 @@ void main() {
                                 // Diffuse lobe: Cosine-weighted hemisphere sampling
                                 sampledSpecularLobe = false;
                                 uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
-                                uint frameRot = pc.frameIndex + pc.sppSampleIndex;
+                                uint frameRot = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                                 nextDirection = (pc.secondarySortMode >= 2u)
                                     ? sampleCosineHemisphereCoherent(hitNormal, seed, clusterK, frameRot)
                                     : sampleCosineHemisphere(hitNormal, seed);

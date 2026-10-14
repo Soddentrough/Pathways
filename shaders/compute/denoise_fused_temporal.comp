@@ -201,8 +201,8 @@ float evaluateSobelGradientLDS(ivec2 ldsCenter, ivec2 tileOrigin) {
 // Bilateral neighbor statistics + firefly soft-clamping (Section 5.6)
 // -----------------------------------------------------------------------------
 
-// Accumulates luminance moments over bilateral-consistent 8-neighbors
-// (STRICTLY excluding the center sample). Returns valid neighbor count.
+// Accumulates luminance moments over bilateral-consistent 8-neighbor LDS ring
+// (STRICTLY excluding the center sample). Returns validNeighbors count.
 float bilateralNeighborMoments(ivec2 ldsCoord, bool isDiffuseLobe, out float outMu, out float outSigma) {
     vec3 centerNorm = sampleNormalLDS(ldsCoord);
     float centerDepth = s_linearDepth[ldsCoord.y][ldsCoord.x];
@@ -240,9 +240,9 @@ float bilateralNeighborMoments(ivec2 ldsCoord, bool isDiffuseLobe, out float out
     return validNeighbors;
 }
 
-// Conservative bilateral-gated current-sample firefly soft-clamping:
+// Conservative bilateral-gated 8-neighbor current-sample firefly soft-clamping:
 // chromaticity-preserving asymptotic rolloff above mu + 3*sigma, emissive bypass,
-// bypass when fewer than 3 geometrically consistent neighbors exist.
+// and bypass when fewer than 3 geometrically consistent neighbors exist.
 vec3 suppressFirefliesLDS(ivec2 ldsCoord, vec3 rawCurrRadiance, bool isDiffuseLobe, bool isEmissive) {
     if (isEmissive) {
         return rawCurrRadiance;
@@ -255,11 +255,12 @@ vec3 suppressFirefliesLDS(ivec2 ldsCoord, vec3 rawCurrRadiance, bool isDiffuseLo
         return rawCurrRadiance; // Insufficient geometric neighbors (subpixel silhouettes)
     }
 
-    float lumThreshold = mu + 3.0 * sigma;
+    float minFireflyLum = isDiffuseLobe ? 4.0 : 8.0;
+    float lumThreshold = max(mu + 3.0 * sigma, minFireflyLum);
     float currLum = denoiseLuminance(rawCurrRadiance);
     if (currLum > lumThreshold && currLum > 1e-4) {
         // Soft-clamp preserving chromaticity (smooth asymptotic rolloff)
-        float clampedLum = lumThreshold + (currLum - lumThreshold) / (1.0 + (currLum - lumThreshold) / max(lumThreshold, 0.1));
+        float clampedLum = lumThreshold + (currLum - lumThreshold) / (1.0 + (currLum - lumThreshold) / max(lumThreshold, 0.5));
         return rawCurrRadiance * (clampedLum / currLum);
     }
     return rawCurrRadiance;
@@ -521,12 +522,15 @@ void main() {
     }
 
     // ---------------- Specular VMV reprojection track ----------------
-    vec2 specMv = specMotionTex.rg;
+    // When stochastic lobe selection did not spawn a specular bounce-1 ray at
+    // this pixel in the current frame (dRefl <= 1e-4), fall back to primary mv.
+    vec2 specMv = (dRefl > 1e-4) ? specMotionTex.rg : mv;
     vec2 prevUVSpec = uv - specMv;
     ivec2 prevCoordSpec = ivec2(floor(prevUVSpec * resolution));
 
     bool validSpec = false;
     float nSpec = 1.0;
+    float dOutRefl = dRefl;
     if (pc.resetHistory == 0u &&
         prevUVSpec.x >= 0.0 && prevUVSpec.x <= 1.0 &&
         prevUVSpec.y >= 0.0 && prevUVSpec.y <= 1.0 &&
@@ -551,16 +555,27 @@ void main() {
             float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
             bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && prevCoordSpec == prevCoord);
 
-            // Secondary reflection hit distance consistency
-            bool hasReflDist = (dRefl > 1e-4) || (dPrevRefl > 1e-4);
-            bool hitDistConsistent = hasReflDist
-                ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.20)
-                : valid;
+            // Secondary reflection hit distance consistency:
+            // On dielectric/clearcoat surfaces with stochastic lobe selection, frames
+            // where all SPP rays pick the diffuse lobe have dRefl == 0. Treating
+            // dRefl == 0 vs dPrevRefl > 0 as a disocclusion would destroy specular
+            // history every 1-3 frames. Only test distance mismatch when BOTH frames
+            // recorded a specular hit AND parallax motion occurred.
+            bool hasBothReflDist = (dRefl > 1e-4) && (dPrevRefl > 1e-4);
+            bool stationaryMatch = valid && !isDynamic && (prevCoordSpec == prevCoord) &&
+                                   (dot(mv * resolution, mv * resolution) <= 0.0025);
+            bool hitDistConsistent = stationaryMatch ||
+                (hasBothReflDist
+                    ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.20)
+                    : valid);
 
             if ((currIsSky || normalClosenessSpec > 0.85) && reflectorDepthConsistent && hitDistConsistent) {
                 validSpec = true;
                 float maxSpecHist = isDynamic ? 8.0 : 16.0;
                 nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
+                if (dOutRefl <= 1e-4) {
+                    dOutRefl = dPrevRefl;
+                }
             }
         }
     }
@@ -569,8 +584,12 @@ void main() {
     vec3 rawCurrDiff = curDiffTex.rgb / demodAlb;
     vec3 currDiff = suppressFirefliesLDS(ldsCoord, rawCurrDiff, true, isEmissive);
     // Specular highlights off small emitters are additionally protected by the
-    // bilateral geometric quorum inside suppressFirefliesLDS
-    vec3 currSpec = suppressFirefliesLDS(ldsCoord, curSpecTex.rgb, false, isEmissive);
+    // bilateral geometric quorum inside suppressFirefliesLDS, and deterministic
+    // mirrors/metals/glass (curRoughness < 0.08) bypass firefly clamping.
+    float curRoughness = imageLoad(uAlbedoRoughness, coord).a;
+    float mirrorBypass = 1.0 - smoothstep(0.02, 0.08, curRoughness);
+    vec3 currSpec = mix(suppressFirefliesLDS(ldsCoord, curSpecTex.rgb, false, isEmissive),
+                        curSpecTex.rgb, mirrorBypass);
 
     float lumDiff = denoiseLuminance(currDiff);
     float lumSpec = denoiseLuminance(currSpec);
@@ -581,6 +600,26 @@ void main() {
     float nbrsDiff = bilateralNeighborMoments(ldsCoord, true, muNDiff, sigmaNDiff);
     float muNSpec = 0.0, sigmaNSpec = 0.0;
     float nbrsSpec = bilateralNeighborMoments(ldsCoord, false, muNSpec, sigmaNSpec);
+
+    // Center-inclusive spatial variance (SVGF Section 4.2):
+    // Including (lum - muN)^2 ensures that a noisy bright center pixel has high
+    // variance so Pass 2 (s=1) smooths it into its neighborhood, while 1-trimmed
+    // sigmaN prevents an outlier from inflating surrounding smooth pixels' variance.
+    float centerDevDiff = lumDiff - muNDiff;
+    float varSpatialDiff = (nbrsDiff >= 3.0)
+        ? (sigmaNDiff * sigmaNDiff + centerDevDiff * centerDevDiff)
+        : 0.01;
+    float centerDevSpec = lumSpec - muNSpec;
+    float varSpatialSpec = (nbrsSpec >= 3.0)
+        ? (sigmaNSpec * sigmaNSpec + centerDevSpec * centerDevSpec)
+        : 0.01;
+
+    // Motion indicators (in pixel units) to prevent zero-inflated Monte Carlo noise
+    // from falsely resetting stationary temporal history
+    vec2 mvPx = mv * resolution;
+    vec2 specMvPx = specMv * resolution;
+    bool hasMotion = isDynamic || (dot(mvPx, mvPx) > 0.0025);
+    bool hasSpecMotion = isDynamic || (dot(specMvPx, specMvPx) > 0.0025) || hasMotion;
 
     // ---------------- Temporal accumulation ----------------
     vec3 accDiff = currDiff;
@@ -594,16 +633,17 @@ void main() {
         vec4 prevMom = imageLoad(uHistoryMoments, prevCoord);
 
         // Illumination-change & sub-pixel disocclusion responsiveness:
-        // When the entire bilateral 3x3 neighborhood has shifted away from historical
-        // luminance (e.g. moving shadow or moving light), shorten effective history
-        // length so stale lighting fades in 2-3 frames without clipping static GI.
+        // Use a tight threshold (2.5 sigma) during motion and a high uniform-shift
+        // threshold (4.5 sigma) on stationary receivers so moving shadows fade in
+        // 2-3 frames while zero-inflated Monte Carlo noise (deltaLD <= 2.0) never resets history.
         if (nbrsDiff >= 3.0) {
             float prevLumD = denoiseLuminance(prevDiffTex.rgb);
             float tempSigmaD = sqrt(max(0.0, prevMom.y - prevMom.x * prevMom.x));
             float denomD = max(max(sigmaNDiff, tempSigmaD), 0.05 * max(prevLumD, muNDiff) + 0.01);
             float deltaLD = abs(prevLumD - muNDiff) / denomD;
-            if (deltaLD > 2.5) {
-                float react = clamp((deltaLD - 2.5) / 4.0, 0.0, 0.85);
+            float threshD = hasMotion ? 2.5 : 4.5;
+            if (deltaLD > threshD) {
+                float react = clamp((deltaLD - threshD) / 4.0, 0.0, 0.85);
                 nDiff = mix(nDiff, 2.0, react);
             }
         }
@@ -614,13 +654,16 @@ void main() {
         accMom.x = mix(prevMom.x, lumDiff, alphaDiff);
         accMom.y = mix(prevMom.y, lumDiff * lumDiff, alphaDiff);
         varDiff = max(0.0, accMom.y - accMom.x * accMom.x);
+
+        // SVGF Section 4.2: supplement noisy temporal moments with spatial variance when N < 4
+        float spatialBlendD = clamp(1.0 - (nDiff - 1.0) / 3.0, 0.0, 1.0);
+        varDiff = mix(varDiff, max(varDiff, varSpatialDiff), spatialBlendD);
     } else {
-        // Disocclusion fallback: initialize local variance from bilateral-consistent
-        // neighboring LDS radiance statistics
-        float seedVar = (nbrsDiff >= 3.0) ? sigmaNDiff * sigmaNDiff : 0.01;
+        // Disocclusion fallback: initialize local variance from center-inclusive
+        // bilateral neighborhood statistics
         accMom.x = lumDiff;
-        accMom.y = lumDiff * lumDiff + seedVar;
-        varDiff = seedVar;
+        accMom.y = lumDiff * lumDiff + varSpatialDiff;
+        varDiff = varSpatialDiff;
     }
 
     if (validSpec) {
@@ -632,8 +675,9 @@ void main() {
             float tempSigmaS = sqrt(max(0.0, prevMom.w - prevMom.z * prevMom.z));
             float denomS = max(max(sigmaNSpec, tempSigmaS), 0.05 * max(prevLumS, muNSpec) + 0.01);
             float deltaLS = abs(prevLumS - muNSpec) / denomS;
-            if (deltaLS > 2.0) {
-                float reactS = clamp((deltaLS - 2.0) / 3.5, 0.0, 0.85);
+            float threshS = hasSpecMotion ? 2.0 : 4.0;
+            if (deltaLS > threshS) {
+                float reactS = clamp((deltaLS - threshS) / 3.5, 0.0, 0.85);
                 nSpec = mix(nSpec, 1.5, reactS);
             }
         }
@@ -644,11 +688,13 @@ void main() {
         accMom.z = mix(prevMom.z, lumSpec, alphaSpec);
         accMom.w = mix(prevMom.w, lumSpec * lumSpec, alphaSpec);
         varSpec = max(0.0, accMom.w - accMom.z * accMom.z);
+
+        float spatialBlendS = clamp(1.0 - (nSpec - 1.0) / 3.0, 0.0, 1.0);
+        varSpec = mix(varSpec, max(varSpec, varSpatialSpec), spatialBlendS);
     } else {
-        float seedVar = (nbrsSpec >= 3.0) ? sigmaNSpec * sigmaNSpec : 0.01;
         accMom.z = lumSpec;
-        accMom.w = lumSpec * lumSpec + seedVar;
-        varSpec = seedVar;
+        accMom.w = lumSpec * lumSpec + varSpatialSpec;
+        varSpec = varSpatialSpec;
     }
 
     // ---------------- Dual-channel effective edge density ----------------
@@ -664,7 +710,7 @@ void main() {
     imageStore(uOutDiffuse, coord, vec4(outDiff, clamp(varDiff, 0.0, 65000.0)));
     imageStore(uOutSpecular, coord, vec4(outSpec, clamp(varSpec, 0.0, 65000.0)));
     imageStore(uOutMoments, coord, clamp(accMom, 0.0, 65000.0));
-    imageStore(uOutHistoryLength, coord, vec4(nDiff, nSpec, dRefl, isDynamic ? 1.0 : 0.0));
+    imageStore(uOutHistoryLength, coord, vec4(nDiff, nSpec, dOutRefl, isDynamic ? 1.0 : 0.0));
     imageStore(uOutNormalDepth, coord, curND);
     imageStore(uOutEdgeDensity, coord, vec4(clamp(rho, 0.0, 1.0), clamp(rhoEffective, 0.0, 1.0), 0.0, 0.0));
 }
