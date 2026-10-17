@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <array>
 
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
@@ -13,24 +14,54 @@
 
 namespace pathways {
 
-struct UpwaysPushConstants {
-    glm::mat4 currInvView;     // 0..63: View to World
-    glm::mat4 prevViewProj;    // 64..127: World to Previous Clip
-    glm::mat4 invProj;         // 128..191: Clip to View
-    glm::vec4 prevViewZ;       // 192..207: Row 2 of PrevView for axial depth
-    glm::vec2 jitterOffset;    // 208..215: Subpixel camera jitter in render pixels
-    glm::uvec2 renderRes;      // 216..223
-    glm::uvec2 displayRes;     // 224..231
-    glm::vec2 scaleFactor;     // 232..239: DisplayRes / RenderRes (e.g. 2.0, 2.0)
-    uint32_t resetHistory;     // 240..243
-    uint32_t frameIndex;       // 244..247
-    float invTotalSamples;     // 248..251
-    uint32_t totalSamples;     // 252..255
+struct UpwaysTemporalPushConstants {
+    uint32_t renderWidth;
+    uint32_t renderHeight;
+    uint32_t resetHistory;
+    float minAlphaDiffuse;
+    float minAlphaSpecular;
 };
-static_assert(sizeof(UpwaysPushConstants) == 256, "UpwaysPushConstants must be exactly 256 bytes");
+static_assert(sizeof(UpwaysTemporalPushConstants) == 20, "UpwaysTemporalPushConstants must be 20 bytes");
+
+struct UpwaysNeuralGuidePushConstants {
+    uint32_t renderWidth;
+    uint32_t renderHeight;
+    uint32_t resetHistory;
+    float minAlphaDiffuse;
+    float minAlphaSpecular;
+    float basePhiDepth;
+    float basePhiNormal;
+    float basePhiLumaDiffuse;
+    float basePhiLumaSpecular;
+};
+static_assert(sizeof(UpwaysNeuralGuidePushConstants) == 36, "UpwaysNeuralGuidePushConstants must be 36 bytes");
+
+struct UpwaysUpscaleResolvePushConstants {
+    uint32_t renderWidth;
+    uint32_t renderHeight;
+    uint32_t displayWidth;
+    uint32_t displayHeight;
+    float jitterX;
+    float jitterY;
+    uint32_t enableDisplayHistory;
+    float displayHistoryAlpha;
+};
+static_assert(sizeof(UpwaysUpscaleResolvePushConstants) == 32, "UpwaysUpscaleResolvePushConstants must be 32 bytes");
+
+struct UpwaysPassTimings {
+    double temporalMs = 0.0;       // Pass 1: upways_temporal.comp (Co-Designed Demodulation, Firefly Clamp, Reprojection & Quad Packing)
+    double neuralGuideMs = 0.0;    // Pass 2: upways_neural_guide.comp (3-Scale Spatiotemporal Recurrent WMMA U-Net & Radiance Refinement)
+    double upscaleResolveMs = 0.0; // Pass 3: upways_upscale_resolve.comp (Fused 2-Stage Coarse s=3 + Fine s=1 Neural KPN & Remodulation)
+    double historyCopyMs = 0.0;    // History Roll: vkCmdCopyImage (normalDepth + specularMotion)
+    double totalMs = 0.0;          // Total Upways GPU time across all passes + history copy
+    bool valid = false;
+};
 
 class UpwaysPipeline {
 public:
+    static constexpr uint32_t MAX_QUERY_SLOTS = 2;
+    static constexpr uint32_t QUERIES_PER_SLOT = 5;
+
     UpwaysPipeline(
         VkDevice device,
         VkPhysicalDevice physicalDevice,
@@ -39,7 +70,9 @@ public:
         uint32_t inputHeight,
         uint32_t outputWidth,
         uint32_t outputHeight,
-        const std::vector<char>& shaderSpv,
+        const std::vector<char>& temporalSpv,
+        const std::vector<char>& neuralGuideSpv,
+        const std::vector<char>& upscaleResolveSpv,
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT
@@ -50,6 +83,11 @@ public:
     UpwaysPipeline& operator=(const UpwaysPipeline&) = delete;
 
     void resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes);
+
+    void setHistorySourceImages(VkImage normalDepthImage, VkImage specularMotionImage) {
+        m_srcNormalDepthImage = normalDepthImage;
+        m_srcSpecMotionImage = specularMotionImage;
+    }
 
     void updateDescriptors(
         VkImageView demodDiffuseView,
@@ -63,7 +101,6 @@ public:
         VkImageView displayNormalsView = VK_NULL_HANDLE
     );
 
-    // Overload for backwards compatibility with legacy 10-parameter signature
     void updateDescriptors(
         VkImageView accumImageView,
         VkImageView normalDepthImageView,
@@ -72,9 +109,9 @@ public:
         VkImageView specularMotionImageView,
         VkImageView diffuseImageView,
         VkImageView specularImageView,
-        VkBuffer restirReservoirBuffer,
-        VkImageView confidenceOutputImageView,
-        VkBuffer restirReservoirBuffer1
+        VkBuffer /*restirReservoirBuffer*/,
+        VkImageView /*confidenceOutputImageView*/,
+        VkBuffer /*restirReservoirBuffer1*/
     ) {
         updateDescriptors(
             diffuseImageView ? diffuseImageView : accumImageView,
@@ -102,7 +139,6 @@ public:
         uint32_t totalSamples = 1u
     );
 
-    // Overload for backwards compatibility with legacy tile-based dispatch signature
     void recordFrame(
         VkCommandBuffer cmd,
         uint32_t frameIndex,
@@ -119,6 +155,18 @@ public:
     }
 
     void transitionInitialLayouts(VkCommandBuffer cmd);
+    void collectQueryResults(int32_t targetSlot = -1);
+
+    [[nodiscard]] const UpwaysPassTimings& getLastPassTimings() const { return m_lastTimings; }
+    [[nodiscard]] std::array<float, 5> getPassTimingsMs() const {
+        return {
+            static_cast<float>(m_lastTimings.temporalMs),
+            static_cast<float>(m_lastTimings.neuralGuideMs),
+            static_cast<float>(m_lastTimings.upscaleResolveMs),
+            static_cast<float>(m_lastTimings.historyCopyMs),
+            0.0f
+        };
+    }
 
     Image* getOutputImage() const { return m_outputImage.get(); }
     Image* getConfidenceImage() const { return m_confidenceImage.get(); }
@@ -132,39 +180,85 @@ public:
 private:
     void initBuffers(const std::string& weightsPath);
     void initImages();
-    void createDescriptorSetLayout();
+    void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void createPipeline(const std::vector<char>& shaderSpv);
+    void refreshDescriptors();
+    void createPipelines(
+        const std::vector<char>& temporalSpv,
+        const std::vector<char>& neuralGuideSpv,
+        const std::vector<char>& upscaleResolveSpv
+    );
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    double m_timestampPeriodNs = 1.0;
     uint32_t m_inputWidth = 0;
     uint32_t m_inputHeight = 0;
     uint32_t m_outputWidth = 0;
     uint32_t m_outputHeight = 0;
+    uint32_t m_quadWidth = 0;
+    uint32_t m_quadHeight = 0;
     bool m_superRes = false;
     VkFormat m_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     bool m_initialized = false;
     bool m_initialLayoutsTransitioned = false;
     uint32_t m_pingPongIndex = 0;
 
+    VkQueryPool m_queryPool = VK_NULL_HANDLE;
+    bool m_slotQueriesRecorded[MAX_QUERY_SLOTS] = { false, false };
+    UpwaysPassTimings m_lastTimings{};
+
+    // External image handles & views cached for descriptor refresh across resizes
+    VkImage m_srcNormalDepthImage = VK_NULL_HANDLE;
+    VkImage m_srcSpecMotionImage = VK_NULL_HANDLE;
+    VkImageView m_cachedDemodDiffuseView = VK_NULL_HANDLE;
+    VkImageView m_cachedDemodSpecularView = VK_NULL_HANDLE;
+    VkImageView m_cachedNormalDepthView = VK_NULL_HANDLE;
+    VkImageView m_cachedAlbedoRoughnessView = VK_NULL_HANDLE;
+    VkImageView m_cachedSurfaceMotionView = VK_NULL_HANDLE;
+    VkImageView m_cachedSpecularMotionView = VK_NULL_HANDLE;
+
+    // Buffers
     std::unique_ptr<Buffer> m_weightBuffer;
+    std::unique_ptr<Buffer> m_featureBuffer;
+    std::unique_ptr<Buffer> m_upscaleKernelBuffer;
+
+    // Images
     std::unique_ptr<Image> m_outputImage;
     std::unique_ptr<Image> m_confidenceImage;
     std::unique_ptr<Image> m_dummyBlackImage;
+    std::unique_ptr<Image> m_dummyMotionImage;
     std::unique_ptr<Image> m_diffHistoryImages[2];
     std::unique_ptr<Image> m_specHistoryImages[2];
-    std::unique_ptr<Image> m_normHistoryImages[2];
-    VkSampler m_historySampler = VK_NULL_HANDLE;
+    std::unique_ptr<Image> m_momentsHistoryImages[2];
+    std::unique_ptr<Image> m_displayHistoryImages[2];
+    std::unique_ptr<Image> m_tempDiffImage;
+    std::unique_ptr<Image> m_tempSpecImage;
+    std::unique_ptr<Image> m_reprojDiffImage;
+    std::unique_ptr<Image> m_reprojSpecImage;
+    std::unique_ptr<Image> m_prevNormalDepthImage;
+    std::unique_ptr<Image> m_prevSpecMotionImage;
 
+    // Descriptor sets & layouts
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_descLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_descSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_temporalDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_neuralGuideDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_upscaleDescLayout = VK_NULL_HANDLE;
 
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet m_temporalDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_neuralGuideDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+    // Pipelines & layouts
+    VkPipelineLayout m_temporalPipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_neuralGuidePipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_upscalePipeLayout = VK_NULL_HANDLE;
+
+    VkPipeline m_temporalPipeline = VK_NULL_HANDLE;
+    VkPipeline m_neuralGuidePipeline = VK_NULL_HANDLE;
+    VkPipeline m_upscalePipeline = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

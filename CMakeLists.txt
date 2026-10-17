@@ -160,8 +160,13 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/nrc_resolve.comp
     ${SHADER_DIR}/compute/dgc_compact.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
-    ${SHADER_DIR}/compute/upways_reconstruct.comp
-    ${SHADER_DIR}/compute/neural_reconstruct.comp
+    ${SHADER_DIR}/compute/upways_temporal.comp
+    ${SHADER_DIR}/compute/upways_neural_guide.comp
+    ${SHADER_DIR}/compute/upways_upscale_resolve.comp
+    ${SHADER_DIR}/compute/gateway_temporal.comp
+    ${SHADER_DIR}/compute/gateway_neural_guide.comp
+    ${SHADER_DIR}/compute/gateway_atrous.comp
+    ${SHADER_DIR}/compute/gateway_upscale_resolve.comp
     ${SHADER_DIR}/compute/fsr3_upscale.comp
     ${SHADER_DIR}/compute/fsr3_rcas.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
@@ -418,7 +423,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageUpwaysWeights.cmake")
 
 add_custom_target(package_upways_weights
     COMMAND ${CMAKE_COMMAND}
-        -DCMAKE_CURRENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        -DPATHWAYS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         -DUPWAYS_DIR="${UPWAYS_DIR}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageUpwaysWeights.cmake"
     BYPRODUCTS
@@ -445,6 +450,24 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
             "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
             "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights.bin"
         COMMENT "Deploying Upways neural weights to build tree"
+    )
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
+         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
+    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
+             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
+    endif()
+    add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
+            "$<TARGET_FILE_DIR:pathways>/data/models/gateway_weights.bin"
+        COMMENT "Deploying Gateway neural weights to build tree"
     )
 endif()
 

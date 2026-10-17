@@ -247,7 +247,7 @@ void main() {
 
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -287,7 +287,7 @@ void main() {
                 imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
                 if (pc.captureMlData != 0u) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                    imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), 0.0));
+                    imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
                 }
 
             }
@@ -480,7 +480,7 @@ void main() {
                                     imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), 0.0));
                                     if (pc.captureMlData != 0u) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), 0.0));
+                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
                                     }
                                 }
                             } else

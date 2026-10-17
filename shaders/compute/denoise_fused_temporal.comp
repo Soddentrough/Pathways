@@ -470,7 +470,7 @@ void main() {
     vec4 curSpecTex = imageLoad(uCurrentSpecular, coord);
     vec4 specMotionTex = imageLoad(uSpecularMotion, coord);
     bool isEmissive = curDiffTex.a > 0.5;
-    float dRefl = (curSpecTex.a > 1e-4) ? curSpecTex.a : specMotionTex.a;
+    float dRefl = specMotionTex.a;
 
     // ---------------- Primary reprojection ----------------
     vec2 uv = (vec2(coord) + 0.5) / resolution;

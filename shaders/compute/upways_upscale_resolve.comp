@@ -1,0 +1,656 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "upways_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uDenoisedDiffuse;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uDenoisedSpecular;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uAlbedoRoughness;
+layout(set = 0, binding = 4, rg16f)   uniform readonly image2D uMotionVectors;
+
+layout(std430, set = 0, binding = 5) readonly buffer UpscaleKernelInBuffer {
+    uvec4 kernelVec4[];
+} uUpscaleKernelIn;
+
+layout(set = 0, binding = 6, rgba16f) uniform readonly image2D uDisplayHistoryIn;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uDisplayOut;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D uDisplayHistoryOut;
+layout(set = 0, binding = 9, rgba16f) uniform readonly image2D uSpecularMetallic;
+
+layout(push_constant) uniform UpscaleResolvePushConstants {
+    uint renderWidth;
+    uint renderHeight;
+    uint displayWidth;
+    uint displayHeight;
+    float jitterX;
+    float jitterY;
+    uint enableDisplayHistory;
+    float displayHistoryAlpha;
+} pc;
+
+const float GAUSS3_KERNEL[3] = float[3](0.25, 0.50, 0.25);
+
+vec3 sampleDisplayHistoryBilinear(vec2 uv, ivec2 displaySize) {
+    vec2 pos = uv * vec2(displaySize) - vec2(0.5);
+    ivec2 baseP = ivec2(floor(pos));
+    vec2 f = fract(pos);
+
+    ivec2 p00 = clamp(baseP + ivec2(0, 0), ivec2(0), displaySize - ivec2(1));
+    ivec2 p10 = clamp(baseP + ivec2(1, 0), ivec2(0), displaySize - ivec2(1));
+    ivec2 p01 = clamp(baseP + ivec2(0, 1), ivec2(0), displaySize - ivec2(1));
+    ivec2 p11 = clamp(baseP + ivec2(1, 1), ivec2(0), displaySize - ivec2(1));
+
+    vec3 c00 = sanitizeVec3(imageLoad(uDisplayHistoryIn, p00).rgb);
+    vec3 c10 = sanitizeVec3(imageLoad(uDisplayHistoryIn, p10).rgb);
+    vec3 c01 = sanitizeVec3(imageLoad(uDisplayHistoryIn, p01).rgb);
+    vec3 c11 = sanitizeVec3(imageLoad(uDisplayHistoryIn, p11).rgb);
+
+    vec3 top = mix(c00, c10, f.x);
+    vec3 bot = mix(c01, c11, f.x);
+    return mix(top, bot, f.y);
+}
+
+void loadRefinedDiffuseSpecular(ivec2 gp, uint qW, out vec4 outDiff4, out vec4 outSpec4) {
+    vec4 d4 = imageLoad(uDenoisedDiffuse, gp);
+    vec4 s4 = imageLoad(uDenoisedSpecular, gp);
+    uint qIdx = uint(gp.y >> 1) * qW + uint(gp.x >> 1);
+    vec2 meanResDS = unpackHalf2x16(uUpscaleKernelIn.kernelVec4[qIdx * 3u + 2u].z);
+    float stdGateD = clamp(sqrt(max(d4.a - 1e-4, 0.0)) * 2.0, 0.0, 1.0);
+    float stdGateS = clamp(sqrt(max(s4.a - 1e-4, 0.0)) * 2.0, 0.0, 1.0);
+    vec3 refDiff = sanitizeVec3(sanitizeVec3(d4.rgb) * exp(0.25 * meanResDS.x * stdGateD));
+    vec3 refSpec = sanitizeVec3(sanitizeVec3(s4.rgb) * exp(0.25 * meanResDS.y * stdGateS));
+    outDiff4 = vec4(refDiff, d4.a);
+    outSpec4 = vec4(refSpec, s4.a);
+}
+
+// 24x24 outer FP16 LDS tile for Fused 2-Stage Hierarchical Multi-Scale Neural KPN Reconstruction (19.4 KB LDS)
+shared f16vec4   s_nd[24][25];
+shared f16vec4   s_diff[24][25];
+shared f16vec4   s_spec[24][25];
+shared f16vec4   s_ar[24][25];
+shared float16_t s_met[18][19];
+
+void evaluateCoarseNeuralStage1(
+    int ox,
+    int oy,
+    float metCenter,
+    ivec2 rp,
+    ivec2 renderSize,
+    uint qW,
+    out vec4 outDiff4,
+    out vec4 outSpec4
+) {
+    vec4 diffCenter = vec4(s_diff[oy][ox]);
+    vec4 specCenter = vec4(s_spec[oy][ox]);
+    vec4 ndCenter   = vec4(s_nd[oy][ox]);
+
+    if (ndCenter.w >= UPWAYS_SKY_DEPTH) {
+        outDiff4 = diffCenter;
+        outSpec4 = specCenter;
+        return;
+    }
+
+    vec3 nCenter   = ndCenter.xyz;
+    float zCenter  = ndCenter.w;
+    vec4 arCenter  = vec4(s_ar[oy][ox]);
+    vec3 albCenter = arCenter.rgb;
+    float rCenter  = arCenter.a;
+
+    ivec2 qP   = rp >> 1;
+    uint qIdx  = uint(qP.y) * qW + uint(qP.x);
+    uvec4 kv0  = uUpscaleKernelIn.kernelVec4[qIdx * 3u + 0u];
+    uvec4 kv1  = uUpscaleKernelIn.kernelVec4[qIdx * 3u + 1u];
+    uvec4 kv2  = uUpscaleKernelIn.kernelVec4[qIdx * 3u + 2u];
+
+    vec2 k01 = unpackHalf2x16(kv0.x);
+    vec2 k23 = unpackHalf2x16(kv0.y);
+    vec2 k45 = unpackHalf2x16(kv0.z);
+    vec2 k67 = unpackHalf2x16(kv0.w);
+    vec2 k89 = unpackHalf2x16(kv1.x);
+    vec2 pZN = unpackHalf2x16(kv2.x);
+    vec2 pDS = unpackHalf2x16(kv2.y);
+
+    float kWeights[9] = float[9](k01.x, k01.y, k23.x, k23.y, k45.x, k45.y, k67.x, k67.y, k89.x);
+    float phiZ  = max(pZN.x, 1e-4);
+    float phiN  = max(pZN.y, 1.0);
+    float phiLD = max(pDS.x, 1e-3);
+    float phiLS = max(pDS.y, 1e-3);
+
+    float zRight = float(s_nd[oy][ox + 1].w);
+    float zLeft  = float(s_nd[oy][ox - 1].w);
+    float zDown  = float(s_nd[oy + 1][ox].w);
+    float zUp    = float(s_nd[oy - 1][ox].w);
+
+    float dzdx = (abs(zRight - zCenter) < abs(zCenter - zLeft)) ? (zRight - zCenter) : (zCenter - zLeft);
+    float dzdy = (abs(zDown - zCenter) < abs(zCenter - zUp)) ? (zDown - zCenter) : (zCenter - zUp);
+    float maxSlope = 0.15 * max(zCenter, 0.1);
+    vec2 dzdxy = clamp(vec2(dzdx, dzdy), vec2(-maxSlope), vec2(maxSlope));
+
+    float varCenterD = max(diffCenter.a, 1e-4);
+    float varCenterS = max(specCenter.a, 1e-4);
+
+    f16vec4 dR = s_diff[oy][ox + 1];
+    f16vec4 dL = s_diff[oy][ox - 1];
+    f16vec4 dD = s_diff[oy + 1][ox];
+    f16vec4 dU = s_diff[oy - 1][ox];
+
+    f16vec4 sR = s_spec[oy][ox + 1];
+    f16vec4 sL = s_spec[oy][ox - 1];
+    f16vec4 sD = s_spec[oy + 1][ox];
+    f16vec4 sU = s_spec[oy - 1][ox];
+
+    float nbrVarD = 0.25 * (max(float(dR.a), 1e-4) + max(float(dL.a), 1e-4) + max(float(dD.a), 1e-4) + max(float(dU.a), 1e-4));
+    float nbrVarS = 0.25 * (max(float(sR.a), 1e-4) + max(float(sL.a), 1e-4) + max(float(sD.a), 1e-4) + max(float(sU.a), 1e-4));
+    float lumCenterD = upwaysLuminance(diffCenter.rgb);
+    float nbrLumD    = 0.25 * upwaysLuminance(vec3(dR.rgb + dL.rgb + dD.rgb + dU.rgb));
+    float refLumD    = 0.5 * (lumCenterD + nbrLumD);
+
+    float lumCenterS = upwaysLuminance(specCenter.rgb);
+    float nbrLumS    = 0.25 * upwaysLuminance(vec3(sR.rgb + sL.rgb + sD.rgb + sU.rgb));
+    float refLumS    = 0.5 * (lumCenterS + nbrLumS);
+
+    bool isConductor       = (metCenter >= 0.5);
+    bool isDielectricGlass = (rCenter < 0.08) && (!isConductor);
+
+    float trueVarD = max(max(varCenterD, nbrVarD) - 1e-4, 0.0);
+    float trueVarS = max(max(varCenterS, nbrVarS) - 1e-4, 0.0);
+    float stdD     = sqrt(trueVarD);
+    float stdS     = sqrt(trueVarS);
+
+    float relNoiseD   = stdD / max(refLumD, 0.05);
+    float relNoiseS   = stdS / max(refLumS, 0.05);
+    float filterGateD = smoothstep(0.005, 0.04, relNoiseD);
+    float filterGateS = smoothstep(0.005, 0.04, relNoiseS);
+
+    float maxCardZDiff = max(
+        max(abs(zRight - zCenter), abs(zLeft - zCenter)),
+        max(abs(zDown - zCenter),  abs(zUp - zCenter))
+    );
+    bool coplanarCard   = (maxCardZDiff < 0.08 * max(zCenter, 0.1));
+    float impulseGateS  = isConductor ? smoothstep(0.15, 0.45, relNoiseS) : (isDielectricGlass ? 1.0 : filterGateS);
+    vec3 cleanDiffC = coplanarCard
+        ? mix(diffCenter.rgb, vec3(clamp(f16vec3(diffCenter.rgb), min(min(dR.rgb, dL.rgb), min(dD.rgb, dU.rgb)), max(max(dR.rgb, dL.rgb), max(dD.rgb, dU.rgb)))), filterGateD)
+        : diffCenter.rgb;
+    vec3 cleanSpecC = coplanarCard
+        ? mix(specCenter.rgb, vec3(clamp(f16vec3(specCenter.rgb), min(min(sR.rgb, sL.rgb), min(sD.rgb, sU.rgb)), max(max(sR.rgb, sL.rgb), max(sD.rgb, sU.rgb)))), impulseGateS)
+        : specCenter.rgb;
+    refLumD = upwaysLuminance(cleanDiffC);
+    refLumS = upwaysLuminance(cleanSpecC);
+
+    float wCenterG = GAUSS3_KERNEL[1] * GAUSS3_KERNEL[1] * max(kWeights[4], 1e-4);
+
+    vec3 sumDiff   = wCenterG * cleanDiffC;
+    float sumWDiff = wCenterG;
+    float sumWVarD = wCenterG * varCenterD;
+
+    vec3 sumSpec   = wCenterG * cleanSpecC;
+    float sumWSpec = wCenterG;
+    float sumWVarS = wCenterG * varCenterS;
+
+    float specRadiusScale = isConductor ? clamp(sqrt(max(rCenter, 0.0)) * 2.5, 0.20, 1.0) : 1.0;
+
+    const float LOG2_E = 1.44269504;
+    float invDenomZLog2 = LOG2_E / max(phiZ * max(zCenter, 0.1), 1e-4);
+    float scaleD        = phiLD * stdD * 1.35 + 1e-4;
+    float phiNS         = phiN * (isDielectricGlass ? 1.5 : 2.5);
+    const float invRoughSigmaLog2 = LOG2_E / 0.08;
+    const float invAlbSigmaLog2   = LOG2_E / 0.06;
+
+    const int step = 3;
+    if (filterGateD > 1e-4 || filterGateS > 1e-4) {
+        for (int ky = -1; ky <= 1; ++ky) {
+            for (int kx = -1; kx <= 1; ++kx) {
+                if (kx == 0 && ky == 0) {
+                    continue;
+                }
+                ivec2 offsetPx = ivec2(kx * step, ky * step);
+                ivec2 q        = rp + offsetPx;
+                if (q.x < 0 || q.y < 0 || q.x >= renderSize.x || q.y >= renderSize.y) {
+                    continue;
+                }
+
+                int nx = ox + kx * step;
+                int ny = oy + ky * step;
+                vec4 ndQ = vec4(s_nd[ny][nx]);
+                if (ndQ.w >= UPWAYS_SKY_DEPTH) {
+                    continue;
+                }
+
+                float cosTheta = clamp(dot(nCenter, ndQ.xyz), 0.0, 1.0);
+                if (cosTheta <= 0.0) {
+                    continue;
+                }
+
+                uint kIdx       = uint((ky + 1) * 3 + (kx + 1));
+                float kW        = GAUSS3_KERNEL[kx + 1] * GAUSS3_KERNEL[ky + 1] * max(kWeights[kIdx], 1e-4);
+                float expectedZ = zCenter + dot(dzdxy, vec2(offsetPx));
+                float log2WZ    = -abs(expectedZ - ndQ.w) * invDenomZLog2;
+                float log2Cos   = log2(cosTheta);
+                float wGeom     = exp2(log2WZ + phiN * log2Cos);
+
+                if (wGeom > 1e-5) {
+                    vec4 diffQ    = vec4(s_diff[ny][nx]);
+                    float lumQ    = upwaysLuminance(diffQ.rgb);
+                    float varQD   = max(diffQ.a, 1e-4);
+                    float tapStdD = sqrt(max(varQD - 1e-4, 0.0));
+                    float tapScaleD = (scaleD + 0.5 * phiLD * tapStdD) * (1.0 + 1.5 * wGeom * filterGateD);
+                    float wLD     = exp2(-abs(refLumD - lumQ) * (LOG2_E / tapScaleD));
+
+                    float wD = kW * wGeom * wLD * filterGateD;
+                    sumDiff  += wD * sanitizeVec3(diffQ.rgb);
+                    sumWDiff += wD;
+                    sumWVarD += wD * varQD;
+
+                    vec4 arQ     = vec4(s_ar[ny][nx]);
+                    float rQ     = arQ.a;
+                    vec4 specQ   = vec4(s_spec[ny][nx]);
+                    float lumSQ  = upwaysLuminance(specQ.rgb);
+                    float varQS  = max(specQ.a, 1e-4);
+                    float minLumS = min(refLumS, lumSQ);
+                    float maxLumS = max(refLumS, lumSQ);
+                    bool isHdrEdge = (maxLumS > 1.20) && (maxLumS > 1.65 * minLumS + 0.10);
+                    float effStdS  = isHdrEdge ? min(stdS, 0.18 * minLumS + 0.015) : stdS;
+                    float extraS   = (isHdrEdge || isConductor) ? 0.0 : ((isDielectricGlass ? 0.12 : 0.04) * filterGateS * minLumS);
+                    float scaleS   = phiLS * (effStdS * 1.35 + extraS) + 1e-4;
+                    float specDist = max(abs(refLumS - lumSQ), length(cleanSpecC - specQ.rgb) * 0.85);
+                    float log2WS   = log2WZ + phiNS * log2Cos
+                                   - abs(rCenter - rQ) * invRoughSigmaLog2
+                                   - length(albCenter - arQ.rgb) * invAlbSigmaLog2
+                                   - specDist * (LOG2_E / scaleS);
+                    float wS = kW * exp2(log2WS) * specRadiusScale * filterGateS;
+                    sumSpec  += wS * sanitizeVec3(specQ.rgb);
+                    sumWSpec += wS;
+                    sumWVarS += wS * varQS;
+                }
+            }
+        }
+    }
+
+    float invWD   = 1.0 / max(sumWDiff, 1e-6);
+    vec3 outDiff  = sanitizeVec3(sumDiff * invWD);
+    float outVarD = sanitizeFloat(0.5 * sumWVarD * invWD);
+
+    float invWS   = 1.0 / max(sumWSpec, 1e-6);
+    vec3 outSpec  = sanitizeVec3(sumSpec * invWS);
+    float outVarS = sanitizeFloat(0.5 * sumWVarS * invWS);
+
+    outDiff4 = vec4(outDiff, outVarD);
+    outSpec4 = vec4(outSpec, outVarS);
+}
+
+void main() {
+    ivec2 renderSize  = ivec2(int(pc.renderWidth), int(pc.renderHeight));
+    ivec2 displaySize = ivec2(int(pc.displayWidth), int(pc.displayHeight));
+    vec2 jitter       = vec2(pc.jitterX, pc.jitterY);
+    uint qW           = (pc.renderWidth + 1u) >> 1u;
+
+    // Compute render-space bounding box of this 16x16 display workgroup
+    ivec2 dispTL = ivec2(gl_WorkGroupID.xy) * 16;
+    ivec2 dispBR = dispTL + ivec2(15, 15);
+    bool isNative1x = (pc.renderWidth == pc.displayWidth && pc.renderHeight == pc.displayHeight);
+
+    ivec2 ancMin;
+    ivec2 ancMax;
+    if (isNative1x) {
+        ancMin = clamp(dispTL, ivec2(0), renderSize - ivec2(1));
+        ancMax = clamp(dispBR, ivec2(0), renderSize - ivec2(1));
+    } else {
+        vec2 uvTL   = (vec2(dispTL) + vec2(0.5)) / vec2(displaySize);
+        vec2 rPosTL = uvTL * vec2(renderSize) - vec2(0.5);
+        ancMin = clamp(ivec2(floor(rPosTL + vec2(0.5))), ivec2(0), renderSize - ivec2(1));
+
+        vec2 uvBR   = (vec2(dispBR) + vec2(0.5)) / vec2(displaySize);
+        vec2 rPosBR = uvBR * vec2(renderSize) - vec2(0.5);
+        ancMax = clamp(ivec2(floor(rPosBR + vec2(0.5))), ivec2(0), renderSize - ivec2(1));
+    }
+
+    ivec2 innerOrigin = ancMin - ivec2(1, 1);
+    ivec2 innerDim    = (ancMax - ancMin) + ivec2(3, 3);
+    ivec2 outerOrigin = innerOrigin - ivec2(3, 3);
+    ivec2 outerDim    = innerDim + ivec2(6, 6);
+    bool enableHist   = ((pc.enableDisplayHistory & 1u) != 0u);
+    bool useLds       = (innerDim.x <= 18 && innerDim.y <= 18);
+
+    if (useLds) {
+        // 1. Preload outer 24x24 render-space tile into LDS for Stage 1 (s = 3) with inline Pass 2 log-radiance refinement
+        uint totalOuterPixels = uint(outerDim.x * outerDim.y);
+        for (uint idx = gl_LocalInvocationIndex; idx < totalOuterPixels; idx += 256u) {
+            int ly = int(idx) / outerDim.x;
+            int lx = int(idx) % outerDim.x;
+            ivec2 gp = clamp(outerOrigin + ivec2(lx, ly), ivec2(0), renderSize - ivec2(1));
+            vec4 d4, s4;
+            loadRefinedDiffuseSpecular(gp, qW, d4, s4);
+            vec4 ar = clamp(imageLoad(uAlbedoRoughness, gp), vec4(0.0), vec4(1.0));
+            s_nd[ly][lx]   = f16vec4(imageLoad(uNormalDepth, gp));
+            s_diff[ly][lx] = f16vec4(d4);
+            s_spec[ly][lx] = f16vec4(s4);
+            s_ar[ly][lx]   = f16vec4(ar);
+        }
+        uint totalInnerPixels = uint(innerDim.x * innerDim.y);
+        for (uint idx = gl_LocalInvocationIndex; idx < totalInnerPixels; idx += 256u) {
+            int iy = int(idx) / innerDim.x;
+            int ix = int(idx) % innerDim.x;
+            ivec2 gp = clamp(innerOrigin + ivec2(ix, iy), ivec2(0), renderSize - ivec2(1));
+            s_met[iy][ix] = float16_t(clamp(imageLoad(uSpecularMetallic, gp).a, 0.0, 1.0));
+        }
+        barrier();
+
+        // 2. Stage 1: Coarse-Scale (s = 3) Neural Kernel Reconstruction across the inner 18x18 render tile
+        f16vec4 stage1Diff0 = f16vec4(0.0);
+        f16vec4 stage1Spec0 = f16vec4(0.0);
+        f16vec4 stage1Diff1 = f16vec4(0.0);
+        f16vec4 stage1Spec1 = f16vec4(0.0);
+        uint idx0 = gl_LocalInvocationIndex;
+        if (idx0 < totalInnerPixels) {
+            int iy   = int(idx0) / innerDim.x;
+            int ix   = int(idx0) % innerDim.x;
+            ivec2 rp = clamp(innerOrigin + ivec2(ix, iy), ivec2(0), renderSize - ivec2(1));
+            int ox   = (rp.x - innerOrigin.x) + 3;
+            int oy   = (rp.y - innerOrigin.y) + 3;
+            vec4 d0, s0;
+            evaluateCoarseNeuralStage1(ox, oy, float(s_met[iy][ix]), rp, renderSize, qW, d0, s0);
+            stage1Diff0 = f16vec4(d0);
+            stage1Spec0 = f16vec4(s0);
+        }
+        if (totalInnerPixels > 256u) {
+            uint idx1 = gl_LocalInvocationIndex + 256u;
+            if (idx1 < totalInnerPixels) {
+                int iy   = int(idx1) / innerDim.x;
+                int ix   = int(idx1) % innerDim.x;
+                ivec2 rp = clamp(innerOrigin + ivec2(ix, iy), ivec2(0), renderSize - ivec2(1));
+                int ox   = (rp.x - innerOrigin.x) + 3;
+                int oy   = (rp.y - innerOrigin.y) + 3;
+                vec4 d1, s1;
+                evaluateCoarseNeuralStage1(ox, oy, float(s_met[iy][ix]), rp, renderSize, qW, d1, s1);
+                stage1Diff1 = f16vec4(d1);
+                stage1Spec1 = f16vec4(s1);
+            }
+        }
+        barrier();
+
+        if (idx0 < totalInnerPixels) {
+            int iy = int(idx0) / innerDim.x;
+            int ix = int(idx0) % innerDim.x;
+            s_diff[iy][ix] = stage1Diff0;
+            s_spec[iy][ix] = stage1Spec0;
+        }
+        if (totalInnerPixels > 256u) {
+            uint idx1 = gl_LocalInvocationIndex + 256u;
+            if (idx1 < totalInnerPixels) {
+                int iy = int(idx1) / innerDim.x;
+                int ix = int(idx1) % innerDim.x;
+                s_diff[iy][ix] = stage1Diff1;
+                s_spec[iy][ix] = stage1Spec1;
+            }
+        }
+        barrier();
+    }
+
+    ivec2 displayPos = ivec2(gl_GlobalInvocationID.xy);
+    if (displayPos.x >= displaySize.x || displayPos.y >= displaySize.y) {
+        return;
+    }
+
+    // 3. Stage 2: Fine-Scale (s = 1) Continuous Subpixel Neural Kernel Reconstruction & Metallic-Fresnel Remodulation
+    vec2 uv            = (vec2(displayPos) + vec2(0.5)) / vec2(displaySize);
+    vec2 baseRenderPos = isNative1x ? vec2(displayPos) : (uv * vec2(renderSize) - vec2(0.5));
+    ivec2 anchorP      = isNative1x ? displayPos : clamp(ivec2(floor(baseRenderPos + vec2(0.5))), ivec2(0), renderSize - ivec2(1));
+    vec2 subpixel      = clamp((baseRenderPos - jitter) - vec2(anchorP), vec2(-0.95), vec2(0.95));
+
+    int ixAnc = anchorP.x - innerOrigin.x;
+    int iyAnc = anchorP.y - innerOrigin.y;
+    int oxAnc = ixAnc + 3;
+    int oyAnc = iyAnc + 3;
+
+    vec4 ndAnchor;
+    vec4 diffAnchor4;
+    vec4 specAnchor4;
+    vec4 arAnchor;
+    float metAnchor;
+    if (useLds) {
+        ndAnchor    = vec4(s_nd[oyAnc][oxAnc]);
+        diffAnchor4 = vec4(s_diff[iyAnc][ixAnc]);
+        specAnchor4 = vec4(s_spec[iyAnc][ixAnc]);
+        arAnchor    = vec4(s_ar[oyAnc][oxAnc]);
+        metAnchor   = float(s_met[iyAnc][ixAnc]);
+    } else {
+        ndAnchor  = imageLoad(uNormalDepth, anchorP);
+        loadRefinedDiffuseSpecular(anchorP, qW, diffAnchor4, specAnchor4);
+        arAnchor  = clamp(imageLoad(uAlbedoRoughness, anchorP), vec4(0.0), vec4(1.0));
+        metAnchor = clamp(imageLoad(uSpecularMetallic, anchorP).a, 0.0, 1.0);
+    }
+    vec3 diffAnchor  = sanitizeVec3(diffAnchor4.rgb);
+    vec3 specAnchor  = sanitizeVec3(specAnchor4.rgb);
+    vec3 albAnchor   = arAnchor.rgb;
+    float rAnchor    = arAnchor.a;
+    float varAnchorD = max(diffAnchor4.a - 1e-4, 0.0);
+    float varAnchorS = max(specAnchor4.a - 1e-4, 0.0);
+    float stdAnchorD = sqrt(varAnchorD);
+    float stdAnchorS = sqrt(varAnchorS);
+    vec3 nAnchor     = ndAnchor.xyz;
+    float zAnchor    = ndAnchor.w;
+    float lumDiffAnchor = upwaysLuminance(diffAnchor);
+    float lumSpecAnchor = upwaysLuminance(specAnchor);
+
+    float relNoiseD    = stdAnchorD / max(lumDiffAnchor, 0.05);
+    float relNoiseS    = stdAnchorS / max(lumSpecAnchor, 0.05);
+    bool isDielectricGlassAnc = (rAnchor < 0.08) && (metAnchor < 0.5);
+    float pass3GateD   = isNative1x ? smoothstep(0.005, 0.04, relNoiseD) : 1.0;
+    float pass3GateS   = isNative1x ? (isDielectricGlassAnc ? max(smoothstep(0.002, 0.02, relNoiseS), 0.75) : smoothstep(0.005, 0.04, relNoiseS)) : 1.0;
+    float pass3GateAlb = isNative1x ? 0.0 : 1.0;
+    float noiseGate    = max(pass3GateD, pass3GateS);
+    bool needHist      = enableHist && (!isNative1x || noiseGate > 1e-5);
+
+    ivec2 qAnchor = anchorP >> 1;
+    uint qIdx = uint(qAnchor.y) * qW + uint(qAnchor.x);
+    float detailGain = 0.0;
+
+    vec3 sumDiff   = vec3(0.0);
+    vec3 sumSpec   = vec3(0.0);
+    vec3 sumAlbedo = vec3(0.0);
+    float sumW     = 0.0;
+    float sumWSpec = 0.0;
+    float sumWAlb  = 0.0;
+
+    vec3 boxMeanDiff = vec3(0.0);
+    float boxW       = 0.0;
+
+    vec3 dMin   = vec3(1e9);
+    vec3 dMax   = vec3(-1e9);
+    vec3 sMin   = vec3(1e9);
+    vec3 sMax   = vec3(-1e9);
+    float wColS = 0.0;
+
+    bool anchorIsSky = (zAnchor >= UPWAYS_SKY_DEPTH);
+
+    vec3 upscaledDiff;
+    vec3 upscaledSpec;
+    vec3 upscaledAlb;
+    vec3 localMeanDiff;
+
+    if (pass3GateD > 1e-5 || pass3GateS > 1e-5 || pass3GateAlb > 1e-5 || needHist) {
+        uvec4 kv0 = uUpscaleKernelIn.kernelVec4[qIdx * 3u + 0u];
+        uvec4 kv1 = uUpscaleKernelIn.kernelVec4[qIdx * 3u + 1u];
+
+        vec2 k01 = unpackHalf2x16(kv0.x);
+        vec2 k23 = unpackHalf2x16(kv0.y);
+        vec2 k45 = unpackHalf2x16(kv0.z);
+        vec2 k67 = unpackHalf2x16(kv0.w);
+        vec2 k89 = unpackHalf2x16(kv1.x);
+
+        float kWeights[9] = float[9](k01.x, k01.y, k23.x, k23.y, k45.x, k45.y, k67.x, k67.y, k89.x);
+        detailGain = clamp(k89.y, -0.25, isNative1x ? 0.0 : 0.25);
+
+        const float invTwoSigmaSqLog2    = 1.44269504 / (2.0 * 0.85 * 0.85);
+        const float invTwoSigmaAlbSqLog2 = 1.44269504 / (2.0 * 0.30 * 0.30);
+        float dx0 = -1.0 - subpixel.x;
+        float dx1 =      - subpixel.x;
+        float dx2 =  1.0 - subpixel.x;
+        float dy0 = -1.0 - subpixel.y;
+        float dy1 =      - subpixel.y;
+        float dy2 =  1.0 - subpixel.y;
+        float wx[3]    = float[3](exp2(-dx0 * dx0 * invTwoSigmaSqLog2),    exp2(-dx1 * dx1 * invTwoSigmaSqLog2),    exp2(-dx2 * dx2 * invTwoSigmaSqLog2));
+        float wy[3]    = float[3](exp2(-dy0 * dy0 * invTwoSigmaSqLog2),    exp2(-dy1 * dy1 * invTwoSigmaSqLog2),    exp2(-dy2 * dy2 * invTwoSigmaSqLog2));
+        float wxAlb[3] = float[3](exp2(-dx0 * dx0 * invTwoSigmaAlbSqLog2), exp2(-dx1 * dx1 * invTwoSigmaAlbSqLog2), exp2(-dx2 * dx2 * invTwoSigmaAlbSqLog2));
+        float wyAlb[3] = float[3](exp2(-dy0 * dy0 * invTwoSigmaAlbSqLog2), exp2(-dy1 * dy1 * invTwoSigmaAlbSqLog2), exp2(-dy2 * dy2 * invTwoSigmaAlbSqLog2));
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            float wyVal    = wy[dy + 1];
+            float wyAlbVal = wyAlb[dy + 1];
+            for (int dx = -1; dx <= 1; ++dx) {
+                uint kIdx = uint((dy + 1) * 3 + (dx + 1));
+
+                vec3 diffQ;
+                vec3 specQ;
+                vec4 ndQ;
+                vec3 albedoQ;
+                if (useLds) {
+                    int nix = ixAnc + dx;
+                    int niy = iyAnc + dy;
+                    int nox = oxAnc + dx;
+                    int noy = oyAnc + dy;
+                    vec4 arQ = vec4(s_ar[noy][nox]);
+                    diffQ   = vec3(s_diff[niy][nix].rgb);
+                    specQ   = vec3(s_spec[niy][nix].rgb);
+                    ndQ     = vec4(s_nd[noy][nox]);
+                    albedoQ = arQ.rgb;
+                } else {
+                    ivec2 q  = clamp(anchorP + ivec2(dx, dy), ivec2(0), renderSize - ivec2(1));
+                    vec4 arQ = clamp(imageLoad(uAlbedoRoughness, q), vec4(0.0), vec4(1.0));
+                    vec4 dQ4, sQ4;
+                    loadRefinedDiffuseSpecular(q, qW, dQ4, sQ4);
+                    diffQ   = dQ4.rgb;
+                    specQ   = sQ4.rgb;
+                    ndQ     = imageLoad(uNormalDepth, q);
+                    albedoQ = arQ.rgb;
+                }
+
+                float wSpatial    = wx[dx + 1] * wyVal;
+                float wSpatialAlb = wxAlb[dx + 1] * wyAlbVal;
+
+                bool isOffCenter = (dx != 0 || dy != 0);
+                float wBilat = 1.0;
+                if (isOffCenter) {
+                    if (anchorIsSky) {
+                        wBilat = (ndQ.w >= UPWAYS_SKY_DEPTH) ? 1.0 : 1e-4;
+                    } else if (ndQ.w >= UPWAYS_SKY_DEPTH) {
+                        wBilat = 1e-4;
+                    } else {
+                        float relDiff = abs(zAnchor - ndQ.w) / max(max(zAnchor, ndQ.w), 0.1);
+                        wBilat = exp2(-relDiff * (20.0 * 1.44269504)) * evaluateNormalWeight16(nAnchor, ndQ.xyz);
+                    }
+                }
+
+                if (needHist && wBilat > 1e-2) {
+                    dMin   = min(dMin, diffQ);
+                    dMax   = max(dMax, diffQ);
+                    sMin   = min(sMin, specQ);
+                    sMax   = max(sMax, specQ);
+                    wColS += wBilat;
+                }
+
+                float wBase = wSpatial * wBilat * kWeights[kIdx];
+                float w;
+                float wSpec;
+                float wAlb;
+                if (isOffCenter) {
+                    float lumDiffQ = upwaysLuminance(diffQ);
+                    float minDL    = min(lumDiffAnchor, lumDiffQ);
+                    float diffLumSigma = isNative1x
+                        ? (stdAnchorD * 3.5 + 1e-3)
+                        : max(stdAnchorD * 3.5, 0.20 * minDL + 0.015);
+                    float wDiffLum = exp2(-abs(lumDiffAnchor - lumDiffQ) * (1.44269504 / max(diffLumSigma, 1e-3)));
+
+                    float lumSpecQ    = upwaysLuminance(specQ);
+                    float minSL       = min(lumSpecAnchor, lumSpecQ);
+                    float maxSL       = max(lumSpecAnchor, lumSpecQ);
+                    bool isHdrEdgeS2  = (maxSL > 1.20) && (maxSL > 1.65 * minSL + 0.10);
+                    float effStdAncS  = isHdrEdgeS2 ? min(stdAnchorS, 0.18 * minSL + 0.015) : stdAnchorS;
+                    float specLumSigma;
+                    if (isNative1x) {
+                        specLumSigma = (metAnchor >= 0.5)
+                            ? (effStdAncS * 2.5 + 1e-3)
+                            : max(effStdAncS * 3.5, 0.18 * minSL + 0.015);
+                    } else {
+                        specLumSigma = (metAnchor >= 0.5)
+                            ? max(effStdAncS * 2.5, (0.08 + 0.80 * rAnchor) * minSL + 0.01)
+                            : max(effStdAncS * 3.5, 0.15 * minSL + 0.01);
+                    }
+                    float specDist2   = max(abs(lumSpecAnchor - lumSpecQ), length(specAnchor - specQ) * 0.85);
+                    float wSpecLumAlb = exp2(-specDist2 * (1.44269504 / max(specLumSigma, 1e-3)) - length(albAnchor - albedoQ) * (1.44269504 / 0.06));
+
+                    w     = wBase * wDiffLum * pass3GateD;
+                    wSpec = wBase * wSpecLumAlb * pass3GateS;
+                    wAlb  = wSpatialAlb * wBilat * pass3GateAlb;
+                } else {
+                    w     = max(wBase, 1e-6);
+                    wSpec = max(wBase, 1e-6);
+                    wAlb  = max(wSpatialAlb, 1e-6);
+                }
+
+                sumDiff   += w * diffQ;
+                sumSpec   += wSpec * specQ;
+                sumAlbedo += wAlb * albedoQ;
+                sumW      += w;
+                sumWSpec  += wSpec;
+                sumWAlb   += wAlb;
+
+                float wBox   = isOffCenter ? (wBilat * pass3GateD) : 1.0;
+                boxMeanDiff += wBox * diffQ;
+                boxW        += wBox;
+            }
+        }
+
+        upscaledDiff  = sumDiff / max(sumW, 1e-6);
+        upscaledSpec  = sumSpec / max(sumWSpec, 1e-6);
+        upscaledAlb   = sumAlbedo / max(sumWAlb, 1e-6);
+        localMeanDiff = boxMeanDiff / max(boxW, 1e-6);
+    } else {
+        upscaledDiff  = diffAnchor;
+        upscaledSpec  = specAnchor;
+        upscaledAlb   = albAnchor;
+        localMeanDiff = diffAnchor;
+    }
+
+    vec3 sharpenedDiff = max(upscaledDiff + detailGain * (upscaledDiff - localMeanDiff), vec3(0.0));
+    vec3 remodDiff     = remodulateDiffuse(sharpenedDiff, upscaledAlb, zAnchor);
+    vec3 remodSpec     = remodulateSpecular(upscaledSpec, upscaledAlb, metAnchor, rAnchor, nAnchor.z, zAnchor);
+    vec3 resolvedColor = sanitizeVec3(remodDiff + remodSpec);
+
+    if (needHist && wColS > 1e-3) {
+        vec2 mv   = imageLoad(uMotionVectors, anchorP).xy;
+        vec2 mvPx = mv * vec2(displaySize);
+        bool hasMotion = (dot(mvPx, mvPx) > 0.0025);
+        vec2 prevUV = uv - mv;
+        if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
+            vec3 prevDisplay = hasMotion
+                ? sampleDisplayHistoryBilinear(prevUV, displaySize)
+                : sanitizeVec3(imageLoad(uDisplayHistoryIn, displayPos).rgb);
+            vec3 cMin        = remodulateDiffuse(max(dMin, vec3(0.0)), upscaledAlb, zAnchor) +
+                               remodulateSpecular(max(sMin, vec3(0.0)), upscaledAlb, metAnchor, rAnchor, nAnchor.z, zAnchor);
+            vec3 cMax        = remodulateDiffuse(max(dMax, vec3(0.0)), upscaledAlb, zAnchor) +
+                               remodulateSpecular(max(sMax, vec3(0.0)), upscaledAlb, metAnchor, rAnchor, nAnchor.z, zAnchor);
+            float padScale   = hasMotion ? 0.05 : 0.15;
+            vec3 span        = max(cMax - cMin, vec3(1e-3));
+            vec3 boxLo       = max(cMin - padScale * span, vec3(0.0));
+            vec3 boxHi       = cMax + padScale * span + vec3(1e-3);
+            vec3 clampedPrev = clamp(prevDisplay, boxLo, boxHi);
+            float baseTaa    = clamp(pc.displayHistoryAlpha, 0.05, 1.0);
+            float alphaTaa   = isNative1x
+                ? (hasMotion ? 1.0 : mix(1.0, baseTaa, noiseGate))
+                : (hasMotion ? max(baseTaa, 0.35) : baseTaa);
+            resolvedColor    = mix(clampedPrev, resolvedColor, alphaTaa);
+        }
+    }
+
+    vec4 finalOut = vec4(sanitizeVec3(resolvedColor), 1.0);
+    imageStore(uDisplayOut, displayPos, finalOut);
+    if ((pc.enableDisplayHistory & 2u) == 0u) {
+        imageStore(uDisplayHistoryOut, displayPos, finalOut);
+    }
+}

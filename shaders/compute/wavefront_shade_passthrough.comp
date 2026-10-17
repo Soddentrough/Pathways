@@ -241,10 +241,10 @@ void main() {
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
                 } else {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), 0.0));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
                 }
             }
         } else {
@@ -404,10 +404,10 @@ void main() {
                                         if (pc.captureMlData != 0u) {
                                             if (isSpecularPath) {
                                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, unshadowed, seed), 0.0));
+                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, unshadowed, seed), prevSpec.a));
                                             } else {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, unshadowed, seed), 0.0));
+                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, unshadowed, seed), prevDiff.a));
                                             }
                                         }
                                     }

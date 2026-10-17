@@ -1,0 +1,709 @@
+#version 460
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : require
+
+#include "upways_common.glsl"
+
+// Eight Wave32 subgroups per workgroup (256 threads), processing a 16x16 2x2-quad tile (256 quads = 1024 render pixels)
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer NeuralFeaturesInBuffer {
+    float16_t features[];
+} uNeuralFeaturesIn;
+
+// 100%-Active 2D Halo-WMMA Weight Buffer Layout (40,256 float16_t elements = 80,512 bytes):
+// - enc1           (Conv1d(16, 32, k=5)):     weights [0..2559],     bias [2560..2591]
+// - rec_proj       (Linear(16, 32)):          weights [2592..3103]
+// - enc2           (Conv2d(32, 32, k=(1,3))): weights [3104..6175],  bias [6176..6207]
+// - bottleneck1    (Conv2d(32, 64, k=(1,3))): weights [6208..12351], bias [12352..12415]
+// - bottleneck2    (Conv2d(64, 64, k=(3,1))): weights [12416..24703], bias [24704..24767]
+// - bottleneck3    (Conv2d(64, 32, k=(1,3))): weights [24768..30911], bias [30912..30943]
+// - dec2           (Conv2d(32, 32, k=(3,1))): weights [30944..34015], bias [34016..34047]
+// - dec1           (Conv1d(32, 32, k=5)):     weights [34048..39167], bias [39168..39199]
+// - head_out       (Linear(32, 16)):          weights [39200..39711], bias [39712..39727]
+// - head_recurrent (Linear(32, 16)):          weights [39728..40239], bias [39728..40255]
+layout(std430, set = 0, binding = 1) readonly buffer WeightsBuffer {
+    float16_t weights[];
+} uWeights;
+
+layout(set = 0, binding = 2, rgba16f) uniform image2D uTemporalDiffuseInOut;
+layout(set = 0, binding = 3, rgba16f) uniform image2D uTemporalSpecularInOut;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uReprojDiffuseIn;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uReprojSpecularIn;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uHistoryDiffuseOut;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uHistorySpecularOut;
+
+layout(std430, set = 0, binding = 8) buffer UpscaleKernelOutBuffer {
+    uvec4 kernelVec4[];
+} uUpscaleKernelOut;
+
+layout(push_constant) uniform NeuralGuidePushConstants {
+    uint renderWidth;
+    uint renderHeight;
+    uint resetHistory;
+    float minAlphaDiffuse;
+    float minAlphaSpecular;
+    float basePhiDepth;
+    float basePhiNormal;
+    float basePhiLumaDiffuse;
+    float basePhiLumaSpecular;
+} pc;
+
+const uint ENC1_W_OFFSET        = 0u;
+const uint ENC1_B_OFFSET        = 2560u;
+const uint REC_PROJ_W_OFFSET    = 2592u;
+const uint ENC2_W_OFFSET        = 3104u;
+const uint ENC2_B_OFFSET        = 6176u;
+const uint BOTTLENECK1_W_OFFSET = 6208u;
+const uint BOTTLENECK1_B_OFFSET = 12352u;
+const uint BOTTLENECK2_W_OFFSET = 12416u;
+const uint BOTTLENECK2_B_OFFSET = 24704u;
+const uint BOTTLENECK3_W_OFFSET = 24768u;
+const uint BOTTLENECK3_B_OFFSET = 30912u;
+const uint DEC2_W_OFFSET        = 30944u;
+const uint DEC2_B_OFFSET        = 34016u;
+const uint DEC1_W_OFFSET        = 34048u;
+const uint DEC1_B_OFFSET        = 39168u;
+const uint HEAD_OUT_W_OFFSET    = 39200u;
+const uint HEAD_OUT_B_OFFSET    = 39712u;
+const uint HEAD_REC_W_OFFSET    = 39728u;
+const uint HEAD_REC_B_OFFSET    = 40240u;
+
+// In an 18x18 2D halo quad tile, row ly (0..15) has center at hy = ly + 1, hx = 1..16 -> (ly + 1)*18 + 1 = ly*18 + 19.
+// The 5 cross taps (dy, dx) in {(0,0), (0,-1), (0,+1), (-1,0), (+1,0)} start at ly*18 + SCALE1_HALO_TAP_OFFSET[tap]:
+const uint SCALE1_HALO_TAP_OFFSET[5] = uint[5](19u, 18u, 20u, 1u, 37u);
+
+// 32.0 KB total LDS (half of the 64 KB Vulkan limit) -> eliminates cross-barrier VGPR arrays while keeping high occupancy
+shared float16_t s_buf[8192];
+shared float16_t s_e1[8192];
+
+float16_t leakyRelu16(float16_t x) {
+    return (x > float16_t(0.0)) ? x : (x * float16_t(0.1));
+}
+
+float readHeadOut(uint localIdx, uint c) {
+    float v = float(s_buf[localIdx * 16u + c]) + float(uWeights.weights[HEAD_OUT_B_OFFSET + c]);
+    return (isnan(v) || isinf(v)) ? 0.0 : v;
+}
+
+float readHeadRec(uint localIdx, uint c) {
+    float v = float(s_buf[4096u + localIdx * 16u + c]) + float(uWeights.weights[HEAD_REC_B_OFFSET + c]);
+    return (isnan(v) || isinf(v)) ? 0.0 : v;
+}
+
+void main() {
+    uint lane     = gl_LocalInvocationID.x; // 0..31 within Wave32 subgroup
+    uint sg       = gl_LocalInvocationID.y; // 0..7 subgroup within workgroup
+    uint localIdx = sg * 32u + lane;        // 0..255 quad index within 16x16 workgroup tile
+    uint lx       = localIdx & 15u;
+    uint ly       = localIdx >> 4u;
+    uint qW       = (pc.renderWidth + 1u) >> 1u;
+    uint qH       = (pc.renderHeight + 1u) >> 1u;
+
+    ivec2 wgOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(1, 1);
+    ivec2 qp       = ivec2(int(gl_WorkGroupID.x * 16u + lx), int(gl_WorkGroupID.y * 16u + ly));
+    ivec2 qClamped = clamp(qp, ivec2(0), ivec2(int(qW) - 1, int(qH) - 1));
+
+    // Cooperatively load true 18x18 2D cross-workgroup halo quad tile (324 quads = 5184 float16_t) into s_buf[0..5183]
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 5184u; elemIdx += 256u) {
+        uint qTile = elemIdx >> 4u;
+        uint c     = elemIdx & 15u;
+        uint hy    = qTile / 18u;
+        uint hx    = qTile % 18u;
+        ivec2 gq   = clamp(wgOrigin + ivec2(int(hx), int(hy)), ivec2(0), ivec2(int(qW) - 1, int(qH) - 1));
+        uint featBase = (uint(gq.y) * qW + uint(gq.x)) * 16u;
+        s_buf[elemIdx] = uNeuralFeaturesIn.features[featBase + c];
+    }
+
+    // Load 16x16 recurrent hidden state h_16 into s_e1[0..4095] prior to Scale 1 WMMA
+    uint hBase = localIdx * 16u;
+    if ((pc.resetHistory & 1u) == 0u) {
+        uint qGlobalClamped = uint(qClamped.y) * qW + uint(qClamped.x);
+        uvec4 kv1 = uUpscaleKernelOut.kernelVec4[qGlobalClamped * 3u + 1u];
+        vec2 h01 = unpackHalf2x16(kv1.y);
+        vec2 h23 = unpackHalf2x16(kv1.z);
+        vec2 h45 = unpackHalf2x16(kv1.w);
+        float16_t h5[5] = float16_t[5](
+            float16_t(isnan(h01.x) || isinf(h01.x) ? 0.0 : clamp(h01.x, -1.0, 1.0)),
+            float16_t(isnan(h01.y) || isinf(h01.y) ? 0.0 : clamp(h01.y, -1.0, 1.0)),
+            float16_t(isnan(h23.x) || isinf(h23.x) ? 0.0 : clamp(h23.x, -1.0, 1.0)),
+            float16_t(isnan(h23.y) || isinf(h23.y) ? 0.0 : clamp(h23.y, -1.0, 1.0)),
+            float16_t(isnan(h45.x) || isinf(h45.x) ? 0.0 : clamp(h45.x, -1.0, 1.0))
+        );
+        for (uint c = 0u; c < 15u; ++c) {
+            s_e1[hBase + c] = h5[c % 5u];
+        }
+        s_e1[hBase + 15u] = h5[0];
+    } else {
+        [[dont_unroll]]
+        for (uint elemIdx = localIdx; elemIdx < 4096u; elemIdx += 256u) {
+            s_e1[elemIdx] = float16_t(0.0);
+        }
+    }
+    barrier();
+
+    uint lyA   = sg * 2u;
+    uint lyB   = sg * 2u + 1u;
+    uint qOff0 = lyA * 16u;
+    uint qOff1 = lyB * 16u;
+
+    // =========================================================================
+    // 1. Scale 1 Encoder (16x16 Quads from 18x18 Cross-Workgroup 2D Halo Tile):
+    //    E1 = LeakyReLU(rec_proj(H_prev) + enc1(X_halo_18))
+    // =========================================================================
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        // Recurrent projection from s_e1[0..4095]
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> hMat0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> hMat1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec1;
+            coopMatLoad(hMat0, s_e1, qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(hMat1, s_e1, qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wRec0, uWeights.weights, REC_PROJ_W_OFFSET + 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wRec1, uWeights.weights, REC_PROJ_W_OFFSET + 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            acc00 = coopMatMulAdd(hMat0, wRec0, acc00);
+            acc01 = coopMatMulAdd(hMat0, wRec1, acc01);
+            acc10 = coopMatMulAdd(hMat1, wRec0, acc10);
+            acc11 = coopMatMulAdd(hMat1, wRec1, acc11);
+        }
+
+        // 5-tap 2D cross convolution on 18x18 halo tile in s_buf[0..5183]
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 5u; ++tap) {
+            uint tapOff = SCALE1_HALO_TAP_OFFSET[tap];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w1;
+
+            coopMatLoad(act0, s_buf, (lyA * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(act1, s_buf, (lyB * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(w0, uWeights.weights, ENC1_W_OFFSET + (tap * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(w1, uWeights.weights, ENC1_W_OFFSET + (tap * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+            acc00 = coopMatMulAdd(act0, w0, acc00);
+            acc01 = coopMatMulAdd(act0, w1, acc01);
+            acc10 = coopMatMulAdd(act1, w0, acc10);
+            acc11 = coopMatMulAdd(act1, w1, acc11);
+        }
+
+        coopMatStore(acc00, s_e1, qOff0 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc10, s_e1, qOff1 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc01, s_e1, 4096u + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc11, s_e1, 4096u + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Activate E1 (256 quads x 32 channels) in-place in s_e1[0..8191] for Scale 1 skip connection
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 4096u; elemIdx += 256u) {
+        uint c = elemIdx & 15u;
+        s_e1[elemIdx]         = leakyRelu16(s_e1[elemIdx]         + uWeights.weights[ENC1_B_OFFSET + c]);
+        s_e1[4096u + elemIdx] = leakyRelu16(s_e1[4096u + elemIdx] + uWeights.weights[ENC1_B_OFFSET + 16u + c]);
+    }
+    barrier();
+
+    // =========================================================================
+    // 2. Scale 2 Encoder (8x8 Cells):
+    //    P2 = AvgPool2x2(E1), E2 = LeakyReLU(enc2_1x3_horiz(P2) + P2)
+    //    Store P2 horizontally padded (cx_pad in 0..9, cy in 0..7) in column-major
+    //    (cx_pad * 8 + cy) order at s_buf[0..2559] (1280 float16_t per 16-ch block).
+    // =========================================================================
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
+        uint c    = elemIdx & 15u;
+        uint cell = (elemIdx >> 4u) & 63u;
+        uint ob   = elemIdx >> 10u;
+        uint cy   = cell >> 3u;
+        uint cx   = cell & 7u;
+        uint e1Off  = ob * 4096u + c;
+        uint dstOff = ob * 1280u + c;
+        uint q00 = ((cy * 2u + 0u) * 16u + (cx * 2u + 0u)) * 16u;
+        uint q01 = ((cy * 2u + 0u) * 16u + (cx * 2u + 1u)) * 16u;
+        uint q10 = ((cy * 2u + 1u) * 16u + (cx * 2u + 0u)) * 16u;
+        uint q11 = ((cy * 2u + 1u) * 16u + (cx * 2u + 1u)) * 16u;
+        float sum4 = float(s_e1[e1Off + q00]) + float(s_e1[e1Off + q01])
+                   + float(s_e1[e1Off + q10]) + float(s_e1[e1Off + q11]);
+        float16_t v = float16_t(sum4 * 0.25);
+        uint rowMid = (cx + 1u) * 8u + cy;
+        s_buf[dstOff + rowMid * 16u] = v;
+        if (cx == 0u) {
+            s_buf[dstOff + cy * 16u] = v;
+        }
+        if (cx == 7u) {
+            s_buf[dstOff + (9u * 8u + cy) * 16u] = v;
+        }
+    }
+    barrier();
+
+    {
+        uint sTile = sg >> 1u; // 0..3 (pair of columns cx = 2*sTile, 2*sTile+1)
+        uint ob    = sg & 1u;  // 0..1
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 3u; ++tap) {
+            uint rowStart = (2u * sTile + tap) * 8u;
+            for (uint ib = 0u; ib < 2u; ++ib) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+                uint wIdx = ((tap * 2u + ob) * 2u + ib) * 256u;
+                coopMatLoad(act, s_buf, ib * 1280u + rowStart * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(w, uWeights.weights, ENC2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(act, w, acc);
+            }
+        }
+        coopMatStore(acc, s_buf, 2560u + ob * 1024u + sTile * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Activate E2 with P2 residual and store E2 in standard row-major (cy * 8 + cx) order at s_buf[6144..8191]
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
+        uint c      = elemIdx & 15u;
+        uint cellCM = (elemIdx >> 4u) & 63u;
+        uint ob     = elemIdx >> 10u;
+        uint cx     = cellCM >> 3u;
+        uint cy     = cellCM & 7u;
+        uint cellRM = cy * 8u + cx;
+        uint rowPad = (cx + 1u) * 8u + cy;
+        float16_t raw = s_buf[2560u + ob * 1024u + cellCM * 16u + c];
+        float16_t b   = uWeights.weights[ENC2_B_OFFSET + ob * 16u + c];
+        float16_t res = s_buf[ob * 1280u + rowPad * 16u + c];
+        s_buf[6144u + ob * 1024u + cellRM * 16u + c] = leakyRelu16((raw + b) + res);
+    }
+    barrier();
+
+    // =========================================================================
+    // 3. Scale 3 Bottleneck (4x4 Cells):
+    //    P3 = AvgPool2x2(E2)
+    //    B1 = LeakyReLU(bottleneck1_1x3_horiz(P3))
+    //    B2 = LeakyReLU(bottleneck2_3x1_vert(B1) + B1)
+    //    B3 = LeakyReLU(bottleneck3_1x3_horiz(B2) + P3)
+    //    Note: E2 in s_buf[6144..8191] remains untouched throughout Step 3.
+    // =========================================================================
+    for (uint elemIdx = localIdx; elemIdx < 512u; elemIdx += 256u) {
+        uint c     = elemIdx & 15u;
+        uint cell3 = (elemIdx >> 4u) & 15u;
+        uint ob    = elemIdx >> 8u;
+        uint cy3   = cell3 >> 2u;
+        uint cx3   = cell3 & 3u;
+        uint e2Off  = 6144u + ob * 1024u + c;
+        uint padOff = ob * 384u + c;
+        uint p3Off  = 5632u + ob * 256u + cell3 * 16u + c;
+        uint c00 = ((cy3 * 2u + 0u) * 8u + (cx3 * 2u + 0u)) * 16u;
+        uint c01 = ((cy3 * 2u + 0u) * 8u + (cx3 * 2u + 1u)) * 16u;
+        uint c10 = ((cy3 * 2u + 1u) * 8u + (cx3 * 2u + 0u)) * 16u;
+        uint c11 = ((cy3 * 2u + 1u) * 8u + (cx3 * 2u + 1u)) * 16u;
+        float sum4 = float(s_buf[e2Off + c00]) + float(s_buf[e2Off + c01])
+                   + float(s_buf[e2Off + c10]) + float(s_buf[e2Off + c11]);
+        float16_t v = float16_t(sum4 * 0.25);
+        uint rowColMaj = (cx3 + 1u) * 4u + cy3;
+        s_buf[p3Off] = v;
+        s_buf[padOff + rowColMaj * 16u] = v;
+        if (cx3 == 0u) {
+            s_buf[padOff + cy3 * 16u] = v;
+        }
+        if (cx3 == 3u) {
+            s_buf[padOff + (5u * 4u + cy3) * 16u] = v;
+        }
+    }
+    barrier();
+
+    // 3a. bottleneck1 (32 -> 64, horizontal 1x3 on 4x4 cells in column-major (cx3_pad, cy3) order)
+    {
+        uint ob = sg >> 1u; // 0..3
+        uint ib = sg & 1u;  // 0..1
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 3u; ++tap) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+            uint wIdx = ((tap * 4u + ob) * 2u + ib) * 256u;
+            coopMatLoad(act, s_buf, ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(w, uWeights.weights, BOTTLENECK1_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            acc = coopMatMulAdd(act, w, acc);
+        }
+        coopMatStore(acc, s_buf, 768u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Reduce ib=0,1 of bottleneck1 and write B1 in row-major (cy3_pad, cx3) order into s_buf[0..1535] for vertical 3x1 bottleneck2
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 1024u; elemIdx += 256u) {
+        uint c   = elemIdx & 15u;
+        uint m   = (elemIdx >> 4u) & 15u;
+        uint ob  = elemIdx >> 8u;
+        uint cx3 = m >> 2u;
+        uint cy3 = m & 3u;
+        uint rowRowMaj = (cy3 + 1u) * 4u + cx3;
+        uint padOff    = ob * 384u + c;
+        uint s0Base    = 768u + (ob * 2u + 0u) * 256u + m * 16u + c;
+        uint s1Base    = 768u + (ob * 2u + 1u) * 256u + m * 16u + c;
+        float16_t sumIB = s_buf[s0Base] + s_buf[s1Base];
+        float16_t b     = uWeights.weights[BOTTLENECK1_B_OFFSET + ob * 16u + c];
+        float16_t v     = leakyRelu16(sumIB + b);
+        s_buf[padOff + rowRowMaj * 16u] = v;
+        if (cy3 == 0u) {
+            s_buf[padOff + cx3 * 16u] = v;
+        }
+        if (cy3 == 3u) {
+            s_buf[padOff + (5u * 4u + cx3) * 16u] = v;
+        }
+    }
+    barrier();
+
+    // 3b. bottleneck2 (64 -> 64, vertical 3x1 on 4x4 cells in row-major (cy3_pad, cx3) order)
+    {
+        uint ob = sg >> 1u; // 0..3
+        uint sp = sg & 1u;  // 0..1 (each split accumulates 2 input blocks)
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 3u; ++tap) {
+            for (uint sub = 0u; sub < 2u; ++sub) {
+                uint ib = sp * 2u + sub;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+                uint wIdx = ((tap * 4u + ob) * 4u + ib) * 256u;
+                coopMatLoad(act, s_buf, ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(w, uWeights.weights, BOTTLENECK2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(act, w, acc);
+            }
+        }
+        coopMatStore(acc, s_buf, 1536u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Reduce sp=0,1 of bottleneck2, add B1 residual from s_buf[0..1535], and write B2 in column-major (cx3_pad, cy3) order into s_buf[3584..5119]
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 1024u; elemIdx += 256u) {
+        uint c       = elemIdx & 15u;
+        uint m       = (elemIdx >> 4u) & 15u;
+        uint ob      = elemIdx >> 8u;
+        uint cy3     = m >> 2u;
+        uint cx3     = m & 3u;
+        uint resBase = ob * 384u + (m + 4u) * 16u + c;
+        uint s0Base  = 1536u + (ob * 2u + 0u) * 256u + m * 16u + c;
+        uint s1Base  = 1536u + (ob * 2u + 1u) * 256u + m * 16u + c;
+        float16_t sumSP = s_buf[s0Base] + s_buf[s1Base];
+        float16_t b     = uWeights.weights[BOTTLENECK2_B_OFFSET + ob * 16u + c];
+        float16_t res   = s_buf[resBase];
+        float16_t v     = leakyRelu16((sumSP + b) + res);
+        uint rowColMaj  = (cx3 + 1u) * 4u + cy3;
+        uint padOff     = 3584u + ob * 384u + c;
+        s_buf[padOff + rowColMaj * 16u] = v;
+        if (cx3 == 0u) {
+            s_buf[padOff + cy3 * 16u] = v;
+        }
+        if (cx3 == 3u) {
+            s_buf[padOff + (5u * 4u + cy3) * 16u] = v;
+        }
+    }
+    barrier();
+
+    // 3c. bottleneck3 (64 -> 32, horizontal 1x3 on 4x4 cells in column-major (cx3_pad, cy3) order from s_buf[3584..5119])
+    {
+        uint ob = sg >> 2u; // 0..1
+        uint ib = sg & 3u;  // 0..3
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 3u; ++tap) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+            uint wIdx = ((tap * 2u + ob) * 4u + ib) * 256u;
+            coopMatLoad(act, s_buf, 3584u + ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(w, uWeights.weights, BOTTLENECK3_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            acc = coopMatMulAdd(act, w, acc);
+        }
+        coopMatStore(acc, s_buf, 1536u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Reduce ib=0..3 of bottleneck3, add P3 residual (from s_buf[5632..6143]), and write B3 in row-major (cy3*4 + cx3) to s_buf[3584..4095]
+    for (uint elemIdx = localIdx; elemIdx < 512u; elemIdx += 256u) {
+        uint c     = elemIdx & 15u;
+        uint m     = (elemIdx >> 4u) & 15u;
+        uint ob    = elemIdx >> 8u;
+        uint cx3   = m >> 2u;
+        uint cy3   = m & 3u;
+        uint cell3 = cy3 * 4u + cx3;
+        uint s0Base = 1536u + (ob * 4u + 0u) * 256u + m * 16u + c;
+        uint s1Base = 1536u + (ob * 4u + 1u) * 256u + m * 16u + c;
+        uint s2Base = 1536u + (ob * 4u + 2u) * 256u + m * 16u + c;
+        uint s3Base = 1536u + (ob * 4u + 3u) * 256u + m * 16u + c;
+        uint p3Base = 5632u + ob * 256u + cell3 * 16u + c;
+        uint b3Base = 3584u + ob * 256u + cell3 * 16u + c;
+        float16_t s01 = s_buf[s0Base] + s_buf[s1Base];
+        float16_t s23 = s_buf[s2Base] + s_buf[s3Base];
+        float16_t b   = uWeights.weights[BOTTLENECK3_B_OFFSET + ob * 16u + c];
+        float16_t res = s_buf[p3Base];
+        s_buf[b3Base] = leakyRelu16(((s01 + s23) + b) + res);
+    }
+    barrier();
+
+    // =========================================================================
+    // 4. Scale 2 Decoder (8x8 Cells):
+    //    U2 = 0.5 * (E2 + Upsample2x2(B3)), D2 = LeakyReLU(dec2_3x1_vert(U2) + U2)
+    //    Store U2 vertically padded (cy2_pad in 0..9, cx2 in 0..7) in row-major
+    //    (cy2_pad * 8 + cx2) order at s_buf[0..2559].
+    // =========================================================================
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
+        uint c      = elemIdx & 15u;
+        uint cell2  = (elemIdx >> 4u) & 63u;
+        uint ob     = elemIdx >> 10u;
+        uint cy2    = cell2 >> 3u;
+        uint cx2    = cell2 & 7u;
+        uint cell3  = (cy2 >> 1u) * 4u + (cx2 >> 1u);
+        uint rowMid = (cy2 + 1u) * 8u + cx2;
+        uint e2Base = 6144u + ob * 1024u + cell2 * 16u + c;
+        uint b3Base = 3584u + ob * 256u + cell3 * 16u + c;
+        uint dstOff = ob * 1280u + c;
+        float16_t u2 = (s_buf[e2Base] + s_buf[b3Base]) * float16_t(0.5);
+        s_buf[dstOff + rowMid * 16u] = u2;
+        if (cy2 == 0u) {
+            s_buf[dstOff + cx2 * 16u] = u2;
+        }
+        if (cy2 == 7u) {
+            s_buf[dstOff + (9u * 8u + cx2) * 16u] = u2;
+        }
+    }
+    barrier();
+
+    {
+        uint sTile = sg >> 1u; // 0..3 (pair of rows cy2 = 2*sTile, 2*sTile+1)
+        uint ob    = sg & 1u;  // 0..1
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint tap = 0u; tap < 3u; ++tap) {
+            uint rowStart = (2u * sTile + tap) * 8u;
+            for (uint ib = 0u; ib < 2u; ++ib) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+                uint wIdx = ((tap * 2u + ob) * 2u + ib) * 256u;
+                coopMatLoad(act, s_buf, ib * 1280u + rowStart * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(w, uWeights.weights, DEC2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(act, w, acc);
+            }
+        }
+        coopMatStore(acc, s_buf, 2560u + ob * 1024u + sTile * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    // Activate D2 with U2 residual and store in row-major (cy2 * 8 + cx2) order at s_buf[6144..8191]
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
+        uint c      = elemIdx & 15u;
+        uint cell2  = (elemIdx >> 4u) & 63u;
+        uint ob     = elemIdx >> 10u;
+        uint rowPad = cell2 + 8u; // (cy2 + 1) * 8 + cx2
+        float16_t raw = s_buf[2560u + ob * 1024u + cell2 * 16u + c];
+        float16_t b   = uWeights.weights[DEC2_B_OFFSET + ob * 16u + c];
+        float16_t res = s_buf[ob * 1280u + rowPad * 16u + c];
+        s_buf[6144u + ob * 1024u + cell2 * 16u + c] = leakyRelu16((raw + b) + res);
+    }
+    barrier();
+
+    // =========================================================================
+    // 5. Scale 1 Decoder (16x16 Quads):
+    //    U1 = 0.5 * (E1 + Upsample2x2(D2)), D1 = LeakyReLU(dec1_cross5(U1) + U1)
+    //    Store U1 in-place in s_e1[0..8191], pad each 16-ch block into s_buf[0..5183].
+    // =========================================================================
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 4096u; elemIdx += 256u) {
+        uint c     = elemIdx & 15u;
+        uint qIdx  = elemIdx >> 4u;
+        uint cell2 = ((qIdx >> 5u) << 3u) + ((qIdx & 15u) >> 1u);
+        s_e1[elemIdx]         = (s_e1[elemIdx]         + s_buf[6144u + cell2 * 16u + c]) * float16_t(0.5);
+        s_e1[4096u + elemIdx] = (s_e1[4096u + elemIdx] + s_buf[7168u + cell2 * 16u + c]) * float16_t(0.5);
+    }
+    barrier();
+
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        [[dont_unroll]]
+        for (uint ib = 0u; ib < 2u; ++ib) {
+            uint srcOff = ib * 4096u;
+            [[dont_unroll]]
+            for (uint elemIdx = localIdx; elemIdx < 5184u; elemIdx += 256u) {
+                uint qTile = elemIdx >> 4u;
+                uint c     = elemIdx & 15u;
+                uint qy    = uint(clamp(int(qTile / 18u) - 1, 0, 15));
+                uint qx    = uint(clamp(int(qTile % 18u) - 1, 0, 15));
+                s_buf[elemIdx] = s_e1[srcOff + (qy * 16u + qx) * 16u + c];
+            }
+            barrier();
+
+            [[dont_unroll]]
+            for (uint tap = 0u; tap < 5u; ++tap) {
+                uint tapOff = SCALE1_HALO_TAP_OFFSET[tap];
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w0;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w1;
+
+                coopMatLoad(act0, s_buf, (lyA * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(act1, s_buf, (lyB * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(w0, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 0u) * 2u + ib) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(w1, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 1u) * 2u + ib) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+                acc00 = coopMatMulAdd(act0, w0, acc00);
+                acc01 = coopMatMulAdd(act0, w1, acc01);
+                acc10 = coopMatMulAdd(act1, w0, acc10);
+                acc11 = coopMatMulAdd(act1, w1, acc11);
+            }
+            barrier();
+        }
+
+        coopMatStore(acc00, s_buf, qOff0 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc10, s_buf, qOff1 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc01, s_buf, 4096u + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc11, s_buf, 4096u + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    [[dont_unroll]]
+    for (uint elemIdx = localIdx; elemIdx < 4096u; elemIdx += 256u) {
+        uint c = elemIdx & 15u;
+        s_buf[elemIdx]         = leakyRelu16((s_buf[elemIdx]         + uWeights.weights[DEC1_B_OFFSET + c])       + s_e1[elemIdx]);
+        s_buf[4096u + elemIdx] = leakyRelu16((s_buf[4096u + elemIdx] + uWeights.weights[DEC1_B_OFFSET + 16u + c]) + s_e1[4096u + elemIdx]);
+    }
+    barrier();
+
+    // =========================================================================
+    // 6. Dual Output Heads (16x16 Quads):
+    //    out = head_out(D1), rec = head_recurrent(D1)
+    // =========================================================================
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accOut0 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accOut1 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accRec0 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accRec1 =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+        for (uint ib = 0u; ib < 2u; ++ib) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wOut;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec;
+
+            uint sOff = ib * 4096u;
+            coopMatLoad(act0, s_buf, sOff + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(act1, s_buf, sOff + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wOut, uWeights.weights, HEAD_OUT_W_OFFSET + ib * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wRec, uWeights.weights, HEAD_REC_W_OFFSET + ib * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+            accOut0 = coopMatMulAdd(act0, wOut, accOut0);
+            accOut1 = coopMatMulAdd(act1, wOut, accOut1);
+            accRec0 = coopMatMulAdd(act0, wRec, accRec0);
+            accRec1 = coopMatMulAdd(act1, wRec, accRec1);
+        }
+
+        barrier();
+        coopMatStore(accOut0, s_buf, qOff0 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(accOut1, s_buf, qOff1 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(accRec0, s_buf, 4096u + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(accRec1, s_buf, 4096u + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    if (qp.x < int(qW) && qp.y < int(qH)) {
+        float rawOut0 = readHeadOut(localIdx, 0u);
+        float rawOut1 = readHeadOut(localIdx, 1u);
+        float rawOut2 = readHeadOut(localIdx, 2u);
+        float rawOut3 = readHeadOut(localIdx, 3u);
+        float rawOut4 = readHeadOut(localIdx, 4u);
+        float rawOut5 = readHeadOut(localIdx, 5u);
+
+        vec3 resD = tanh(vec3(
+            readHeadRec(localIdx, 0u),
+            readHeadRec(localIdx, 1u),
+            readHeadRec(localIdx, 2u)
+        ));
+        vec3 resS = tanh(vec3(
+            readHeadRec(localIdx, 3u),
+            readHeadRec(localIdx, 4u),
+            readHeadRec(localIdx, 5u)
+        ));
+        float meanResD = (resD.x + resD.y + resD.z) * (1.0 / 3.0) + 0.10 * tanh(rawOut0);
+        float meanResS = (resS.x + resS.y + resS.z) * (1.0 / 3.0) + 0.10 * tanh(rawOut1);
+
+        float phiZ  = pc.basePhiDepth * exp(1.0 * tanh(rawOut2));
+        float phiN  = pc.basePhiNormal * exp(1.0 * tanh(rawOut3));
+        float phiLD = pc.basePhiLumaDiffuse * exp(1.25 * tanh(rawOut4));
+        float phiLS = pc.basePhiLumaSpecular * exp(1.25 * tanh(rawOut5));
+
+        float w0 = exp(0.50 * tanh(readHeadOut(localIdx, 6u)));
+        float w1 = exp(0.50 * tanh(readHeadOut(localIdx, 7u)));
+        float w2 = exp(0.50 * tanh(readHeadOut(localIdx, 8u)));
+        float w3 = exp(0.50 * tanh(readHeadOut(localIdx, 9u)));
+        float w4 = exp(0.50 * tanh(readHeadOut(localIdx, 10u)));
+        float w5 = exp(0.50 * tanh(readHeadOut(localIdx, 11u)));
+        float w6 = exp(0.50 * tanh(readHeadOut(localIdx, 12u)));
+        float w7 = exp(0.50 * tanh(readHeadOut(localIdx, 13u)));
+        float w8 = exp(0.50 * tanh(readHeadOut(localIdx, 14u)));
+        float detailGain = 0.10 * tanh(readHeadOut(localIdx, 15u));
+
+        float hNew0 = tanh(readHeadRec(localIdx, 6u)  + readHeadRec(localIdx, 11u));
+        float hNew1 = tanh(readHeadRec(localIdx, 7u)  + readHeadRec(localIdx, 12u));
+        float hNew2 = tanh(readHeadRec(localIdx, 8u)  + readHeadRec(localIdx, 13u));
+        float hNew3 = tanh(readHeadRec(localIdx, 9u)  + readHeadRec(localIdx, 14u));
+        float hNew4 = tanh(readHeadRec(localIdx, 10u) + readHeadRec(localIdx, 15u));
+
+        uint qGlobal = uint(qp.y) * qW + uint(qp.x);
+        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 0u] = uvec4(
+            packHalf2x16(vec2(w0, w1)),
+            packHalf2x16(vec2(w2, w3)),
+            packHalf2x16(vec2(w4, w5)),
+            packHalf2x16(vec2(w6, w7))
+        );
+        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 1u] = uvec4(
+            packHalf2x16(vec2(w8, detailGain)),
+            packHalf2x16(vec2(hNew0, hNew1)),
+            packHalf2x16(vec2(hNew2, hNew3)),
+            packHalf2x16(vec2(hNew4, 0.0))
+        );
+        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 2u] = uvec4(
+            packHalf2x16(vec2(phiZ, phiN)),
+            packHalf2x16(vec2(phiLD, phiLS)),
+            packHalf2x16(vec2(meanResD, meanResS)),
+            0u
+        );
+    }
+}

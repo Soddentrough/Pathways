@@ -199,10 +199,10 @@ void main() {
         if (pc.captureMlData != 0u) {
             if (isSpecular > 0.5) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, radiance, seed), 0.0));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, radiance, seed), prevSpec.a));
             } else {
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radiance, seed), 0.0));
+                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radiance, seed), prevDiff.a));
             }
         }
     }

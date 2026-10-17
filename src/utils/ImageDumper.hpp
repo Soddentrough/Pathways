@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <array>
 #include <cstdint>
 #include <future>
 
@@ -88,6 +89,7 @@ struct FrameStats {
     std::string pipeline_type_str = "rtp";
     uint32_t width = 0;
     uint32_t height = 0;
+    std::string denoiser_mode_str = "None";
     std::string upscaler_mode_str = "None";
     float render_scale = 1.0f;
     uint32_t spp = 0;
@@ -170,9 +172,24 @@ struct FrameStats {
     double secondary_gpu_time_ms = 0.0;
     double tonemap_time_ms = 0.0;
     double upways_time_ms = 0.0;
-    // Adaptive E-SVGF per-dispatch GPU timings (ms):
-    // [0] fused temporal, [1] atrous s=1, [2] atrous s=2, [3] atrous s=4, [4] coarse s=8 + remodulate
+    // Per-dispatch denoiser GPU timings (ms):
     double denoise_pass_ms[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+    std::array<std::string, 5> denoise_pass_names = {
+        "fusedTemporal", "atrousStep1", "atrousStep2", "atrousStep3", "coarseRemodulate"
+    };
+    struct DenoiserProfilerStats {
+        bool valid = false;
+        std::string mode = "none"; // "upways", "gateway", or "svgf"
+        double temporal_ms = 0.0;
+        double neural_guide_ms = 0.0;
+        double atrous_step2_ms = 0.0;
+        double atrous_step6_ms = 0.0;
+        double upscale_resolve_ms = 0.0;
+        double history_copy_ms = 0.0;
+        double total_pass_ms = 0.0;
+        double outer_envelope_ms = 0.0;
+    };
+    DenoiserProfilerStats denoiser_profiler_stats;
     double pcie_transfer_time_ms = 0.0;
 
     // Multi-GPU Interconnect & Async Queue Telemetry
@@ -238,6 +255,9 @@ struct FrameStats {
         std::vector<StageBounceSummary> bounces;
         double tail_megakernel_ms = 0.0;
         uint32_t tail_megakernel_bounce = 0;
+        double denoiser_upscale_ms = 0.0;
+        std::string denoiser_mode = "none";
+        double denoise_pass_ms[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
         double tonemap_ms = 0.0;
     };
 

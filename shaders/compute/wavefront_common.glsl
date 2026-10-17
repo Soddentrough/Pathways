@@ -553,8 +553,12 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
             vec4 pClip_ = ubo.prevViewProj * vec4(xVirt_, 1.0); \
             vec2 vS_ = vec2(0.0); \
-            if (cClip_.w > 1e-4 && pClip_.w > 1e-4) { \
-                vS_ = (cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5; \
+            if (cClip_.w > 1e-4) { \
+                if (pClip_.w > 1e-2) { \
+                    vS_ = clamp((cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5, vec2(-2.0), vec2(2.0)); \
+                } else { \
+                    vS_ = vec2(2.0); \
+                } \
             } \
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
             imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \

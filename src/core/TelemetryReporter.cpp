@@ -10,6 +10,10 @@
 #include "rt/AccelerationStructure.hpp"
 #include "rt/GpuTlasUpdatePipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
+#include "rt/DenoiserPipeline.hpp"
+#include "rt/SuperResolutionManager.hpp"
+#include "rt/UpwaysPipeline.hpp"
+#include "rt/Fsr3Upscaler.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 
 #include <glm/glm.hpp>
@@ -35,6 +39,18 @@ void TelemetryReporter::dumpOutputFiles() {
     VkQueue queue = m_engine->m_context->getGraphicsQueue();
 
     vkDeviceWaitIdle(device);
+
+    if (m_engine->m_superResolution) {
+        if (auto* upw = m_engine->m_superResolution->getUpwaysPipeline()) {
+            upw->collectQueryResults();
+        }
+        if (auto* gtw = m_engine->m_superResolution->getGatewayPipeline()) {
+            gtw->collectQueryResults();
+        }
+    }
+    if (m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
+        m_engine->m_denoiser->collectQueryResults();
+    }
 
     // Drain remaining in-flight queries after vkDeviceWaitIdle
     uint32_t drainCount = std::min(m_engine->m_totalFramesRendered, Engine::MAX_FRAMES_IN_FLIGHT);
@@ -115,11 +131,35 @@ void TelemetryReporter::dumpOutputFiles() {
     }
 
     // 2. Dump HDR OpenEXR
-    if (!m_engine->m_config.dump_hdr_path.empty() && m_engine->m_accumImage) {
-        VkFormat accumFormat = m_engine->m_accumImage->getFormat();
+    Image* hdrSourceImage = m_engine->m_accumImage;
+    if (m_engine->m_config.denoiser_mode == DenoiserMode::Svgf &&
+        m_engine->m_denoiser && m_engine->m_denoiser->getDenoisedImage()) {
+        hdrSourceImage = m_engine->m_denoiser->getDenoisedImage();
+    } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Upways ||
+                m_engine->m_config.upscaler_mode == UpscalerMode::Upways) &&
+               m_engine->m_superResolution &&
+               m_engine->m_superResolution->getUpwaysPipeline() &&
+               m_engine->m_superResolution->getUpwaysPipeline()->getOutputImage()) {
+        hdrSourceImage = m_engine->m_superResolution->getUpwaysPipeline()->getOutputImage();
+    } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Gateway ||
+                m_engine->m_config.upscaler_mode == UpscalerMode::Gateway) &&
+               m_engine->m_superResolution &&
+               m_engine->m_superResolution->getGatewayPipeline() &&
+               m_engine->m_superResolution->getGatewayPipeline()->getOutputImage()) {
+        hdrSourceImage = m_engine->m_superResolution->getGatewayPipeline()->getOutputImage();
+    } else if (m_engine->m_config.upscaler_mode == UpscalerMode::FSR3 &&
+               m_engine->m_superResolution &&
+               m_engine->m_superResolution->getFsr3Upscaler() &&
+               m_engine->m_superResolution->getFsr3Upscaler()->getOutputImage()) {
+        hdrSourceImage = m_engine->m_superResolution->getFsr3Upscaler()->getOutputImage();
+    }
+    if (!m_engine->m_config.dump_hdr_path.empty() && hdrSourceImage) {
+        VkFormat accumFormat = hdrSourceImage->getFormat();
         bool isFp16 = (accumFormat == VK_FORMAT_R16G16B16A16_SFLOAT);
+        uint32_t dumpW = hdrSourceImage->getWidth();
+        uint32_t dumpH = hdrSourceImage->getHeight();
         VkDeviceSize bytesPerPixel = isFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
-        VkDeviceSize bufferSize = m_engine->m_config.width * m_engine->m_config.height * bytesPerPixel;
+        VkDeviceSize bufferSize = static_cast<VkDeviceSize>(dumpW) * dumpH * bytesPerPixel;
         Buffer staging(allocator, bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
@@ -128,23 +168,23 @@ void TelemetryReporter::dumpOutputFiles() {
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(m_engine->m_commandBuffers[0], &beginInfo);
 
-        m_engine->m_accumImage->transitionLayout(
+        hdrSourceImage->transitionLayout(
             m_engine->m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
 
         VkBufferImageCopy copyRegion{};
         copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copyRegion.imageSubresource.layerCount = 1;
-        copyRegion.imageExtent = { m_engine->m_config.width, m_engine->m_config.height, 1 };
+        copyRegion.imageExtent = { dumpW, dumpH, 1 };
 
-        vkCmdCopyImageToBuffer(m_engine->m_commandBuffers[0], m_engine->m_accumImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
+        vkCmdCopyImageToBuffer(m_engine->m_commandBuffers[0], hdrSourceImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.getBuffer(), 1, &copyRegion);
 
-        m_engine->m_accumImage->transitionLayout(
+        hdrSourceImage->transitionLayout(
             m_engine->m_commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
         vkEndCommandBuffer(m_engine->m_commandBuffers[0]);
@@ -161,15 +201,15 @@ void TelemetryReporter::dumpOutputFiles() {
         staging.invalidate();
         if (isFp16) {
             const uint16_t* halfPixels = static_cast<const uint16_t*>(staging.map());
-            std::vector<float> floatPixels(static_cast<size_t>(m_engine->m_config.width) * m_engine->m_config.height * 4);
+            std::vector<float> floatPixels(static_cast<size_t>(dumpW) * dumpH * 4);
             for (size_t p = 0; p < floatPixels.size(); ++p) {
                 floatPixels[p] = glm::detail::toFloat32(halfPixels[p]);
             }
-            ImageDumper::saveEXR(m_engine->m_config.dump_hdr_path, m_engine->m_config.width, m_engine->m_config.height, floatPixels.data());
+            ImageDumper::saveEXR(m_engine->m_config.dump_hdr_path, dumpW, dumpH, floatPixels.data());
             staging.unmap();
         } else {
             const float* floatPixels = static_cast<const float*>(staging.map());
-            ImageDumper::saveEXR(m_engine->m_config.dump_hdr_path, m_engine->m_config.width, m_engine->m_config.height, floatPixels);
+            ImageDumper::saveEXR(m_engine->m_config.dump_hdr_path, dumpW, dumpH, floatPixels);
             staging.unmap();
         }
     }
@@ -408,9 +448,80 @@ FrameStats TelemetryReporter::getStats() const {
     stats.secondary_gpu_time_ms = m_engine->m_lastSecGpuMs;
     stats.tonemap_time_ms = m_engine->m_lastTonemapMs;
     stats.upways_time_ms = m_engine->m_lastUpwaysMs;
-    if (m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
+
+    const bool isUpwaysActive =
+        (m_engine->m_config.denoiser_mode == DenoiserMode::Upways ||
+         m_engine->m_config.upscaler_mode == UpscalerMode::Upways);
+    const bool isGatewayActive =
+        !isUpwaysActive &&
+        (m_engine->m_config.denoiser_mode == DenoiserMode::Gateway ||
+         m_engine->m_config.upscaler_mode == UpscalerMode::Gateway);
+
+    if (isUpwaysActive && m_engine->m_superResolution && m_engine->m_superResolution->getUpwaysPipeline()) {
+        auto* upw = m_engine->m_superResolution->getUpwaysPipeline();
+        const auto& pt = upw->getLastPassTimings();
+        stats.denoiser_mode_str = "Upways";
+        stats.denoise_pass_names = {
+            "upwaysTemporal", "upwaysNeuralGuide", "upwaysUpscaleResolve", "upwaysHistoryCopy", "unused"
+        };
+        stats.denoise_pass_ms[0] = pt.temporalMs;
+        stats.denoise_pass_ms[1] = pt.neuralGuideMs;
+        stats.denoise_pass_ms[2] = pt.upscaleResolveMs;
+        stats.denoise_pass_ms[3] = pt.historyCopyMs;
+        stats.denoise_pass_ms[4] = 0.0;
+
+        stats.denoiser_profiler_stats.valid = pt.valid || (stats.upways_time_ms > 0.0001);
+        stats.denoiser_profiler_stats.mode = "upways";
+        stats.denoiser_profiler_stats.temporal_ms = pt.temporalMs;
+        stats.denoiser_profiler_stats.neural_guide_ms = pt.neuralGuideMs;
+        stats.denoiser_profiler_stats.atrous_step2_ms = 0.0;
+        stats.denoiser_profiler_stats.atrous_step6_ms = 0.0;
+        stats.denoiser_profiler_stats.upscale_resolve_ms = pt.upscaleResolveMs;
+        stats.denoiser_profiler_stats.history_copy_ms = pt.historyCopyMs;
+        stats.denoiser_profiler_stats.total_pass_ms = pt.totalMs;
+        stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
+    } else if (isGatewayActive && m_engine->m_superResolution && m_engine->m_superResolution->getGatewayPipeline()) {
+        auto* gtw = m_engine->m_superResolution->getGatewayPipeline();
+        const auto& pt = gtw->getLastPassTimings();
+        stats.denoiser_mode_str = "Gateway";
+        stats.denoise_pass_names = {
+            "gatewayTemporal", "gatewayNeuralGuide", "gatewayAtrousStep2", "gatewayAtrousStep6", "gatewayUpscaleResolve"
+        };
+        stats.denoise_pass_ms[0] = pt.temporalMs;
+        stats.denoise_pass_ms[1] = pt.neuralGuideMs;
+        stats.denoise_pass_ms[2] = pt.atrousStep2Ms;
+        stats.denoise_pass_ms[3] = pt.atrousStep6Ms;
+        stats.denoise_pass_ms[4] = pt.upscaleResolveMs;
+
+        stats.denoiser_profiler_stats.valid = pt.valid || (stats.upways_time_ms > 0.0001);
+        stats.denoiser_profiler_stats.mode = "gateway";
+        stats.denoiser_profiler_stats.temporal_ms = pt.temporalMs;
+        stats.denoiser_profiler_stats.neural_guide_ms = pt.neuralGuideMs;
+        stats.denoiser_profiler_stats.atrous_step2_ms = pt.atrousStep2Ms;
+        stats.denoiser_profiler_stats.atrous_step6_ms = pt.atrousStep6Ms;
+        stats.denoiser_profiler_stats.upscale_resolve_ms = pt.upscaleResolveMs;
+        stats.denoiser_profiler_stats.history_copy_ms = pt.historyCopyMs;
+        stats.denoiser_profiler_stats.total_pass_ms = pt.totalMs;
+        stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
+    } else if (m_engine->m_config.denoiser_mode == DenoiserMode::Svgf &&
+               m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
         const auto& passMs = m_engine->m_denoiser->getPassTimingsMs();
-        for (int p = 0; p < 5; ++p) stats.denoise_pass_ms[p] = passMs[p];
+        stats.denoiser_mode_str = "SVGF";
+        stats.denoise_pass_names = {
+            "fusedTemporal", "atrousStep1", "atrousStep2", "atrousStep3", "coarseRemodulate"
+        };
+        double sumPass = 0.0;
+        for (int p = 0; p < 5; ++p) {
+            stats.denoise_pass_ms[p] = passMs[p];
+            sumPass += passMs[p];
+        }
+        stats.denoiser_profiler_stats.valid = (sumPass > 0.0001) || (stats.upways_time_ms > 0.0001);
+        stats.denoiser_profiler_stats.mode = "svgf";
+        stats.denoiser_profiler_stats.temporal_ms = passMs[0];
+        stats.denoiser_profiler_stats.total_pass_ms = sumPass;
+        stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
+    } else {
+        stats.denoiser_mode_str = "None";
     }
     stats.num_triangles = m_engine->m_numTriangles;
     stats.num_instanced_triangles = m_engine->m_numInstancedTriangles;
@@ -598,6 +709,7 @@ FrameStats TelemetryReporter::getStats() const {
     switch (m_engine->m_config.upscaler_mode) {
         case UpscalerMode::FSR3: stats.upscaler_mode_str = "FSR 3.1"; break;
         case UpscalerMode::Upways: stats.upscaler_mode_str = "Upways"; break;
+        case UpscalerMode::Gateway: stats.upscaler_mode_str = "Gateway"; break;
         case UpscalerMode::None: default: stats.upscaler_mode_str = "None"; break;
     }
     stats.render_scale = m_engine->m_config.render_scale;
@@ -669,10 +781,56 @@ FrameStats TelemetryReporter::getStats() const {
         s.avg_fps = tally.getAvgFps();
         s.primary_gpu_time_ms = tally.getAvgPrimaryRtMs();
         s.secondary_gpu_time_ms = tally.getAvgSecondaryRtMs();
+        s.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
         s.tonemap_time_ms = tally.getAvgTonemapMs();
         s.gigarays_per_second = tally.getRayThroughput() * 1e-9;
         s.target_frame_time_ms = m_engine->m_config.target_frame_time_ms;
         s.target_achieved = tally.isTargetAchieved(m_engine->m_config.target_frame_time_ms);
+
+        const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
+        const bool tallyIsGateway = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::Gateway || tally.key.upscaler == UpscalerMode::Gateway);
+        const bool tallyIsSvgf = !tallyIsUpways && !tallyIsGateway && (tally.key.denoiser == DenoiserMode::Svgf);
+
+        s.pipeline_stages.denoiser_upscale_ms = tally.getAvgDenoiserUpscaleMs();
+        s.pipeline_stages.denoiser_mode = tallyIsUpways ? "upways" : (tallyIsGateway ? "gateway" : (tallyIsSvgf ? "svgf" : "none"));
+        for (size_t p = 0; p < 6; ++p) {
+            s.pipeline_stages.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(p);
+        }
+
+        // If this tally has post-warmup denoiser samples, also populate top-level denoiser_profiler_stats with the steady-state average
+        if (tally.denoisePassSampleCount > 0) {
+            if (tallyIsUpways && stats.denoiser_profiler_stats.mode == "upways") {
+                stats.denoise_pass_ms[0] = tally.getAvgDenoisePassMs(0);
+                stats.denoise_pass_ms[1] = tally.getAvgDenoisePassMs(1);
+                stats.denoise_pass_ms[2] = tally.getAvgDenoisePassMs(2);
+                stats.denoise_pass_ms[3] = tally.getAvgDenoisePassMs(3);
+                stats.denoise_pass_ms[4] = 0.0;
+                stats.denoiser_profiler_stats.temporal_ms = stats.denoise_pass_ms[0];
+                stats.denoiser_profiler_stats.neural_guide_ms = stats.denoise_pass_ms[1];
+                stats.denoiser_profiler_stats.upscale_resolve_ms = stats.denoise_pass_ms[2];
+                stats.denoiser_profiler_stats.history_copy_ms = stats.denoise_pass_ms[3];
+                stats.denoiser_profiler_stats.total_pass_ms =
+                    stats.denoise_pass_ms[0] + stats.denoise_pass_ms[1] + stats.denoise_pass_ms[2] + stats.denoise_pass_ms[3];
+                stats.denoiser_profiler_stats.outer_envelope_ms = tally.getAvgDenoiserUpscaleMs();
+                stats.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
+            } else if (tallyIsGateway && stats.denoiser_profiler_stats.mode == "gateway") {
+                for (int p = 0; p < 5; ++p) {
+                    stats.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(static_cast<size_t>(p));
+                }
+                stats.denoiser_profiler_stats.temporal_ms = tally.getAvgDenoisePassMs(0);
+                stats.denoiser_profiler_stats.neural_guide_ms = tally.getAvgDenoisePassMs(1);
+                stats.denoiser_profiler_stats.atrous_step2_ms = tally.getAvgDenoisePassMs(2);
+                stats.denoiser_profiler_stats.atrous_step6_ms = tally.getAvgDenoisePassMs(3);
+                stats.denoiser_profiler_stats.upscale_resolve_ms = tally.getAvgDenoisePassMs(4);
+                stats.denoiser_profiler_stats.history_copy_ms = tally.getAvgDenoisePassMs(5);
+                stats.denoiser_profiler_stats.total_pass_ms =
+                    stats.denoiser_profiler_stats.temporal_ms + stats.denoiser_profiler_stats.neural_guide_ms +
+                    stats.denoiser_profiler_stats.atrous_step2_ms + stats.denoiser_profiler_stats.atrous_step6_ms +
+                    stats.denoiser_profiler_stats.upscale_resolve_ms + stats.denoiser_profiler_stats.history_copy_ms;
+                stats.denoiser_profiler_stats.outer_envelope_ms = tally.getAvgDenoiserUpscaleMs();
+                stats.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
+            }
+        }
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
             s.pipeline_stages.is_wavefront = true;
@@ -742,7 +900,7 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
     key.scene_name = m_engine->getActiveSceneName();
     key.pipeline_type = m_engine->m_config.pipeline_type;
     key.mgpu_mode = (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive() && m_engine->m_config.mgpu_mode != MultiGpuMode::Off) ? m_engine->m_config.mgpu_mode : MultiGpuMode::Off;
-    key.denoiser = (m_engine->m_config.denoiser_mode == DenoiserMode::Upways) ? DenoiserMode::Upways : DenoiserMode::None;
+    key.denoiser = m_engine->m_config.denoiser_mode;
     key.enable_nrc = m_engine->m_config.enable_nrc;
     key.width = m_engine->m_config.width;
     key.height = m_engine->m_config.height;
@@ -755,6 +913,49 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
     key.render_scale = m_engine->m_config.render_scale;
     key.enable_tail_megakernel = m_engine->m_config.enable_tail_megakernel;
     key.tail_bounce = m_engine->m_config.tail_megakernel_bounce;
+
+    double denoiserUpscaleMs = m_engine->m_lastUpwaysMs;
+    double denoisePasses[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    uint32_t numDenoisePasses = 0;
+
+    const bool isUpways = (key.denoiser == DenoiserMode::Upways || key.upscaler == UpscalerMode::Upways);
+    const bool isGateway = !isUpways && (key.denoiser == DenoiserMode::Gateway || key.upscaler == UpscalerMode::Gateway);
+
+    if (isUpways && m_engine->m_superResolution && m_engine->m_superResolution->getUpwaysPipeline()) {
+        auto* upw = m_engine->m_superResolution->getUpwaysPipeline();
+        const auto& pt = upw->getLastPassTimings();
+        if (pt.valid) {
+            denoisePasses[0] = pt.temporalMs;
+            denoisePasses[1] = pt.neuralGuideMs;
+            denoisePasses[2] = pt.upscaleResolveMs;
+            denoisePasses[3] = pt.historyCopyMs;
+            numDenoisePasses = 4;
+            if (denoiserUpscaleMs <= 0.0001) {
+                denoiserUpscaleMs = pt.totalMs;
+            }
+        }
+    } else if (isGateway && m_engine->m_superResolution && m_engine->m_superResolution->getGatewayPipeline()) {
+        auto* gtw = m_engine->m_superResolution->getGatewayPipeline();
+        const auto& pt = gtw->getLastPassTimings();
+        if (pt.valid) {
+            denoisePasses[0] = pt.temporalMs;
+            denoisePasses[1] = pt.neuralGuideMs;
+            denoisePasses[2] = pt.atrousStep2Ms;
+            denoisePasses[3] = pt.atrousStep6Ms;
+            denoisePasses[4] = pt.upscaleResolveMs;
+            denoisePasses[5] = pt.historyCopyMs;
+            numDenoisePasses = 6;
+            if (denoiserUpscaleMs <= 0.0001) {
+                denoiserUpscaleMs = pt.totalMs;
+            }
+        }
+    } else if (key.denoiser == DenoiserMode::Svgf && m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
+        const auto& pm = m_engine->m_denoiser->getPassTimingsMs();
+        for (int p = 0; p < 5; ++p) {
+            denoisePasses[p] = pm[p];
+        }
+        numDenoisePasses = 5;
+    }
 
     auto updateAsMetrics = [this](ConfigStatsTally& t) {
         if (m_engine->m_asManager) {
@@ -779,13 +980,13 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
 
     for (auto& tally : m_configTallies) {
         if (tally.key == key) {
-            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+            tally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample, denoiserUpscaleMs, denoisePasses, numDenoisePasses);
             updateAsMetrics(tally);
             return;
         }
     }
     ConfigStatsTally newTally(key);
-    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample);
+    newTally.addSample(frameTimeMs, primRtMs, secRtMs, tonemapMs, wfSample, denoiserUpscaleMs, denoisePasses, numDenoisePasses);
     updateAsMetrics(newTally);
     m_configTallies.push_back(std::move(newTally));
 }
@@ -856,10 +1057,16 @@ void TelemetryReporter::printExecutionSummary() const {
         Logger::info("      - GPU TLAS Updates:  {} update{}",
                      tally.tlasGpuUpdateCount, tally.tlasGpuUpdateCount == 1 ? "" : "s");
 
+        const double avgDenoiseSrMs = tally.getAvgDenoiserUpscaleMs();
         if (tally.key.mgpu_mode != MultiGpuMode::Off) {
             double secXferMs = m_engine->m_mgpu ? m_engine->m_mgpu->getSecondaryTransferTimeMs() : 0.0;
-            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms (Xfer: {:.3f} ms) | Tonemap: {:.3f} ms",
-                         tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), secXferMs, tally.getAvgTonemapMs());
+            if (avgDenoiseSrMs > 0.0005) {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms (Xfer: {:.3f} ms) | Denoiser/SR: {:.3f} ms | Tonemap: {:.3f} ms",
+                             tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), secXferMs, avgDenoiseSrMs, tally.getAvgTonemapMs());
+            } else {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | GPU 1 RT: {:.3f} ms (Xfer: {:.3f} ms) | Tonemap: {:.3f} ms",
+                             tally.getAvgPrimaryRtMs(), tally.getAvgSecondaryRtMs(), secXferMs, tally.getAvgTonemapMs());
+            }
             // Find single GPU baseline for speedup calculation
             double baselineMs = 0.0;
             for (const auto* other : activeTallies) {
@@ -883,8 +1090,13 @@ void TelemetryReporter::printExecutionSummary() const {
                 Logger::info("    Multi-GPU Scaling:   {:.2f}x speedup vs Single GPU ({:.1f}% efficiency)", speedup, efficiency);
             }
         } else {
-            Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms (Single GPU)",
-                         tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+            if (avgDenoiseSrMs > 0.0005) {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Denoiser/SR: {:.3f} ms | Tonemap: {:.3f} ms (Single GPU)",
+                             tally.getAvgPrimaryRtMs(), avgDenoiseSrMs, tally.getAvgTonemapMs());
+            } else {
+                Logger::info("    GPU Breakdown:       GPU 0 RT: {:.3f} ms | Tonemap: {:.3f} ms (Single GPU)",
+                             tally.getAvgPrimaryRtMs(), tally.getAvgTonemapMs());
+            }
         }
 
         if (tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) {
@@ -910,6 +1122,53 @@ void TelemetryReporter::printExecutionSummary() const {
                 Logger::info("      - Tail Megakernel (Bounce {}..{}): {:.3f} ms",
                              tally.tailMegakernelBounce, tally.key.max_bounces, tally.getAvgTailMegakernelMs());
             }
+        } else if (avgDenoiseSrMs > 0.0005) {
+            Logger::info("    Pipeline Stages:");
+            Logger::info("      - Hardware RTP Ray Tracing:  {:.3f} ms", tally.getAvgPrimaryRtMs());
+        }
+
+        const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
+        const bool tallyIsGateway = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::Gateway || tally.key.upscaler == UpscalerMode::Gateway);
+        const bool tallyIsSvgf = !tallyIsUpways && !tallyIsGateway && (tally.key.denoiser == DenoiserMode::Svgf);
+
+        if (tallyIsUpways && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+            const double p1 = tally.getAvgDenoisePassMs(0);
+            const double p2 = tally.getAvgDenoisePassMs(1);
+            const double p3 = tally.getAvgDenoisePassMs(2);
+            const double hc = tally.getAvgDenoisePassMs(3);
+            const double passSum = p1 + p2 + p3 + hc;
+            Logger::info("      - Upways Neural Reconstructor & Multi-Scale KPN: {:.3f} ms (Sub-Pass Sum: {:.3f} ms)",
+                         avgDenoiseSrMs, passSum);
+            Logger::info("          * Pass 1 (Temporal Demod, Reproj & 2x2 Quad Pack): {:.3f} ms", p1);
+            Logger::info("          * Pass 2 (3-Scale Recurrent WMMA U-Net Guide):     {:.3f} ms", p2);
+            Logger::info("          * Pass 3 (Fused 2-Stage s=3+s=1 KPN & Resolve):    {:.3f} ms", p3);
+            Logger::info("          * History Copy (Normal/Depth + Specular Motion):   {:.3f} ms", hc);
+        } else if (tallyIsGateway && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+            const double p1 = tally.getAvgDenoisePassMs(0);
+            const double p2 = tally.getAvgDenoisePassMs(1);
+            const double p3a = tally.getAvgDenoisePassMs(2);
+            const double p3b = tally.getAvgDenoisePassMs(3);
+            const double p4 = tally.getAvgDenoisePassMs(4);
+            const double hc = tally.getAvgDenoisePassMs(5);
+            const double passSum = p1 + p2 + p3a + p3b + p4 + hc;
+            Logger::info("      - Gateway Hybrid E-SVGF + Quad MLP Denoiser:     {:.3f} ms (Sub-Pass Sum: {:.3f} ms)",
+                         avgDenoiseSrMs, passSum);
+            Logger::info("          * Pass 1 (Temporal Reprojection & Quad Pack):      {:.3f} ms", p1);
+            Logger::info("          * Pass 2 (Wave32 WMMA 16->32->16 MLP Guide):       {:.3f} ms", p2);
+            Logger::info("          * Pass 3a (Guided A-Trous Spatial Step s=2):       {:.3f} ms", p3a);
+            Logger::info("          * Pass 3b (Guided A-Trous Spatial Step s=6):       {:.3f} ms", p3b);
+            Logger::info("          * Pass 4 (Bilateral Upscale & Remodulate s=1):     {:.3f} ms", p4);
+            Logger::info("          * History Copy (Normal/Depth + Specular Motion):   {:.3f} ms", hc);
+        } else if (tallyIsSvgf && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+            Logger::info("      - E-SVGF Spatio-Temporal Denoiser:               {:.3f} ms", avgDenoiseSrMs);
+            Logger::info("          * Pass 1 (Fused Temporal):                         {:.3f} ms", tally.getAvgDenoisePassMs(0));
+            Logger::info("          * Pass 2 (A-Trous s=1):                            {:.3f} ms", tally.getAvgDenoisePassMs(1));
+            Logger::info("          * Pass 3 (A-Trous s=2):                            {:.3f} ms", tally.getAvgDenoisePassMs(2));
+            Logger::info("          * Pass 4 (A-Trous s=4):                            {:.3f} ms", tally.getAvgDenoisePassMs(3));
+            Logger::info("          * Pass 5 (Coarse s=8 + Remodulate):                {:.3f} ms", tally.getAvgDenoisePassMs(4));
+        }
+
+        if ((tally.hasWavefrontStages && tally.wavefrontSampleCount > 0) || avgDenoiseSrMs > 0.0005) {
             Logger::info("      - Tonemap / Resolve:         {:.3f} ms", tally.getAvgTonemapMs());
         }
 

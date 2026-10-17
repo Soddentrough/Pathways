@@ -573,11 +573,11 @@ void main() {
         if (pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height)) {
             if (any(greaterThan(accumMlDiffuse, vec3(0.0)))) {
                 vec4 prevD = imageLoad(uMlDiffuseImage, pixelCoord);
-                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevD.rgb, accumMlDiffuse, seed), 0.0));
+                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevD.rgb, accumMlDiffuse, seed), prevD.a));
             }
             if (any(greaterThan(accumMlSpecular, vec3(0.0)))) {
                 vec4 prevS = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevS.rgb, accumMlSpecular, seed), 0.0));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevS.rgb, accumMlSpecular, seed), prevS.a));
             }
         }
     }

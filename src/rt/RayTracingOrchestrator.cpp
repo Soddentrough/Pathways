@@ -351,8 +351,11 @@ void RayTracingOrchestrator::recordRayTracing(
         bool needAccumReset = params.accumReset || !config.progressive_accumulation;
         bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::Svgf ||
                                   config.denoiser_mode == DenoiserMode::Upways ||
+                                  config.denoiser_mode == DenoiserMode::Gateway ||
                                   config.upscaler_mode == UpscalerMode::Upways ||
-                                  config.upways_superres);
+                                  config.upscaler_mode == UpscalerMode::Gateway ||
+                                  config.upways_superres ||
+                                  config.gateway_superres);
         if (needAccumReset || isDenoisingActive) {
             if (needAccumReset && accumImage) {
                 vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
@@ -459,14 +462,19 @@ void RayTracingOrchestrator::recordRayTracing(
 
         bool needGbuffers = (config.upscaler_mode == UpscalerMode::FSR3 ||
                              config.upscaler_mode == UpscalerMode::Upways ||
+                             config.upscaler_mode == UpscalerMode::Gateway ||
                              config.denoiser_mode == DenoiserMode::Upways ||
+                             config.denoiser_mode == DenoiserMode::Gateway ||
                              config.denoiser_mode == DenoiserMode::Svgf ||
                              params.isRestirActive ||
                              config.enable_caustics);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
+                          config.denoiser_mode == DenoiserMode::Gateway ||
                           config.denoiser_mode == DenoiserMode::Svgf ||
                           config.upscaler_mode == UpscalerMode::Upways ||
+                          config.upscaler_mode == UpscalerMode::Gateway ||
                           config.upways_superres ||
+                          config.gateway_superres ||
                           !config.capture_training_data_dir.empty());
         wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u);
 

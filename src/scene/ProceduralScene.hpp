@@ -177,6 +177,17 @@ struct SceneData {
     std::vector<InstanceGPU> instanceData;     // Uploaded to InstancesBuffer (binding 30)
     std::vector<AnimatedInstance> animatedInstances; // Dynamic kinematic animators
 
+    // Mineshaft Coaster 500m / 30s Real-Time Ride State
+    struct CoasterTrackLight {
+        float trackDistance = 0.0f;
+        LightGPU light{};
+    };
+    bool isMineshaftCoaster = false;
+    uint32_t coasterRiderCartInst = UINT32_MAX;
+    uint32_t coasterLeadCart1Inst = UINT32_MAX;
+    uint32_t coasterLeadCart2Inst = UINT32_MAX;
+    std::vector<CoasterTrackLight> coasterStaticLights;
+
     bool hasCamera = false;
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 2.7f);
     glm::vec3 cameraTarget = glm::vec3(0.0f, 1.0f, 0.0f);
@@ -223,6 +234,11 @@ public:
     static SceneData createManyLightsScene(uint32_t gridDim = 8);
     static SceneData createCyberCityScene();
     static SceneData createInfinityMirrorScene();
+    static SceneData createMineshaftScene();
+    static SceneData createMineshaftModelShowcase(const std::string& modelName);
+    static void updateMineshaftCoaster(SceneData& scene, float simTimeSec,
+                                       glm::vec3& outCamPos, glm::vec3& outCamTarget, glm::vec3& outCamUp, float& outCamFov,
+                                       glm::mat4& outRiderCartMat, glm::mat4& outLeadCart1Mat, glm::mat4& outLeadCart2Mat);
 };
 
 } // namespace pathways

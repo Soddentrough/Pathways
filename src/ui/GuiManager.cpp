@@ -230,8 +230,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
     // Record true instantaneous frame time from GPU execution
     float currentFrameTime = static_cast<float>(
         stats.current_frame_time_ms > 0.001 ? stats.current_frame_time_ms :
-        ((stats.primary_gpu_time_ms + stats.tonemap_time_ms > 0.001) ?
-         (stats.primary_gpu_time_ms + stats.tonemap_time_ms) : stats.avg_frame_time_ms));
+        ((stats.primary_gpu_time_ms + stats.upways_time_ms + stats.tonemap_time_ms > 0.001) ?
+         (stats.primary_gpu_time_ms + stats.upways_time_ms + stats.tonemap_time_ms) : stats.avg_frame_time_ms));
     if (currentFrameTime <= 0.001f) currentFrameTime = 0.5f;
 
     // Fast-adapting exponential moving average (alpha = 0.25) for responsive yet rock-solid, flicker-free HUD readout
@@ -548,6 +548,27 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
             } else {
                 ImGui::Text("  GPU 0 Ray Tracing:     %.3f ms", stats.primary_gpu_time_ms > 0.0 ? stats.primary_gpu_time_ms : currentFrameTime);
+                if (stats.denoiser_profiler_stats.valid || stats.upways_time_ms > 0.0005) {
+                    const auto& dp = stats.denoiser_profiler_stats;
+                    const double totMs = dp.total_pass_ms > 0.0001 ? dp.total_pass_ms : stats.upways_time_ms;
+                    if (dp.mode == "upways") {
+                        ImGui::Text("  Upways Neural + KPN:   %.3f ms", totMs);
+                        ImGui::TextDisabled("    - Pass 1 (Temporal): %.3f ms", dp.temporal_ms);
+                        ImGui::TextDisabled("    - Pass 2 (U-Net):    %.3f ms", dp.neural_guide_ms);
+                        ImGui::TextDisabled("    - Pass 3 (KPN SR):   %.3f ms", dp.upscale_resolve_ms);
+                        ImGui::TextDisabled("    - History Copy:      %.3f ms", dp.history_copy_ms);
+                    } else if (dp.mode == "gateway") {
+                        ImGui::Text("  Gateway Hybrid + SR:   %.3f ms", totMs);
+                        ImGui::TextDisabled("    - Pass 1 (Temporal): %.3f ms", dp.temporal_ms);
+                        ImGui::TextDisabled("    - Pass 2 (Quad MLP): %.3f ms", dp.neural_guide_ms);
+                        ImGui::TextDisabled("    - Pass 3a (s=2):     %.3f ms", dp.atrous_step2_ms);
+                        ImGui::TextDisabled("    - Pass 3b (s=6):     %.3f ms", dp.atrous_step6_ms);
+                        ImGui::TextDisabled("    - Pass 4 (Resolve):  %.3f ms", dp.upscale_resolve_ms);
+                        ImGui::TextDisabled("    - History Copy:      %.3f ms", dp.history_copy_ms);
+                    } else {
+                        ImGui::Text("  Denoiser / Upscaler:   %.3f ms", totMs);
+                    }
+                }
                 ImGui::Text("  ACES Filmic Tonemap:   %.3f ms", stats.tonemap_time_ms);
                 if (!stats.secondary_gpu_name.empty()) {
                     ImGui::TextDisabled("  GPU 1 (Secondary):     Standby / Offline (0.000 ms)");
@@ -616,14 +637,20 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Lighting:     Fallback Synthetic Sun (0 lights in asset)");
             }
             if (config.denoiser_mode == DenoiserMode::Upways) {
-                ImGui::Text("Denoising:    Neural Reconstruction (EXPERIMENTAL)");
+                ImGui::Text("Denoising:    Upways Neural Reconstruction (EXPERIMENTAL)");
+            } else if (config.denoiser_mode == DenoiserMode::Gateway) {
+                ImGui::Text("Denoising:    Gateway Hybrid Reconstruction");
+            } else if (config.denoiser_mode == DenoiserMode::Svgf) {
+                ImGui::Text("Denoising:    E-SVGF Spatio-Temporal Filter");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
             if (config.upscaler_mode == UpscalerMode::FSR3) {
                 ImGui::Text("Upscaling:    Temporal Upscaler (EXPERIMENTAL, %.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
-                ImGui::Text("Upscaling:    Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
+                ImGui::Text("Upscaling:    Upways Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
+            } else if (config.upscaler_mode == UpscalerMode::Gateway) {
+                ImGui::Text("Upscaling:    Gateway Hybrid Reconstruction (%.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::FSR1) {
                 ImGui::Text("Upscaling:    Spatial Upscaler (EXPERIMENTAL, %.2fx)", config.render_scale);
             }
@@ -886,6 +913,32 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Unindent();
             }
 
+            if (ImGui::Checkbox("Dielectric Delta Unrolling", &config.enable_delta_unroll)) {
+                if (config.enable_delta_unroll && config.delta_unroll == 0) {
+                    config.delta_unroll = 4;
+                } else if (!config.enable_delta_unroll) {
+                    config.delta_unroll = 0;
+                }
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Trace up to N consecutive smooth dielectric (glass/mirror) bounces inline in registers without writing back to global Wavefront queues.");
+            }
+            if (config.enable_delta_unroll) {
+                ImGui::Indent();
+                int unrollSteps = static_cast<int>(config.delta_unroll > 0 ? config.delta_unroll : 4);
+                if (ImGui::SliderInt("Unroll Depth", &unrollSteps, 1, 8, "%d Bounces")) {
+                    config.delta_unroll = static_cast<uint32_t>(std::clamp(unrollSteps, 1, 8));
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Maximum consecutive smooth dielectric reflections/refractions unrolled inline per Wavefront bounce.");
+                }
+                ImGui::Unindent();
+            }
+
             ImGui::Spacing();
             ImGui::SeparatorText("Stationary Frame Accumulation");
 
@@ -1012,18 +1065,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::PopStyleColor(3);
 
             if (sceneHeaderOpen) {
-                // Category Filter Tabs
+                // Category Filter Tabs (default to 0 = All so all scenes are visible in the selector)
                 static int sceneCategoryFilter = 0; // 0: All, 1: Showcase, 2: Research, 3: USD, 4: Custom, 5: Procedural
-                static int lastSyncedSceneIndex = -1;
-                if (lastSyncedSceneIndex != currentSceneIndex && currentSceneIndex >= 0 && currentSceneIndex < static_cast<int>(availableScenes.size())) {
-                    lastSyncedSceneIndex = currentSceneIndex;
-                    const auto& grp = availableScenes[currentSceneIndex].group;
-                    if (grp == "Showcase") sceneCategoryFilter = 1;
-                    else if (grp == "Research") sceneCategoryFilter = 2;
-                    else if (grp == "USD Scenes") sceneCategoryFilter = 3;
-                    else if (grp == "Custom") sceneCategoryFilter = 4;
-                    else if (grp == "Procedural") sceneCategoryFilter = 5;
-                }
 
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 3.0f));
                 auto drawFilterTab = [&](const char* name, int filterIdx) {
@@ -1373,19 +1416,26 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
-                "In-House ReLAX / A-SVGF"
+                "In-House ReLAX / A-SVGF",
+                "Gateway (Analytical Bilateral)",
+                "Upways (WMMA Neural + Spatiotemporal)"
             };
-            int denoiserIdx = (config.denoiser_mode == DenoiserMode::Svgf) ? 1 : 0;
+            int denoiserIdx = static_cast<int>(config.denoiser_mode);
+            if (denoiserIdx < 0 || denoiserIdx >= IM_ARRAYSIZE(denoiserModeLabels)) {
+                denoiserIdx = 0;
+            }
 
             if (ImGui::Combo("Denoiser Mode", &denoiserIdx, denoiserModeLabels, IM_ARRAYSIZE(denoiserModeLabels))) {
-                config.denoiser_mode = (denoiserIdx == 1) ? DenoiserMode::Svgf : DenoiserMode::None;
+                config.denoiser_mode = static_cast<DenoiserMode>(denoiserIdx);
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
-                                  "- In-House ReLAX / A-SVGF: Real-time spatiotemporal variance-guided wavelet filtering with edge-avoiding bilateral weights.");
+                                  "- In-House ReLAX / A-SVGF: Legacy variance-guided wavelet filter.\n"
+                                  "- Gateway: Analytical spatiotemporal + dilated A-Trous bilateral filter.\n"
+                                  "- Upways: 3-Scale Recurrent WMMA Neural U-Net + spatiotemporal A-Trous & subpixel upscaler.");
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {

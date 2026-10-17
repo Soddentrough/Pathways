@@ -403,6 +403,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << "    \"gpu_profiler_breakdown_ms\": {\n"
         << std::format("      \"primary_gpu_time_ms\": {:.3f},\n", stats.primary_gpu_time_ms)
         << std::format("      \"secondary_gpu_time_ms\": {:.3f},\n", stats.secondary_gpu_time_ms)
+        << std::format("      \"denoiser_and_upscale_time_ms\": {:.3f},\n", stats.upways_time_ms)
         << std::format("      \"tonemap_and_merge_time_ms\": {:.3f},\n", stats.tonemap_time_ms)
         << std::format("      \"pcie_transfer_time_ms\": {:.3f}\n", stats.pcie_transfer_time_ms)
         << "    },\n";
@@ -411,7 +412,24 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("{:.3f}, {:.3f}, {:.3f}, {:.3f}, {:.3f}],\n",
                        stats.denoise_pass_ms[0], stats.denoise_pass_ms[1], stats.denoise_pass_ms[2],
                        stats.denoise_pass_ms[3], stats.denoise_pass_ms[4])
-        << "    \"denoise_pass_names\": [\"fusedTemporal\", \"atrousStep1\", \"atrousStep2\", \"atrousStep3\", \"coarseRemodulate\"],\n";
+        << std::format("    \"denoise_pass_names\": [\"{}\", \"{}\", \"{}\", \"{}\", \"{}\"],\n",
+                       stats.denoise_pass_names[0], stats.denoise_pass_names[1], stats.denoise_pass_names[2],
+                       stats.denoise_pass_names[3], stats.denoise_pass_names[4]);
+
+    if (stats.denoiser_profiler_stats.valid) {
+        const auto& dp = stats.denoiser_profiler_stats;
+        out << "    \"denoiser_profiler_breakdown_ms\": {\n"
+            << std::format("      \"mode\": \"{}\",\n", dp.mode)
+            << std::format("      \"temporal_ms\": {:.3f},\n", dp.temporal_ms)
+            << std::format("      \"neural_guide_ms\": {:.3f},\n", dp.neural_guide_ms)
+            << std::format("      \"atrous_step2_ms\": {:.3f},\n", dp.atrous_step2_ms)
+            << std::format("      \"atrous_step6_ms\": {:.3f},\n", dp.atrous_step6_ms)
+            << std::format("      \"upscale_resolve_ms\": {:.3f},\n", dp.upscale_resolve_ms)
+            << std::format("      \"history_copy_ms\": {:.3f},\n", dp.history_copy_ms)
+            << std::format("      \"total_pass_ms\": {:.3f},\n", dp.total_pass_ms)
+            << std::format("      \"outer_envelope_ms\": {:.3f}\n", dp.outer_envelope_ms)
+            << "    },\n";
+    }
 
     if (stats.wavefront_stats.valid) {
         out << "    \"wavefront_profiler_breakdown\": {\n"
@@ -482,6 +500,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
              << std::format("        \"avg_fps\": {:.1f},\n", c.avg_fps)
              << std::format("        \"primary_gpu_time_ms\": {:.3f},\n", c.primary_gpu_time_ms)
              << std::format("        \"secondary_gpu_time_ms\": {:.3f},\n", c.secondary_gpu_time_ms)
+             << std::format("        \"denoiser_and_upscale_time_ms\": {:.3f},\n", c.upways_time_ms)
              << std::format("        \"tonemap_time_ms\": {:.3f},\n", c.tonemap_time_ms)
              << std::format("        \"gigarays_per_second\": {:.3f},\n", c.gigarays_per_second)
              << std::format("        \"target_frame_time_ms\": {:.2f},\n", c.target_frame_time_ms)
@@ -525,11 +544,27 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
                 out << std::format("          \"tail_megakernel_ms\": {:.3f},\n", c.pipeline_stages.tail_megakernel_ms)
                     << std::format("          \"tail_megakernel_bounce\": {},\n", c.pipeline_stages.tail_megakernel_bounce);
             }
-            out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
         } else {
-            out << std::format("          \"ray_tracing_pass_ms\": {:.3f},\n", c.pipeline_stages.ray_tracing_pass_ms)
-                << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
+            out << std::format("          \"ray_tracing_pass_ms\": {:.3f},\n", c.pipeline_stages.ray_tracing_pass_ms);
         }
+        if (c.pipeline_stages.denoiser_upscale_ms > 0.0005) {
+            out << std::format("          \"denoiser_upscale_ms\": {:.3f},\n", c.pipeline_stages.denoiser_upscale_ms)
+                << std::format("          \"denoiser_mode\": \"{}\",\n", c.pipeline_stages.denoiser_mode);
+            if (c.pipeline_stages.denoiser_mode == "upways") {
+                out << std::format("          \"upways_temporal_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[0])
+                    << std::format("          \"upways_neural_guide_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
+                    << std::format("          \"upways_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
+                    << std::format("          \"upways_history_copy_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3]);
+            } else if (c.pipeline_stages.denoiser_mode == "gateway") {
+                out << std::format("          \"gateway_temporal_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[0])
+                    << std::format("          \"gateway_neural_guide_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
+                    << std::format("          \"gateway_atrous_step2_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
+                    << std::format("          \"gateway_atrous_step6_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3])
+                    << std::format("          \"gateway_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[4])
+                    << std::format("          \"gateway_history_copy_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[5]);
+            }
+        }
+        out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
         out << "        }\n"
              << (i + 1 < stats.configurations_breakdown.size() ? "      },\n" : "      }\n");
     }

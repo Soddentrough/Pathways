@@ -149,6 +149,7 @@ public:
     // 20-query pool (10 queries x 2 frames in flight, indexed frameSlot * 10).
     // Order: fusedTemporal, atrousStep1, atrousStep2, atrousStep3, coarseRemodulate.
     [[nodiscard]] const std::array<float, NUM_PASSES>& getPassTimingsMs() const { return m_passTimingsMs; }
+    void collectQueryResults();
 
 private:
     void initPipelines();
@@ -163,7 +164,6 @@ private:
         Image* accumImage,
         Image* specularMotion
     );
-    void collectQueryResults();
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotQueriesRecorded = { false, false };
 
     VkDevice m_device = VK_NULL_HANDLE;

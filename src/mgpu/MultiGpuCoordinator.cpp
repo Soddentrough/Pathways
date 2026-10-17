@@ -152,7 +152,9 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
 
         bool enableJitter = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Upways);
+                             params.config.upscaler_mode == UpscalerMode::Gateway ||
+                             params.config.denoiser_mode == DenoiserMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Gateway);
         if (enableJitter && params.camera) {
             uint32_t phaseOffset = (params.config.mgpu_mode == MultiGpuMode::SampleParallel) ? 4 : 0;
             plan.uboSec = params.camera->getUniformData(params.frameIndex, plan.secSpp, params.activeBounces, params.flags,
@@ -182,7 +184,9 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
         bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
+                             params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Svgf);
         if (plan.tileOffsetX_sec == 2u && needGbuffers) {
             plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 12; // 4 MV + 8 NormDepth
@@ -199,7 +203,9 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     // Launch secondary GPU concurrently for current frame
     if (!params.skipRayTracing && params.mgpu) {
         glm::vec2 jitterSec(0.0f);
-        if (params.config.upscaler_mode == UpscalerMode::FSR3 || params.config.upscaler_mode == UpscalerMode::Upways) {
+        if (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+            params.config.upscaler_mode == UpscalerMode::Upways ||
+            params.config.upscaler_mode == UpscalerMode::Gateway) {
             if (!params.config.progressive_accumulation || params.cameraMovedLastFrame || inOutAccumulatedSamples <= 1) {
                 jitterSec = getHaltonJitter(params.frameIndex + 4);
             }
@@ -342,7 +348,9 @@ void MultiGpuCoordinator::recordMergePass(
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
         bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
+                             params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
+                             params.config.denoiser_mode == DenoiserMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Svgf);
         PostProcessPipeline::MergePushConstants mergePC{
             plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp,
@@ -365,10 +373,12 @@ void MultiGpuCoordinator::recordMergePass(
     mergeDep.pMemoryBarriers = &mergeBarrier;
     vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-    // Copy merged FP16 radiance into mlDiffuseImage for Upways neural reconstruction / ReLAX SVGF denoiser
+    // Copy merged FP16 radiance into mlDiffuseImage for Upways/Gateway neural reconstruction / ReLAX SVGF denoiser
     if (!params.skipRayTracing && mlDiffuseImage && frameImage && 
         (params.config.upscaler_mode == UpscalerMode::Upways ||
+         params.config.upscaler_mode == UpscalerMode::Gateway ||
          params.config.denoiser_mode == DenoiserMode::Upways ||
+         params.config.denoiser_mode == DenoiserMode::Gateway ||
          params.config.denoiser_mode == DenoiserMode::Svgf)) {
         VkImageCopy copyRegion{};
         copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };

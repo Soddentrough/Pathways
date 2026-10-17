@@ -1,0 +1,243 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gateway_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uDiffuseIn;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uSpecularIn;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uAlbedoRoughness;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uGuideParams;
+
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D uDiffuseOut;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uSpecularOut;
+
+layout(push_constant) uniform AtrousPushConstants {
+    uint renderWidth;
+    uint renderHeight;
+    uint stepSize;
+} pc;
+
+const float GAUSS3_KERNEL[3] = float[3](0.25, 0.50, 0.25);
+
+// 28x28 FP16 LDS tile preload for 3x3 Gaussian up to stepSize = 6 (border = 6, stride 29 eliminates bank conflicts)
+shared f16vec4   s_nd[28][29];
+shared f16vec4   s_diff[28][29];
+shared f16vec4   s_spec[28][29];
+shared f16vec4 s_ar[28][29];
+
+void main() {
+    ivec2 renderSize = ivec2(int(pc.renderWidth), int(pc.renderHeight));
+    int step    = int(pc.stepSize);
+    int border  = clamp(step, 1, 6);
+    int tileDim = 16 + 2 * border;
+    ivec2 wgBase = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(border);
+    uint localIdx = gl_LocalInvocationIndex;
+
+    uint totalTilePixels = uint(tileDim * tileDim);
+    for (uint idx = localIdx; idx < totalTilePixels; idx += 256u) {
+        int ly = int(idx) / tileDim;
+        int lx = int(idx) % tileDim;
+        ivec2 gp = clamp(wgBase + ivec2(lx, ly), ivec2(0), renderSize - ivec2(1));
+        s_nd[ly][lx]   = f16vec4(imageLoad(uNormalDepth, gp));
+        s_diff[ly][lx] = f16vec4(imageLoad(uDiffuseIn, gp));
+        s_spec[ly][lx] = f16vec4(imageLoad(uSpecularIn, gp));
+        s_ar[ly][lx]   = f16vec4(clamp(imageLoad(uAlbedoRoughness, gp), vec4(0.0), vec4(1.0)));
+    }
+    barrier();
+
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= renderSize.x || p.y >= renderSize.y) {
+        return;
+    }
+
+    int cx = int(gl_LocalInvocationID.x) + border;
+    int cy = int(gl_LocalInvocationID.y) + border;
+
+    vec4 diffCenter = vec4(s_diff[cy][cx]);
+    vec4 specCenter = vec4(s_spec[cy][cx]);
+    vec4 ndCenter   = vec4(s_nd[cy][cx]);
+
+    if (ndCenter.w >= GATEWAY_SKY_DEPTH) {
+        imageStore(uDiffuseOut, p, diffCenter);
+        imageStore(uSpecularOut, p, specCenter);
+        return;
+    }
+
+    vec3 nCenter   = ndCenter.xyz;
+    float zCenter  = ndCenter.w;
+    vec4 arCenter  = vec4(s_ar[cy][cx]);
+    vec3 albCenter = arCenter.rgb;
+    float rCenter  = arCenter.a;
+    vec4 guide     = imageLoad(uGuideParams, p >> 1);
+
+    float phiZ  = max(guide.r, 1e-4);
+    float phiN  = max(guide.g, 1.0);
+    float phiLD = max(guide.b, 1e-3);
+    float phiLS = max(guide.a, 1e-3);
+
+    // 1. Estimate local tangent-plane depth gradient dz/dxy in LDS with discontinuity guard
+    float zRight = float(s_nd[cy][cx + 1].w);
+    float zLeft  = float(s_nd[cy][cx - 1].w);
+    float zDown  = float(s_nd[cy + 1][cx].w);
+    float zUp    = float(s_nd[cy - 1][cx].w);
+
+    float dzdx = (abs(zRight - zCenter) < abs(zCenter - zLeft)) ? (zRight - zCenter) : (zCenter - zLeft);
+    float dzdy = (abs(zDown - zCenter) < abs(zCenter - zUp)) ? (zDown - zCenter) : (zCenter - zUp);
+    float maxSlope = 0.15 * max(zCenter, 0.1);
+    vec2 dzdxy = clamp(vec2(dzdx, dzdy), vec2(-maxSlope), vec2(maxSlope));
+
+    float varCenterD = max(diffCenter.a, 1e-4);
+    float varCenterS = max(specCenter.a, 1e-4);
+
+    // 5-tap cross variance and luminance prefilter in LDS (SVGF Section 4.2)
+    vec4 dR = vec4(s_diff[cy][cx + 1]);
+    vec4 dL = vec4(s_diff[cy][cx - 1]);
+    vec4 dD = vec4(s_diff[cy + 1][cx]);
+    vec4 dU = vec4(s_diff[cy - 1][cx]);
+
+    vec4 sR = vec4(s_spec[cy][cx + 1]);
+    vec4 sL = vec4(s_spec[cy][cx - 1]);
+    vec4 sD = vec4(s_spec[cy + 1][cx]);
+    vec4 sU = vec4(s_spec[cy - 1][cx]);
+
+    float nbrVarD = 0.25 * (max(dR.a, 1e-4) + max(dL.a, 1e-4) + max(dD.a, 1e-4) + max(dU.a, 1e-4));
+    float nbrVarS = 0.25 * (max(sR.a, 1e-4) + max(sL.a, 1e-4) + max(sD.a, 1e-4) + max(sU.a, 1e-4));
+    float lumCenterD = gatewayLuminance(diffCenter.rgb);
+    float nbrLumD = 0.25 * (
+        gatewayLuminance(dR.rgb) +
+        gatewayLuminance(dL.rgb) +
+        gatewayLuminance(dD.rgb) +
+        gatewayLuminance(dU.rgb)
+    );
+    float refLumD = 0.5 * (lumCenterD + nbrLumD);
+
+    float lumCenterS = gatewayLuminance(specCenter.rgb);
+    float nbrLumS = 0.25 * (
+        gatewayLuminance(sR.rgb) +
+        gatewayLuminance(sL.rgb) +
+        gatewayLuminance(sD.rgb) +
+        gatewayLuminance(sU.rgb)
+    );
+    float refLumS = 0.5 * (lumCenterS + nbrLumS);
+
+    float trueVarD = max(max(varCenterD, nbrVarD) - 1e-4, 0.0);
+    float trueVarS = max(max(varCenterS, nbrVarS) - 1e-4, 0.0);
+    float stdD     = sqrt(trueVarD);
+    bool isMirrorGlass = (rCenter < 0.05);
+    float stdS     = isMirrorGlass
+        ? max(sqrt(trueVarS), abs(lumCenterS - nbrLumS))
+        : sqrt(trueVarS);
+
+    float relNoiseD   = stdD / max(refLumD, 0.05);
+    float relNoiseS   = stdS / max(refLumS, 0.05);
+    float filterGateD = smoothstep(0.005, 0.04, relNoiseD);
+    float filterGateS = isMirrorGlass
+        ? smoothstep(0.002, 0.02, relNoiseS)
+        : smoothstep(0.005, 0.04, relNoiseS);
+
+    // 2. 3x3 Dilated Gaussian Wavelet Filter in LDS (s = 2, 6 + Pass 4 s = 1 -> 19x19 hole-free receptive field)
+    float wCenterG = GAUSS3_KERNEL[1] * GAUSS3_KERNEL[1];
+
+    vec3 sumDiff    = wCenterG * diffCenter.rgb;
+    float sumWDiff  = wCenterG;
+    float sumWVarD  = wCenterG * varCenterD;
+
+    vec3 sumSpec    = wCenterG * specCenter.rgb;
+    float sumWSpec  = wCenterG;
+    float sumWVarS  = wCenterG * varCenterS;
+
+    float specRadiusScale = clamp(sqrt(max(rCenter, 0.04)) * 1.8, 0.35, 1.0);
+
+    // Precompute loop-invariant reciprocals scaled by log2(e) for single-instruction hardware exp2()
+    const float LOG2_E = 1.44269504;
+    float invDenomZLog2  = LOG2_E / max(phiZ * max(zCenter, 0.1), 1e-4);
+    float scaleD         = max(phiLD * stdD, filterGateD * (0.35 * refLumD + 0.04) + 1e-4);
+    float invDenomLDLog2 = LOG2_E / scaleD;
+    float phiNS          = phiN * (isMirrorGlass ? 1.5 : 2.5);
+    const float invRoughSigmaLog2 = LOG2_E / 0.08;
+    const float invAlbSigmaLog2   = LOG2_E / 0.06;
+
+    if (filterGateD > 1e-4 || filterGateS > 1e-4) {
+        for (int ky = -1; ky <= 1; ++ky) {
+            for (int kx = -1; kx <= 1; ++kx) {
+                if (kx == 0 && ky == 0) {
+                    continue;
+                }
+                ivec2 offsetPx = ivec2(kx * step, ky * step);
+                ivec2 q        = p + offsetPx;
+                if (q.x < 0 || q.y < 0 || q.x >= renderSize.x || q.y >= renderSize.y) {
+                    continue;
+                }
+
+                int nx = cx + kx * step;
+                int ny = cy + ky * step;
+                vec4 ndQ = vec4(s_nd[ny][nx]);
+                if (ndQ.w >= GATEWAY_SKY_DEPTH) {
+                    continue;
+                }
+
+                float cosTheta = clamp(dot(nCenter, ndQ.xyz), 0.0, 1.0);
+                if (cosTheta <= 0.0) {
+                    continue;
+                }
+
+                float kW        = GAUSS3_KERNEL[kx + 1] * GAUSS3_KERNEL[ky + 1];
+                float expectedZ = zCenter + dot(dzdxy, vec2(offsetPx));
+                float wZ        = exp2(-abs(expectedZ - ndQ.w) * invDenomZLog2);
+                float log2Cos   = log2(cosTheta);
+                float wN        = exp2(phiN * log2Cos);
+                float wGeom     = wZ * wN;
+
+                if (wGeom > 1e-5) {
+                    vec4 diffQ   = vec4(s_diff[ny][nx]);
+                    float lumQ   = gatewayLuminance(diffQ.rgb);
+                    float varQD  = max(diffQ.a, 1e-4);
+                    float wLD    = exp2(-abs(refLumD - lumQ) * invDenomLDLog2);
+
+                    float wD = kW * wGeom * wLD * filterGateD;
+                    sumDiff   += wD * sanitizeVec3(diffQ.rgb);
+                    sumWDiff  += wD;
+                    sumWVarD  += wD * varQD;
+
+                    vec4 arQ     = vec4(s_ar[ny][nx]);
+                    float rQ     = arQ.a;
+                    float wR     = exp2(-abs(rCenter - rQ) * invRoughSigmaLog2);
+                    float wAlbS  = isMirrorGlass ? 1.0 : exp2(-length(albCenter - arQ.rgb) * invAlbSigmaLog2);
+                    float wNS    = exp2(phiNS * log2Cos);
+                    vec4 specQ   = vec4(s_spec[ny][nx]);
+                    float lumSQ  = gatewayLuminance(specQ.rgb);
+                    float varQS  = max(specQ.a, 1e-4);
+                    float minLumS = min(refLumS, lumSQ);
+                    float maxLumS = max(refLumS, lumSQ);
+                    bool isHdrEdge = (maxLumS > 2.5);
+                    float effStdS = isHdrEdge ? min(stdS, 1.25 * minLumS + 0.15) : stdS;
+                    float scaleS  = isHdrEdge
+                        ? max(phiLS * effStdS, filterGateS * (0.35 * minLumS + 0.05) + 1e-4)
+                        : max(phiLS * effStdS, (isMirrorGlass ? (0.60 * maxLumS + 0.15) : (filterGateS * 0.25 * maxLumS)) + 1e-4);
+                    float wLS     = exp2(-abs(refLumS - lumSQ) * (LOG2_E / scaleS));
+                    float tapSpecScale = (isHdrEdge || !isMirrorGlass) ? specRadiusScale : 1.0;
+
+                    float wS = kW * wZ * wNS * wR * wAlbS * wLS * tapSpecScale * filterGateS;
+                    sumSpec   += wS * sanitizeVec3(specQ.rgb);
+                    sumWSpec  += wS;
+                    sumWVarS  += wS * varQS;
+                }
+            }
+        }
+    }
+
+    float invWD   = 1.0 / max(sumWDiff, 1e-6);
+    vec3 outDiff  = sumDiff * invWD;
+    float outVarD = 0.5 * sumWVarD * invWD;
+
+    float invWS   = 1.0 / max(sumWSpec, 1e-6);
+    vec3 outSpec  = sumSpec * invWS;
+    float outVarS = 0.5 * sumWVarS * invWS;
+
+    imageStore(uDiffuseOut, p, vec4(sanitizeVec3(outDiff), sanitizeFloat(outVarD)));
+    imageStore(uSpecularOut, p, vec4(sanitizeVec3(outSpec), sanitizeFloat(outVarS)));
+}

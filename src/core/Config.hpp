@@ -48,8 +48,9 @@ enum class SecondarySortMode {
 enum class DenoiserMode {
     None,     // Raw stochastic path traced output (unfiltered progressive)
     Upways,   // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    Svgf      // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
-            //         (docs/design/adaptive_svgf_denoiser_proposal.md)
+    Svgf,     // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
+              //         (docs/design/adaptive_svgf_denoiser_proposal.md)
+    Gateway   // Gateway 4-pass E-SVGF + 2x2 Quad WMMA Guide & Continuous Upscaler
 };
 
 // EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
@@ -58,10 +59,11 @@ enum class DenoiserMode {
 // NOTE: the 'FSR3'/'FSR1' passes are Pathways-authored custom filters, NOT the official AMD
 // FidelityFX SDK techniques (see docs/reports/codebase_review_2026_10_07.md findings A3/A5).
 enum class UpscalerMode {
-    None,   // Native resolution or direct linear blit [Default]
-    FSR3,   // EXPERIMENTAL: custom temporal upscaler (hidden)
-    Upways, // EXPERIMENTAL: neural denoiser/SR via Wave32 WMMA (hidden)
-    FSR1    // EXPERIMENTAL: custom spatial upscaler (hidden)
+    None,    // Native resolution or direct linear blit [Default]
+    FSR3,    // EXPERIMENTAL: custom temporal upscaler (hidden)
+    Upways,  // EXPERIMENTAL: neural denoiser/SR via Wave32 WMMA (hidden)
+    FSR1,    // EXPERIMENTAL: custom spatial upscaler (hidden)
+    Gateway  // EXPERIMENTAL: Gateway 4-pass E-SVGF + WMMA Guide SR
 };
 
 // Post-mortem visualization overlays written directly over the output image
@@ -108,7 +110,7 @@ struct Config {
     float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
     bool enable_tail_megakernel = false;      // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: false, opt-in via --tail-megakernel]
     uint32_t tail_megakernel_bounce = 2;      // Bounce at which to switch from Wavefront to Tail Megakernel (default: 2)
-    uint32_t delta_unroll = 0;                // Max delta-chain unroll depth for smooth dielectrics [Default: 0 = Pure Wavefront]
+    uint32_t delta_unroll = 4;                // Max delta-chain unroll depth for smooth dielectrics [Default: 4, 0 = Pure Wavefront]
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -128,14 +130,14 @@ struct Config {
 
     uint32_t getRenderWidth() const {
         if (render_width > 0) return render_width;
-        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
             return std::max(1u, static_cast<uint32_t>(std::round(width * render_scale)));
         }
         return width;
     }
     uint32_t getRenderHeight() const {
         if (render_height > 0) return render_height;
-        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
             return std::max(1u, static_cast<uint32_t>(std::round(height * render_scale)));
         }
         return height;
@@ -168,18 +170,20 @@ struct Config {
     bool transparent_shadows = false; // --transparent-shadows: dielectrics don't occlude NEE (biased fast mode, UBO bit 26)
     uint32_t rng_seed = 0;         // --seed: RNG frame-counter offset (seed << 20) for independent runs
     bool enable_light_tree = true;       // Hierarchical Light Tree importance sampling for many-light scenes [Default: true]
-    bool enable_delta_unroll = false;    // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: false]
-    uint32_t max_delta_events = 2;       // Maximum internal delta events to unroll per dielectric vertex (default: 2)
+    bool enable_delta_unroll = true;     // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: true]
+    uint32_t max_delta_events = 4;       // Maximum internal delta events to unroll per dielectric vertex (default: 4)
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)
     // Denoiser Defaults & Rationale:
     // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None).
     // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise
     // with zero motion trails during interactive navigation, and seamless progressive convergence (up to 2048 spp)
-    // when stationary. Real-time reconstruction is provided via Upways or FSR 3.1.
+    // when stationary. Real-time reconstruction is provided via Upways, Gateway, or FSR 3.1.
     DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
     bool upways_superres = false;         // Upways 2x Continuous Super-Resolution (e.g. 1080p -> 4K)
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
+    bool gateway_superres = false;        // Gateway Continuous Super-Resolution (e.g. 1080p -> 4K)
+    std::string gateway_weights_path = ""; // Custom path to gateway_weights.bin
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]
     float upscaler_sharpness = 0.0f;                 // RCAS contrast-adaptive sharpness [0.0 - 1.0] (default: 0.0)

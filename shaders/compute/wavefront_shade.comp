@@ -219,10 +219,10 @@ void main() {
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
                 } else {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), 0.0));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
                 }
             }
             // Ray terminates here (survivesToNext remains false)
@@ -315,10 +315,10 @@ void main() {
                     if (pc.captureMlData != 0u) {
                         if (isSpecularPath) {
                             vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                            imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), 0.0));
+                            imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
                         } else {
                             vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                            imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), 0.0));
+                            imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), prevDiff.a));
                         }
                     }
                 }
@@ -404,7 +404,7 @@ void main() {
                                 causticApplied = true;
                                 if (pc.captureMlData != 0u) {
                                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                                    imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), 0.0));
+                                    imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), prevDiff.a));
                                 }
                             }
                         }
@@ -579,12 +579,12 @@ void main() {
                                              if (pc.captureMlData != 0u) {
                                                  if (isSpecularPath) {
                                                      vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, unshadowed, seed), 0.0));
+                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, unshadowed, seed), prevSpec.a));
                                                  } else {
                                                      vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffUnshadowed, seed), 0.0));
+                                                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffUnshadowed, seed), prevDiff.a));
                                                      vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specUnshadowed, seed), 0.0));
+                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specUnshadowed, seed), prevSpec.a));
                                                  }
                                              }
                                          }

@@ -96,7 +96,10 @@ std::string SceneManager::resolveScenePath(const std::string& inputPath) const {
         inputPath == "procedural:cyber_city" || inputPath == "Procedural Cyber City" ||
         inputPath == "infinity-mirror" || inputPath == "procedural:infinity-mirror" ||
         inputPath == "infinity_mirror" || inputPath == "procedural:infinity_mirror" ||
-        inputPath == "Infinity Mirror" || inputPath == "Procedural Infinity Mirror") {
+        inputPath == "Infinity Mirror" || inputPath == "Procedural Infinity Mirror" ||
+        inputPath == "mineshaft" || inputPath == "procedural:mineshaft" ||
+        inputPath == "Mineshaft" || inputPath == "Mineshaft Coaster" ||
+        inputPath.rfind("mineshaft-", 0) == 0 || inputPath.rfind("procedural:mineshaft-", 0) == 0) {
         return inputPath;
     }
 
@@ -196,6 +199,12 @@ std::string SceneManager::getActiveSceneName(const std::string& fallbackPath) co
     if (fallbackPath == "infinity-mirror" || fallbackPath == "infinity_mirror" || fallbackPath == "procedural:infinity-mirror" || fallbackPath == "procedural:infinity_mirror" || fallbackPath == "Infinity Mirror" || fallbackPath == "Procedural Infinity Mirror") {
         return "Infinity Mirror";
     }
+    if (fallbackPath == "mineshaft" || fallbackPath == "procedural:mineshaft" || fallbackPath == "Mineshaft" || fallbackPath == "Mineshaft Coaster") {
+        return "Mineshaft Coaster";
+    }
+    if (fallbackPath.rfind("mineshaft-", 0) == 0 || fallbackPath.rfind("procedural:mineshaft-", 0) == 0) {
+        return "Mineshaft Model Showcase";
+    }
     std::filesystem::path p(fallbackPath);
     return SceneRegistry::formatSceneName(p.stem().string());
 }
@@ -213,6 +222,17 @@ SceneData SceneManager::loadRawSceneData(const std::string& filepath, const UsdL
     } else if (filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "Procedural Infinity Mirror" || filepath == "Infinity Mirror") {
         Logger::info("Loading Infinity Mirror Corridor...");
         return ProceduralScene::createInfinityMirrorScene();
+    } else if (filepath == "procedural:mineshaft" || filepath == "mineshaft" || filepath == "Mineshaft" || filepath == "Mineshaft Coaster") {
+        Logger::info("Loading Procedural Mineshaft Coaster...");
+        return ProceduralScene::createMineshaftScene();
+    } else if (filepath.rfind("mineshaft-", 0) == 0) {
+        std::string modelName = filepath.substr(10);
+        Logger::info("Loading Mineshaft Model Showcase: '{}'...", modelName);
+        return ProceduralScene::createMineshaftModelShowcase(modelName);
+    } else if (filepath.rfind("procedural:mineshaft-", 0) == 0) {
+        std::string modelName = filepath.substr(21);
+        Logger::info("Loading Mineshaft Model Showcase: '{}'...", modelName);
+        return ProceduralScene::createMineshaftModelShowcase(modelName);
     } else {
         Logger::info("Loading user specified scene: {}", filepath);
         if (UsdLoader::isUsdFile(filepath)) {
@@ -247,6 +267,8 @@ void SceneManager::requestSceneChange(const std::string& filepath, const Config&
             prettyName = "Cyber City";
         } else if (filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "Procedural Infinity Mirror" || filepath == "Infinity Mirror") {
             prettyName = "Infinity Mirror";
+        } else if (filepath == "procedural:mineshaft" || filepath == "mineshaft" || filepath == "Mineshaft" || filepath == "Mineshaft Coaster") {
+            prettyName = "Mineshaft Coaster";
         } else {
             prettyName = SceneRegistry::formatSceneName(stem);
         }
@@ -467,7 +489,8 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
         m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
-    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size(),
+                                          sizeof(LightTreeNodeGPU) * std::max<size_t>(1, 2 * m_sceneData.lights.size()));
     m_lightTreeBuffer = std::make_unique<Buffer>(
         m_allocator, lightTreeSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -476,6 +499,25 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     );
     if (!m_sceneData.lightTreeNodes.empty()) {
         m_lightTreeBuffer->copyFrom(m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size());
+    }
+}
+
+void SceneManager::updateDynamicLights(SceneData& sceneData) {
+    if (sceneData.lights.empty() || !m_lightBuffer) return;
+    buildLightAliasTable(sceneData.lights);
+    buildLightTree(sceneData.lights, sceneData.lightTreeNodes);
+    computeLightTreePaths(sceneData.lightTreeNodes, sceneData.lights);
+    m_numLights = static_cast<uint32_t>(sceneData.lights.size());
+
+    VkDeviceSize lightBytes = sizeof(LightGPU) * sceneData.lights.size();
+    if (lightBytes <= m_lightBuffer->getSize()) {
+        m_lightBuffer->copyFrom(sceneData.lights.data(), lightBytes);
+    }
+    if (m_lightTreeBuffer && !sceneData.lightTreeNodes.empty()) {
+        VkDeviceSize treeBytes = sizeof(LightTreeNodeGPU) * sceneData.lightTreeNodes.size();
+        if (treeBytes <= m_lightTreeBuffer->getSize()) {
+            m_lightTreeBuffer->copyFrom(sceneData.lightTreeNodes.data(), treeBytes);
+        }
     }
 }
 

@@ -236,7 +236,7 @@ void main() {
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -294,7 +294,7 @@ void main() {
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
                 if (pc.captureMlData != 0u) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), 0.0));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
                 }
             }
 
@@ -387,110 +387,6 @@ void main() {
                     }
                 }
 
-                bool entersMedium = frontFace && !isThinWalled && (!cannotRefract && rFlip >= reflectProb);
-
-                // Delta-Chain Unrolling: Collapse internal volume transmission and exit interface
-                // Loops through up to 4 consecutive dielectric interfaces of the same smooth dielectric mesh
-                // on-chip without incrementing global bounce counters, preserving ray budget for indirect diffuse GI.
-                if (bounce == 0u && entersMedium && pc.useHardwareRT == 1u && (ubo.flags & (1u << 11)) != 0u) {
-                    vec3 curOrigin = nextOrigin;
-                    vec3 curDir = nextDirection;
-                    bool inGlass = true;
-
-                    for (uint deltaIter = 0u; deltaIter < 4u; ++deltaIter) {
-                        rayQueryEXT rq;
-                        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, curOrigin, EPSILON, curDir, 10000.0);
-                        rayQueryProceedEXT(rq);
-
-                        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-                            // Escaped mesh boundary directly to sky/environment
-                            vec3 skyColor;
-                            if (pc.hasEnvMap == 1u) {
-                                vec2 envUv = directionToEquirectangular(curDir);
-                                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
-                            } else {
-                                float t = 0.5 * (curDir.y + 1.0);
-                                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
-                            }
-                            vec3 skyContrib = throughput * skyColor;
-                            if (bounce > 0u) {
-                                skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
-                            }
-                            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
-                            if (pc.captureMlData != 0u) {
-                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
-                            }
-                            pathTerminated = true;
-                            break;
-                        }
-
-                        // Committed hit on internal/external mesh boundary
-                        float intHitT = rayQueryGetIntersectionTEXT(rq, true);
-                        uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-                        uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
-                        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-                        InstanceGPU inst = instances[instIdx];
-                        uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
-                        uint hitMatId = triangles[triIdx].materialId + inst.materialOffset;
-                        uint arch = (hitMatId < pc.numMaterials) ? materialArchetypes[hitMatId] : 2u;
-
-                        // Only continue unrolling while interacting with the SAME dielectric material
-                        if (hitMatId != matId || arch != 2u) {
-                            // Hit an opaque or foreign object outside the dielectric mesh.
-                            // Hand off to the regular wavefront bounce queue!
-                            nextOrigin = curOrigin;
-                            nextDirection = curDir;
-                            break;
-                        }
-
-                        // If traveling inside medium, apply volumetric Beer-Lambert absorption
-                        if (inGlass) {
-                            vec4 atten = mat.attenuationColor;
-                            if (isWater && atten.w <= 0.0) {
-                                atten = vec4(0.3, 0.7, 0.9, 4.0);
-                            }
-                            if (atten.w > 0.0 && intHitT > 0.0) {
-                                vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
-                                throughput *= exp(-sigma_a * intHitT);
-                            }
-                        }
-
-                        Triangle exitTri = triangles[triIdx];
-                        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-                        mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-                        vec3 localNorm = getTriangleNormal(exitTri, bary);
-                        vec3 intNormal = normalize(transpose(mat3(w2o)) * localNorm);
-
-                        bool faceFront = dot(curDir, intNormal) < 0.0;
-                        vec3 orientedNormal = faceFront ? intNormal : -intNormal;
-                        vec3 intHitPoint = curOrigin + intHitT * curDir;
-
-                        float curEta = inGlass ? iorVal : (1.0 / iorVal);
-                        float cosTh = clamp(dot(-curDir, orientedNormal), 0.0, 1.0);
-                        float sinTh = sqrt(max(0.0, 1.0 - cosTh * cosTh));
-                        bool cantRefract = (curEta * sinTh > 1.0);
-                        float reflProb = cantRefract ? 1.0 : fresnelDielectric(cosTh, curEta);
-
-                        float rStep = randFloat(seed);
-                        if (cantRefract || rStep < reflProb) {
-                            // Total Internal Reflection (TIR) or Fresnel reflection
-                            curDir = reflect(curDir, orientedNormal);
-                            curOrigin = intHitPoint + orientedNormal * 0.0005;
-                        } else {
-                            // Refract through interface
-                            curDir = normalize(refract(curDir, orientedNormal, curEta));
-                            curOrigin = intHitPoint - orientedNormal * 0.0005;
-                            inGlass = !inGlass;
-                        }
-
-                        nextDirection = curDir;
-                        nextOrigin = curOrigin;
-                    }
-                }
-
                 if (bounce + 1u >= pc.maxBounces) {
                     pathTerminated = true;
                 } else {
@@ -506,15 +402,15 @@ void main() {
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                         nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
 
-                        // Delta-Chain Unrolling: Unroll consecutive smooth dielectric events on-chip
-                        if (pc.deltaUnroll > 0u && pc.useHardwareRT == 1u && (bounce + 1u < pc.maxBounces)) {
+                        // Delta-Chain Unrolling: Collapse consecutive smooth dielectric events on-chip
+                        // without consuming global Wavefront bounce passes, preserving bounce budget for scene lighting.
+                        if (pc.deltaUnroll > 1u && pc.useHardwareRT == 1u && !isThinWalled && (bounce + 1u < pc.maxBounces)) {
                             uint maxDelta = pc.deltaUnroll;
                             vec3 currOrigin = nextOrigin;
                             vec3 currDirection = nextDirection;
-                            uint currBounce = bounce + 1u;
                             uint deltaEvents = 1u;
 
-                            while (survivesToNext && deltaEvents < maxDelta && currBounce < pc.maxBounces) {
+                            while (survivesToNext && deltaEvents < maxDelta) {
                                 float closestT = 10000.0;
                                 int closestTri = -1;
                                 vec2 closestBary = vec2(0.0);
@@ -568,7 +464,7 @@ void main() {
                                     imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
                                     if (pc.captureMlData != 0u) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), 0.0));
+                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
                                     }
                                     survivesToNext = false;
                                     break;
@@ -677,18 +573,12 @@ void main() {
                                     }
                                 }
 
-                                currBounce++;
-                                if (currBounce >= pc.maxBounces) {
-                                    survivesToNext = false;
-                                    break;
-                                }
-
                                 float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
                                 if (!(maxThresh > 0.0)) {
                                     survivesToNext = false;
                                     break;
                                 }
-                                if (currBounce >= 2u && applyRussianRoulette(throughput, maxThresh, currBounce, seed)) {
+                                if (bounce >= 2u && applyRussianRoulette(throughput, maxThresh, bounce, seed)) {
                                     survivesToNext = false;
                                     break;
                                 }

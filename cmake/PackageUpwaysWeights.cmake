@@ -1,25 +1,24 @@
 # PackageUpwaysWeights.cmake
 # Standalone CMake script executed at build/configure time to package and embed Upways weights.
 
-if(NOT DEFINED CMAKE_CURRENT_SOURCE_DIR)
-    get_filename_component(CMAKE_CURRENT_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+if(NOT DEFINED PATHWAYS_SOURCE_DIR)
+    get_filename_component(PATHWAYS_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
 if(NOT DEFINED UPWAYS_DIR)
     if(DEFINED ENV{UPWAYS_DIR})
         set(UPWAYS_DIR "$ENV{UPWAYS_DIR}")
     else()
-        get_filename_component(UPWAYS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Upways" ABSOLUTE)
+        get_filename_component(UPWAYS_DIR "${PATHWAYS_SOURCE_DIR}/../Upways" ABSOLUTE)
     endif()
 endif()
 
-set(UPWAYS_PRODUCTION_BIN "${UPWAYS_DIR}/checkpoints/upways_kpn_production/vulkan_export/upways_kpn_weights.bin")
-set(UPWAYS_PRODUCTION_HPP "${UPWAYS_DIR}/checkpoints/upways_kpn_production/vulkan_export/upways_kpn_weights.hpp")
+set(UPWAYS_PRODUCTION_BIN "${UPWAYS_DIR}/data/models/upways_weights.bin")
 
-set(PATHWAYS_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data/models")
+set(PATHWAYS_MODEL_DIR "${PATHWAYS_SOURCE_DIR}/data/models")
 set(PATHWAYS_MODEL_BIN "${PATHWAYS_MODEL_DIR}/upways_weights.bin")
-set(PATHWAYS_WEIGHTS_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_weights.hpp")
-set(PATHWAYS_DEFAULT_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_weights.hpp")
+set(PATHWAYS_WEIGHTS_HPP "${PATHWAYS_SOURCE_DIR}/src/rt/upways_weights.hpp")
+set(PATHWAYS_DEFAULT_HPP "${PATHWAYS_SOURCE_DIR}/src/rt/upways_default_weights.hpp")
 
 # Function to generate upways_default_weights.hpp directly from upways_weights.bin
 function(generate_embedded_weights bin_file out_header)
@@ -27,6 +26,7 @@ function(generate_embedded_weights bin_file out_header)
         return()
     endif()
 
+    file(SHA256 "${bin_file}" BIN_SHA256)
     file(READ "${bin_file}" HEX_DATA HEX)
     string(LENGTH "${HEX_DATA}" HEX_LEN)
     math(EXPR BYTE_COUNT "${HEX_LEN} / 2")
@@ -39,6 +39,7 @@ function(generate_embedded_weights bin_file out_header)
 
 // Auto-generated embedded default neural reconstructor weights
 // Generated from data/models/upways_weights.bin by CMake build process
+// Source SHA256: ${BIN_SHA256}
 #include <cstdint>
 #include <cstddef>
 
@@ -52,36 +53,42 @@ inline constexpr uint8_t DEFAULT_UPWAYS_WEIGHTS[] = {
 
 } // namespace upways
 ")
-    message(STATUS "UpwaysPackaging: Embedded ${BYTE_COUNT} bytes into ${out_header}")
+    message(STATUS "UpwaysPackaging: Embedded ${BYTE_COUNT} bytes (SHA256: ${BIN_SHA256}) into ${out_header}")
 endfunction()
 
-# 1. Check if upstream Upways has newer production weights to ingest
+# 1. Check if upstream Upways has updated production weights to ingest
 if(EXISTS "${UPWAYS_PRODUCTION_BIN}")
     set(NEEDS_SYNC FALSE)
     if(NOT EXISTS "${PATHWAYS_MODEL_BIN}")
         set(NEEDS_SYNC TRUE)
-    elseif("${UPWAYS_PRODUCTION_BIN}" IS_NEWER_THAN "${PATHWAYS_MODEL_BIN}")
-        set(NEEDS_SYNC TRUE)
+    else()
+        file(SHA256 "${UPWAYS_PRODUCTION_BIN}" UPSTREAM_SHA256)
+        file(SHA256 "${PATHWAYS_MODEL_BIN}" LOCAL_SHA256)
+        if(NOT "${UPSTREAM_SHA256}" STREQUAL "${LOCAL_SHA256}")
+            set(NEEDS_SYNC TRUE)
+        endif()
     endif()
 
     if(NEEDS_SYNC)
-        message(STATUS "UpwaysPackaging: Ingesting newer Upways weights from ${UPWAYS_PRODUCTION_BIN}")
+        message(STATUS "UpwaysPackaging: Ingesting updated Upways weights from ${UPWAYS_PRODUCTION_BIN}")
         file(MAKE_DIRECTORY "${PATHWAYS_MODEL_DIR}")
         file(COPY_FILE "${UPWAYS_PRODUCTION_BIN}" "${PATHWAYS_MODEL_BIN}")
-        if(EXISTS "${UPWAYS_PRODUCTION_HPP}")
-            file(COPY_FILE "${UPWAYS_PRODUCTION_HPP}" "${PATHWAYS_WEIGHTS_HPP}")
-        endif()
         generate_embedded_weights("${PATHWAYS_MODEL_BIN}" "${PATHWAYS_DEFAULT_HPP}")
     endif()
 endif()
 
 # 2. Always ensure upways_default_weights.hpp is synchronized with data/models/upways_weights.bin
 if(EXISTS "${PATHWAYS_MODEL_BIN}")
+    file(SHA256 "${PATHWAYS_MODEL_BIN}" LOCAL_BIN_SHA256)
     set(NEEDS_EMBED FALSE)
     if(NOT EXISTS "${PATHWAYS_DEFAULT_HPP}")
         set(NEEDS_EMBED TRUE)
-    elseif("${PATHWAYS_MODEL_BIN}" IS_NEWER_THAN "${PATHWAYS_DEFAULT_HPP}")
-        set(NEEDS_EMBED TRUE)
+    else()
+        file(READ "${PATHWAYS_DEFAULT_HPP}" DEFAULT_HPP_CONTENT)
+        string(FIND "${DEFAULT_HPP_CONTENT}" "${LOCAL_BIN_SHA256}" SHA_FOUND)
+        if(SHA_FOUND EQUAL -1)
+            set(NEEDS_EMBED TRUE)
+        endif()
     endif()
 
     if(NEEDS_EMBED)
@@ -89,3 +96,4 @@ if(EXISTS "${PATHWAYS_MODEL_BIN}")
         generate_embedded_weights("${PATHWAYS_MODEL_BIN}" "${PATHWAYS_DEFAULT_HPP}")
     endif()
 endif()
+

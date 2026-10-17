@@ -42,10 +42,27 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     VmaAllocator allocator = m_engine->m_context->getAllocator();
     uint32_t width = m_engine->m_config.width;
     uint32_t height = m_engine->m_config.height;
+    if (isReference) {
+        if (m_engine->m_config.capture_ref_width > 0 && m_engine->m_config.capture_ref_height > 0) {
+            width = std::min(m_engine->m_config.capture_ref_width, m_engine->m_config.width);
+            height = std::min(m_engine->m_config.capture_ref_height, m_engine->m_config.height);
+        }
+    } else {
+        if (m_engine->m_config.capture_input_width > 0 && m_engine->m_config.capture_input_height > 0) {
+            width = std::min(m_engine->m_config.capture_input_width, m_engine->m_config.width);
+            height = std::min(m_engine->m_config.capture_input_height, m_engine->m_config.height);
+        }
+    }
 
     if (!m_engine->m_wavefrontPipeline || !m_engine->m_accumImage || !m_engine->m_camera) {
         Logger::error("Cannot capture training frame: Wavefront pipeline, accum image, or camera is null!");
         return;
+    }
+
+    uint32_t requiredCapacity = width * height;
+    if (m_engine->m_wavefrontPipeline->getMaxCapacity() < requiredCapacity) {
+        m_engine->m_wavefrontPipeline->resize(width, height, requiredCapacity);
+        m_engine->updateWavefrontSceneDescriptors();
     }
 
     uint32_t flags = 0;
@@ -57,8 +74,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_engine->m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_engine->m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && m_engine->isRestirActive())) flags |= (1 << 7);
-    if (m_engine->isRestirActive()) flags |= (1 << 9) | (1 << 24);
+    if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && !isReference && m_engine->isRestirActive())) flags |= (1 << 7);
+    if (!isReference && m_engine->isRestirActive()) flags |= (1 << 9) | (1 << 24);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
 
@@ -196,6 +213,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
             VkBufferImageCopy copyRegion{};
+            copyRegion.bufferOffset = 0;
+            copyRegion.bufferRowLength = width;
+            copyRegion.bufferImageHeight = height;
             copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copyRegion.imageSubresource.layerCount = 1;
             copyRegion.imageExtent = { width, height, 1 };
@@ -220,22 +240,30 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         stagingAccum.invalidate();
         std::vector<uint16_t> refPayload(static_cast<size_t>(width) * height * 4);
         uint16_t sppFp16 = glm::detail::toFloat16(static_cast<float>(spp));
+        float invSpp = (spp > 0u) ? (1.0f / static_cast<float>(spp)) : 1.0f;
+
+        auto safeToFp16 = [](float val) -> uint16_t {
+            if (!std::isfinite(val)) {
+                return (val > 0.0f) ? glm::detail::toFloat16(65500.0f) : glm::detail::toFloat16(0.0f);
+            }
+            return glm::detail::toFloat16(std::clamp(val, -65500.0f, 65500.0f));
+        };
 
         if (isTargetFp16) {
             const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
             for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
-                refPayload[p * 4 + 0] = src[p * 4 + 0];
-                refPayload[p * 4 + 1] = src[p * 4 + 1];
-                refPayload[p * 4 + 2] = src[p * 4 + 2];
+                refPayload[p * 4 + 0] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 0]) * invSpp);
+                refPayload[p * 4 + 1] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 1]) * invSpp);
+                refPayload[p * 4 + 2] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 2]) * invSpp);
                 refPayload[p * 4 + 3] = sppFp16;
             }
             stagingAccum.unmap();
         } else {
             const float* src = static_cast<const float*>(stagingAccum.map());
             for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
-                refPayload[p * 4 + 0] = glm::detail::toFloat16(src[p * 4 + 0]);
-                refPayload[p * 4 + 1] = glm::detail::toFloat16(src[p * 4 + 1]);
-                refPayload[p * 4 + 2] = glm::detail::toFloat16(src[p * 4 + 2]);
+                refPayload[p * 4 + 0] = safeToFp16(src[p * 4 + 0] * invSpp);
+                refPayload[p * 4 + 1] = safeToFp16(src[p * 4 + 1] * invSpp);
+                refPayload[p * 4 + 2] = safeToFp16(src[p * 4 + 2] * invSpp);
                 refPayload[p * 4 + 3] = sppFp16;
             }
             stagingAccum.unmap();
@@ -271,8 +299,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         clearImage(cmd, m_engine->m_normalDepthImage);
 
         // 2. Set camera UBO (advances m_prevViewProj to track true velocity)
+        bool enableInputJitter = (width < m_engine->m_config.width || height < m_engine->m_config.height);
         CameraUniform ubo = m_engine->m_camera->getUniformData(frameIdx, 1, m_engine->m_config.max_bounces, flags,
-                                                     false, width, height, 0, /*updatePrev=*/true,
+                                                     enableInputJitter, width, height, 0, /*updatePrev=*/true,
                                                      m_engine->m_config.capture_halton_length);
         m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
@@ -425,11 +454,16 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
                 inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2]; // diffuse B
                 inputPayload[p * outChannels + 3]  = arPixels[p * 4 + 3];   // roughness
-                // Vector 1 (Ch 04..07): Specular Radiance RGB + Metallic
+                // Vector 1 (Ch 04..07): Specular Radiance RGB + Metallic (or 2.0 when primary emissive)
                 inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 0]; // specular R
                 inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 1]; // specular G
                 inputPayload[p * outChannels + 6]  = specPixels[p * 4 + 2]; // specular B
-                inputPayload[p * outChannels + 7]  = diffPixels[p * 4 + 3]; // metallic
+                {
+                    float isEmissive = glm::unpackHalf1x16(diffPixels[p * 4 + 3]);
+                    inputPayload[p * outChannels + 7] = (isEmissive > 0.5f)
+                        ? glm::packHalf1x16(2.0f)
+                        : specPixels[p * 4 + 3]; // metallic in [0, 1]
+                }
                 // Vector 2 (Ch 08..11): Base Color Albedo RGB + Linear Depth
                 inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 0];   // albedo R
                 inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 1];   // albedo G
@@ -444,7 +478,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 inputPayload[p * outChannels + 16] = ndPixels[p * 4 + 0];   // normal X
                 inputPayload[p * outChannels + 17] = ndPixels[p * 4 + 1];   // normal Y
                 inputPayload[p * outChannels + 18] = ndPixels[p * 4 + 2];   // normal Z
-                inputPayload[p * outChannels + 19] = smPixels[p * 4 + 2];   // specular hit distance
+                inputPayload[p * outChannels + 19] = smPixels[p * 4 + 3];   // specular hit distance (reflDist)
 
                 if (outChannels >= 23) {
                     if (resPixels) {
@@ -491,6 +525,12 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             }
         }
         stagingInput.unmap();
+
+        for (uint16_t& h : inputPayload) {
+            if ((h & 0x7C00u) == 0x7C00u) {
+                h = ((h & 0x03FFu) != 0u) ? 0x0000u : ((h & 0x8000u) ? 0xFBFFu : 0x7BFFu);
+            }
+        }
 
         glm::vec3 camPos = m_engine->m_camera ? m_engine->m_camera->getPosition() : glm::vec3(0.0f);
         float fov = m_engine->m_camera ? m_engine->m_camera->getFov() : 45.0f;
@@ -542,8 +582,10 @@ void TrainingCaptureManager::updateGamingChoreography(Camera* camera, uint32_t f
 
     constexpr float PI = 3.14159265358979323846f;
 
-    // Normalize frame progress across 240 frames
-    float normalizedFrame = (static_cast<float>(frameIdx) / static_cast<float>(totalFrames)) * 240.0f;
+    // Normalize frame progress across 240 frames (or advance at bounded 60Hz rate from active walk/strafe phase for short sequences)
+    float normalizedFrame = (totalFrames >= 120u)
+        ? ((static_cast<float>(frameIdx) / static_cast<float>(totalFrames)) * 240.0f)
+        : (15.0f + static_cast<float>(frameIdx) * 2.5f);
 
     // Landmark positions for phase continuity
     const float walkDist = 0.22f;
@@ -709,7 +751,7 @@ void TrainingCaptureManager::updateCaptureCamera(Camera* camera, uint32_t frameI
     if (totalFrames <= 1) return;
 
     constexpr float PI = 3.14159265358979323846f;
-    float t = static_cast<float>(frameIdx) / static_cast<float>(totalFrames);
+    float t = static_cast<float>(frameIdx) / static_cast<float>(std::max(totalFrames, 120u));
 
     switch (m_engine->m_config.capture_camera_mode) {
         case CaptureCameraMode::Static: {
@@ -756,8 +798,7 @@ void TrainingCaptureManager::updateCaptureCamera(Camera* camera, uint32_t frameI
             float angle = 2.0f * PI * t;
             float camY = m_choreoInitialPos.y + 0.3f * std::sin(PI * t);
             glm::vec3 orbitPos = center + glm::vec3(radius * std::sin(angle), camY - center.y, radius * std::cos(angle));
-            camera->lookAt(orbitPos, center);
-            camera->setFov(m_choreoInitialFov);
+            camera->setAnimatedPose(orbitPos, center, glm::vec3(0.0f, 1.0f, 0.0f), m_choreoInitialFov);
             break;
         }
         case CaptureCameraMode::Gaming:

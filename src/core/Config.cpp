@@ -181,6 +181,11 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
         cfg.upways_superres = true;
         cfg.denoiser_mode = DenoiserMode::Upways;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default Performance (2.0x / 1080p)
+    } else if (a == "gateway" || a == "gateway-sr" || a == "gateway_sr") {
+        cfg.upscaler_mode = UpscalerMode::Gateway;
+        cfg.gateway_superres = true;
+        cfg.denoiser_mode = DenoiserMode::Gateway;
+        if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default Performance (2.0x / 1080p)
     } else if (a == "fsr" || a == "fsr3" || a == "fsr3.1") {
         cfg.upscaler_mode = UpscalerMode::FSR3;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f; // Default Quality (1.5x)
@@ -190,12 +195,13 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
     } else if (a == "none" || a == "off" || a == "disable") {
         cfg.upscaler_mode = UpscalerMode::None;
         cfg.upways_superres = false;
+        cfg.gateway_superres = false;
         cfg.render_scale = 1.0f;
         cfg.render_width = 0;
         cfg.render_height = 0;
         return true;
     } else {
-        Logger::warn("Unknown scaler mode '{}'. Available: upways, fsr, fsr1, none", algo);
+        Logger::warn("Unknown scaler mode '{}'. Available: upways, gateway, fsr, fsr1, none", algo);
         return false;
     }
 
@@ -213,11 +219,14 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
                 cfg.render_height = 0;
                 if (scale >= 0.999f) {
                     cfg.upways_superres = false;
-                    if (cfg.upscaler_mode == UpscalerMode::Upways) {
+                    cfg.gateway_superres = false;
+                    if (cfg.upscaler_mode == UpscalerMode::Upways || cfg.upscaler_mode == UpscalerMode::Gateway) {
                         cfg.upscaler_mode = UpscalerMode::None;
                     }
                 } else if (cfg.upscaler_mode == UpscalerMode::Upways) {
                     cfg.upways_superres = true;
+                } else if (cfg.upscaler_mode == UpscalerMode::Gateway) {
+                    cfg.gateway_superres = true;
                 }
             }
         } else {
@@ -366,8 +375,8 @@ void Config::printUsage(const char* progName) {
               << "  --tail-megakernel       Enable Hybrid Wavefront-to-Megakernel transition for late bounces (eliminates per-bounce barriers/queues) [default: disabled]\n"
               << "  --tail-bounce <int>     Bounce depth to switch to Tail Megakernel (default: 2, alias: --tail-megakernel-bounce)\n"
               << "  --no-tail-megakernel    Disable Tail Megakernel (force pure wavefront across all bounces)\n"
-              << "  --delta-unroll          Enable inline rayQuery delta-chain unrolling for dielectric double-bounce (experimental) [default: disabled]\n"
-              << "  --no-delta-unroll       Disable inline rayQuery delta-chain unrolling [default]\n"
+              << "  --delta-unroll [N]      Enable inline rayQuery delta-chain unrolling for smooth dielectrics (default: enabled, N=4)\n"
+              << "  --no-delta-unroll       Disable inline rayQuery delta-chain unrolling (pure Wavefront bounces)\n"
               << "  --no-dgc-preprocess     Disable explicit DGC preprocessing and unordered flags (fallback to baseline implicit DGC)\n"
               << "  --no-dgc-batch-preprocess Disable batched DGC preprocessing (fallback to sequential stop-and-wait preprocessing)\n"
               << "  --batches <int|auto>    Number of coarse 2D batches / tiles (default: auto, 1 = monolithic, alias: --macro-tiles)\n"
@@ -835,10 +844,16 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "gateway") {
+                cfg.gateway_superres = false;
+                cfg.denoiser_mode = DenoiserMode::Gateway;
+            } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
+                cfg.gateway_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, or none.", mode);
             }
             continue;
         }
@@ -853,17 +868,24 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
+            } else if (mode == "gateway") {
+                cfg.gateway_superres = false;
+                cfg.denoiser_mode = DenoiserMode::Gateway;
+            } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
+                cfg.gateway_superres = true;
+                cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, or none.", mode);
             }
             continue;
         }
         // Consolidated Scaler / Upscaler CLI flag:
-        //   --scaler <upways|fsr|fsr1|none> [preset|WxH]
+        //   --scaler <upways|gateway|fsr|fsr1|none> [preset|WxH]
         // Examples:
         //   --res 4k --scaler upways quality
+        //   --res 4k --scaler gateway quality
         //   --res 4k --scaler fsr quality
         //   --res 4k --scaler upways 1080
         //   --res 4k --scaler fsr 1080
@@ -937,12 +959,20 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.denoiser_mode = DenoiserMode::Upways;
             continue;
         }
+        if (arg == "--gateway") {
+            cfg.denoiser_mode = DenoiserMode::Gateway;
+            continue;
+        }
         if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf" || arg == "--esvgf") {
             cfg.denoiser_mode = DenoiserMode::Svgf;
             continue;
         }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
             applyScaler(cfg, "upways");
+            continue;
+        }
+        if (arg == "--gateway-sr" || arg == "--gateway-superres") {
+            applyScaler(cfg, "gateway");
             continue;
         }
         if (arg == "--fsr" || arg == "--fsr3" || arg == "--fsr3.1") {
@@ -972,6 +1002,14 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
+            continue;
+        }
+        if (arg == "--gateway-weights" && i + 1 < argc) {
+            cfg.gateway_weights_path = argv[++i];
+            continue;
+        }
+        if (arg.starts_with("--gateway-weights=")) {
+            cfg.gateway_weights_path = arg.substr(arg.find('=') + 1);
             continue;
         }
         if (arg == "--light-tree") {
@@ -1190,7 +1228,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_delta_unroll = (cfg.delta_unroll > 0);
             continue;
         }
-        if (arg == "--no-delta-unroll") {
+        if (arg == "--no-delta-unroll" || arg == "--disable-delta-unroll") {
             cfg.enable_delta_unroll = false;
             cfg.delta_unroll = 0;
             continue;
@@ -1673,6 +1711,8 @@ Config Config::parse(int argc, char* argv[]) {
         cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
         cfg.explicit_accum_format = true;
         Logger::info("Config: --reference ground-truth mode (BSDF-only for hittable lights, NEE only for unhittable lights, no clamps, no ReSTIR, FP32 accumulation)");
+    } else if (!cfg.capture_training_data_dir.empty() && !cfg.explicit_accum_format) {
+        cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
     }
 
     if (cfg.render_width > 0 && cfg.render_height > 0) {
@@ -1681,11 +1721,17 @@ Config Config::parse(int argc, char* argv[]) {
             if (cfg.denoiser_mode == DenoiserMode::Upways && cfg.upscaler_mode == UpscalerMode::None) {
                 cfg.upways_superres = true;
                 cfg.upscaler_mode = UpscalerMode::Upways;
+            } else if (cfg.denoiser_mode == DenoiserMode::Gateway && cfg.upscaler_mode == UpscalerMode::None) {
+                cfg.gateway_superres = true;
+                cfg.upscaler_mode = UpscalerMode::Gateway;
             }
         } else {
             cfg.render_scale = 1.0f;
             if (cfg.upscaler_mode == UpscalerMode::Upways) {
                 cfg.upways_superres = false;
+                cfg.upscaler_mode = UpscalerMode::None;
+            } else if (cfg.upscaler_mode == UpscalerMode::Gateway) {
+                cfg.gateway_superres = false;
                 cfg.upscaler_mode = UpscalerMode::None;
             }
         }

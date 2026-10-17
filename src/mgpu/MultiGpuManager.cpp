@@ -1986,11 +1986,14 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.fullHeight = packet.tileHeight;
         bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
+                             m_config.upscaler_mode == UpscalerMode::Gateway ||
                              m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Gateway ||
                              m_config.denoiser_mode == DenoiserMode::Svgf ||
                              m_config.enable_restir ||
                              m_config.enable_caustics ||
                              m_config.upways_superres ||
+                             m_config.gateway_superres ||
                              !m_config.capture_training_data_dir.empty());
         wfSceneData.captureMlData = needGbuffers ? 2u : 0u;
 
@@ -2089,7 +2092,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
                              m_config.upscaler_mode == UpscalerMode::Upways ||
+                             m_config.upscaler_mode == UpscalerMode::Gateway ||
                              m_config.denoiser_mode == DenoiserMode::Upways ||
+                             m_config.denoiser_mode == DenoiserMode::Gateway ||
                              m_config.denoiser_mode == DenoiserMode::Svgf);
         bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage && needGbuffers);
 

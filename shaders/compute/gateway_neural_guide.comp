@@ -1,0 +1,242 @@
+#version 460
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gateway_common.glsl"
+
+// Eight Wave32 subgroups per workgroup (256 threads), processing a 16x16 2D render pixel tile (32 pixels per Wave32 subgroup)
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer NeuralFeaturesInBuffer {
+    float16_t features[];
+} uNeuralFeaturesIn;
+
+// Weight buffer layout (1072 float16_t elements = 2144 bytes):
+// [0..255]:    W1_0 (16x16 row-major)
+// [256..511]:  W1_1 (16x16 row-major)
+// [512..543]:  b1   (32 elements)
+// [544..799]:  W2_0 (16x16 row-major)
+// [800..1055]: W2_1 (16x16 row-major)
+// [1056..1071]: b2  (16 elements)
+layout(std430, set = 0, binding = 1) readonly buffer WeightsBuffer {
+    float16_t weights[];
+} uWeights;
+
+layout(set = 0, binding = 2, rgba16f) uniform image2D uTemporalDiffuseInOut;
+layout(set = 0, binding = 3, rgba16f) uniform image2D uTemporalSpecularInOut;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uReprojDiffuseIn;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uReprojSpecularIn;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uHistoryDiffuseOut;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D uHistorySpecularOut;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D uGuideParamsOut;
+
+layout(std430, set = 0, binding = 9) writeonly buffer UpscaleKernelOutBuffer {
+    uvec4 kernelVec4[];
+} uUpscaleKernelOut;
+
+layout(push_constant) uniform NeuralGuidePushConstants {
+    uint renderWidth;
+    uint renderHeight;
+    uint resetHistory;
+    float minAlphaDiffuse;
+    float minAlphaSpecular;
+    float basePhiDepth;
+    float basePhiNormal;
+    float basePhiLumaDiffuse;
+    float basePhiLumaSpecular;
+} pc;
+
+// Per-subgroup scratch buffer (8 subgroups x 576 float16_t = 9.2 KB LDS -> 100% WGP wave occupancy; stride 18 eliminates 8-way bank conflicts)
+shared float16_t s_scratch[8][576];
+
+float16_t leakyRelu16(float16_t x) {
+    return (x > float16_t(0.0)) ? x : (x * float16_t(0.1));
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x; // 0..31 within Wave32 subgroup
+    uint sg   = gl_LocalInvocationID.y; // 0..7 subgroup within workgroup
+    uint qW   = (pc.renderWidth + 1u) >> 1u;
+    uint qH   = (pc.renderHeight + 1u) >> 1u;
+    uint numGroupsX = (qW + 15u) >> 4u;
+    uint wgIdx      = gl_WorkGroupID.y * numGroupsX + gl_WorkGroupID.x;
+    uint sgFeatBase = (wgIdx * 256u + sg * 32u) * 16u;
+    uint col        = lane & 15u;
+
+    // 1. Direct hardware coopMatLoad of two 16x16 quad tiles (32 quads = 128 pixels per Wave32 subgroup)
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matInA;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matInB;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matZero =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+    coopMatLoad(matInA, uNeuralFeaturesIn.features, sgFeatBase + 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matInB, uNeuralFeaturesIn.features, sgFeatBase + 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    // 2. Hidden Half 0 (columns 0..15): Layer 1 WMMA -> LeakyReLU -> Layer 2 WMMA partial sum
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW1_0;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW2_0;
+    coopMatLoad(matW1_0, uWeights.weights, 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matW2_0, uWeights.weights, 544u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAccA0 =
+        coopMatMulAdd(matInA, matW1_0, matZero);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAccB0 =
+        coopMatMulAdd(matInB, matW1_0, matZero);
+
+    coopMatStore(matAccA0, s_scratch[sg], 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matAccB0, s_scratch[sg], 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+
+    float16_t b0 = uWeights.weights[512u + col];
+    for (uint i = 0u; i < 16u; ++i) {
+        uint elemIdx = lane + i * 32u;
+        s_scratch[sg][elemIdx] = leakyRelu16(s_scratch[sg][elemIdx] + b0);
+    }
+    subgroupMemoryBarrierShared();
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matHA0;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matHB0;
+    coopMatLoad(matHA0, s_scratch[sg], 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matHB0, s_scratch[sg], 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matOutA =
+        coopMatMulAdd(matHA0, matW2_0, matZero);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matOutB =
+        coopMatMulAdd(matHB0, matW2_0, matZero);
+    subgroupMemoryBarrierShared();
+
+    // 3. Hidden Half 1 (columns 16..31): Layer 1 WMMA -> LeakyReLU -> Layer 2 WMMA accumulate
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW1_1;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matW2_1;
+    coopMatLoad(matW1_1, uWeights.weights, 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matW2_1, uWeights.weights, 800u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAccA1 =
+        coopMatMulAdd(matInA, matW1_1, matZero);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAccB1 =
+        coopMatMulAdd(matInB, matW1_1, matZero);
+
+    coopMatStore(matAccA1, s_scratch[sg], 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matAccB1, s_scratch[sg], 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+
+    float16_t b1 = uWeights.weights[512u + 16u + col];
+    for (uint i = 0u; i < 16u; ++i) {
+        uint elemIdx = lane + i * 32u;
+        s_scratch[sg][elemIdx] = leakyRelu16(s_scratch[sg][elemIdx] + b1);
+    }
+    subgroupMemoryBarrierShared();
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matHA1;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matHB1;
+    coopMatLoad(matHA1, s_scratch[sg], 0u,   16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matHB1, s_scratch[sg], 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+    matOutA = coopMatMulAdd(matHA1, matW2_1, matOutA);
+    matOutB = coopMatMulAdd(matHB1, matW2_1, matOutB);
+    subgroupMemoryBarrierShared();
+
+    // Store Layer 2 outputs with stride 18 (36 bytes = 9 dwords -> zero 32-bank conflicts during per-lane readback)
+    coopMatStore(matOutA, s_scratch[sg], 0u,   18u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matOutB, s_scratch[sg], 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+
+    // 4. All 32 lanes decode the 16 neural outputs for their assigned 2x2 quad in the 16x16 quad tile
+    uint localIdx = sg * 32u + lane;
+    uint lx = localIdx & 15u;
+    uint ly = localIdx >> 4u;
+    ivec2 qp = ivec2(int(gl_WorkGroupID.x * 16u + lx), int(gl_WorkGroupID.y * 16u + ly));
+
+    if (qp.x < int(qW) && qp.y < int(qH)) {
+        uint outBase = lane * 18u;
+        float rawOut[16];
+        for (uint c = 0u; c < 16u; ++c) {
+            float val = float(s_scratch[sg][outBase + c] + uWeights.weights[1056u + c]);
+            rawOut[c] = (isnan(val) || isinf(val)) ? 0.0 : val;
+        }
+
+        if ((pc.resetHistory & 1u) == 0u) {
+            float scaleAlphaD = exp(0.35 * tanh(rawOut[0]));
+            float scaleAlphaS = exp(0.35 * tanh(rawOut[1]));
+
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    ivec2 p = qp * 2 + ivec2(dx, dy);
+                    if (p.x < int(pc.renderWidth) && p.y < int(pc.renderHeight)) {
+                        vec4 curDiffVar  = imageLoad(uTemporalDiffuseInOut, p);
+                        vec4 curSpecVar  = imageLoad(uTemporalSpecularInOut, p);
+                        vec4 reprojDiffN = imageLoad(uReprojDiffuseIn, p);
+                        vec4 reprojSpecN = imageLoad(uReprojSpecularIn, p);
+
+                        float histLenD = reprojDiffN.a;
+                        float histLenS = reprojSpecN.a;
+
+                        float baseAlphaD = (histLenD <= 1.0) ? 1.0 : max(1.0 / histLenD, pc.minAlphaDiffuse);
+                        float baseAlphaS = (histLenS <= 1.0) ? 1.0 : max(1.0 / histLenS, pc.minAlphaSpecular);
+
+                        float alphaD = (histLenD <= 1.0) ? 1.0 : clamp(baseAlphaD * scaleAlphaD, 0.02, 1.0);
+                        float alphaS = (histLenS <= 1.0) ? 1.0 : clamp(baseAlphaS * scaleAlphaS, 0.04, 1.0);
+
+                        vec3 blendedDiff = mix(reprojDiffN.rgb, curDiffVar.rgb, alphaD);
+                        vec3 blendedSpec = mix(reprojSpecN.rgb, curSpecVar.rgb, alphaS);
+
+                        imageStore(uTemporalDiffuseInOut, p, vec4(blendedDiff, curDiffVar.a));
+                        imageStore(uTemporalSpecularInOut, p, vec4(blendedSpec, curSpecVar.a));
+                        imageStore(uHistoryDiffuseOut, p, vec4(blendedDiff, histLenD));
+                        imageStore(uHistorySpecularOut, p, vec4(blendedSpec, histLenS));
+                    }
+                }
+            }
+        } else if ((pc.resetHistory & 2u) == 0u) {
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    ivec2 p = qp * 2 + ivec2(dx, dy);
+                    if (p.x < int(pc.renderWidth) && p.y < int(pc.renderHeight)) {
+                        vec4 curDiffVar = imageLoad(uTemporalDiffuseInOut, p);
+                        vec4 curSpecVar = imageLoad(uTemporalSpecularInOut, p);
+                        imageStore(uHistoryDiffuseOut, p, vec4(curDiffVar.rgb, 1.0));
+                        imageStore(uHistorySpecularOut, p, vec4(curSpecVar.rgb, 1.0));
+                    }
+                }
+            }
+        }
+
+        // Adaptive edge-stopping parameters around analytical baseline (1 texel per 2x2 quad)
+        float phiZ  = pc.basePhiDepth * exp(0.5 * tanh(rawOut[2]));
+        float phiN  = pc.basePhiNormal * exp(0.5 * tanh(rawOut[3]));
+        float phiLD = pc.basePhiLumaDiffuse * exp(0.5 * tanh(rawOut[4]));
+        float phiLS = pc.basePhiLumaSpecular * exp(0.5 * tanh(rawOut[5]));
+
+        imageStore(uGuideParamsOut, qp, vec4(phiZ, phiN, phiLD, phiLS));
+
+        // Pre-exponentiate 9 subpixel 3x3 neural kernel weights + 1 detail gain parameter per 2x2 quad
+        float w0 = exp(0.30 * tanh(rawOut[6]));
+        float w1 = exp(0.30 * tanh(rawOut[7]));
+        float w2 = exp(0.30 * tanh(rawOut[8]));
+        float w3 = exp(0.30 * tanh(rawOut[9]));
+        float w4 = exp(0.30 * tanh(rawOut[10]));
+        float w5 = exp(0.30 * tanh(rawOut[11]));
+        float w6 = exp(0.30 * tanh(rawOut[12]));
+        float w7 = exp(0.30 * tanh(rawOut[13]));
+        float w8 = exp(0.30 * tanh(rawOut[14]));
+        float detailGain = 0.05 * tanh(rawOut[15]);
+
+        uint qGlobal = uint(qp.y) * qW + uint(qp.x);
+        uUpscaleKernelOut.kernelVec4[qGlobal * 2u + 0u] = uvec4(
+            packHalf2x16(vec2(w0, w1)),
+            packHalf2x16(vec2(w2, w3)),
+            packHalf2x16(vec2(w4, w5)),
+            packHalf2x16(vec2(w6, w7))
+        );
+        uUpscaleKernelOut.kernelVec4[qGlobal * 2u + 1u] = uvec4(
+            packHalf2x16(vec2(w8, detailGain)),
+            0u,
+            0u,
+            0u
+        );
+    }
+}

@@ -1,61 +1,171 @@
-#ifndef UPWAYS_COMMON_V3_GLSL
-#define UPWAYS_COMMON_V3_GLSL
+#ifndef UPWAYS_COMMON_GLSL
+#define UPWAYS_COMMON_GLSL
 
-// Upways 3.0 Ultra-Low-Latency Pure Vulkan 1.4 Neural Reconstructor
-// Target Architecture: AMD RDNA 4 (gfx1201 / Wave32 WMMA v_wmma_f32_16x16x16_f16)
+// Shared constants and physical helper functions for Upways Vulkan 1.4 shaders.
+// Synchronized 1:1 with Pathways/shaders/compute/denoise_common.glsl and upways/model.py.
 
-const float UPWAYS_MU = 16.0;
-const float UPWAYS_LOG_DENOM = 2.833213344056216; // ln(1.0 + 16.0)
+const vec3 UPWAYS_LUMA_WEIGHTS = vec3(0.2126, 0.7152, 0.0722);
+const float UPWAYS_SKY_DEPTH = 9999.0;
+const float UPWAYS_EMISSIVE_ALBEDO_SQ_EPS = 1e-5;
+const float UPWAYS_MIN_DEMOD_ALBEDO = 0.01;
+const float UPWAYS_MAX_RADIANCE = 65504.0;
 
-// Invertible log-space radiance compression: phi(x) = ln(1 + mu * x) / ln(1 + mu)
-vec3 upwaysLogTransform(vec3 x) {
-    vec3 clampedX = max(x, vec3(0.0));
-    return log(vec3(1.0) + UPWAYS_MU * clampedX) / UPWAYS_LOG_DENOM;
+float upwaysLuminance(vec3 c) {
+    return max(dot(c, UPWAYS_LUMA_WEIGHTS), 0.0);
 }
 
-float16_t upwaysLogTransformF16(float16_t x) {
-    float16_t clampedX = max(x, float16_t(0.0));
-    return log(float16_t(1.0) + float16_t(UPWAYS_MU) * clampedX) / float16_t(UPWAYS_LOG_DENOM);
+float sanitizeFloat(float v) {
+    if (isnan(v) || isinf(v)) {
+        return 0.0;
+    }
+    return clamp(v, 0.0, UPWAYS_MAX_RADIANCE);
 }
 
-// Exact inverse log-space decompression: phi^-1(y) = ((1 + mu)^y - 1) / mu
-// Clamped at 3.8 in FP16 to strictly prevent 16-bit half-precision exponential overflow (17^3.8 = 48,707 < 65,504)
-vec3 upwaysInverseLogTransform(vec3 y) {
-    vec3 clampedY = clamp(y, vec3(0.0), vec3(31.0));
-    return (pow(vec3(1.0 + UPWAYS_MU), clampedY) - vec3(1.0)) / UPWAYS_MU;
+vec3 sanitizeVec3(vec3 v) {
+    return vec3(sanitizeFloat(v.r), sanitizeFloat(v.g), sanitizeFloat(v.b));
 }
 
-float16_t upwaysInverseLogTransformF16(float16_t y) {
-    float16_t clampedY = clamp(y, float16_t(0.0), float16_t(3.8));
-    return (pow(float16_t(1.0 + UPWAYS_MU), clampedY) - float16_t(1.0)) / float16_t(UPWAYS_MU);
+// Matches denoiseDemodulationFactor in Pathways/shaders/compute/denoise_common.glsl:16-21
+vec3 denoiseDemodulationFactor(vec3 albedo, float linearDepth) {
+    if (linearDepth >= UPWAYS_SKY_DEPTH || dot(albedo, albedo) <= UPWAYS_EMISSIVE_ALBEDO_SQ_EPS) {
+        return vec3(1.0);
+    }
+    return max(albedo, vec3(UPWAYS_MIN_DEMOD_ALBEDO));
 }
 
-// Fast approximate GELU activation: 0.5 * x * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-float16_t upwaysGelu(float16_t x) {
-    const float16_t c1 = float16_t(0.79788456); // sqrt(2/pi)
-    const float16_t c2 = float16_t(0.044715);
-    float16_t x3 = x * x * x;
-    return float16_t(0.5) * x * (float16_t(1.0) + tanh(c1 * (x + c2 * x3)));
+vec3 demodulateDiffuse(vec3 diffuseRad, vec3 albedo, float linearDepth) {
+    vec3 factor = denoiseDemodulationFactor(albedo, linearDepth);
+    return sanitizeVec3(diffuseRad) / factor;
 }
 
-// Normalized sample density for variable SPP conditioning: S_norm = 1.0 / sqrt(max(SPP, 1.0))
-float upwaysComputeSnorm(float spp) {
-    return 1.0 / sqrt(max(spp, 1.0));
+vec3 remodulateDiffuse(vec3 demodIrradiance, vec3 albedo, float linearDepth) {
+    vec3 factor = denoiseDemodulationFactor(albedo, linearDepth);
+    return sanitizeVec3(demodIrradiance * factor);
 }
 
-float16_t upwaysComputeSnormF16(float16_t spp) {
-    return float16_t(1.0) / sqrt(max(spp, float16_t(1.0)));
+// Co-designed Metallic-Fresnel Specular Demodulation/Remodulation factor matching upways/data/protocol.py
+vec3 denoiseSpecularModulationFactor(
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    float nViewZ,
+    float linearDepth
+) {
+    if (linearDepth >= UPWAYS_SKY_DEPTH || metallic <= 1e-4 || dot(albedo, albedo) <= UPWAYS_EMISSIVE_ALBEDO_SQ_EPS) {
+        return vec3(1.0);
+    }
+    vec3 f0Metal = max(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.04));
+    float cosTheta = clamp(abs(nViewZ), 0.0, 1.0);
+    float oneMinusCos = 1.0 - cosTheta;
+    float oneMinusCos2 = oneMinusCos * oneMinusCos;
+    float fresnel = oneMinusCos2 * oneMinusCos2 * oneMinusCos * (1.0 - clamp(roughness, 0.0, 1.0));
+    vec3 metalMod = mix(f0Metal, vec3(1.0), 0.25 * fresnel);
+    return mix(vec3(1.0), metalMod, clamp(metallic, 0.0, 1.0));
 }
 
-// Temperature parameter for convex KPN softmax: tau = clamp(S_norm, 0.08, 1.0)
-float16_t upwaysComputeTau(float16_t s_norm) {
-    return clamp(s_norm, float16_t(0.08), float16_t(1.0));
+vec3 demodulateSpecular(
+    vec3 specularRad,
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    float nViewZ,
+    float linearDepth
+) {
+    vec3 factor = denoiseSpecularModulationFactor(albedo, metallic, roughness, nViewZ, linearDepth);
+    return sanitizeVec3(specularRad) / factor;
 }
 
-// Dielectric and Conductor Fresnel reflectance calculation
-vec3 upwaysComputeF0(vec3 albedo, float roughness, float metallic) {
-    vec3 dielectricF0 = vec3(0.04);
-    return max(mix(dielectricF0, albedo, metallic), dielectricF0);
+vec3 remodulateSpecular(
+    vec3 demodSpecular,
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    float nViewZ,
+    float linearDepth
+) {
+    vec3 factor = denoiseSpecularModulationFactor(albedo, metallic, roughness, nViewZ, linearDepth);
+    return sanitizeVec3(demodSpecular * factor);
 }
 
-#endif // UPWAYS_COMMON_V3_GLSL
+// Physical Schlick-GGX view-dependent Fresnel reflectance luminance for neural feature channel 14
+float evaluateFresnelLuminance(
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    float nViewZ,
+    float linearDepth
+) {
+    if (linearDepth >= UPWAYS_SKY_DEPTH) {
+        return 0.0;
+    }
+    vec3 f0 = mix(vec3(0.04), max(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.04)), clamp(metallic, 0.0, 1.0));
+    float cosTheta = clamp(abs(nViewZ), 0.0, 1.0);
+    float u = 1.0 - cosTheta;
+    float u2 = u * u;
+    float u5 = u2 * u2 * u;
+    vec3 fMax = max(vec3(1.0 - clamp(roughness, 0.0, 1.0)), f0);
+    vec3 fEnv = f0 + (fMax - f0) * u5;
+    return clamp(upwaysLuminance(fEnv), 0.0, 1.0);
+}
+
+float karisWeight(vec3 rad) {
+    return 1.0 / (1.0 + upwaysLuminance(rad));
+}
+
+float evaluateNormalWeight(vec3 nCenter, vec3 nTap, float phiNormal) {
+    float cosTheta = clamp(dot(nCenter, nTap), 0.0, 1.0);
+    return pow(cosTheta, max(phiNormal, 1.0));
+}
+
+float evaluateNormalWeight16(vec3 nCenter, vec3 nTap) {
+    float c  = clamp(dot(nCenter, nTap), 0.0, 1.0);
+    float c2 = c * c;
+    float c4 = c2 * c2;
+    float c8 = c4 * c4;
+    return c8 * c8;
+}
+
+float evaluateNormalWeight24(vec3 nCenter, vec3 nTap) {
+    float c  = clamp(dot(nCenter, nTap), 0.0, 1.0);
+    float c2 = c * c;
+    float c4 = c2 * c2;
+    float c8 = c4 * c4;
+    return (c8 * c8) * c8;
+}
+
+float evaluateNormalWeight32(vec3 nCenter, vec3 nTap) {
+    float c16 = evaluateNormalWeight16(nCenter, nTap);
+    return c16 * c16;
+}
+
+// Metric tangent-plane depth weight matching Pathways evaluatePlaneDepthWeight
+float evaluatePlaneDepthWeight(
+    float zCenter,
+    float zTap,
+    vec2 dzdxy,
+    vec2 offsetPx,
+    float phiDepth
+) {
+    float zExpected = zCenter + dot(dzdxy, offsetPx);
+    float absDiff = abs(zTap - zExpected);
+    float denom = max(phiDepth * max(zCenter, 0.1), 1e-4);
+    return exp(-clamp(absDiff / denom, 0.0, 20.0));
+}
+
+float evaluateRelativeDepthWeight(float zCenter, float zTap, float phiDepth) {
+    float relDiff = abs(zCenter - zTap) / max(max(zCenter, zTap), 0.1);
+    return exp(-clamp(relDiff / max(phiDepth, 1e-4), 0.0, 20.0));
+}
+
+// Soft logarithmic firefly rolloff above threshold T while preserving RGB chromaticity
+vec3 softClampLuminance(vec3 rad, float maxLum) {
+    vec3 clean = sanitizeVec3(rad);
+    float lum = upwaysLuminance(clean);
+    if (lum <= maxLum || lum <= 1e-6) {
+        return clean;
+    }
+    float compressedLum = maxLum + log(1.0 + (lum - maxLum));
+    return clean * (compressedLum / lum);
+}
+
+#endif // UPWAYS_COMMON_GLSL

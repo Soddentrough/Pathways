@@ -2,6 +2,7 @@
 
 #include "core/Config.hpp"
 #include "rt/UpwaysPipeline.hpp"
+#include "rt/GatewayPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
 #include "vulkan/Image.hpp"
 #include "vulkan/Buffer.hpp"
@@ -60,6 +61,13 @@ public:
                         Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
                         PostProcessPipeline* postProcess, Image* outputImage);
 
+    bool dispatchGateway(VkCommandBuffer cmd, bool resetHistory,
+                         const Config& config, Camera* camera,
+                         uint32_t frameIndex, bool cameraMovedLastFrame,
+                         uint32_t accumulatedSamples,
+                         Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
+                         PostProcessPipeline* postProcess, Image* outputImage);
+
     bool dispatchFsr3(VkCommandBuffer cmd, bool resetHistory,
                       const Config& config, uint32_t frameIndex,
                       bool cameraMovedLastFrame, uint32_t accumulatedSamples,
@@ -69,11 +77,13 @@ public:
                       const std::function<void()>& onDescriptorsInvalidated);
 
     [[nodiscard]] UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
+    [[nodiscard]] GatewayPipeline* getGatewayPipeline() const { return m_gatewayPipeline.get(); }
     [[nodiscard]] Fsr3Upscaler* getFsr3Upscaler() const { return m_fsr3Upscaler.get(); }
     [[nodiscard]] Image* getDisplayAlbedoImage() const { return m_displayAlbedoImage.get(); }
     [[nodiscard]] Image* getDisplayNormalsImage() const { return m_displayNormalsImage.get(); }
     [[nodiscard]] Image* getSecAccumImage() const { return m_secAccumImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapUpwaysDescSet() const { return m_tonemapUpwaysDescSet; }
+    [[nodiscard]] VkDescriptorSet getTonemapGatewayDescSet() const { return m_tonemapGatewayDescSet; }
     [[nodiscard]] VkDescriptorSet getTonemapFsr3DescSet() const { return m_tonemapFsr3DescSet; }
     [[nodiscard]] VkDescriptorPool getPostProcessDescPool() const { return m_postProcessDescPool; }
 
@@ -81,6 +91,11 @@ public:
     void destroyUpwaysPipelines();
     void createUpwaysResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd);
     void destroyUpwaysResources();
+
+    void createGatewayPipelines(const Config& config);
+    void destroyGatewayPipelines();
+    void createGatewayResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd);
+    void destroyGatewayResources();
 
     void createFsr3Pipelines(const Config& config);
     void destroyFsr3Pipelines();
@@ -98,6 +113,8 @@ private:
 
     std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
     VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    std::unique_ptr<GatewayPipeline> m_gatewayPipeline;
+    VkDescriptorSet m_tonemapGatewayDescSet = VK_NULL_HANDLE;
     std::unique_ptr<Image> m_displayAlbedoImage;
     std::unique_ptr<Image> m_displayNormalsImage;
 

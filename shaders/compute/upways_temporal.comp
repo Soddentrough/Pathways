@@ -1,0 +1,447 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "upways_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uCurrentDiffuse;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uCurrentSpecular;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uNormalDepth;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uPrevNormalDepth;
+layout(set = 0, binding = 4, rg16f)   uniform readonly image2D uMotionVectors;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uAlbedoRoughness;
+layout(set = 0, binding = 6, rgba16f) uniform readonly image2D uSpecularMotion;
+layout(set = 0, binding = 7, rgba16f) uniform readonly image2D uPrevSpecularMotion;
+layout(set = 0, binding = 8, rgba16f) uniform readonly image2D uHistoryDiffuseIn;
+layout(set = 0, binding = 9, rgba16f) uniform readonly image2D uHistorySpecularIn;
+layout(set = 0, binding = 10, rgba16f) uniform readonly image2D uHistoryMomentsIn;
+
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D uTemporalDiffuseOut;
+layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D uTemporalSpecularOut;
+layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D uReprojDiffuseOut;
+layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D uReprojSpecularOut;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D uHistoryMomentsOut;
+
+layout(std430, set = 0, binding = 16) writeonly buffer NeuralFeaturesOutBuffer {
+    uvec4 features4[];
+} uNeuralFeaturesOut;
+
+layout(push_constant) uniform TemporalPushConstants {
+    uint renderWidth;
+    uint renderHeight;
+    uint resetHistory;
+    float minAlphaDiffuse;
+    float minAlphaSpecular;
+} pc;
+
+// Compact 18x18 FP16 LDS tile preload (6.2 KB -> 100% WGP wave occupancy, zero redundant RGB LDS reads)
+shared f16vec4 s_nd[18][19];
+shared f16vec4 s_albLumD[18][19];
+shared float16_t s_lumS[18][20];
+
+void main() {
+    ivec2 renderSize = ivec2(int(pc.renderWidth), int(pc.renderHeight));
+    ivec2 wgBase = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(1, 1);
+    uint localIdx = gl_LocalInvocationIndex;
+
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 gp = clamp(p, ivec2(0), renderSize - ivec2(1));
+    int cx   = int(gl_LocalInvocationID.x) + 1;
+    int cy   = int(gl_LocalInvocationID.y) + 1;
+
+    vec4 ndCenter    = vec4(f16vec4(imageLoad(uNormalDepth, gp)));
+    vec4 arCenter    = vec4(f16vec4(clamp(imageLoad(uAlbedoRoughness, gp), vec4(0.0), vec4(1.0))));
+    vec4 rawD        = imageLoad(uCurrentDiffuse, gp);
+    vec4 rawS        = imageLoad(uCurrentSpecular, gp);
+    float isEmissive = float(float16_t(rawD.a));
+    float metallic   = float(float16_t(clamp(rawS.a, 0.0, 1.0)));
+    vec3 demodDiff   = vec3(f16vec3(demodulateDiffuse(rawD.rgb, arCenter.rgb, ndCenter.w)));
+    vec3 curSpec     = vec3(f16vec3(demodulateSpecular(rawS.rgb, arCenter.rgb, metallic, arCenter.a, ndCenter.z, ndCenter.w)));
+
+    s_nd[cy][cx]      = f16vec4(ndCenter);
+    s_albLumD[cy][cx] = f16vec4(arCenter.rgb, upwaysLuminance(demodDiff));
+    s_lumS[cy][cx]    = float16_t(upwaysLuminance(curSpec));
+
+    if (localIdx < 68u) {
+        int hx, hy;
+        if (localIdx < 18u) {
+            hy = 0;
+            hx = int(localIdx);
+        } else if (localIdx < 36u) {
+            hy = 17;
+            hx = int(localIdx - 18u);
+        } else if (localIdx < 52u) {
+            hx = 0;
+            hy = int(localIdx - 35u);
+        } else {
+            hx = 17;
+            hy = int(localIdx - 51u);
+        }
+        ivec2 hp   = clamp(wgBase + ivec2(hx, hy), ivec2(0), renderSize - ivec2(1));
+        vec4 hNd   = vec4(f16vec4(imageLoad(uNormalDepth, hp)));
+        vec4 hAr   = vec4(f16vec4(clamp(imageLoad(uAlbedoRoughness, hp), vec4(0.0), vec4(1.0))));
+        vec4 hRawD = imageLoad(uCurrentDiffuse, hp);
+        vec4 hRawS = imageLoad(uCurrentSpecular, hp);
+        float hMet = float(float16_t(clamp(hRawS.a, 0.0, 1.0)));
+        vec3 hDiff = vec3(f16vec3(demodulateDiffuse(hRawD.rgb, hAr.rgb, hNd.w)));
+        vec3 hSpec = vec3(f16vec3(demodulateSpecular(hRawS.rgb, hAr.rgb, hMet, hAr.a, hNd.z, hNd.w)));
+        s_nd[hy][hx]      = f16vec4(hNd);
+        s_albLumD[hy][hx] = f16vec4(hAr.rgb, upwaysLuminance(hDiff));
+        s_lumS[hy][hx]    = float16_t(upwaysLuminance(hSpec));
+    }
+    barrier();
+
+    if (p.x >= renderSize.x || p.y >= renderSize.y) {
+        return;
+    }
+
+    vec3 nCenter    = ndCenter.xyz;
+    float zCenter   = ndCenter.w;
+    vec3 albedo     = arCenter.rgb;
+    float roughness = arCenter.a;
+
+    // 1. Bilateral 8-Neighbor Firefly Suppression in LDS (Strictly Excluding Center Sample)
+    float sumWD = 0.0;
+    float sumWS = 0.0;
+    float m1DiffN = 0.0;
+    float m2DiffN = 0.0;
+    float m1SpecN = 0.0;
+    float m2SpecN = 0.0;
+
+    vec3 rawDemodDiff = demodDiff;
+    vec3 rawCurSpec   = curSpec;
+    bool applyFfD     = false;
+    bool applyFfS     = false;
+    float maxD        = 65504.0;
+    float maxS        = 65504.0;
+    bool isSmoothSpec = (roughness < 0.08);
+
+    if (zCenter < UPWAYS_SKY_DEPTH) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                vec4 ndQ = vec4(s_nd[cy + dy][cx + dx]);
+                if (ndQ.w >= UPWAYS_SKY_DEPTH) {
+                    continue;
+                }
+                float relZ = abs(zCenter - ndQ.w) / max(max(zCenter, ndQ.w), 0.1);
+                float wZ = exp2(-relZ * (1.44269504 / 0.08));
+                float wN = evaluateNormalWeight32(nCenter, ndQ.xyz);
+                float w  = wZ * wN;
+                if (w > 1e-4) {
+                    vec4 albLumDQ = vec4(s_albLumD[cy + dy][cx + dx]);
+                    float wAlb    = exp2(-length(albedo - albLumDQ.rgb) * (6.666667 * 1.44269504));
+                    float wS      = w * wAlb;
+                    float lumD    = albLumDQ.a;
+                    float lumS    = float(s_lumS[cy + dy][cx + dx]);
+                    sumWD   += w;
+                    m1DiffN += w * lumD;
+                    m2DiffN += w * lumD * lumD;
+                    sumWS   += wS;
+                    m1SpecN += wS * lumS;
+                    m2SpecN += wS * lumS * lumS;
+                }
+            }
+        }
+
+        if (sumWD > 1.0 && isEmissive <= 0.5) {
+            applyFfD    = true;
+            float invWD = 1.0 / sumWD;
+            float meanD = m1DiffN * invWD;
+            float stdD  = sqrt(max(m2DiffN * invWD - meanD * meanD, 0.0));
+            maxD        = max(meanD + 2.5 * stdD, 2.0 * meanD + 0.5);
+            demodDiff   = softClampLuminance(rawDemodDiff, maxD);
+        }
+        if (sumWS > 1.0 && isEmissive <= 0.5) {
+            applyFfS    = true;
+            float invWS = 1.0 / sumWS;
+            float meanS = m1SpecN * invWS;
+            float stdS  = sqrt(max(m2SpecN * invWS - meanS * meanS, 0.0));
+            float kS    = isSmoothSpec ? 3.5 : 2.5;
+            float biasS = isSmoothSpec ? 2.5 : 0.75;
+            maxS        = max(meanS + kS * stdS, kS * meanS + biasS);
+            curSpec     = softClampLuminance(rawCurSpec, maxS);
+        }
+    }
+
+    float curLumD = upwaysLuminance(demodDiff);
+    float curLumS = upwaysLuminance(curSpec);
+
+    float totalW3D = 1.0 + sumWD;
+    float mean3D   = (curLumD + m1DiffN) / totalW3D;
+    float dev3D    = curLumD - mean3D;
+    float var3D    = max((curLumD * curLumD + m2DiffN) / totalW3D - mean3D * mean3D + dev3D * dev3D, 1e-4);
+    float totalW3S = 1.0 + sumWS;
+    float mean3S   = (curLumS + m1SpecN) / totalW3S;
+    float dev3S    = curLumS - mean3S;
+    float var3S    = max((curLumS * curLumS + m2SpecN) / totalW3S - mean3S * mean3S + dev3S * dev3S, 1e-4);
+
+    // 2. Dual-Track Bilateral Temporal Reprojection
+    vec3 reprojDiff    = demodDiff;
+    vec3 reprojSpec    = curSpec;
+    float histLenDiff  = 1.0;
+    float histLenSpec  = 1.0;
+    vec2 prevMomentsD  = vec2(curLumD, curLumD * curLumD + var3D);
+    vec2 prevMomentsS  = vec2(curLumS, curLumS * curLumS + var3S);
+
+    if ((pc.resetHistory & 1u) == 0u && zCenter < UPWAYS_SKY_DEPTH) {
+        if ((pc.resetHistory & 4u) != 0u) {
+            vec4 hMom  = imageLoad(uHistoryMomentsIn, p);
+            vec4 hDiff = imageLoad(uHistoryDiffuseIn, p);
+            if (hDiff.a > 0.5) {
+                reprojDiff   = sanitizeVec3(hDiff.rgb);
+                histLenDiff  = min(hDiff.a + 1.0, 64.0);
+                prevMomentsD = hMom.rg;
+            }
+            vec4 hSpec = imageLoad(uHistorySpecularIn, p);
+            if (hSpec.a > 0.5) {
+                reprojSpec   = sanitizeVec3(hSpec.rgb);
+                histLenSpec  = min(hSpec.a + 1.0, 64.0);
+                prevMomentsS = hMom.ba;
+            }
+        } else {
+            vec2 uv      = (vec2(p) + vec2(0.5)) / vec2(renderSize);
+            vec2 mvSurf  = imageLoad(uMotionVectors, p).xy;
+            vec2 mvPx    = mvSurf * vec2(renderSize);
+            bool hasSurfMotion = (dot(mvPx, mvPx) > 0.0025);
+            vec4 specMot = vec4(0.0);
+            bool hasReflHit = false;
+            if (metallic >= 0.5 && roughness < 0.06) {
+                specMot = imageLoad(uSpecularMotion, p);
+                hasReflHit = (specMot.z > 1e-4) && (specMot.w > 1e-4) && (specMot.w < UPWAYS_SKY_DEPTH);
+            }
+            vec2 mvSpec             = hasReflHit ? specMot.xy : mvSurf;
+            vec2 mvSpecPx           = mvSpec * vec2(renderSize);
+            bool hasSpecMotion      = (dot(mvSpecPx, mvSpecPx) > 0.0025) || hasSurfMotion;
+            bool separateSpecReproj = hasReflHit && hasSpecMotion;
+
+            float wSumS = 0.0;
+            vec3 accSpec = vec3(0.0);
+            float accNS  = 0.0;
+            vec2 accMomS = vec2(0.0);
+
+            float wSumD = 0.0;
+            vec3 accDiff = vec3(0.0);
+            float accND  = 0.0;
+            vec2 accMomD = vec2(0.0);
+
+            if (!hasSurfMotion) {
+                vec4 prevND = imageLoad(uPrevNormalDepth, p);
+                if (prevND.w < UPWAYS_SKY_DEPTH) {
+                    float relZ = abs(zCenter - prevND.w) / max(max(zCenter, prevND.w), 0.1);
+                    float dotN = dot(nCenter, prevND.xyz);
+                    if (relZ < 0.15 && dotN > 0.75) {
+                        float wZ   = evaluateRelativeDepthWeight(zCenter, prevND.w, 0.05);
+                        vec4 hMom  = imageLoad(uHistoryMomentsIn, p);
+                        vec4 hDiff = imageLoad(uHistoryDiffuseIn, p);
+                        if (hDiff.a > 0.5) {
+                            float wTapD = wZ * evaluateNormalWeight16(nCenter, prevND.xyz);
+                            wSumD   = wTapD;
+                            accDiff = wTapD * sanitizeVec3(hDiff.rgb);
+                            accND   = wTapD * hDiff.a;
+                            accMomD = wTapD * hMom.rg;
+                        }
+                        if (!separateSpecReproj) {
+                            vec4 hSpec = imageLoad(uHistorySpecularIn, p);
+                            if (hSpec.a > 0.5) {
+                                float wTapS = wZ * evaluateNormalWeight24(nCenter, prevND.xyz);
+                                wSumS   = wTapS;
+                                accSpec = wTapS * sanitizeVec3(hSpec.rgb);
+                                accNS   = wTapS * hSpec.a;
+                                accMomS = wTapS * hMom.ba;
+                            }
+                        }
+                    }
+                }
+            } else {
+                vec2 prevUV = uv - mvSurf;
+                if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
+                    vec2 prevPos = vec2(p) - mvPx;
+                    ivec2 baseP  = ivec2(floor(prevPos));
+                    vec2 f       = fract(prevPos);
+
+                    for (int ty = 0; ty <= 1; ++ty) {
+                        for (int tx = 0; tx <= 1; ++tx) {
+                            float wBilin = (tx == 0 ? (1.0 - f.x) : f.x) * (ty == 0 ? (1.0 - f.y) : f.y);
+                            if (wBilin <= 1e-4) {
+                                continue;
+                            }
+                            ivec2 tapP = baseP + ivec2(tx, ty);
+                            if (tapP.x < 0 || tapP.y < 0 || tapP.x >= renderSize.x || tapP.y >= renderSize.y) {
+                                continue;
+                            }
+                            vec4 prevND = imageLoad(uPrevNormalDepth, tapP);
+                            if (prevND.w >= UPWAYS_SKY_DEPTH) {
+                                continue;
+                            }
+                            float relZ = abs(zCenter - prevND.w) / max(max(zCenter, prevND.w), 0.1);
+                            float dotN = dot(nCenter, prevND.xyz);
+                            if (relZ < 0.15 && dotN > 0.75) {
+                                float wZ   = evaluateRelativeDepthWeight(zCenter, prevND.w, 0.05);
+                                vec4 hMom  = imageLoad(uHistoryMomentsIn, tapP);
+                                vec4 hDiff = imageLoad(uHistoryDiffuseIn, tapP);
+                                if (hDiff.a > 0.5) {
+                                    float wTapD = wBilin * wZ * evaluateNormalWeight16(nCenter, prevND.xyz);
+                                    wSumD   += wTapD;
+                                    accDiff += wTapD * sanitizeVec3(hDiff.rgb);
+                                    accND   += wTapD * hDiff.a;
+                                    accMomD += wTapD * hMom.rg;
+                                }
+                                if (!separateSpecReproj) {
+                                    vec4 hSpec = imageLoad(uHistorySpecularIn, tapP);
+                                    if (hSpec.a > 0.5) {
+                                        float wTapS = wBilin * wZ * evaluateNormalWeight24(nCenter, prevND.xyz);
+                                        wSumS   += wTapS;
+                                        accSpec += wTapS * sanitizeVec3(hSpec.rgb);
+                                        accNS   += wTapS * hSpec.a;
+                                        accMomS += wTapS * hMom.ba;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (wSumD > 1e-3 && !(hasSurfMotion && isEmissive > 0.5)) {
+                float invWD    = 1.0 / wSumD;
+                vec3 rawRepD   = accDiff * invWD;
+                float sigma3D  = sqrt(var3D);
+                float maxRepD  = mean3D + 2.5 * sigma3D + 0.10;
+                reprojDiff     = (hasSurfMotion && isEmissive <= 0.5) ? softClampLuminance(rawRepD, maxRepD) : rawRepD;
+                float maxHistD = hasSurfMotion ? 10.0 : 64.0;
+                histLenDiff    = min(accND * invWD + 1.0, maxHistD);
+                prevMomentsD   = accMomD * invWD;
+            }
+
+            if (separateSpecReproj) {
+                vec2 prevUVSpec = uv - mvSpec;
+                if (prevUVSpec.x >= 0.0 && prevUVSpec.x <= 1.0 && prevUVSpec.y >= 0.0 && prevUVSpec.y <= 1.0) {
+                    vec2 prevPosS = vec2(p) - mvSpecPx;
+                    ivec2 basePS  = ivec2(floor(prevPosS));
+                    vec2 fS       = fract(prevPosS);
+
+                    for (int ty = 0; ty <= 1; ++ty) {
+                        for (int tx = 0; tx <= 1; ++tx) {
+                            float wBilin = (tx == 0 ? (1.0 - fS.x) : fS.x) * (ty == 0 ? (1.0 - fS.y) : fS.y);
+                            if (wBilin <= 1e-4) {
+                                continue;
+                            }
+                            ivec2 tapP = basePS + ivec2(tx, ty);
+                            if (tapP.x < 0 || tapP.y < 0 || tapP.x >= renderSize.x || tapP.y >= renderSize.y) {
+                                continue;
+                            }
+                            vec4 prevND = imageLoad(uPrevNormalDepth, tapP);
+                            if (prevND.w >= UPWAYS_SKY_DEPTH) {
+                                continue;
+                            }
+                            float relZ = abs(zCenter - prevND.w) / max(max(zCenter, prevND.w), 0.1);
+                            float dotN = dot(nCenter, prevND.xyz);
+                            if (relZ < 0.15 && dotN > 0.75) {
+                                float wRefl = 1.0;
+                                float dPrevRefl = imageLoad(uPrevSpecularMotion, tapP).w;
+                                if (dPrevRefl > 1e-4) {
+                                    float relRefl = abs(specMot.w - dPrevRefl) / max(max(specMot.w, dPrevRefl), 0.1);
+                                    wRefl = exp(-relRefl / max(0.15 + roughness * 0.5, 0.05));
+                                }
+                                float wGeom = evaluateRelativeDepthWeight(zCenter, prevND.w, 0.05) *
+                                              evaluateNormalWeight24(nCenter, prevND.xyz) * wRefl;
+                                float wTap  = wBilin * wGeom;
+                                vec4 hSpec  = imageLoad(uHistorySpecularIn, tapP);
+                                vec4 hMom   = imageLoad(uHistoryMomentsIn, tapP);
+                                if (hSpec.a > 0.5) {
+                                    wSumS   += wTap;
+                                    accSpec += wTap * sanitizeVec3(hSpec.rgb);
+                                    accNS   += wTap * hSpec.a;
+                                    accMomS += wTap * hMom.ba;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (wSumS > 1e-3) {
+                float invWS    = 1.0 / wSumS;
+                vec3 rawRepS   = accSpec * invWS;
+                float sigma3S  = sqrt(var3S);
+                float maxRepS  = mean3S + 2.5 * sigma3S + 0.15;
+                reprojSpec     = hasSpecMotion ? softClampLuminance(rawRepS, maxRepS) : rawRepS;
+                float maxHistS = hasSpecMotion ? 8.0 : 64.0;
+                histLenSpec    = min(accNS * invWS + 1.0, maxHistS);
+                prevMomentsS   = accMomS * invWS;
+            }
+        }
+    }
+
+    float baseAlphaD = (histLenDiff <= 1.0) ? 1.0 : max(1.0 / histLenDiff, pc.minAlphaDiffuse);
+    float baseAlphaS = (histLenSpec <= 1.0) ? 1.0 : max(1.0 / histLenSpec, pc.minAlphaSpecular);
+
+    float momAlphaD = max(baseAlphaD, 0.06);
+    float momAlphaS = max(baseAlphaS, 0.06);
+    vec2 curMomD = vec2(curLumD, curLumD * curLumD);
+    vec2 curMomS = vec2(curLumS, curLumS * curLumS);
+    vec2 newMomD = (histLenDiff <= 1.0) ? prevMomentsD : mix(prevMomentsD, curMomD, momAlphaD);
+    vec2 newMomS = (histLenSpec <= 1.0) ? prevMomentsS : mix(prevMomentsS, curMomS, momAlphaS);
+
+    float tempVarD = max(newMomD.y - newMomD.x * newMomD.x, 1e-4);
+    float tempVarS = max(newMomS.y - newMomS.x * newMomS.x, 1e-4);
+
+    float spatialBlendD = clamp(1.0 - (histLenDiff - 1.0) / 3.0, 0.0, 1.0);
+    float spatialBlendS = clamp(1.0 - (histLenSpec - 1.0) / 3.0, 0.0, 1.0);
+    float rawFinalVarD  = mix(tempVarD, max(tempVarD, var3D), spatialBlendD);
+    float rawFinalVarS  = mix(tempVarS, max(tempVarS, var3S), spatialBlendS);
+    float finalVarD     = (isEmissive > 0.5) ? 1e-4 : max(rawFinalVarD / histLenDiff, 1e-4);
+    float varDecayS     = (isSmoothSpec && metallic < 0.5) ? sqrt(histLenSpec) : histLenSpec;
+    float finalVarS     = max(rawFinalVarS / varDecayS, 1e-4);
+
+    float ffScaleD   = min(sqrt(histLenDiff), 4.0);
+    float ffScaleS   = min(sqrt(histLenSpec), 4.0);
+    vec3 blendInDiff = applyFfD ? softClampLuminance(rawDemodDiff, maxD * ffScaleD) : rawDemodDiff;
+    vec3 blendInSpec = applyFfS ? softClampLuminance(rawCurSpec,   maxS * ffScaleS) : rawCurSpec;
+    vec3 blendedDiff = sanitizeVec3(mix(reprojDiff, blendInDiff, baseAlphaD));
+    vec3 blendedSpec = sanitizeVec3(mix(reprojSpec, blendInSpec, baseAlphaS));
+
+    imageStore(uTemporalDiffuseOut, p, vec4(blendedDiff, finalVarD));
+    imageStore(uTemporalSpecularOut, p, vec4(blendedSpec, finalVarS));
+    if ((pc.resetHistory & 2u) == 0u) {
+        imageStore(uReprojDiffuseOut, p, vec4(blendedDiff, histLenDiff));
+        imageStore(uReprojSpecularOut, p, vec4(blendedSpec, histLenSpec));
+        imageStore(uHistoryMomentsOut, p, vec4(newMomD, newMomS));
+    }
+
+    // 3. Pack 16-Channel Feature Vector for Pass 2 (128-bit vectorized once per 2x2 quad in linear 2D order)
+    if (((uint(p.x) | uint(p.y)) & 1u) == 0u) {
+        uint qW         = (pc.renderWidth + 1u) >> 1u;
+        uint qx         = uint(p.x) >> 1u;
+        uint qy         = uint(p.y) >> 1u;
+        uint qLinearIdx = qy * qW + qx;
+
+        vec3 logDiff     = log(vec3(1.0) + blendedDiff);
+        vec3 logSpec     = log(vec3(1.0) + blendedSpec);
+        float dispZ      = (zCenter >= UPWAYS_SKY_DEPTH) ? 0.0 : (1.0 / (1.0 + max(zCenter, 0.0)));
+        float fresnelLum = evaluateFresnelLuminance(albedo, metallic, roughness, nCenter.z, zCenter);
+        float logStd     = log(1.0 + sqrt(max(finalVarD + finalVarS, 0.0)));
+
+        uvec4 f0 = uvec4(
+            packHalf2x16(vec2(logDiff.r,  logDiff.g)),
+            packHalf2x16(vec2(logDiff.b,  logSpec.r)),
+            packHalf2x16(vec2(logSpec.g,  logSpec.b)),
+            packHalf2x16(vec2(albedo.r,   albedo.g))
+        );
+        uvec4 f1 = uvec4(
+            packHalf2x16(vec2(albedo.b,   nCenter.x)),
+            packHalf2x16(vec2(nCenter.y,  nCenter.z)),
+            packHalf2x16(vec2(dispZ,      roughness)),
+            packHalf2x16(vec2(fresnelLum, logStd))
+        );
+
+        uNeuralFeaturesOut.features4[qLinearIdx * 2u + 0u] = f0;
+        uNeuralFeaturesOut.features4[qLinearIdx * 2u + 1u] = f1;
+    }
+}

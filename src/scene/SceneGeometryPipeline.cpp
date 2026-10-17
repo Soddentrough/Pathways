@@ -168,7 +168,8 @@ void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_
 }
 
 void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const Config& config) {
-    if (!config.enable_macro_blas || scene.instances.size() <= 16 || scene.blasRanges.empty()) {
+    if (!config.enable_macro_blas || scene.instances.size() <= 16 || scene.blasRanges.empty() ||
+        scene.isMineshaftCoaster || !scene.animatedInstances.empty()) {
         return;
     }
 

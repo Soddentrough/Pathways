@@ -28,6 +28,8 @@ SuperResolutionManager::~SuperResolutionManager() {
 void SuperResolutionManager::destroy() {
     destroyFsr3Resources();
     destroyFsr3Pipelines();
+    destroyGatewayResources();
+    destroyGatewayPipelines();
     destroyUpwaysResources();
     destroyUpwaysPipelines();
     destroyDescPool();
@@ -38,10 +40,10 @@ void SuperResolutionManager::createDescPool() {
         return;
     }
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 8;
+    poolInfo.maxSets = 16;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_postProcessDescPool) != VK_SUCCESS) {
@@ -55,6 +57,7 @@ void SuperResolutionManager::destroyDescPool() {
         m_postProcessDescPool = VK_NULL_HANDLE;
     }
     m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    m_tonemapGatewayDescSet = VK_NULL_HANDLE;
     m_tonemapFsr3DescSet = VK_NULL_HANDLE;
 }
 
@@ -64,6 +67,8 @@ void SuperResolutionManager::init(const Config& config,
     createDescPool();
     createUpwaysPipelines(config);
     createUpwaysResources(config, postProcess, cmd);
+    createGatewayPipelines(config);
+    createGatewayResources(config, postProcess, cmd);
     createFsr3Pipelines(config);
     createFsr3Resources(config, postProcess);
 }
@@ -71,19 +76,18 @@ void SuperResolutionManager::init(const Config& config,
 void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
     if (!m_shaderLoader) return;
     try {
-        auto upwaysCode = m_shaderLoader("neural_reconstruct.comp.spv");
-        if (upwaysCode.empty()) {
-            upwaysCode = m_shaderLoader("upways_reconstruct.comp.spv");
-        }
+        auto temporalCode = m_shaderLoader("upways_temporal.comp.spv");
+        auto neuralGuideCode = m_shaderLoader("upways_neural_guide.comp.spv");
+        auto upscaleResolveCode = m_shaderLoader("upways_upscale_resolve.comp.spv");
+
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-        bool isSuperRes = config.upways_superres || (config.upscaler_mode == UpscalerMode::Upways);
         uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
             static_cast<uint32_t>(config.width * config.render_scale) : config.width;
         uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
             static_cast<uint32_t>(config.height * config.render_scale) : config.height;
         uint32_t outW = config.width;
         uint32_t outH = config.height;
-        isSuperRes = (inW < outW || inH < outH || isSuperRes);
+        bool isSuperRes = (inW < outW || inH < outH);
 
         m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
             m_device,
@@ -93,12 +97,14 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
             inH,
             outW,
             outH,
-            upwaysCode,
+            temporalCode,
+            neuralGuideCode,
+            upscaleResolveCode,
             config.upways_weights_path,
             isSuperRes,
             format
         );
-        Logger::info("Upways Neural Reconstruction Pipeline initialized successfully.");
+        Logger::info("Upways 3-Pass Neural Reconstruction & Multi-Scale KPN Pipeline initialized successfully.");
     } catch (const std::exception& e) {
         if (config.upscaler_mode == UpscalerMode::Upways || config.upways_superres || config.denoiser_mode == DenoiserMode::Upways) {
             throw std::runtime_error(std::string("Upways was explicitly requested but initialization failed: ") + e.what());
@@ -112,7 +118,7 @@ void SuperResolutionManager::destroyUpwaysPipelines() {
     m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
 }
 
-void SuperResolutionManager::createUpwaysResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
+void SuperResolutionManager::createUpwaysResources(const Config& /*config*/, PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
     if (m_postProcessDescPool && postProcess && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         tmAllocInfo.descriptorPool = m_postProcessDescPool;
@@ -125,19 +131,6 @@ void SuperResolutionManager::createUpwaysResources(const Config& config, PostPro
         }
     }
 
-    uint32_t outW = config.width;
-    uint32_t outH = config.height;
-    m_displayAlbedoImage = std::make_unique<Image>(
-        m_device, m_allocator, outW, outH,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-    );
-    m_displayNormalsImage = std::make_unique<Image>(
-        m_device, m_allocator, outW, outH,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-    );
-
     if (m_upwaysPipeline && cmd != VK_NULL_HANDLE) {
         VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -145,23 +138,6 @@ void SuperResolutionManager::createUpwaysResources(const Config& config, PostPro
         vkBeginCommandBuffer(cmd, &beginInfo);
 
         m_upwaysPipeline->transitionInitialLayouts(cmd);
-
-        if (m_displayAlbedoImage) {
-            m_displayAlbedoImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
-                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT
-            );
-        }
-        if (m_displayNormalsImage) {
-            m_displayNormalsImage->transitionLayout(
-                cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
-                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT
-            );
-        }
 
         vkEndCommandBuffer(cmd);
 
@@ -179,6 +155,90 @@ void SuperResolutionManager::createUpwaysResources(const Config& config, PostPro
 void SuperResolutionManager::destroyUpwaysResources() {
     m_displayAlbedoImage.reset();
     m_displayNormalsImage.reset();
+}
+
+void SuperResolutionManager::createGatewayPipelines(const Config& config) {
+    if (!m_shaderLoader) return;
+    try {
+        auto temporalCode = m_shaderLoader("gateway_temporal.comp.spv");
+        auto neuralGuideCode = m_shaderLoader("gateway_neural_guide.comp.spv");
+        auto atrousCode = m_shaderLoader("gateway_atrous.comp.spv");
+        auto upscaleResolveCode = m_shaderLoader("gateway_upscale_resolve.comp.spv");
+
+        VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+        uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
+            static_cast<uint32_t>(config.width * config.render_scale) : config.width;
+        uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
+            static_cast<uint32_t>(config.height * config.render_scale) : config.height;
+        uint32_t outW = config.width;
+        uint32_t outH = config.height;
+        bool isSuperRes = (inW < outW || inH < outH);
+
+        m_gatewayPipeline = std::make_unique<GatewayPipeline>(
+            m_device,
+            m_physicalDevice,
+            m_allocator,
+            inW,
+            inH,
+            outW,
+            outH,
+            temporalCode,
+            neuralGuideCode,
+            atrousCode,
+            upscaleResolveCode,
+            config.gateway_weights_path,
+            isSuperRes,
+            format
+        );
+        Logger::info("Gateway 4-Pass Hybrid Denoiser & Super-Resolution Pipeline initialized successfully.");
+    } catch (const std::exception& e) {
+        if (config.upscaler_mode == UpscalerMode::Gateway || config.gateway_superres || config.denoiser_mode == DenoiserMode::Gateway) {
+            throw std::runtime_error(std::string("Gateway was explicitly requested but initialization failed: ") + e.what());
+        }
+        Logger::warn("GatewayPipeline initialization failed: {}", e.what());
+    }
+}
+
+void SuperResolutionManager::destroyGatewayPipelines() {
+    m_gatewayPipeline.reset();
+    m_tonemapGatewayDescSet = VK_NULL_HANDLE;
+}
+
+void SuperResolutionManager::createGatewayResources(const Config& /*config*/, PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
+    if (m_postProcessDescPool && postProcess && m_tonemapGatewayDescSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        tmAllocInfo.descriptorPool = m_postProcessDescPool;
+        tmAllocInfo.descriptorSetCount = 1;
+        VkDescriptorSetLayout layout = postProcess->getTonemapDescLayout();
+        tmAllocInfo.pSetLayouts = &layout;
+        if (vkAllocateDescriptorSets(m_device, &tmAllocInfo, &m_tonemapGatewayDescSet) != VK_SUCCESS) {
+            Logger::warn("Failed to allocate Tonemap Gateway descriptor set");
+            m_tonemapGatewayDescSet = VK_NULL_HANDLE;
+        }
+    }
+
+    if (m_gatewayPipeline && cmd != VK_NULL_HANDLE) {
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkResetCommandBuffer(cmd, 0);
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        m_gatewayPipeline->transitionInitialLayouts(cmd);
+
+        vkEndCommandBuffer(cmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = cmd;
+
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(m_queue);
+    }
+}
+
+void SuperResolutionManager::destroyGatewayResources() {
 }
 
 void SuperResolutionManager::createFsr3Pipelines(const Config& config) {
@@ -261,15 +321,26 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
                                     PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
     destroyUpwaysResources();
     if (m_upwaysPipeline) {
-        bool isSuperRes = upwaysSuperres || (upscalerMode == UpscalerMode::Upways);
         uint32_t inW = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
             static_cast<uint32_t>(width * renderScale) : width;
         uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
             static_cast<uint32_t>(height * renderScale) : height;
         uint32_t outW = width;
         uint32_t outH = height;
-        isSuperRes = (inW < outW || inH < outH || isSuperRes);
+        bool isSuperRes = (inW < outW || inH < outH);
         m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+    }
+
+    destroyGatewayResources();
+    if (m_gatewayPipeline) {
+        uint32_t inW = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
+            static_cast<uint32_t>(width * renderScale) : width;
+        uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
+            static_cast<uint32_t>(height * renderScale) : height;
+        uint32_t outW = width;
+        uint32_t outH = height;
+        bool isSuperRes = (inW < outW || inH < outH);
+        m_gatewayPipeline->resize(inW, inH, outW, outH, isSuperRes);
     }
 
     Config cfgStub{};
@@ -282,6 +353,7 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     cfgStub.accum_format = accumFormat;
 
     createUpwaysResources(cfgStub, postProcess, cmd);
+    createGatewayResources(cfgStub, postProcess, cmd);
     destroyFsr3Resources();
     if (m_fsr3Upscaler) {
         uint32_t renderW = (renderScale < 1.0f) ?
@@ -302,17 +374,17 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
                                               Image* mlDiffuseImage, Image* mlSpecularImage,
                                               Image* frameImage0) {
     if (m_upwaysPipeline && accumImage && outputImage) {
-        bool isSuperRes = m_upwaysPipeline->isSuperResEnabled();
-
         VkImageView normDepthView = normalDepthImage ? normalDepthImage->getImageView() : VK_NULL_HANDLE;
         VkImageView motionView = motionVectorImage ? motionVectorImage->getImageView() : VK_NULL_HANDLE;
         VkImageView albedoView = mlAlbedoRoughnessImage ? mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView specMotionView = mlSpecularMotionImage ? mlSpecularMotionImage->getImageView() : motionView;
+        VkImageView specMotionView = mlSpecularMotionImage ? mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE;
         VkImageView diffView = mlDiffuseImage ? mlDiffuseImage->getImageView() : (frameImage0 ? frameImage0->getImageView() : VK_NULL_HANDLE);
         VkImageView specView = mlSpecularImage ? mlSpecularImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView displayAlbedoView = (isSuperRes && m_displayAlbedoImage) ? m_displayAlbedoImage->getImageView() : albedoView;
-        VkImageView displayNormalsView = (isSuperRes && m_displayNormalsImage) ? m_displayNormalsImage->getImageView() : normDepthView;
-        VkImageView restirMetadataView = VK_NULL_HANDLE;
+
+        m_upwaysPipeline->setHistorySourceImages(
+            normalDepthImage ? normalDepthImage->getImage() : VK_NULL_HANDLE,
+            mlSpecularMotionImage ? mlSpecularMotionImage->getImage() : VK_NULL_HANDLE
+        );
 
         m_upwaysPipeline->updateDescriptors(
             diffView,
@@ -321,13 +393,43 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
             albedoView,
             motionView,
             specMotionView,
-            restirMetadataView,
-            displayAlbedoView,
-            displayNormalsView
+            VK_NULL_HANDLE,
+            albedoView,
+            normDepthView
         );
 
         if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage() && postProcess) {
             postProcess->updateTonemapDescriptors(m_tonemapUpwaysDescSet, m_upwaysPipeline->getOutputImage(), outputImage);
+        }
+    }
+
+    if (m_gatewayPipeline && accumImage && outputImage) {
+        VkImageView normDepthView = normalDepthImage ? normalDepthImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView motionView = motionVectorImage ? motionVectorImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView albedoView = mlAlbedoRoughnessImage ? mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView specMotionView = mlSpecularMotionImage ? mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView diffView = mlDiffuseImage ? mlDiffuseImage->getImageView() : (frameImage0 ? frameImage0->getImageView() : VK_NULL_HANDLE);
+        VkImageView specView = mlSpecularImage ? mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+
+        m_gatewayPipeline->setHistorySourceImages(
+            normalDepthImage ? normalDepthImage->getImage() : VK_NULL_HANDLE,
+            mlSpecularMotionImage ? mlSpecularMotionImage->getImage() : VK_NULL_HANDLE
+        );
+
+        m_gatewayPipeline->updateDescriptors(
+            diffView,
+            specView,
+            normDepthView,
+            albedoView,
+            motionView,
+            specMotionView,
+            VK_NULL_HANDLE,
+            albedoView,
+            normDepthView
+        );
+
+        if (m_tonemapGatewayDescSet != VK_NULL_HANDLE && m_gatewayPipeline->getOutputImage() && postProcess) {
+            postProcess->updateTonemapDescriptors(m_tonemapGatewayDescSet, m_gatewayPipeline->getOutputImage(), outputImage);
         }
     }
 
@@ -345,114 +447,27 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
                                             const Config& config, Camera* camera,
                                             uint32_t frameIndex, bool cameraMovedLastFrame,
                                             uint32_t accumulatedSamples,
-                                            Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
+                                            Image* /*mlAlbedoRoughnessImage*/, Image* /*normalDepthImage*/,
                                             PostProcessPipeline* postProcess, Image* outputImage) {
     if ((config.denoiser_mode != DenoiserMode::Upways && config.upscaler_mode != UpscalerMode::Upways) || !m_upwaysPipeline) {
         return false;
     }
 
-    bool isSuperRes = config.upways_superres || (config.upscaler_mode == UpscalerMode::Upways);
     uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
         static_cast<uint32_t>(config.width * config.render_scale) : config.width;
     uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
         static_cast<uint32_t>(config.height * config.render_scale) : config.height;
     uint32_t outW = config.width;
     uint32_t outH = config.height;
-    isSuperRes = (inW < outW || inH < outH || isSuperRes);
-
-    if (isSuperRes) {
-        if (!m_displayAlbedoImage || !m_displayNormalsImage ||
-            m_displayAlbedoImage->getWidth() != outW || m_displayAlbedoImage->getHeight() != outH ||
-            m_displayNormalsImage->getWidth() != outW || m_displayNormalsImage->getHeight() != outH) {
-            vkDeviceWaitIdle(m_device);
-            destroyUpwaysResources();
-            createUpwaysResources(config, postProcess, cmd);
-        }
-    }
+    bool isSuperRes = (inW < outW || inH < outH);
 
     if (m_upwaysPipeline->getInputWidth() != inW || m_upwaysPipeline->getInputHeight() != inH ||
         m_upwaysPipeline->getOutputWidth() != outW || m_upwaysPipeline->getOutputHeight() != outH ||
         m_upwaysPipeline->isSuperResEnabled() != isSuperRes) {
         vkDeviceWaitIdle(m_device);
         m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
-        updateDescriptors(postProcess, nullptr, outputImage, normalDepthImage, nullptr,
-                          mlAlbedoRoughnessImage, nullptr, nullptr, nullptr, nullptr);
-    }
-
-    if (isSuperRes && m_displayAlbedoImage && m_displayNormalsImage) {
-        Image* srcAlbedo = mlAlbedoRoughnessImage;
-        Image* srcNormDepth = normalDepthImage;
-
-        if (srcAlbedo && srcNormDepth) {
-            std::vector<VkImageMemoryBarrier2> preBlitBarriers;
-            auto addPreBlitBarrier = [&](Image* img, VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
-                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-                b.srcAccessMask = srcAccess;
-                b.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
-                b.dstAccessMask = dstAccess;
-                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.image = img->getImage();
-                b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                preBlitBarriers.push_back(b);
-            };
-
-            addPreBlitBarrier(srcAlbedo, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            addPreBlitBarrier(srcNormDepth, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            addPreBlitBarrier(m_displayAlbedoImage.get(), VK_ACCESS_2_NONE, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            addPreBlitBarrier(m_displayNormalsImage.get(), VK_ACCESS_2_NONE, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-
-            VkDependencyInfo preBlitDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            preBlitDep.imageMemoryBarrierCount = static_cast<uint32_t>(preBlitBarriers.size());
-            preBlitDep.pImageMemoryBarriers = preBlitBarriers.data();
-            vkCmdPipelineBarrier2(cmd, &preBlitDep);
-
-            VkImageBlit blitAlbedo{};
-            blitAlbedo.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blitAlbedo.srcOffsets[0] = { 0, 0, 0 };
-            blitAlbedo.srcOffsets[1] = { static_cast<int32_t>(inW), static_cast<int32_t>(inH), 1 };
-            blitAlbedo.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blitAlbedo.dstOffsets[0] = { 0, 0, 0 };
-            blitAlbedo.dstOffsets[1] = { static_cast<int32_t>(outW), static_cast<int32_t>(outH), 1 };
-            vkCmdBlitImage(cmd, srcAlbedo->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitAlbedo, VK_FILTER_LINEAR);
-
-            VkImageBlit blitNormals{};
-            blitNormals.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blitNormals.srcOffsets[0] = { 0, 0, 0 };
-            blitNormals.srcOffsets[1] = { static_cast<int32_t>(inW), static_cast<int32_t>(inH), 1 };
-            blitNormals.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blitNormals.dstOffsets[0] = { 0, 0, 0 };
-            blitNormals.dstOffsets[1] = { static_cast<int32_t>(outW), static_cast<int32_t>(outH), 1 };
-            vkCmdBlitImage(cmd, srcNormDepth->getImage(), VK_IMAGE_LAYOUT_GENERAL, m_displayNormalsImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &blitNormals, VK_FILTER_NEAREST);
-
-            std::vector<VkImageMemoryBarrier2> postBlitBarriers;
-            auto addPostBlitBarrier = [&](Image* img, VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
-                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                b.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
-                b.srcAccessMask = srcAccess;
-                b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                b.dstAccessMask = dstAccess;
-                b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.image = img->getImage();
-                b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                postBlitBarriers.push_back(b);
-            };
-
-            addPostBlitBarrier(m_displayAlbedoImage.get(), VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-            addPostBlitBarrier(m_displayNormalsImage.get(), VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-            addPostBlitBarrier(srcAlbedo, VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-            addPostBlitBarrier(srcNormDepth, VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-
-            VkDependencyInfo postBlitDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            postBlitDep.imageMemoryBarrierCount = static_cast<uint32_t>(postBlitBarriers.size());
-            postBlitDep.pImageMemoryBarriers = postBlitBarriers.data();
-            vkCmdPipelineBarrier2(cmd, &postBlitDep);
+        if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage() && postProcess && outputImage) {
+            postProcess->updateTonemapDescriptors(m_tonemapUpwaysDescSet, m_upwaysPipeline->getOutputImage(), outputImage);
         }
     }
 
@@ -466,7 +481,7 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         if (resetHistory) {
             camera->resetPrevViewProj();
         }
-        bool enableJitter = (config.upscaler_mode == UpscalerMode::Upways || config.upways_superres);
+        bool enableJitter = true;
         CameraUniform ubo = camera->getUniformData(
             frameIndex, 1, config.max_bounces, 0,
             enableJitter, inW, inH, 0, false
@@ -481,6 +496,65 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
     uint32_t totalSamples = (config.progressive_accumulation && accumulatedSamples > 0 && !isSuperRes) ? accumulatedSamples : 1u;
 
     m_upwaysPipeline->recordFrame(
+        cmd, frameIndex, resetHistory, cameraMovedLastFrame,
+        currInvView, prevViewProj, invProj, prevView, jitter, totalSamples
+    );
+    return true;
+}
+
+bool SuperResolutionManager::dispatchGateway(VkCommandBuffer cmd, bool resetHistory,
+                                             const Config& config, Camera* camera,
+                                             uint32_t frameIndex, bool cameraMovedLastFrame,
+                                             uint32_t accumulatedSamples,
+                                             Image* /*mlAlbedoRoughnessImage*/, Image* /*normalDepthImage*/,
+                                             PostProcessPipeline* postProcess, Image* outputImage) {
+    if ((config.denoiser_mode != DenoiserMode::Gateway && config.upscaler_mode != UpscalerMode::Gateway) || !m_gatewayPipeline) {
+        return false;
+    }
+
+    uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
+        static_cast<uint32_t>(config.width * config.render_scale) : config.width;
+    uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
+        static_cast<uint32_t>(config.height * config.render_scale) : config.height;
+    uint32_t outW = config.width;
+    uint32_t outH = config.height;
+    bool isSuperRes = (inW < outW || inH < outH);
+
+    if (m_gatewayPipeline->getInputWidth() != inW || m_gatewayPipeline->getInputHeight() != inH ||
+        m_gatewayPipeline->getOutputWidth() != outW || m_gatewayPipeline->getOutputHeight() != outH ||
+        m_gatewayPipeline->isSuperResEnabled() != isSuperRes) {
+        vkDeviceWaitIdle(m_device);
+        m_gatewayPipeline->resize(inW, inH, outW, outH, isSuperRes);
+        if (m_tonemapGatewayDescSet != VK_NULL_HANDLE && m_gatewayPipeline->getOutputImage() && postProcess && outputImage) {
+            postProcess->updateTonemapDescriptors(m_tonemapGatewayDescSet, m_gatewayPipeline->getOutputImage(), outputImage);
+        }
+    }
+
+    glm::mat4 currInvView(1.0f);
+    glm::mat4 prevViewProj(1.0f);
+    glm::mat4 invProj(1.0f);
+    glm::mat4 prevView(1.0f);
+    glm::vec2 jitter(0.0f);
+
+    if (camera) {
+        if (resetHistory) {
+            camera->resetPrevViewProj();
+        }
+        bool enableJitter = true;
+        CameraUniform ubo = camera->getUniformData(
+            frameIndex, 1, config.max_bounces, 0,
+            enableJitter, inW, inH, 0, false
+        );
+        currInvView = ubo.viewInverse;
+        prevViewProj = camera->getPrevViewProjMatrix();
+        invProj = ubo.projInverse;
+        prevView = camera->getPrevViewMatrix();
+        jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
+    }
+
+    uint32_t totalSamples = (config.progressive_accumulation && accumulatedSamples > 0 && !isSuperRes) ? accumulatedSamples : 1u;
+
+    m_gatewayPipeline->recordFrame(
         cmd, frameIndex, resetHistory, cameraMovedLastFrame,
         currInvView, prevViewProj, invProj, prevView, jitter, totalSamples
     );

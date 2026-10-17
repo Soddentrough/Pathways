@@ -73,6 +73,10 @@ struct ConfigKey {
             denoiserStr = " [Pure MC]";
         } else if (denoiser == DenoiserMode::Upways) {
             denoiserStr = " [Upways]";
+        } else if (denoiser == DenoiserMode::Gateway) {
+            denoiserStr = " [Gateway]";
+        } else if (denoiser == DenoiserMode::Svgf) {
+            denoiserStr = " [SVGF]";
         }
         std::string upscalerStr = "";
         std::string mgpuUpscaleStr = "";
@@ -83,6 +87,8 @@ struct ConfigKey {
             upscalerStr = " [FSR 3.1]" + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::Upways) {
             upscalerStr = " [Upways SR]" + mgpuUpscaleStr;
+        } else if (upscaler == UpscalerMode::Gateway) {
+            upscalerStr = " [Gateway SR]" + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::FSR1) {
             upscalerStr = " [FSR 1.0]" + mgpuUpscaleStr;
         }
@@ -144,6 +150,9 @@ struct ConfigStatsTally {
     double sumPrimaryRtMs = 0.0;
     double sumSecondaryRtMs = 0.0;
     double sumTonemapMs = 0.0;
+    double sumDenoiserUpscaleMs = 0.0;
+    double sumDenoisePassMs[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    uint32_t denoisePassSampleCount = 0;
     std::vector<double> frameTimesMs;
 
     // Acceleration structures
@@ -187,7 +196,10 @@ struct ConfigStatsTally {
         : key(k), label(k.getLabel()) {}
 
     void addSample(double frameTimeMs, double primRtMs, double secRtMs, double tonemapMs,
-                   const WavefrontStageSample* wfSample = nullptr) {
+                   const WavefrontStageSample* wfSample = nullptr,
+                   double denoiserUpscaleMs = 0.0,
+                   const double* denoisePasses = nullptr,
+                   uint32_t numDenoisePasses = 0) {
         if (frameTimeMs <= 0.001) return;
         frameCount++;
         sumFrameTimeMs += frameTimeMs;
@@ -196,6 +208,20 @@ struct ConfigStatsTally {
         sumPrimaryRtMs += primRtMs;
         sumSecondaryRtMs += secRtMs;
         sumTonemapMs += tonemapMs;
+        sumDenoiserUpscaleMs += denoiserUpscaleMs;
+        if (denoisePasses && numDenoisePasses > 0) {
+            double passSum = 0.0;
+            uint32_t n = std::min(numDenoisePasses, 6u);
+            for (uint32_t p = 0; p < n; ++p) {
+                passSum += denoisePasses[p];
+            }
+            if (passSum > 0.0001) {
+                denoisePassSampleCount++;
+                for (uint32_t p = 0; p < n; ++p) {
+                    sumDenoisePassMs[p] += denoisePasses[p];
+                }
+            }
+        }
         frameTimesMs.push_back(frameTimeMs);
 
         if (wfSample && (!wfSample->bounces.empty() || wfSample->tailMegakernelMs > 0.0)) {
@@ -256,6 +282,15 @@ struct ConfigStatsTally {
 
     double getAvgTonemapMs() const {
         return frameCount > 0 ? (sumTonemapMs / frameCount) : 0.0;
+    }
+
+    double getAvgDenoiserUpscaleMs() const {
+        return frameCount > 0 ? (sumDenoiserUpscaleMs / frameCount) : 0.0;
+    }
+
+    double getAvgDenoisePassMs(size_t idx) const {
+        if (idx >= 6 || denoisePassSampleCount == 0) return 0.0;
+        return sumDenoisePassMs[idx] / denoisePassSampleCount;
     }
 
     double getAvgClassifyMs() const {

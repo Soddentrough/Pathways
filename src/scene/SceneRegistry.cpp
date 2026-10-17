@@ -213,6 +213,18 @@ std::vector<SceneEntry> SceneRegistry::scan(const std::string& scenesDir) {
     infinityMirror.fileSizeBytes = 0;
     entries.push_back(infinityMirror);
 
+    // 0e. Add Mineshaft Coaster as index 4
+    SceneEntry mineshaft;
+    mineshaft.label = "Mineshaft Coaster";
+    mineshaft.filepath = "mineshaft";
+    mineshaft.group = "Procedural";
+    mineshaft.triangleCount = 14800;
+    mineshaft.instancedTriangleCount = 185000;
+    mineshaft.instanceCount = 240;
+    mineshaft.materialCount = 15;
+    mineshaft.fileSizeBytes = 0;
+    entries.push_back(mineshaft);
+
     if (scenesDir.empty()) {
         return entries;
     }

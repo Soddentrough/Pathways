@@ -64,6 +64,7 @@ public:
                          SceneGeometryPipeline* geomPipeline);
 
     void uploadGpuBuffers(SceneGeometryPipeline* geomPipeline);
+    void updateDynamicLights(SceneData& sceneData);
     void loadTextures(const std::string& hdriPath, const std::string& scenePath);
     void updateCamera(Camera* camera, const Config& config);
 

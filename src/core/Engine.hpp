@@ -18,6 +18,7 @@
 #include "rt/NRCManager.hpp"
 #include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
+#include "rt/GatewayPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
 #include "rt/SuperResolutionManager.hpp"
 #include "rt/CausticsPipeline.hpp"
@@ -99,6 +100,7 @@ public:
     QualityGovernor* getGovernor() const { return m_governor.get(); }
     NRCManager* getNrcManager() const { return m_nrcManager; }
     UpwaysPipeline* getUpwaysPipeline() const { return m_superResolution ? m_superResolution->getUpwaysPipeline() : nullptr; }
+    GatewayPipeline* getGatewayPipeline() const { return m_superResolution ? m_superResolution->getGatewayPipeline() : nullptr; }
     Fsr3Upscaler* getFsr3Upscaler() const { return m_superResolution ? m_superResolution->getFsr3Upscaler() : nullptr; }
     SuperResolutionManager* getSuperResolution() const { return m_superResolution.get(); }
     CausticsPipeline* getCausticsPipeline() const { return m_causticsPipeline.get(); }
@@ -249,6 +251,8 @@ private:
     void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
     void markTlasDirty();
     void updateAnimatedInstances(float frameDelta);
+    float m_coasterSimTime = 0.0f;
+    float m_coasterLastEvalTime = -999.0f;
 
     // Commands & Synchronization
     VkCommandPool m_commandPool = VK_NULL_HANDLE;

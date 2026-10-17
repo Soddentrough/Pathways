@@ -618,8 +618,8 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
         } else {
             m_config.max_bounces = 4;
         }
-        m_dynamicWavefrontBounces = m_config.max_bounces;
     }
+    m_dynamicWavefrontBounces = m_config.max_bounces;
 
     // Rebuild Acceleration Structures (BLAS & TLAS)
     createAccelerationStructures();
@@ -651,6 +651,8 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     // Reset frame accumulation. --seed offsets the RNG frame counter so repeated
     // headless runs are statistically independent (bias/variance harnesses).
     m_frameIndex = m_config.rng_seed << 20;
+    m_coasterSimTime = 0.0f;
+    m_coasterLastEvalTime = -999.0f;
     m_resetAccumulation = true;
     m_frameTimesMs.clear();
     if (m_rtOrchestrator) {
@@ -1417,6 +1419,17 @@ void Engine::renderFrame() {
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
         m_lastTonemapMs = gpuTonemapMs;
         m_lastUpwaysMs = gpuUpwaysMs;
+        if (m_superResolution) {
+            if (auto* upw = m_superResolution->getUpwaysPipeline()) {
+                upw->collectQueryResults(static_cast<int32_t>(m_currentFrame));
+            }
+            if (auto* gtw = m_superResolution->getGatewayPipeline()) {
+                gtw->collectQueryResults(static_cast<int32_t>(m_currentFrame));
+            }
+        }
+        if (m_denoiser && m_denoiser->isInitialized()) {
+            m_denoiser->collectQueryResults();
+        }
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
 
         if (!completedSlotSkipped) {
@@ -1595,17 +1608,18 @@ void Engine::renderFrame() {
             m_pendingTileSizeChange = false;
         }
 
-        if (m_config.upscaler_mode == UpscalerMode::Upways && m_config.render_scale >= 1.0f) {
+        if ((m_config.upscaler_mode == UpscalerMode::Upways || m_config.upscaler_mode == UpscalerMode::Gateway) && m_config.render_scale >= 1.0f) {
             m_config.render_scale = 0.5f;
             m_lastRenderScale = 0.5f;
         }
 
-        if (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways) {
+        if (m_config.upscaler_mode == UpscalerMode::Upways || m_config.denoiser_mode == DenoiserMode::Upways ||
+            m_config.upscaler_mode == UpscalerMode::Gateway || m_config.denoiser_mode == DenoiserMode::Gateway) {
             if (m_superResolution) {
                 m_superResolution->resize(
                     m_config.width, m_config.height, m_config.render_scale,
                     m_config.upscaler_mode, m_config.denoiser_mode,
-                    m_config.upways_superres, m_config.accum_format,
+                    m_config.upways_superres || m_config.gateway_superres, m_config.accum_format,
                     m_postProcess.get(), m_commandBuffers[0]
                 );
             }
@@ -1669,14 +1683,63 @@ void Engine::renderFrame() {
     }
 
     // Advance dynamic kinematic object animations
-    float animDt = 1.0f / 60.0f;
+    float animDt = 1.0f / (m_config.target_fps > 0 ? static_cast<float>(m_config.target_fps) : 60.0f);
     if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
         animDt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
     }
-    bool isAnimating = m_config.animate_objects && (m_config.animation_speed > 0.0001f) && !m_sceneData.animatedInstances.empty();
+    const bool coasterFrozen = (m_config.camera_path_freeze_time >= 0.0f);
+    bool isAnimating = !coasterFrozen && m_config.animate_objects && (m_config.animation_speed > 0.0001f) &&
+                       (!m_sceneData.animatedInstances.empty() || m_sceneData.isMineshaftCoaster);
     if (isAnimating) {
         updateAnimatedInstances(animDt);
     }
+
+    if (!sceneLoadingActive && m_sceneData.isMineshaftCoaster && (isAnimating || coasterFrozen)) {
+        float evalTime = 0.0f;
+        if (coasterFrozen) {
+            evalTime = m_config.camera_path_freeze_time;
+        } else {
+            m_coasterSimTime += animDt * m_config.animation_speed;
+            evalTime = m_config.headless ? (static_cast<float>(m_totalFramesRendered) * animDt * m_config.animation_speed) : m_coasterSimTime;
+        }
+
+        if (isAnimating || std::abs(evalTime - m_coasterLastEvalTime) > 1e-5f) {
+            m_coasterLastEvalTime = evalTime;
+            glm::vec3 cCamPos, cCamTarget, cCamUp;
+            float cCamFov = 55.0f;
+            glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
+            ProceduralScene::updateMineshaftCoaster(
+                m_sceneData, evalTime,
+                cCamPos, cCamTarget, cCamUp, cCamFov,
+                riderMat, lead1Mat, lead2Mat
+            );
+
+            if (m_sceneData.coasterRiderCartInst != UINT32_MAX) {
+                updateInstanceTransform(m_sceneData.coasterRiderCartInst, riderMat);
+            }
+            if (m_sceneData.coasterLeadCart1Inst != UINT32_MAX) {
+                updateInstanceTransform(m_sceneData.coasterLeadCart1Inst, lead1Mat);
+            }
+            if (m_sceneData.coasterLeadCart2Inst != UINT32_MAX) {
+                updateInstanceTransform(m_sceneData.coasterLeadCart2Inst, lead2Mat);
+            }
+
+            if (m_sceneManager) {
+                m_sceneManager->updateDynamicLights(m_sceneData);
+                m_numLights = m_sceneManager->getNumLights();
+            }
+
+            if (!pathActive && !isCameraMode() && !m_config.camera_pos.has_value() && m_camera) {
+                m_camera->setAnimatedPose(cCamPos, cCamTarget, cCamUp, cCamFov);
+                if (coasterFrozen) {
+                    m_camera->resetMoved();
+                } else {
+                    pathMoving = true;
+                }
+            }
+        }
+    }
+
     bool instanceMovedThisFrame = isAnimating && (m_totalFramesRendered > 0);
     bool instanceJustStopped = (!isAnimating && m_instanceMovedLastFrame);
 
@@ -1685,7 +1748,7 @@ void Engine::renderFrame() {
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || instanceJustStopped || hardReset;
-    if (accumReset || cameraMovedThisFrame) {
+    if (hardReset) {
         m_dynamicWavefrontBounces = m_config.max_bounces;
     }
     if (accumReset && !sceneLoadingActive) {
@@ -1799,8 +1862,9 @@ void Engine::renderFrame() {
     }
 
     bool isStationaryAccum = m_config.progressive_accumulation && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
-    bool isUpscalerActive = (m_config.upscaler_mode == UpscalerMode::FSR3) || (m_config.upscaler_mode == UpscalerMode::Upways) || m_config.upways_superres;
-    bool enableJitter = isUpscalerActive;
+    bool enableJitter = (m_config.upscaler_mode == UpscalerMode::FSR3) ||
+                        (m_config.upscaler_mode == UpscalerMode::Upways && m_config.upways_superres) ||
+                        (m_config.upscaler_mode == UpscalerMode::Gateway && m_config.gateway_superres);
     uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
         static_cast<uint32_t>(m_config.width * m_config.render_scale) : m_config.width;
     uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
@@ -1886,7 +1950,7 @@ void Engine::renderFrame() {
 
         // GPU-Timeline TLAS Update / Refit (Tier 3)
         if (m_tlasUpdatePipeline && m_tlasUpdatePipeline->needsGpuUpdate() && m_tlas) {
-            recordGpuTlasUpdate(cmd, true);
+            recordGpuTlasUpdate(cmd, !m_sceneData.isMineshaftCoaster);
         }
 
         // Update animated video billboard texture if a new frame is ready
@@ -1941,7 +2005,9 @@ void Engine::renderFrame() {
 
         bool needDecoupledPost = (m_config.denoiser_mode == DenoiserMode::Svgf ||
                                   m_config.denoiser_mode == DenoiserMode::Upways ||
+                                  m_config.denoiser_mode == DenoiserMode::Gateway ||
                                   m_config.upscaler_mode == UpscalerMode::Upways ||
+                                  m_config.upscaler_mode == UpscalerMode::Gateway ||
                                   m_config.upscaler_mode == UpscalerMode::FSR3);
 
         if (!needDecoupledPost && m_postProcess && m_postProcess->hasFusedPipeline() && !skipRayTracing) {
@@ -1965,9 +2031,13 @@ void Engine::renderFrame() {
 
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         } else {
-            // Decoupled Path (Used when SVGF, Upways, or FSR3 is active or RT was skipped)
+            // Decoupled Path (Used when SVGF, Upways, Gateway, or FSR3 is active or RT was skipped)
             // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
-            if (!skipRayTracing && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
+            // Skipped when Upways or Gateway is active because both consume raw split diffuse/specular directly.
+            const bool isUpwaysOrGateway =
+                (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
+                (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway);
+            if (!skipRayTracing && !isUpwaysOrGateway && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
                 PostProcessPipeline::RunningAvgPushConstants avgPC{};
                 avgPC.width = renderW;
                 avgPC.height = renderH;
@@ -2023,9 +2093,24 @@ void Engine::renderFrame() {
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
 
+            // Gateway Hybrid Denoiser & Super-Resolution (Wave32 WMMA)
+            bool gatewayRun = false;
+            if (!svgfRun && !upwaysRun && (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway)) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+                if (m_superResolution) {
+                    gatewayRun = m_superResolution->dispatchGateway(
+                        cmd, resetTemporal, m_config, m_camera.get(),
+                        m_frameIndex, m_cameraMovedLastFrame, m_accumulatedSamples,
+                        m_mlAlbedoRoughnessImage, m_normalDepthImage,
+                        m_postProcess.get(), m_outputImage
+                    );
+                }
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+            }
+
             // AMD FidelityFX Super Resolution 3.1
             bool fsr3Run = false;
-            if (!svgfRun && !upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+            if (!svgfRun && !upwaysRun && !gatewayRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
                 if (m_superResolution) {
                     fsr3Run = m_superResolution->dispatchFsr3(
                         cmd, resetTemporal, m_config, m_frameIndex,
@@ -2049,6 +2134,9 @@ void Engine::renderFrame() {
                     tonemapConstants.totalSamples = 1u;
                 } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_superResolution->getUpwaysPipeline())) {
                     tmSet = m_superResolution->getTonemapUpwaysDescSet();
+                    tonemapConstants.totalSamples = 1u;
+                } else if (gatewayRun || (m_config.upscaler_mode == UpscalerMode::Gateway && m_superResolution->getGatewayPipeline())) {
+                    tmSet = m_superResolution->getTonemapGatewayDescSet();
                     tonemapConstants.totalSamples = 1u;
                 } else {
                     tonemapConstants.totalSamples = 1u;
@@ -2160,7 +2248,7 @@ void Engine::renderFrame() {
             }
         }
 
-        // Post-processing passes on activeCmd: SVGF / Upways / FSR3 / Tonemap
+        // Post-processing passes on activeCmd: SVGF / Upways / Gateway / FSR3 / Tonemap
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
 
@@ -2213,8 +2301,22 @@ void Engine::renderFrame() {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
+        bool gatewayRun = false;
+        if (!svgfRun && !upwaysRun && (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway)) {
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+            if (m_superResolution) {
+                gatewayRun = m_superResolution->dispatchGateway(
+                    activeCmd, resetTemporal, m_config, m_camera.get(),
+                    m_frameIndex, m_cameraMovedLastFrame, m_accumulatedSamples,
+                    m_mlAlbedoRoughnessImage, m_normalDepthImage,
+                    m_postProcess.get(), m_outputImage
+                );
+            }
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
+        }
+
         bool fsr3Run = false;
-        if (!svgfRun && !upwaysRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
+        if (!svgfRun && !upwaysRun && !gatewayRun && m_config.upscaler_mode == UpscalerMode::FSR3) {
             if (m_superResolution) {
                 fsr3Run = m_superResolution->dispatchFsr3(
                     activeCmd, resetTemporal, m_config, m_frameIndex,
@@ -2237,6 +2339,9 @@ void Engine::renderFrame() {
                 tonemapConstants.totalSamples = 1u;
             } else if (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_superResolution->getUpwaysPipeline())) {
                 tmSet = m_superResolution->getTonemapUpwaysDescSet();
+                tonemapConstants.totalSamples = 1u;
+            } else if (gatewayRun || (m_config.upscaler_mode == UpscalerMode::Gateway && m_superResolution->getGatewayPipeline())) {
+                tmSet = m_superResolution->getTonemapGatewayDescSet();
                 tonemapConstants.totalSamples = 1u;
             } else {
                 tonemapConstants.totalSamples = 1u;
@@ -2603,7 +2708,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_superResolution->resize(
             m_config.width, m_config.height, m_config.render_scale,
             m_config.upscaler_mode, m_config.denoiser_mode,
-            m_config.upways_superres, m_config.accum_format,
+            m_config.upways_superres || m_config.gateway_superres, m_config.accum_format,
             m_postProcess.get(), m_commandBuffers[0]
         );
     }
