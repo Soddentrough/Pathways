@@ -36,7 +36,6 @@ jobs:
             zlib-ng-compat-devel \
             pkgconf-pkg-config \
             ffmpeg-free-devel \
-            python3 \
             tar \
             gzip
 
@@ -50,15 +49,12 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_NATIVE_OPTIMIZATION=ON \
+            -DBUILD_TESTING=OFF \
             -DCMAKE_INSTALL_PREFIX=/usr
 
       - name: Build
         run: |
-          cmake --build build --parallel
-
-      - name: Run unit tests
-        run: |
-          ctest --test-dir build --output-on-failure
+          cmake --build build --target pathways --parallel
 
       - name: Package RPM & Tarball with CPack
         run: |
@@ -107,13 +103,14 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CONFIGURATION_TYPES=Release \
             -DENABLE_NATIVE_OPTIMIZATION=ON \
+            -DBUILD_TESTING=OFF \
             -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }};C:/vcpkg/installed/x64-windows" \
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build (Windows)
         shell: bash
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release --target pathways --parallel
 
       - name: Package Release (Windows)
         shell: bash

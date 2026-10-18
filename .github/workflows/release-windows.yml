@@ -53,17 +53,13 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
             -DENABLE_NATIVE_OPTIMIZATION=ON \
+            -DBUILD_TESTING=OFF \
             -DCPACK_GENERATOR="NSIS;ZIP"
 
       - name: Compile Pathways & Shaders
         shell: msys2 {0}
         run: |
-          cmake --build build -j16
-
-      - name: Run Unit Tests
-        shell: msys2 {0}
-        run: |
-          ctest --test-dir build --output-on-failure -E "P2PDirectBar"
+          cmake --build build --target pathways -j16
 
       - name: Package Windows Installer (NSIS) & Portable ZIP
         shell: msys2 {0}

@@ -69,7 +69,7 @@ UpwaysPipeline::UpwaysPipeline(
     refreshDescriptors();
 
     m_initialized = true;
-    Logger::info("UpwaysPipeline successfully initialized (3-pass 203.4 KB 3-Scale Recurrent WMMA U-Net + Fused 2-Stage KPN architecture).");
+    Logger::info("UpwaysPipeline successfully initialized (3-pass 80.5 KB 3-Scale 2D Halo-WMMA Recurrent U-Net + Fused 2-Stage KPN architecture).");
 }
 
 UpwaysPipeline::~UpwaysPipeline() {

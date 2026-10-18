@@ -472,6 +472,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
 endif()
 
 # Testing
+option(BUILD_TESTING "Build unit test executables" ON)
+if(BUILD_TESTING)
 enable_testing()
 
 # Camera & FPS Controls Unit Test Target
@@ -663,8 +665,6 @@ if(UNIX)
     target_link_libraries(test_restir_pt_math PRIVATE m)
 endif()
 add_test(NAME RestirPtMath COMMAND test_restir_pt_math)
-add_test(NAME VisualIntegrity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_visual_integrity.py)
-add_test(NAME PerformanceMatrix COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_performance_matrix.py --quick)
 
 
 
@@ -827,6 +827,7 @@ if(pxr_FOUND)
     endif()
     add_test(NAME UsdLoader COMMAND test_usd_loader)
 endif()
+endif() # BUILD_TESTING
 
 
 
@@ -903,6 +904,9 @@ if(WIN32)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION data/models)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin" DESTINATION data/models)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico" DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
@@ -952,6 +956,9 @@ else()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)

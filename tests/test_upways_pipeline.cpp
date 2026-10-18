@@ -95,26 +95,26 @@ int main() {
     }
     std::cout << "  -> Co-designed diffuse and metallic-Fresnel specular demodulation/remodulation verified." << std::endl;
 
-    // 4. Verify Upways (203,392B U-Net) vs Gateway (2,144B MLP) Weight Topologies
-    std::cout << "[TEST 4] Upways (203,392B 3-Scale U-Net) & Gateway (2,144B Quad MLP) Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_ELEMENTS == 101696, "Upways TOTAL_WEIGHT_ELEMENTS must be 101,696 FP16 parameters");
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 203392, "Upways TOTAL_WEIGHT_BUFFER_SIZE must be 203,392 bytes");
+    // 4. Verify Upways (80,512B U-Net) vs Gateway (2,144B MLP) Weight Topologies
+    std::cout << "[TEST 4] Upways (80,512B 3-Scale 2D Halo-WMMA U-Net) & Gateway (2,144B Quad MLP) Weights Topology..." << std::endl;
+    check_true(upways::TOTAL_WEIGHT_ELEMENTS == 40256, "Upways TOTAL_WEIGHT_ELEMENTS must be 40,256 FP16 parameters");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 80512, "Upways TOTAL_WEIGHT_BUFFER_SIZE must be 80,512 bytes");
     check_true(upways::ENC1_W_OFFSET == 0, "ENC1_W_OFFSET must be 0");
     check_true(upways::ENC1_B_OFFSET == 2560, "ENC1_B_OFFSET must be 2560");
     check_true(upways::REC_PROJ_W_OFFSET == 2592, "REC_PROJ_W_OFFSET must be 2592");
     check_true(upways::ENC2_W_OFFSET == 3104, "ENC2_W_OFFSET must be 3104");
-    check_true(upways::BOTTLENECK1_W_OFFSET == 12352, "BOTTLENECK1_W_OFFSET must be 12352");
-    check_true(upways::BOTTLENECK2_W_OFFSET == 30848, "BOTTLENECK2_W_OFFSET must be 30848");
-    check_true(upways::BOTTLENECK3_W_OFFSET == 67776, "BOTTLENECK3_W_OFFSET must be 67776");
-    check_true(upways::DEC2_W_OFFSET == 86240, "DEC2_W_OFFSET must be 86240");
-    check_true(upways::DEC1_W_OFFSET == 95488, "DEC1_W_OFFSET must be 95488");
-    check_true(upways::HEAD_OUT_W_OFFSET == 100640, "HEAD_OUT_W_OFFSET must be 100640");
-    check_true(upways::HEAD_REC_W_OFFSET == 101168, "HEAD_REC_W_OFFSET must be 101168");
-    check_true(upways::HEAD_REC_B_OFFSET + 16 == upways::TOTAL_WEIGHT_ELEMENTS, "HEAD_REC_B_OFFSET + 16 must equal 101,696");
+    check_true(upways::BOTTLENECK1_W_OFFSET == 6208, "BOTTLENECK1_W_OFFSET must be 6208");
+    check_true(upways::BOTTLENECK2_W_OFFSET == 12416, "BOTTLENECK2_W_OFFSET must be 12416");
+    check_true(upways::BOTTLENECK3_W_OFFSET == 24768, "BOTTLENECK3_W_OFFSET must be 24768");
+    check_true(upways::DEC2_W_OFFSET == 30944, "DEC2_W_OFFSET must be 30944");
+    check_true(upways::DEC1_W_OFFSET == 34048, "DEC1_W_OFFSET must be 34048");
+    check_true(upways::HEAD_OUT_W_OFFSET == 39200, "HEAD_OUT_W_OFFSET must be 39200");
+    check_true(upways::HEAD_REC_W_OFFSET == 39728, "HEAD_REC_W_OFFSET must be 39728");
+    check_true(upways::HEAD_REC_B_OFFSET + 16 == upways::TOTAL_WEIGHT_ELEMENTS, "HEAD_REC_B_OFFSET + 16 must equal 40,256");
 
     check_true(gateway::TOTAL_WEIGHT_BUFFER_SIZE == 2144, "Gateway TOTAL_WEIGHT_BUFFER_SIZE must be 2,144 bytes (1,072 FP16 params)");
     check_true(sizeof(gateway::DEFAULT_GATEWAY_WEIGHTS) == gateway::TOTAL_WEIGHT_BUFFER_SIZE, "Gateway embedded weights must be 2,144 bytes");
-    std::cout << "  -> Upways (101,696 FP16 params = 203,392B) and Gateway (1,072 FP16 params = 2,144B) verified." << std::endl;
+    std::cout << "  -> Upways (40,256 FP16 params = 80,512B) and Gateway (1,072 FP16 params = 2,144B) verified." << std::endl;
 
     // 5. Verify Exported Weights and Embedded Fallback Integrity
     std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
@@ -182,19 +182,19 @@ int main() {
     // 8. Verify 3-Pass Upways LDS Memory Footprint & Occupancy Invariants
     std::cout << "[TEST 8] 3-Pass Upways LDS Footprint & Wave32 Occupancy Invariants..." << std::endl;
     {
-        // Pass 1 (upways_temporal.comp): 4 x f16vec4[18][19] = 4 * 18 * 19 * 8B = 10,944 bytes (10.69 KB)
-        size_t pass1LdsBytes = 4 * 18 * 19 * 8;
-        // Pass 2 (upways_neural_guide.comp): float16_t s_buf[8192] = 8192 * 2B = 16,384 bytes (16.00 KB)
-        size_t pass2LdsBytes = 8192 * sizeof(uint16_t);
+        // Pass 1 (upways_temporal.comp): 2 x f16vec4[18][19] + float16_t s_lumS[18][20] = 5,472 + 720 = 6,192 bytes (6.05 KB)
+        size_t pass1LdsBytes = (2 * 18 * 19 * 8) + (18 * 20 * sizeof(uint16_t));
+        // Pass 2 (upways_neural_guide.comp): float16_t s_buf[8192] + float16_t s_e1[8192] = 32,768 bytes (32.00 KB)
+        size_t pass2LdsBytes = 2 * 8192 * sizeof(uint16_t);
         // Pass 3 (upways_upscale_resolve.comp): 4 x f16vec4[24][25] + float16_t s_met[18][19] = 19,200 + 684 = 19,884 bytes (19.42 KB)
         size_t pass3LdsBytes = (4 * 24 * 25 * 8) + (18 * 19 * sizeof(uint16_t));
 
-        check_true(pass1LdsBytes == 10944 && pass1LdsBytes < 32768, "Pass 1 LDS must be 10,944 bytes (< 32 KB)");
-        check_true(pass2LdsBytes == 16384, "Pass 2 LDS must be exactly 16,384 bytes (16.0 KB)");
-        check_true(pass3LdsBytes == 19884 && pass3LdsBytes < 32768, "Pass 3 LDS must be 19,884 bytes (< 32 KB)");
+        check_true(pass1LdsBytes == 6192 && pass1LdsBytes <= 32768, "Pass 1 LDS must be 6,192 bytes (<= 32 KB)");
+        check_true(pass2LdsBytes == 32768, "Pass 2 LDS must be exactly 32,768 bytes (32.0 KB)");
+        check_true(pass3LdsBytes == 19884 && pass3LdsBytes <= 32768, "Pass 3 LDS must be 19,884 bytes (<= 32 KB)");
         std::cout << "  -> LDS footprints verified: Pass 1 = " << (pass1LdsBytes / 1024.0f)
                   << " KB, Pass 2 = " << (pass2LdsBytes / 1024.0f)
-                  << " KB, Pass 3 = " << (pass3LdsBytes / 1024.0f) << " KB (< 32 KB budget)." << std::endl;
+                  << " KB, Pass 3 = " << (pass3LdsBytes / 1024.0f) << " KB (<= 32 KB budget)." << std::endl;
     }
 
     // 9. Verify Separate CLI Configuration for --denoiser gateway vs --denoiser upways
