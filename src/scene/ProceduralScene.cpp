@@ -3900,11 +3900,12 @@ static void buildCrystalClusterModel(std::vector<TriangleGPU>& tris, const glm::
     uint32_t accentMat = cyanVariant ? m.crystalViolet : m.crystalCyan;
     int accentCore = static_cast<int>(cyanVariant ? m.crystalCoreViolet : m.crystalCoreCyan);
 
-    // Deep fractured host-rock matrix pedestal base (extends down to Y = -0.32m so it embeds deeply into curved rock walls/ceilings/ground)
-    addFrustum(tris, origin + glm::vec3(0.0f, -0.04f, 0.0f),
-               glm::vec2(1.18f, 1.18f), glm::vec2(0.64f, 0.64f), 0.56f, m.rock);
-    addBox(tris, origin + glm::vec3(-0.24f, 0.06f, 0.18f), glm::vec3(0.38f, 0.34f, 0.34f), 28.0f, m.rock);
-    addBox(tris, origin + glm::vec3( 0.26f, 0.04f,-0.16f), glm::vec3(0.34f, 0.32f, 0.36f), -35.0f, m.rock);
+    // Deep fractured host-rock matrix pedestal base (extends down to Y = -0.45m so it embeds deeply into curved rock walls/ceilings/ground)
+    addFrustum(tris, origin + glm::vec3(0.0f, -0.10f, 0.0f),
+               glm::vec2(1.42f, 1.42f), glm::vec2(0.76f, 0.76f), 0.70f, m.rock);
+    addBox(tris, origin + glm::vec3(-0.28f, 0.04f, 0.20f), glm::vec3(0.46f, 0.42f, 0.42f), 28.0f, m.rock);
+    addBox(tris, origin + glm::vec3( 0.30f, 0.02f,-0.18f), glm::vec3(0.42f, 0.38f, 0.44f), -35.0f, m.rock);
+    addBox(tris, origin + glm::vec3( 0.00f,-0.02f,-0.28f), glm::vec3(0.44f, 0.36f, 0.38f), 12.0f, m.rock);
     addBox(tris, origin + glm::vec3( 0.08f, 0.18f, 0.22f), glm::vec3(0.18f, 0.16f, 0.18f), 15.0f, m.goldOre);
 
     // 9 Radiating Hexagonal Crystal Shards
@@ -4481,13 +4482,16 @@ SceneData ProceduralScene::createMineshaftScene() {
         glm::vec3 cPos, rAxis, uAxis, fAxis;
         evalMineshaftTrackFrame(s, cPos, rAxis, uAxis, fAxis);
 
-        // Smoothly expand tunnel in Zone 2 (Sluiceway: s=115..235m) and in Zone 3 (Grand Cavern: s=235..375m)
-        float sluiceEnv = glm::smoothstep(105.0f, 130.0f, s) * (1.0f - glm::smoothstep(222.0f, 244.0f, s));
-        float cavernEnv = glm::smoothstep(228.0f, 260.0f, s) * (1.0f - glm::smoothstep(348.0f, 380.0f, s));
+        // Smoothly expand tunnel in Zone 2 (Sluiceway: s=115..225m) and in Zone 3 (Grand Cavern: s=245..360m)
+        // Notice cavernEnv == 1.0 across the entire [244, 361]m trestle bridge plateau so every 4.85m trestle
+        // bent sits flat on the -4.85m cavern floor and no transition ramp encroaches on the cavern interior.
+        float sluiceEnv = glm::smoothstep(105.0f, 125.0f, s) * (1.0f - glm::smoothstep(218.0f, 236.0f, s));
+        float cavernEnv = glm::smoothstep(224.0f, 244.0f, s) * (1.0f - glm::smoothstep(361.0f, 381.0f, s));
 
         // Base clearance envelope strictly encloses the timber support arches (halfSpan = 1.62m, height = 3.05m)
-        float tunnelW   = 2.30f + 0.65f * sluiceEnv + 4.30f * cavernEnv;
-        float crownH    = 3.55f + 0.50f * sluiceEnv + 3.60f * cavernEnv;
+        // and expands into the Grand Cavern so the sweeping curved trestle bridge has wide lateral clearance
+        float tunnelW   = 2.30f + 0.65f * sluiceEnv + 3.85f * cavernEnv;
+        float crownH    = 3.55f + 0.50f * sluiceEnv + 2.15f * cavernEnv;
         float floorDrop = -0.06f - 4.79f * cavernEnv; // In Zone 3 cavern, floor drops to -4.85m for the trestle bridge
 
         float u = static_cast<float>(sClamped) / static_cast<float>(ringSectors);
@@ -4540,19 +4544,18 @@ SceneData ProceduralScene::createMineshaftScene() {
 
         for (int r = rStart; r < rEnd; ++r) {
             float sMid = ((static_cast<float>(r) + 0.5f) / static_cast<float>(totalRings)) * totalTrackLength;
-            bool inFloodedZone = (sMid >= 115.0f && sMid <= 378.0f);
-            uint32_t floorMat  = inFloodedZone ? m.waterSurface : m.wetFloor;
+            bool inCavernRamp  = (sMid > 224.0f && sMid < 244.0f) || (sMid > 361.0f && sMid < 381.0f);
+            bool inFloodedZone = !inCavernRamp && (sMid >= 115.0f && sMid <= 361.0f);
+            uint32_t floorMat  = inCavernRamp ? m.rock : (inFloodedZone ? m.waterSurface : m.wetFloor);
 
-            // Watertight 16-sector rock wall & ceiling arch (with integrated gold-ore vein strata in Zone 4)
-            bool inGoldZone = (sMid >= 378.0f && sMid <= 492.0f);
+            // Watertight 16-sector rock wall & ceiling arch (using exact 3D inward geometric normal)
             for (int sec = 0; sec < ringSectors; ++sec) {
                 auto [p00, n00] = getTunnelRingVertex(r, sec);
                 auto [p10, n10] = getTunnelRingVertex(r + 1, sec);
                 auto [p11, n11] = getTunnelRingVertex(r + 1, sec + 1);
                 auto [p01, n01] = getTunnelRingVertex(r, sec + 1);
-                glm::vec3 faceNorm = glm::normalize(n00 + n10 + n11 + n01);
-                bool isGoldVeinQuad = inGoldZone && (sec >= 2 && sec <= ringSectors - 3) && (((r + sec * 3) % 7) == 0);
-                addQuad(scene.triangles, p00, p10, p11, p01, faceNorm, isGoldVeinQuad ? m.goldOre : m.rock);
+                glm::vec3 faceNorm = glm::normalize(glm::cross(p10 - p00, p01 - p00));
+                addQuad(scene.triangles, p00, p10, p11, p01, faceNorm, m.rock);
             }
 
             // Subdivided 4-strip floor ribbon connecting sec=ringSectors (left wall base) to sec=0 (right wall base)
@@ -4565,8 +4568,8 @@ SceneData ProceduralScene::createMineshaftScene() {
                 glm::vec3 f01 = getTunnelFloorPoint(r,     1.0f - t1, n0);
                 glm::vec3 f11 = getTunnelFloorPoint(r + 1, 1.0f - t1, n1);
                 glm::vec3 f10 = getTunnelFloorPoint(r + 1, 1.0f - t0, n1);
-                glm::vec3 floorNorm = glm::normalize(n0 + n1);
-                addQuad(scene.triangles, f00, f01, f11, f10, floorNorm, floorMat);
+                glm::vec3 floorNorm = glm::normalize(glm::cross(f10 - f00, f01 - f00));
+                addQuad(scene.triangles, f00, f10, f11, f01, floorNorm, floorMat);
             }
 
             // Zone 2 (s = 118..225m): Rusty Iron & Brass Sluiceway Drainage Pipes mounted flush along the lower rock walls
@@ -4702,7 +4705,7 @@ SceneData ProceduralScene::createMineshaftScene() {
         glm::mat4 frameMat = makeCoasterFrameMatrix(pos, right, up, forward);
 
         bool inGrandCavern = (s >= 245.0f && s <= 360.0f);
-        bool inTransition  = (s > 228.0f && s < 245.0f) || (s > 360.0f && s < 378.0f);
+        bool inTransition  = (s > 224.0f && s < 245.0f) || (s > 360.0f && s < 381.0f);
 
         if (inGrandCavern) {
             // Wooden Trestle Bridge Viaduct Bent spanning the 5.35m cavern abyss
@@ -4773,34 +4776,34 @@ SceneData ProceduralScene::createMineshaftScene() {
         glm::vec3 cPos, rAxis, uAxis, fAxis;
         evalMineshaftTrackFrame(sMid, cPos, rAxis, uAxis, fAxis);
 
-        bool inCavern = (sMid >= 238.0f && sMid <= 368.0f);
+        bool inCavern     = (sMid >= 245.0f && sMid <= 360.0f);
+        bool inCavernRamp = (sMid > 224.0f && sMid < 245.0f) || (sMid > 360.0f && sMid < 381.0f);
 
-        // Helper to evaluate exact rock quad center & inward normal at ring r, sector sec
+        // Helper to evaluate exact rock quad center & 3D inward geometric normal at ring r, sector sec
         auto evalRockWallQuad = [&](int sec, glm::vec3& outPos, glm::vec3& outNorm) {
             auto [p00, n00] = getTunnelRingVertex(r,     sec);
             auto [p10, n10] = getTunnelRingVertex(r + 1, sec);
             auto [p11, n11] = getTunnelRingVertex(r + 1, sec + 1);
             auto [p01, n01] = getTunnelRingVertex(r,     sec + 1);
             outPos  = 0.25f * (p00 + p10 + p11 + p01);
-            outNorm = glm::normalize(n00 + n10 + n11 + n01);
+            outNorm = glm::normalize(glm::cross(p10 - p00, p01 - p00));
         };
 
         if (inCavern) {
-            // In the Grand Cavern, attach monumental crystal clusters directly to:
-            // 1. Cavern rock walls (left & right lower/mid walls, sec = 1..3 and 12..14)
-            // 2. Cavern rock ceiling arch (sec = 5..10)
-            // 3. Cavern rock ground floor well outside the wooden trestle bridge pilings (tLat in [0.12, 0.20] or [0.80, 0.88])
-            int secLeftWall  = 12 + (crystalCounter % 3);
-            int secRightWall = 1  + (crystalCounter % 3);
-            int secCeiling   = 5  + (crystalCounter % 6);
+            // In the Grand Cavern, attach crystal clusters directly to the cavern rock walls (sec = 3..4 and 11..12)
+            // and cavern rock ceiling arch (sec = 6..9), high above the wooden trestle guardrails so they never
+            // visually overlap the wooden bridge railing and are unmistakably rooted in the cavern rock arch.
+            int secLeftWall  = 11 + (crystalCounter % 2);
+            int secRightWall = 3  + (crystalCounter % 2);
+            int secCeiling   = 6  + (crystalCounter % 4);
 
             glm::vec3 wPosL, wNormL, wPosR, wNormR, cPosCeil, cNormCeil;
             evalRockWallQuad(secLeftWall,  wPosL,    wNormL);
             evalRockWallQuad(secRightWall, wPosR,    wNormR);
             evalRockWallQuad(secCeiling,   cPosCeil, cNormCeil);
 
-            float scaleWall = 1.65f + 0.55f * std::abs(std::sin(static_cast<float>(crystalCounter) * 1.3f));
-            float scaleCeil = 1.85f + 0.65f * std::abs(std::cos(static_cast<float>(crystalCounter) * 1.7f));
+            float scaleWall = 1.25f + 0.35f * std::abs(std::sin(static_cast<float>(crystalCounter) * 1.3f));
+            float scaleCeil = 1.35f + 0.40f * std::abs(std::cos(static_cast<float>(crystalCounter) * 1.7f));
             bool isCyanL = ((crystalCounter % 2) == 0);
             bool isCyanR = !isCyanL;
             bool isCyanC = ((crystalCounter % 3) != 0);
@@ -4808,22 +4811,12 @@ SceneData ProceduralScene::createMineshaftScene() {
             placeCrystalOnRock(sMid, wPosL,    wNormL,    fAxis, scaleWall, isCyanL, true);
             placeCrystalOnRock(sMid, wPosR,    wNormR,    fAxis, scaleWall, isCyanR, (crystalCounter % 2 == 0));
             placeCrystalOnRock(sMid, cPosCeil, cNormCeil, fAxis, scaleCeil, isCyanC, (crystalCounter % 2 == 1));
-
-            // Cavern rock ground cluster (far left or far right of the wooden trestle pilings at |x| <= 2.65m)
-            float tFloor = (crystalCounter % 2 == 0) ? 0.14f : 0.86f;
-            glm::vec3 fNorm0, fNorm1;
-            glm::vec3 fPos0 = getTunnelFloorPoint(r,     tFloor, fNorm0);
-            glm::vec3 fPos1 = getTunnelFloorPoint(r + 1, tFloor, fNorm1);
-            glm::vec3 floorPos  = 0.5f * (fPos0 + fPos1);
-            glm::vec3 floorNorm = glm::normalize(fNorm0 + fNorm1 + ((tFloor < 0.5f) ? -rAxis : rAxis) * 0.25f);
-            float scaleFloor = 1.55f + 0.45f * std::abs(std::sin(static_cast<float>(crystalCounter) * 2.1f));
-            placeCrystalOnRock(sMid, floorPos, floorNorm, fAxis, scaleFloor, (crystalCounter % 3 == 0), false);
         } else {
             // In standard rock tunnels (Zones 1, 2, 4), place crystals across rock ground, rock walls, and rock ceiling!
             // Because r % 4 == 2 is 2.5m away from the nearest timber support arch (r % 4 == 0),
             // and ground crystals are placed at the outer rock floor corners (|x| ~ 1.8m, well outside the 0.76m wooden sleepers),
             // crystals NEVER touch wood and NEVER float in air.
-            int mode = crystalCounter % 3; // 0 = rock wall, 1 = rock ceiling, 2 = rock ground beside wall
+            int mode = inCavernRamp ? (crystalCounter % 2) : (crystalCounter % 3); // 0 = rock wall, 1 = rock ceiling, 2 = rock ground beside wall
             bool sideLeft = ((crystalCounter / 3) % 2 == 0);
             bool isCyan   = ((crystalCounter % 3) != 0);
             float scale   = 0.68f + 0.22f * std::abs(std::sin(static_cast<float>(crystalCounter) * 1.7f));

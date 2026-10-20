@@ -664,20 +664,37 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_coasterLastEvalTime = -999.0f;
     if (m_sceneData.isMineshaftCoaster) {
         // Automatically parent camera to the second minecart facing forward and ensure looping animation is active
+        if (m_cameraPath) {
+            m_cameraPath.reset();
+        }
         m_config.animate_objects = true;
         if (m_config.animation_speed <= 0.0f) {
             m_config.animation_speed = 1.0f;
         }
         setCameraMode(false);
+        glm::vec3 cCamPos, cCamTarget, cCamUp;
+        float cCamFov = 58.0f;
+        glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
+        float initTime = (m_config.camera_path_freeze_time >= 0.0f) ? m_config.camera_path_freeze_time : 0.0f;
+        ProceduralScene::updateMineshaftCoaster(
+            m_sceneData, initTime,
+            cCamPos, cCamTarget, cCamUp, cCamFov,
+            riderMat, lead1Mat, lead2Mat
+        );
+        if (m_sceneData.coasterRiderCartInst != UINT32_MAX) {
+            updateInstanceTransform(m_sceneData.coasterRiderCartInst, riderMat);
+        }
+        if (m_sceneData.coasterLeadCart1Inst != UINT32_MAX) {
+            updateInstanceTransform(m_sceneData.coasterLeadCart1Inst, lead1Mat);
+        }
+        if (m_sceneData.coasterLeadCart2Inst != UINT32_MAX) {
+            updateInstanceTransform(m_sceneData.coasterLeadCart2Inst, lead2Mat);
+        }
+        if (m_sceneManager) {
+            m_sceneManager->updateDynamicLights(m_sceneData);
+            m_numLights = m_sceneManager->getNumLights();
+        }
         if (m_camera) {
-            glm::vec3 cCamPos, cCamTarget, cCamUp;
-            float cCamFov = 58.0f;
-            glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
-            ProceduralScene::updateMineshaftCoaster(
-                m_sceneData, 0.0f,
-                cCamPos, cCamTarget, cCamUp, cCamFov,
-                riderMat, lead1Mat, lead2Mat
-            );
             m_camera->setAnimatedPose(cCamPos, cCamTarget, cCamUp, cCamFov);
             m_camera->resetMoved();
         }
