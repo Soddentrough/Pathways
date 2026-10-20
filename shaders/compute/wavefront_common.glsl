@@ -421,7 +421,7 @@ void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
         }
         InstanceGPU inst = instances[h.instanceId];
         pos = (inst.transform * vec4(localPos, 1.0)).xyz;
-        mat3 normalMat = transpose(mat3(inst.invTransform));
+        mat3 normalMat = transpose(inverse(mat3(inst.transform)));
         vec3 worldNorm = normalMat * localNorm;
         float lenNorm = length(worldNorm);
         norm = (lenNorm > 1e-8) ? (worldNorm / lenNorm) : vec3(0.0, 1.0, 0.0);
@@ -545,13 +545,32 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     do { \
         if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
+            vec2 vSurf_ = imageLoad(uMlSpecularMotionImage, pCoord_).xy; \
             float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
             vec3 toSurf_ = origin - ubo.position.xyz; \
             float surfDist_ = length(toSurf_); \
             vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
             vec3 xVirt_ = origin + primDir_ * reflDist_; \
+            vec3 prevXVirt_ = xVirt_; \
+            if (!(isMiss) && (hit.hitData1.w & 1u) == 0u && hit.hitData1.y != 0xFFFFFFFFu) { \
+                vec2 rBary_ = unpackUnorm2x16(hit.hitData1.z); \
+                float rW_ = 1.0 - rBary_.x - rBary_.y; \
+                vec3 rV0_ = vertexPositions[3u * hit.hitData1.y + 0u].xyz; \
+                vec3 rV1_ = vertexPositions[3u * hit.hitData1.y + 1u].xyz; \
+                vec3 rV2_ = vertexPositions[3u * hit.hitData1.y + 2u].xyz; \
+                vec3 rLocalPos_ = rW_ * rV0_ + rBary_.x * rV1_ + rBary_.y * rV2_; \
+                InstanceGPU rInst_ = instances[hit.hitData1.x]; \
+                vec3 rCurrWorld_ = (rInst_.transform * vec4(rLocalPos_, 1.0)).xyz; \
+                vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
+                vec3 rDeltaWorld_ = rCurrWorld_ - rPrevWorld_; \
+                vec3 reflAxis_ = rayDir - primDir_; \
+                float axisLenSq_ = dot(reflAxis_, reflAxis_); \
+                vec3 nMirror_ = (axisLenSq_ > 1e-6) ? (reflAxis_ * inversesqrt(axisLenSq_)) : vec3(0.0, 1.0, 0.0); \
+                vec3 virtDelta_ = rDeltaWorld_ - 2.0 * dot(rDeltaWorld_, nMirror_) * nMirror_; \
+                prevXVirt_ = xVirt_ - virtDelta_; \
+            } \
             vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
-            vec4 pClip_ = ubo.prevViewProj * vec4(xVirt_, 1.0); \
+            vec4 pClip_ = ubo.prevViewProj * vec4(prevXVirt_, 1.0); \
             vec2 vS_ = vec2(0.0); \
             if (cClip_.w > 1e-4) { \
                 if (pClip_.w > 1e-2) { \
@@ -559,6 +578,9 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
                 } else { \
                     vS_ = vec2(2.0); \
                 } \
+            } \
+            if (dot(vSurf_, vSurf_) > dot(vS_, vS_)) { \
+                vS_ = vSurf_; \
             } \
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
             imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \

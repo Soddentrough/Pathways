@@ -69,7 +69,7 @@ UpwaysPipeline::UpwaysPipeline(
     refreshDescriptors();
 
     m_initialized = true;
-    Logger::info("UpwaysPipeline successfully initialized (3-pass 80.5 KB 3-Scale 2D Halo-WMMA Recurrent U-Net + Fused 2-Stage KPN architecture).");
+    Logger::info("UpwaysPipeline successfully initialized (3-pass 81.6 KB 3-Scale 2D Halo-WMMA Recurrent U-Net + Fused 2-Stage KPN architecture).");
 }
 
 UpwaysPipeline::~UpwaysPipeline() {
@@ -249,26 +249,26 @@ void UpwaysPipeline::initImages() {
     for (int i = 0; i < 2; ++i) {
         m_diffHistoryImages[i] = std::make_unique<Image>(
             m_device, m_allocator,
-            m_inputWidth, m_inputHeight,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_outputWidth, m_outputHeight,
+            VK_FORMAT_R32G32B32A32_UINT,
             imgUsage
         );
         m_specHistoryImages[i] = std::make_unique<Image>(
             m_device, m_allocator,
             m_inputWidth, m_inputHeight,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_FORMAT_R32G32_UINT,
             imgUsage
         );
         m_momentsHistoryImages[i] = std::make_unique<Image>(
             m_device, m_allocator,
-            m_inputWidth, m_inputHeight,
+            m_outputWidth, m_outputHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             imgUsage
         );
         m_displayHistoryImages[i] = std::make_unique<Image>(
             m_device, m_allocator,
             m_outputWidth, m_outputHeight,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_FORMAT_R32G32_UINT,
             imgUsage
         );
     }
@@ -276,13 +276,13 @@ void UpwaysPipeline::initImages() {
     m_tempDiffImage = std::make_unique<Image>(
         m_device, m_allocator,
         m_inputWidth, m_inputHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_FORMAT_R32G32B32A32_UINT,
         imgUsage
     );
     m_tempSpecImage = std::make_unique<Image>(
         m_device, m_allocator,
         m_inputWidth, m_inputHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_FORMAT_R32G32B32A32_UINT,
         imgUsage
     );
     m_reprojDiffImage = std::make_unique<Image>(
@@ -420,7 +420,7 @@ void UpwaysPipeline::createDescriptorSetLayouts() {
     };
     m_neuralGuideDescLayout = createLayout(makeBindings(ngTypes));
 
-    // Pass 3: Fused 2-Stage Hierarchical Multi-Scale KPN Upscale & Resolve (0..4: Image, 5: SSBO, 6..9: Image = 10 bindings)
+    // Pass 3: Fused 2-Stage Hierarchical Multi-Scale KPN Upscale & Resolve (0..4: Image, 5: SSBO, 6..16: Image, 17: SSBO = 18 bindings)
     std::vector<VkDescriptorType> upTypes = {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 0: uDenoisedDiffuse
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 1: uDenoisedSpecular
@@ -431,7 +431,15 @@ void UpwaysPipeline::createDescriptorSetLayouts() {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 6: uDisplayHistoryIn
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 7: uDisplayOut
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 8: uDisplayHistoryOut
-        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE   // 9: uSpecularMetallic (.a = metallic)
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 9: uSpecularMetallic (.a = metallic)
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 10: uSpecularMotion
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 11: uHistoryDiffuseIn
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 12: uHistorySpecularIn
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 13: uHistoryMomentsIn
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 14: uHistoryDiffuseOut
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 15: uHistorySpecularOut
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 16: uHistoryMomentsOut
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER  // 17: uWeights
     };
     m_upscaleDescLayout = createLayout(makeBindings(upTypes));
 }
@@ -574,7 +582,7 @@ void UpwaysPipeline::refreshDescriptors() {
         bindImg(ngSet, 7, m_specHistoryImages[writeSlot]->getImageView());
         bindBuf(ngSet, 8, m_upscaleKernelBuffer.get());
 
-        // Pass 3: Fused 2-Stage Hierarchical Multi-Scale KPN Upscale & Physical Remodulation (10 bindings)
+        // Pass 3: Fused 2-Stage Hierarchical Multi-Scale KPN Upscale & Physical Remodulation (18 bindings)
         VkDescriptorSet uSet = m_upscaleDescSets[pingPong];
         bindImg(uSet, 0, m_tempDiffImage->getImageView());
         bindImg(uSet, 1, m_tempSpecImage->getImageView());
@@ -586,6 +594,14 @@ void UpwaysPipeline::refreshDescriptors() {
         bindImg(uSet, 7, m_outputImage->getImageView());
         bindImg(uSet, 8, m_displayHistoryImages[writeSlot]->getImageView());
         bindImg(uSet, 9, dSpecView);
+        bindImg(uSet, 10, smView);
+        bindImg(uSet, 11, m_diffHistoryImages[readSlot]->getImageView());
+        bindImg(uSet, 12, m_specHistoryImages[readSlot]->getImageView());
+        bindImg(uSet, 13, m_momentsHistoryImages[readSlot]->getImageView());
+        bindImg(uSet, 14, m_diffHistoryImages[writeSlot]->getImageView());
+        bindImg(uSet, 15, m_specHistoryImages[writeSlot]->getImageView());
+        bindImg(uSet, 16, m_momentsHistoryImages[writeSlot]->getImageView());
+        bindBuf(uSet, 17, m_weightBuffer.get());
     }
 
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -659,7 +675,7 @@ void UpwaysPipeline::createPipelines(
 
     buildPipe(temporalSpv, m_temporalDescLayout, sizeof(UpwaysTemporalPushConstants), false, m_temporalPipeLayout, m_temporalPipeline);
     buildPipe(neuralGuideSpv, m_neuralGuideDescLayout, sizeof(UpwaysNeuralGuidePushConstants), true, m_neuralGuidePipeLayout, m_neuralGuidePipeline);
-    buildPipe(upscaleResolveSpv, m_upscaleDescLayout, sizeof(UpwaysUpscaleResolvePushConstants), false, m_upscalePipeLayout, m_upscalePipeline);
+    buildPipe(upscaleResolveSpv, m_upscaleDescLayout, sizeof(UpwaysUpscaleResolvePushConstants), true, m_upscalePipeLayout, m_upscalePipeline);
 }
 
 void UpwaysPipeline::resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes) {
@@ -802,7 +818,7 @@ void UpwaysPipeline::recordFrame(
     computeBarrier();
     writeTimestamp(1, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
-    // Pass 2: 3-Scale Spatiotemporal Recurrent 2D Halo-WMMA U-Net (40,256 FP16 params = 80,512 bytes over 2x2 quads)
+    // Pass 2: 3-Scale Spatiotemporal Recurrent 2D Halo-WMMA U-Net (40,800 FP16 params = 81,600 bytes over 2x2 quads)
     UpwaysNeuralGuidePushConstants pc2{
         m_inputWidth, m_inputHeight, resetFlag,
         minAlphaDiff, minAlphaSpec, 0.02f, 32.0f, 4.0f, 3.0f
@@ -819,7 +835,7 @@ void UpwaysPipeline::recordFrame(
     // Pass 3: Fused 2-Stage Hierarchical Multi-Scale Neural KPN Upscale & Physical Remodulation Resolve
     const uint32_t dGroupsX = (m_outputWidth + 15u) / 16u;
     const uint32_t dGroupsY = (m_outputHeight + 15u) / 16u;
-    uint32_t enableDispHistory = m_superRes ? ((!resetHistory) ? 1u : 0u) : 2u;
+    uint32_t enableDispHistory = (!resetHistory) ? 1u : 0u;
     float jitterScale = (m_superRes || resetHistory) ? 1.0f : 0.0f;
     float dispHistAlpha = m_superRes ? 0.15f : 0.20f;
     UpwaysUpscaleResolvePushConstants pc3{

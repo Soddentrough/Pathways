@@ -15,10 +15,7 @@ float upwaysLuminance(vec3 c) {
 }
 
 float sanitizeFloat(float v) {
-    if (isnan(v) || isinf(v)) {
-        return 0.0;
-    }
-    return clamp(v, 0.0, UPWAYS_MAX_RADIANCE);
+    return (isnan(v) || isinf(v)) ? 0.0 : clamp(v, 0.0, UPWAYS_MAX_RADIANCE);
 }
 
 vec3 sanitizeVec3(vec3 v) {
@@ -27,10 +24,8 @@ vec3 sanitizeVec3(vec3 v) {
 
 // Matches denoiseDemodulationFactor in Pathways/shaders/compute/denoise_common.glsl:16-21
 vec3 denoiseDemodulationFactor(vec3 albedo, float linearDepth) {
-    if (linearDepth >= UPWAYS_SKY_DEPTH || dot(albedo, albedo) <= UPWAYS_EMISSIVE_ALBEDO_SQ_EPS) {
-        return vec3(1.0);
-    }
-    return max(albedo, vec3(UPWAYS_MIN_DEMOD_ALBEDO));
+    bool isIdentity = (linearDepth >= UPWAYS_SKY_DEPTH || dot(albedo, albedo) <= UPWAYS_EMISSIVE_ALBEDO_SQ_EPS);
+    return isIdentity ? vec3(1.0) : max(albedo, vec3(UPWAYS_MIN_DEMOD_ALBEDO));
 }
 
 vec3 demodulateDiffuse(vec3 diffuseRad, vec3 albedo, float linearDepth) {
@@ -108,64 +103,65 @@ float evaluateFresnelLuminance(
     return clamp(upwaysLuminance(fEnv), 0.0, 1.0);
 }
 
-float karisWeight(vec3 rad) {
-    return 1.0 / (1.0 + upwaysLuminance(rad));
+// Packs log1p irradiance in [0, 11.09035489] into 32-bit 11-11-10 using FP16(v + 1.0) - 0x3C00u.
+// Since v + 1.0 is in [1.0, 12.09035489], its FP16 biased exponent is in 15..18 (2 bits), so
+// (h - 0x3C00u) is a 12-bit integer preserving all 10 FP16 mantissa bits. Zero-initialized 0u unpacks to vec3(0.0).
+uint packIrr11_11_10(vec3 v) {
+    vec3 vp1 = clamp(v, vec3(0.0), vec3(11.09035489)) + vec3(1.0);
+    uint hr_hg = packHalf2x16(vp1.rg);
+    uint hb    = packHalf2x16(vec2(vp1.b, 0.0));
+    uint r12 = clamp((hr_hg & 0xFFFFu) - 0x3C00u, 0u, 4095u);
+    uint g12 = clamp((hr_hg >> 16u)    - 0x3C00u, 0u, 4095u);
+    uint b12 = clamp((hb    & 0xFFFFu) - 0x3C00u, 0u, 4095u);
+    uint r11 = (r12 + 1u) >> 1u;
+    uint g11 = (g12 + 1u) >> 1u;
+    uint b10 = (b12 + 2u) >> 2u;
+    return (r11 & 0x7FFu) | ((g11 & 0x7FFu) << 11u) | ((b10 & 0x3FFu) << 22u);
 }
 
-float evaluateNormalWeight(vec3 nCenter, vec3 nTap, float phiNormal) {
-    float cosTheta = clamp(dot(nCenter, nTap), 0.0, 1.0);
-    return pow(cosTheta, max(phiNormal, 1.0));
+vec3 unpackIrr11_11_10(uint p) {
+    uint r12 = (p & 0x7FFu) << 1u;
+    uint g12 = ((p >> 11u) & 0x7FFu) << 1u;
+    uint b12 = ((p >> 22u) & 0x3FFu) << 2u;
+    uint hr_hg = (r12 + 0x3C00u) | ((g12 + 0x3C00u) << 16u);
+    uint hb    = (b12 + 0x3C00u);
+    vec2 rg = unpackHalf2x16(hr_hg) - vec2(1.0);
+    float b = unpackHalf2x16(hb).x - 1.0;
+    return max(vec3(f16vec3(vec3(rg, b))), vec3(0.0));
 }
 
-float evaluateNormalWeight16(vec3 nCenter, vec3 nTap) {
-    float c  = clamp(dot(nCenter, nTap), 0.0, 1.0);
-    float c2 = c * c;
-    float c4 = c2 * c2;
-    float c8 = c4 * c4;
-    return c8 * c8;
+uint packGuide11_11_10(vec3 g) {
+    vec3 c = clamp(g, vec3(0.0), vec3(1.0));
+    uint r  = uint(round(c.r * 2047.0));
+    uint gr = uint(round(c.g * 2047.0));
+    uint b  = uint(round(c.b * 1023.0));
+    return (r & 0x7FFu) | ((gr & 0x7FFu) << 11u) | ((b & 0x3FFu) << 22u);
 }
 
-float evaluateNormalWeight24(vec3 nCenter, vec3 nTap) {
-    float c  = clamp(dot(nCenter, nTap), 0.0, 1.0);
-    float c2 = c * c;
-    float c4 = c2 * c2;
-    float c8 = c4 * c4;
-    return (c8 * c8) * c8;
+vec3 unpackGuide11_11_10(uint p) {
+    float r = float(p & 0x7FFu) * (1.0 / 2047.0);
+    float g = float((p >> 11u) & 0x7FFu) * (1.0 / 2047.0);
+    float b = float((p >> 22u) & 0x3FFu) * (1.0 / 1023.0);
+    return vec3(f16vec3(vec3(r, g, b)));
 }
 
-float evaluateNormalWeight32(vec3 nCenter, vec3 nTap) {
-    float c16 = evaluateNormalWeight16(nCenter, nTap);
-    return c16 * c16;
+uint packSpecGuide29(vec3 g, bool isSurf, bool hasCustomSpecMv) {
+    vec3 c = clamp(g, vec3(0.0), vec3(1.0));
+    uint r  = uint(round(c.r * 1023.0)) & 0x3FFu;
+    uint gr = uint(round(c.g * 1023.0)) & 0x3FFu;
+    uint b  = uint(round(c.b * 511.0))  & 0x1FFu;
+    uint flags = (isSurf ? (1u << 29u) : 0u)
+               | (hasCustomSpecMv ? (1u << 31u) : 0u);
+    return r | (gr << 10u) | (b << 20u) | flags;
 }
 
-// Metric tangent-plane depth weight matching Pathways evaluatePlaneDepthWeight
-float evaluatePlaneDepthWeight(
-    float zCenter,
-    float zTap,
-    vec2 dzdxy,
-    vec2 offsetPx,
-    float phiDepth
-) {
-    float zExpected = zCenter + dot(dzdxy, offsetPx);
-    float absDiff = abs(zTap - zExpected);
-    float denom = max(phiDepth * max(zCenter, 0.1), 1e-4);
-    return exp(-clamp(absDiff / denom, 0.0, 20.0));
-}
-
-float evaluateRelativeDepthWeight(float zCenter, float zTap, float phiDepth) {
-    float relDiff = abs(zCenter - zTap) / max(max(zCenter, zTap), 0.1);
-    return exp(-clamp(relDiff / max(phiDepth, 1e-4), 0.0, 20.0));
-}
-
-// Soft logarithmic firefly rolloff above threshold T while preserving RGB chromaticity
-vec3 softClampLuminance(vec3 rad, float maxLum) {
-    vec3 clean = sanitizeVec3(rad);
-    float lum = upwaysLuminance(clean);
-    if (lum <= maxLum || lum <= 1e-6) {
-        return clean;
-    }
-    float compressedLum = maxLum + log(1.0 + (lum - maxLum));
-    return clean * (compressedLum / lum);
+vec3 unpackSpecGuide29(uint p, out float isSurf, out bool hasCustomSpecMv) {
+    float r = float(p & 0x3FFu) * (1.0 / 1023.0);
+    float g = float((p >> 10u) & 0x3FFu) * (1.0 / 1023.0);
+    float b = float((p >> 20u) & 0x1FFu) * (1.0 / 511.0);
+    isSurf          = ((p & (1u << 29u)) != 0u) ? 1.0 : 0.0;
+    hasCustomSpecMv = ((p & (1u << 31u)) != 0u);
+    return vec3(f16vec3(vec3(r, g, b)));
 }
 
 #endif // UPWAYS_COMMON_GLSL

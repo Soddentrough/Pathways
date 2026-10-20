@@ -3716,27 +3716,22 @@ static void buildMinecartModel(std::vector<TriangleGPU>& tris, const glm::vec3& 
         }
     }
 
-    // 4. Mound of Mined Rock, Raw Gold Nuggets & Glowing Crystal Shards Inside Tub
-    addFrustum(tris, origin + glm::vec3(0.0f, tubTopY - 0.04f, 0.0f),
-               glm::vec2(0.92f, 1.42f), glm::vec2(0.56f, 0.96f), 0.22f, m.rock);
+    // 4. Mound of Mined Rock & Raw Gold Nuggets Inside Tub (kept low at front for clean rider sightlines)
+    addFrustum(tris, origin + glm::vec3(0.0f, tubTopY - 0.05f, 0.0f),
+               glm::vec2(0.92f, 1.42f), glm::vec2(0.56f, 0.96f), 0.18f, m.rock);
     const glm::vec3 oreOffsets[7] = {
-        glm::vec3(-0.22f, tubTopY + 0.06f,  0.30f),
-        glm::vec3( 0.18f, tubTopY + 0.08f,  0.15f),
-        glm::vec3(-0.10f, tubTopY + 0.10f, -0.20f),
-        glm::vec3( 0.25f, tubTopY + 0.05f, -0.35f),
-        glm::vec3( 0.02f, tubTopY + 0.11f,  0.42f),
-        glm::vec3(-0.28f, tubTopY + 0.05f, -0.05f),
-        glm::vec3( 0.14f, tubTopY + 0.09f, -0.05f)
+        glm::vec3(-0.22f, tubTopY + 0.02f,  0.28f),
+        glm::vec3( 0.18f, tubTopY + 0.03f,  0.15f),
+        glm::vec3(-0.10f, tubTopY + 0.05f, -0.22f),
+        glm::vec3( 0.25f, tubTopY + 0.03f, -0.35f),
+        glm::vec3( 0.02f, tubTopY + 0.02f,  0.38f),
+        glm::vec3(-0.28f, tubTopY + 0.03f, -0.05f),
+        glm::vec3( 0.14f, tubTopY + 0.04f, -0.08f)
     };
     for (int i = 0; i < 7; ++i) {
         uint32_t oreMat = (i % 2 == 0) ? m.goldOre : m.rock;
-        addBox(tris, origin + oreOffsets[i], glm::vec3(0.18f, 0.14f, 0.20f), static_cast<float>(i * 37), oreMat);
+        addBox(tris, origin + oreOffsets[i], glm::vec3(0.17f, 0.11f, 0.18f), static_cast<float>(i * 37), oreMat);
     }
-    // Crystal shards jutting out of the ore load
-    addHexCrystalPrism(tris, origin + glm::vec3(-0.12f, tubTopY + 0.04f, 0.22f),
-                       glm::normalize(glm::vec3(-0.25f, 0.92f, 0.20f)), 0.055f, 0.22f, 0.09f, m.crystalViolet, static_cast<int>(m.crystalCoreViolet));
-    addHexCrystalPrism(tris, origin + glm::vec3(0.16f, tubTopY + 0.04f, -0.12f),
-                       glm::normalize(glm::vec3(0.30f, 0.88f, -0.15f)), 0.050f, 0.20f, 0.08f, m.crystalCyan, static_cast<int>(m.crystalCoreCyan));
 
     // 5. Front Brass & Glass Carbide Headlamp Assembly (at Z = +0.84m)
     glm::vec3 lampCenter = origin + glm::vec3(0.0f, tubTopY - 0.12f, 0.85f);
@@ -3806,10 +3801,10 @@ static void buildMineLanternModel(std::vector<TriangleGPU>& tris, const glm::vec
 
 // Model 3: Heavy Timber Tunnel Support Arch & Overhead Lagging
 static void buildTimberSupportModel(std::vector<TriangleGPU>& tris, const glm::vec3& baseOrigin, const MineshaftMaterials& m) {
-    const float halfSpanBottom = 1.65f;
-    const float halfSpanTop = 1.42f;
-    const float postHeight = 2.85f;
-    const float postThick = 0.26f;
+    const float halfSpanBottom = 1.62f;
+    const float halfSpanTop = 1.32f;
+    const float postHeight = 2.75f;
+    const float postThick = 0.24f;
 
     // Left and right battered oak posts (tilted inward toward tunnel crown)
     addBeam(tris,
@@ -3823,39 +3818,39 @@ static void buildTimberSupportModel(std::vector<TriangleGPU>& tris, const glm::v
 
     // Heavy horizontal collar / cap beam across the top
     addBox(tris, baseOrigin + glm::vec3(0.0f, postHeight + 0.12f, 0.0f),
-           glm::vec3(halfSpanTop * 2.0f + 0.52f, 0.28f, 0.28f), 0.0f, m.timber);
+           glm::vec3(halfSpanTop * 2.0f + 0.30f, 0.26f, 0.26f), 0.0f, m.timber);
 
     // 45-degree mortised knee braces
     addBeam(tris,
-            baseOrigin + glm::vec3(-halfSpanTop - 0.06f, postHeight - 0.78f, 0.0f),
-            baseOrigin + glm::vec3(-halfSpanTop + 0.72f, postHeight + 0.04f, 0.0f),
-            0.20f, 0.20f, m.timber);
+            baseOrigin + glm::vec3(-halfSpanTop - 0.05f, postHeight - 0.74f, 0.0f),
+            baseOrigin + glm::vec3(-halfSpanTop + 0.68f, postHeight + 0.04f, 0.0f),
+            0.19f, 0.19f, m.timber);
     addBeam(tris,
-            baseOrigin + glm::vec3( halfSpanTop + 0.06f, postHeight - 0.78f, 0.0f),
-            baseOrigin + glm::vec3( halfSpanTop - 0.72f, postHeight + 0.04f, 0.0f),
-            0.20f, 0.20f, m.timber);
+            baseOrigin + glm::vec3( halfSpanTop + 0.05f, postHeight - 0.74f, 0.0f),
+            baseOrigin + glm::vec3( halfSpanTop - 0.68f, postHeight + 0.04f, 0.0f),
+            0.19f, 0.19f, m.timber);
 
     // Cast-iron structural joint gusset plates & bolt heads
     for (int side = -1; side <= 1; side += 2) {
         float sx = static_cast<float>(side);
         glm::vec3 jointPos = baseOrigin + glm::vec3(sx * halfSpanTop, postHeight - 0.02f, 0.0f);
-        addBox(tris, jointPos, glm::vec3(0.32f, 0.32f, 0.31f), 0.0f, m.castIron);
-        addSphere(tris, jointPos + glm::vec3(0.0f, 0.06f,  0.17f), 0.025f, m.brass, 8, 8);
-        addSphere(tris, jointPos + glm::vec3(0.0f, -0.06f, 0.17f), 0.025f, m.brass, 8, 8);
-        addSphere(tris, jointPos + glm::vec3(0.0f, 0.06f, -0.17f), 0.025f, m.brass, 8, 8);
-        addSphere(tris, jointPos + glm::vec3(0.0f, -0.06f,-0.17f), 0.025f, m.brass, 8, 8);
+        addBox(tris, jointPos, glm::vec3(0.30f, 0.30f, 0.29f), 0.0f, m.castIron);
+        addSphere(tris, jointPos + glm::vec3(0.0f, 0.06f,  0.16f), 0.024f, m.brass, 8, 8);
+        addSphere(tris, jointPos + glm::vec3(0.0f, -0.06f, 0.16f), 0.024f, m.brass, 8, 8);
+        addSphere(tris, jointPos + glm::vec3(0.0f, 0.06f, -0.16f), 0.024f, m.brass, 8, 8);
+        addSphere(tris, jointPos + glm::vec3(0.0f, -0.06f,-0.16f), 0.024f, m.brass, 8, 8);
     }
 
     // Overhead & upper-wall rough-sawn lagging planks
-    for (int p = -3; p <= 3; ++p) {
+    for (int p = -2; p <= 2; ++p) {
         float px = static_cast<float>(p) * 0.42f;
-        addBox(tris, baseOrigin + glm::vec3(px, postHeight + 0.30f, 0.0f),
-               glm::vec3(0.34f, 0.06f, 1.40f), static_cast<float>(p) * 1.5f, m.timber);
+        addBox(tris, baseOrigin + glm::vec3(px, postHeight + 0.28f, 0.0f),
+               glm::vec3(0.34f, 0.06f, 1.32f), static_cast<float>(p) * 1.5f, m.timber);
     }
     // Wrought-iron lantern hook projecting inward from left knee brace
     addBeam(tris,
-            baseOrigin + glm::vec3(-halfSpanTop + 0.35f, postHeight - 0.22f, 0.0f),
-            baseOrigin + glm::vec3(-halfSpanTop + 0.55f, postHeight - 0.22f, 0.0f),
+            baseOrigin + glm::vec3(-halfSpanTop + 0.32f, postHeight - 0.20f, 0.0f),
+            baseOrigin + glm::vec3(-halfSpanTop + 0.52f, postHeight - 0.20f, 0.0f),
             0.03f, 0.03f, m.castIron);
 }
 
@@ -3905,12 +3900,12 @@ static void buildCrystalClusterModel(std::vector<TriangleGPU>& tris, const glm::
     uint32_t accentMat = cyanVariant ? m.crystalViolet : m.crystalCyan;
     int accentCore = static_cast<int>(cyanVariant ? m.crystalCoreViolet : m.crystalCoreCyan);
 
-    // Fractured host-rock matrix base with gold ore veins
-    addFrustum(tris, origin + glm::vec3(0.0f, 0.10f, 0.0f),
-               glm::vec2(0.85f, 0.85f), glm::vec2(0.55f, 0.55f), 0.22f, m.rock);
-    addBox(tris, origin + glm::vec3(-0.22f, 0.14f, 0.16f), glm::vec3(0.32f, 0.22f, 0.28f), 28.0f, m.rock);
-    addBox(tris, origin + glm::vec3( 0.24f, 0.12f,-0.14f), glm::vec3(0.28f, 0.20f, 0.30f), -35.0f, m.rock);
-    addBox(tris, origin + glm::vec3( 0.08f, 0.20f, 0.22f), glm::vec3(0.16f, 0.12f, 0.16f), 15.0f, m.goldOre);
+    // Deep fractured host-rock matrix pedestal base (extends down to Y = -0.32m so it embeds deeply into curved rock walls/ceilings/ground)
+    addFrustum(tris, origin + glm::vec3(0.0f, -0.04f, 0.0f),
+               glm::vec2(1.18f, 1.18f), glm::vec2(0.64f, 0.64f), 0.56f, m.rock);
+    addBox(tris, origin + glm::vec3(-0.24f, 0.06f, 0.18f), glm::vec3(0.38f, 0.34f, 0.34f), 28.0f, m.rock);
+    addBox(tris, origin + glm::vec3( 0.26f, 0.04f,-0.16f), glm::vec3(0.34f, 0.32f, 0.36f), -35.0f, m.rock);
+    addBox(tris, origin + glm::vec3( 0.08f, 0.18f, 0.22f), glm::vec3(0.18f, 0.16f, 0.18f), 15.0f, m.goldOre);
 
     // 9 Radiating Hexagonal Crystal Shards
     struct ShardSpec {
@@ -4147,50 +4142,93 @@ SceneData ProceduralScene::createMineshaftModelShowcase(const std::string& model
 }
 
 // =========================================================================================
-// 500-Meter, 30-Second 4-Zone Mineshaft Coaster Spline & Kinematic Ride Evaluator
+// 500-Meter, 30-Second Seamless Closed-Loop 4-Zone Mineshaft Coaster Spline & Ride Evaluator
 // =========================================================================================
-// Parameter s in [0, 500] meters represents distance along the primary Z progression (Z = -s).
-//   Zone 1 (  0..115m): Old Timber Shaft & First Steep Plunge (-18m drop)
-//   Zone 2 (115..235m): Flooded Sluiceway & High-Speed Banked S-Curves
+// Parameter s in [0, 500) meters represents periodic arc-length distance around a closed 3D loop:
+//   Zone 1 (  0..115m): Old Timber Shaft & First Steep Plunge
+//   Zone 2 (115..235m): Flooded Sluiceway & Banked S-Curves
 //   Zone 3 (235..375m): Grand Crystal Geode Cavern & Wooden Trestle Viaduct over Abyss
-//   Zone 4 (375..500m): Gold-Vein Corkscrew Slalom & Deep Geothermal Finale
-static glm::vec3 evalMineshaftTrackCenter(float s) {
-    const float PI = 3.14159265358979323846f;
-    s = glm::clamp(s, -5.0f, 510.0f);
+//   Zone 4 (375..500m): Gold-Vein Corkscrew Slalom & Return Climb into Zone 1
+static constexpr float kMineshaftLoopLength = 500.0f;
 
-    // Smooth zone envelopes
-    float wZ1 = 1.0f - glm::smoothstep(100.0f, 130.0f, s);
-    float wZ2 = glm::smoothstep(100.0f, 130.0f, s) * (1.0f - glm::smoothstep(220.0f, 250.0f, s));
-    float wZ3 = glm::smoothstep(220.0f, 250.0f, s) * (1.0f - glm::smoothstep(360.0f, 390.0f, s));
-    float wZ4 = glm::smoothstep(360.0f, 390.0f, s);
+static inline float wrapMineshaftDistance(float s) {
+    float w = std::fmod(s, kMineshaftLoopLength);
+    if (w < 0.0f) w += kMineshaftLoopLength;
+    return w;
+}
 
-    // Lateral X(s):
-    // Zone 1: Sweeping right-then-left plunge curve
-    float x1 = 6.5f * std::sin(s * (2.0f * PI / 110.0f)) - 1.8f * std::cos(s * (2.0f * PI / 55.0f)) + 1.8f;
-    // Zone 2: Rapid banked S-curve chicanes through the flooded sluiceway
-    float x2 = 10.5f * std::sin((s - 115.0f) * (2.0f * PI / 68.0f));
-    // Zone 3: Majestic wide sweeping viaduct curve across the Grand Crystal Cavern
-    float x3 = 14.0f * std::sin((s - 235.0f) * (PI / 140.0f)) - 4.5f * std::sin((s - 235.0f) * (2.0f * PI / 70.0f));
-    // Zone 4: Tight high-G corkscrew slalom into the gold-vein forge brake run
-    float brakeTaper = 1.0f - glm::smoothstep(455.0f, 492.0f, s);
-    float x4 = brakeTaper * (9.2f * std::sin((s - 375.0f) * (2.0f * PI / 52.0f)));
+static inline float mineshaftCircularDistance(float a, float b) {
+    float d = std::abs(wrapMineshaftDistance(a) - wrapMineshaftDistance(b));
+    return std::min(d, kMineshaftLoopLength - d);
+}
 
-    float x = wZ1 * x1 + wZ2 * x2 + wZ3 * x3 + wZ4 * x4;
+// Smooth periodic 3D loop parameterized by phase theta in [0, 2*PI).
+// Designed as a gentle figure-8 / kidney loop with minimum radius of curvature > 26m everywhere
+// (and > 45m across the wide Zone 3 Grand Cavern) so the extruded tunnel & cavern walls never
+// self-intersect or fold, and all derivatives are C^infinity continuous across s = 0 <-> 500m.
+static glm::vec3 evalMineshaftLoopRaw(float theta) {
+    // Horizontal closed loop (total arc length ~500m):
+    // X(theta) has a broad primary loop plus gentle 2nd and 3rd harmonic S-curves
+    float x = 52.0f * std::sin(theta)
+            + 9.5f  * std::sin(2.0f * theta + 0.45f)
+            + 3.2f  * std::sin(3.0f * theta - 0.30f);
 
-    // Vertical Y(s): Rollercoaster elevation profile (drops from Y = 0m down to Y = -58m)
-    // Base descent slope + First Big Plunge (s = 18..78m) + Sluiceway Camelback + Cavern Viaduct Arch + Finale Drop
-    float firstPlunge = -14.5f * glm::smoothstep(14.0f, 72.0f, s);
-    float camelback   =  2.8f  * std::sin(glm::clamp((s - 72.0f) / 48.0f, 0.0f, 1.0f) * PI);
-    float sluiceDrop  = -11.0f * glm::smoothstep(115.0f, 235.0f, s)
-                      +  1.8f  * std::sin(glm::clamp((s - 120.0f) / 115.0f, 0.0f, 1.0f) * 3.0f * PI);
-    float cavernArch  = -8.5f  * glm::smoothstep(235.0f, 375.0f, s)
-                      +  3.6f  * std::sin(glm::clamp((s - 235.0f) / 140.0f, 0.0f, 1.0f) * PI);
-    float goldPlunge  = -16.0f * glm::smoothstep(370.0f, 475.0f, s)
-                      +  2.2f  * std::sin(glm::clamp((s - 375.0f) / 90.0f, 0.0f, 1.0f) * 2.0f * PI);
+    // Z(theta) has a long 188m main axis with gentle 2nd harmonic asymmetry
+    float z = 94.0f * std::cos(theta)
+            + 7.0f  * std::cos(2.0f * theta - 0.25f)
+            - 94.0f;
 
-    float y = firstPlunge + camelback + sluiceDrop + cavernArch + goldPlunge;
-    float z = 12.0f - s; // Starts at Z = +12m (s=0) and runs to Z = -488m (s=500)
+    // Vertical Y(theta) rollercoaster profile (periodic, smooth plunges and climbs):
+    // Drops steeply in Zone 1, undulates through Zone 2 sluiceway, arches across the Zone 3
+    // Grand Cavern viaduct, plunges into Zone 4 gold forge, and climbs smoothly back to s = 0.
+    float y = -13.5f * (1.0f - std::cos(theta - 0.25f))
+            -  5.2f  * std::sin(2.0f * theta - 0.40f)
+            +  2.6f  * std::cos(3.0f * theta + 0.20f)
+            -  1.2f  * std::sin(4.0f * theta);
+
     return glm::vec3(x, y, z);
+}
+
+static glm::vec3 evalMineshaftTrackCenter(float s) {
+    static constexpr float TWO_PI = 6.28318530717958647692f;
+    static constexpr int LUT_SAMPLES = 2048;
+
+    // Build static arc-length table once so parameter s in [0, 500) is uniform in 3D arc length
+    struct LoopArcLut {
+        float thetaForArc[LUT_SAMPLES + 1];
+        LoopArcLut() {
+            float cumLen[LUT_SAMPLES + 1];
+            cumLen[0] = 0.0f;
+            glm::vec3 prev = evalMineshaftLoopRaw(0.0f);
+            for (int i = 1; i <= LUT_SAMPLES; ++i) {
+                float th = (static_cast<float>(i) / static_cast<float>(LUT_SAMPLES)) * TWO_PI;
+                glm::vec3 cur = evalMineshaftLoopRaw(th);
+                cumLen[i] = cumLen[i - 1] + glm::length(cur - prev);
+                prev = cur;
+            }
+            float totalLen = cumLen[LUT_SAMPLES];
+            thetaForArc[0] = 0.0f;
+            thetaForArc[LUT_SAMPLES] = TWO_PI;
+            int k = 0;
+            for (int i = 1; i < LUT_SAMPLES; ++i) {
+                float targetLen = (static_cast<float>(i) / static_cast<float>(LUT_SAMPLES)) * totalLen;
+                while (k + 1 < LUT_SAMPLES && cumLen[k + 1] < targetLen) {
+                    ++k;
+                }
+                float seg = std::max(1e-6f, cumLen[k + 1] - cumLen[k]);
+                float alpha = (targetLen - cumLen[k]) / seg;
+                thetaForArc[i] = ((static_cast<float>(k) + alpha) / static_cast<float>(LUT_SAMPLES)) * TWO_PI;
+            }
+        }
+    };
+    static const LoopArcLut arcLut{};
+
+    float wS = wrapMineshaftDistance(s);
+    float fIdx = (wS / kMineshaftLoopLength) * static_cast<float>(LUT_SAMPLES);
+    int idx0 = std::clamp(static_cast<int>(fIdx), 0, LUT_SAMPLES - 1);
+    float frac = fIdx - static_cast<float>(idx0);
+    float theta = glm::mix(arcLut.thetaForArc[idx0], arcLut.thetaForArc[idx0 + 1], frac);
+    return evalMineshaftLoopRaw(theta);
 }
 
 static void evalMineshaftTrackFrame(float s, glm::vec3& outPos, glm::vec3& outRight, glm::vec3& outUp, glm::vec3& outForward) {
@@ -4205,10 +4243,10 @@ static void evalMineshaftTrackFrame(float s, glm::vec3& outPos, glm::vec3& outRi
     float flatLen = glm::length(flatRight);
     flatRight = (flatLen > 1e-5f) ? (flatRight / flatLen) : glm::vec3(-1.0f, 0.0f, 0.0f);
 
-    // Centripetal lateral curvature banking: rolls the cart into every left/right turn
+    // Centripetal lateral curvature banking: rolls the cart smoothly into every left/right turn
     glm::vec3 accel = (nextPos - 2.0f * outPos + prevPos) / (ds * ds);
     float latCurv = glm::dot(accel, flatRight);
-    float bankAngle = glm::clamp(latCurv * 6.5f, -0.44f, 0.44f); // up to ~25 deg roll banking
+    float bankAngle = glm::clamp(latCurv * 6.5f, -0.38f, 0.38f); // up to ~22 deg roll banking
 
     glm::vec3 bankedUp = glm::normalize(worldUp + flatRight * std::tan(bankAngle));
     outRight = glm::normalize(glm::cross(bankedUp, outForward));
@@ -4224,31 +4262,31 @@ static glm::mat4 makeCoasterFrameMatrix(const glm::vec3& pos, const glm::vec3& r
     return m;
 }
 
-// Maps elapsed ride time (0..30s loop) to track parameter s in [6.0, 476.0] meters
+// Maps elapsed ride time (30s per full 500m loop) to periodic track distance s in [0, 500) meters
 // with physically motivated gravity acceleration on plunges and slight slowdowns on crests.
+// Seamless across loop boundaries: s(t + 30.0f) == s(t) mod 500.0f with continuous velocity.
 static float mapCoasterTimeToDistance(float simTimeSec, float* outSpeedMps = nullptr) {
     static constexpr float RIDE_DURATION = 30.0f;
-    static constexpr float S_START = 6.0f;
-    static constexpr float S_END   = 476.0f;
-    static constexpr int   STEPS   = 300;
+    static constexpr int   STEPS         = 500;
 
-    // Build static pre-integrated time->distance table once
+    // Build static pre-integrated periodic time->distance table once over the full 500m loop
     struct CoasterLut {
         float sTable[STEPS + 1];
         float vTable[STEPS + 1];
         CoasterLut() {
             float rawTime[STEPS + 1];
             rawTime[0] = 0.0f;
-            float ds = (S_END - S_START) / static_cast<float>(STEPS);
+            float ds = kMineshaftLoopLength / static_cast<float>(STEPS);
             for (int i = 0; i <= STEPS; ++i) {
-                float s = S_START + static_cast<float>(i) * ds;
+                float s = static_cast<float>(i) * ds;
                 glm::vec3 p0 = evalMineshaftTrackCenter(s - 0.5f);
                 glm::vec3 p1 = evalMineshaftTrackCenter(s + 0.5f);
                 float slope = (p1.y - p0.y); // negative on downhill drops
 
-                // Downhill drops boost speed; cavern bridge crest savors the view; finale stays fast
-                float zoneCavernSlow = 1.0f - 0.14f * glm::smoothstep(240.0f, 275.0f, s) * (1.0f - glm::smoothstep(335.0f, 365.0f, s));
-                float vRel = std::clamp(1.0f - 1.35f * slope, 0.68f, 1.42f) * zoneCavernSlow;
+                // Downhill drops boost speed; cavern bridge crest savors the view
+                float wS = wrapMineshaftDistance(s);
+                float zoneCavernSlow = 1.0f - 0.14f * glm::smoothstep(240.0f, 275.0f, wS) * (1.0f - glm::smoothstep(335.0f, 365.0f, wS));
+                float vRel = std::clamp(1.0f - 1.25f * slope, 0.72f, 1.38f) * zoneCavernSlow;
                 vTable[i] = vRel;
                 if (i > 0) {
                     float avgV = 0.5f * (vTable[i - 1] + vTable[i]);
@@ -4260,9 +4298,9 @@ static float mapCoasterTimeToDistance(float simTimeSec, float* outSpeedMps = nul
             for (int i = 0; i <= STEPS; ++i) {
                 vTable[i] *= speedScale;
             }
-            // Resample uniformly in normalized time u in [0, 1]
-            sTable[0] = S_START;
-            sTable[STEPS] = S_END;
+            // Resample uniformly in normalized time u in [0, 1] across [0, 500]
+            sTable[0] = 0.0f;
+            sTable[STEPS] = kMineshaftLoopLength;
             int k = 0;
             for (int i = 1; i < STEPS; ++i) {
                 float targetT = (static_cast<float>(i) / static_cast<float>(STEPS)) * totalRawTime;
@@ -4271,7 +4309,7 @@ static float mapCoasterTimeToDistance(float simTimeSec, float* outSpeedMps = nul
                 }
                 float segDt = std::max(1e-6f, rawTime[k + 1] - rawTime[k]);
                 float alpha = (targetT - rawTime[k]) / segDt;
-                sTable[i] = S_START + (static_cast<float>(k) + alpha) * ds;
+                sTable[i] = (static_cast<float>(k) + alpha) * ds;
             }
         }
     };
@@ -4287,7 +4325,7 @@ static float mapCoasterTimeToDistance(float simTimeSec, float* outSpeedMps = nul
     if (outSpeedMps) {
         *outSpeedMps = (lut.sTable[idx0 + 1] - lut.sTable[idx0]) * (static_cast<float>(STEPS) / RIDE_DURATION);
     }
-    return s;
+    return wrapMineshaftDistance(s);
 }
 
 void ProceduralScene::updateMineshaftCoaster(
@@ -4295,39 +4333,49 @@ void ProceduralScene::updateMineshaftCoaster(
     glm::vec3& outCamPos, glm::vec3& outCamTarget, glm::vec3& outCamUp, float& outCamFov,
     glm::mat4& outRiderCartMat, glm::mat4& outLeadCart1Mat, glm::mat4& outLeadCart2Mat)
 {
-    float speedMps = 15.6f;
-    float sRider = mapCoasterTimeToDistance(simTimeSec, &speedMps);
+    const float TWO_PI = 6.28318530717958647692f;
+    float speedMps = 16.6f;
+    float sRearCart = mapCoasterTimeToDistance(simTimeSec, &speedMps);
 
-    // Lead Cart #1 and #2 stay ahead on the rails with subtle accordion spacing on drops/climbs
-    float sLead1 = sRider + 6.6f + 1.35f * std::sin(simTimeSec * 1.65f);
-    float sLead2 = sRider + 14.8f + 1.90f * std::cos(simTimeSec * 1.25f);
+    // 3-cart coupled mine train with periodic harmonic accordion spacing (multiples of 2*PI / 30s
+    // so the train spacing is 100% periodic across the 30-second loop):
+    // - Cart 0 (coasterRiderCartInst): trailing third cart at sRearCart
+    // - Cart 1 (coasterLeadCart1Inst): SECOND (middle) cart at sSecondCart — CAMERA IS PARENTED HERE!
+    // - Cart 2 (coasterLeadCart2Inst): front lead cart at sFrontCart visible ahead of the camera
+    float phase1 = (simTimeSec / 30.0f) * TWO_PI * 8.0f;
+    float phase2 = (simTimeSec / 30.0f) * TWO_PI * 6.0f;
+    float sSecondCart = wrapMineshaftDistance(sRearCart + 6.4f + 0.85f * std::sin(phase1));
+    float sFrontCart  = wrapMineshaftDistance(sSecondCart + 7.2f + 0.95f * std::cos(phase2));
 
     glm::vec3 rPos, rRight, rUp, rFwd;
-    evalMineshaftTrackFrame(sRider, rPos, rRight, rUp, rFwd);
+    evalMineshaftTrackFrame(sRearCart, rPos, rRight, rUp, rFwd);
     outRiderCartMat = makeCoasterFrameMatrix(rPos, rRight, rUp, rFwd);
 
     glm::vec3 c1Pos, c1Right, c1Up, c1Fwd;
-    evalMineshaftTrackFrame(sLead1, c1Pos, c1Right, c1Up, c1Fwd);
+    evalMineshaftTrackFrame(sSecondCart, c1Pos, c1Right, c1Up, c1Fwd);
     outLeadCart1Mat = makeCoasterFrameMatrix(c1Pos, c1Right, c1Up, c1Fwd);
 
     glm::vec3 c2Pos, c2Right, c2Up, c2Fwd;
-    evalMineshaftTrackFrame(sLead2, c2Pos, c2Right, c2Up, c2Fwd);
+    evalMineshaftTrackFrame(sFrontCart, c2Pos, c2Right, c2Up, c2Fwd);
     outLeadCart2Mat = makeCoasterFrameMatrix(c2Pos, c2Right, c2Up, c2Fwd);
 
-    // First-person Rider Camera mounted at the front prow of the Rider's Minecart:
-    // Positioned ahead and above the internal ore load so the front riveted rim & brass carbide headlamp
-    // sit cleanly at the bottom edge of the frame while looking ahead at Lead Cart #1 & #2!
+    // Camera is parented directly to the SECOND cart (c1Pos / c1Right / c1Up / c1Fwd) facing forward:
+    // Positioned at the rider seat inside the second cart so the second cart's front riveted rim,
+    // glowing ore load, and brass carbide headlamp frame the bottom of the view while looking
+    // forward along the rails at the front lead cart (Cart #2)!
     glm::vec3 lookPos, lRight, lUp, lFwd;
-    evalMineshaftTrackFrame(sRider + 6.5f, lookPos, lRight, lUp, lFwd);
+    evalMineshaftTrackFrame(sSecondCart + 7.2f, lookPos, lRight, lUp, lFwd);
 
-    // Subtle high-frequency rail clatter vibration proportional to speed
-    float vib = 0.008f * glm::clamp(speedMps / 16.0f, 0.5f, 1.5f);
-    glm::vec3 railShake = rUp * (vib * std::sin(simTimeSec * 34.0f)) + rRight * (vib * 0.7f * std::cos(simTimeSec * 27.0f));
+    // Subtle high-frequency rail clatter vibration proportional to speed (periodic over 30s)
+    float vibPhaseA = (simTimeSec / 30.0f) * TWO_PI * 162.0f;
+    float vibPhaseB = (simTimeSec / 30.0f) * TWO_PI * 129.0f;
+    float vib = 0.007f * glm::clamp(speedMps / 16.0f, 0.5f, 1.5f);
+    glm::vec3 railShake = c1Up * (vib * std::sin(vibPhaseA)) + c1Right * (vib * 0.7f * std::cos(vibPhaseB));
 
-    outCamPos    = rPos + rUp * 1.56f + rFwd * 0.52f + railShake;
-    outCamTarget = lookPos + lUp * 0.92f;
-    outCamUp     = glm::normalize(glm::mix(glm::vec3(0.0f, 1.0f, 0.0f), rUp, 0.78f));
-    outCamFov    = glm::clamp(55.0f + (speedMps - 14.0f) * 0.9f, 52.0f, 62.0f);
+    outCamPos    = c1Pos + c1Up * 1.54f + c1Fwd * 0.44f + railShake;
+    outCamTarget = lookPos + lUp * 0.96f;
+    outCamUp     = glm::normalize(glm::mix(glm::vec3(0.0f, 1.0f, 0.0f), c1Up, 0.82f));
+    outCamFov    = glm::clamp(56.0f + (speedMps - 15.0f) * 0.9f, 53.0f, 62.0f);
 
     // Update Active Sliding-Window Light Buffer (Fixed 32 Lights = 6 Dynamic Cart Lights + 26 Nearest Static Lights)
     auto makePointAreaLight = [](glm::vec3 pos, glm::vec3 forwardDir, glm::vec3 emission, float size) -> LightGPU {
@@ -4350,32 +4398,32 @@ void ProceduralScene::updateMineshaftCoaster(
     scene.lights.reserve(kMaxActiveLights);
 
     // 1. Six Dynamic Cart Lights (2 per Minecart: Forward Carbide Headlamp Beam + Warm Rim/Tail Fill)
-    // Rider Cart headlamp beam + cockpit rim fill
+    // Rear Cart (Cart 0) headlamp beam + tail fill
     glm::vec3 riderLampPos = rPos + rUp * 1.04f + rFwd * 1.04f;
-    scene.lights.push_back(makePointAreaLight(riderLampPos, glm::normalize(rFwd - rUp * 0.12f), glm::vec3(95.0f, 74.0f, 40.0f), 0.22f));
-    scene.lights.push_back(makePointAreaLight(rPos + rUp * 1.38f + rFwd * 0.35f, glm::normalize(rFwd - rUp * 0.45f), glm::vec3(36.0f, 26.0f, 14.0f), 0.16f));
+    scene.lights.push_back(makePointAreaLight(riderLampPos, glm::normalize(rFwd - rUp * 0.12f), glm::vec3(85.0f, 66.0f, 36.0f), 0.22f));
+    scene.lights.push_back(makePointAreaLight(rPos + rUp * 1.38f + rFwd * 0.35f, glm::normalize(rFwd - rUp * 0.45f), glm::vec3(32.0f, 22.0f, 12.0f), 0.16f));
 
-    // Lead Cart #1 headlamp beam + rear amber tail-light illuminating Cart #1's back & rails
+    // Second Cart (Cart 1 — Camera Cart) headlamp beam + cockpit rim fill illuminating the second cart's front & rails ahead
     glm::vec3 c1LampPos = c1Pos + c1Up * 1.04f + c1Fwd * 1.04f;
-    scene.lights.push_back(makePointAreaLight(c1LampPos, glm::normalize(c1Fwd - c1Up * 0.14f), glm::vec3(120.0f, 92.0f, 48.0f), 0.24f));
-    scene.lights.push_back(makePointAreaLight(c1Pos + c1Up * 0.85f - c1Fwd * 0.95f, glm::normalize(-c1Fwd - c1Up * 0.25f), glm::vec3(45.0f, 20.0f, 6.0f), 0.18f));
+    scene.lights.push_back(makePointAreaLight(c1LampPos, glm::normalize(c1Fwd - c1Up * 0.12f), glm::vec3(115.0f, 88.0f, 46.0f), 0.24f));
+    scene.lights.push_back(makePointAreaLight(c1Pos + c1Up * 1.42f + c1Fwd * 0.38f, glm::normalize(c1Fwd - c1Up * 0.48f), glm::vec3(42.0f, 30.0f, 16.0f), 0.16f));
 
-    // Lead Cart #2 headlamp beam + local fill
+    // Front Lead Cart (Cart 2) headlamp beam + rear amber tail-light illuminating Cart #2's back & rails
     glm::vec3 c2LampPos = c2Pos + c2Up * 1.04f + c2Fwd * 1.04f;
-    scene.lights.push_back(makePointAreaLight(c2LampPos, glm::normalize(c2Fwd - c2Up * 0.14f), glm::vec3(110.0f, 84.0f, 44.0f), 0.24f));
-    scene.lights.push_back(makePointAreaLight(c2Pos + c2Up * 0.90f - c2Fwd * 0.95f, glm::normalize(-c2Fwd - c2Up * 0.20f), glm::vec3(38.0f, 18.0f, 5.0f), 0.18f));
+    scene.lights.push_back(makePointAreaLight(c2LampPos, glm::normalize(c2Fwd - c2Up * 0.14f), glm::vec3(120.0f, 92.0f, 48.0f), 0.24f));
+    scene.lights.push_back(makePointAreaLight(c2Pos + c2Up * 0.88f - c2Fwd * 0.95f, glm::normalize(-c2Fwd - c2Up * 0.22f), glm::vec3(48.0f, 22.0f, 7.0f), 0.18f));
 
-    // 2. Select the 26 Nearest Static Tunnel/Cavern Lights around (sRider + 15m)
+    // 2. Select the 26 Nearest Static Tunnel/Cavern Lights around (sSecondCart + 12m) using circular loop distance
     if (!scene.coasterStaticLights.empty()) {
-        const float focusS = sRider + 15.0f;
+        const float focusS = wrapMineshaftDistance(sSecondCart + 12.0f);
         std::vector<size_t> order(scene.coasterStaticLights.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
 
         size_t takeCount = std::min(kMaxActiveLights - scene.lights.size(), order.size());
         std::partial_sort(order.begin(), order.begin() + takeCount, order.end(),
             [&](size_t a, size_t b) {
-                return std::abs(scene.coasterStaticLights[a].trackDistance - focusS) <
-                       std::abs(scene.coasterStaticLights[b].trackDistance - focusS);
+                return mineshaftCircularDistance(scene.coasterStaticLights[a].trackDistance, focusS) <
+                       mineshaftCircularDistance(scene.coasterStaticLights[b].trackDistance, focusS);
             });
 
         for (size_t i = 0; i < takeCount; ++i) {
@@ -4390,11 +4438,11 @@ SceneData ProceduralScene::createMineshaftScene() {
     MineshaftMaterials m = initMineshaftMaterials(scene);
 
     const float PI = 3.14159265358979323846f;
-    const float totalTrackLength = 500.0f;
-    const int   numChunks        = 25;   // 25 spatial BLAS chunks x 20.0m = 500.0m
-    const int   ringsPerChunk    = 10;   // 2.0m per rock ring -> 250 rings total
+    const float totalTrackLength = kMineshaftLoopLength;
+    const int   numChunks        = 25;   // 25 spatial BLAS chunks x 20.0m = 500.0m closed loop
+    const int   ringsPerChunk    = 16;   // 1.25m per rock ring -> 400 rings total for watertight curvature
     const int   totalRings       = numChunks * ringsPerChunk;
-    const int   ringSectors      = 10;
+    const int   ringSectors      = 16;   // 16 arch sectors + 4 floor strips = 20-gon closed watertight tube
 
     auto recordBlasPrototype = [&](const std::string& name, uint32_t startTri) -> uint32_t {
         uint32_t bIdx = static_cast<uint32_t>(scene.blasRanges.size());
@@ -4421,40 +4469,67 @@ SceneData ProceduralScene::createMineshaftScene() {
         return bIdx;
     };
 
-    // Helper for tunnel/cavern cross-section geometry at ring index r (0..totalRings)
+    // Helper for watertight, periodic tunnel/cavern cross-section geometry at ring index r (0..totalRings)
+    // secIdx = 0 is the right floor corner (rx > 0, ry == floorDrop),
+    // secIdx = ringSectors / 2 is the ceiling crown (rx == 0, ry == crownH),
+    // secIdx = ringSectors is the left floor corner (rx < 0, ry == floorDrop).
     auto getTunnelRingVertex = [&](int ringIdx, int secIdx) -> std::pair<glm::vec3, glm::vec3> {
-        float s = (static_cast<float>(ringIdx) / static_cast<float>(totalRings)) * totalTrackLength;
+        int rWrapped = ((ringIdx % totalRings) + totalRings) % totalRings;
+        int sClamped = std::clamp(secIdx, 0, ringSectors);
+        float s = (static_cast<float>(rWrapped) / static_cast<float>(totalRings)) * totalTrackLength;
+
         glm::vec3 cPos, rAxis, uAxis, fAxis;
         evalMineshaftTrackFrame(s, cPos, rAxis, uAxis, fAxis);
 
-        // Smoothly expand tunnel in Zone 2 (Sluiceway: s=115..235m) and dramatically in Zone 3 (Grand Cavern: s=235..375m)
-        float sluiceEnv = glm::smoothstep(105.0f, 130.0f, s) * (1.0f - glm::smoothstep(225.0f, 245.0f, s));
-        float cavernEnv = glm::smoothstep(228.0f, 256.0f, s) * (1.0f - glm::smoothstep(352.0f, 382.0f, s));
+        // Smoothly expand tunnel in Zone 2 (Sluiceway: s=115..235m) and in Zone 3 (Grand Cavern: s=235..375m)
+        float sluiceEnv = glm::smoothstep(105.0f, 130.0f, s) * (1.0f - glm::smoothstep(222.0f, 244.0f, s));
+        float cavernEnv = glm::smoothstep(228.0f, 260.0f, s) * (1.0f - glm::smoothstep(348.0f, 380.0f, s));
 
-        float tunnelW   = 2.10f + 0.75f * sluiceEnv + 7.40f * cavernEnv;
-        float tunnelH   = 3.20f + 0.45f * sluiceEnv + 6.80f * cavernEnv;
-        float floorDrop = -0.08f - 5.25f * cavernEnv; // In Zone 3 cavern, floor drops 5.3m below the rails for the trestle bridge!
+        // Base clearance envelope strictly encloses the timber support arches (halfSpan = 1.62m, height = 3.05m)
+        float tunnelW   = 2.30f + 0.65f * sluiceEnv + 4.30f * cavernEnv;
+        float crownH    = 3.55f + 0.50f * sluiceEnv + 3.60f * cavernEnv;
+        float floorDrop = -0.06f - 4.79f * cavernEnv; // In Zone 3 cavern, floor drops to -4.85m for the trestle bridge
 
-        float u = static_cast<float>(secIdx) / static_cast<float>(ringSectors);
-        float ang = glm::mix(-0.14f * PI, 1.14f * PI, u);
+        float u = static_cast<float>(sClamped) / static_cast<float>(ringSectors);
+        float ang = u * PI; // 0..PI: sin(ang) == 0 at both u=0 and u=1, so ry smoothly meets floorDrop with zero cliff!
 
-        // Deterministic multi-frequency rock displacement
-        float hash = std::sin(static_cast<float>(ringIdx * 17 + secIdx * 31) * 1.37f) * (0.18f + 0.45f * cavernEnv) +
-                     std::cos(static_cast<float>(ringIdx * 7 - secIdx * 13) * 0.83f) * (0.12f + 0.30f * cavernEnv);
-        float rx = std::cos(ang) * (tunnelW + hash);
-        float ry = std::max(floorDrop, std::sin(ang) * (tunnelH + hash) + 1.05f);
+        // Periodic, strictly non-negative outward rock displacement (zero at floor corners so the floor seam is exact)
+        float cornerTap = std::sin(ang);
+        float ringPhase = (static_cast<float>(rWrapped) / static_cast<float>(totalRings)) * (2.0f * PI);
+        float rawNoise = 0.5f + 0.28f * std::sin(ringPhase * 29.0f + static_cast<float>(sClamped) * 1.7f)
+                              + 0.22f * std::cos(ringPhase * 43.0f - static_cast<float>(sClamped) * 1.1f);
+        float hash = cornerTap * rawNoise * (0.32f + 0.65f * cavernEnv);
 
-        // At floor corners (secIdx == 0 or ringSectors), pin ry to floorDrop so the floor ribbon seals cleanly
-        if (secIdx == 0 || secIdx == ringSectors) {
+        // Rounded horseshoe-arch profile so lower walls have generous lateral clearance
+        float cosA = std::cos(ang);
+        float sinA = std::sin(ang);
+        float archX = std::copysign(std::pow(std::abs(cosA), 0.78f), cosA);
+        float archY = std::pow(std::max(0.0f, sinA), 0.78f);
+
+        float rx = archX * (tunnelW + hash);
+        float ry = floorDrop + archY * ((crownH - floorDrop) + hash);
+        if (sClamped == 0 || sClamped == ringSectors) {
             ry = floorDrop;
         }
 
         glm::vec3 worldPos = cPos + rAxis * rx + uAxis * ry;
-        glm::vec3 inwardNorm = glm::normalize(-rAxis * std::cos(ang) - uAxis * std::sin(ang));
+        glm::vec3 inwardNorm = glm::normalize(-rAxis * cosA - uAxis * sinA);
         return { worldPos, inwardNorm };
     };
 
-    // 1. Build 25 Spatial 20-Meter Tunnel/Cavern BLAS Chunks (Disjoint Z-Intervals for O(1) BVH Traversal)
+    // Helper to sample the rock floor ribbon between right floor wall (tLat = 0) and left floor wall (tLat = 1)
+    auto getTunnelFloorPoint = [&](int ringIdx, float tLat, glm::vec3& outNormal) -> glm::vec3 {
+        auto [pRight, nR] = getTunnelRingVertex(ringIdx, 0);
+        auto [pLeft,  nL] = getTunnelRingVertex(ringIdx, ringSectors);
+        int rWrapped = ((ringIdx % totalRings) + totalRings) % totalRings;
+        float s = (static_cast<float>(rWrapped) / static_cast<float>(totalRings)) * totalTrackLength;
+        glm::vec3 cPos, rAxis, uAxis, fAxis;
+        evalMineshaftTrackFrame(s, cPos, rAxis, uAxis, fAxis);
+        outNormal = uAxis;
+        return glm::mix(pRight, pLeft, tLat);
+    };
+
+    // 1. Build 25 Spatial 20-Meter Watertight Tunnel/Cavern BLAS Chunks around the closed 500m loop
     std::vector<uint32_t> chunkBlasIndices;
     chunkBlasIndices.reserve(numChunks);
 
@@ -4468,69 +4543,60 @@ SceneData ProceduralScene::createMineshaftScene() {
             bool inFloodedZone = (sMid >= 115.0f && sMid <= 378.0f);
             uint32_t floorMat  = inFloodedZone ? m.waterSurface : m.wetFloor;
 
+            // Watertight 16-sector rock wall & ceiling arch (with integrated gold-ore vein strata in Zone 4)
+            bool inGoldZone = (sMid >= 378.0f && sMid <= 492.0f);
             for (int sec = 0; sec < ringSectors; ++sec) {
                 auto [p00, n00] = getTunnelRingVertex(r, sec);
                 auto [p10, n10] = getTunnelRingVertex(r + 1, sec);
                 auto [p11, n11] = getTunnelRingVertex(r + 1, sec + 1);
                 auto [p01, n01] = getTunnelRingVertex(r, sec + 1);
                 glm::vec3 faceNorm = glm::normalize(n00 + n10 + n11 + n01);
-                addQuad(scene.triangles, p00, p10, p11, p01, faceNorm, m.rock);
+                bool isGoldVeinQuad = inGoldZone && (sec >= 2 && sec <= ringSectors - 3) && (((r + sec * 3) % 7) == 0);
+                addQuad(scene.triangles, p00, p10, p11, p01, faceNorm, isGoldVeinQuad ? m.goldOre : m.rock);
             }
 
-            // Cave/Sluiceway/Cavern Chasm Floor Ribbon
-            auto [left0, nl0]   = getTunnelRingVertex(r, 0);
-            auto [right0, nr0]  = getTunnelRingVertex(r, ringSectors);
-            auto [left1, nl1]   = getTunnelRingVertex(r + 1, 0);
-            auto [right1, nr1]  = getTunnelRingVertex(r + 1, ringSectors);
-            addQuad(scene.triangles, left0, right0, right1, left1, glm::vec3(0.0f, 1.0f, 0.0f), floorMat);
+            // Subdivided 4-strip floor ribbon connecting sec=ringSectors (left wall base) to sec=0 (right wall base)
+            const int floorStrips = 4;
+            for (int fs = 0; fs < floorStrips; ++fs) {
+                float t0 = static_cast<float>(fs) / static_cast<float>(floorStrips);
+                float t1 = static_cast<float>(fs + 1) / static_cast<float>(floorStrips);
+                glm::vec3 n0, n1;
+                glm::vec3 f00 = getTunnelFloorPoint(r,     1.0f - t0, n0);
+                glm::vec3 f01 = getTunnelFloorPoint(r,     1.0f - t1, n0);
+                glm::vec3 f11 = getTunnelFloorPoint(r + 1, 1.0f - t1, n1);
+                glm::vec3 f10 = getTunnelFloorPoint(r + 1, 1.0f - t0, n1);
+                glm::vec3 floorNorm = glm::normalize(n0 + n1);
+                addQuad(scene.triangles, f00, f01, f11, f10, floorNorm, floorMat);
+            }
 
-            // Zone 2 (s = 115..235m): Rusty Iron & Brass Sluiceway Drainage Pipes along the lower tunnel walls
-            if (sMid >= 115.0f && sMid <= 232.0f) {
-                glm::vec3 c0, r0, u0, f0;
-                glm::vec3 c1, r1, u1, f1;
-                float s0 = (static_cast<float>(r) / static_cast<float>(totalRings)) * totalTrackLength;
-                float s1 = (static_cast<float>(r + 1) / static_cast<float>(totalRings)) * totalTrackLength;
-                evalMineshaftTrackFrame(s0, c0, r0, u0, f0);
-                evalMineshaftTrackFrame(s1, c1, r1, u1, f1);
-                for (int side = -1; side <= 1; side += 2) {
-                    float sx = static_cast<float>(side) * 2.15f;
-                    glm::vec3 pipeA = c0 + r0 * sx + u0 * 0.55f;
-                    glm::vec3 pipeB = c1 + r1 * sx + u1 * 0.55f;
-                    addOrientedCylinder(scene.triangles, pipeA, pipeB, 0.14f, 0.14f, m.castIron, 10, false);
+            // Zone 2 (s = 118..225m): Rusty Iron & Brass Sluiceway Drainage Pipes mounted flush along the lower rock walls
+            if (sMid >= 118.0f && sMid <= 225.0f) {
+                for (int sideIdx = 0; sideIdx < 2; ++sideIdx) {
+                    int secPipe = (sideIdx == 0) ? 1 : (ringSectors - 1);
+                    auto [w0, wn0] = getTunnelRingVertex(r,     secPipe);
+                    auto [w1, wn1] = getTunnelRingVertex(r + 1, secPipe);
+                    glm::vec3 pipeA = w0 + wn0 * 0.16f;
+                    glm::vec3 pipeB = w1 + wn1 * 0.16f;
+                    addOrientedCylinder(scene.triangles, pipeA, pipeB, 0.13f, 0.13f, m.castIron, 10, false);
                     if (r % 2 == 0) {
-                        addOrientedCylinder(scene.triangles, pipeA - f0 * 0.06f, pipeA + f0 * 0.06f, 0.19f, 0.19f, m.brass, 10, true);
+                        glm::vec3 pipeDir = glm::normalize(pipeB - pipeA);
+                        addOrientedCylinder(scene.triangles, pipeA - pipeDir * 0.06f, pipeA + pipeDir * 0.06f, 0.18f, 0.18f, m.brass, 10, true);
                     }
                 }
             }
 
-            // Zone 3 (s = 240..370m): Hanging Cavern Stalactites overhead in the Grand Crystal Geode Cavern
-            if (sMid >= 242.0f && sMid <= 368.0f && (r % 2 == 0)) {
-                glm::vec3 cPos, rAxis, uAxis, fAxis;
-                evalMineshaftTrackFrame(sMid, cPos, rAxis, uAxis, fAxis);
-                for (int st = -1; st <= 1; st += 2) {
-                    float offX = static_cast<float>(st) * (2.6f + 1.8f * std::sin(static_cast<float>(r * 13 + st)));
-                    glm::vec3 ceilBase = cPos + rAxis * offX + uAxis * 9.2f;
-                    glm::vec3 tipPos   = ceilBase - uAxis * (2.4f + 0.9f * std::cos(static_cast<float>(r * 7)));
-                    addOrientedCylinder(scene.triangles, ceilBase, tipPos, 0.55f, 0.04f, m.rock, 8, true);
+            // Zone 3 (s = 248..362m): Hanging Cavern Stalactites anchored directly into the Grand Cavern rock ceiling
+            if (sMid >= 248.0f && sMid <= 362.0f && (r % 2 == 0)) {
+                for (int st = 0; st < 2; ++st) {
+                    int secCeil = (st == 0) ? (5 + (r % 2)) : (10 - (r % 2));
+                    auto [ceilPos, ceilNorm] = getTunnelRingVertex(r, secCeil);
+                    // Sink stalactite base 0.45m deep into ceiling rock so it is completely fused with the ceiling arch
+                    glm::vec3 ceilBase = ceilPos - ceilNorm * 0.45f;
+                    float stalLen = 1.65f + 0.55f * std::abs(std::cos(static_cast<float>(r * 7 + st * 11)));
+                    glm::vec3 tipPos = ceilPos + ceilNorm * stalLen;
+                    addOrientedCylinder(scene.triangles, ceilBase, tipPos, 0.46f, 0.04f, m.rock, 8, true);
                 }
             }
-
-            // Zone 4 (s = 375..495m): Glittering Metallic Gold Ore Veins protruding from the deep rock walls
-            if (sMid >= 375.0f && sMid <= 495.0f) {
-                glm::vec3 cPos, rAxis, uAxis, fAxis;
-                evalMineshaftTrackFrame(sMid, cPos, rAxis, uAxis, fAxis);
-                float side = (r % 2 == 0) ? -1.0f : 1.0f;
-                glm::vec3 veinStart = cPos + rAxis * (side * 2.05f) + uAxis * 0.45f - fAxis * 0.8f;
-                glm::vec3 veinEnd   = cPos + rAxis * (side * 1.95f) + uAxis * 2.15f + fAxis * 0.8f;
-                addBeam(scene.triangles, veinStart, veinEnd, 0.28f, 0.24f, m.goldOre);
-            }
-        }
-
-        // Seal far cavern end wall on the final chunk
-        if (chunk == numChunks - 1) {
-            glm::vec3 endPos, rAxis, uAxis, fAxis;
-            evalMineshaftTrackFrame(totalTrackLength, endPos, rAxis, uAxis, fAxis);
-            addBox(scene.triangles, endPos + uAxis * 2.0f, glm::vec3(10.0f, 8.0f, 0.8f), 0.0f, m.rock);
         }
 
         chunkBlasIndices.push_back(recordBlasPrototype("TunnelChunk_" + std::to_string(chunk), startTri));
@@ -4550,7 +4616,7 @@ SceneData ProceduralScene::createMineshaftScene() {
     uint32_t blasTimber = recordBlasPrototype("Prototype_TimberSupport", startTimber);
 
     uint32_t startTrestle = static_cast<uint32_t>(scene.triangles.size());
-    buildTrestleSupportModel(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), m, 5.35f);
+    buildTrestleSupportModel(scene.triangles, glm::vec3(0.0f, 0.0f, 0.0f), m, 4.85f);
     uint32_t blasTrestle = recordBlasPrototype("Prototype_TrestleSupport", startTrestle);
 
     uint32_t startTrack = static_cast<uint32_t>(scene.triangles.size());
@@ -4607,7 +4673,7 @@ SceneData ProceduralScene::createMineshaftScene() {
         l.v = glm::vec4(u * size, 0.0f);
         l.emission = glm::vec4(emission, size * size);
         l.normal = glm::vec4(f, 0.0f);
-        scene.coasterStaticLights.push_back({ sTrack, l });
+        scene.coasterStaticLights.push_back({ wrapMineshaftDistance(sTrack), l });
     };
 
     // Instantiate all 25 Static Rock Tunnel / Cavern Chunks
@@ -4615,26 +4681,33 @@ SceneData ProceduralScene::createMineshaftScene() {
         addInstance(bChunk, glm::mat4(1.0f));
     }
 
-    // Continuous Steel Rail Track Segments along the entire 500m coaster spline
-    for (float s = 0.0f; s <= totalTrackLength - 1.5f; s += 2.90f) {
+    // Continuous Steel Rail Track Segments around the entire 500m closed loop (180 segments * 2.7778m = 500.0m exact)
+    const int numTrackSegments = 180;
+    for (int t = 0; t < numTrackSegments; ++t) {
+        float s = (static_cast<float>(t) / static_cast<float>(numTrackSegments)) * totalTrackLength;
         glm::vec3 pos, right, up, forward;
         evalMineshaftTrackFrame(s, pos, right, up, forward);
         addInstance(blasTrack, makeCoasterFrameMatrix(pos, right, up, forward));
     }
 
-    // Timber Support Arches (Zones 1, 2, 4) vs Wooden Trestle Bridge Bents (Zone 3 Grand Cavern: s = 236..374m)
-    int supportIdx = 0;
-    for (float s = 2.0f; s <= totalTrackLength - 6.0f; s += 3.0f, ++supportIdx) {
+    // Timber Support Arches (Zones 1, 2, 4) vs Wooden Trestle Bridge Bents (Zone 3 Grand Cavern)
+    // Placed strictly at ring indices r % 4 == 0 (every 5.0m = 100 supports around the 500m loop).
+    // Crystals are placed strictly at ring indices r % 4 == 2 (2.5m away, mid-span between timber arches)
+    // so a crystal can NEVER touch or overlap any wooden timber arch or trestle bent!
+    for (int r = 0; r < totalRings; r += 4) {
+        int supportIdx = r / 4;
+        float s = (static_cast<float>(r) / static_cast<float>(totalRings)) * totalTrackLength;
         glm::vec3 pos, right, up, forward;
         evalMineshaftTrackFrame(s, pos, right, up, forward);
         glm::mat4 frameMat = makeCoasterFrameMatrix(pos, right, up, forward);
 
-        bool inGrandCavern = (s >= 236.0f && s <= 374.0f);
+        bool inGrandCavern = (s >= 245.0f && s <= 360.0f);
+        bool inTransition  = (s > 228.0f && s < 245.0f) || (s > 360.0f && s < 378.0f);
+
         if (inGrandCavern) {
-            // Wooden Trestle Bridge Viaduct Bent spanning the 5.35m cavern abyss!
+            // Wooden Trestle Bridge Viaduct Bent spanning the 5.35m cavern abyss
             addInstance(blasTrestle, frameMat);
 
-            // Every second trestle bent has a swinging lantern mounted on its outer guardrail post
             if (supportIdx % 2 == 0) {
                 float side = ((supportIdx / 2) % 2 == 0) ? -1.22f : 1.22f;
                 glm::vec3 hookWorld = pos + right * side + up * 1.22f;
@@ -4646,63 +4719,145 @@ SceneData ProceduralScene::createMineshaftScene() {
                 addStaticTrackLight(s, flamePos, glm::normalize(forward - up * 0.30f - right * (side * 0.35f)),
                                     glm::vec3(46.0f, 24.0f, 7.0f), 0.22f);
             }
+        } else if (!inTransition) {
+            // Timber Support Arch inside standard tunnel (Zones 1, 2, 4)
+            addInstance(blasTimber, frameMat);
+
+            float side = (supportIdx % 2 == 0) ? -0.92f : 0.92f;
+            glm::vec3 hookWorld = pos + right * side + up * 2.42f;
+            float tiltDeg = (supportIdx % 2 == 0) ? 9.0f : -9.0f;
+            glm::mat4 lanternMat = glm::translate(glm::mat4(1.0f), hookWorld) *
+                                   glm::rotate(glm::mat4(1.0f), glm::radians(tiltDeg), forward);
+            addInstance(blasLantern, lanternMat, true, hookWorld, glm::vec3(0.0f, 1.0f, 0.0f),
+                        (supportIdx % 2 == 0) ? 1.25f : -1.25f);
+
+            glm::vec3 lanternColor = (s >= 375.0f) ? glm::vec3(62.0f, 34.0f, 8.0f) : glm::vec3(44.0f, 22.0f, 6.0f);
+            glm::vec3 flamePos = hookWorld - up * 0.34f - right * (side * 0.24f);
+            addStaticTrackLight(s, flamePos, glm::normalize(forward * 0.5f - up * 0.5f - right * (side * 0.35f)),
+                                lanternColor, 0.20f);
+        }
+    }
+
+    // Helper to attach a glowing crystal cluster directly onto a rock surface point & normal
+    // Sinks the cluster's rock base 0.14m*scale into the rock along -surfNorm so it is 100% anchored in rock
+    auto placeCrystalOnRock = [&](float sTrack, glm::vec3 surfPos, glm::vec3 surfNorm, glm::vec3 refTangent,
+                                  float scale, bool isCyan, bool emitLight) {
+        glm::vec3 clusterUp = glm::normalize(surfNorm);
+        glm::vec3 refDir = refTangent - clusterUp * glm::dot(refTangent, clusterUp);
+        if (glm::length(refDir) < 1e-4f) {
+            refDir = (std::abs(clusterUp.y) < 0.9f) ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+        }
+        glm::vec3 clusterRight = glm::normalize(glm::cross(refDir, clusterUp));
+        glm::vec3 clusterFwd   = glm::normalize(glm::cross(clusterRight, clusterUp));
+
+        // Sink rock pedestal base into the rock surface so the crystal cluster is firmly embedded in stone
+        glm::vec3 anchoredPos = surfPos - clusterUp * (0.06f * scale);
+        glm::mat4 cMat = makeCoasterFrameMatrix(anchoredPos, clusterRight * scale, clusterUp * scale, clusterFwd * scale);
+        addInstance(isCyan ? blasCrystalC : blasCrystalV, cMat);
+
+        if (emitLight) {
+            glm::vec3 cLightColor = isCyan ? glm::vec3(11.0f, 46.0f, 58.0f) : glm::vec3(42.0f, 12.0f, 58.0f);
+            // Aim area light back toward the rock attachment surface and along the tunnel so the host rock wall/ceiling/ground is brightly lit
+            glm::vec3 lightDir = glm::normalize(-clusterUp * 0.72f - refDir * 0.69f);
+            addStaticTrackLight(sTrack, anchoredPos + clusterUp * (1.16f * scale), lightDir, cLightColor, 0.28f);
+        }
+    };
+
+    // Subterranean Bioluminescent Crystal Clusters anchored strictly to ROCK surfaces (ground, walls, ceiling)
+    // Placed at ring indices r % 4 == 2 (midway between the r % 4 == 0 wooden supports so they NEVER touch wood!)
+    int crystalCounter = 0;
+    for (int r = 2; r < totalRings; r += 4, ++crystalCounter) {
+        float s0 = (static_cast<float>(r) / static_cast<float>(totalRings)) * totalTrackLength;
+        float s1 = (static_cast<float>(r + 1) / static_cast<float>(totalRings)) * totalTrackLength;
+        float sMid = 0.5f * (s0 + s1);
+        glm::vec3 cPos, rAxis, uAxis, fAxis;
+        evalMineshaftTrackFrame(sMid, cPos, rAxis, uAxis, fAxis);
+
+        bool inCavern = (sMid >= 238.0f && sMid <= 368.0f);
+
+        // Helper to evaluate exact rock quad center & inward normal at ring r, sector sec
+        auto evalRockWallQuad = [&](int sec, glm::vec3& outPos, glm::vec3& outNorm) {
+            auto [p00, n00] = getTunnelRingVertex(r,     sec);
+            auto [p10, n10] = getTunnelRingVertex(r + 1, sec);
+            auto [p11, n11] = getTunnelRingVertex(r + 1, sec + 1);
+            auto [p01, n01] = getTunnelRingVertex(r,     sec + 1);
+            outPos  = 0.25f * (p00 + p10 + p11 + p01);
+            outNorm = glm::normalize(n00 + n10 + n11 + n01);
+        };
+
+        if (inCavern) {
+            // In the Grand Cavern, attach monumental crystal clusters directly to:
+            // 1. Cavern rock walls (left & right lower/mid walls, sec = 1..3 and 12..14)
+            // 2. Cavern rock ceiling arch (sec = 5..10)
+            // 3. Cavern rock ground floor well outside the wooden trestle bridge pilings (tLat in [0.12, 0.20] or [0.80, 0.88])
+            int secLeftWall  = 12 + (crystalCounter % 3);
+            int secRightWall = 1  + (crystalCounter % 3);
+            int secCeiling   = 5  + (crystalCounter % 6);
+
+            glm::vec3 wPosL, wNormL, wPosR, wNormR, cPosCeil, cNormCeil;
+            evalRockWallQuad(secLeftWall,  wPosL,    wNormL);
+            evalRockWallQuad(secRightWall, wPosR,    wNormR);
+            evalRockWallQuad(secCeiling,   cPosCeil, cNormCeil);
+
+            float scaleWall = 1.65f + 0.55f * std::abs(std::sin(static_cast<float>(crystalCounter) * 1.3f));
+            float scaleCeil = 1.85f + 0.65f * std::abs(std::cos(static_cast<float>(crystalCounter) * 1.7f));
+            bool isCyanL = ((crystalCounter % 2) == 0);
+            bool isCyanR = !isCyanL;
+            bool isCyanC = ((crystalCounter % 3) != 0);
+
+            placeCrystalOnRock(sMid, wPosL,    wNormL,    fAxis, scaleWall, isCyanL, true);
+            placeCrystalOnRock(sMid, wPosR,    wNormR,    fAxis, scaleWall, isCyanR, (crystalCounter % 2 == 0));
+            placeCrystalOnRock(sMid, cPosCeil, cNormCeil, fAxis, scaleCeil, isCyanC, (crystalCounter % 2 == 1));
+
+            // Cavern rock ground cluster (far left or far right of the wooden trestle pilings at |x| <= 2.65m)
+            float tFloor = (crystalCounter % 2 == 0) ? 0.14f : 0.86f;
+            glm::vec3 fNorm0, fNorm1;
+            glm::vec3 fPos0 = getTunnelFloorPoint(r,     tFloor, fNorm0);
+            glm::vec3 fPos1 = getTunnelFloorPoint(r + 1, tFloor, fNorm1);
+            glm::vec3 floorPos  = 0.5f * (fPos0 + fPos1);
+            glm::vec3 floorNorm = glm::normalize(fNorm0 + fNorm1 + ((tFloor < 0.5f) ? -rAxis : rAxis) * 0.25f);
+            float scaleFloor = 1.55f + 0.45f * std::abs(std::sin(static_cast<float>(crystalCounter) * 2.1f));
+            placeCrystalOnRock(sMid, floorPos, floorNorm, fAxis, scaleFloor, (crystalCounter % 3 == 0), false);
         } else {
-            // Place Timber Support Arches every 4.5m in Zones 1, 2, and 4
-            if (supportIdx % 3 != 1) {
-                addInstance(blasTimber, frameMat);
+            // In standard rock tunnels (Zones 1, 2, 4), place crystals across rock ground, rock walls, and rock ceiling!
+            // Because r % 4 == 2 is 2.5m away from the nearest timber support arch (r % 4 == 0),
+            // and ground crystals are placed at the outer rock floor corners (|x| ~ 1.8m, well outside the 0.76m wooden sleepers),
+            // crystals NEVER touch wood and NEVER float in air.
+            int mode = crystalCounter % 3; // 0 = rock wall, 1 = rock ceiling, 2 = rock ground beside wall
+            bool sideLeft = ((crystalCounter / 3) % 2 == 0);
+            bool isCyan   = ((crystalCounter % 3) != 0);
+            float scale   = 0.68f + 0.22f * std::abs(std::sin(static_cast<float>(crystalCounter) * 1.7f));
 
-                float side = (supportIdx % 2 == 0) ? -0.92f : 0.92f;
-                glm::vec3 hookWorld = pos + right * side + up * 2.58f;
-                float tiltDeg = (supportIdx % 2 == 0) ? 9.0f : -9.0f;
-                glm::mat4 lanternMat = glm::translate(glm::mat4(1.0f), hookWorld) *
-                                       glm::rotate(glm::mat4(1.0f), glm::radians(tiltDeg), forward);
-                addInstance(blasLantern, lanternMat, true, hookWorld, glm::vec3(0.0f, 1.0f, 0.0f),
-                            (supportIdx % 2 == 0) ? 1.25f : -1.25f);
-
-                // Warm amber/forge lantern emitter in Zone 4, classic oil-lantern glow in Zones 1 & 2
-                glm::vec3 lanternColor = (s >= 375.0f) ? glm::vec3(62.0f, 34.0f, 8.0f) : glm::vec3(44.0f, 22.0f, 6.0f);
-                glm::vec3 flamePos = hookWorld - up * 0.34f - right * (side * 0.24f);
-                addStaticTrackLight(s, flamePos, glm::normalize(forward * 0.5f - up * 0.5f - right * (side * 0.35f)),
-                                    lanternColor, 0.20f);
+            if (mode == 0) {
+                // Rock wall attachment (mid-height rock wall quad)
+                // Avoid sec=1 and sec=15 in Zone 2 where iron drainage pipes run
+                int secWall = sideLeft ? (ringSectors - 3 - (crystalCounter % 2)) : (2 + (crystalCounter % 2));
+                glm::vec3 wPos, wNorm;
+                evalRockWallQuad(secWall, wPos, wNorm);
+                placeCrystalOnRock(sMid, wPos, wNorm, fAxis, scale, isCyan, (crystalCounter % 2 == 0));
+            } else if (mode == 1) {
+                // Rock ceiling attachment (upper arch / roof quad)
+                int secCeil = sideLeft ? (ringSectors / 2 + 1 + (crystalCounter % 2))
+                                       : (ringSectors / 2 - 2 - (crystalCounter % 2));
+                glm::vec3 cPosQuad, cNormQuad;
+                evalRockWallQuad(secCeil, cPosQuad, cNormQuad);
+                placeCrystalOnRock(sMid, cPosQuad, cNormQuad, fAxis, scale * 0.92f, isCyan, (crystalCounter % 2 == 0));
+            } else {
+                // Rock ground attachment at the outer tunnel floor shoulder (tLat = 0.10 or 0.90 -> |rx| ~ 1.85m,
+                // well clear of the 0.76m wooden track sleepers at the center of the floor!)
+                float tFloor = sideLeft ? 0.89f : 0.11f;
+                glm::vec3 fNorm0, fNorm1;
+                glm::vec3 fPos0 = getTunnelFloorPoint(r,     tFloor, fNorm0);
+                glm::vec3 fPos1 = getTunnelFloorPoint(r + 1, tFloor, fNorm1);
+                glm::vec3 floorPos  = 0.5f * (fPos0 + fPos1);
+                glm::vec3 inwardSide = sideLeft ? rAxis : -rAxis;
+                glm::vec3 floorNorm = glm::normalize(fNorm0 + fNorm1 + inwardSide * 0.35f);
+                placeCrystalOnRock(sMid, floorPos, floorNorm, fAxis, scale * 0.88f, isCyan, (crystalCounter % 2 == 0));
             }
         }
     }
 
-    // Subterranean Bioluminescent Crystal Clusters along the 500m ride (extra-dense & colossal in Zone 3 Grand Cavern!)
-    for (int c = 0; c < 110; ++c) {
-        float u = static_cast<float>(c) / 109.0f;
-        // Concentrate crystal clusters in Zone 2, Zone 3 (Grand Cavern), and Zone 4
-        float s = glm::mix(14.0f, 490.0f, u);
-        glm::vec3 pos, right, up, forward;
-        evalMineshaftTrackFrame(s, pos, right, up, forward);
-
-        bool inCavern = (s >= 232.0f && s <= 378.0f);
-        float side = (c % 2 == 0) ? -1.0f : 1.0f;
-        bool isCyan = ((c % 3) != 0);
-
-        float wallDist = inCavern ? (3.2f + 4.2f * std::abs(std::sin(static_cast<float>(c) * 1.9f)))
-                                  : (1.78f + 0.25f * std::abs(std::sin(static_cast<float>(c) * 2.3f)));
-        float heightOff = inCavern ? (-3.8f + 5.6f * std::sin(static_cast<float>(c) * 1.37f))
-                                   : (0.12f + 0.45f * std::abs(std::sin(static_cast<float>(c) * 1.7f)));
-        float scale = inCavern ? (1.65f + 1.15f * std::abs(std::cos(static_cast<float>(c) * 1.1f)))
-                               : (0.75f + 0.25f * std::abs(std::sin(static_cast<float>(c))));
-
-        glm::vec3 clusterPos = pos + right * (side * wallDist) + up * heightOff;
-        glm::vec3 clusterUp = glm::normalize(up * 0.74f - right * (side * 0.66f));
-        glm::vec3 clusterRight = glm::normalize(glm::cross(forward, clusterUp));
-        glm::vec3 clusterFwd = glm::normalize(glm::cross(clusterRight, clusterUp));
-
-        glm::mat4 cMat = makeCoasterFrameMatrix(clusterPos, clusterRight * scale, clusterUp * scale, clusterFwd * scale);
-        addInstance(isCyan ? blasCrystalC : blasCrystalV, cMat);
-
-        if (inCavern || (c % 3 == 0)) {
-            glm::vec3 cLightColor = isCyan ? glm::vec3(7.0f, 34.0f, 44.0f) : glm::vec3(30.0f, 8.0f, 44.0f);
-            if (inCavern) cLightColor *= 1.65f;
-            addStaticTrackLight(s, clusterPos + clusterUp * (1.16f * scale), clusterUp, cLightColor, 0.26f);
-        }
-    }
-
-    // 3. Instantiate the 3 Animated Coaster Minecarts (Rider Cart + Lead Cart #1 + Lead Cart #2)
+    // 3. Instantiate the 3 Animated Coaster Minecarts (Rear Cart + Second/Camera Cart + Front Lead Cart)
     glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
     scene.hasCamera = true;
     updateMineshaftCoaster(scene, 0.0f,
@@ -4713,10 +4868,10 @@ SceneData ProceduralScene::createMineshaftScene() {
     scene.coasterLeadCart1Inst = addInstance(blasCart, lead1Mat);
     scene.coasterLeadCart2Inst = addInstance(blasCart, lead2Mat);
 
-    // Ensure animatedInstances is non-empty so Engine::renderFrame enables isAnimating
-    scene.boundsMin = glm::vec3(-35.0f, -68.0f, -500.0f);
-    scene.boundsMax = glm::vec3( 35.0f,   8.0f,   20.0f);
-    scene.sceneRadius = 260.0f;
+    // Scene bounds covering the closed 500m loop
+    scene.boundsMin = glm::vec3(-75.0f, -45.0f, -210.0f);
+    scene.boundsMax = glm::vec3( 75.0f,  15.0f,   25.0f);
+    scene.sceneRadius = 160.0f;
     scene.focalBoundsMin = glm::vec3(-12.0f, -15.0f, -45.0f);
     scene.focalBoundsMax = glm::vec3( 12.0f,   6.0f,  15.0f);
     scene.focalRadius = 18.0f;
@@ -4724,8 +4879,8 @@ SceneData ProceduralScene::createMineshaftScene() {
     scene.centralTarget = scene.cameraTarget;
 
     scene.hasDielectrics = true;
-    scene.dielectricBoundsMin = glm::vec3(-25.0f, -65.0f, -490.0f);
-    scene.dielectricBoundsMax = glm::vec3( 25.0f,   6.0f,   16.0f);
+    scene.dielectricBoundsMin = glm::vec3(-70.0f, -42.0f, -205.0f);
+    scene.dielectricBoundsMax = glm::vec3( 70.0f,  12.0f,   20.0f);
 
     return scene;
 }

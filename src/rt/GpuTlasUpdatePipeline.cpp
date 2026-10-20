@@ -254,8 +254,19 @@ void GpuTlasUpdatePipeline::recordGpuTlasUpdate(VkCommandBuffer cmd, Acceleratio
 }
 
 void GpuTlasUpdatePipeline::updateInstanceTransform(uint32_t index, const glm::mat4& transform, std::vector<SceneInstance>& sceneInstances) {
+    glm::mat4 prevTransform = (index < sceneInstances.size()) ? sceneInstances[index].transform : transform;
     if (index < sceneInstances.size()) {
         sceneInstances[index].transform = transform;
+    }
+    if (m_shaderInstanceBuffer && (index + 1) * sizeof(InstanceGPU) <= m_shaderInstanceBuffer->getSize()) {
+        void* mappedInst = m_shaderInstanceBuffer->map();
+        if (mappedInst) {
+            VkDeviceSize instOffset = index * sizeof(InstanceGPU) + offsetof(InstanceGPU, transform);
+            std::memcpy(static_cast<char*>(mappedInst) + instOffset, &transform, sizeof(glm::mat4));
+            std::memcpy(static_cast<char*>(mappedInst) + instOffset + sizeof(glm::mat4), &prevTransform, sizeof(glm::mat4));
+            vmaFlushAllocation(m_allocator, m_shaderInstanceBuffer->getAllocation(), instOffset, sizeof(glm::mat4) * 2);
+            m_shaderInstanceBuffer->unmap();
+        }
     }
     if (!m_tlasInputInstancesBuffer || index >= m_tlasInstanceCount) {
         return;
@@ -265,6 +276,7 @@ void GpuTlasUpdatePipeline::updateInstanceTransform(uint32_t index, const glm::m
     if (mapped) {
         std::memcpy(static_cast<char*>(mapped) + offset, &transform, sizeof(glm::mat4));
         vmaFlushAllocation(m_allocator, m_tlasInputInstancesBuffer->getAllocation(), offset, sizeof(glm::mat4));
+        m_tlasInputInstancesBuffer->unmap();
         m_needsGpuUpdate = true;
     }
 }
@@ -273,8 +285,25 @@ void GpuTlasUpdatePipeline::updateAnimatedInstances(float frameDelta, bool anima
                                                    const std::vector<AnimatedInstance>& animInstances,
                                                    std::vector<SceneInstance>& sceneInstances) {
     if (!animateObjects || animSpeed <= 0.0001f || animInstances.empty()) {
+        if (m_wasAnimatingLastFrame && m_shaderInstanceBuffer) {
+            for (const auto& anim : animInstances) {
+                uint32_t idx = anim.instanceIndex;
+                if (idx < sceneInstances.size() && (idx + 1) * sizeof(InstanceGPU) <= m_shaderInstanceBuffer->getSize()) {
+                    const glm::mat4& cur = sceneInstances[idx].transform;
+                    void* mappedInst = m_shaderInstanceBuffer->map();
+                    if (mappedInst) {
+                        VkDeviceSize instOffset = idx * sizeof(InstanceGPU) + offsetof(InstanceGPU, invTransform);
+                        std::memcpy(static_cast<char*>(mappedInst) + instOffset, &cur, sizeof(glm::mat4));
+                        vmaFlushAllocation(m_allocator, m_shaderInstanceBuffer->getAllocation(), instOffset, sizeof(glm::mat4));
+                        m_shaderInstanceBuffer->unmap();
+                    }
+                }
+            }
+            m_wasAnimatingLastFrame = false;
+        }
         return;
     }
+    m_wasAnimatingLastFrame = true;
 
     // Fixed timestep accumulator (Fix-Your-Timestep decoupled from display rate)
     float effectiveDelta = std::min(frameDelta, 0.1f) * animSpeed;

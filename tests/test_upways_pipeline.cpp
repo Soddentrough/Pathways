@@ -95,10 +95,10 @@ int main() {
     }
     std::cout << "  -> Co-designed diffuse and metallic-Fresnel specular demodulation/remodulation verified." << std::endl;
 
-    // 4. Verify Upways (80,512B U-Net) vs Gateway (2,144B MLP) Weight Topologies
-    std::cout << "[TEST 4] Upways (80,512B 3-Scale 2D Halo-WMMA U-Net) & Gateway (2,144B Quad MLP) Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_ELEMENTS == 40256, "Upways TOTAL_WEIGHT_ELEMENTS must be 40,256 FP16 parameters");
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 80512, "Upways TOTAL_WEIGHT_BUFFER_SIZE must be 80,512 bytes");
+    // 4. Verify Upways (81,600B U-Net + Subpixel MLP) vs Gateway (2,144B MLP) Weight Topologies
+    std::cout << "[TEST 4] Upways (81,600B 3-Scale 2D Halo-WMMA U-Net + Subpixel MLP) & Gateway (2,144B Quad MLP) Weights Topology..." << std::endl;
+    check_true(upways::TOTAL_WEIGHT_ELEMENTS == 40800, "Upways TOTAL_WEIGHT_ELEMENTS must be 40,800 FP16 parameters");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 81600, "Upways TOTAL_WEIGHT_BUFFER_SIZE must be 81,600 bytes");
     check_true(upways::ENC1_W_OFFSET == 0, "ENC1_W_OFFSET must be 0");
     check_true(upways::ENC1_B_OFFSET == 2560, "ENC1_B_OFFSET must be 2560");
     check_true(upways::REC_PROJ_W_OFFSET == 2592, "REC_PROJ_W_OFFSET must be 2592");
@@ -110,11 +110,12 @@ int main() {
     check_true(upways::DEC1_W_OFFSET == 34048, "DEC1_W_OFFSET must be 34048");
     check_true(upways::HEAD_OUT_W_OFFSET == 39200, "HEAD_OUT_W_OFFSET must be 39200");
     check_true(upways::HEAD_REC_W_OFFSET == 39728, "HEAD_REC_W_OFFSET must be 39728");
-    check_true(upways::HEAD_REC_B_OFFSET + 16 == upways::TOTAL_WEIGHT_ELEMENTS, "HEAD_REC_B_OFFSET + 16 must equal 40,256");
+    check_true(upways::SUBPIXEL_MLP_FC1_W_OFFSET == 40256, "SUBPIXEL_MLP_FC1_W_OFFSET must be 40256");
+    check_true(upways::SUBPIXEL_MLP_FC2_B_OFFSET + 16 == upways::TOTAL_WEIGHT_ELEMENTS, "SUBPIXEL_MLP_FC2_B_OFFSET + 16 must equal 40,800");
 
     check_true(gateway::TOTAL_WEIGHT_BUFFER_SIZE == 2144, "Gateway TOTAL_WEIGHT_BUFFER_SIZE must be 2,144 bytes (1,072 FP16 params)");
     check_true(sizeof(gateway::DEFAULT_GATEWAY_WEIGHTS) == gateway::TOTAL_WEIGHT_BUFFER_SIZE, "Gateway embedded weights must be 2,144 bytes");
-    std::cout << "  -> Upways (40,256 FP16 params = 80,512B) and Gateway (1,072 FP16 params = 2,144B) verified." << std::endl;
+    std::cout << "  -> Upways (40,800 FP16 params = 81,600B) and Gateway (1,072 FP16 params = 2,144B) verified." << std::endl;
 
     // 5. Verify Exported Weights and Embedded Fallback Integrity
     std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;

@@ -193,6 +193,12 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     std::vector<InstanceGPU> instanceUpload;
     if (!scene.instanceData.empty()) {
         instanceUpload = scene.instanceData;
+        for (size_t i = 0; i < instanceUpload.size(); ++i) {
+            if (i < scene.instances.size()) {
+                instanceUpload[i].transform = scene.instances[i].transform;
+                instanceUpload[i].invTransform = scene.instances[i].transform;
+            }
+        }
     } else {
         uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
         if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {

@@ -53,6 +53,12 @@ void AccelerationStructurePipeline::build(
     std::vector<InstanceGPU> instanceUpload;
     if (!sceneData.instanceData.empty()) {
         instanceUpload = sceneData.instanceData;
+        for (size_t i = 0; i < instanceUpload.size(); ++i) {
+            if (i < sceneData.instances.size()) {
+                instanceUpload[i].transform = sceneData.instances[i].transform;
+                instanceUpload[i].invTransform = sceneData.instances[i].transform;
+            }
+        }
     } else {
         uint32_t numNonOpaque = (numTriangles > numOpaqueTriangles) ? (numTriangles - numOpaqueTriangles) : 0;
         if (numTriangles > 0 && numOpaqueTriangles > 0 && numNonOpaque > 0) {
@@ -84,7 +90,7 @@ void AccelerationStructurePipeline::build(
         m_allocator, instanceBufferSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        0
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (geomPipeline) {
         geomPipeline->uploadToDeviceBuffer(*m_instanceBuffer, instanceUpload.data(), instanceBufferSize);

@@ -43,6 +43,7 @@ public:
     [[nodiscard]] Buffer* getInstanceBuffer() const noexcept { return m_tlasInstanceBuffer.get(); }
     [[nodiscard]] Buffer* getInputInstancesBuffer() const noexcept { return m_tlasInputInstancesBuffer.get(); }
     [[nodiscard]] Buffer* getScratchBuffer() const noexcept { return m_tlasScratchBuffer.get(); }
+    void setShaderInstanceBuffer(Buffer* shaderInstBuf) noexcept { m_shaderInstanceBuffer = shaderInstBuf; }
     [[nodiscard]] VkPipeline getPipeline() const noexcept { return m_updateTlasPipeline; }
     [[nodiscard]] VkPipelineLayout getPipelineLayout() const noexcept { return m_updateTlasPipelineLayout; }
     [[nodiscard]] VkDescriptorSet getDescriptorSet() const noexcept { return m_updateTlasDescSet; }
@@ -58,8 +59,10 @@ private:
     std::unique_ptr<Buffer> m_tlasInstanceBuffer;
     std::unique_ptr<Buffer> m_tlasInputInstancesBuffer;
     std::unique_ptr<Buffer> m_tlasScratchBuffer;
+    Buffer* m_shaderInstanceBuffer = nullptr;
     uint32_t m_tlasInstanceCount = 0;
     bool m_needsGpuUpdate = false;
+    bool m_wasAnimatingLastFrame = false;
     uint32_t m_tlasGpuUpdateCount = 0;
 
     // Pipeline & Descriptors

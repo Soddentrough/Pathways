@@ -67,8 +67,7 @@ void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_
                 sceneData.instanceData[i].firstTriangle = sceneData.blasRanges[bIdx].firstTriangle;
                 sceneData.instanceData[i].numOpaqueTriangles = sceneData.blasRanges[bIdx].numOpaqueTriangles;
                 sceneData.instanceData[i].transform = sceneData.instances[i].transform;
-                float det = glm::determinant(sceneData.instances[i].transform);
-                sceneData.instanceData[i].invTransform = (std::abs(det) > 1e-8f) ? glm::inverse(sceneData.instances[i].transform) : glm::mat4(1.0f);
+                sceneData.instanceData[i].invTransform = sceneData.instances[i].transform;
             }
         }
         outNumOpaqueTriangles = totalOpaque;
@@ -426,8 +425,7 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
         remGpu.materialOffset = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].materialOffset : 0;
         remGpu.flags = (info.origIdx < scene.instanceData.size()) ? scene.instanceData[info.origIdx].flags : 0;
         remGpu.transform = remInst.transform;
-        float det = glm::determinant(remInst.transform);
-        remGpu.invTransform = (std::abs(det) > 1e-8f) ? glm::inverse(remInst.transform) : glm::mat4(1.0f);
+        remGpu.invTransform = remInst.transform;
         newInstanceData.push_back(remGpu);
     }
 

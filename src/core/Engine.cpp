@@ -178,7 +178,7 @@ Engine::Engine(const Config& config) : m_config(config) {
     m_inputController->setGuiToggleCallback([this]() {
         m_config.enable_gui = !m_config.enable_gui;
         Logger::info("GUI Overlay: {}", m_config.enable_gui ? "ENABLED" : "DISABLED");
-        if (!m_config.enable_gui && m_inputController) {
+        if (!m_config.enable_gui && m_inputController && !m_sceneData.isMineshaftCoaster) {
             m_inputController->setCameraMode(true);
         }
     });
@@ -190,7 +190,7 @@ Engine::Engine(const Config& config) : m_config(config) {
     });
     if (!m_config.headless && m_swapchain) {
         m_inputController->init();
-        if (!m_config.enable_gui) {
+        if (!m_config.enable_gui && !m_sceneData.isMineshaftCoaster) {
             m_inputController->setCameraMode(true);
         }
     }
@@ -452,6 +452,9 @@ void Engine::syncAsPointers() {
         m_instanceBuffer = nullptr;
         m_asIndexBuffer = nullptr;
     }
+    if (m_tlasUpdatePipeline) {
+        m_tlasUpdatePipeline->setShaderInstanceBuffer(m_instanceBuffer);
+    }
 }
 
 void Engine::syncRayTracingPointers() {
@@ -639,6 +642,12 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
         m_mgpu->loadScene(m_sceneData, filepath);
     }
 
+    // Clear any initial CLI camera overrides when switching scenes so the new scene's camera takes effect
+    m_config.camera_pos.reset();
+    m_config.camera_target.reset();
+    m_config.camera_up.reset();
+    m_config.camera_fov.reset();
+
     // Update camera framing
     if (m_sceneManager) {
         m_sceneManager->updateCamera(m_camera.get(), m_config);
@@ -653,6 +662,26 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
     m_frameIndex = m_config.rng_seed << 20;
     m_coasterSimTime = 0.0f;
     m_coasterLastEvalTime = -999.0f;
+    if (m_sceneData.isMineshaftCoaster) {
+        // Automatically parent camera to the second minecart facing forward and ensure looping animation is active
+        m_config.animate_objects = true;
+        if (m_config.animation_speed <= 0.0f) {
+            m_config.animation_speed = 1.0f;
+        }
+        setCameraMode(false);
+        if (m_camera) {
+            glm::vec3 cCamPos, cCamTarget, cCamUp;
+            float cCamFov = 58.0f;
+            glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
+            ProceduralScene::updateMineshaftCoaster(
+                m_sceneData, 0.0f,
+                cCamPos, cCamTarget, cCamUp, cCamFov,
+                riderMat, lead1Mat, lead2Mat
+            );
+            m_camera->setAnimatedPose(cCamPos, cCamTarget, cCamUp, cCamFov);
+            m_camera->resetMoved();
+        }
+    }
     m_resetAccumulation = true;
     m_frameTimesMs.clear();
     if (m_rtOrchestrator) {
@@ -1729,7 +1758,7 @@ void Engine::renderFrame() {
                 m_numLights = m_sceneManager->getNumLights();
             }
 
-            if (!pathActive && !isCameraMode() && !m_config.camera_pos.has_value() && m_camera) {
+            if (!pathActive && !m_config.camera_pos.has_value() && m_camera) {
                 m_camera->setAnimatedPose(cCamPos, cCamTarget, cCamUp, cCamFov);
                 if (coasterFrozen) {
                     m_camera->resetMoved();
@@ -2194,7 +2223,7 @@ void Engine::renderFrame() {
             auto onPreRecord = [this](VkCommandBuffer c) {
                 // GPU-Timeline TLAS Update / Refit (Tier 3)
                 if (m_tlasUpdatePipeline && m_tlasUpdatePipeline->needsGpuUpdate() && m_tlas) {
-                    recordGpuTlasUpdate(c, true);
+                    recordGpuTlasUpdate(c, !m_sceneData.isMineshaftCoaster);
                 }
                 // Update animated video billboard texture if a new frame is ready
                 if (m_videoBillboard && !getSceneTextures().empty()) {

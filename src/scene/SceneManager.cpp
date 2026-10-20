@@ -361,6 +361,8 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
              (filepath == "cyber-city" || filepath == "cyber_city" || filepath == "procedural:cyber-city" || filepath == "procedural:cyber_city" || filepath == "Procedural Cyber City")) ||
             (scenePath == "infinity-mirror" &&
              (filepath == "infinity-mirror" || filepath == "infinity_mirror" || filepath == "procedural:infinity-mirror" || filepath == "procedural:infinity_mirror" || filepath == "Infinity Mirror" || filepath == "Procedural Infinity Mirror")) ||
+            (scenePath == "mineshaft" &&
+             (filepath == "mineshaft" || filepath == "mine-shaft" || filepath == "mine_shaft" || filepath == "procedural:mineshaft" || filepath == "procedural:mine-shaft" || filepath == "procedural:mine_shaft" || filepath == "Mineshaft" || filepath == "Mineshaft Coaster" || filepath == "Procedural Mineshaft")) ||
             (!scenePath.empty() && !filepath.empty() &&
              std::filesystem::exists(scenePath) &&
              std::filesystem::exists(filepath) &&

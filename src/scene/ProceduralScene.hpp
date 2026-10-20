@@ -137,7 +137,7 @@ struct alignas(16) InstanceGPU {
     uint32_t materialOffset = 0;     // Optional material ID offset
     uint32_t flags = 0;              // Flags / metadata
     glm::mat4 transform = glm::mat4(1.0f);    // Instance transform to world space
-    glm::mat4 invTransform = glm::mat4(1.0f); // Inverse transform for normals and un-projection
+    glm::mat4 invTransform = glm::mat4(1.0f); // Previous-frame object-to-world transform M_{t-1} for motion vectors
 };
 static_assert(sizeof(InstanceGPU) == 144, "InstanceGPU must be 144 bytes (std430 aligned)");
 

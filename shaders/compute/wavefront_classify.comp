@@ -374,8 +374,13 @@ void main() {
                 float transmissionVal = 0.0;
 
                 vec3 primaryHitPoint = origin + direction * closestT;
+                vec3 prevHitPoint = primaryHitPoint;
+                if (closestTri >= 0) {
+                    vec3 localHitPos = hitW2o * vec4(primaryHitPoint, 1.0);
+                    prevHitPoint = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
+                }
                 vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
-                vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPoint, 1.0);
+                vec4 prevClip = ubo.prevViewProj * vec4(prevHitPoint, 1.0);
                 if (currClip.w > 1e-4) {
                     if (prevClip.w > 1e-2) {
                         vSurface = clamp((currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
