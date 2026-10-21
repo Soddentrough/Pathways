@@ -411,8 +411,9 @@ void main() {
     float smoothC  = clamp(1.0 - roughHr, 0.0, 1.0);
     float smoothC2 = smoothC * smoothC;
     float smoothC4 = smoothC2 * smoothC2;
+    float specGate = clamp(1.0 - 1.7 * smoothC4, 0.0, 1.0);
 
-    float betaSub    = (1.5 + 2.0 * max(z0, 0.0)) * activityGate;
+    float betaSub    = (0.35 + 1.5 * max(z0, 0.0)) * activityGate;
     float betaZ      = (16.0 + 16.0 * max(z6, 0.0)) * activityGate;
     float betaN      = (12.0 + 12.0 * max(z7, 0.0)) * activityGate;
     float betaLum    = (3.0 + 4.0 * max(z5, 0.0)) * activityGate;
@@ -447,8 +448,8 @@ void main() {
         uint b0i = tapIdx[i] << 3u;
         vec3 d_i = vec3(float(s_buf[b0i + 0u]), float(s_buf[b0i + 1u]), float(s_buf[b0i + 2u]));
         vec3 s_i = vec3(float(s_buf[b0i + 3u]), float(s_buf[b0i + 4u]), float(s_buf[b0i + 5u]));
-        float yD = upwaysLuminance(d_i);
-        float yS = upwaysLuminance(s_i);
+        float yD = max(upwaysLuminance(d_i), max(d_i.r, max(d_i.g, d_i.b)) * 0.75);
+        float yS = max(upwaysLuminance(s_i), max(s_i.r, max(s_i.g, s_i.b)) * 0.75);
         tapDiff[i]  = d_i;
         tapSpec[i]  = s_i;
         tapYDiff[i] = yD;
@@ -488,6 +489,8 @@ void main() {
     madYDiff *= invWGeom;
     madYSpec *= invWGeom;
     float geomCov = sumAff / (sumAff + 0.25);
+    float threshD = meanYDiff + 1.5 * madYDiff + 0.15;
+    float threshS = meanYSpec + 1.5 * madYSpec + 0.05;
 
     float rawLogits[9] = float[9](
         float(l0), float(l1), float(l2),
@@ -509,25 +512,26 @@ void main() {
     for (uint i = 0u; i < 9u; ++i) {
         float yD = tapYDiff[i];
         float yS = tapYSpec[i];
-        float exD = max(0.0, yD - meanYDiff);
-        float exS = max(0.0, yS - meanYSpec);
+        float exD = max(0.0, yD - threshD);
+        float exS = max(0.0, yS - threshS);
         float dID = geomCov * (exD / (madYDiff + 0.15));
-        float dIS = geomCov * (exS / (madYSpec + 0.15));
+        float dIS = geomCov * specGate * (exS / (madYSpec + 0.15));
 
-        float kD = (min(yD, meanYDiff) + exD / (1.0 + betaClip * dID)) / max(yD, 1e-4);
-        float kS = (min(yS, meanYSpec) + exS / (1.0 + betaClip * dIS)) / max(yS, 1e-4);
+        float kD = (min(yD, threshD) + exD / (1.0 + betaClip * dID)) / max(yD, 1e-4);
+        float kS = (min(yS, threshS) + exS / (1.0 + betaClip * dIS)) / max(yS, 1e-4);
         tapDiff[i] *= kD;
         tapSpec[i] *= kS;
 
         float ld = rawLogits[i];
         float ls = rawLogits[i];
         if (i == 4u) {
-            ls += deltaSpec;
+            ld -= betaClip * dID;
+            ls += deltaSpec - betaClip * dIS;
         } else {
             vec2 off = kTapOff[i];
             float phiSub = betaSub * (dot(off, off) - 2.0 * (off.x * dpx + off.y * dpy));
-            ld -= (phiSub + phiGeom[i] + betaLum * dID);
-            ls -= (phiSub + (1.0 + 2.0 * smoothC2) * phiGeom[i] + betaLum * dIS);
+            ld -= (phiSub + phiGeom[i]) + (betaLum + betaClip) * dID;
+            ls -= (phiSub + (1.0 + 2.0 * smoothC2) * phiGeom[i]) + (betaLum + betaClip) * dIS;
         }
         modLogitDiff[i] = ld;
         modLogitSpec[i] = ls;
@@ -537,29 +541,37 @@ void main() {
 
     float sumWDiff = 0.0;
     float sumWSpec = 0.0;
-    vec3 currDiffHr = vec3(0.0);
-    vec3 currSpecHr = vec3(0.0);
+    vec3 currDiffHr  = vec3(0.0);
+    vec3 currSpecLog = vec3(0.0);
+    vec3 currSpecLin = vec3(0.0);
     [[unroll]]
     for (uint i = 0u; i < 9u; ++i) {
         float wD = exp(modLogitDiff[i] - maxLogitDiff);
         float wS = exp(modLogitSpec[i] - maxLogitSpec);
-        sumWDiff   += wD;
-        sumWSpec   += wS;
-        currDiffHr += wD * tapDiff[i];
-        currSpecHr += wS * tapSpec[i];
+        sumWDiff    += wD;
+        sumWSpec    += wS;
+        currDiffHr  += wD * tapDiff[i];
+        currSpecLog += wS * tapSpec[i];
+        currSpecLin += wS * (exp(tapSpec[i]) - vec3(1.0));
     }
-    currDiffHr /= max(sumWDiff, 1e-12);
-    currSpecHr /= max(sumWSpec, 1e-12);
+    float invSumWDiff = 1.0 / max(sumWDiff, 1e-12);
+    float invSumWSpec = 1.0 / max(sumWSpec, 1e-12);
+    currDiffHr  *= invSumWDiff;
+    currSpecLog *= invSumWSpec;
+    currSpecLin *= invSumWSpec;
+    float specLinW = smoothC2 * activityGate;
+    vec3 currSpecHr = mix(currSpecLog, log(vec3(1.0) + max(currSpecLin, vec3(0.0))), specLinW);
 
     float resDHr = tanh(float(rawResD16));
     float resSHr = tanh(float(rawResS16));
     vec3 refCurrDiffHr = max(currDiffHr + vec3(resDHr * isSurfHr), vec3(0.0));
     vec3 refCurrSpecHr = max(currSpecHr + vec3(resSHr * isSurfHr), vec3(0.0));
 
-    float dzExcess   = clamp(max(0.0, relDzHr - 0.02) * 12.5, 0.0, 1.0);
+    float dzThresh   = 0.02 + 0.18 * (1.0 - smoothC4);
+    float dzExcess   = clamp(max(0.0, relDzHr - dzThresh) * 12.5, 0.0, 1.0);
     float dnExcess   = clamp(max(0.0, 0.85 - nDotHr) * (1.0 / 0.35), 0.0, 1.0);
     float disoccSurf = clamp(dzExcess + dnExcess, 0.0, 1.0);
-    float drExcess   = clamp(max(0.0, relDReflHr - 0.03) * (1.0 / 0.12), 0.0, 1.0);
+    float drExcess   = smoothC4 * clamp(max(0.0, relDReflHr - 0.03) * (1.0 / 0.12), 0.0, 1.0);
     float disoccSpec = clamp(max(disoccSurf, drExcess), 0.0, 1.0);
 
     float dJit2 = clamp((scaleX * scaleX) * (dtx * dtx) + (scaleY * scaleY) * (dty * dty), 0.0, 2.0);
@@ -605,8 +617,10 @@ void main() {
     float effAlphaS = 1.0 - validSpecHr * (1.0 - netAlphaS);
     float effAlphaG = 1.0 - validSurfHr * (1.0 - netAlphaG);
 
-    vec3 blendedDiffHr = (1.0 - effAlphaD) * wDiffHr + effAlphaD * refCurrDiffHr;
-    vec3 blendedSpecHr = (1.0 - effAlphaS) * wSpecHr + effAlphaS * refCurrSpecHr;
+    vec3 blendedDiffHr  = (1.0 - effAlphaD) * wDiffHr + effAlphaD * refCurrDiffHr;
+    vec3 blendedSpecLog = (1.0 - effAlphaS) * wSpecHr + effAlphaS * refCurrSpecHr;
+    vec3 blendedSpecLin = (1.0 - effAlphaS) * (exp(wSpecHr) - vec3(1.0)) + effAlphaS * (exp(refCurrSpecHr) - vec3(1.0));
+    vec3 blendedSpecHr  = mix(blendedSpecLog, log(vec3(1.0) + max(blendedSpecLin, vec3(0.0))), specLinW);
     vec3 irrDiffHr = clamp(blendedDiffHr * activityGate, vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
     vec3 irrSpecHr = clamp(blendedSpecHr * activityGate, vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
 

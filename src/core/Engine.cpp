@@ -1668,6 +1668,7 @@ void Engine::renderFrame() {
                     m_config.upways_superres || m_config.gateway_superres, m_config.accum_format,
                     m_postProcess.get(), m_commandBuffers[0]
                 );
+                updateUpwaysDescriptors();
             }
         }
 

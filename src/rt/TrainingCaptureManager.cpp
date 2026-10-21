@@ -6,6 +6,8 @@
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
 #include "scene/Camera.hpp"
+#include "scene/ProceduralScene.hpp"
+#include "scene/SceneManager.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
@@ -840,23 +842,42 @@ void TrainingCaptureManager::run() {
     for (uint32_t f = 0; f < m_engine->m_config.capture_frames; ++f) {
         Logger::info("--- Capturing Training Frame [{}/{}] ---", f + 1, m_engine->m_config.capture_frames);
 
-        // Update camera for frame f according to capture_camera_mode
-        if (m_engine->m_camera) {
-            updateCaptureCamera(m_engine->m_camera.get(), f, m_engine->m_config.capture_frames, m_engine->m_config.scene_path);
-        }
+        if (m_engine->m_sceneData.isMineshaftCoaster) {
+            bool advanceCoaster = m_engine->m_config.animate_objects &&
+                                  (m_engine->m_config.capture_camera_mode != CaptureCameraMode::Static &&
+                                   m_engine->m_config.capture_camera_mode != CaptureCameraMode::Rotate);
+            float animSpeed = (m_engine->m_config.animation_speed > 0.0001f) ? m_engine->m_config.animation_speed : 1.0f;
+            float animDt = (1.0f / 60.0f) * animSpeed;
+            float evalTime = advanceCoaster ? (static_cast<float>(f) * animDt) : 0.0f;
 
-        // Step dynamic object animations for frame f if enabled
-        if (m_engine->m_config.animate_objects && !m_engine->m_sceneData.animatedInstances.empty()) {
-            float animDt = (1.0f / 60.0f) * m_engine->m_config.animation_speed;
-            m_engine->updateAnimatedInstances(animDt);
-            // Record GPU TLAS update/refit
+            glm::vec3 cCamPos, cCamTarget, cCamUp;
+            float cCamFov = 58.0f;
+            glm::mat4 riderMat(1.0f), lead1Mat(1.0f), lead2Mat(1.0f);
+            ProceduralScene::updateMineshaftCoaster(
+                m_engine->m_sceneData, evalTime,
+                cCamPos, cCamTarget, cCamUp, cCamFov,
+                riderMat, lead1Mat, lead2Mat
+            );
+            if (m_engine->m_sceneData.coasterRiderCartInst != UINT32_MAX) {
+                m_engine->updateInstanceTransform(m_engine->m_sceneData.coasterRiderCartInst, riderMat);
+            }
+            if (m_engine->m_sceneData.coasterLeadCart1Inst != UINT32_MAX) {
+                m_engine->updateInstanceTransform(m_engine->m_sceneData.coasterLeadCart1Inst, lead1Mat);
+            }
+            if (m_engine->m_sceneData.coasterLeadCart2Inst != UINT32_MAX) {
+                m_engine->updateInstanceTransform(m_engine->m_sceneData.coasterLeadCart2Inst, lead2Mat);
+            }
+            if (m_engine->m_sceneManager) {
+                m_engine->m_sceneManager->updateDynamicLights(m_engine->m_sceneData);
+                m_engine->m_numLights = m_engine->m_sceneManager->getNumLights();
+            }
             if (m_engine->m_tlasUpdatePipeline && m_engine->m_tlas) {
                 VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
                 vkResetCommandBuffer(cmd, 0);
                 VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                 vkBeginCommandBuffer(cmd, &beginInfo);
-                m_engine->recordGpuTlasUpdate(cmd, true);
+                m_engine->recordGpuTlasUpdate(cmd, false);
                 vkEndCommandBuffer(cmd);
 
                 VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -866,6 +887,55 @@ void TrainingCaptureManager::run() {
                 submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
                 vkQueueSubmit2(m_engine->m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
                 vkQueueWaitIdle(m_engine->m_context->getGraphicsQueue());
+            }
+            if (m_engine->m_camera) {
+                m_engine->m_camera->setAnimatedPose(cCamPos, cCamTarget, cCamUp, cCamFov);
+                constexpr float PI = 3.14159265358979323846f;
+                uint32_t totalFrames = m_engine->m_config.capture_frames;
+                if (m_engine->m_config.capture_camera_mode == CaptureCameraMode::Static || f == 0u) {
+                    if (m_engine->m_config.capture_camera_mode == CaptureCameraMode::Static) {
+                        m_engine->m_camera->resetMoved();
+                    }
+                }
+                if (m_engine->m_config.capture_camera_mode == CaptureCameraMode::Rotate && totalFrames > 1u) {
+                    float degPerFrame = 360.0f / std::max(totalFrames, 120u);
+                    float sweepYaw = degPerFrame * static_cast<float>(f);
+                    float nodPitch = 5.0f * std::sin(2.0f * PI * (static_cast<float>(f) / std::max(totalFrames, 60u)));
+                    m_engine->m_camera->setPose(cCamPos, m_engine->m_camera->getYaw() + sweepYaw, m_engine->m_camera->getPitch() + nodPitch);
+                } else if (m_engine->m_config.capture_camera_mode == CaptureCameraMode::Gaming && totalFrames > 1u) {
+                    float glanceYaw = 6.0f * std::sin(2.0f * PI * (static_cast<float>(f) / 16.0f));
+                    float glancePitch = 2.5f * std::cos(2.0f * PI * (static_cast<float>(f) / 12.0f));
+                    m_engine->m_camera->setPose(cCamPos, m_engine->m_camera->getYaw() + glanceYaw, m_engine->m_camera->getPitch() + glancePitch);
+                }
+            }
+        } else {
+            // Update camera for frame f according to capture_camera_mode
+            if (m_engine->m_camera) {
+                updateCaptureCamera(m_engine->m_camera.get(), f, m_engine->m_config.capture_frames, m_engine->m_config.scene_path);
+            }
+
+            // Step dynamic object animations for frame f if enabled
+            if (m_engine->m_config.animate_objects && !m_engine->m_sceneData.animatedInstances.empty()) {
+                float animDt = (1.0f / 60.0f) * m_engine->m_config.animation_speed;
+                m_engine->updateAnimatedInstances(animDt);
+                // Record GPU TLAS update/refit
+                if (m_engine->m_tlasUpdatePipeline && m_engine->m_tlas) {
+                    VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
+                    vkResetCommandBuffer(cmd, 0);
+                    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(cmd, &beginInfo);
+                    m_engine->recordGpuTlasUpdate(cmd, true);
+                    vkEndCommandBuffer(cmd);
+
+                    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                    cmdSubmitInfo.commandBuffer = cmd;
+                    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                    submitInfo.commandBufferInfoCount = 1;
+                    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+                    vkQueueSubmit2(m_engine->m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+                    vkQueueWaitIdle(m_engine->m_context->getGraphicsQueue());
+                }
             }
         }
 

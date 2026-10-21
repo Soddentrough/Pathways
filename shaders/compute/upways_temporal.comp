@@ -157,7 +157,9 @@ void main() {
 
     if (activeHist) {
         vec4 rawSmLoad = imageLoad(uSpecularMotion, gp);
-        hasSpecHit = (rawSmLoad.w > 1e-4 && rawSmLoad.w < UPWAYS_SKY_DEPTH);
+        float surfMvMag2 = dot(mvSurf, mvSurf);
+        hasSpecHit = (rawSmLoad.w > 1e-4 && rawSmLoad.w < UPWAYS_SKY_DEPTH &&
+                      roughness < 0.25 && (roughness < 0.08 || surfMvMag2 > 1e-7));
         if (hasSpecHit) {
             effSpecMv = rawSmLoad.xy;
         }
@@ -211,7 +213,7 @@ void main() {
     float specHitT  = activeHist ? imageLoad(uSpecularMotion, gp).w : 0.0;
     float denomRefl = max(max(specHitT, wPrevSm.w), 0.1);
     float relDRefl  = activeHist
-        ? (hasSpecHit ? float(float16_t(clamp(abs(specHitT - wPrevSm.w) / denomRefl, 0.0, 2.0))) : relDz)
+        ? ((hasSpecHit && wPrevSm.w > 1e-4) ? float(float16_t(clamp(abs(specHitT - wPrevSm.w) / denomRefl, 0.0, 2.0))) : relDz)
         : 1.0;
 
     // 3. Zero-LDS Subgroup DPP Quad Average Pooling for Stage 2 Multi-Scale U-Net
