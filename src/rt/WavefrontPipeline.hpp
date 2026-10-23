@@ -4,6 +4,7 @@
 #include "vulkan/Buffer.hpp"
 #include "rt/DGCManager.hpp"
 #include "scene/Camera.hpp"
+#include "../../shaders/compute/wavefront_shared.glsl"
 #include <memory>
 #include <vector>
 #include <array>
@@ -13,38 +14,6 @@
 namespace pathways {
 
 class Image;
-
-struct QueueCountersBuffer {
-    uint32_t activeRayCount;
-    uint32_t nextActiveCount;
-    uint32_t totalProcessed;
-    uint32_t shadowRayCount;
-    uint32_t retiredWorkgroups;
-    uint32_t currentShadowCount;
-    uint32_t diffuseCount; // Standard count
-    uint32_t complexCount;
-    uint32_t dielectricCount;
-    uint32_t emissiveCount;
-    uint32_t conductorCount; // Reserved
-    uint32_t alphamaskCount; // Reserved
-    uint32_t nextDiffuseCount;
-    uint32_t nextComplexCount;
-    uint32_t nextDielectricCount;
-    uint32_t nextEmissiveCount;
-    uint32_t nextConductorCount; // Reserved
-    uint32_t nextAlphamaskCount; // Reserved
-    uint32_t currentMaterialCounts[4];
-    uint32_t padMat[2];
-    uint32_t totalShadeWorkgroups;
-    uint32_t octantCounts[8];
-    uint32_t currentOctantCounts[8];
-    uint32_t totalIntersectWorkgroups;
-    uint32_t secondaryRayCount;
-    uint32_t activeMaterialSequenceCount;
-    uint32_t pad[20];
-};
-static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
-static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
 
 struct WavefrontSceneData {
     uint32_t numTriangles = 0;
@@ -267,8 +236,7 @@ private:
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_descSetLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_descSetsEven = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // In: A, Out: B
-    std::array<VkDescriptorSet, 2> m_descSetsOdd = { VK_NULL_HANDLE, VK_NULL_HANDLE };  // In: B, Out: A
+    std::array<VkDescriptorSet, 2> m_descSetsEven = { VK_NULL_HANDLE, VK_NULL_HANDLE }; // Unified descriptor set per frame slot
 
     // Pipelines
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
@@ -289,7 +257,37 @@ private:
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
 
+    struct BatchBounceTimestamps {
+        uint64_t shadeStart = 0;
+        uint64_t shadeEnd = 0;
+        uint64_t shadowStart = 0;
+        uint64_t shadowEnd = 0;
+        uint64_t intersectStart = 0;
+        uint64_t intersectEnd = 0;
+    };
+    struct BatchTimestamps {
+        uint64_t classifyStart = 0;
+        uint64_t classifyEnd = 0;
+        std::vector<BatchBounceTimestamps> bounces;
+    };
+    struct SlotTimestampRecord {
+        uint64_t frameStart = 0;
+        uint64_t frameEnd = 0;
+        std::vector<BatchTimestamps> batches;
+        std::vector<uint64_t*> destPtrs;
+        void reset(uint32_t numBatches, uint32_t maxBounces) {
+            frameStart = 0;
+            frameEnd = 0;
+            batches.assign(numBatches, BatchTimestamps{0, 0, std::vector<BatchBounceTimestamps>(maxBounces)});
+            destPtrs.clear();
+        }
+    };
+
+    void writeTimestamp(VkCommandBuffer cmd, uint32_t frameSlot, uint64_t* dest,
+                        VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
     std::array<VkQueryPool, 2> m_queryPools = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<SlotTimestampRecord, 2> m_timestampRecords;
     std::array<bool, 2> m_hasRecordedSlot = { false, false };
     std::array<uint32_t, 2> m_slotBounces = { 0, 0 };
     std::array<uint32_t, 2> m_slotTailMegakernelBounce = { 0, 0 };

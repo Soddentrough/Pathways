@@ -149,6 +149,7 @@ public:
     bool isPciLinkDegraded() const { return m_pciLinkInfo.isDegraded; }
     bool hasPositionFetch() const { return m_hasPositionFetch; }
     bool hasDescriptorHeap() const { return m_hasDescriptorHeap; }
+    bool hasUnifiedImageLayouts() const { return m_hasUnifiedImageLayouts; }
 #ifdef _WIN32
     bool hasExternalMemoryWin32() const { return m_hasExternalMemoryWin32; }
     bool hasExternalSemaphoreWin32() const { return m_hasExternalSemaphoreWin32; }
@@ -211,6 +212,7 @@ private:
 #endif
     bool m_hasPositionFetch = false;
     bool m_hasDescriptorHeap = false;
+    bool m_hasUnifiedImageLayouts = false;
 #ifdef _WIN32
     bool m_hasExternalMemoryWin32 = false;
     bool m_hasExternalSemaphoreWin32 = false;

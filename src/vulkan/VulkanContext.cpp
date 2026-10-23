@@ -481,6 +481,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) == 0) {
             m_hasDescriptorHeap = true;
         }
+#ifdef VK_KHR_unified_image_layouts
+        if (std::strcmp(ext.extensionName, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME) == 0) {
+            m_hasUnifiedImageLayouts = true;
+        }
+#endif
 #ifdef _WIN32
         if (std::strcmp(ext.extensionName, "VK_KHR_external_memory_win32") == 0) {
             m_hasExternalMemoryWin32 = true;
@@ -530,10 +535,23 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     VkPhysicalDeviceVulkan13Features vk13Features{};
     vk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vk12Features.pNext = &vk13Features;
+#ifdef VK_KHR_unified_image_layouts
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutsFeatures{};
+    unifiedLayoutsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR;
+    if (m_hasUnifiedImageLayouts) {
+        vk13Features.pNext = &unifiedLayoutsFeatures;
+    }
+#endif
 
     VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     feat2.pNext = &vk12Features;
     vkGetPhysicalDeviceFeatures2(m_physicalDevice, &feat2);
+
+#ifdef VK_KHR_unified_image_layouts
+    if (m_hasUnifiedImageLayouts && !unifiedLayoutsFeatures.unifiedImageLayouts) {
+        m_hasUnifiedImageLayouts = false;
+    }
+#endif
 
     m_vk12Features = vk12Features;
     m_vk13Features = vk13Features;
@@ -956,6 +974,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasDescriptorHeap) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
     }
+#ifdef VK_KHR_unified_image_layouts
+    if (m_hasUnifiedImageLayouts) {
+        deviceExtensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+    }
+#endif
 #ifdef _WIN32
     if (m_hasExternalMemoryWin32) {
         deviceExtensions.push_back("VK_KHR_external_memory_win32");
@@ -967,6 +990,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 
     // Vulkan 1.4 / 1.3 / 1.2 Features chaining
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featuresPositionFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
+#ifdef VK_KHR_unified_image_layouts
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR };
+#endif
 
     VkPhysicalDeviceVulkan14Features features14{};
     features14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
@@ -978,11 +1004,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features14.maintenance5 = VK_TRUE;
     features14.maintenance6 = VK_TRUE;
     features14.pushDescriptor = VK_TRUE;
-
-    if (m_hasPositionFetch) {
-        featuresPositionFetch.rayTracingPositionFetch = VK_TRUE;
-        features14.pNext = &featuresPositionFetch;
-    }
 
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -1024,42 +1045,48 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     asFeatures.accelerationStructure = VK_TRUE;
-    asFeatures.pNext = &rtPipelineFeatures;
 
     VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rayQueryFeatures.rayQuery = VK_TRUE;
-    rayQueryFeatures.pNext = &asFeatures;
 
     VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT dgcFeatures{};
     dgcFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT;
     dgcFeatures.deviceGeneratedCommands = VK_TRUE;
     dgcFeatures.dynamicGeneratedPipelineLayout = VK_TRUE;
-    dgcFeatures.pNext = &rayQueryFeatures;
-
-    void* tailFeature = nullptr;
-    if (m_hasRayTracing && m_hasDGC) {
-        features14.pNext = &dgcFeatures;
-        tailFeature = &rtPipelineFeatures;
-    } else if (m_hasRayTracing) {
-        features14.pNext = &rayQueryFeatures;
-        tailFeature = &rtPipelineFeatures;
-    } else {
-        tailFeature = &features14;
-    }
 
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatFeatures{};
     coopMatFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
     coopMatFeatures.cooperativeMatrix = VK_TRUE;
-    coopMatFeatures.pNext = nullptr;
 
-    if (m_hasCooperativeMatrix) {
-        if (tailFeature == &rtPipelineFeatures) {
-            rtPipelineFeatures.pNext = &coopMatFeatures;
-        } else if (tailFeature == &features14) {
-            features14.pNext = &coopMatFeatures;
-        }
+    void** pNextChain = &features14.pNext;
+    auto appendFeature = [&](auto& featureStruct) {
+        featureStruct.pNext = nullptr;
+        *pNextChain = &featureStruct;
+        pNextChain = &featureStruct.pNext;
+    };
+
+    if (m_hasDGC) {
+        appendFeature(dgcFeatures);
     }
+    if (m_hasRayTracing) {
+        appendFeature(rayQueryFeatures);
+        appendFeature(asFeatures);
+        appendFeature(rtPipelineFeatures);
+    }
+    if (m_hasPositionFetch) {
+        featuresPositionFetch.rayTracingPositionFetch = VK_TRUE;
+        appendFeature(featuresPositionFetch);
+    }
+    if (m_hasCooperativeMatrix) {
+        appendFeature(coopMatFeatures);
+    }
+#ifdef VK_KHR_unified_image_layouts
+    if (m_hasUnifiedImageLayouts) {
+        unifiedLayoutFeatures.unifiedImageLayouts = VK_TRUE;
+        appendFeature(unifiedLayoutFeatures);
+    }
+#endif
 
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;

@@ -226,6 +226,23 @@ void PostProcessPipeline::createPipelines(
     };
     subgroupSize32.requiredSubgroupSize = 32;
 
+    auto buildComputePipeline = [&](const std::vector<char>& code, VkPipelineLayout layout, const char* errMsg) -> VkPipeline {
+        VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        smInfo.pNext = m_hasSubgroupSizeControl ? &subgroupSize32 : nullptr;
+        smInfo.codeSize = code.size();
+        smInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+        VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        pipeInfo.layout = layout;
+        pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &smInfo, 0, VK_SHADER_STAGE_COMPUTE_BIT, VK_NULL_HANDLE, "main", nullptr };
+
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe) != VK_SUCCESS) {
+            throw std::runtime_error(errMsg);
+        }
+        return pipe;
+    };
+
     // 1. Tonemap Pipeline
     if (!tonemapSpv.empty()) {
         VkPushConstantRange tonemapPushConstant{};
@@ -241,17 +258,7 @@ void PostProcessPipeline::createPipelines(
         if (vkCreatePipelineLayout(m_device, &tonemapPipeLayoutInfo, nullptr, &m_tonemapPipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create tonemap pipeline layout");
         }
-
-        VkShaderModule tonemapModule = createShaderModule(tonemapSpv);
-        VkComputePipelineCreateInfo tonemapPipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        tonemapPipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, tonemapModule, "main", nullptr };
-        if (m_hasSubgroupSizeControl) tonemapPipelineInfo.stage.pNext = &subgroupSize32;
-        tonemapPipelineInfo.layout = m_tonemapPipelineLayout;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &tonemapPipelineInfo, nullptr, &m_tonemapPipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, tonemapModule, nullptr);
-            throw std::runtime_error("Failed to create tonemap pipeline");
-        }
-        vkDestroyShaderModule(m_device, tonemapModule, nullptr);
+        m_tonemapPipeline = buildComputePipeline(tonemapSpv, m_tonemapPipelineLayout, "Failed to create tonemap pipeline");
     }
 
     // 2. Running Avg Pipeline
@@ -269,17 +276,7 @@ void PostProcessPipeline::createPipelines(
         if (vkCreatePipelineLayout(m_device, &pipeLayoutInfo, nullptr, &m_accumRunningAvgPipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create running avg pipeline layout");
         }
-
-        VkShaderModule shaderModule = createShaderModule(runningAvgSpv);
-        VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-        if (m_hasSubgroupSizeControl) pipelineInfo.stage.pNext = &subgroupSize32;
-        pipelineInfo.layout = m_accumRunningAvgPipelineLayout;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_accumRunningAvgPipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, shaderModule, nullptr);
-            throw std::runtime_error("Failed to create running avg pipeline");
-        }
-        vkDestroyShaderModule(m_device, shaderModule, nullptr);
+        m_accumRunningAvgPipeline = buildComputePipeline(runningAvgSpv, m_accumRunningAvgPipelineLayout, "Failed to create running avg pipeline");
     }
 
     // 3. Fused Accum/Tonemap Pipeline
@@ -297,17 +294,7 @@ void PostProcessPipeline::createPipelines(
         if (vkCreatePipelineLayout(m_device, &pipeLayoutInfo, nullptr, &m_accumTonemapPipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create fused accum tonemap pipeline layout");
         }
-
-        VkShaderModule shaderModule = createShaderModule(fusedAccumTonemapSpv);
-        VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shaderModule, "main", nullptr };
-        if (m_hasSubgroupSizeControl) pipelineInfo.stage.pNext = &subgroupSize32;
-        pipelineInfo.layout = m_accumTonemapPipelineLayout;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_accumTonemapPipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, shaderModule, nullptr);
-            throw std::runtime_error("Failed to create fused accum tonemap pipeline");
-        }
-        vkDestroyShaderModule(m_device, shaderModule, nullptr);
+        m_accumTonemapPipeline = buildComputePipeline(fusedAccumTonemapSpv, m_accumTonemapPipelineLayout, "Failed to create fused accum tonemap pipeline");
     }
 
     // 4. Blend 4K Pipeline
@@ -325,18 +312,7 @@ void PostProcessPipeline::createPipelines(
         if (vkCreatePipelineLayout(m_device, &blendPipeLayoutInfo, nullptr, &m_fsr3BlendPipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create FSR3 blend pipeline layout");
         }
-
-        VkShaderModule blendModule = createShaderModule(blendSpv);
-        VkComputePipelineCreateInfo blendPipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        blendPipeInfo.layout = m_fsr3BlendPipelineLayout;
-        blendPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, blendModule, "main", nullptr };
-        if (m_hasSubgroupSizeControl) blendPipeInfo.stage.pNext = &subgroupSize32;
-
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &blendPipeInfo, nullptr, &m_fsr3BlendPipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, blendModule, nullptr);
-            throw std::runtime_error("Failed to create FSR3 blend compute pipeline");
-        }
-        vkDestroyShaderModule(m_device, blendModule, nullptr);
+        m_fsr3BlendPipeline = buildComputePipeline(blendSpv, m_fsr3BlendPipelineLayout, "Failed to create FSR3 blend compute pipeline");
     }
 
     // 5. Merge Pipeline
@@ -354,18 +330,7 @@ void PostProcessPipeline::createPipelines(
         if (vkCreatePipelineLayout(m_device, &mergePipeLayoutInfo, nullptr, &m_mergePipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create merge pipeline layout");
         }
-
-        VkShaderModule mergeModule = createShaderModule(mergeSpv);
-        VkComputePipelineCreateInfo mergePipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        mergePipelineInfo.layout = m_mergePipelineLayout;
-        mergePipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mergeModule, "main", nullptr };
-        if (m_hasSubgroupSizeControl) mergePipelineInfo.stage.pNext = &subgroupSize32;
-
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &mergePipelineInfo, nullptr, &m_mergePipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, mergeModule, nullptr);
-            throw std::runtime_error("Failed to create merge pipeline");
-        }
-        vkDestroyShaderModule(m_device, mergeModule, nullptr);
+        m_mergePipeline = buildComputePipeline(mergeSpv, m_mergePipelineLayout, "Failed to create merge pipeline");
     }
 }
 
@@ -463,15 +428,16 @@ void PostProcessPipeline::createDebugViewPipeline(const std::vector<char>& spv) 
         throw std::runtime_error("Failed to create ReSTIR debug view pipeline layout");
     }
 
-    VkShaderModule mod = createShaderModule(spv);
+    VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smInfo.codeSize = spv.size();
+    smInfo.pCode = reinterpret_cast<const uint32_t*>(spv.data());
+
     VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+    pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &smInfo, 0, VK_SHADER_STAGE_COMPUTE_BIT, VK_NULL_HANDLE, "main", nullptr };
     pipelineInfo.layout = m_restirDebugPipelineLayout;
     if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_restirDebugPipeline) != VK_SUCCESS) {
-        vkDestroyShaderModule(m_device, mod, nullptr);
         throw std::runtime_error("Failed to create ReSTIR debug view pipeline");
     }
-    vkDestroyShaderModule(m_device, mod, nullptr);
 }
 
 void PostProcessPipeline::updateRunningAvgDescriptors(

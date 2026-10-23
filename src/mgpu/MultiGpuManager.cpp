@@ -630,12 +630,23 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
     vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
     vkGetPhysicalDeviceMemoryProperties(phys1, &memProps1);
 
-    // Find Device-Local memory type on Device 0
+    // Find cached Device-Local memory type on Device 0 (exclude uncached/device-coherent AMD heaps)
+    constexpr VkMemoryPropertyFlags kDisallowedUncachedFlags =
+        VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
     uint32_t devLocalIdx0 = UINT32_MAX;
     for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
-        if (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+        VkMemoryPropertyFlags flags = memProps0.memoryTypes[i].propertyFlags;
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (flags & kDisallowedUncachedFlags) == 0) {
             devLocalIdx0 = i;
             break;
+        }
+    }
+    if (devLocalIdx0 == UINT32_MAX) {
+        for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+            if (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                devLocalIdx0 = i;
+                break;
+            }
         }
     }
     if (devLocalIdx0 == UINT32_MAX) return false;
@@ -735,9 +746,18 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
 
         uint32_t memIdx1 = UINT32_MAX;
         for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
-            if (fdProps.memoryTypeBits & (1 << i)) {
+            if ((fdProps.memoryTypeBits & (1 << i)) &&
+                (memProps1.memoryTypes[i].propertyFlags & kDisallowedUncachedFlags) == 0) {
                 memIdx1 = i;
                 break;
+            }
+        }
+        if (memIdx1 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+                if (fdProps.memoryTypeBits & (1 << i)) {
+                    memIdx1 = i;
+                    break;
+                }
             }
         }
         if (memIdx1 == UINT32_MAX) {
@@ -944,12 +964,25 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         VkMemoryHostPointerPropertiesEXT hostProps1{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         pfnGet1(dev1, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, m_sharedHostPtr[slot], &hostProps1);
 
+        constexpr VkMemoryPropertyFlags kDisallowedUncachedFlags =
+            VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
         uint32_t memIdx0 = UINT32_MAX, memIdx1 = UINT32_MAX;
         for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+            VkMemoryPropertyFlags flags = memProps0.memoryTypes[i].propertyFlags;
             if ((hostProps0.memoryTypeBits & (1 << i)) &&
-                (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+                (flags & kDisallowedUncachedFlags) == 0) {
                 memIdx0 = i;
                 break;
+            }
+        }
+        if (memIdx0 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+                if ((hostProps0.memoryTypeBits & (1 << i)) &&
+                    (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                    memIdx0 = i;
+                    break;
+                }
             }
         }
         if (memIdx0 == UINT32_MAX) {
@@ -959,10 +992,21 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
         }
 
         for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+            VkMemoryPropertyFlags flags = memProps1.memoryTypes[i].propertyFlags;
             if ((hostProps1.memoryTypeBits & (1 << i)) &&
-                (memProps1.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+                (flags & kDisallowedUncachedFlags) == 0) {
                 memIdx1 = i;
                 break;
+            }
+        }
+        if (memIdx1 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+                if ((hostProps1.memoryTypeBits & (1 << i)) &&
+                    (memProps1.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                    memIdx1 = i;
+                    break;
+                }
             }
         }
         if (memIdx1 == UINT32_MAX) {

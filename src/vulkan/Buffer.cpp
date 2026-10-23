@@ -34,9 +34,14 @@ Buffer::Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usa
     allocInfo.flags = flags;
     allocInfo.minAlignment = minAlignment;
 
-    VkResult res = vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &m_buffer, &m_allocation, nullptr);
+    VmaAllocationInfo allocOutInfo{};
+    VkResult res = vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &m_buffer, &m_allocation, &allocOutInfo);
     if (res != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate buffer with VMA! Error: " + std::to_string(res));
+    }
+    if ((flags & VMA_ALLOCATION_CREATE_MAPPED_BIT) && allocOutInfo.pMappedData != nullptr) {
+        m_mappedData = allocOutInfo.pMappedData;
+        m_persistentlyMapped = true;
     }
 }
 
@@ -50,12 +55,14 @@ Buffer::Buffer(Buffer&& other) noexcept {
     m_allocation = other.m_allocation;
     m_size = other.m_size;
     m_mappedData = other.m_mappedData;
+    m_persistentlyMapped = other.m_persistentlyMapped;
 
     other.m_allocator = VK_NULL_HANDLE;
     other.m_buffer = VK_NULL_HANDLE;
     other.m_allocation = VK_NULL_HANDLE;
     other.m_size = 0;
     other.m_mappedData = nullptr;
+    other.m_persistentlyMapped = false;
 }
 
 Buffer& Buffer::operator=(Buffer&& other) noexcept {
@@ -66,20 +73,24 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
         m_allocation = other.m_allocation;
         m_size = other.m_size;
         m_mappedData = other.m_mappedData;
+        m_persistentlyMapped = other.m_persistentlyMapped;
 
         other.m_allocator = VK_NULL_HANDLE;
         other.m_buffer = VK_NULL_HANDLE;
         other.m_allocation = VK_NULL_HANDLE;
         other.m_size = 0;
         other.m_mappedData = nullptr;
+        other.m_persistentlyMapped = false;
     }
     return *this;
 }
 
 void Buffer::release() {
-    if (m_mappedData) {
+    if (m_mappedData && !m_persistentlyMapped) {
         unmap();
     }
+    m_mappedData = nullptr;
+    m_persistentlyMapped = false;
     if (m_buffer && m_allocator) {
         vmaDestroyBuffer(m_allocator, m_buffer, m_allocation);
         m_buffer = VK_NULL_HANDLE;
@@ -105,7 +116,7 @@ void* Buffer::map() {
 }
 
 void Buffer::unmap() {
-    if (m_mappedData && m_allocator && m_allocation) {
+    if (m_mappedData && !m_persistentlyMapped && m_allocator && m_allocation) {
         vmaUnmapMemory(m_allocator, m_allocation);
         m_mappedData = nullptr;
     }

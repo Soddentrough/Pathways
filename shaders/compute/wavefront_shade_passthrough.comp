@@ -47,43 +47,7 @@ layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
 layout(binding = 8) uniform sampler2D sceneTextures[512];
 
-layout(std430, binding = 9) readonly buffer InRayStateQueue {
-    RayState inStates[];
-};
-
-layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
-    RayState outStates[];
-};
-
-layout(std430, binding = 11) buffer QueueCounters {
-    uint activeRayCount;
-    uint nextActiveCount;
-    uint totalProcessed;
-    uint shadowRayCount;
-    uint retiredWorkgroups;
-    uint currentShadowCount;
-    uint diffuseCount; // Standard count
-    uint complexCount;
-    uint dielectricCount;
-    uint emissiveCount;
-    uint conductorCount; // Reserved
-    uint alphamaskCount; // Reserved
-    uint nextDiffuseCount;
-    uint nextComplexCount;
-    uint nextDielectricCount;
-    uint nextEmissiveCount;
-    uint nextConductorCount; // Reserved
-    uint nextAlphamaskCount; // Reserved
-    uint currentMaterialCounts[4];
-    uint padMat[2];
-    uint totalShadeWorkgroups;
-    uint octantCounts[8];
-    uint currentOctantCounts[8];
-    uint totalIntersectWorkgroups;
-    uint secondaryRayCount;
-    uint activeMaterialSequenceCount;
-    uint pad[20];
-} queueCounters;
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
@@ -96,14 +60,6 @@ layout(std430, binding = 13) buffer IndirectCommand {
 layout(std430, binding = 14) buffer DGCStream {
     DGCCommand commands[];
 } dgcStream;
-
-layout(std430, binding = 15) readonly buffer InRayGeomQueue {
-    RayGeometry inGeoms[];
-};
-
-layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
-    RayGeometry outGeoms[];
-};
 
 layout(std430, binding = 17) readonly buffer InRayHitQueue {
     RayHit inHits[];
@@ -150,31 +106,8 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
 #endif
 
 layout(push_constant) uniform PushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint currentBounce;
-    uint maxBounces;
-    uint maxQueueCapacity;
-    uint sppSampleIndex;
-    uint hasEnvMap;
-    float envMapIntensity;
-    uint useHardwareRT;
-    uint secondarySortMode;
-    uint enableNrc;
-    uint nrcBounce;
-    float nrcTrainRatio;
-    uint frameIndex;
-    uint numOpaqueTriangles;
-    uint captureMlData;
-    float indirectClamp;
-    uint deltaUnroll;
-    uint restirMCap;
-    uint minRayThreshold;
-} pc;
+    WavefrontShadePC pc;
+};
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;

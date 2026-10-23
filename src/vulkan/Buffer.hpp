@@ -39,6 +39,7 @@ private:
     VmaAllocation m_allocation = VK_NULL_HANDLE;
     VkDeviceSize m_size = 0;
     void* m_mappedData = nullptr;
+    bool m_persistentlyMapped = false;
 };
 
 } // namespace pathways

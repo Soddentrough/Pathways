@@ -7,6 +7,8 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
+#define WF_IN_QUEUE_IDX  0u
+#define WF_OUT_QUEUE_IDX 0u
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 8, local_size_y = 4) in;
@@ -49,39 +51,7 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
 
-layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
-    RayState outStates[];
-};
-
-layout(std430, binding = 11) buffer QueueCounters {
-    uint activeRayCount;
-    uint nextActiveCount;
-    uint totalProcessed;
-    uint shadowRayCount;
-    uint retiredWorkgroups;
-    uint currentShadowCount;
-    uint diffuseCount; // Standard count
-    uint complexCount;
-    uint dielectricCount;
-    uint emissiveCount;
-    uint conductorCount; // Reserved
-    uint alphamaskCount; // Reserved
-    uint nextDiffuseCount;
-    uint nextComplexCount;
-    uint nextDielectricCount;
-    uint nextEmissiveCount;
-    uint nextConductorCount; // Reserved
-    uint nextAlphamaskCount; // Reserved
-    uint currentMaterialCounts[4];
-    uint padMat[2];
-    uint totalShadeWorkgroups;
-    uint octantCounts[8];
-    uint currentOctantCounts[8];
-    uint totalIntersectWorkgroups;
-    uint secondaryRayCount;
-    uint activeMaterialSequenceCount;
-    uint pad[20];
-} queueCounters;
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
 layout(std430, binding = 13) buffer IndirectCommand {
     DispatchCommand commands[];
@@ -90,10 +60,6 @@ layout(std430, binding = 13) buffer IndirectCommand {
 layout(std430, binding = 14) buffer DGCStream {
     DGCCommand commands[];
 } dgcStream;
-
-layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
-    RayGeometry outGeoms[];
-};
 
 layout(std430, binding = 17) writeonly buffer OutRayHitQueue {
     RayHit outHits[];
@@ -108,28 +74,8 @@ layout(std430, binding = 33) writeonly buffer PixelToRayBuffer {
 };
 
 layout(push_constant) uniform PushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint useMorton;
-    uint hasEnvMap;
-    float envMapIntensity;
-    uint maxQueueCapacity;
-    uint sppSampleIndex;
-    uint useHardwareRT;
-    uint tileOffsetX;
-    uint tileOffsetY;
-    uint tileSizeX;
-    uint tileSizeY;
-    uint sortMode;
-    uint numOpaqueTriangles;
-    uint fullWidth;
-    uint fullHeight;
-    uint captureMlData;
-} pc;
+    WavefrontClassifyPC pc;
+};
 
 void main() {
     uint fw = (pc.fullWidth > 0u) ? pc.fullWidth : pc.width;

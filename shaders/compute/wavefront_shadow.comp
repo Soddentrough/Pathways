@@ -42,48 +42,11 @@ layout(std430, binding = 12) readonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
 };
 
-layout(std430, binding = 11) buffer QueueCounters {
-    uint activeRayCount;
-    uint nextActiveCount;
-    uint totalProcessed;
-    uint shadowRayCount;
-    uint retiredWorkgroups;
-    uint currentShadowCount;
-    uint diffuseCount; // Standard count
-    uint complexCount;
-    uint dielectricCount;
-    uint emissiveCount;
-    uint conductorCount; // Reserved
-    uint alphamaskCount; // Reserved
-    uint nextDiffuseCount;
-    uint nextComplexCount;
-    uint nextDielectricCount;
-    uint nextEmissiveCount;
-    uint nextConductorCount; // Reserved
-    uint nextAlphamaskCount; // Reserved
-    uint currentMaterialCounts[4];
-    uint padMat[2];
-    uint totalShadeWorkgroups;
-    uint octantCounts[8];
-    uint currentOctantCounts[8];
-    uint totalIntersectWorkgroups;
-    uint secondaryRayCount;
-    uint activeMaterialSequenceCount;
-    uint pad[20];
-} queueCounters;
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
 layout(push_constant) uniform PushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint frameIndex;
-    uint sppSampleIndex;
-    uint numOpaqueTriangles;
-    uint captureMlData;
-} pc;
+    WavefrontShadowPC pc;
+};
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;

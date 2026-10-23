@@ -5,6 +5,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 
+#define WF_IN_QUEUE_IDX  ((pc.currentBounce & 1u) ^ 1u)
+#define WF_OUT_QUEUE_IDX (pc.currentBounce & 1u)
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -23,43 +25,7 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 
-layout(std430, binding = 9) readonly buffer InRayStateQueue {
-    RayState inStates[];
-};
-
-layout(std430, binding = 10) writeonly buffer OutRayStateQueue {
-    RayState outStates[];
-};
-
-layout(std430, binding = 11) buffer QueueCountersBuffer {
-    uint activeRayCount;
-    uint nextActiveCount;
-    uint totalProcessed;
-    uint shadowRayCount;
-    uint retiredWorkgroups;
-    uint currentShadowCount;
-    uint diffuseCount; // Standard count
-    uint complexCount;
-    uint dielectricCount;
-    uint emissiveCount;
-    uint conductorCount; // Reserved
-    uint alphamaskCount; // Reserved
-    uint nextDiffuseCount;
-    uint nextComplexCount;
-    uint nextDielectricCount;
-    uint nextEmissiveCount;
-    uint nextConductorCount; // Reserved
-    uint nextAlphamaskCount; // Reserved
-    uint currentMaterialCounts[4];
-    uint padMat[2];
-    uint totalShadeWorkgroups;
-    uint octantCounts[8];
-    uint currentOctantCounts[8];
-    uint totalIntersectWorkgroups;
-    uint secondaryRayCount;
-    uint activeMaterialSequenceCount;
-    uint pad[20];
-} queueCounters;
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
 layout(std430, binding = 13) buffer IndirectCommand {
     DispatchCommand commands[];
@@ -68,14 +34,6 @@ layout(std430, binding = 13) buffer IndirectCommand {
 layout(std430, binding = 14) buffer DGCStream {
     DGCCommand commands[];
 } dgcStream;
-
-layout(std430, binding = 15) readonly buffer InRayGeomQueue {
-    RayGeometry inGeom[];
-};
-
-layout(std430, binding = 16) writeonly buffer OutRayGeomQueue {
-    RayGeometry outGeoms[];
-};
 
 layout(std430, binding = 17) writeonly buffer OutRayHitQueue {
     RayHit outHits[];
@@ -90,26 +48,8 @@ layout(std430, binding = 19) readonly buffer SecondaryIndexQueue {
 };
 
 layout(push_constant) uniform PushConstants {
-    uint numTriangles;
-    uint numSpheres;
-    uint numMaterials;
-    uint numLights;
-    uint width;
-    uint height;
-    uint currentBounce;
-    uint maxBounces;
-    uint maxQueueCapacity;
-    uint sppSampleIndex;
-    uint hasEnvMap;
-    float envMapIntensity;
-    uint useHardwareRT;
-    uint sortMode;
-    uint numOpaqueTriangles;
-    uint secondarySortMode;
-    uint octantBin;
-    float maxRayDistance;
-    uint minRayThreshold;
-} pc;
+    WavefrontIntersectPC pc;
+};
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;

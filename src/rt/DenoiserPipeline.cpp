@@ -157,14 +157,6 @@ void DenoiserPipeline::initPipelines() {
         VkPipeline& outPipeline
     ) {
         auto code = m_shaderLoader(shaderName);
-        VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-        smInfo.codeSize = code.size();
-        smInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-        VkShaderModule module = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(m_device, &smInfo, nullptr, &module) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create denoiser shader module: " + shaderName);
-        }
-
         VkPushConstantRange pcRange{};
         pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pcRange.offset = 0;
@@ -176,32 +168,31 @@ void DenoiserPipeline::initPipelines() {
         layoutInfo.pushConstantRangeCount = (pushConstantSize > 0) ? 1 : 0;
         layoutInfo.pPushConstantRanges = (pushConstantSize > 0) ? &pcRange : nullptr;
         if (vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &outLayout) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, module, nullptr);
             throw std::runtime_error("Failed to create denoiser pipeline layout for: " + shaderName);
         }
 
-        // Wave32 enforcement (guarded by device capability at construction site to
-        // avoid VUID-VkPipelineShaderStageCreateInfo-pNext-02755)
+        // Wave32 enforcement + Vulkan 1.4 maintenance5 inline VkShaderModuleCreateInfo
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSizeInfo{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
         };
         subgroupSizeInfo.requiredSubgroupSize = 32;
 
+        VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        smInfo.pNext = m_forceWave32 ? &subgroupSizeInfo : nullptr;
+        smInfo.codeSize = code.size();
+        smInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
         VkComputePipelineCreateInfo compInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         compInfo.layout = outLayout;
         compInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        compInfo.stage.pNext = &smInfo;
         compInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        compInfo.stage.module = module;
+        compInfo.stage.module = VK_NULL_HANDLE;
         compInfo.stage.pName = "main";
-        if (m_forceWave32) {
-            compInfo.stage.pNext = &subgroupSizeInfo;
-        }
 
         if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &outPipeline) != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device, module, nullptr);
             throw std::runtime_error("Failed to create denoiser compute pipeline for: " + shaderName);
         }
-        vkDestroyShaderModule(m_device, module, nullptr);
     };
 
     createComputePipeline("denoise_fused_temporal.comp.spv", m_fusedTemporalDescSetLayout,
@@ -256,7 +247,7 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
                 m_allocator, sizeof(CameraMatrices),
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                 VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
             );
         }
     }

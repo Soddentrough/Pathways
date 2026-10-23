@@ -11,6 +11,7 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 
 #include "nrc_common.glsl"
+#include "wavefront_shared.glsl"
 
 #define SAMPLE_SCENE_TEXTURE(texId, uv) textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), 0.0)
 
@@ -498,6 +499,28 @@ struct RayState {
     // z: seed
     // w: pixelIndex | specularFlag
 };
+
+// Ping-pong RayState and RayGeometry queues indexed via uniform scalar bounce parity (single descriptor set)
+#ifndef WF_IN_QUEUE_IDX
+#define WF_IN_QUEUE_IDX (pc.currentBounce & 1u)
+#endif
+#ifndef WF_OUT_QUEUE_IDX
+#define WF_OUT_QUEUE_IDX ((pc.currentBounce & 1u) ^ 1u)
+#endif
+
+#undef WAVEFRONT_QUEUE_COUNTERS_BINDING
+#define WAVEFRONT_QUEUE_COUNTERS_BINDING(bind_idx) \
+    layout(std430, binding = 9) readonly restrict buffer InRayStateQueue { RayState d[]; } wfInStateQueues[2]; \
+    layout(std430, binding = 10) writeonly restrict buffer OutRayStateQueue { RayState d[]; } wfOutStateQueues[2]; \
+    layout(std430, binding = 15) readonly restrict buffer InRayGeomQueue { RayGeometry d[]; } wfInGeomQueues[2]; \
+    layout(std430, binding = 16) writeonly restrict buffer OutRayGeomQueue { RayGeometry d[]; } wfOutGeomQueues[2]; \
+    layout(std430, binding = bind_idx) buffer QueueCounters { QueueCountersBuffer queueCounters; }
+
+#define inStates  wfInStateQueues[WF_IN_QUEUE_IDX].d
+#define outStates wfOutStateQueues[WF_OUT_QUEUE_IDX].d
+#define inGeoms   wfInGeomQueues[WF_IN_QUEUE_IDX].d
+#define inGeom    wfInGeomQueues[WF_IN_QUEUE_IDX].d
+#define outGeoms  wfOutGeomQueues[WF_OUT_QUEUE_IDX].d
 
 #define SPECULAR_FLAG_BIT             (1u << 31)
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
