@@ -1,4 +1,4 @@
-#include "rt/Fsr3Upscaler.hpp"
+#include "rt/FsrUpscaler.hpp"
 #include "core/Logger.hpp"
 
 #include <stdexcept>
@@ -6,7 +6,7 @@
 
 namespace pathways {
 
-Fsr3Upscaler::Fsr3Upscaler(
+FsrUpscaler::FsrUpscaler(
     VkDevice device,
     VkPhysicalDevice physicalDevice,
     VmaAllocator allocator,
@@ -17,7 +17,8 @@ Fsr3Upscaler::Fsr3Upscaler(
     const std::vector<char>& upscaleSpv,
     const std::vector<char>& rcasSpv,
     VkFormat format,
-    const std::string& instanceName
+    const std::string& instanceName,
+    FsrVersion targetVersion
 ) : m_device(device),
     m_physDevice(physicalDevice),
     m_allocator(allocator),
@@ -26,20 +27,22 @@ Fsr3Upscaler::Fsr3Upscaler(
     m_displayWidth(displayWidth),
     m_displayHeight(displayHeight),
     m_format(format),
+    m_targetVersion(targetVersion),
     m_instanceName(instanceName)
 {
-    Logger::info("Fsr3Upscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}",
-                 m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight, static_cast<int>(m_format));
+    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Version: {}",
+                 m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
+                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion));
 
     initImages();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     createPipelines(upscaleSpv, rcasSpv);
 
-    Logger::info("Fsr3Upscaler [{}] successfully initialized.", m_instanceName);
+    Logger::info("FsrUpscaler [{}] successfully initialized.", m_instanceName);
 }
 
-Fsr3Upscaler::~Fsr3Upscaler() {
+FsrUpscaler::~FsrUpscaler() {
     if (m_device != VK_NULL_HANDLE) {
         if (m_upscalePipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_device, m_upscalePipeline, nullptr);
@@ -72,7 +75,7 @@ Fsr3Upscaler::~Fsr3Upscaler() {
     }
 }
 
-void Fsr3Upscaler::initImages() {
+void FsrUpscaler::initImages() {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
@@ -106,7 +109,7 @@ void Fsr3Upscaler::initImages() {
     m_lastBoundDepthView = VK_NULL_HANDLE;
 }
 
-void Fsr3Upscaler::createDescriptorSetLayouts() {
+void FsrUpscaler::createDescriptorSetLayouts() {
     // 1. Upscale & Temporal Accumulation Descriptor Layout:
     // Binding 0: Input Render-Resolution Radiance (image2D)
     // Binding 1: Input Render-Resolution Motion Vectors (image2D)
@@ -127,7 +130,7 @@ void Fsr3Upscaler::createDescriptorSetLayouts() {
     upscaleLayoutInfo.pBindings = upscaleBindings;
 
     if (vkCreateDescriptorSetLayout(m_device, &upscaleLayoutInfo, nullptr, &m_upscaleDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create upscale descriptor set layout!");
+        throw std::runtime_error("FsrUpscaler: Failed to create upscale descriptor set layout!");
     }
 
     // 2. RCAS Descriptor Layout:
@@ -149,11 +152,11 @@ void Fsr3Upscaler::createDescriptorSetLayouts() {
     rcasLayoutInfo.pBindings = rcasBindings;
 
     if (vkCreateDescriptorSetLayout(m_device, &rcasLayoutInfo, nullptr, &m_rcasDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create RCAS descriptor set layout!");
+        throw std::runtime_error("FsrUpscaler: Failed to create RCAS descriptor set layout!");
     }
 }
 
-void Fsr3Upscaler::allocateDescriptorSets() {
+void FsrUpscaler::allocateDescriptorSets() {
     VkDescriptorPoolSize poolSizes[1]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[0].descriptorCount = 24; // 2 sets * 6 bindings + 1 set * 2 bindings + headroom
@@ -164,7 +167,7 @@ void Fsr3Upscaler::allocateDescriptorSets() {
     poolInfo.pPoolSizes = poolSizes;
 
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descPool) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create descriptor pool!");
+        throw std::runtime_error("FsrUpscaler: Failed to create descriptor pool!");
     }
 
     VkDescriptorSetLayout upscaleLayouts[2] = { m_upscaleDescLayout, m_upscaleDescLayout };
@@ -173,7 +176,7 @@ void Fsr3Upscaler::allocateDescriptorSets() {
     upscaleAlloc.descriptorSetCount = 2;
     upscaleAlloc.pSetLayouts = upscaleLayouts;
     if (vkAllocateDescriptorSets(m_device, &upscaleAlloc, m_upscaleDescSets) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to allocate upscale descriptor sets!");
+        throw std::runtime_error("FsrUpscaler: Failed to allocate upscale descriptor sets!");
     }
 
     VkDescriptorSetAllocateInfo rcasAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -181,11 +184,11 @@ void Fsr3Upscaler::allocateDescriptorSets() {
     rcasAlloc.descriptorSetCount = 1;
     rcasAlloc.pSetLayouts = &m_rcasDescLayout;
     if (vkAllocateDescriptorSets(m_device, &rcasAlloc, &m_rcasDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to allocate RCAS descriptor set!");
+        throw std::runtime_error("FsrUpscaler: Failed to allocate RCAS descriptor set!");
     }
 }
 
-void Fsr3Upscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
+void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
     if (inputColorView == VK_NULL_HANDLE || !m_upscaledImage || !m_sharpenedImage || !m_historyImages[0] || !m_historyImages[1]) {
         return;
     }
@@ -311,19 +314,19 @@ void Fsr3Upscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView 
     m_lastBoundDepthView = dView;
 }
 
-VkShaderModule Fsr3Upscaler::createShaderModule(const std::vector<char>& code) {
+VkShaderModule FsrUpscaler::createShaderModule(const std::vector<char>& code) {
     VkShaderModuleCreateInfo createInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     createInfo.codeSize = code.size();
     createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
 
     VkShaderModule shaderModule;
     if (vkCreateShaderModule(m_device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create shader module!");
+        throw std::runtime_error("FsrUpscaler: Failed to create shader module!");
     }
     return shaderModule;
 }
 
-void Fsr3Upscaler::createPipelines(const std::vector<char>& upscaleSpv, const std::vector<char>& rcasSpv) {
+void FsrUpscaler::createPipelines(const std::vector<char>& upscaleSpv, const std::vector<char>& rcasSpv) {
     // 1. Upscale Pipeline Layout
     VkPushConstantRange upscalePcRange{};
     upscalePcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -337,7 +340,7 @@ void Fsr3Upscaler::createPipelines(const std::vector<char>& upscaleSpv, const st
     upscaleLayoutInfo.pPushConstantRanges = &upscalePcRange;
 
     if (vkCreatePipelineLayout(m_device, &upscaleLayoutInfo, nullptr, &m_upscalePipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create upscale pipeline layout!");
+        throw std::runtime_error("FsrUpscaler: Failed to create upscale pipeline layout!");
     }
 
     VkShaderModule upscaleModule = createShaderModule(upscaleSpv);
@@ -350,7 +353,7 @@ void Fsr3Upscaler::createPipelines(const std::vector<char>& upscaleSpv, const st
 
     if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &upscaleInfo, nullptr, &m_upscalePipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, upscaleModule, nullptr);
-        throw std::runtime_error("Fsr3Upscaler: Failed to create upscale compute pipeline!");
+        throw std::runtime_error("FsrUpscaler: Failed to create upscale compute pipeline!");
     }
     vkDestroyShaderModule(m_device, upscaleModule, nullptr);
 
@@ -367,7 +370,7 @@ void Fsr3Upscaler::createPipelines(const std::vector<char>& upscaleSpv, const st
     rcasLayoutInfo.pPushConstantRanges = &rcasPcRange;
 
     if (vkCreatePipelineLayout(m_device, &rcasLayoutInfo, nullptr, &m_rcasPipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("Fsr3Upscaler: Failed to create RCAS pipeline layout!");
+        throw std::runtime_error("FsrUpscaler: Failed to create RCAS pipeline layout!");
     }
 
     VkShaderModule rcasModule = createShaderModule(rcasSpv);
@@ -380,23 +383,23 @@ void Fsr3Upscaler::createPipelines(const std::vector<char>& upscaleSpv, const st
 
     if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &rcasInfo, nullptr, &m_rcasPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, rcasModule, nullptr);
-        throw std::runtime_error("Fsr3Upscaler: Failed to create RCAS compute pipeline!");
+        throw std::runtime_error("FsrUpscaler: Failed to create RCAS compute pipeline!");
     }
     vkDestroyShaderModule(m_device, rcasModule, nullptr);
 }
 
-void Fsr3Upscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, uint32_t displayH) {
+void FsrUpscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, uint32_t displayH) {
     m_renderWidth = renderW;
     m_renderHeight = renderH;
     m_displayWidth = displayW;
     m_displayHeight = displayH;
 
     initImages();
-    Logger::info("Fsr3Upscaler resized: Render {}x{}, Display {}x{}",
+    Logger::info("FsrUpscaler resized: Render {}x{}, Display {}x{}",
                  m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight);
 }
 
-void Fsr3Upscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
+void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
     if (!m_upscalePipeline || !m_rcasPipeline || !m_upscaledImage || !m_sharpenedImage ||
         !m_historyImages[0] || !m_historyImages[1]) {
         return;

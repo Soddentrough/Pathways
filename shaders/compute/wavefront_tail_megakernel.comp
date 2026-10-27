@@ -8,6 +8,7 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
+#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -517,10 +518,12 @@ void main() {
             if (any(greaterThan(accumMlDiffuse, vec3(0.0)))) {
                 vec4 prevD = imageLoad(uMlDiffuseImage, pixelCoord);
                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevD.rgb, accumMlDiffuse, seed), prevD.a));
+                accumFfxSignal(pixelCoord, accumMlDiffuse, false, false, seed);
             }
             if (any(greaterThan(accumMlSpecular, vec3(0.0)))) {
                 vec4 prevS = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevS.rgb, accumMlSpecular, seed), prevS.a));
+                accumFfxSignal(pixelCoord, accumMlSpecular, true, false, seed);
             }
         }
     }

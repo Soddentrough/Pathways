@@ -11,7 +11,7 @@ layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uCurrentDiffuse;
 layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uCurrentSpecular;
 layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uNormalDepth;
 layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uPrevNormalDepth;
-layout(set = 0, binding = 4, rg16f)   uniform readonly image2D uMotionVectors;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uMotionVectors;
 layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uAlbedoRoughness;
 layout(set = 0, binding = 6, rgba16f) uniform readonly image2D uSpecularMotion;
 layout(set = 0, binding = 7, rgba16f) uniform readonly image2D uPrevSpecularMotion;

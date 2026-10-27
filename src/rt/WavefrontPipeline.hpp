@@ -123,7 +123,11 @@ public:
                                 VkBuffer ptHistoryReservoirBuffer = VK_NULL_HANDLE,
                                 VkBuffer pathSampleBuffer = VK_NULL_HANDLE,
                                 VkBuffer shadeRequestBuffer = VK_NULL_HANDLE,
-                                VkBuffer shadeResultBuffer = VK_NULL_HANDLE);
+                                VkBuffer shadeResultBuffer = VK_NULL_HANDLE,
+                                VkImageView ffxDirectDiffuseImageView = VK_NULL_HANDLE,
+                                VkImageView ffxDirectSpecularImageView = VK_NULL_HANDLE,
+                                VkImageView ffxIndirectDiffuseImageView = VK_NULL_HANDLE,
+                                VkImageView ffxIndirectSpecularImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }

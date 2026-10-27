@@ -41,7 +41,7 @@ layout(std140, set = 0, binding = 0) uniform CameraMatricesUBO {
 
 layout(set = 0, binding = 1,  rgba16f) readonly uniform image2D uCurrentDiffuse;   // RGB radiance, A emissive flag
 layout(set = 0, binding = 2,  rgba16f) readonly uniform image2D uCurrentSpecular;  // RGB radiance, A d_refl
-layout(set = 0, binding = 3,  rg16f)   readonly uniform image2D uMotionVectors;
+layout(set = 0, binding = 3,  rgba16f) readonly uniform image2D uMotionVectors;    // 2.5D MV: RG = UV delta, B = PrevLinearZ - CurrLinearZ
 layout(set = 0, binding = 4,  rgba16f) readonly uniform image2D uSpecularMotion;  // Reflection VMV (RG = uv delta, engine packs RG inside RGBA16F)
 layout(set = 0, binding = 5,  rgba16f) readonly uniform image2D uNormalDepth;
 layout(set = 0, binding = 6,  rgba16f) readonly uniform image2D uPrevNormalDepth;

@@ -532,7 +532,7 @@ void PostProcessPipeline::updateMergeDescriptors(
     uint32_t bpp = (format == AccumFormat::RGBA16_SFLOAT) ? 8 : (format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
     VkDeviceSize radSize = static_cast<VkDeviceSize>(width) * height * bpp;
     VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-    VkDeviceSize mvSize = static_cast<VkDeviceSize>(width) * height * 4; // RG16F
+    VkDeviceSize mvSize = static_cast<VkDeviceSize>(width) * height * 8; // RGBA16F (2.5D motion vectors)
     VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
     VkDescriptorBufferInfo secBufInfo{ secBuffer, 0, curSize };

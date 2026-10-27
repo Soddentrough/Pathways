@@ -20,7 +20,7 @@ layout(binding = 1) uniform CameraUBO {
 } ubo;
 
 layout(binding = 12, rgba16f) uniform readonly image2D uNormalDepthImage;
-layout(binding = 14, rg16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 14, rgba16f) uniform readonly image2D uMotionVectorImage;
 
 layout(std430, binding = 21) buffer CausticAtomicBuffer {
     uint causticAtomicBuffer[];

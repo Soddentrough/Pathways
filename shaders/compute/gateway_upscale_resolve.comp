@@ -11,7 +11,7 @@ layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uDenoisedDiffuse;
 layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uDenoisedSpecular;
 layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uNormalDepth;
 layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uAlbedoRoughness;
-layout(set = 0, binding = 4, rg16f)   uniform readonly image2D uMotionVectors;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uMotionVectors;
 
 layout(std430, set = 0, binding = 5) readonly buffer UpscaleKernelInBuffer {
     uvec4 kernelVec4[];

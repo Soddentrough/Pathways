@@ -472,6 +472,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
             m_hasCooperativeMatrix = true;
         }
+#ifdef VK_EXT_shader_float8
+        if (std::strcmp(ext.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) {
+            m_hasShaderFloat8 = true;
+        }
+#endif
         if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
             m_hasHdrMetadata = true;
         }
@@ -535,11 +540,21 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     VkPhysicalDeviceVulkan13Features vk13Features{};
     vk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     vk12Features.pNext = &vk13Features;
+    void** featQueryNext = &vk13Features.pNext;
 #ifdef VK_KHR_unified_image_layouts
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutsFeatures{};
     unifiedLayoutsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR;
     if (m_hasUnifiedImageLayouts) {
-        vk13Features.pNext = &unifiedLayoutsFeatures;
+        *featQueryNext = &unifiedLayoutsFeatures;
+        featQueryNext = &unifiedLayoutsFeatures.pNext;
+    }
+#endif
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
+    float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+    if (m_hasShaderFloat8) {
+        *featQueryNext = &float8Features;
+        featQueryNext = &float8Features.pNext;
     }
 #endif
 
@@ -552,10 +567,44 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         m_hasUnifiedImageLayouts = false;
     }
 #endif
+#ifdef VK_EXT_shader_float8
+    if (m_hasShaderFloat8) {
+        m_hasShaderFloat8 = (float8Features.shaderFloat8 == VK_TRUE);
+        m_hasShaderFloat8CoopMatrix = (float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
+    }
+#endif
 
     m_vk12Features = vk12Features;
     m_vk13Features = vk13Features;
     m_dgcProperties = dgcProps;
+
+    if (m_hasCooperativeMatrix) {
+        auto pfnGetCoopMatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+            vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (pfnGetCoopMatProps) {
+            uint32_t propCount = 0;
+            if (pfnGetCoopMatProps(m_physicalDevice, &propCount, nullptr) == VK_SUCCESS && propCount > 0) {
+                std::vector<VkCooperativeMatrixPropertiesKHR> coopProps(propCount);
+                for (auto& cp : coopProps) {
+                    cp = {};
+                    cp.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                }
+                if (pfnGetCoopMatProps(m_physicalDevice, &propCount, coopProps.data()) == VK_SUCCESS) {
+                    for (const auto& cp : coopProps) {
+                        if (cp.scope != VK_SCOPE_SUBGROUP_KHR) continue;
+                        if (cp.AType == VK_COMPONENT_TYPE_SINT8_KHR || cp.AType == VK_COMPONENT_TYPE_UINT8_KHR) {
+                            m_hasInt8CoopMatrix = true;
+                        }
+#ifdef VK_EXT_shader_float8
+                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT || cp.AType == VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT) {
+                            m_hasFp8CoopMatrix = true;
+                        }
+#endif
+                    }
+                }
+            }
+        }
+    }
 
     Logger::info("Vulkan Driver: {} | Driver ID: {} ({}) | Conformance: {}.{}.{}.{}",
                  m_driverProperties.driverName,
@@ -600,6 +649,12 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                  m_hasRayTracing ? "SUPPORTED" : "NOT FOUND",
                  m_hasSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)",
                  m_hasRtSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)");
+    Logger::info("ML / Cooperative Matrix Capabilities -> CoopMatrix: {}, Int8: {}, Float8: {}, WMMA Int8: {}, WMMA FP8: {}",
+                 m_hasCooperativeMatrix ? "SUPPORTED" : "NOT FOUND",
+                 m_vk12Features.shaderInt8 ? "SUPPORTED" : "NOT FOUND",
+                 m_hasShaderFloat8 ? "SUPPORTED" : "NOT FOUND",
+                 m_hasInt8CoopMatrix ? "SUPPORTED" : "NOT FOUND",
+                 m_hasFp8CoopMatrix ? "SUPPORTED" : "NOT FOUND");
     if (m_hasRayTracing) {
         Logger::info("RT Pipeline Properties -> HandleSize: {} B, BaseAlign: {} B, HandleAlign: {} B, MaxRecursion: {}",
                      m_rtPipelineProperties.shaderGroupHandleSize,
@@ -683,6 +738,9 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     requireFeat(feat12.vulkanMemoryModel, "Vulkan 1.2: vulkanMemoryModel");
     requireFeat(feat12.vulkanMemoryModelDeviceScope, "Vulkan 1.2: vulkanMemoryModelDeviceScope");
     requireFeat(feat12.shaderFloat16, "Vulkan 1.2: shaderFloat16");
+    requireFeat(feat12.shaderInt8, "Vulkan 1.2: shaderInt8");
+    requireFeat(feat12.storageBuffer8BitAccess, "Vulkan 1.2: storageBuffer8BitAccess");
+    requireFeat(feat12.uniformAndStorageBuffer8BitAccess, "Vulkan 1.2: uniformAndStorageBuffer8BitAccess");
 
     // Vulkan 1.1 Core Features
     requireFeat(feat11.storageBuffer16BitAccess, "Vulkan 1.1: storageBuffer16BitAccess");
@@ -968,6 +1026,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasCooperativeMatrix) {
         deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
+#ifdef VK_EXT_shader_float8
+    if (m_hasShaderFloat8) {
+        deviceExtensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    }
+#endif
     if (m_hasPositionFetch) {
         deviceExtensions.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
     }
@@ -992,6 +1055,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featuresPositionFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
 #ifdef VK_KHR_unified_image_layouts
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR };
+#endif
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT };
 #endif
 
     VkPhysicalDeviceVulkan14Features features14{};
@@ -1029,6 +1095,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features12.vulkanMemoryModel = VK_TRUE;
     features12.vulkanMemoryModelDeviceScope = VK_TRUE;
     features12.shaderFloat16 = VK_TRUE;
+    features12.shaderInt8 = VK_TRUE;
+    features12.storageBuffer8BitAccess = VK_TRUE;
+    features12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
     features12.pNext = &features13;
 
     VkPhysicalDeviceVulkan11Features features11{};
@@ -1081,6 +1150,13 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasCooperativeMatrix) {
         appendFeature(coopMatFeatures);
     }
+#ifdef VK_EXT_shader_float8
+    if (m_hasShaderFloat8) {
+        float8Features.shaderFloat8 = VK_TRUE;
+        float8Features.shaderFloat8CooperativeMatrix = m_hasShaderFloat8CoopMatrix ? VK_TRUE : VK_FALSE;
+        appendFeature(float8Features);
+    }
+#endif
 #ifdef VK_KHR_unified_image_layouts
     if (m_hasUnifiedImageLayouts) {
         unifiedLayoutFeatures.unifiedImageLayouts = VK_TRUE;

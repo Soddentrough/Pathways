@@ -58,6 +58,10 @@ public:
     [[nodiscard]] Image* getMlSpecularMotionImage() const { return m_mlSpecularMotionImage.get(); }
     [[nodiscard]] Image* getMlDiffuseImage() const { return m_mlDiffuseImage.get(); }
     [[nodiscard]] Image* getMlSpecularImage() const { return m_mlSpecularImage.get(); }
+    [[nodiscard]] Image* getFfxDirectDiffuseImage() const { return m_ffxDirectDiffuseImage.get(); }
+    [[nodiscard]] Image* getFfxDirectSpecularImage() const { return m_ffxDirectSpecularImage.get(); }
+    [[nodiscard]] Image* getFfxIndirectDiffuseImage() const { return m_ffxIndirectDiffuseImage.get(); }
+    [[nodiscard]] Image* getFfxIndirectSpecularImage() const { return m_ffxIndirectSpecularImage.get(); }
 
 private:
     void transitionAllToGeneral(VkCommandBuffer cmd);
@@ -79,6 +83,10 @@ private:
     std::unique_ptr<Image> m_mlSpecularMotionImage;
     std::unique_ptr<Image> m_mlDiffuseImage;
     std::unique_ptr<Image> m_mlSpecularImage;
+    std::unique_ptr<Image> m_ffxDirectDiffuseImage;
+    std::unique_ptr<Image> m_ffxDirectSpecularImage;
+    std::unique_ptr<Image> m_ffxIndirectDiffuseImage;
+    std::unique_ptr<Image> m_ffxIndirectSpecularImage;
 };
 
 } // namespace pathways

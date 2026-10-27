@@ -22,7 +22,7 @@ layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 11, rgba16f) uniform image2D uDirectLightImage;
 layout(binding = 12, rgba16f) uniform image2D uNormalDepthImage;
 layout(binding = 13) uniform sampler2D uBlueNoiseTexture;
-layout(binding = 14, rg16f) uniform image2D uMotionVectorImage;
+layout(binding = 14, rgba16f) uniform image2D uMotionVectorImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -152,6 +152,7 @@ void main() {
     vec3 primaryAlbedo = vec3(0.0);
     float primaryRoughness = 0.0;
     vec2 vSurface = vec2(0.0);
+    float vLinearDepthDelta = 0.0;
     vec2 vSpecular = vec2(0.0);
     float specularHitDist = 1000.0;
 
@@ -253,6 +254,7 @@ void main() {
                     vec4 prevClip = ubo.prevViewProj * vec4(primaryHitPoint, 1.0);
                     if (currClip.w > 1e-4 && prevClip.w > 1e-4) {
                         vSurface = (currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5;
+                        vLinearDepthDelta = prevClip.w - currClip.w;
                     }
                     // Corrupted normal overwrite permanently removed: uNormalDepthImage retains true view-space normal from raytrace.rchit
                 } else {
@@ -350,6 +352,6 @@ void main() {
     float dSpec = 1.0 / (1.0 + max(specularHitDist, 0.0));
     imageStore(uDirectLightImage, storeCoord, vec4(primaryAlbedo, dSpec));
 
-    // Tex 3: Surface MV (rg) + Specular Virtual MV (ba)
-    imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, vSpecular));
+    // Tex 3: 2.5D Surface MV (rg = 2D UV motion, b = PrevLinearZ - CurrLinearZ, a = 0.0)
+    imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, vLinearDepthDelta, 0.0));
 }

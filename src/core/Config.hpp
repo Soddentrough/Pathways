@@ -46,24 +46,34 @@ enum class SecondarySortMode {
 };
 
 enum class DenoiserMode {
-    None,     // Raw stochastic path traced output (unfiltered progressive)
-    Upways,   // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    Svgf,     // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
-              //         (docs/design/adaptive_svgf_denoiser_proposal.md)
-    Gateway   // Gateway 4-pass E-SVGF + 2x2 Quad WMMA Guide & Continuous Upscaler
+    None,               // Raw stochastic path traced output (unfiltered progressive)
+    Upways,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+    Svgf,               // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
+                        //         (docs/design/adaptive_svgf_denoiser_proposal.md)
+    Gateway,            // Gateway 4-pass E-SVGF + 2x2 Quad WMMA Guide & Continuous Upscaler
+    FfxRayRegeneration  // AMD FidelityFX Ray Regeneration (ML Denoiser, 4-signal decoupled)
+};
+
+enum class FsrVersion : uint32_t {
+    Auto = 0, // Highest supported FidelityFX FSR version on the device (FSR 4 on RDNA 4+, FSR 3 fallback)
+    Fsr3 = 3, // AMD FSR 3 (analytical temporal super-resolution)
+    Fsr4 = 4, // AMD FSR 4 (ML cooperative-matrix super-resolution)
+    Fsr5 = 5  // Future AMD FSR 5 target
 };
 
 // EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
 // super-resolution modes below are experimental. They are intentionally absent from the README,
 // --help, and the GUI, and are reachable only via hidden CLI flags (--scaler/--denoiser/--upways*).
-// NOTE: the 'FSR3'/'FSR1' passes are Pathways-authored custom filters, NOT the official AMD
-// FidelityFX SDK techniques (see docs/reports/codebase_review_2026_10_07.md findings A3/A5).
+// NOTE: the 'FSR'/'FSR1' passes are Pathways-authored custom filters until the Vulkan FidelityFX
+// SDK backend is linked (see docs/reports/codebase_review_2026_10_07.md findings A3/A5).
 enum class UpscalerMode {
     None,    // Native resolution or direct linear blit [Default]
-    FSR3,    // EXPERIMENTAL: custom temporal upscaler (hidden)
+    FSR,     // EXPERIMENTAL: AMD FSR temporal/ML upscaler (FSR 3 / FSR 4 / future FSR 5)
     Upways,  // EXPERIMENTAL: neural denoiser/SR via Wave32 WMMA (hidden)
     FSR1,    // EXPERIMENTAL: custom spatial upscaler (hidden)
-    Gateway  // EXPERIMENTAL: Gateway 4-pass E-SVGF + WMMA Guide SR
+    Gateway, // EXPERIMENTAL: Gateway 4-pass E-SVGF + WMMA Guide SR
+    // Legacy alias
+    FSR3 = FSR
 };
 
 // Post-mortem visualization overlays written directly over the output image
@@ -185,6 +195,7 @@ struct Config {
     bool gateway_superres = false;        // Gateway Continuous Super-Resolution (e.g. 1080p -> 4K)
     std::string gateway_weights_path = ""; // Custom path to gateway_weights.bin
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
+    FsrVersion fsr_version = FsrVersion::Auto;       // Target FSR version when UpscalerMode::FSR is active [Default: Auto]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]
     float upscaler_sharpness = 0.0f;                 // RCAS contrast-adaptive sharpness [0.0 - 1.0] (default: 0.0)
     bool enable_indirect_light = true;

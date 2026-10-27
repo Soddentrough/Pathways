@@ -38,6 +38,16 @@ inline glm::vec2 getHaltonJitter(uint32_t phaseIndex, uint32_t sequenceLength = 
     return glm::vec2(halton(idx, 2) - 0.5f, halton(idx, 3) - 0.5f);
 }
 
+// Compute FidelityFX FSR recommended Halton(2, 3) jitter phase count:
+// phaseCount = floor(8 * (displayWidth / renderWidth)^2)
+inline uint32_t getFsrJitterPhaseCount(uint32_t renderWidth, uint32_t displayWidth) {
+    if (renderWidth == 0 || displayWidth == 0 || displayWidth <= renderWidth) {
+        return 8u;
+    }
+    const float scaleRatio = static_cast<float>(displayWidth) / static_cast<float>(renderWidth);
+    return std::max(8u, static_cast<uint32_t>(std::floor(8.0f * scaleRatio * scaleRatio)));
+}
+
 class Camera {
 public:
     Camera(glm::vec3 position = glm::vec3(0.0f, 1.0f, 3.5f),

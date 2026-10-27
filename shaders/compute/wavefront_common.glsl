@@ -51,6 +51,25 @@ vec3 unpackOct32(uint p) {
     return octDecode(unpackSnorm2x16(p));
 }
 
+// AMD FidelityFX Ray Regeneration 1.2.0 Octahedral Normal & BRDF Helpers (denoising.md §5.3.1, §5.5.2)
+vec2 ffxNormalToOctahedronUv(vec3 N) {
+    return octEncode(N) * 0.5 + 0.5;
+}
+
+vec3 ffxOctahedronUvToNormal(vec2 uv) {
+    return octDecode(uv * 2.0 - 1.0);
+}
+
+vec3 ffxApproximateBRDF(vec3 specularAlbedo, float roughness, vec3 N, vec3 V) {
+    float NoV = clamp(abs(dot(N, V)), 1e-5, 1.0);
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return specularAlbedo * AB.x + AB.y;
+}
+
 // 64-byte cache-line aligned shading triangle (2 triangles per 128B RDNA 4 vector cache line)
 struct Triangle {
     uint octNormal0;
@@ -1222,6 +1241,40 @@ bool applyRussianRoulette16(inout f16vec3 throughput, float pathLum, uint bounce
     }
     return false;
 }
+#endif
+
+#ifdef WF_ENABLE_FFX_SIGNALS
+layout(binding = 46, rgba16f) uniform image2D uFfxDirectDiffuseImage;
+layout(binding = 47, rgba16f) uniform image2D uFfxDirectSpecularImage;
+layout(binding = 48, rgba16f) uniform image2D uFfxIndirectDiffuseImage;
+layout(binding = 49, rgba16f) uniform image2D uFfxIndirectSpecularImage;
+
+void accumFfxSignalImpl(ivec2 coord, vec3 radiance, bool isSpecular, bool isDirect, inout uint seed) {
+    if (isSpecular) {
+        if (isDirect) {
+            vec4 prev = imageLoad(uFfxDirectSpecularImage, coord);
+            imageStore(uFfxDirectSpecularImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        } else {
+            vec4 prev = imageLoad(uFfxIndirectSpecularImage, coord);
+            imageStore(uFfxIndirectSpecularImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        }
+    } else {
+        if (isDirect) {
+            vec4 prev = imageLoad(uFfxDirectDiffuseImage, coord);
+            imageStore(uFfxDirectDiffuseImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        } else {
+            vec4 prev = imageLoad(uFfxIndirectDiffuseImage, coord);
+            imageStore(uFfxIndirectDiffuseImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        }
+    }
+}
+
+#define accumFfxSignal(coord, radiance, isSpecular, isDirect, seed) \
+    do { \
+        if ((pc.captureMlData & 4u) != 0u) { \
+            accumFfxSignalImpl((coord), (radiance), (isSpecular), (isDirect), (seed)); \
+        } \
+    } while(false)
 #endif
 
 #endif // WAVEFRONT_COMMON_GLSL

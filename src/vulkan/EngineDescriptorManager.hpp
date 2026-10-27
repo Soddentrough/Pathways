@@ -68,6 +68,10 @@ struct WavefrontDescriptorParams {
     Image* mlSpecularMotionImage = nullptr;
     Image* mlDiffuseImage = nullptr;
     Image* mlSpecularImage = nullptr;
+    Image* ffxDirectDiffuseImage = nullptr;
+    Image* ffxDirectSpecularImage = nullptr;
+    Image* ffxIndirectDiffuseImage = nullptr;
+    Image* ffxIndirectSpecularImage = nullptr;
     Image* filteredCausticImage = nullptr;
 };
 

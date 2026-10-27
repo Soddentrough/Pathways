@@ -31,7 +31,7 @@ layout(set = 0, binding = 4, rg8) readonly uniform image2D uEdgeDensity;  // G: 
 layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D uFinalDenoised; // -> m_denoisedImage
 
 #ifdef ENABLE_STATIONARY_PREVIEW
-layout(set = 0, binding = 6, rg16f) readonly uniform image2D uMotionVectors;
+layout(set = 0, binding = 6, rgba16f) readonly uniform image2D uMotionVectors;
 layout(set = 0, binding = 7, rgba16f) readonly uniform image2D uAccumImage;
 
 

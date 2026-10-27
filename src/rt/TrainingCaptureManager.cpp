@@ -343,7 +343,6 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         // 4. Staging copy for 6 ML images (and ReSTIR reservoir buffer if capture_channels >= 23)
         VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
         VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
-        VkDeviceSize rg16Size   = numPixels * 2 * sizeof(uint16_t);
 
         VkDeviceSize offsetDiff = 0;
         VkDeviceSize offsetSpec = offsetDiff + rgba16Size;
@@ -351,7 +350,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         VkDeviceSize offsetND   = offsetAR   + rgba16Size;
         VkDeviceSize offsetSM   = offsetND   + rgba16Size;
         VkDeviceSize offsetMV   = offsetSM   + rgba16Size;
-        VkDeviceSize totalInputStagingSize = offsetMV + rg16Size;
+        VkDeviceSize totalInputStagingSize = offsetMV + rgba16Size;
 
         uint32_t outChannels = m_engine->m_config.capture_channels;
         VkDeviceSize offsetRes = 0;
@@ -472,8 +471,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 inputPayload[p * outChannels + 10] = arPixels[p * 4 + 2];   // albedo B
                 inputPayload[p * outChannels + 11] = ndPixels[p * 4 + 3];   // linear depth
                 // Vector 3 (Ch 12..15): Surface Motion XY + Specular Motion XY
-                inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
-                inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+                inputPayload[p * outChannels + 12] = mvPixels[p * 4 + 0];   // surface motion X
+                inputPayload[p * outChannels + 13] = mvPixels[p * 4 + 1];   // surface motion Y
                 inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
                 inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
                 // Vector 4 (Ch 16..19): Surface Normal XYZ + Specular Hit Distance
@@ -515,8 +514,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 3];   // roughness
                 inputPayload[p * outChannels + 10] = ndPixels[p * 4 + 3];   // linear depth
                 inputPayload[p * outChannels + 11] = smPixels[p * 4 + 2];   // specular hit distance
-                inputPayload[p * outChannels + 12] = mvPixels[p * 2 + 0];   // surface motion X
-                inputPayload[p * outChannels + 13] = mvPixels[p * 2 + 1];   // surface motion Y
+                inputPayload[p * outChannels + 12] = mvPixels[p * 4 + 0];   // surface motion X
+                inputPayload[p * outChannels + 13] = mvPixels[p * 4 + 1];   // surface motion Y
                 inputPayload[p * outChannels + 14] = smPixels[p * 4 + 0];   // specular motion X
                 inputPayload[p * outChannels + 15] = smPixels[p * 4 + 1];   // specular motion Y
                 if (outChannels >= 19) {

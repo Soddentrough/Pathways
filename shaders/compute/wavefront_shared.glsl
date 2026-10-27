@@ -106,6 +106,7 @@ struct WavefrontShadowPC {
     wf_uint sppSampleIndex;
     wf_uint numOpaqueTriangles;
     wf_uint captureMlData;
+    wf_uint currentBounce;
 };
 
 struct WavefrontIntersectPC {
@@ -160,7 +161,7 @@ static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 2
 static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
 static_assert(sizeof(WavefrontClassifyPC) == 88, "WavefrontClassifyPC must be 88 bytes");
 static_assert(sizeof(WavefrontShadePC) == 96, "WavefrontShadePC must be 96 bytes");
-static_assert(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
+static_assert(sizeof(WavefrontShadowPC) == 44, "WavefrontShadowPC must be 44 bytes");
 static_assert(sizeof(WavefrontIntersectPC) == 76, "WavefrontIntersectPC must be 76 bytes");
 static_assert(sizeof(WavefrontTailPC) == 88, "WavefrontTailPC must be 88 bytes");
 } // namespace pathways

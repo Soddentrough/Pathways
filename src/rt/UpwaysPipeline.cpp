@@ -242,7 +242,7 @@ void UpwaysPipeline::initImages() {
     m_dummyMotionImage = std::make_unique<Image>(
         m_device, m_allocator,
         m_inputWidth, m_inputHeight,
-        VK_FORMAT_R16G16_SFLOAT,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
     );
 
@@ -426,7 +426,7 @@ void UpwaysPipeline::createDescriptorSetLayouts() {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 1: uDenoisedSpecular
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 2: uNormalDepth
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 3: uAlbedoRoughness
-        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 4: uMotionVectors (rg16f)
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 4: uMotionVectors (rgba16f)
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, // 5: uUpscaleKernelIn
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 6: uDisplayHistoryIn
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 7: uDisplayOut
@@ -836,7 +836,7 @@ void UpwaysPipeline::recordFrame(
     const uint32_t dGroupsX = (m_outputWidth + 15u) / 16u;
     const uint32_t dGroupsY = (m_outputHeight + 15u) / 16u;
     uint32_t enableDispHistory = (!resetHistory) ? 1u : 0u;
-    float jitterScale = (m_superRes || resetHistory) ? 1.0f : 0.0f;
+    float jitterScale = m_superRes ? 1.0f : 0.0f;
     float dispHistAlpha = m_superRes ? 0.15f : 0.20f;
     UpwaysUpscaleResolvePushConstants pc3{
         m_inputWidth, m_inputHeight, m_outputWidth, m_outputHeight,

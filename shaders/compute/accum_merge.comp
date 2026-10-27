@@ -17,15 +17,15 @@ layout(std430, binding = 2) readonly buffer SecondaryAccumBuffer32 {
     vec4 secondaryRadiance32[];
 };
 
-// Binding 3: Primary GPU Motion Vectors image (RG16F)
+// Binding 3: Primary GPU Motion Vectors image (RGBA16F 2.5D)
 layout(binding = 3) uniform image2D uPrimaryMotionVectors;
 
 // Binding 4: Primary GPU Normal & Linear Depth image (RGBA16F)
 layout(binding = 4) uniform image2D uPrimaryNormalDepth;
 
-// Binding 5: Secondary GPU Motion Vectors buffer (RG16F packed as uint)
+// Binding 5: Secondary GPU Motion Vectors buffer (RGBA16F packed as uvec2)
 layout(std430, binding = 5) readonly buffer SecondaryMvBuffer {
-    uint secondaryMv16[];
+    uvec2 secondaryMv16[];
 };
 
 // Binding 6: Secondary GPU Normal & Linear Depth buffer (RGBA16F packed as uvec2)
@@ -112,10 +112,10 @@ void main() {
 
         bool mergeGbuffers = (pc.mergeGbuffers != 0u);
         if (mergeGbuffers) {
-            // Merge Motion Vectors (RG16F)
-            uint rawMv = secondaryMv16[linearIndex];
-            vec2 secMv = unpackHalf2x16(rawMv);
-            imageStore(uPrimaryMotionVectors, pixelCoord, vec4(secMv, 0.0, 0.0));
+            // Merge Motion Vectors (RGBA16F 2.5D)
+            uvec2 rawMv = secondaryMv16[linearIndex];
+            vec4 secMv = vec4(unpackHalf2x16(rawMv.x), unpackHalf2x16(rawMv.y));
+            imageStore(uPrimaryMotionVectors, pixelCoord, secMv);
 
             // Merge Normal & Depth (RGBA16F)
             uvec2 rawNd = secondaryNormDepth16[linearIndex];

@@ -186,8 +186,12 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
         cfg.gateway_superres = true;
         cfg.denoiser_mode = DenoiserMode::Gateway;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default Performance (2.0x / 1080p)
-    } else if (a == "fsr" || a == "fsr3" || a == "fsr3.1") {
-        cfg.upscaler_mode = UpscalerMode::FSR3;
+    } else if (a == "fsr" || a == "fsr3" || a == "fsr3.1" || a == "fsr4" || a == "fsr5") {
+        cfg.upscaler_mode = UpscalerMode::FSR;
+        if (a == "fsr3" || a == "fsr3.1") cfg.fsr_version = FsrVersion::Fsr3;
+        else if (a == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
+        else if (a == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
+        else cfg.fsr_version = FsrVersion::Auto;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f; // Default Quality (1.5x)
     } else if (a == "fsr1" || a == "cas" || a == "spatial") {
         cfg.upscaler_mode = UpscalerMode::FSR1;
@@ -839,21 +843,27 @@ Config Config::parse(int argc, char* argv[]) {
             if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
-                cfg.upways_superres = false;
+                if (cfg.upscaler_mode != UpscalerMode::Upways) {
+                    cfg.upways_superres = false;
+                }
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "gateway") {
-                cfg.gateway_superres = false;
+                if (cfg.upscaler_mode != UpscalerMode::Gateway) {
+                    cfg.gateway_superres = false;
+                }
                 cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+                cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, ffx, or none.", mode);
             }
             continue;
         }
@@ -863,21 +873,27 @@ Config Config::parse(int argc, char* argv[]) {
             if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
-                cfg.upways_superres = false;
+                if (cfg.upscaler_mode != UpscalerMode::Upways) {
+                    cfg.upways_superres = false;
+                }
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "gateway") {
-                cfg.gateway_superres = false;
+                if (cfg.upscaler_mode != UpscalerMode::Gateway) {
+                    cfg.gateway_superres = false;
+                }
                 cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+                cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, or none.", mode);
+                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, ffx, or none.", mode);
             }
             continue;
         }
@@ -975,8 +991,20 @@ Config Config::parse(int argc, char* argv[]) {
             applyScaler(cfg, "gateway");
             continue;
         }
-        if (arg == "--fsr" || arg == "--fsr3" || arg == "--fsr3.1") {
+        if (arg == "--fsr") {
             applyScaler(cfg, "fsr");
+            continue;
+        }
+        if (arg == "--fsr3" || arg == "--fsr3.1") {
+            applyScaler(cfg, "fsr3");
+            continue;
+        }
+        if (arg == "--fsr4") {
+            applyScaler(cfg, "fsr4");
+            continue;
+        }
+        if (arg == "--fsr5") {
+            applyScaler(cfg, "fsr5");
             continue;
         }
         if (arg == "--upscaler-sharpening") {

@@ -350,12 +350,14 @@ void RayTracingOrchestrator::recordRayTracing(
 
         bool needAccumReset = params.accumReset || !config.progressive_accumulation;
         bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::Svgf ||
+                                  config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                                   config.denoiser_mode == DenoiserMode::Upways ||
                                   config.denoiser_mode == DenoiserMode::Gateway ||
                                   config.upscaler_mode == UpscalerMode::Upways ||
                                   config.upscaler_mode == UpscalerMode::Gateway ||
                                   config.upways_superres ||
                                   config.gateway_superres);
+        bool isFfxDenoisingActive = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
         if (needAccumReset || isDenoisingActive) {
             if (needAccumReset && accumImage) {
                 vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
@@ -365,6 +367,20 @@ void RayTracingOrchestrator::recordRayTracing(
             }
             if (mlSpecularImage) {
                 vkCmdClearColorImage(cmd, mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+            }
+            if (isFfxDenoisingActive) {
+                if (params.ffxDirectDiffuseImage) {
+                    vkCmdClearColorImage(cmd, params.ffxDirectDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (params.ffxDirectSpecularImage) {
+                    vkCmdClearColorImage(cmd, params.ffxDirectSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (params.ffxIndirectDiffuseImage) {
+                    vkCmdClearColorImage(cmd, params.ffxIndirectDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (params.ffxIndirectSpecularImage) {
+                    vkCmdClearColorImage(cmd, params.ffxIndirectSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
             }
         }
 
@@ -389,6 +405,12 @@ void RayTracingOrchestrator::recordRayTracing(
         if (needAccumReset || isDenoisingActive) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
+            if (isFfxDenoisingActive) {
+                addClearBarrier(params.ffxDirectDiffuseImage);
+                addClearBarrier(params.ffxDirectSpecularImage);
+                addClearBarrier(params.ffxIndirectDiffuseImage);
+                addClearBarrier(params.ffxIndirectSpecularImage);
+            }
         }
 
         if (!clearBarriers.empty()) {
@@ -460,23 +482,25 @@ void RayTracingOrchestrator::recordRayTracing(
             wfSceneData.fullWidth = params.dispatchWidth;
         }
 
-        bool needGbuffers = (config.upscaler_mode == UpscalerMode::FSR3 ||
+        bool needGbuffers = (config.upscaler_mode == UpscalerMode::FSR ||
                              config.upscaler_mode == UpscalerMode::Upways ||
                              config.upscaler_mode == UpscalerMode::Gateway ||
                              config.denoiser_mode == DenoiserMode::Upways ||
                              config.denoiser_mode == DenoiserMode::Gateway ||
                              config.denoiser_mode == DenoiserMode::Svgf ||
+                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                              params.isRestirActive ||
                              config.enable_caustics);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
                           config.denoiser_mode == DenoiserMode::Gateway ||
                           config.denoiser_mode == DenoiserMode::Svgf ||
+                          config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                           config.upscaler_mode == UpscalerMode::Upways ||
                           config.upscaler_mode == UpscalerMode::Gateway ||
                           config.upways_superres ||
                           config.gateway_superres ||
                           !config.capture_training_data_dir.empty());
-        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u);
+        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (isFfxDenoisingActive ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
             causticsPipeline->recordTrace(

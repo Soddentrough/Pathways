@@ -12,7 +12,7 @@ layout(set = 0, binding = 0, rgba16f)  uniform readonly image2D  uCurrentDiffuse
 layout(set = 0, binding = 1, rgba16f)  uniform readonly image2D  uCurrentSpecular;
 layout(set = 0, binding = 2, rgba16f)  uniform readonly image2D  uNormalDepth;
 layout(set = 0, binding = 3, rgba16f)  uniform readonly image2D  uPrevNormalDepth;
-layout(set = 0, binding = 4, rg16f)    uniform readonly image2D  uMotionVectors;
+layout(set = 0, binding = 4, rgba16f)  uniform readonly image2D  uMotionVectors;
 layout(set = 0, binding = 5, rgba16f)  uniform readonly image2D  uAlbedoRoughness;
 layout(set = 0, binding = 6, rgba16f)  uniform readonly image2D  uSpecularMotion;
 layout(set = 0, binding = 7, rgba16f)  uniform readonly image2D  uPrevSpecularMotion;
@@ -158,7 +158,7 @@ void main() {
     if (activeHist) {
         vec4 rawSmLoad = imageLoad(uSpecularMotion, gp);
         float surfMvMag2 = dot(mvSurf, mvSurf);
-        hasSpecHit = (rawSmLoad.w > 1e-4 && rawSmLoad.w < UPWAYS_SKY_DEPTH &&
+        hasSpecHit = (rawSmLoad.w > 1e-4 && rawSmLoad.w < 999.0 &&
                       roughness < 0.25 && (roughness < 0.08 || surfMvMag2 > 1e-7));
         if (hasSpecHit) {
             effSpecMv = rawSmLoad.xy;
@@ -208,12 +208,19 @@ void main() {
     vec3 logDiff    = vec3(f16vec3(clamp(log(vec3(1.0) + rawDiffIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
     vec3 logSpec    = vec3(f16vec3(clamp(log(vec3(1.0) + rawSpecIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
     float denomZ    = max(max(ndCenter.w, wPrevNd.w), 0.1);
-    float relDz     = activeHist ? float(float16_t(clamp(abs(ndCenter.w - wPrevNd.w) / denomZ, 0.0, 2.0))) : 1.0;
+    float dollyTol  = (0.03 + 0.8 * length(mvSurf)) * denomZ;
+    float dzSigned  = ndCenter.w - wPrevNd.w;
+    float dzDisocc  = max(dzSigned, max(-dzSigned - dollyTol, 0.0));
+    float relDz     = activeHist ? float(float16_t(clamp(dzDisocc / denomZ, 0.0, 2.0))) : 1.0;
     float nDot      = activeHist ? float(float16_t(clamp(dot(ndCenter.xyz, wPrevNd.xyz), -1.0, 1.0))) : 0.0;
-    float specHitT  = activeHist ? imageLoad(uSpecularMotion, gp).w : 0.0;
+    vec4 rawSmCurr  = activeHist ? imageLoad(uSpecularMotion, gp) : vec4(0.0);
+    float specHitT  = rawSmCurr.w;
     float denomRefl = max(max(specHitT, wPrevSm.w), 0.1);
+    float skySlip   = (specHitT >= 999.0) ? (16.0 * length(rawSmCurr.xy - mvSurf)) : 0.0;
     float relDRefl  = activeHist
-        ? ((hasSpecHit && wPrevSm.w > 1e-4) ? float(float16_t(clamp(abs(specHitT - wPrevSm.w) / denomRefl, 0.0, 2.0))) : relDz)
+        ? ((hasSpecHit && wPrevSm.w > 1e-4)
+            ? float(float16_t(clamp(abs(specHitT - wPrevSm.w) / denomRefl, 0.0, 2.0)))
+            : float(float16_t(clamp(relDz + skySlip, 0.0, 2.0))))
         : 1.0;
 
     // 3. Zero-LDS Subgroup DPP Quad Average Pooling for Stage 2 Multi-Scale U-Net

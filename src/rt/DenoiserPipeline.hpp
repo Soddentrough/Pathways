@@ -144,6 +144,8 @@ public:
     [[nodiscard]] Image* getDenoisedImage() const { return m_denoisedImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapDescSet() const { return m_tonemapDescSet; }
     [[nodiscard]] bool isInitialized() const { return m_width > 0 && m_height > 0 && m_denoisedImage != nullptr; }
+    [[nodiscard]] uint32_t getWidth() const { return m_width; }
+    [[nodiscard]] uint32_t getHeight() const { return m_height; }
 
     // Per-pass GPU timestamps (ms) collected asynchronously from the internal
     // 20-query pool (10 queries x 2 frames in flight, indexed frameSlot * 10).

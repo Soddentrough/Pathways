@@ -43,6 +43,10 @@ struct RayTracingDispatchParams {
     bool cameraMovedLastFrame = false;
     bool diagnosticHalfTiles = false;
     bool isRestirActive = false;
+    Image* ffxDirectDiffuseImage = nullptr;
+    Image* ffxDirectSpecularImage = nullptr;
+    Image* ffxIndirectDiffuseImage = nullptr;
+    Image* ffxIndirectSpecularImage = nullptr;
 };
 
 class RayTracingOrchestrator {

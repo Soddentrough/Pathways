@@ -21,6 +21,7 @@ struct ConfigKey {
     uint32_t max_bounces = 4;
     DenoiserMode denoiser = DenoiserMode::None;
     UpscalerMode upscaler = UpscalerMode::None;
+    FsrVersion fsr_version = FsrVersion::Auto;
     MgpuUpscaleMode mgpu_upscale_mode = MgpuUpscaleMode::PostMerge;
     float render_scale = 1.0f;
     AccumFormat accum_format = AccumFormat::RGBA16_SFLOAT;
@@ -35,6 +36,7 @@ struct ConfigKey {
         if (mgpu_mode != o.mgpu_mode) return false;
         if (denoiser != o.denoiser) return false;
         if (upscaler != o.upscaler) return false;
+        if (upscaler == UpscalerMode::FSR && fsr_version != o.fsr_version) return false;
         if (upscaler != UpscalerMode::None && std::abs(render_scale - o.render_scale) > 0.001f) return false;
         if (mgpu_mode != MultiGpuMode::Off && upscaler != UpscalerMode::None && mgpu_upscale_mode != o.mgpu_upscale_mode) return false;
         if (enable_nrc != o.enable_nrc) return false;
@@ -77,14 +79,19 @@ struct ConfigKey {
             denoiserStr = " [Gateway]";
         } else if (denoiser == DenoiserMode::Svgf) {
             denoiserStr = " [SVGF]";
+        } else if (denoiser == DenoiserMode::FfxRayRegeneration) {
+            denoiserStr = " [FFX Ray Regeneration]";
         }
         std::string upscalerStr = "";
         std::string mgpuUpscaleStr = "";
         if (mgpu_mode != MultiGpuMode::Off && upscaler != UpscalerMode::None) {
             mgpuUpscaleStr = (mgpu_upscale_mode == MgpuUpscaleMode::PostMerge) ? " [Post-Merge SR]" : " [Sample-Blend SR]";
         }
-        if (upscaler == UpscalerMode::FSR3) {
-            upscalerStr = " [FSR 3.1]" + mgpuUpscaleStr;
+        if (upscaler == UpscalerMode::FSR) {
+            const char* fsrLabel = (fsr_version == FsrVersion::Fsr5) ? " [FSR 5]" :
+                                   (fsr_version == FsrVersion::Fsr4) ? " [FSR 4]" :
+                                   (fsr_version == FsrVersion::Fsr3) ? " [FSR 3.1]" : " [FSR]";
+            upscalerStr = std::string(fsrLabel) + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::Upways) {
             upscalerStr = " [Upways SR]" + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::Gateway) {

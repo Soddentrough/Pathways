@@ -26,8 +26,8 @@ SuperResolutionManager::~SuperResolutionManager() {
 }
 
 void SuperResolutionManager::destroy() {
-    destroyFsr3Resources();
-    destroyFsr3Pipelines();
+    destroyFsrResources();
+    destroyFsrPipelines();
     destroyGatewayResources();
     destroyGatewayPipelines();
     destroyUpwaysResources();
@@ -58,7 +58,7 @@ void SuperResolutionManager::destroyDescPool() {
     }
     m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
     m_tonemapGatewayDescSet = VK_NULL_HANDLE;
-    m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+    m_tonemapFsrDescSet = VK_NULL_HANDLE;
 }
 
 void SuperResolutionManager::init(const Config& config,
@@ -69,8 +69,8 @@ void SuperResolutionManager::init(const Config& config,
     createUpwaysResources(config, postProcess, cmd);
     createGatewayPipelines(config);
     createGatewayResources(config, postProcess, cmd);
-    createFsr3Pipelines(config);
-    createFsr3Resources(config, postProcess);
+    createFsrPipelines(config);
+    createFsrResources(config, postProcess);
 }
 
 void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
@@ -81,12 +81,10 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         auto upscaleResolveCode = m_shaderLoader("upways_upscale_resolve.comp.spv");
 
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-        uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
-            static_cast<uint32_t>(config.width * config.render_scale) : config.width;
-        uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
-            static_cast<uint32_t>(config.height * config.render_scale) : config.height;
-        uint32_t outW = config.width;
-        uint32_t outH = config.height;
+        uint32_t inW = config.getRenderWidth();
+        uint32_t inH = config.getRenderHeight();
+        uint32_t outW = (config.upscaler_mode == UpscalerMode::FSR) ? inW : config.width;
+        uint32_t outH = (config.upscaler_mode == UpscalerMode::FSR) ? inH : config.height;
         bool isSuperRes = (inW < outW || inH < outH);
 
         m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
@@ -166,12 +164,10 @@ void SuperResolutionManager::createGatewayPipelines(const Config& config) {
         auto upscaleResolveCode = m_shaderLoader("gateway_upscale_resolve.comp.spv");
 
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-        uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
-            static_cast<uint32_t>(config.width * config.render_scale) : config.width;
-        uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
-            static_cast<uint32_t>(config.height * config.render_scale) : config.height;
-        uint32_t outW = config.width;
-        uint32_t outH = config.height;
+        uint32_t inW = config.getRenderWidth();
+        uint32_t inH = config.getRenderHeight();
+        uint32_t outW = (config.upscaler_mode == UpscalerMode::FSR) ? inW : config.width;
+        uint32_t outH = (config.upscaler_mode == UpscalerMode::FSR) ? inH : config.height;
         bool isSuperRes = (inW < outW || inH < outH);
 
         m_gatewayPipeline = std::make_unique<GatewayPipeline>(
@@ -241,8 +237,8 @@ void SuperResolutionManager::createGatewayResources(const Config& /*config*/, Po
 void SuperResolutionManager::destroyGatewayResources() {
 }
 
-void SuperResolutionManager::createFsr3Pipelines(const Config& config) {
-    if (config.upscaler_mode != UpscalerMode::FSR3 || !m_shaderLoader) {
+void SuperResolutionManager::createFsrPipelines(const Config& config) {
+    if (config.upscaler_mode != UpscalerMode::FSR || !m_shaderLoader) {
         return;
     }
 
@@ -250,14 +246,10 @@ void SuperResolutionManager::createFsr3Pipelines(const Config& config) {
         auto upscaleCode = m_shaderLoader("fsr3_upscale.comp.spv");
         auto rcasCode = m_shaderLoader("fsr3_rcas.comp.spv");
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-        uint32_t renderW = (config.render_scale < 1.0f) ?
-            static_cast<uint32_t>(config.width * config.render_scale) :
-            config.width;
-        uint32_t renderH = (config.render_scale < 1.0f) ?
-            static_cast<uint32_t>(config.height * config.render_scale) :
-            config.height;
+        uint32_t renderW = config.getRenderWidth();
+        uint32_t renderH = config.getRenderHeight();
 
-        m_fsr3Upscaler = std::make_unique<Fsr3Upscaler>(
+        m_fsrUpscaler = std::make_unique<FsrUpscaler>(
             m_device,
             m_physicalDevice,
             m_allocator,
@@ -268,34 +260,35 @@ void SuperResolutionManager::createFsr3Pipelines(const Config& config) {
             upscaleCode,
             rcasCode,
             format,
-            "[GPU 0 Primary Viewport]"
+            "[GPU 0 Primary Viewport]",
+            config.fsr_version
         );
 
-        Logger::info("AMD FSR 3.1 Super-Resolution Pipeline initialized successfully.");
+        Logger::info("AMD FSR Super-Resolution Pipeline initialized successfully.");
     } catch (const std::exception& e) {
-        Logger::warn("Fsr3Upscaler initialization failed: {}", e.what());
+        Logger::warn("FsrUpscaler initialization failed: {}", e.what());
     }
 }
 
-void SuperResolutionManager::destroyFsr3Pipelines() {
-    m_fsr3Upscaler.reset();
-    m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+void SuperResolutionManager::destroyFsrPipelines() {
+    m_fsrUpscaler.reset();
+    m_tonemapFsrDescSet = VK_NULL_HANDLE;
 }
 
-void SuperResolutionManager::createFsr3Resources(const Config& config, PostProcessPipeline* postProcess) {
-    if (config.upscaler_mode != UpscalerMode::FSR3) {
+void SuperResolutionManager::createFsrResources(const Config& config, PostProcessPipeline* postProcess) {
+    if (config.upscaler_mode != UpscalerMode::FSR) {
         return;
     }
 
-    if (m_postProcessDescPool && postProcess && m_tonemapFsr3DescSet == VK_NULL_HANDLE) {
+    if (m_postProcessDescPool && postProcess && m_tonemapFsrDescSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         tmAllocInfo.descriptorPool = m_postProcessDescPool;
         tmAllocInfo.descriptorSetCount = 1;
         VkDescriptorSetLayout layout = postProcess->getTonemapDescLayout();
         tmAllocInfo.pSetLayouts = &layout;
-        if (vkAllocateDescriptorSets(m_device, &tmAllocInfo, &m_tonemapFsr3DescSet) != VK_SUCCESS) {
-            Logger::warn("Failed to allocate Tonemap FSR3 descriptor set");
-            m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+        if (vkAllocateDescriptorSets(m_device, &tmAllocInfo, &m_tonemapFsrDescSet) != VK_SUCCESS) {
+            Logger::warn("Failed to allocate Tonemap FSR descriptor set");
+            m_tonemapFsrDescSet = VK_NULL_HANDLE;
         }
     }
 
@@ -311,22 +304,23 @@ void SuperResolutionManager::createFsr3Resources(const Config& config, PostProce
     }
 }
 
-void SuperResolutionManager::destroyFsr3Resources() {
+void SuperResolutionManager::destroyFsrResources() {
     m_secAccumImage.reset();
 }
 
 void SuperResolutionManager::resize(uint32_t width, uint32_t height, float renderScale,
                                     UpscalerMode upscalerMode, DenoiserMode denoiserMode,
                                     bool upwaysSuperres, AccumFormat accumFormat,
-                                    PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
+                                    PostProcessPipeline* postProcess, VkCommandBuffer cmd,
+                                    FsrVersion fsrVersion) {
     destroyUpwaysResources();
     if (m_upwaysPipeline) {
         uint32_t inW = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
             static_cast<uint32_t>(width * renderScale) : width;
         uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
             static_cast<uint32_t>(height * renderScale) : height;
-        uint32_t outW = width;
-        uint32_t outH = height;
+        uint32_t outW = (upscalerMode == UpscalerMode::FSR) ? inW : width;
+        uint32_t outH = (upscalerMode == UpscalerMode::FSR) ? inH : height;
         bool isSuperRes = (inW < outW || inH < outH);
         m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
     }
@@ -337,8 +331,8 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
             static_cast<uint32_t>(width * renderScale) : width;
         uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
             static_cast<uint32_t>(height * renderScale) : height;
-        uint32_t outW = width;
-        uint32_t outH = height;
+        uint32_t outW = (upscalerMode == UpscalerMode::FSR) ? inW : width;
+        uint32_t outH = (upscalerMode == UpscalerMode::FSR) ? inH : height;
         bool isSuperRes = (inW < outW || inH < outH);
         m_gatewayPipeline->resize(inW, inH, outW, outH, isSuperRes);
     }
@@ -351,20 +345,22 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     cfgStub.denoiser_mode = denoiserMode;
     cfgStub.upways_superres = upwaysSuperres;
     cfgStub.accum_format = accumFormat;
+    cfgStub.fsr_version = fsrVersion;
 
     createUpwaysResources(cfgStub, postProcess, cmd);
     createGatewayResources(cfgStub, postProcess, cmd);
-    destroyFsr3Resources();
-    if (m_fsr3Upscaler) {
+    destroyFsrResources();
+    if (m_fsrUpscaler) {
+        m_fsrUpscaler->setTargetVersion(fsrVersion);
         uint32_t renderW = (renderScale < 1.0f) ?
             static_cast<uint32_t>(width * renderScale) :
             width;
         uint32_t renderH = (renderScale < 1.0f) ?
             static_cast<uint32_t>(height * renderScale) :
             height;
-        m_fsr3Upscaler->resize(renderW, renderH, width, height);
+        m_fsrUpscaler->resize(renderW, renderH, width, height);
     }
-    createFsr3Resources(cfgStub, postProcess);
+    createFsrResources(cfgStub, postProcess);
 }
 
 void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
@@ -433,12 +429,12 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
         }
     }
 
-    if (m_fsr3Upscaler && outputImage && postProcess) {
-        if (m_tonemapFsr3DescSet != VK_NULL_HANDLE && m_fsr3Upscaler->getOutputImage()) {
-            postProcess->updateTonemapDescriptors(m_tonemapFsr3DescSet, m_fsr3Upscaler->getOutputImage(), outputImage);
+    if (m_fsrUpscaler && outputImage && postProcess) {
+        if (m_tonemapFsrDescSet != VK_NULL_HANDLE && m_fsrUpscaler->getOutputImage()) {
+            postProcess->updateTonemapDescriptors(m_tonemapFsrDescSet, m_fsrUpscaler->getOutputImage(), outputImage);
         }
-        if (m_fsr3Upscaler->getOutputImage() && m_secAccumImage) {
-            postProcess->updateBlendDescriptors(m_fsr3Upscaler->getOutputImage(), m_secAccumImage.get());
+        if (m_fsrUpscaler->getOutputImage() && m_secAccumImage) {
+            postProcess->updateBlendDescriptors(m_fsrUpscaler->getOutputImage(), m_secAccumImage.get());
         }
     }
 }
@@ -453,12 +449,10 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         return false;
     }
 
-    uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
-        static_cast<uint32_t>(config.width * config.render_scale) : config.width;
-    uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.upways_superres)) ?
-        static_cast<uint32_t>(config.height * config.render_scale) : config.height;
-    uint32_t outW = config.width;
-    uint32_t outH = config.height;
+    uint32_t inW = config.getRenderWidth();
+    uint32_t inH = config.getRenderHeight();
+    uint32_t outW = (config.upscaler_mode == UpscalerMode::FSR) ? inW : config.width;
+    uint32_t outH = (config.upscaler_mode == UpscalerMode::FSR) ? inH : config.height;
     bool isSuperRes = (inW < outW || inH < outH);
 
     if (m_upwaysPipeline->getInputWidth() != inW || m_upwaysPipeline->getInputHeight() != inH ||
@@ -512,12 +506,10 @@ bool SuperResolutionManager::dispatchGateway(VkCommandBuffer cmd, bool resetHist
         return false;
     }
 
-    uint32_t inW = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
-        static_cast<uint32_t>(config.width * config.render_scale) : config.width;
-    uint32_t inH = (config.render_scale < 1.0f && (config.upscaler_mode != UpscalerMode::None || config.gateway_superres)) ?
-        static_cast<uint32_t>(config.height * config.render_scale) : config.height;
-    uint32_t outW = config.width;
-    uint32_t outH = config.height;
+    uint32_t inW = config.getRenderWidth();
+    uint32_t inH = config.getRenderHeight();
+    uint32_t outW = (config.upscaler_mode == UpscalerMode::FSR) ? inW : config.width;
+    uint32_t outH = (config.upscaler_mode == UpscalerMode::FSR) ? inH : config.height;
     bool isSuperRes = (inW < outW || inH < outH);
 
     if (m_gatewayPipeline->getInputWidth() != inW || m_gatewayPipeline->getInputHeight() != inH ||
@@ -561,43 +553,41 @@ bool SuperResolutionManager::dispatchGateway(VkCommandBuffer cmd, bool resetHist
     return true;
 }
 
-bool SuperResolutionManager::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory,
-                                          const Config& config, uint32_t frameIndex,
-                                          bool cameraMovedLastFrame, uint32_t accumulatedSamples,
-                                          Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
-                                          MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
-                                          PostProcessPipeline* postProcess, Image* outputImage,
-                                          const std::function<void()>& onDescriptorsInvalidated) {
-    if (config.upscaler_mode != UpscalerMode::FSR3) {
+bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
+                                         const Config& config, uint32_t frameIndex,
+                                         bool cameraMovedLastFrame, uint32_t accumulatedSamples,
+                                         Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
+                                         MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
+                                         PostProcessPipeline* postProcess, Image* outputImage,
+                                         const std::function<void()>& onDescriptorsInvalidated) {
+    if (config.upscaler_mode != UpscalerMode::FSR) {
         return false;
     }
-    if (!m_fsr3Upscaler) {
-        createFsr3Pipelines(config);
-        createFsr3Resources(config, postProcess);
+    if (!m_fsrUpscaler) {
+        createFsrPipelines(config);
+        createFsrResources(config, postProcess);
         updateDescriptors(postProcess, accumImage, outputImage, normalDepthImage, motionVectorImage,
                           nullptr, nullptr, nullptr, nullptr, nullptr);
     }
-    if (!m_fsr3Upscaler || !accumImage) {
+    if (!m_fsrUpscaler || !accumImage) {
         return false;
     }
 
-    uint32_t renderW = (config.render_scale < 1.0f) ?
-        static_cast<uint32_t>(config.width * config.render_scale) :
-        config.width;
-    uint32_t renderH = (config.render_scale < 1.0f) ?
-        static_cast<uint32_t>(config.height * config.render_scale) :
-        config.height;
+    uint32_t renderW = config.getRenderWidth();
+    uint32_t renderH = config.getRenderHeight();
 
-    if (m_fsr3Upscaler->getRenderWidth() != renderW || m_fsr3Upscaler->getRenderHeight() != renderH ||
-        m_fsr3Upscaler->getDisplayWidth() != config.width || m_fsr3Upscaler->getDisplayHeight() != config.height) {
+    if (m_fsrUpscaler->getRenderWidth() != renderW || m_fsrUpscaler->getRenderHeight() != renderH ||
+        m_fsrUpscaler->getDisplayWidth() != config.width || m_fsrUpscaler->getDisplayHeight() != config.height) {
         vkDeviceWaitIdle(m_device);
-        m_fsr3Upscaler->resize(renderW, renderH, config.width, config.height);
+        m_fsrUpscaler->resize(renderW, renderH, config.width, config.height);
         updateDescriptors(postProcess, accumImage, outputImage, normalDepthImage, motionVectorImage,
                           nullptr, nullptr, nullptr, nullptr, nullptr);
         if (onDescriptorsInvalidated) {
             onDescriptorsInvalidated();
         }
     }
+
+    const uint32_t fsrPhaseCount = getFsrJitterPhaseCount(renderW, config.width);
 
     VkBuffer secBuffer = VK_NULL_HANDLE;
     if (mgpu && (mgpu->isZeroCopyActive() || mgpu->isP2PDirectBarActive())) {
@@ -617,15 +607,15 @@ bool SuperResolutionManager::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory
         descPrim.colorIn = accumImage->getImageView();
         descPrim.depthIn = normalDepthImage ? normalDepthImage->getImageView() : VK_NULL_HANDLE;
         descPrim.motionVectorsIn = motionVectorImage ? motionVectorImage->getImageView() : VK_NULL_HANDLE;
-        descPrim.colorOut = m_fsr3Upscaler->getOutputImage()->getImageView();
+        descPrim.colorOut = m_fsrUpscaler->getOutputImage()->getImageView();
         descPrim.renderWidth = renderW;
         descPrim.renderHeight = renderH;
         descPrim.displayWidth = config.width;
         descPrim.displayHeight = config.height;
         glm::vec2 jitter(0.0f);
-        if (config.upscaler_mode == UpscalerMode::FSR3) {
+        if (config.upscaler_mode == UpscalerMode::FSR) {
             if (!config.progressive_accumulation || cameraMovedLastFrame || accumulatedSamples <= 1) {
-                jitter = getHaltonJitter(frameIndex);
+                jitter = getHaltonJitter(frameIndex, fsrPhaseCount);
             }
         }
         descPrim.jitterX = jitter.x;
@@ -637,7 +627,7 @@ bool SuperResolutionManager::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory
         descPrim.frameIndex = frameIndex;
         descPrim.inputIsNormalized = true;
         descPrim.totalSamples = (config.progressive_accumulation && accumulatedSamples > 0) ? accumulatedSamples : 1u;
-        m_fsr3Upscaler->recordUpscale(descPrim);
+        m_fsrUpscaler->recordUpscale(descPrim);
 
         m_secAccumImage->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -688,20 +678,20 @@ bool SuperResolutionManager::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory
         desc.colorIn = accumImage->getImageView();
         desc.depthIn = normalDepthImage ? normalDepthImage->getImageView() : VK_NULL_HANDLE;
         desc.motionVectorsIn = motionVectorImage ? motionVectorImage->getImageView() : VK_NULL_HANDLE;
-        desc.colorOut = m_fsr3Upscaler->getOutputImage()->getImageView();
+        desc.colorOut = m_fsrUpscaler->getOutputImage()->getImageView();
         desc.renderWidth = renderW;
         desc.renderHeight = renderH;
         desc.displayWidth = config.width;
         desc.displayHeight = config.height;
         glm::vec2 jitter(0.0f);
-        if (config.upscaler_mode == UpscalerMode::FSR3) {
+        if (config.upscaler_mode == UpscalerMode::FSR) {
             if (!config.progressive_accumulation || cameraMovedLastFrame || accumulatedSamples <= 1) {
-                glm::vec2 jitterPrim = getHaltonJitter(frameIndex);
+                glm::vec2 jitterPrim = getHaltonJitter(frameIndex, fsrPhaseCount);
                 bool isMgpuSampleParallel = (mgpu && mgpu->isMultiGpuActive() && config.mgpu_mode != MultiGpuMode::Off &&
                     (config.mgpu_mode == MultiGpuMode::SampleParallel ||
                      (config.mgpu_mode == MultiGpuMode::Auto && (config.spp > 1))));
                 if (isMgpuSampleParallel) {
-                    glm::vec2 jitterSec = getHaltonJitter(frameIndex + 4);
+                    glm::vec2 jitterSec = getHaltonJitter(frameIndex + (fsrPhaseCount / 2), fsrPhaseCount);
                     jitter = (jitterPrim + jitterSec) * 0.5f;
                 } else {
                     jitter = jitterPrim;
@@ -718,7 +708,7 @@ bool SuperResolutionManager::dispatchFsr3(VkCommandBuffer cmd, bool resetHistory
         desc.inputIsNormalized = true;
         desc.totalSamples = (config.progressive_accumulation && accumulatedSamples > 0) ? accumulatedSamples : 1u;
 
-        m_fsr3Upscaler->recordUpscale(desc);
+        m_fsrUpscaler->recordUpscale(desc);
     }
     return true;
 }

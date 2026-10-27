@@ -19,6 +19,7 @@
 #include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/GatewayPipeline.hpp"
+#include "rt/FsrUpscaler.hpp"
 #include "rt/Fsr3Upscaler.hpp"
 #include "rt/SuperResolutionManager.hpp"
 #include "rt/CausticsPipeline.hpp"
@@ -101,6 +102,7 @@ public:
     NRCManager* getNrcManager() const { return m_nrcManager; }
     UpwaysPipeline* getUpwaysPipeline() const { return m_superResolution ? m_superResolution->getUpwaysPipeline() : nullptr; }
     GatewayPipeline* getGatewayPipeline() const { return m_superResolution ? m_superResolution->getGatewayPipeline() : nullptr; }
+    FsrUpscaler* getFsrUpscaler() const { return m_superResolution ? m_superResolution->getFsrUpscaler() : nullptr; }
     Fsr3Upscaler* getFsr3Upscaler() const { return m_superResolution ? m_superResolution->getFsr3Upscaler() : nullptr; }
     SuperResolutionManager* getSuperResolution() const { return m_superResolution.get(); }
     CausticsPipeline* getCausticsPipeline() const { return m_causticsPipeline.get(); }
@@ -291,6 +293,10 @@ private:
     Image* m_mlSpecularMotionImage = nullptr;
     Image* m_mlDiffuseImage = nullptr;
     Image* m_mlSpecularImage = nullptr;
+    Image* m_ffxDirectDiffuseImage = nullptr;
+    Image* m_ffxDirectSpecularImage = nullptr;
+    Image* m_ffxIndirectDiffuseImage = nullptr;
+    Image* m_ffxIndirectSpecularImage = nullptr;
     void createGBufferResources();
     void destroyGBufferResources();
     void syncRenderTargetPointers();
@@ -303,10 +309,11 @@ private:
     bool m_temporalResetRequested = true;
     bool m_dgcPreprocessEnabled = false;
 
-    // Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR 3.1)
+    // Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR)
     friend class SuperResolutionManager;
     std::unique_ptr<SuperResolutionManager> m_superResolution;
     void updateUpwaysDescriptors();
+    void updateFsrDescriptors();
     void updateFsr3Descriptors();
 
     // In-House ReLAX / A-SVGF Denoiser Subsystem

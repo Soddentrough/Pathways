@@ -165,7 +165,11 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PtHistoryReservoirsBuffer
         { 43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // PathSamplesBuffer
         { 44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeRequestsBuffer
-        { 45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // ShadeResultsBuffer
+        { 45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // ShadeResultsBuffer
+        { 46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uFfxDirectDiffuseImage
+        { 47, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uFfxDirectSpecularImage
+        { 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uFfxIndirectDiffuseImage
+        { 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uFfxIndirectSpecularImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -349,7 +353,11 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer ptHistoryReservoirBuffer,
                                                 VkBuffer pathSampleBuffer,
                                                 VkBuffer shadeRequestBuffer,
-                                                VkBuffer shadeResultBuffer) {
+                                                VkBuffer shadeResultBuffer,
+                                                VkImageView ffxDirectDiffuseImageView,
+                                                VkImageView ffxDirectSpecularImageView,
+                                                VkImageView ffxIndirectDiffuseImageView,
+                                                VkImageView ffxIndirectSpecularImageView) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -367,6 +375,14 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo diffImageInfo{ VK_NULL_HANDLE, diffView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView specView = (mlSpecularImageView != VK_NULL_HANDLE) ? mlSpecularImageView : defaultStorageView;
     VkDescriptorImageInfo specImageInfo{ VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ffxDirDiffView = (ffxDirectDiffuseImageView != VK_NULL_HANDLE) ? ffxDirectDiffuseImageView : defaultStorageView;
+    VkDescriptorImageInfo ffxDirDiffInfo{ VK_NULL_HANDLE, ffxDirDiffView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ffxDirSpecView = (ffxDirectSpecularImageView != VK_NULL_HANDLE) ? ffxDirectSpecularImageView : defaultStorageView;
+    VkDescriptorImageInfo ffxDirSpecInfo{ VK_NULL_HANDLE, ffxDirSpecView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ffxIndDiffView = (ffxIndirectDiffuseImageView != VK_NULL_HANDLE) ? ffxIndirectDiffuseImageView : defaultStorageView;
+    VkDescriptorImageInfo ffxIndDiffInfo{ VK_NULL_HANDLE, ffxIndDiffView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView ffxIndSpecView = (ffxIndirectSpecularImageView != VK_NULL_HANDLE) ? ffxIndirectSpecularImageView : defaultStorageView;
+    VkDescriptorImageInfo ffxIndSpecInfo{ VK_NULL_HANDLE, ffxIndSpecView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : defaultStorageView;
     VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
 
@@ -487,6 +503,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 43, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pathSampleInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 44, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeReqInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 45, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadeResInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 46, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ffxDirDiffInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 47, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ffxDirSpecInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 48, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ffxIndDiffInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 49, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ffxIndSpecInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -947,7 +967,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .frameIndex = sceneData.frameIndex,
                 .sppSampleIndex = sampleIdx,
                 .numOpaqueTriangles = sceneData.numOpaqueTriangles,
-                .captureMlData = sceneData.captureMlData
+                .captureMlData = sceneData.captureMlData,
+                .currentBounce = b
             };
 
             float maxRayDist = 10000.0f;

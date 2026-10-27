@@ -483,6 +483,42 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::Text("Active Topology: %s", stats.topology_name.c_str());
             ImGui::Text("Multi-GPU Mode:  %s", stats.mgpu_mode_str.c_str());
 
+            // Quick 1-Click Mode Switcher right inside the Telemetry HUD
+            ImGui::PushID("HudMgpuQuickSwitch");
+            auto drawHudMgpuBtn = [&](MultiGpuMode mode, const char* label, const char* tip) {
+                bool isActive = (config.mgpu_mode == mode);
+                if (isActive) {
+                    ImVec4 activeCol = (mode == MultiGpuMode::Off)
+                        ? ImVec4(0.22f, 0.44f, 0.68f, 1.0f)
+                        : ImVec4(0.14f, 0.62f, 0.42f, 1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(activeCol.x + 0.08f, activeCol.y + 0.08f, activeCol.z + 0.08f, 1.0f));
+                }
+                if (ImGui::SmallButton(label)) {
+                    if (mode != config.mgpu_mode) {
+                        if (actions) {
+                            actions->mgpuModeChanged = true;
+                            actions->newMgpuMode = mode;
+                            actions->resetAccumulation = true;
+                        }
+                        config.mgpu_mode = mode;
+                        settingsChanged = true;
+                    }
+                }
+                if (isActive) ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered() && tip) ImGui::SetTooltip("%s", tip);
+            };
+            ImGui::TextDisabled("Mode:");
+            ImGui::SameLine();
+            drawHudMgpuBtn(MultiGpuMode::Off, "Single GPU", "Run on GPU 0 only (GPU 1 in low-power standby)");
+            ImGui::SameLine();
+            drawHudMgpuBtn(MultiGpuMode::CheckerboardTile, "Dual: Tile", "Dual-GPU spatial checkerboard tiling (optimal at 1 SPP)");
+            ImGui::SameLine();
+            drawHudMgpuBtn(MultiGpuMode::SampleParallel, "Dual: Sample", "Dual-GPU sample parallelism (splits SPP across GPUs)");
+            ImGui::SameLine();
+            drawHudMgpuBtn(MultiGpuMode::Auto, "Auto", "Automatically select Checkerboard (1 SPP) or Sample Parallel (>1 SPP)");
+            ImGui::PopID();
+
             // Hardware PCIe Link & Live Telemetry
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "GPU 0 (Primary):");
@@ -642,11 +678,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Denoising:    Gateway Hybrid Reconstruction");
             } else if (config.denoiser_mode == DenoiserMode::Svgf) {
                 ImGui::Text("Denoising:    E-SVGF Spatio-Temporal Filter");
+            } else if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
+                ImGui::Text("Denoising:    AMD FSR Ray Regeneration (4-Signal)");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
-            if (config.upscaler_mode == UpscalerMode::FSR3) {
-                ImGui::Text("Upscaling:    Temporal Upscaler (EXPERIMENTAL, %.2fx)", config.render_scale);
+            if (config.upscaler_mode == UpscalerMode::FSR) {
+                const char* fsrVerStr = (config.fsr_version == FsrVersion::Fsr5) ? "FSR 5" :
+                                        (config.fsr_version == FsrVersion::Fsr4) ? "FSR 4" :
+                                        (config.fsr_version == FsrVersion::Fsr3) ? "FSR 3.1" : "FSR (Auto)";
+                ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", fsrVerStr, config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
                 ImGui::Text("Upscaling:    Upways Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Gateway) {
@@ -776,6 +817,135 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (actions) actions->resetAccumulation = true;
         }
         ImGui::PopStyleColor(2);
+
+        // 0. MULTI-GPU & HARDWARE SCALING (TOP-LEVEL ZERO-SCROLL ACCESS)
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.10f, 0.30f, 0.44f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.16f, 0.42f, 0.60f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.22f, 0.52f, 0.72f, 1.0f));
+        bool mgpuHeaderOpen = ImGui::CollapsingHeader("MULTI-GPU & HARDWARE SCALING", ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor(3);
+
+        if (mgpuHeaderOpen) {
+            ImGui::PushID("CtrlPanelMgpu");
+            float availW = ImGui::GetContentRegionAvail().x;
+            float spacingX = ImGui::GetStyle().ItemSpacing.x;
+            float modeBtnW = (availW - spacingX * 3.0f) * 0.25f;
+
+            auto drawMgpuModeBtn = [&](MultiGpuMode mode, const char* label, const char* tooltip) {
+                bool isCurrent = (config.mgpu_mode == mode);
+                if (isCurrent) {
+                    ImVec4 activeBg = (mode == MultiGpuMode::Off)
+                        ? ImVec4(0.20f, 0.42f, 0.68f, 1.0f)
+                        : ImVec4(0.14f, 0.60f, 0.38f, 1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, activeBg);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(activeBg.x + 0.08f, activeBg.y + 0.08f, activeBg.z + 0.08f, 1.0f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
+                }
+                if (ImGui::Button(label, ImVec2(modeBtnW, 30.0f))) {
+                    if (mode != config.mgpu_mode) {
+                        if (actions) {
+                            actions->mgpuModeChanged = true;
+                            actions->newMgpuMode = mode;
+                            actions->resetAccumulation = true;
+                        }
+                        config.mgpu_mode = mode;
+                        settingsChanged = true;
+                    }
+                }
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered() && tooltip) {
+                    ImGui::SetTooltip("%s", tooltip);
+                }
+            };
+
+            drawMgpuModeBtn(MultiGpuMode::Off, "Single GPU", "Run solely on Primary GPU (GPU 0). Secondary GPU (GPU 1) remains in low-power standby.");
+            ImGui::SameLine();
+            drawMgpuModeBtn(MultiGpuMode::CheckerboardTile, "Checkerboard", "Dual-GPU spatial checkerboard tiling (even tiles on GPU 0, odd tiles on GPU 1). Optimal for 1 SPP real-time path tracing.");
+            ImGui::SameLine();
+            drawMgpuModeBtn(MultiGpuMode::SampleParallel, "Sample Split", "Dual-GPU temporal sample parallelism (each GPU traces half the SPP over the full frame). Best when SPP >= 2.");
+            ImGui::SameLine();
+            drawMgpuModeBtn(MultiGpuMode::Auto, "Auto (Adaptive)", "Automatically chooses Checkerboard Tiling at 1 SPP and Sample Parallelism when SPP >= 2.");
+
+            if (config.mgpu_mode == MultiGpuMode::Off) {
+                ImGui::TextDisabled("Active: Single GPU (GPU 0)  |  Click 'Checkerboard' or 'Sample Split' to engage Dual GPU");
+            } else {
+                ImGui::Spacing();
+                if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || config.mgpu_mode == MultiGpuMode::Auto) {
+                    ImGui::TextDisabled("Tile Size:");
+                    ImGui::SameLine();
+                    auto drawTilePreset = [&](uint32_t sz, const char* lbl) {
+                        bool isCur = (config.tile_size == sz);
+                        if (isCur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                        if (ImGui::SmallButton(lbl)) {
+                            if (sz != config.tile_size) {
+                                if (actions) {
+                                    actions->tileSizeChanged = true;
+                                    actions->newTileSize = sz;
+                                    actions->resetAccumulation = true;
+                                }
+                                config.tile_size = sz;
+                                settingsChanged = true;
+                            }
+                        }
+                        if (isCur) ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                    };
+                    drawTilePreset(16, "16x16");
+                    drawTilePreset(32, "32x32");
+                    drawTilePreset(64, "64x64 (Default)");
+                    drawTilePreset(128, "128x128");
+                    ImGui::NewLine();
+                } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
+                    uint32_t currentTotalSpp = config.spp;
+                    uint32_t primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
+                    uint32_t secSpp = std::max(1u, currentTotalSpp / 2);
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "Sample Split: GPU 0 = %u SPP  |  GPU 1 = %u SPP", primSpp, secSpp);
+                }
+
+                if (ImGui::Checkbox("Visualize GPU Load Split (GPU 0 Cyan / GPU 1 Amber)", &config.visualize_mgpu_split)) {
+                    // Immediate push constant update
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) to visually inspect multi-GPU work distribution.");
+                }
+            }
+
+            if (ImGui::TreeNode("Advanced Multi-GPU Memory & Transfer Settings")) {
+                const char* accumFormats[] = {
+                    "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
+                    "RGBA32_SFLOAT (128-bit Full Float HDR)",
+                    "R11G11B10_UFLOAT (32-bit Packed Float HDR) [High-Speed mGPU]"
+                };
+                int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 :
+                                    (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 2 : 0;
+                if (ImGui::Combo("Accumulation Format##MgpuFormat", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
+                    AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT :
+                                                 (currentFormat == 2) ? AccumFormat::R11G11B10_UFLOAT : AccumFormat::RGBA16_SFLOAT;
+                    if (actions && selectedFormat != config.accum_format) {
+                        actions->accumFormatChanged = true;
+                        actions->newAccumFormat = selectedFormat;
+                    }
+                    config.accum_format = selectedFormat;
+                    settingsChanged = true;
+                }
+
+                if (ImGui::Checkbox("Double-Buffered Shared Memory", &config.double_buffered_shared_mem)) {
+                    if (actions) {
+                        actions->doubleBufferChanged = true;
+                        actions->newDoubleBuffer = config.double_buffered_shared_mem;
+                    }
+                    settingsChanged = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Pipelined zero-copy DMA buffers to overlap Secondary GPU execution with Primary GPU present.");
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+            ImGui::Separator();
+        }
 
         // 1. PRIMARY RAY BUDGET & PROGRESSIVE ACCUMULATION (ZERO-SCROLL PRIORITY)
         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.32f, 0.24f, 1.0f));
@@ -1412,13 +1582,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 4. Post-Processing & Reconstruction
-        if (ImGui::CollapsingHeader("Post-Processing & Reconstruction")) {
+        // 4. Post-Processing, Denoising & Super-Resolution
+        if (ImGui::CollapsingHeader("Post-Processing, Denoising & Super-Resolution")) {
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
-                "In-House ReLAX / A-SVGF",
-                "Gateway (Analytical Bilateral)",
-                "Upways (WMMA Neural + Spatiotemporal)"
+                "Upways (WMMA Neural + Spatiotemporal)",
+                "Gateway (Hybrid E-SVGF + Quad MLP)",
+                "E-SVGF (Spatio-Temporal Wavelet)",
+                "AMD FSR Ray Regeneration (4-Signal)"
             };
             int denoiserIdx = static_cast<int>(config.denoiser_mode);
             if (denoiserIdx < 0 || denoiserIdx >= IM_ARRAYSIZE(denoiserModeLabels)) {
@@ -1433,9 +1604,79 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
-                                  "- In-House ReLAX / A-SVGF: Legacy variance-guided wavelet filter.\n"
-                                  "- Gateway: Analytical spatiotemporal + dilated A-Trous bilateral filter.\n"
-                                  "- Upways: 3-Scale Recurrent WMMA Neural U-Net + spatiotemporal A-Trous & subpixel upscaler.");
+                                  "- Upways: 3-Scale Recurrent WMMA Neural U-Net + multi-scale KPN.\n"
+                                  "- Gateway: 4-Pass Hybrid E-SVGF + Wave32 WMMA Quad MLP.\n"
+                                  "- E-SVGF: Variance-guided spatio-temporal A-Trous wavelet filter.\n"
+                                  "- AMD FSR Ray Regeneration: 4-Signal Direct/Indirect Diffuse+Specular pipeline.");
+            }
+
+            static const char* upscalerModeLabels[] = {
+                "None (Native Resolution)",
+                "AMD FSR (Temporal Super-Resolution)",
+                "Upways SR (Neural KPN Super-Resolution)",
+                "Gateway SR (Bilateral Super-Resolution)",
+                "FSR 1.0 (Spatial EASU + RCAS)"
+            };
+            int upscalerIdx = static_cast<int>(config.upscaler_mode);
+            if (upscalerIdx < 0 || upscalerIdx >= IM_ARRAYSIZE(upscalerModeLabels)) {
+                upscalerIdx = 0;
+            }
+            if (ImGui::Combo("Upscaler Mode", &upscalerIdx, upscalerModeLabels, IM_ARRAYSIZE(upscalerModeLabels))) {
+                config.upscaler_mode = static_cast<UpscalerMode>(upscalerIdx);
+                if (config.upscaler_mode != UpscalerMode::None && config.render_scale >= 0.999f) {
+                    config.render_scale = 0.6666667f; // Default to Quality (1.5x)
+                } else if (config.upscaler_mode == UpscalerMode::None) {
+                    config.render_scale = 1.0f;
+                }
+                settingsChanged = true;
+                if (actions) actions->resetAccumulation = true;
+            }
+
+            if (config.upscaler_mode == UpscalerMode::FSR) {
+                ImGui::PushID("FsrVerSelect");
+                ImGui::TextDisabled("FSR Target Version:");
+                ImGui::SameLine();
+                auto drawFsrVerBtn = [&](FsrVersion ver, const char* lbl) {
+                    bool isCur = (config.fsr_version == ver);
+                    if (isCur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                    if (ImGui::SmallButton(lbl)) {
+                        config.fsr_version = ver;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (isCur) ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                };
+                drawFsrVerBtn(FsrVersion::Auto, "Auto");
+                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1");
+                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4");
+                drawFsrVerBtn(FsrVersion::Fsr5, "FSR 5");
+                ImGui::NewLine();
+                ImGui::PopID();
+            }
+
+            if (config.upscaler_mode != UpscalerMode::None) {
+                ImGui::PushID("ScalePresetBtns");
+                ImGui::TextDisabled("Quality Preset:");
+                ImGui::SameLine();
+                auto drawScalePreset = [&](float scaleVal, const char* lbl) {
+                    bool isCur = (std::abs(config.render_scale - scaleVal) < 0.015f);
+                    if (isCur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                    if (ImGui::SmallButton(lbl)) {
+                        config.render_scale = scaleVal;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (isCur) ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                };
+                drawScalePreset(1.0f, "Native (1.0x)");
+                drawScalePreset(0.6666667f, "Quality (0.67x)");
+                drawScalePreset(0.5882353f, "Balanced (0.59x)");
+                drawScalePreset(0.5f, "Perf (0.50x)");
+                drawScalePreset(0.3333333f, "UltraPerf (0.33x)");
+                ImGui::NewLine();
+                ImGui::PopID();
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {
@@ -1648,8 +1889,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        // 7. Wavefront Engine & Multi-GPU Architecture
-        if (ImGui::CollapsingHeader("Wavefront Engine & Multi-GPU Architecture")) {
+        // 7. Wavefront Engine & Ray Scheduling
+        if (ImGui::CollapsingHeader("Wavefront Engine & Ray Scheduling")) {
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
             int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
             if (ImGui::RadioButton("Wavefront Path Tracing (Ray Queues & DGC)", &pipeType, 0)) {
@@ -1768,109 +2009,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 else if (currentBatchMode == 5) config.batch_count = 16;
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
-            }
-
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Multi-GPU Scalability Subsystem:");
-            const char* mgpuModes[] = {
-                "Single GPU (Secondary Standby)",
-                "Checkerboard Tiling (Optimal RDNA4, default)",
-                "Sample Parallelism (Temporal Sample Splitting)",
-                "Auto (SPP Adaptive)"
-            };
-            int currentMode = 0;
-            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile) currentMode = 1;
-            else if (config.mgpu_mode == MultiGpuMode::SampleParallel) currentMode = 2;
-            else if (config.mgpu_mode == MultiGpuMode::Auto) currentMode = 3;
-
-            if (ImGui::Combo("Execution Mode##MgpuMode", &currentMode, mgpuModes, IM_ARRAYSIZE(mgpuModes))) {
-                MultiGpuMode selectedMode = MultiGpuMode::Off;
-                if (currentMode == 1) selectedMode = MultiGpuMode::CheckerboardTile;
-                else if (currentMode == 2) selectedMode = MultiGpuMode::SampleParallel;
-                else if (currentMode == 3) selectedMode = MultiGpuMode::Auto;
-
-                if (actions && selectedMode != config.mgpu_mode) {
-                    actions->mgpuModeChanged = true;
-                    actions->newMgpuMode = selectedMode;
-                    actions->resetAccumulation = true;
-                }
-                config.mgpu_mode = selectedMode;
-                settingsChanged = true;
-            }
-
-            if (config.mgpu_mode == MultiGpuMode::CheckerboardTile || config.mgpu_mode == MultiGpuMode::Auto) {
-                const char* tileSizes[] = {
-                    "16x16 (Finest Interleaving)",
-                    "32x32 (Balanced Cache)",
-                    "64x64 (Optimal RDNA4 Default)",
-                    "128x128 (Maximum Ray Coherence)"
-                };
-                int currentTileIdx = 2; // default 64
-                if (config.tile_size == 16) currentTileIdx = 0;
-                else if (config.tile_size == 32) currentTileIdx = 1;
-                else if (config.tile_size == 64) currentTileIdx = 2;
-                else if (config.tile_size == 128) currentTileIdx = 3;
-
-                if (ImGui::Combo("Tile Size##MgpuTile", &currentTileIdx, tileSizes, IM_ARRAYSIZE(tileSizes))) {
-                    uint32_t chosenSize = 64;
-                    if (currentTileIdx == 0) chosenSize = 16;
-                    else if (currentTileIdx == 1) chosenSize = 32;
-                    else if (currentTileIdx == 2) chosenSize = 64;
-                    else if (currentTileIdx == 3) chosenSize = 128;
-
-                    if (actions && chosenSize != config.tile_size) {
-                        actions->tileSizeChanged = true;
-                        actions->newTileSize = chosenSize;
-                        actions->resetAccumulation = true;
-                    }
-                    config.tile_size = chosenSize;
-                    settingsChanged = true;
-                }
-            } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-                uint32_t currentTotalSpp = config.spp;
-                uint32_t primSpp = std::max(1u, (currentTotalSpp + 1) / 2);
-                uint32_t secSpp = std::max(1u, currentTotalSpp / 2);
-                ImGui::TextDisabled("  Sample Split: GPU 0 = %u SPP, GPU 1 = %u SPP", primSpp, secSpp);
-            }
-
-            // Accumulation format selection
-            const char* accumFormats[] = {
-                "RGBA16_SFLOAT (64-bit Half Float HDR) [Default]",
-                "RGBA32_SFLOAT (128-bit Full Float HDR)",
-                "R11G11B10_UFLOAT (32-bit Packed Float HDR) [High-Speed mGPU]"
-            };
-            int currentFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? 1 :
-                                (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 2 : 0;
-            if (ImGui::Combo("Accumulation Format##MgpuFormat", &currentFormat, accumFormats, IM_ARRAYSIZE(accumFormats))) {
-                AccumFormat selectedFormat = (currentFormat == 1) ? AccumFormat::RGBA32_SFLOAT :
-                                             (currentFormat == 2) ? AccumFormat::R11G11B10_UFLOAT : AccumFormat::RGBA16_SFLOAT;
-                if (actions && selectedFormat != config.accum_format) {
-                    actions->accumFormatChanged = true;
-                    actions->newAccumFormat = selectedFormat;
-                }
-                config.accum_format = selectedFormat;
-                settingsChanged = true;
-            }
-
-            // Double buffering toggle
-            if (ImGui::Checkbox("Double-Buffered Shared Memory", &config.double_buffered_shared_mem)) {
-                if (actions) {
-                    actions->doubleBufferChanged = true;
-                    actions->newDoubleBuffer = config.double_buffered_shared_mem;
-                }
-                settingsChanged = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Pipelined zero-copy DMA buffers to overlap Secondary GPU execution with Primary GPU present.");
-            }
-
-            if (config.mgpu_mode != MultiGpuMode::Off) {
-                if (ImGui::Checkbox("Visualize GPU Load Split", &config.visualize_mgpu_split)) {
-                    // Changing visualization immediately updates shader push constants
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Overlays on-screen color tints (GPU 0 Cyan, GPU 1 Amber) to visually display work distribution.");
-                }
             }
         }
 

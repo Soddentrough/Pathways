@@ -334,7 +334,11 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             ptPrevBuf ? ptPrevBuf->getBuffer() : VK_NULL_HANDLE,
             pathSampleBuf ? pathSampleBuf->getBuffer() : VK_NULL_HANDLE,
             shadeReqBuf ? shadeReqBuf->getBuffer() : VK_NULL_HANDLE,
-            shadeResBuf ? shadeResBuf->getBuffer() : VK_NULL_HANDLE
+            shadeResBuf ? shadeResBuf->getBuffer() : VK_NULL_HANDLE,
+            params.ffxDirectDiffuseImage ? params.ffxDirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
+            params.ffxDirectSpecularImage ? params.ffxDirectSpecularImage->getImageView() : VK_NULL_HANDLE,
+            params.ffxIndirectDiffuseImage ? params.ffxIndirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
+            params.ffxIndirectSpecularImage ? params.ffxIndirectSpecularImage->getImageView() : VK_NULL_HANDLE
         );
     }
 
@@ -352,8 +356,8 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
         return;
     }
 
-    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 24 :
-                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 20 : 32;
+    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 32 :
+                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 28 : 40;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(params.width) * params.height * bytesPerPixel;
 
     for (uint32_t slot = 0; slot < 2; ++slot) {

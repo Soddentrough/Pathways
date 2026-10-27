@@ -3,7 +3,7 @@
 #include "core/Config.hpp"
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/GatewayPipeline.hpp"
-#include "rt/Fsr3Upscaler.hpp"
+#include "rt/FsrUpscaler.hpp"
 #include "vulkan/Image.hpp"
 #include "vulkan/Buffer.hpp"
 #include "scene/Camera.hpp"
@@ -45,7 +45,8 @@ public:
     void resize(uint32_t width, uint32_t height, float renderScale,
                 UpscalerMode upscalerMode, DenoiserMode denoiserMode,
                 bool upwaysSuperres, AccumFormat accumFormat,
-                PostProcessPipeline* postProcess, VkCommandBuffer cmd);
+                PostProcessPipeline* postProcess, VkCommandBuffer cmd,
+                FsrVersion fsrVersion = FsrVersion::Auto);
 
     void updateDescriptors(PostProcessPipeline* postProcess,
                            Image* accumImage, Image* outputImage,
@@ -68,23 +69,37 @@ public:
                          Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
                          PostProcessPipeline* postProcess, Image* outputImage);
 
+    bool dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
+                     const Config& config, uint32_t frameIndex,
+                     bool cameraMovedLastFrame, uint32_t accumulatedSamples,
+                     Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
+                     MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
+                     PostProcessPipeline* postProcess, Image* outputImage,
+                     const std::function<void()>& onDescriptorsInvalidated);
+
     bool dispatchFsr3(VkCommandBuffer cmd, bool resetHistory,
                       const Config& config, uint32_t frameIndex,
                       bool cameraMovedLastFrame, uint32_t accumulatedSamples,
                       Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
                       MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
                       PostProcessPipeline* postProcess, Image* outputImage,
-                      const std::function<void()>& onDescriptorsInvalidated);
+                      const std::function<void()>& onDescriptorsInvalidated) {
+        return dispatchFsr(cmd, resetHistory, config, frameIndex, cameraMovedLastFrame, accumulatedSamples,
+                           accumImage, normalDepthImage, motionVectorImage, mgpu, secTransferBuffer, currentFrame,
+                           postProcess, outputImage, onDescriptorsInvalidated);
+    }
 
     [[nodiscard]] UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
     [[nodiscard]] GatewayPipeline* getGatewayPipeline() const { return m_gatewayPipeline.get(); }
-    [[nodiscard]] Fsr3Upscaler* getFsr3Upscaler() const { return m_fsr3Upscaler.get(); }
+    [[nodiscard]] FsrUpscaler* getFsrUpscaler() const { return m_fsrUpscaler.get(); }
+    [[nodiscard]] FsrUpscaler* getFsr3Upscaler() const { return m_fsrUpscaler.get(); }
     [[nodiscard]] Image* getDisplayAlbedoImage() const { return m_displayAlbedoImage.get(); }
     [[nodiscard]] Image* getDisplayNormalsImage() const { return m_displayNormalsImage.get(); }
     [[nodiscard]] Image* getSecAccumImage() const { return m_secAccumImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapUpwaysDescSet() const { return m_tonemapUpwaysDescSet; }
     [[nodiscard]] VkDescriptorSet getTonemapGatewayDescSet() const { return m_tonemapGatewayDescSet; }
-    [[nodiscard]] VkDescriptorSet getTonemapFsr3DescSet() const { return m_tonemapFsr3DescSet; }
+    [[nodiscard]] VkDescriptorSet getTonemapFsrDescSet() const { return m_tonemapFsrDescSet; }
+    [[nodiscard]] VkDescriptorSet getTonemapFsr3DescSet() const { return m_tonemapFsrDescSet; }
     [[nodiscard]] VkDescriptorPool getPostProcessDescPool() const { return m_postProcessDescPool; }
 
     void createUpwaysPipelines(const Config& config);
@@ -97,10 +112,15 @@ public:
     void createGatewayResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd);
     void destroyGatewayResources();
 
-    void createFsr3Pipelines(const Config& config);
-    void destroyFsr3Pipelines();
-    void createFsr3Resources(const Config& config, PostProcessPipeline* postProcess);
-    void destroyFsr3Resources();
+    void createFsrPipelines(const Config& config);
+    void destroyFsrPipelines();
+    void createFsrResources(const Config& config, PostProcessPipeline* postProcess);
+    void destroyFsrResources();
+
+    void createFsr3Pipelines(const Config& config) { createFsrPipelines(config); }
+    void destroyFsr3Pipelines() { destroyFsrPipelines(); }
+    void createFsr3Resources(const Config& config, PostProcessPipeline* postProcess) { createFsrResources(config, postProcess); }
+    void destroyFsr3Resources() { destroyFsrResources(); }
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
@@ -118,9 +138,9 @@ private:
     std::unique_ptr<Image> m_displayAlbedoImage;
     std::unique_ptr<Image> m_displayNormalsImage;
 
-    std::unique_ptr<Fsr3Upscaler> m_fsr3Upscaler;
+    std::unique_ptr<FsrUpscaler> m_fsrUpscaler;
     std::unique_ptr<Image> m_secAccumImage;
-    VkDescriptorSet m_tonemapFsr3DescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_tonemapFsrDescSet = VK_NULL_HANDLE;
 };
 
 } // namespace pathways

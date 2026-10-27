@@ -7,6 +7,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
+#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -181,6 +182,7 @@ void main() {
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
+                accumFfxSignal(pixelCoord, skyContrib, true, bounce == 0u, seed);
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -221,6 +223,7 @@ void main() {
                 if (pc.captureMlData != 0u) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
                     imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
+                    accumFfxSignal(pCoord, emissiveContrib, true, bounce == 0u, seed);
                 }
 
             }
@@ -414,6 +417,7 @@ void main() {
                                     if (pc.captureMlData != 0u) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                         imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
+                                        accumFfxSignal(pixelCoord, vec3(unshadowed), true, bounce == 0u, seed);
                                     }
                                 }
                             } else

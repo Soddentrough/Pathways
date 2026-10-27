@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
+#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
 #include "restir_common.glsl"
@@ -169,6 +170,7 @@ void main() {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), prevDiff.a));
                 }
+                accumFfxSignal(pixelCoord, accumRadiance, isSpecularPath, pc.currentBounce == 0u, seed);
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -259,6 +261,7 @@ void main() {
                     float emissiveFlag = (pc.currentBounce == 0u) ? 1.0 : prevDiff.a;
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), emissiveFlag));
                 }
+                accumFfxSignal(pixelCoord, accumRadiance, isSpecularPath, pc.currentBounce == 0u, seed);
             }
         }
     }

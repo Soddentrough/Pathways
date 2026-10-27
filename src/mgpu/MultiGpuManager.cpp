@@ -630,20 +630,23 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
     vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
     vkGetPhysicalDeviceMemoryProperties(phys1, &memProps1);
 
-    // Find cached Device-Local memory type on Device 0 (exclude uncached/device-coherent AMD heaps)
+    // Find BAR-visible Device-Local memory type on Device 0 (DEVICE_LOCAL | HOST_VISIBLE, excluding uncached/device-coherent AMD heaps)
     constexpr VkMemoryPropertyFlags kDisallowedUncachedFlags =
         VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+    constexpr VkMemoryPropertyFlags kBarVisibleFlags =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     uint32_t devLocalIdx0 = UINT32_MAX;
     for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
         VkMemoryPropertyFlags flags = memProps0.memoryTypes[i].propertyFlags;
-        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (flags & kDisallowedUncachedFlags) == 0) {
+        if ((flags & kBarVisibleFlags) == kBarVisibleFlags && (flags & kDisallowedUncachedFlags) == 0) {
             devLocalIdx0 = i;
             break;
         }
     }
     if (devLocalIdx0 == UINT32_MAX) {
         for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
-            if (memProps0.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            VkMemoryPropertyFlags flags = memProps0.memoryTypes[i].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (flags & kDisallowedUncachedFlags) == 0) {
                 devLocalIdx0 = i;
                 break;
             }
@@ -745,11 +748,24 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
         }
 
         uint32_t memIdx1 = UINT32_MAX;
+        // Prefer external/peer aperture memory type (non-DEVICE_LOCAL on the importing peer device)
+        // so the importing driver does not mark the foreign DMA-BUF BO's preferred domain as its own local VRAM.
         for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+            VkMemoryPropertyFlags flags1 = memProps1.memoryTypes[i].propertyFlags;
             if ((fdProps.memoryTypeBits & (1 << i)) &&
-                (memProps1.memoryTypes[i].propertyFlags & kDisallowedUncachedFlags) == 0) {
+                (flags1 & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0 &&
+                (flags1 & kDisallowedUncachedFlags) == 0) {
                 memIdx1 = i;
                 break;
+            }
+        }
+        if (memIdx1 == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps1.memoryTypeCount; ++i) {
+                if ((fdProps.memoryTypeBits & (1 << i)) &&
+                    (memProps1.memoryTypes[i].propertyFlags & kDisallowedUncachedFlags) == 0) {
+                    memIdx1 = i;
+                    break;
+                }
             }
         }
         if (memIdx1 == UINT32_MAX) {
@@ -1102,7 +1118,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 }
 
 VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t height) const {
-    if (m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend && m_config.upscaler_mode == UpscalerMode::FSR3) {
+    if (m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend && m_config.upscaler_mode == UpscalerMode::FSR) {
         VkDeviceSize displaySize = static_cast<VkDeviceSize>(width) * height * 8;
         return (displaySize + 65535) & ~static_cast<VkDeviceSize>(65535);
     }
@@ -1129,7 +1145,7 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
         return radOffsetAligned;
     }
 
-    VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
+    VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors)
     VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
     VkDeviceSize ndSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F
     return mvOffsetAligned + ndSize;
@@ -1556,7 +1572,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
-        VK_FORMAT_R16G16_SFLOAT,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     secNode->causticImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
@@ -2213,7 +2229,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                            (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
             VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
             VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 4; // RG16F
+            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors)
             VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
             // Copy Motion Vectors
@@ -2436,7 +2452,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
         node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
-            VK_FORMAT_R16G16_SFLOAT,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
         node->causticImage = std::make_unique<Image>(secDevice, secAlloc, width, height,

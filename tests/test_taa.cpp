@@ -58,7 +58,29 @@ int main() {
         Config cDenUpways = Config::parse(3, const_cast<char**>(argvDenUpways));
         check_true(cDenUpways.denoiser_mode == DenoiserMode::Upways, "--denoiser upways sets Upways");
 
-        std::cout << "  -> CLI flags and Denoiser modes successfully verified." << std::endl;
+        const char* argvDenFfx[] = { "pathways", "--denoiser", "ffx" };
+        Config cDenFfx = Config::parse(3, const_cast<char**>(argvDenFfx));
+        check_true(cDenFfx.denoiser_mode == DenoiserMode::FfxRayRegeneration, "--denoiser ffx sets FfxRayRegeneration");
+
+        const char* argvFsr4[] = { "pathways", "--scaler", "fsr4", "quality" };
+        Config cFsr4 = Config::parse(4, const_cast<char**>(argvFsr4));
+        check_true(cFsr4.upscaler_mode == UpscalerMode::FSR, "--scaler fsr4 sets UpscalerMode::FSR");
+        check_true(cFsr4.fsr_version == FsrVersion::Fsr4, "--scaler fsr4 sets FsrVersion::Fsr4");
+        assert_near(cFsr4.render_scale, 0.6666667f, 1e-3f, "--scaler fsr4 quality sets 0.667 render_scale");
+
+        const char* argvFsr5[] = { "pathways", "--scaler", "fsr5", "performance" };
+        Config cFsr5 = Config::parse(4, const_cast<char**>(argvFsr5));
+        check_true(cFsr5.upscaler_mode == UpscalerMode::FSR, "--scaler fsr5 sets UpscalerMode::FSR");
+        check_true(cFsr5.fsr_version == FsrVersion::Fsr5, "--scaler fsr5 sets FsrVersion::Fsr5");
+        assert_near(cFsr5.render_scale, 0.5f, 1e-3f, "--scaler fsr5 performance sets 0.5 render_scale");
+
+        // Verify FidelityFX recommended Halton jitter phase count scaling: max(8, floor(8 * (displayW / renderW)^2))
+        check_true(getFsrJitterPhaseCount(1920, 1920) == 8u, "FSR 1.0x native jitter phase count = 8");
+        check_true(getFsrJitterPhaseCount(1280, 1920) == 18u, "FSR 1.5x Quality jitter phase count = 18");
+        check_true(getFsrJitterPhaseCount(960, 1920) == 32u, "FSR 2.0x Performance jitter phase count = 32");
+        check_true(getFsrJitterPhaseCount(640, 1920) == 72u, "FSR 3.0x UltraPerformance jitter phase count = 72");
+
+        std::cout << "  -> CLI flags, FSR versions, FFX Ray Regeneration mode, and FSR jitter phase counts verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------

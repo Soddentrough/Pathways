@@ -19,7 +19,7 @@ layout(set = 0, binding = 0, rgba32ui) uniform readonly uimage2D uDenoisedDiffus
 layout(set = 0, binding = 1, rgba32ui) uniform readonly uimage2D uDenoisedSpecular;
 layout(set = 0, binding = 2, rgba16f)  uniform readonly image2D  uNormalDepth;
 layout(set = 0, binding = 3, rgba16f)  uniform readonly image2D  uAlbedoRoughness;
-layout(set = 0, binding = 4, rg16f)    uniform readonly image2D  uMotionVectors;
+layout(set = 0, binding = 4, rgba16f)  uniform readonly image2D  uMotionVectors;
 
 layout(std430, set = 0, binding = 5) readonly buffer UpscaleKernelInBuffer {
     uvec4 kernelVec4[];
@@ -410,16 +410,14 @@ void main() {
 
     float smoothC  = clamp(1.0 - roughHr, 0.0, 1.0);
     float smoothC2 = smoothC * smoothC;
-    float smoothC4 = smoothC2 * smoothC2;
-    float specGate = clamp(1.0 - 1.7 * smoothC4, 0.0, 1.0);
 
-    float betaSub    = (0.35 + 1.5 * max(z0, 0.0)) * activityGate;
-    float betaZ      = (16.0 + 16.0 * max(z6, 0.0)) * activityGate;
-    float betaN      = (12.0 + 12.0 * max(z7, 0.0)) * activityGate;
-    float betaLum    = (3.0 + 4.0 * max(z5, 0.0)) * activityGate;
-    float betaClip   = 6.0 * (abs(z4) + max(z4, 0.0)) * activityGate;
-    float betaDisocc = (8.0 + 4.0 * max(z2, 0.0)) * activityGate;
-    float gammaJit   = 3.0 * (abs(z3) + max(z3, 0.0)) * activityGate;
+    float betaSub    = max(z0, 0.0) * activityGate;
+    float betaDisocc = max(z2, 0.0) * activityGate;
+    float gammaJit   = max(z3, 0.0) * activityGate;
+    float betaClip   = max(z4, 0.0) * activityGate;
+    float betaLum    = max(z5, 0.0) * activityGate;
+    float betaZ      = max(z6, 0.0) * activityGate;
+    float betaN      = max(z7, 0.0) * activityGate;
 
     uint tapIdx[9] = uint[9](
         cy0 + cx1 - 1u, cy0 + cx1, cy0 + cx1 + 1u,
@@ -448,8 +446,8 @@ void main() {
         uint b0i = tapIdx[i] << 3u;
         vec3 d_i = vec3(float(s_buf[b0i + 0u]), float(s_buf[b0i + 1u]), float(s_buf[b0i + 2u]));
         vec3 s_i = vec3(float(s_buf[b0i + 3u]), float(s_buf[b0i + 4u]), float(s_buf[b0i + 5u]));
-        float yD = max(upwaysLuminance(d_i), max(d_i.r, max(d_i.g, d_i.b)) * 0.75);
-        float yS = max(upwaysLuminance(s_i), max(s_i.r, max(s_i.g, s_i.b)) * 0.75);
+        float yD = max(d_i.r, max(d_i.g, d_i.b));
+        float yS = max(s_i.r, max(s_i.g, s_i.b));
         tapDiff[i]  = d_i;
         tapSpec[i]  = s_i;
         tapYDiff[i] = yD;
@@ -464,7 +462,7 @@ void main() {
             float z_i = float(s_buf[b2i + 3u]);
             float dz = clamp(abs(zCenter - z_i) / max(max(zCenter, z_i), 0.1), 0.0, 2.0);
             float dn = 1.0 - clamp(dot(nCenter, n_i), 0.0, 1.0);
-            float pg = betaZ * dz + betaN * dn;
+            float pg = 16.0 * (betaZ * dz + betaN * dn);
             float af = exp(-pg);
             phiGeom[i] = pg;
             geomAff[i] = af;
@@ -488,20 +486,16 @@ void main() {
     }
     madYDiff *= invWGeom;
     madYSpec *= invWGeom;
-    float geomCov = sumAff / (sumAff + 0.25);
-    float threshD = meanYDiff + 1.5 * madYDiff + 0.15;
-    float threshS = meanYSpec + 1.5 * madYSpec + 0.05;
+    float geomCov = sumAff / (sumAff + 1.0);
+    float threshD = meanYDiff + madYDiff;
+    float threshS = meanYSpec + madYSpec;
 
     float rawLogits[9] = float[9](
         float(l0), float(l1), float(l2),
         float(l3), float(l4), float(l5),
         float(l6), float(l7), float(l8)
     );
-    float deltaSpec = clamp(
-        max(float(rawSpecSharp16), 0.0) + 3.5 * smoothC4 * (abs(z1) + max(z1, 0.0)) * activityGate,
-        0.0,
-        8.0
-    );
+    float deltaSpec = max(float(rawSpecSharp16) + smoothC2 * max(z1, 0.0), 0.0) * activityGate;
 
     float modLogitDiff[9];
     float modLogitSpec[9];
@@ -514,8 +508,8 @@ void main() {
         float yS = tapYSpec[i];
         float exD = max(0.0, yD - threshD);
         float exS = max(0.0, yS - threshS);
-        float dID = geomCov * (exD / (madYDiff + 0.15));
-        float dIS = geomCov * specGate * (exS / (madYSpec + 0.15));
+        float dID = geomCov * exD;
+        float dIS = geomCov * roughHr * exS;
 
         float kD = (min(yD, threshD) + exD / (1.0 + betaClip * dID)) / max(yD, 1e-4);
         float kS = (min(yS, threshS) + exS / (1.0 + betaClip * dIS)) / max(yS, 1e-4);
@@ -531,7 +525,7 @@ void main() {
             vec2 off = kTapOff[i];
             float phiSub = betaSub * (dot(off, off) - 2.0 * (off.x * dpx + off.y * dpy));
             ld -= (phiSub + phiGeom[i]) + (betaLum + betaClip) * dID;
-            ls -= (phiSub + (1.0 + 2.0 * smoothC2) * phiGeom[i]) + (betaLum + betaClip) * dIS;
+            ls -= (phiSub + (1.0 + smoothC2) * phiGeom[i]) + (betaLum + betaClip) * dIS;
         }
         modLogitDiff[i] = ld;
         modLogitSpec[i] = ls;
@@ -567,20 +561,25 @@ void main() {
     vec3 refCurrDiffHr = max(currDiffHr + vec3(resDHr * isSurfHr), vec3(0.0));
     vec3 refCurrSpecHr = max(currSpecHr + vec3(resSHr * isSurfHr), vec3(0.0));
 
-    float dzThresh   = 0.02 + 0.18 * (1.0 - smoothC4);
-    float dzExcess   = clamp(max(0.0, relDzHr - dzThresh) * 12.5, 0.0, 1.0);
-    float dnExcess   = clamp(max(0.0, 0.85 - nDotHr) * (1.0 / 0.35), 0.0, 1.0);
-    float disoccSurf = clamp(dzExcess + dnExcess, 0.0, 1.0);
-    float drExcess   = smoothC4 * clamp(max(0.0, relDReflHr - 0.03) * (1.0 / 0.12), 0.0, 1.0);
-    float disoccSpec = clamp(max(disoccSurf, drExcess), 0.0, 1.0);
+    float nDotPos    = clamp(nDotHr, 0.0, 1.0);
+    float dnDisocc   = (1.0 - nDotPos) * (1.0 - nDotPos);
+    float disoccSurf = clamp(relDzHr + dnDisocc, 0.0, 1.0);
+    float disoccSpec = clamp(max(disoccSurf, smoothC2 * relDReflHr), 0.0, 1.0);
 
-    float dJit2 = clamp((scaleX * scaleX) * (dtx * dtx) + (scaleY * scaleY) * (dty * dty), 0.0, 2.0);
-    float adjRawAlphaD = float(rawAlphaD16) + betaDisocc * disoccSurf;
-    float adjRawAlphaS = float(rawAlphaS16) + betaDisocc * disoccSpec;
-    float adjRawAlphaG = float(rawAlphaG16) + betaDisocc * disoccSurf - gammaJit * dJit2 * (1.0 - disoccSurf);
+    float dJit2        = clamp((scaleX * scaleX) * (dtx * dtx) + (scaleY * scaleY) * (dty * dty), 0.0, 2.0);
+    float adjRawAlphaD = float(rawAlphaD16) + 16.0 * betaDisocc * disoccSurf;
+    float adjRawAlphaS = float(rawAlphaS16) + 16.0 * betaDisocc * disoccSpec;
+    float adjRawAlphaG = float(rawAlphaG16) + 16.0 * betaDisocc * disoccSurf - gammaJit * dJit2 * (1.0 - disoccSurf);
 
-    float netAlphaD    = 1.0 / (1.0 + exp(-adjRawAlphaD));
-    float netAlphaS    = 1.0 / (1.0 + exp(-adjRawAlphaS));
+    float horizonDecay = (pc.displayHistoryAlpha > 0.0) ? pc.displayHistoryAlpha : 1.0;
+    float movingDecay  = 0.80 + 0.20 * horizonDecay;
+    float motionGate   = clamp(length(mvSurfPref * vec2(displaySize)), 0.0, 1.0);
+    float baseDecay    = mix(horizonDecay, movingDecay, motionGate);
+    float effDecayD    = mix(baseDecay, 1.0, disoccSurf);
+    float effDecayS    = mix(baseDecay, 1.0, disoccSpec);
+
+    float netAlphaD    = (1.0 / (1.0 + exp(-adjRawAlphaD))) * effDecayD;
+    float netAlphaS    = (1.0 / (1.0 + exp(-adjRawAlphaS))) * effDecayS;
     float netAlphaG    = 1.0 / (1.0 + exp(-adjRawAlphaG));
 
     float inBSpecHr   = inBSurfHr;
@@ -610,8 +609,8 @@ void main() {
     }
 
     // 5. Learned Target-Resolution Temporal Accumulation & Log-Irradiance Refinement
-    float validSurfHr = inBSurfHr * hasHistory;
-    float validSpecHr = inBSpecHr * hasHistory;
+    float validSurfHr = inBSurfHr * hasHistory * isSurfHr;
+    float validSpecHr = inBSpecHr * hasHistory * isSurfHr;
 
     float effAlphaD = 1.0 - validSurfHr * (1.0 - netAlphaD);
     float effAlphaS = 1.0 - validSpecHr * (1.0 - netAlphaS);

@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
+#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -179,6 +180,7 @@ void main() {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
                 }
+                accumFfxSignal(pixelCoord, skyContrib, isSpecularPath, bounce == 0u, seed);
             }
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
@@ -342,6 +344,7 @@ void main() {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                                                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, unshadowed, seed), prevDiff.a));
                                             }
+                                            accumFfxSignal(pixelCoord, unshadowed, isSpecularPath, bounce == 0u, seed);
                                         }
                                     }
                                 } else

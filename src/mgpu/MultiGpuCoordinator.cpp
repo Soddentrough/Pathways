@@ -93,7 +93,10 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     plan.mgpuBaseH = params.renderH;
     plan.dispatchWidth = plan.mgpuBaseW;
     plan.dispatchHeight = (plan.mgpuBaseH + 1) / 2;
-    plan.isSampleBlendFsr3 = (params.config.upscaler_mode == UpscalerMode::FSR3 && params.config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend);
+    plan.isSampleBlendFsr3 = (params.config.upscaler_mode == UpscalerMode::FSR &&
+                              params.config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
+                              params.config.denoiser_mode != DenoiserMode::Svgf &&
+                              params.config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
     plan.totalCompositeSpp = 0u;
     plan.secAccumHistory = 0u;
     plan.mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
@@ -150,15 +153,18 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.uboSec.spp = plan.secSpp;
         plan.uboSec.frameIndex = params.frameIndex + 1000003u;
 
-        bool enableJitter = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+        bool enableJitter = (params.config.upscaler_mode == UpscalerMode::FSR ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
                              params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
                              params.config.denoiser_mode == DenoiserMode::Gateway);
         if (enableJitter && params.camera) {
             uint32_t phaseOffset = (params.config.mgpu_mode == MultiGpuMode::SampleParallel) ? 4 : 0;
+            uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
+                ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
+                : 32u;
             plan.uboSec = params.camera->getUniformData(params.frameIndex, plan.secSpp, params.activeBounces, params.flags,
-                                                       true, plan.mgpuBaseW, plan.mgpuBaseH, phaseOffset, false);
+                                                       true, plan.mgpuBaseW, plan.mgpuBaseH, phaseOffset, false, jitterSeqLen);
             plan.uboSec.frameIndex = params.frameIndex + 1000003u;
         }
 
@@ -182,14 +188,15 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * 8;
     } else {
         plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
-        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
                              params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
                              params.config.denoiser_mode == DenoiserMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Svgf);
+                             params.config.denoiser_mode == DenoiserMode::Svgf ||
+                             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
         if (plan.tileOffsetX_sec == 2u && needGbuffers) {
-            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 12; // 4 MV + 8 NormDepth
+            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 16; // 8 MV + 8 NormDepth
         }
     }
     m_lastSecToPrimBytes = plan.frameBytes;
@@ -203,11 +210,14 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     // Launch secondary GPU concurrently for current frame
     if (!params.skipRayTracing && params.mgpu) {
         glm::vec2 jitterSec(0.0f);
-        if (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+        if (params.config.upscaler_mode == UpscalerMode::FSR ||
             params.config.upscaler_mode == UpscalerMode::Upways ||
             params.config.upscaler_mode == UpscalerMode::Gateway) {
             if (!params.config.progressive_accumulation || params.cameraMovedLastFrame || inOutAccumulatedSamples <= 1) {
-                jitterSec = getHaltonJitter(params.frameIndex + 4);
+                uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
+                    ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
+                    : 32u;
+                jitterSec = getHaltonJitter(params.frameIndex + 4, jitterSeqLen);
             }
         }
         bool isSecMotion = params.cameraMovedThisFrame || params.cameraMovedLastFrame;
@@ -321,6 +331,13 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
     rtSubmit.pCommandBufferInfos = &cmdSubmitInfo;
     rtSubmit.signalSemaphoreInfoCount = 1;
     rtSubmit.pSignalSemaphoreInfos = &signalInfo;
+    if (!params.skipRayTracing && params.mgpu && params.mgpu->isP2PDirectBarActive()) {
+        // Ensure the secondary GPU (DMA-BUF importer) submits before the primary GPU (DMA-BUF exporter).
+        // In Linux amdgpu, imported DMA-BUF BOs use implicit AMDGPU_SYNC_NE_OWNER synchronization while
+        // exported native BOs use AMDGPU_SYNC_EXPLICIT; submitting the importer first avoids a false
+        // dma_resv dependency on the primary GPU's ray tracing submission.
+        params.mgpu->waitWorkerIdle();
+    }
     vkQueueSubmit2(queue, 1, &rtSubmit, VK_NULL_HANDLE);
 }
 
@@ -346,12 +363,13 @@ void MultiGpuCoordinator::recordMergePass(
 
     // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
-        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR3 ||
+        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
                              params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
                              params.config.denoiser_mode == DenoiserMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Svgf);
+                             params.config.denoiser_mode == DenoiserMode::Svgf ||
+                             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
         PostProcessPipeline::MergePushConstants mergePC{
             plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp,
             plan.secDispatchWidth, needGbuffers ? 1u : 0u
@@ -373,13 +391,14 @@ void MultiGpuCoordinator::recordMergePass(
     mergeDep.pMemoryBarriers = &mergeBarrier;
     vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-    // Copy merged FP16 radiance into mlDiffuseImage for Upways/Gateway neural reconstruction / ReLAX SVGF denoiser
+    // Copy merged FP16 radiance into mlDiffuseImage for Upways/Gateway neural reconstruction / ReLAX SVGF / FFX denoiser
     if (!params.skipRayTracing && mlDiffuseImage && frameImage && 
         (params.config.upscaler_mode == UpscalerMode::Upways ||
          params.config.upscaler_mode == UpscalerMode::Gateway ||
          params.config.denoiser_mode == DenoiserMode::Upways ||
          params.config.denoiser_mode == DenoiserMode::Gateway ||
-         params.config.denoiser_mode == DenoiserMode::Svgf)) {
+         params.config.denoiser_mode == DenoiserMode::Svgf ||
+         params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration)) {
         VkImageCopy copyRegion{};
         copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };

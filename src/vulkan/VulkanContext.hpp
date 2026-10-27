@@ -131,6 +131,11 @@ public:
     uint32_t getSubgroupSize() const { return m_subgroupSize; }
     const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT& getDgcProperties() const { return m_dgcProperties; }
     bool hasCooperativeMatrix() const { return m_hasCooperativeMatrix; }
+    bool hasShaderInt8() const { return m_vk12Features.shaderInt8 == VK_TRUE; }
+    bool hasStorageBuffer8BitAccess() const { return m_vk12Features.storageBuffer8BitAccess == VK_TRUE; }
+    bool hasShaderFloat8() const { return m_hasShaderFloat8; }
+    bool hasFp8CooperativeMatrix() const { return m_hasFp8CoopMatrix; }
+    bool hasInt8CooperativeMatrix() const { return m_hasInt8CoopMatrix; }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
     PFN_vkSetHdrMetadataEXT getSetHdrMetadataEXT() const { return pfnVkSetHdrMetadataEXT; }
@@ -203,6 +208,10 @@ private:
     VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT m_dgcProperties{};
     uint32_t m_subgroupSize = 0;
     bool m_hasCooperativeMatrix = false;
+    bool m_hasShaderFloat8 = false;
+    bool m_hasShaderFloat8CoopMatrix = false;
+    bool m_hasFp8CoopMatrix = false;
+    bool m_hasInt8CoopMatrix = false;
     bool m_hasHdrMetadata = false;
     bool m_hasFullScreenExclusive = false;
     PFN_vkSetHdrMetadataEXT pfnVkSetHdrMetadataEXT = nullptr;

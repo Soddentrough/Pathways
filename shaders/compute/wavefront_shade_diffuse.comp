@@ -11,13 +11,14 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
+#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
 
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
-layout(binding = 23, rg16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 23, rgba16f) uniform readonly image2D uMotionVectorImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
@@ -253,6 +254,7 @@ void main() {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
                 }
+                accumFfxSignal(pixelCoord, skyContrib, isSpecularPath, bounce == 0u, seed);
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -397,6 +399,7 @@ void main() {
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
                         imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), prevDiff.a));
                     }
+                    accumFfxSignal(pCoord, emissiveContrib, isSpecularPath, bounce == 0u, seed);
                 }
                 bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
                 if (enableRestirPT && bounce == 0u) {
@@ -471,6 +474,7 @@ void main() {
                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
                                 imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), prevDiff.a));
                             }
+                            accumFfxSignal(pCoord, causticRad, isSpecularPath, false, seed);
                         }
                     }
                 }
@@ -644,6 +648,7 @@ void main() {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                                                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), prevDiff.a));
                                             }
+                                            accumFfxSignal(pixelCoord, vec3(unshadowed), isSpecularPath, bounce == 0u, seed);
                                         }
                                     } else {
                                         secDirectL = f16vec3(0.0);
@@ -844,6 +849,7 @@ void main() {
                                         vec4 prevDiff = imageLoad(uMlDiffuseImage, giPixC);
                                         imageStore(uMlDiffuseImage, giPixC, vec4(addFp16Stochastic(prevDiff.rgb, giContrib, seed), prevDiff.a));
                                     }
+                                    accumFfxSignal(giPixC, giContrib, isSpecularPath, false, seed);
                                 }
                             } else {
                                 // Decoupled winner replay visibility x1 <-> x2_w
@@ -1045,11 +1051,14 @@ void main() {
                                                 if (isSpecularPath) {
                                                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
+                                                    accumFfxSignal(pixelCoord, vec3(unshadowed), true, bounce == 0u, seed);
                                                 } else {
                                                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                                                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), prevDiff.a));
                                                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), prevSpec.a));
+                                                    accumFfxSignal(pixelCoord, vec3(diffUnshadowed), false, bounce == 0u, seed);
+                                                    accumFfxSignal(pixelCoord, vec3(specUnshadowed), true, bounce == 0u, seed);
                                                 }
                                             }
                                         } else {
@@ -1104,6 +1113,7 @@ void main() {
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                         imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, ambientRad, seed), prevDiff.a));
                     }
+                    accumFfxSignal(pixelCoord, ambientRad, isSpecularPath, false, seed);
                 }
             }
 #endif
