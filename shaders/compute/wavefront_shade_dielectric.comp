@@ -146,12 +146,13 @@ void main() {
         // ReSTIR DI: dielectric surfaces do not maintain a reservoir; invalidate
         // this pixel's current-frame slot so stale history cannot be tapped
         // next frame (review 2026-10-10 §4.8).
-        if (bounce == 0u && (ubo.flags & (1 << 9)) != 0) {
-            currentReservoirs[pixelIndex] = invalidDiReservoir();
-        }
-        if ((ubo.flags & (1 << 24)) != 0) {
-            if (bounce == 0u) x1Contexts[pixelIndex] = invalidX1Context();
-            if (bounce == 1u) giReservoirs[pixelIndex] = invalidGiReservoir();
+        if ((ubo.flags & (1 << 9)) != 0) {
+            if (bounce == 0u) {
+                currentReservoirs[pixelIndex] = invalidDiReservoir();
+                x1Contexts[pixelIndex] = invalidX1Context();
+            } else if (bounce == 1u) {
+                giReservoirs[pixelIndex] = invalidGiReservoir();
+            }
         }
 
         if (hitType == 2u) {

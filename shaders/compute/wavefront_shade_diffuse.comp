@@ -128,19 +128,6 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
     GiReservoir giHistoryReservoirs[];
 };
 
-// ReSTIR PT Phase 3 (Approach B) state — docs/RESTIR_PT_DESIGN.md
-layout(std430, binding = 41) buffer PtCurrentReservoirsBuffer {
-    ReservoirPT ptReservoirs[];
-};
-
-layout(std430, binding = 42) readonly buffer PtHistoryReservoirsBuffer {
-    ReservoirPT ptHistoryReservoirs[];
-};
-
-layout(std430, binding = 43) buffer PathSamplesBuffer {
-    PathSample pathSamples[];
-};
-
 #ifndef ENABLE_RESTIR_GI
 #if IS_SECONDARY_BOUNCE
 #define ENABLE_RESTIR_GI 0
@@ -211,7 +198,7 @@ void main() {
         // only made valid below where a diffuse cosine reflection lobe emits
         // the bounce-1 ray (docs/RESTIR_PT_DESIGN.md).
         bool giCtxEligible = false;
-        if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+        if (bounce == 0u && (ubo.flags & (1u << 9)) != 0u) {
             x1Contexts[pixelIndex] = invalidX1Context();
         }
 #endif
@@ -239,7 +226,7 @@ void main() {
                 currentReservoirs[pixelIndex] = invalidDiReservoir();
             }
 #if ENABLE_RESTIR_GI
-            if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
+            if ((ubo.flags & (1u << 9)) != 0u && bounce == 1u) {
                 // Bounce-1 ray escaped to the sky: no secondary vertex exists,
                 // so this pixel contributes no GI candidate this frame.
                 giReservoirs[pixelIndex] = invalidGiReservoir();
@@ -356,7 +343,7 @@ void main() {
                             (alphaMode == 2u && randFloat(seed) > baseColor.a);
             if (isCutout) {
 #if ENABLE_RESTIR_GI
-                if ((ubo.flags & (1u << 24)) != 0u && bounce == 1u) {
+                if ((ubo.flags & (1u << 9)) != 0u && bounce == 1u) {
                     // Cutout pass-through: the shaded x2 belongs to the next
                     // vertex; this pixel's GI slot must not reuse stale data.
                     giReservoirs[pixelIndex] = invalidGiReservoir();
@@ -508,12 +495,12 @@ void main() {
             // ReSTIR GI (docs/RESTIR_PT_DESIGN.md): for bounce-1 rays the 2-bounce
             // term T1·L_direct(x1) is estimated by resampling cached secondary
             // vertices at the primary hit x1 (this ray's origin) instead of the
-            // plain T1·NEE(x2) accumulation. Requires inline ray queries for the
+            // plain T1·NEE(x2) accumulation.
             X1Context giCtx = x1Contexts[pixelIndex];
-            bool giActive = ((ubo.flags & (1u << 24)) != 0u) && (bounce == 1u) &&
+            bool giActive = ((ubo.flags & (1u << 9)) != 0u) && (bounce == 1u) &&
                             (pc.useHardwareRT == 1u) && enableDirect && (pc.numLights > 0u) &&
                             x1ContextValid(giCtx);
-            if (!giActive && bounce == 1u && (ubo.flags & (1u << 24)) != 0u) {
+            if (!giActive && bounce == 1u && (ubo.flags & (1u << 9)) != 0u) {
                 giReservoirs[pixelIndex] = invalidGiReservoir();
             }
             vec3 giL2 = vec3(0.0);              // shadowed radiance leaving x2 toward x1
@@ -699,7 +686,6 @@ void main() {
                 // Every bounce-1 ray owns its pixel's GI slot this frame:
                 // write invalid first, overwrite below when a candidate exists.
                 giReservoirs[pixelIndex] = invalidGiReservoir();
-                ptReservoirs[pixelIndex] = invalidReservoirPT();
 
                 if (!pathTerminated && !isDelta) {
                     vec3 giX1 = origin;              // primary hit point (epsilon-offset)
@@ -709,9 +695,6 @@ void main() {
                     float giAlbedoBar = max(dot(clamp(giAlbedo, vec3(0.0), vec3(1.0)), vec3(0.3333333)), 1e-4);
 
                     Hit selfHit = getRayHitAtom(hit);
-                    pathSamples[pixelIndex].vertices[1] = makePathVertex(selfHit, -rayDir, matId, 1u /* SURFACE_DIFFUSE */, 0u);
-                    pathSamples[pixelIndex].vertexCount = 2u;
-
                     vec3 selfX2;
                     vec3 selfN2;
                     reconstructHitPositionAndNormal(selfHit, selfX2, selfN2);
@@ -730,14 +713,6 @@ void main() {
                         // Unlit / shadowed candidate evaluated this frame: carries 0 weight, but M=1
                         giR = makeGiReservoir(selfHit, 0.0, 1u, 0.0, vec3(0.0), hitT, cosRcSelf, 0u);
                     }
-
-                    // Phase 3 geometric target proxy and initial ReservoirPT R0
-                    float emitLum = max(dot(giL2, vec3(0.2126, 0.7152, 0.0722)), 0.0);
-                    float ptPSelf = evalPathTargetProxy(pathSamples[pixelIndex], emitLum);
-                    float ptQ = max(dot(giN1, rayDir), 0.0) * INV_PI;
-                    float ptWSelf = (ptPSelf > 0.0 && ptQ > 1e-9) ? (ptPSelf / ptQ) : 0.0;
-                    ReservoirPT ptR = invalidReservoirPT();
-                    ptUpdate(ptR, pixelIndex, ptWSelf, ptPSelf, seed);
 
                     if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
                         // Temporal center tap (MV-reprojected) from previous frame's temporal history
@@ -760,13 +735,6 @@ void main() {
                                             giWinnerSelf = false;
                                         }
                                     }
-
-                                    ReservoirPT ptTap = ptHistoryReservoirs[uint(giPrev.y) * pc.width + uint(giPrev.x)];
-                                    if (ptIsValid(ptTap) && ptGetAge(ptTap) < RESTIR_MAX_AGE) {
-                                        PathSample ptTapPath = pathSamples[ptTap.pathIndex];
-                                        uint ptAgeNew = min(ptGetAge(ptTap) + 1u, RESTIR_MAX_AGE);
-                                        ptApplyTap(ptR, ptTap, ptTapPath, giX1, giN1, giRoughness, float(pc.restirMCap), ptAgeNew, seed);
-                                    }
                                 }
                             }
                         }
@@ -780,17 +748,9 @@ void main() {
                         giReservoirs[pixelIndex] = invalidGiReservoir();
                     }
 
-                    if (ptIsValid(ptR)) {
-                        ptReservoirs[pixelIndex] = ptR;
-                    } else {
-                        ptReservoirs[pixelIndex] = invalidReservoirPT();
-                    }
-
                     // Shading reservoir: starts from temporal reservoir, then gathers spatial neighbors
                     GiReservoir giShadeR = giR;
                     bool giShadeWinnerSelf = giWinnerSelf;
-
-                    ReservoirPT ptShadeR = ptR;
 
                     if (ubo.frameIndex > 0u && (ubo.flags & (1u << 23)) == 0u) {
                         ivec2 giPix = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -825,16 +785,8 @@ void main() {
                                     giShadeWinnerSelf = false;
                                 }
                             }
-
-                            ReservoirPT ptTap = ptHistoryReservoirs[uint(giCoord.y) * pc.width + uint(giCoord.x)];
-                            if (ptIsValid(ptTap) && ptGetAge(ptTap) < RESTIR_MAX_AGE) {
-                                PathSample ptTapPath = pathSamples[ptTap.pathIndex];
-                                ptApplyTap(ptShadeR, ptTap, ptTapPath, giX1, giN1, giRoughness, 8.0, ptGetAge(ptTap), seed);
-                            }
                         }
                     }
-
-                    ptFinalize(ptShadeR);
 
                     if (giIsValid(giShadeR) && giGetM(giShadeR) > 0u && giGetTarget(giShadeR) > 0.0) {
                         vec3 giL2w = giGetRadiance(giShadeR);
@@ -942,33 +894,10 @@ void main() {
                         uint mCap = min(pc.restirMCap, 8u);
                         uint ageNew = restirGetAge(src.flags);
 
-                        bool spatialOccluded = false;
-                        // In unbiased mode (when --transparent-shadows fast mode is not set), verify visibility
-                        if ((ubo.flags & (1u << 26)) == 0u && restirIsValid(src.flags) && src.targetPdf > 0.0) {
-                            uint sLightIdx = restirGetLightIdx(src.idxM);
-                            if (sLightIdx < pc.numLights) {
-                                Light sLight = lights[sLightIdx];
-                                vec2 sLuv = restirUnpackUv8(src.lightPacked >> 16u);
-                                vec3 rDir;
-                                float rDist;
-                                vec3 rEmiss;
-                                float cLightNew;
-                                if (reconnectDirectPath(hitPoint, sLight, sLuv, rDir, rDist, rEmiss, cLightNew)) {
-                                    float rNdotL = dot(hitNormal, rDir);
-                                    if (rNdotL > 0.0) {
-                                        spatialOccluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, rDir, rDist,
-                                                                               (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                    } else {
-                                        spatialOccluded = true;
-                                    }
-                                } else {
-                                    spatialOccluded = true;
-                                }
-                            }
-                        }
-
+                        // Post-selection LATE_WRS_MIS inline shadow ray at finalization handles visibility
+                        // without 4 per-tap divergent rayQueryEXT traversals inside the spatial loop.
                         restirDiApplyTap(shadeR, shadeSel, src, pc.numLights, hitPoint, hitNormal, hitT,
-                                         proxyLumWeight, diffTrans, mCap, ageNew, spatialOccluded, seed);
+                                         proxyLumWeight, diffTrans, mCap, ageNew, false, seed);
                     }
 
                     r = shadeR;
@@ -1271,17 +1200,9 @@ void main() {
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                             nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath || sampledSpecularLobe, causticApplied, dispersionChannel, nextPdfCode);
 #if !IS_SECONDARY_BOUNCE
-                            if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+                            if (bounce == 0u && (ubo.flags & (1u << 9)) != 0u) {
                                 if (giCtxEligible) {
                                     x1Contexts[pixelIndex] = makeX1Context(hitNormal, vec3(diffuseColor), V, dot(vec3(F0), vec3(0.3333333)), roughness);
-                                    Hit primaryHit = getRayHitAtom(hit);
-                                    pathSamples[pixelIndex].vertexCount = 1u;
-                                    pathSamples[pixelIndex].rcIndex = 1u;
-                                    pathSamples[pixelIndex].rngSeedPrefix = seed;
-                                    pathSamples[pixelIndex].rngSeedSuffix = 0u;
-                                    pathSamples[pixelIndex].strategyId = 0u;
-                                    pathSamples[pixelIndex].flags = 0u;
-                                    pathSamples[pixelIndex].vertices[0] = makePathVertex(primaryHit, V, matId, 1u /* SURFACE_DIFFUSE */, 0u);
                                 } else {
                                     x1Contexts[pixelIndex] = invalidX1Context();
                                 }
@@ -1289,7 +1210,7 @@ void main() {
 #endif
                         } else {
 #if !IS_SECONDARY_BOUNCE
-                            if (bounce == 0u && (ubo.flags & (1u << 24)) != 0u) {
+                            if (bounce == 0u && (ubo.flags & (1u << 9)) != 0u) {
                                 x1Contexts[pixelIndex] = invalidX1Context();
                             }
 #endif

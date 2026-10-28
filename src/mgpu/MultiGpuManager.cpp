@@ -1693,7 +1693,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 wfTailMegakernelCode
             );
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
-            if (config.enable_restir) {
+            if (config.enable_restir && config.mgpu_mode != MultiGpuMode::Off) {
                 secNode->restirManager->resize(config.width, config.height);
             }
             updateSecondaryWavefrontDescriptors(secNode.get());
@@ -1828,11 +1828,6 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
         Buffer* giCurrBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(slot) : nullptr;
         Buffer* giPrevBuf = secNode->restirManager ? secNode->restirManager->getGiReservoirBuffer(1 - slot) : nullptr;
         Buffer* x1CtxBuf = secNode->restirManager ? secNode->restirManager->getX1ContextBuffer() : nullptr;
-        Buffer* ptCurrBuf = secNode->restirManager ? secNode->restirManager->getReservoirPTBuffer(slot) : nullptr;
-        Buffer* ptPrevBuf = secNode->restirManager ? secNode->restirManager->getReservoirPTBuffer(1 - slot) : nullptr;
-        Buffer* pathSampleBuf = secNode->restirManager ? secNode->restirManager->getPathSampleBuffer() : nullptr;
-        Buffer* shadeReqBuf = secNode->restirManager ? secNode->restirManager->getShadeRequestBuffer() : nullptr;
-        Buffer* shadeResBuf = secNode->restirManager ? secNode->restirManager->getShadeResultBuffer() : nullptr;
 
         secNode->wavefrontPipeline->updateSceneDescriptors(
             slot,
@@ -1863,12 +1858,7 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE,
-            ptCurrBuf ? ptCurrBuf->getBuffer() : VK_NULL_HANDLE,
-            ptPrevBuf ? ptPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            pathSampleBuf ? pathSampleBuf->getBuffer() : VK_NULL_HANDLE,
-            shadeReqBuf ? shadeReqBuf->getBuffer() : VK_NULL_HANDLE,
-            shadeResBuf ? shadeResBuf->getBuffer() : VK_NULL_HANDLE
+            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE
         );
     }
 }
@@ -1944,6 +1934,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
     }
     vkResetFences(device, 1, &node->renderFences[slot]);
+
+    if (m_config.enable_restir && node->restirManager && !node->restirManager->isInitialized()) {
+        vkDeviceWaitIdle(device);
+        node->restirManager->resize(m_config.width, m_config.height);
+        updateSecondaryWavefrontDescriptors(node);
+    }
 
     // 2. Update Camera UBO for this slot
     CameraUniform uboSecCopy = packet.cameraUniform;
@@ -2552,7 +2548,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         }
         if (node->wavefrontPipeline) {
             node->wavefrontPipeline->resize(width, height);
-            if (m_config.enable_restir) {
+            if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
                 if (!node->restirManager) {
                     node->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
                 }
@@ -2581,7 +2577,7 @@ void MultiGpuManager::setConfig(const Config& config) {
     m_config = config;
     if (!m_devices.empty()) {
         GpuDeviceNode* secNode = m_devices[0].get();
-        if (m_config.enable_restir) {
+        if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
             if (!secNode->restirManager) {
                 secNode->restirManager = std::make_unique<ReSTIRManager>(secNode->context->getDevice(), secNode->context->getAllocator());
             }

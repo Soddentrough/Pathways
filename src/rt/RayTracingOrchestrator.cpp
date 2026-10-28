@@ -127,9 +127,8 @@ void RayTracingOrchestrator::initNRC(
 void RayTracingOrchestrator::createReSTIRResources() {
     // Buffer allocation is deferred: the grid is only (re)allocated when
     // ReSTIR is actually enabled (Engine::renderFrame lazy-init path) to
-    // avoid ~2 x W*H*28 B of idle VRAM when the feature is off.
+    // avoid ~144 B/pixel of idle VRAM when the feature is off.
     m_restirManager = std::make_unique<ReSTIRManager>(m_device, m_allocator);
-    m_restirManager->setPhase3Enabled(true);
     Logger::info("ReSTIR PT subsystem initialized (path-space reservoirs; inline temporal + spatial-tap reuse in wavefront shading).");
 }
 

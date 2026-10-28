@@ -10,19 +10,16 @@
 
 namespace pathways {
 
-// Owns the per-pixel ReSTIR state grids consumed by the wavefront shade
+// Owns the per-pixel ReSTIR PT state grids consumed by the wavefront shade
 // passes:
-//   binding 32/36: double-buffered DI reservoirs (current / history)
-//   binding 37:    single-buffered X1 context (same-frame producer/consumer)
-//   binding 38/39: double-buffered GI reservoirs (current / history)
-//   binding 41/42: double-buffered PT reservoirs (current / history)
-//   binding 43:    single-buffered PathSample pool (Approach B)
+//   binding 32/36: double-buffered Direct Reconnection reservoirs (current / history)
+//   binding 37:    single-buffered X1 primary surface context (same-frame producer/consumer)
+//   binding 38/39: double-buffered Indirect Reconnection reservoirs (current / history)
 //
 // All resampling happens inline in the wavefront shade shaders; this class
-// deliberately contains no pipelines or dispatches (the former "fused ReSTIR
-// pass" pipeline was dead code — see docs/reports/restir_review_2026_10_10.md
-// §6). Buffers are allocated lazily on the first resize() and zero-filled
-// before first use so uninitialized memory can never alias a valid reservoir.
+// deliberately contains no pipelines or dispatches. Buffers are allocated
+// lazily on the first resize() and zero-filled before first use so
+// uninitialized memory can never alias a valid reservoir.
 class ReSTIRManager {
 public:
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
@@ -50,18 +47,9 @@ public:
     Buffer* getGiReservoirBuffer(uint32_t frameSlot) const {
         return (frameSlot < MAX_FRAMES_IN_FLIGHT) ? m_giReservoirBuffers[frameSlot].get() : nullptr;
     }
-    Buffer* getReservoirPTBuffer(uint32_t frameSlot) const {
-        return (frameSlot < MAX_FRAMES_IN_FLIGHT) ? m_reservoirPTBuffers[frameSlot].get() : nullptr;
-    }
-    Buffer* getPathSampleBuffer() const { return m_pathSampleBuffer.get(); }
     Buffer* getX1ContextBuffer() const { return m_x1Context.get(); }
-    Buffer* getShadeRequestBuffer() const { return m_shadeRequestBuffer.get(); }
-    Buffer* getShadeResultBuffer() const { return m_shadeResultBuffer.get(); }
 
     bool isInitialized() const { return m_width > 0 && m_height > 0; }
-
-    bool isPhase3Enabled() const { return m_enablePhase3; }
-    void setPhase3Enabled(bool enabled) { m_enablePhase3 = enabled; }
 
 private:
     void initBuffers();
@@ -70,22 +58,13 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
-    bool m_enablePhase3 = true;
     bool m_clearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
     bool m_giClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
-    bool m_ptClearPending[MAX_FRAMES_IN_FLIGHT] = { true, true };
-    bool m_pathClearPending = true;
     bool m_ctxClearPending = true;
-    bool m_reqClearPending = true;
-    bool m_resClearPending = true;
 
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_reservoirBuffers;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_giReservoirBuffers;
-    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_reservoirPTBuffers;
-    std::unique_ptr<Buffer> m_pathSampleBuffer;
     std::unique_ptr<Buffer> m_x1Context;
-    std::unique_ptr<Buffer> m_shadeRequestBuffer;
-    std::unique_ptr<Buffer> m_shadeResultBuffer;
 };
 
 } // namespace pathways

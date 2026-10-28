@@ -1,9 +1,9 @@
 # ReSTIR PT Design — Path-Space Reservoir Resampling & Decoupled Architecture
 
 **Status:**
-- **Phase 1 (Completed 2026-10-10):** Inline ReSTIR DI subsystem, shared `restir_common.glsl`, temporal + spatial-tap reuse for analytical lights (`docs/reports/restir_review_2026_10_10.md`).
-- **Phase 2a (Completed 2026-10-11):** Path-space secondary-vertex ReSTIR GI at bounce 1, X1 context buffer, continuous random 2D spatial rotation, target ratio and weight clamping (`commit d5e4fab`).
-- **Phase 2b (Partial — 2026-10-11):** Decoupled ReSTIR PT — winner replay visibility decoupled to shadow ray queue (`commit 5d35634`), eliminating inline `rayQuery` from replay evaluation (candidate generation retains synchronous inline rayQuery for shadowed $\hat{L}_2$ storage), 16-byte `Hit` atom and position fetch (`commit 165c804`), transient ShadeRequest/ShadeResult queues, and exact analytical reconnection Jacobians with hybrid shift map gating.
+- **Phase 1 (Completed 2026-10-10):** Inline ReSTIR PT Direct stage, shared `restir_common.glsl`, temporal + spatial-tap reuse for analytical lights (`docs/reports/restir_review_2026_10_10.md`).
+- **Phase 2a (Completed 2026-10-11):** Path-space secondary-vertex ReSTIR PT Indirect stage at bounce 1, `X1Context` buffer (`24 B/pixel`), continuous random 2D spatial rotation, target ratio and weight clamping (`commit d5e4fab`).
+- **Phase 2b (Completed 2026-10-28):** Unified 144 B/pixel ReSTIR PT architecture (`2 × 28 B` Direct reservoirs + `2 × 32 B` Indirect `Hit`-atom reservoirs + `24 B` `X1Context`, unified under `ubo.flags` bit 9). Winner replay visibility at bounce 1 is decoupled to the stream-compacted `PackedShadowRay` queue (`commit 5d35634`), bounce-0 spatial reuse relies on the single post-selection `LATE_WRS_MIS` inline visibility check rather than 4 per-tap inline ray queries, and unused scaffolding buffers (`ShadeRequest`/`ShadeResult`/`ReservoirPT`/`PathSample`, `272 B/pixel`) were removed to cut 4K ReSTIR VRAM footprint by 65% (`3.29 GB` → `1.14 GB`).
 - **Phase 3 (Long-Term Architectural Target):** Fully Inverted / Deferred Gather Path-Database Architecture (pure geometry/visibility resampling with end-of-frame deferred material closure evaluation).
 
 ---
