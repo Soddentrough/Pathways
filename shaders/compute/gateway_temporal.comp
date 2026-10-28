@@ -165,6 +165,31 @@ void main() {
         vec2 uv      = (vec2(p) + vec2(0.5)) / vec2(renderSize);
         vec2 mvSurf  = imageLoad(uMotionVectors, p).xy;
         vec4 specMot = imageLoad(uSpecularMotion, p);
+        // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV using LDS Normal/Depth
+        if (roughness < 0.16 && (roughness > 0.015 || specMot.w <= 1e-4) && specMot.w < GATEWAY_SKY_DEPTH) {
+            bool centerValid = (specMot.w > 1e-4);
+            vec4 smAccum = centerValid ? specMot : vec4(0.0);
+            float wSum = centerValid ? 1.0 : 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    vec4 ndQ = vec4(s_nd[cy + dy][cx + dx]);
+                    if (ndQ.w >= GATEWAY_SKY_DEPTH) continue;
+                    float w = evaluateRelativeDepthWeight(zCenter, ndQ.w, 0.05) * evaluateNormalWeight32(nCenter, ndQ.xyz);
+                    if (w > 1e-3) {
+                        ivec2 qp = clamp(p + ivec2(dx, dy), ivec2(0), renderSize - ivec2(1));
+                        vec4 qSm = imageLoad(uSpecularMotion, qp);
+                        if (qSm.w > 1e-4 && qSm.w < GATEWAY_SKY_DEPTH) {
+                            smAccum += qSm * w;
+                            wSum += w;
+                        }
+                    }
+                }
+            }
+            if (wSum > 1e-3) {
+                specMot = smAccum / wSum;
+            }
+        }
         vec2 mvPx    = mvSurf * vec2(renderSize);
         bool hasSurfMotion = (dot(mvPx, mvPx) > 0.0025);
         vec2 prevUV  = uv - mvSurf;
@@ -220,7 +245,7 @@ void main() {
             }
         }
 
-        bool hasReflHit = (specMot.z > 1e-4) && (specMot.w > 1e-4) && (specMot.w < GATEWAY_SKY_DEPTH) && (roughness < 0.06);
+        bool hasReflHit = (specMot.z > 1e-4) && (specMot.w > 1e-4) && (specMot.w < GATEWAY_SKY_DEPTH) && (roughness < 0.14);
         vec2 mvSpec     = hasReflHit ? specMot.xy : mvSurf;
         vec2 mvSpecPx   = mvSpec * vec2(renderSize);
         bool hasSpecMotion = (dot(mvSpecPx, mvSpecPx) > 0.0025) || hasSurfMotion;

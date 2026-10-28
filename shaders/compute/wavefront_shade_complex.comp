@@ -887,7 +887,15 @@ void main() {
                     // One-sample mixture over the shared BSDF (bsdf_standard.glsl):
                     // clearcoat (prob ccProb), else base spec (specProb), else cosine
                     // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
+#if !IS_SECONDARY_BOUNCE
+                    bool useBounce0Sobol = (pc.captureMlData != 0u || pc.secondarySortMode < 2u);
+                    uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
+                    float lobeSelect = useBounce0Sobol
+                        ? sampleSobolOwen1D(pixelIndex, pc.width, sobolSampleIdx, 0u)
+                        : randFloat(seed);
+#else
                     float lobeSelect = randFloat(seed);
+#endif
                     bool pickSpec = false;
                     bool isClearcoatSample = false;
                     bool isTrans = false;
@@ -898,7 +906,14 @@ void main() {
                         // V below the coat normal: the coat lobe has no valid
                         // samples (its pdf term is 0 there) -> discard.
                         if (dot(bsdf.Nc, V) > 0.0) {
+#if !IS_SECONDARY_BOUNCE
+                            vec2 uCc = useBounce0Sobol
+                                ? sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 1u)
+                                : randVec2(seed);
+                            vec3 H_cc = sampleGgxVndfHalfVectorVec2(bsdf.Nc, V, bsdf.ccAlpha, uCc);
+#else
                             vec3 H_cc = sampleGgxVndfHalfVector(bsdf.Nc, V, bsdf.ccAlpha, seed);
+#endif
                             nextDirection = reflect(-V, H_cc);
                         } else {
                             validSample = false;
@@ -907,16 +922,29 @@ void main() {
                         float u = (lobeSelect - bsdf.ccProb) / max(1.0 - bsdf.ccProb, 1e-6);
                         if (u < bsdf.specProb) {
                             pickSpec = true;
+#if !IS_SECONDARY_BOUNCE
+                            vec2 uSpec = useBounce0Sobol
+                                ? sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 1u)
+                                : randVec2(seed);
+                            vec3 H_spec = sampleGgxVndfHalfVectorVec2(hitNormal, V, bsdf.alpha, uSpec);
+#else
                             vec3 H_spec = sampleGgxVndfHalfVector(hitNormal, V, bsdf.alpha, seed);
+#endif
                             nextDirection = reflect(-V, H_spec);
                         } else {
                             uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
                             uint frameRot = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                             isTrans = (bsdf.diffTrans > 0.0 && randFloat(seed) < bsdf.diffTrans);
                             vec3 lobeN = isTrans ? -hitNormal : hitNormal;
+#if !IS_SECONDARY_BOUNCE
+                            nextDirection = useBounce0Sobol
+                                ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 2u))
+                                : sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot);
+#else
                             nextDirection = (pc.secondarySortMode >= 2u && pc.captureMlData == 0u)
                                 ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
                                 : sampleCosineHemisphere(lobeN, seed);
+#endif
                         }
                     }
                     // Reflection samples below the shading horizon are discarded

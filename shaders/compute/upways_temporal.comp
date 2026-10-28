@@ -155,13 +155,42 @@ void main() {
     vec3 wSpecLr      = vec3(0.0);
     float validSurfLr = 0.0;
 
+    vec4 rawSmCurr    = vec4(0.0);
     if (activeHist) {
-        vec4 rawSmLoad = imageLoad(uSpecularMotion, gp);
+        rawSmCurr = imageLoad(uSpecularMotion, gp);
+        // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV
+        if (roughness < 0.25 && ndCenter.w < 9999.0 &&
+            (roughness > 0.015 || rawSmCurr.w <= 1e-4) &&
+            (rawSmCurr.w < 999.0)) {
+            bool centerValid = (rawSmCurr.w > 1e-4);
+            vec4 smAccum = centerValid ? rawSmCurr : vec4(0.0);
+            float wSum = centerValid ? 1.0 : 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    ivec2 qp = clamp(gp + ivec2(dx, dy), ivec2(0), renderSize - ivec2(1));
+                    vec4 qSm = imageLoad(uSpecularMotion, qp);
+                    if (qSm.w > 1e-4 && qSm.w < 999.0) {
+                        vec4 qNd = imageLoad(uNormalDepth, qp);
+                        float relZ = abs(ndCenter.w - qNd.w) / max(max(ndCenter.w, qNd.w), 0.1);
+                        float nSim = max(dot(ndCenter.xyz, qNd.xyz), 0.0);
+                        float nSim2 = nSim * nSim;
+                        float nSim4 = nSim2 * nSim2;
+                        float w = exp(-relZ * 20.0) * (nSim4 * nSim4);
+                        smAccum += qSm * w;
+                        wSum += w;
+                    }
+                }
+            }
+            if (wSum > 1e-3) {
+                rawSmCurr = smAccum / wSum;
+            }
+        }
         float surfMvMag2 = dot(mvSurf, mvSurf);
-        hasSpecHit = (rawSmLoad.w > 1e-4 && rawSmLoad.w < 999.0 &&
-                      roughness < 0.25 && (roughness < 0.08 || surfMvMag2 > 1e-7));
+        hasSpecHit = (rawSmCurr.w > 1e-4 && rawSmCurr.w < 999.0 &&
+                      roughness < 0.25 && (roughness < 0.14 || surfMvMag2 > 1e-7));
         if (hasSpecHit) {
-            effSpecMv = rawSmLoad.xy;
+            effSpecMv = rawSmCurr.xy;
         }
 
         vec2 uv         = (vec2(gp) + vec2(0.5)) / vec2(renderSize);
@@ -213,7 +242,6 @@ void main() {
     float dzDisocc  = max(dzSigned, max(-dzSigned - dollyTol, 0.0));
     float relDz     = activeHist ? float(float16_t(clamp(dzDisocc / denomZ, 0.0, 2.0))) : 1.0;
     float nDot      = activeHist ? float(float16_t(clamp(dot(ndCenter.xyz, wPrevNd.xyz), -1.0, 1.0))) : 0.0;
-    vec4 rawSmCurr  = activeHist ? imageLoad(uSpecularMotion, gp) : vec4(0.0);
     float specHitT  = rawSmCurr.w;
     float denomRefl = max(max(specHitT, wPrevSm.w), 0.1);
     float skySlip   = (specHitT >= 999.0) ? (16.0 * length(rawSmCurr.xy - mvSurf)) : 0.0;

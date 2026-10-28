@@ -56,6 +56,24 @@ vec3 adjustShadingNormal(vec3 N, vec3 V) {
     return (backFacing > 0.0) ? normalize(N + backFacing * V) : N;
 }
 
+// 3x3 Orthogonal Householder Reflection Matrix (I - 2 * N * N^T) for Primary Surface Replacement (PSR)
+mat3 buildReflectionMatrix(vec3 n) {
+    return mat3(1.0) - 2.0 * outerProduct(n, n);
+}
+
+// 3x3 Orthogonal Rotation Matrix rotating unit vector 'from' to unit vector 'to' (Rodrigues / Möller-Hughes)
+// Used by RTXPT SplitDeltaPath (MatrixRotateFromTo) to accumulate refractive bending in the 3x3 PSR imageXform.
+mat3 buildRotationMatrixFromTo(vec3 from, vec3 to) {
+    vec3 v = cross(from, to);
+    float c = dot(from, to);
+    float k = 1.0 / max(1.0 + c, 1e-4);
+    return mat3(
+        v.x * v.x * k + c,     v.y * v.x * k + v.z,   v.z * v.x * k - v.y,
+        v.x * v.y * k - v.z,   v.y * v.y * k + c,     v.z * v.y * k + v.x,
+        v.x * v.z * k + v.y,   v.y * v.z * k - v.x,   v.z * v.z * k + c
+    );
+}
+
 // =============================================================================
 // 2-Slot Register-Resident Nested Dielectrics Priority Stack (RTXPT InteriorList)
 // Each slot packs: [31:16] fp16 IOR (positive IEEE-754 fp16 is monotonically ordered
@@ -955,9 +973,51 @@ uint morton2D_8bit(uvec2 v) {
     return x | (y << 1u);
 }
 
-// Cosine-weighted hemisphere sampling
-vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
-    vec2 r = randVec2(seed);
+// =============================================================================
+// Stateless Bounce-Adaptive Owen-Scrambled Sobol (Burley 2020 / Psychopath 2021)
+// Uses 2D Morton pixel indexing for screen-space blue-noise stratification on
+// Bounce 0 without lookup tables, falling back to PCG hash on secondary bounces.
+// =============================================================================
+uint owenHash(uint x, uint seed) {
+    x ^= x * 0x3d20adeau;
+    x += seed;
+    x *= (seed >> 16u) | 1u;
+    x ^= x * 0x05526c56u;
+    x ^= x * 0x53a22864u;
+    return x;
+}
+
+float sampleSobolOwen1D(uint pixelIndex, uint width, uint frameIndex, uint dimSalt) {
+    uvec2 px = uvec2(pixelIndex % width, pixelIndex / width);
+    uint sobolIdx = (morton2D_8bit(px) << 8u) | (frameIndex & 0xFFu);
+    uint tileSeed = ((px.x >> 8u) * 0x9E3779B9u) ^ ((px.y >> 8u) * 0x85EBCA6Bu) ^
+                    ((frameIndex >> 8u) * 0xC2B2AE35u) ^ (dimSalt * 0x27D4EB2Fu);
+    uint shuffledIdx = bitfieldReverse(owenHash(bitfieldReverse(sobolIdx), tileSeed ^ 0xA511E9B3u));
+    uint x = bitfieldReverse(owenHash(shuffledIdx, tileSeed ^ 0x63D83595u));
+    return float(x >> 8u) * (1.0 / 16777216.0);
+}
+
+vec2 sampleSobolOwen2D(uint pixelIndex, uint width, uint frameIndex, uint dimSalt) {
+    uvec2 px = uvec2(pixelIndex % width, pixelIndex / width);
+    uint sobolIdx = (morton2D_8bit(px) << 8u) | (frameIndex & 0xFFu);
+    uint tileSeed = ((px.x >> 8u) * 0x9E3779B9u) ^ ((px.y >> 8u) * 0x85EBCA6Bu) ^
+                    ((frameIndex >> 8u) * 0xC2B2AE35u) ^ (dimSalt * 0x27D4EB2Fu);
+    uint shuffledIdx = bitfieldReverse(owenHash(bitfieldReverse(sobolIdx), tileSeed ^ 0xA511E9B3u));
+    uint x = bitfieldReverse(owenHash(shuffledIdx, tileSeed ^ 0x63D83595u));
+
+    // Fast 5-step butterfly for Sobol dimension 1 (Sierpinski (0,2)-net generator matrix)
+    uint v = shuffledIdx;
+    v ^= (v & 0xAAAAAAAAu) >> 1u;
+    v ^= (v & 0xCCCCCCCCu) >> 2u;
+    v ^= (v & 0xF0F0F0F0u) >> 4u;
+    v ^= (v & 0xFF00FF00u) >> 8u;
+    v ^= (v & 0xFFFF0000u) >> 16u;
+    uint y = bitfieldReverse(owenHash(v, tileSeed ^ 0xB5297A4Du));
+    return vec2(float(x >> 8u) * (1.0 / 16777216.0), float(y >> 8u) * (1.0 / 16777216.0));
+}
+
+// Cosine-weighted hemisphere sampling from an explicit 2D sample r in [0,1)^2
+vec3 sampleCosineHemisphereVec2(vec3 normal, vec2 r) {
     float phi = TWO_PI * r.x;
     float cosTheta = sqrt(r.y);
     float sinTheta = sqrt(max(0.0, 1.0 - r.y));
@@ -969,6 +1029,11 @@ vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
     return normalize(tangent * (cos(phi) * sinTheta) +
                      bitangent * (sin(phi) * sinTheta) +
                      normal * cosTheta);
+}
+
+// Cosine-weighted hemisphere sampling
+vec3 sampleCosineHemisphere(vec3 normal, inout uint seed) {
+    return sampleCosineHemisphereVec2(normal, randVec2(seed));
 }
 
 // Direct Coherent Cosine-Weighted Hemisphere Sampling (Xiang et al. 2023)
@@ -1137,8 +1202,7 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
 }
 
 // Visible Normal Distribution Function (VNDF) Sampling (Dupuy & Heitz 2023)
-vec3 sampleVNDF_GGX(vec3 V_local, float alpha_x, float alpha_y, inout uint seed) {
-    vec2 u = randVec2(seed);
+vec3 sampleVNDF_GGX_Vec2(vec3 V_local, float alpha_x, float alpha_y, vec2 u) {
     vec3 Vh = normalize(vec3(alpha_x * V_local.x, alpha_y * V_local.y, V_local.z));
     float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
     vec3 T1 = lensq > 1e-7 ? vec3(-Vh.y, Vh.x, 0.0) / sqrt(lensq) : vec3(1.0, 0.0, 0.0);
@@ -1151,6 +1215,10 @@ vec3 sampleVNDF_GGX(vec3 V_local, float alpha_x, float alpha_y, inout uint seed)
     t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
     vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
     return normalize(vec3(alpha_x * Nh.x, alpha_y * Nh.y, max(0.0, Nh.z)));
+}
+
+vec3 sampleVNDF_GGX(vec3 V_local, float alpha_x, float alpha_y, inout uint seed) {
+    return sampleVNDF_GGX_Vec2(V_local, alpha_x, alpha_y, randVec2(seed));
 }
 
 // Height-correlated Smith G2 / G1 ratio for exact VNDF Monte Carlo estimator weighting

@@ -469,7 +469,40 @@ void main() {
     vec4 curDiffTex = imageLoad(uCurrentDiffuse, coord);
     vec4 curSpecTex = imageLoad(uCurrentSpecular, coord);
     vec4 specMotionTex = imageLoad(uSpecularMotion, coord);
+    float curRoughness = imageLoad(uAlbedoRoughness, coord).a;
     bool isEmissive = curDiffTex.a > 0.5;
+    // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV using LDS Normal/Depth
+    if (pc.resetHistory == 0u && curRoughness < 0.25 && curZ < 9999.0 &&
+        (curRoughness > 0.015 || specMotionTex.a <= 1e-4) && specMotionTex.a < 999.0) {
+        bool centerValid = (specMotionTex.a > 1e-4);
+        vec4 smAccum = centerValid ? specMotionTex : vec4(0.0);
+        float wSum = centerValid ? 1.0 : 0.0;
+        ivec2 maxCoord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                float qZ = s_linearDepth[ldsCoord.y + dy][ldsCoord.x + dx];
+                if (qZ >= 9999.0) continue;
+                vec3 qN = sampleNormalLDS(ldsCoord + ivec2(dx, dy));
+                float relZ = abs(curZ - qZ) / max(max(curZ, qZ), 0.1);
+                float nSim = max(dot(curN, qN), 0.0);
+                float nSim2 = nSim * nSim;
+                float nSim4 = nSim2 * nSim2;
+                float w = exp(-relZ * 20.0) * (nSim4 * nSim4);
+                if (w > 1e-3) {
+                    ivec2 qp = clamp(coord + ivec2(dx, dy), ivec2(0), maxCoord);
+                    vec4 qSm = imageLoad(uSpecularMotion, qp);
+                    if (qSm.a > 1e-4 && qSm.a < 999.0) {
+                        smAccum += qSm * w;
+                        wSum += w;
+                    }
+                }
+            }
+        }
+        if (wSum > 1e-3) {
+            specMotionTex = smAccum / wSum;
+        }
+    }
     float dRefl = specMotionTex.a;
 
     // ---------------- Primary reprojection ----------------
@@ -586,7 +619,6 @@ void main() {
     // Specular highlights off small emitters are additionally protected by the
     // bilateral geometric quorum inside suppressFirefliesLDS, and deterministic
     // mirrors/metals/glass (curRoughness < 0.08) bypass firefly clamping.
-    float curRoughness = imageLoad(uAlbedoRoughness, coord).a;
     float mirrorBypass = 1.0 - smoothstep(0.02, 0.08, curRoughness);
     vec3 currSpec = mix(suppressFirefliesLDS(ldsCoord, curSpecTex.rgb, false, isEmissive),
                         curSpecTex.rgb, mirrorBypass);

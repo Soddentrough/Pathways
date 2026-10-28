@@ -209,13 +209,17 @@ vec3 stdBsdfEval(StdBsdf b, vec3 N, vec3 V, vec3 L, out float pdf) {
 }
 
 // GGX VNDF half-vector sample around N (isotropic), world space.
-vec3 sampleGgxVndfHalfVector(vec3 N, vec3 V, float alpha, inout uint seed) {
+vec3 sampleGgxVndfHalfVectorVec2(vec3 N, vec3 V, float alpha, vec2 u2) {
     vec3 b1, b2;
     buildOrthonormalBasis(N, b1, b2);
     vec3 Vl = vec3(dot(V, b1), dot(V, b2), max(dot(V, N), 1e-4));
     Vl = normalize(Vl);
-    vec3 Hl = sampleVNDF_GGX(Vl, alpha, alpha, seed);
+    vec3 Hl = sampleVNDF_GGX_Vec2(Vl, alpha, alpha, u2);
     return normalize(b1 * Hl.x + b2 * Hl.y + N * Hl.z);
+}
+
+vec3 sampleGgxVndfHalfVector(vec3 N, vec3 V, float alpha, inout uint seed) {
+    return sampleGgxVndfHalfVectorVec2(N, V, alpha, randVec2(seed));
 }
 
 #endif // BSDF_STANDARD_GLSL

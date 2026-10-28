@@ -33,6 +33,9 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 23, rgba16f) uniform image2D uMotionVectorImage;
+layout(binding = 24, rgba16f) uniform image2D uNormalDepthImage;
+layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
@@ -351,6 +354,12 @@ void main() {
                             uvec2 interiorStack = (frontFace && !reflected0)
                                 ? uvec2(packInteriorSlot(matId, iorVal), 0u)
                                 : uvec2(0u);
+                            bool enablePsrGuides = (bounce == 0u) &&
+                                (pc.captureMlData != 0u || (ubo.flags & ((1u << 9) | (1u << 24))) != 0u);
+                            float psrPathLength = hitT;
+                            mat3 psrXform = enablePsrGuides
+                                ? (reflected0 ? buildReflectionMatrix(hitNormal) : buildRotationMatrixFromTo(nextDirection, rayDir))
+                                : mat3(1.0);
 
                             while (survivesToNext && deltaEvents < maxDelta) {
                                 float closestT = 10000.0;
@@ -360,6 +369,7 @@ void main() {
                                 mat4x3 hitW2o = mat4x3(1.0);
                                 mat4x3 hitO2w = mat4x3(1.0);
                                 uint hitInstMatOffset = 0u;
+                                uint hitInstIdx = 0u;
 
                                 rayQueryEXT rq;
                                 rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, currOrigin, EPSILON, currDirection, closestT);
@@ -376,6 +386,7 @@ void main() {
                                     hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
                                     hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
                                     hitInstMatOffset = inst.materialOffset;
+                                    hitInstIdx = instIdx;
                                 }
 
                                 if (pc.numSpheres > 0u) {
@@ -389,6 +400,8 @@ void main() {
                                         }
                                     }
                                 }
+
+                                psrPathLength += closestT;
 
                                 // Miss: ray escaped out of glass into sky / environment
                                 if (closestTri < 0 && closestSphere < 0) {
@@ -408,6 +421,20 @@ void main() {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                         imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
                                         accumFfxSignal(pixelCoord, skyContrib, true, false, seed);
+                                    }
+                                    if (enablePsrGuides) {
+                                        vec3 skyVirtPos = ubo.position.xyz + rayDir * 1000.0;
+                                        vec4 cClip = ubo.unjitteredViewProj * vec4(skyVirtPos, 1.0);
+                                        vec4 pClip = ubo.prevViewProj * vec4(skyVirtPos, 1.0);
+                                        vec2 vSky = (cClip.w > 1e-4 && pClip.w > 1e-2)
+                                            ? clamp((cClip.xy / cClip.w - pClip.xy / pClip.w) * 0.5, vec2(-2.0), vec2(2.0))
+                                            : vec2(0.0);
+                                        imageStore(uNormalDepthImage, pixelCoord, vec4(0.0, 0.0, 1.0, 10000.0));
+                                        imageStore(uMotionVectorImage, pixelCoord, vec4(vSky, 0.0, 0.0));
+                                        if (pc.captureMlData != 0u) {
+                                            imageStore(uMlAlbedoRoughnessImage, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
+                                            imageStore(uMlSpecularMotionImage, pixelCoord, vec4(vSky, 0.0, 10000.0));
+                                        }
                                     }
                                     survivesToNext = false;
                                     break;
@@ -430,21 +457,62 @@ void main() {
                                 }
 
                                 uint dArchetype = (dMatId < pc.numMaterials) ? materialArchetypes[dMatId] : MATERIAL_ARCHETYPE_DIFFUSE;
-                                if (dArchetype != MATERIAL_ARCHETYPE_DIELECTRIC) {
-                                    nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
-                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
-                                    nextDirection = currDirection;
-                                    survivesToNext = true;
-                                    break;
+                                bool isNonSmoothDielectric = (dArchetype != MATERIAL_ARCHETYPE_DIELECTRIC);
+                                Material dMat;
+                                bool isWaterD = false;
+                                if (!isNonSmoothDielectric) {
+                                    dMat = materials[dMatId];
+                                    isWaterD = ((dMat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (dMat.normalTex == 0xFFFFFF03u);
+                                    isNonSmoothDielectric = (dMat.roughness > 0.05 ||
+                                        dMat.albedoTex > 0u || dMat.normalTex > 0u || dMat.emissiveTex > 0u ||
+                                        length(dMat.emissive.rgb) > 1e-3 || dMat.iridescence > 0.001 || isWaterD);
                                 }
 
-                                Material dMat = materials[dMatId];
-                                bool isWaterD = ((dMat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (dMat.normalTex == 0xFFFFFF03u);
-
                                 // If non-dielectric, rough, textured, or emissive, emit ray for specialized downstream microkernels
-                                if (dMat.roughness > 0.05 || 
-                                    dMat.albedoTex > 0u || dMat.normalTex > 0u || dMat.emissiveTex > 0u ||
-                                    length(dMat.emissive.rgb) > 1e-3 || dMat.iridescence > 0.001 || isWaterD) {
+                                // and perform Primary Surface Replacement (PSR) of G-buffer guides via the 3x3 imageXform.
+                                if (isNonSmoothDielectric) {
+                                    if (enablePsrGuides) {
+                                        ivec2 psrCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                        vec3 virtWorldPos = ubo.position.xyz + rayDir * psrPathLength;
+                                        vec3 worldMotion = vec3(0.0);
+                                        if (closestTri >= 0) {
+                                            vec3 dHitPt = currOrigin + closestT * currDirection;
+                                            vec3 localHitPos = hitW2o * vec4(dHitPt, 1.0);
+                                            vec3 prevWorldPos = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
+                                            worldMotion = prevWorldPos - dHitPt;
+                                        }
+                                        vec3 prevVirtWorldPos = virtWorldPos + psrXform * worldMotion;
+                                        vec4 cClip = ubo.unjitteredViewProj * vec4(virtWorldPos, 1.0);
+                                        vec4 pClip = ubo.prevViewProj * vec4(prevVirtWorldPos, 1.0);
+                                        vec2 vPsr = vec2(0.0);
+                                        float vDepthDelta = 0.0;
+                                        if (cClip.w > 1e-4) {
+                                            if (pClip.w > 1e-2) {
+                                                vPsr = clamp((cClip.xy / cClip.w - pClip.xy / pClip.w) * 0.5, vec2(-2.0), vec2(2.0));
+                                                vDepthDelta = pClip.w - cClip.w;
+                                            } else {
+                                                vPsr = vec2(2.0);
+                                            }
+                                        }
+                                        vec3 camForward = -ubo.viewInverse[2].xyz;
+                                        float virtDepth = max(dot(virtWorldPos - ubo.position.xyz, camForward), 0.0);
+                                        vec3 faceN = (dot(currDirection, dHitNormal) < 0.0) ? dHitNormal : -dHitNormal;
+                                        vec3 virtWorldN = normalize(psrXform * faceN);
+                                        vec3 virtViewN = normalize(transpose(mat3(ubo.viewInverse)) * virtWorldN);
+                                        imageStore(uNormalDepthImage, psrCoord, vec4(virtViewN, virtDepth));
+                                        imageStore(uMotionVectorImage, psrCoord, vec4(vPsr, vDepthDelta, 0.0));
+                                        if (pc.captureMlData != 0u && dMatId < pc.numMaterials) {
+                                            Material repMat = (dArchetype == MATERIAL_ARCHETYPE_DIELECTRIC) ? dMat : materials[dMatId];
+                                            vec3 repAlbedo = repMat.albedo.rgb;
+                                            if (repMat.albedoTex > 0u && repMat.albedoTex <= 512u) {
+                                                repAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(repMat.albedoTex, dHitUv, 0.0).rgb;
+                                            }
+                                            repAlbedo = clamp(throughput * repAlbedo, vec3(0.05), vec3(1.0));
+                                            float repRough = clamp(repMat.roughness, 0.085, 1.0);
+                                            imageStore(uMlAlbedoRoughnessImage, psrCoord, vec4(repAlbedo, repRough));
+                                            imageStore(uMlSpecularMotionImage, psrCoord, vec4(vPsr, 1.0 / (1.0 + virtDepth), psrPathLength));
+                                        }
+                                    }
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
                                     nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
                                     nextDirection = currDirection;
@@ -516,6 +584,9 @@ void main() {
 
                                 float rFlipD = randFloat(seed);
                                 if (dCannotRefract || rFlipD < dReflectProb) {
+                                    if (enablePsrGuides) {
+                                        psrXform = psrXform * buildReflectionMatrix(dHitNormal);
+                                    }
                                     currDirection = reflect(currDirection, dHitNormal);
                                     currOrigin = offsetRayOrigin(dHitPoint, dHitNormal);
                                 } else {
@@ -533,7 +604,11 @@ void main() {
                                             else extIor = dIorVal;
                                             dEta = extIor / max(intIor, 1e-4);
                                         }
-                                        currDirection = normalize(refract(currDirection, dHitNormal, dEta));
+                                        vec3 nextD = normalize(refract(currDirection, dHitNormal, dEta));
+                                        if (enablePsrGuides) {
+                                            psrXform = psrXform * buildRotationMatrixFromTo(nextD, currDirection);
+                                        }
+                                        currDirection = nextD;
                                         currOrigin = offsetRayOrigin(dHitPoint, -dHitNormal);
                                         commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                     }

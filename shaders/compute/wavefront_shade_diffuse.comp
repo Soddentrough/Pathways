@@ -1199,21 +1199,43 @@ void main() {
                     } else {
                         // One-sample mixture over the shared BSDF (bsdf_standard.glsl):
                         // weight = f·|cos| / pdf_mixture, pdf_mixture feeds MIS.
+#if !IS_SECONDARY_BOUNCE
+                        bool useBounce0Sobol = (pc.captureMlData != 0u || pc.secondarySortMode < 2u);
+                        uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
+                        float rLobe = useBounce0Sobol
+                            ? sampleSobolOwen1D(pixelIndex, pc.width, sobolSampleIdx, 0u)
+                            : randFloat(seed);
+#else
+                        float rLobe = randFloat(seed);
+#endif
                         bool pickSpec = (bsdf.specProb >= 1.0) ||
-                                        (bsdf.specProb > 0.0 && randFloat(seed) < bsdf.specProb);
+                                        (bsdf.specProb > 0.0 && rLobe < bsdf.specProb);
                         bool isTrans = false;
                         if (pickSpec) {
                             sampledSpecularLobe = true;
+#if !IS_SECONDARY_BOUNCE
+                            vec2 uVndf = useBounce0Sobol
+                                ? sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 1u)
+                                : randVec2(seed);
+                            vec3 H = sampleGgxVndfHalfVectorVec2(hitNormal, V, bsdf.alpha, uVndf);
+#else
                             vec3 H = sampleGgxVndfHalfVector(hitNormal, V, bsdf.alpha, seed);
+#endif
                             nextDirection = reflect(-V, H);
                         } else {
                             uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
                             uint frameRot = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                             isTrans = (diffTrans > 0.001 && randFloat(seed) < diffTrans);
                             vec3 lobeN = isTrans ? -hitNormal : hitNormal;
+#if !IS_SECONDARY_BOUNCE
+                            nextDirection = useBounce0Sobol
+                                ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 2u))
+                                : sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot);
+#else
                             nextDirection = (pc.secondarySortMode >= 2u && pc.captureMlData == 0u)
                                 ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
                                 : sampleCosineHemisphere(lobeN, seed);
+#endif
                             if (isTrans) {
                                 nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
                             }
