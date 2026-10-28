@@ -97,7 +97,24 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
     if (tri.v0.tangent.w >= 0.0f) signs |= (1u << 0);
     if (tri.v1.tangent.w >= 0.0f) signs |= (1u << 1);
     if (tri.v2.tangent.w >= 0.0f) signs |= (1u << 2);
-    s.tanSigns   = signs;
+    // Precompute Ray Cone triangle LOD constant C_Delta = 0.5 * log2(Area_UV / Area_Obj) (RTXPT RayCones.hlsli)
+    // Packed into upper 16 bits of tanSigns (dword 9, same 16B vector load as uv2 and materialId)
+    // so wavefront_classify / wavefront_intersect never touch the 4th 16B uvec4 (reserved).
+    glm::vec3 p0(tri.v0.position);
+    glm::vec3 p1(tri.v1.position);
+    glm::vec3 p2(tri.v2.position);
+    glm::vec2 t0(tri.v0.position.w, tri.v0.normal.w);
+    glm::vec2 t1(tri.v1.position.w, tri.v1.normal.w);
+    glm::vec2 t2(tri.v2.position.w, tri.v2.normal.w);
+    float areaObj2 = glm::length(glm::cross(p1 - p0, p2 - p0));
+    glm::vec2 duv1 = t1 - t0;
+    glm::vec2 duv2 = t2 - t0;
+    float areaUv2  = std::abs(duv1.x * duv2.y - duv1.y * duv2.x);
+    float lodConstant = (areaObj2 > 1e-10f && areaUv2 > 1e-10f)
+        ? std::clamp(0.5f * std::log2(areaUv2 / areaObj2), -16.0f, 16.0f)
+        : 0.0f;
+    uint32_t lodHalf = glm::packHalf2x16(glm::vec2(lodConstant, 0.0f)) & 0xFFFFu;
+    s.tanSigns   = signs | (lodHalf << 16u);
 
     s.materialId = tri.materialId;
     s.padding0   = tri.padding[0];

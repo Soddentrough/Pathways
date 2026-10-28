@@ -11,7 +11,7 @@ class Image {
 public:
     Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t height,
           VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT,
-          const std::vector<uint32_t>& queueFamilyIndices = {});
+          const std::vector<uint32_t>& queueFamilyIndices = {}, uint32_t mipLevels = 1);
     ~Image();
 
     Image(const Image&) = delete;
@@ -25,7 +25,9 @@ public:
     VkFormat getFormat() const { return m_format; }
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
+    uint32_t getMipLevels() const { return m_mipLevels; }
     VkImageLayout getLayout() const { return m_layout; }
+    void setLayout(VkImageLayout layout) { m_layout = layout; }
 
     void transitionLayout(VkCommandBuffer cmd, VkImageLayout newLayout,
                           VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
@@ -42,6 +44,7 @@ private:
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    uint32_t m_mipLevels = 1;
     VkFormat m_format = VK_FORMAT_UNDEFINED;
     VkImageLayout m_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags m_aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT;

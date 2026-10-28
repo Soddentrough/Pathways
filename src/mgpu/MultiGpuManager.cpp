@@ -1502,11 +1502,12 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     for (const auto& texData : scene.textures) {
         if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
             VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            bool genMips = (texData.width >= 64 && texData.height >= 64);
             auto tex = Texture::createFromPixels(
                 secDevice, secAlloc, secQueue, secPool,
                 texData.width, texData.height,
                 fmt, texData.pixels.data(),
-                texData.pixels.size(), false
+                texData.pixels.size(), false, genMips
             );
             secNode->sceneTextures.push_back(std::move(tex));
         } else {
@@ -2771,11 +2772,12 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     for (const auto& texData : scene.textures) {
         if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
             VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            bool genMips = (texData.width >= 64 && texData.height >= 64);
             auto tex = Texture::createFromPixels(
                 secDevice, secAlloc, secQueue, secPool,
                 texData.width, texData.height,
                 fmt, texData.pixels.data(),
-                texData.pixels.size(), false
+                texData.pixels.size(), false, genMips
             );
             secNode->sceneTextures.push_back(std::move(tex));
         } else {

@@ -39,7 +39,7 @@ public:
     static std::unique_ptr<Texture> createFromPixels(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
         uint32_t width, uint32_t height, VkFormat format, const void* pixels, size_t dataSize,
-        bool isHdr = false
+        bool isHdr = false, bool generateMips = false
     );
 
     static std::unique_ptr<Texture> createDummyWhite(

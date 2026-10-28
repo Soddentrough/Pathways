@@ -43,7 +43,7 @@ AccelerationStructure& AccelerationStructure::operator=(AccelerationStructure&& 
     return *this;
 }
 
-void AccelerationStructure::setHandle(VkAccelerationStructureKHR handle, VkDeviceAddress addr, std::unique_ptr<Buffer> buffer) {
+void AccelerationStructure::setHandle(VkAccelerationStructureKHR handle, VkDeviceAddress addr, std::shared_ptr<Buffer> buffer) {
     release();
     m_handle = handle;
     m_deviceAddress = addr;
@@ -194,22 +194,35 @@ std::vector<std::unique_ptr<AccelerationStructure>> AccelerationStructureManager
     VkDeviceAddress rawScratch = scratchBuffer.getDeviceAddress(m_device);
     VkDeviceAddress alignedScratchBase = (rawScratch + (scratchAlignment - 1)) & ~(scratchAlignment - 1);
 
-    // Allocate initial uncompacted BLAS buffers and handles
-    std::vector<std::unique_ptr<Buffer>> initialBlasBuffers(numBlases);
+    // Suballocate all initial uncompacted BLASes from a single 256-byte aligned Buffer pool
+    // (RTXPT BlasPool concept: eliminates thousands of individual VkBuffer allocations)
+    constexpr VkDeviceSize blasAlignment = 256;
+    std::vector<VkDeviceSize> initialOffsets(numBlases, 0);
+    VkDeviceSize totalInitialSize = 0;
+    for (uint32_t i = 0; i < numBlases; ++i) {
+        initialOffsets[i] = totalInitialSize;
+        VkDeviceSize alignedSize = (sizeInfos[i].accelerationStructureSize + (blasAlignment - 1)) & ~(blasAlignment - 1);
+        totalInitialSize += alignedSize;
+    }
+    if (totalInitialSize == 0) {
+        totalInitialSize = blasAlignment;
+    }
+
+    auto initialPoolBuffer = std::make_shared<Buffer>(
+        m_allocator, totalInitialSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, blasAlignment
+    );
+
     std::vector<VkAccelerationStructureKHR> initialBlasHandles(numBlases);
 
     for (uint32_t i = 0; i < numBlases; ++i) {
         buildInfos[i].scratchData.deviceAddress = alignedScratchBase + scratchOffsets[i];
 
-        initialBlasBuffers[i] = std::make_unique<Buffer>(
-            m_allocator, sizeInfos[i].accelerationStructureSize,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, 256
-        );
-
         VkAccelerationStructureCreateInfoKHR createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-        createInfo.buffer = initialBlasBuffers[i]->getBuffer();
+        createInfo.buffer = initialPoolBuffer->getBuffer();
+        createInfo.offset = initialOffsets[i];
         createInfo.size = sizeInfos[i].accelerationStructureSize;
         createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 
@@ -296,39 +309,55 @@ std::vector<std::unique_ptr<AccelerationStructure>> AccelerationStructureManager
         }
     }
 
-    // Allocate tightly-fitted compact buffers and handles
-    std::vector<std::unique_ptr<Buffer>> finalBlasBuffers(numBlases);
+    // Suballocate tightly-fitted compacted BLASes from a single shared 256-byte aligned Buffer slab
+    std::vector<std::shared_ptr<Buffer>> finalBlasBuffers(numBlases);
     std::vector<VkAccelerationStructureKHR> finalBlasHandles(numBlases);
     std::vector<bool> isCompacted(numBlases, false);
-    uint32_t numCompacted = 0;
+    std::vector<VkDeviceSize> compactOffsets(numBlases, 0);
+    VkDeviceSize totalCompactSize = 0;
+    uint32_t numEligibleCompact = 0;
 
     for (uint32_t i = 0; i < numBlases; ++i) {
         if (compactedSizes[i] > 0 && compactedSizes[i] < sizeInfos[i].accelerationStructureSize) {
-            auto compactBuffer = std::make_unique<Buffer>(
-                m_allocator, compactedSizes[i],
-                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, 256
-            );
+            compactOffsets[i] = totalCompactSize;
+            VkDeviceSize alignedCompact = (compactedSizes[i] + (blasAlignment - 1)) & ~(blasAlignment - 1);
+            totalCompactSize += alignedCompact;
+            numEligibleCompact++;
+        }
+    }
 
+    std::shared_ptr<Buffer> compactPoolBuffer = nullptr;
+    if (numEligibleCompact > 0 && totalCompactSize > 0) {
+        compactPoolBuffer = std::make_shared<Buffer>(
+            m_allocator, totalCompactSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, blasAlignment
+        );
+    }
+
+    uint32_t numCompacted = 0;
+    for (uint32_t i = 0; i < numBlases; ++i) {
+        if (compactPoolBuffer && compactedSizes[i] > 0 && compactedSizes[i] < sizeInfos[i].accelerationStructureSize) {
             VkAccelerationStructureCreateInfoKHR compactCreateInfo{};
             compactCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-            compactCreateInfo.buffer = compactBuffer->getBuffer();
+            compactCreateInfo.buffer = compactPoolBuffer->getBuffer();
+            compactCreateInfo.offset = compactOffsets[i];
             compactCreateInfo.size = compactedSizes[i];
             compactCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 
             VkAccelerationStructureKHR compactHandle = VK_NULL_HANDLE;
             VkResult resCompact = pfn_vkCreateAccelerationStructureKHR(m_device, &compactCreateInfo, nullptr, &compactHandle);
             if (resCompact == VK_SUCCESS) {
-                finalBlasBuffers[i] = std::move(compactBuffer);
+                finalBlasBuffers[i] = compactPoolBuffer;
                 finalBlasHandles[i] = compactHandle;
                 isCompacted[i] = true;
                 numCompacted++;
             } else {
-                finalBlasBuffers[i] = std::move(initialBlasBuffers[i]);
+                finalBlasBuffers[i] = initialPoolBuffer;
                 finalBlasHandles[i] = initialBlasHandles[i];
             }
         } else {
-            finalBlasBuffers[i] = std::move(initialBlasBuffers[i]);
+            finalBlasBuffers[i] = initialPoolBuffer;
             finalBlasHandles[i] = initialBlasHandles[i];
         }
     }

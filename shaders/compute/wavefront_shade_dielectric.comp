@@ -163,7 +163,8 @@ void main() {
             }
             vec3 skyContrib = throughput * skyColor;
             if (bounce > 0u) {
-                skyContrib = clampIndirectRadiance(skyContrib, pc.indirectClamp);
+                float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, unpackRayPdfCode(state));
+                skyContrib = clampIndirectRadiance(skyContrib, effClamp);
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -206,7 +207,7 @@ void main() {
                 }
                 vec3 geomBitangent = cross(hitNormal, geomTan) * tanSign;
                 mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
-                hitNormal = normalize(tbn * normalMap);
+                hitNormal = adjustShadingNormal(normalize(tbn * normalMap), -rayDir);
             }
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
@@ -222,7 +223,8 @@ void main() {
             if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                 vec3 emissiveContrib = throughput * emissive * emitMisW;
                 if (bounce > 0u) {
-                    emissiveContrib = clampIndirectRadiance(emissiveContrib, pc.indirectClamp);
+                    float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, unpackRayPdfCode(state));
+                    emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
                 }
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -284,15 +286,16 @@ void main() {
                     ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
                     : randFloat(seed);
 
-                if (cannotRefract || rFlip < reflectProb) {
+                bool reflected0 = (cannotRefract || rFlip < reflectProb);
+                if (reflected0) {
                     // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(rayDir, hitNormal);
-                    nextOrigin = hitPoint + hitNormal * EPSILON;
+                    nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
                 } else {
                     if (isThinWalled) {
                         // Thin-walled transmission: direct ray passthrough without refraction deviation
                         nextDirection = rayDir;
-                        nextOrigin = hitPoint + rayDir * (EPSILON * 2.0);
+                        nextOrigin = offsetRayOrigin(hitPoint, rayDir * 2.0);
                     } else {
                         // Snell's law refraction: entering dispersive medium for the first time
                         if (mat.dispersion > 0.001 && dispersionChannel == 0u) {
@@ -305,7 +308,7 @@ void main() {
                             eta = frontFace ? (1.0 / iorVal) : iorVal;
                         }
                         nextDirection = normalize(refract(rayDir, hitNormal, eta));
-                        nextOrigin = hitPoint - hitNormal * EPSILON;
+                        nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
                     }
                     throughput *= baseColor.rgb;
                 }
@@ -345,6 +348,9 @@ void main() {
                             vec3 currOrigin = nextOrigin;
                             vec3 currDirection = nextDirection;
                             uint deltaEvents = 1u;
+                            uvec2 interiorStack = (frontFace && !reflected0)
+                                ? uvec2(packInteriorSlot(matId, iorVal), 0u)
+                                : uvec2(0u);
 
                             while (survivesToNext && deltaEvents < maxDelta) {
                                 float closestT = 10000.0;
@@ -447,19 +453,51 @@ void main() {
                                 }
 
                                 // Pure Smooth Dielectric: evaluate interface in fast registers
-                                deltaEvents++;
                                 vec3 dHitPoint = currOrigin + closestT * currDirection;
                                 bool dFrontFace = dot(currDirection, dHitNormal) < 0.0;
                                 dHitNormal = dFrontFace ? dHitNormal : -dHitNormal;
+                                bool isThinWalledD = (dMat.thickness <= 0.001);
 
-                                float dIor = dMat.ior > 0.0 ? dMat.ior : 1.5;
-                                if (dMat.dispersion > 0.001 && dispersionChannel != 0u) {
-                                    uint channel = dispersionChannel - 1u;
-                                    float dispDelta = (float(channel) - 1.0) * (dMat.dispersion * 0.03 * dIor);
-                                    dIor += dispDelta;
+                                // Volumetric Beer-Lambert absorption for interior traversal segment [currOrigin -> dHitPoint]
+                                if (!isThinWalledD && !dFrontFace) {
+                                    vec4 atten = dMat.attenuationColor;
+                                    if (atten.w > 0.0 && closestT > 0.0) {
+                                        vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
+                                        throughput *= exp(-sigma_a * closestT);
+                                    }
                                 }
 
-                                float dEta = dFrontFace ? (1.0 / dIor) : dIor;
+                                deltaEvents++;
+                                float dIorVal = dMat.ior > 0.0 ? dMat.ior : 1.5;
+                                if (dMat.dispersion > 0.001 && dispersionChannel != 0u) {
+                                    dIorVal += (float(dispersionChannel - 1u) - 1.0) * (dMat.dispersion * 0.03 * dIorVal);
+                                }
+
+                                // Nested Dielectrics Priority Resolution (RTXPT InteriorList)
+                                float extIor = dFrontFace ? 1.0 : dIorVal;
+                                float intIor = dFrontFace ? dIorVal : 1.0;
+                                bool isTrueInterface = true;
+                                if (!isThinWalledD) {
+                                    isTrueInterface = handleNestedDielectricIntersection(
+                                        interiorStack, dMatId, dIorVal, dFrontFace, extIor, intIor
+                                    );
+                                }
+
+                                if (!isTrueInterface) {
+                                    // False internal interface overlapped by a higher-priority enclosing dielectric:
+                                    // update the priority stack and pass straight through without scattering.
+                                    commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
+                                    currOrigin = offsetRayOrigin(dHitPoint, currDirection);
+                                    nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                    nextDirection = currDirection;
+                                    survivesToNext = true;
+                                    continue;
+                                }
+
+                                float dEta = isThinWalledD
+                                    ? (dFrontFace ? (1.0 / max(dIorVal, 1e-4)) : dIorVal)
+                                    : (extIor / max(intIor, 1e-4));
                                 vec3 dV = -currDirection;
                                 float dCosTheta = min(dot(dV, dHitNormal), 1.0);
                                 float dSinTheta = sqrt(max(0.0, 1.0 - dCosTheta * dCosTheta));
@@ -467,7 +505,6 @@ void main() {
                                 bool dCannotRefract = dEta * dSinTheta > 1.0;
                                 float dReflectProb = fresnelDielectric(dCosTheta, dEta);
 
-                                bool isThinWalledD = (dMat.thickness <= 0.001);
                                 if (isThinWalledD) {
                                     if (!dFrontFace) {
                                         dReflectProb = 0.0;
@@ -480,34 +517,27 @@ void main() {
                                 float rFlipD = randFloat(seed);
                                 if (dCannotRefract || rFlipD < dReflectProb) {
                                     currDirection = reflect(currDirection, dHitNormal);
-                                    currOrigin = dHitPoint + dHitNormal * EPSILON;
+                                    currOrigin = offsetRayOrigin(dHitPoint, dHitNormal);
                                 } else {
                                     if (isThinWalledD) {
-                                        currOrigin = dHitPoint + currDirection * (EPSILON * 2.0);
+                                        currOrigin = offsetRayOrigin(dHitPoint, currDirection * 2.0);
                                     } else {
                                         if (dMat.dispersion > 0.001 && dispersionChannel == 0u) {
                                             uint channel = min(uint(randFloat(seed) * 3.0), 2u);
                                             dispersionChannel = channel + 1u;
                                             vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
                                             throughput *= mask;
-                                            float dispDelta = (float(channel) - 1.0) * (dMat.dispersion * 0.03 * dIor);
-                                            dIor += dispDelta;
-                                            dEta = dFrontFace ? (1.0 / dIor) : dIor;
+                                            float dispDelta = (float(channel) - 1.0) * (dMat.dispersion * 0.03 * dIorVal);
+                                            dIorVal += dispDelta;
+                                            if (dFrontFace) intIor = dIorVal;
+                                            else extIor = dIorVal;
+                                            dEta = extIor / max(intIor, 1e-4);
                                         }
                                         currDirection = normalize(refract(currDirection, dHitNormal, dEta));
-                                        currOrigin = dHitPoint - dHitNormal * EPSILON;
+                                        currOrigin = offsetRayOrigin(dHitPoint, -dHitNormal);
+                                        commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                     }
                                     throughput *= dMat.albedo.rgb;
-                                }
-
-                                // Volumetric Beer-Lambert absorption
-                                if (!isThinWalledD) {
-                                    float mediumDist = !dFrontFace ? closestT : 0.0;
-                                    vec4 atten = dMat.attenuationColor;
-                                    if (atten.w > 0.0 && mediumDist > 0.0) {
-                                        vec3 sigma_a = -log(max(atten.rgb, vec3(0.0001))) / atten.w;
-                                        throughput *= exp(-sigma_a * mediumDist);
-                                    }
                                 }
 
                                 float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));

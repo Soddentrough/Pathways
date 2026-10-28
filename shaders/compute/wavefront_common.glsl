@@ -15,10 +15,119 @@
 
 #define SAMPLE_SCENE_TEXTURE(texId, uv) textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), 0.0)
 
+#define SAMPLE_SCENE_TEXTURE_LOD(texId, uv, baseLod) \
+    textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), \
+               clamp((baseLod) + float(textureQueryLevels(sceneTextures[nonuniformEXT((texId) - 1u)]) - 1), 0.0, 12.0))
+
+// Ray Cone texture LOD base offset (Akenine-Möller et al. / RTXPT RayCones.hlsli):
+// Returns C_Delta + log2(coneWidth) - 0.5 * log2(|N.V|) so adding log2(max(W_tex, H_tex)) yields mip level.
+float computeRayConeBaseLod(uint packedTriLodHalf, float hitT, vec3 rayDir, vec3 hitNormal, float pixelSpreadAngle, uint bounce, uint pdfCode) {
+    if (packedTriLodHalf == 0u) return -16.0;
+    float triLod = unpackHalf2x16(packedTriLodHalf).x;
+    float spreadAngle = max(pixelSpreadAngle, 1e-4);
+    if (bounce > 0u && pdfCode > 0u) {
+        float log2Pdf = float(pdfCode) * (1.0 / 64.0) - 20.0;
+        spreadAngle = max(spreadAngle, exp2(-0.826 - 0.5 * log2Pdf));
+    }
+    float coneWidth = max(hitT * spreadAngle, 1e-6);
+    float absNdotV = max(abs(dot(hitNormal, rayDir)), 0.25);
+    float bounceBias = (bounce == 0u) ? -0.5 : 0.0;
+    return triLod + 0.5 * log2((coneWidth * coneWidth) / absNdotV) + bounceBias;
+}
+
 #define PI 3.14159265358979323846
 #define TWO_PI 6.28318530717958647692
 #define INV_PI 0.31830988618379067154
 #define EPSILON 0.0005
+
+// Magnitude-scaled ray origin offset (RTXPT DonutGeometryHelpers/ComputeRayOrigin):
+// Preserves exact EPSILON for standard scenes (|p| <= 32m) while scaling proportionally
+// with floating-point coordinate magnitude at large world coordinates to prevent self-intersection.
+vec3 offsetRayOrigin(vec3 p, vec3 n) {
+    float maxCoord = max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z))) * 0.03125);
+    return p + n * (EPSILON * maxCoord);
+}
+
+// Pull normal-mapped shading normal toward view vector at extreme grazing angles
+// (RTXPT ShadingData::AdjustShadingNormalAndComputeTangentSpace) to prevent black normal-map fringes.
+vec3 adjustShadingNormal(vec3 N, vec3 V) {
+    const float k = 0.05;
+    float backFacing = (max(-k, dot(-V, N) + 1e-4) + k) * (1.0 / (1.0 + k));
+    return (backFacing > 0.0) ? normalize(N + backFacing * V) : N;
+}
+
+// =============================================================================
+// 2-Slot Register-Resident Nested Dielectrics Priority Stack (RTXPT InteriorList)
+// Each slot packs: [31:16] fp16 IOR (positive IEEE-754 fp16 is monotonically ordered
+// as uint16, serving as both priority and exact IOR without extra Material fetches),
+// [15:0] materialId.
+// =============================================================================
+uint packInteriorSlot(uint matId, float ior) {
+    uint iorHalf = packHalf2x16(vec2(max(ior, 1.0), 0.0)) & 0xFFFFu;
+    return (iorHalf << 16u) | (matId & 0xFFFFu);
+}
+
+uint interiorSlotPriority(uint slot) {
+    return slot >> 16u;
+}
+
+uint interiorSlotMatId(uint slot) {
+    return slot & 0xFFFFu;
+}
+
+float interiorSlotIor(uint slot) {
+    return (slot != 0u) ? unpackHalf2x16(slot >> 16u).x : 1.0;
+}
+
+bool handleNestedDielectricIntersection(
+    in uvec2 stack,
+    uint hitMatId,
+    float hitIor,
+    bool frontFace,
+    out float extIor,
+    out float intIor
+) {
+    uint hitSlot = packInteriorSlot(hitMatId, hitIor);
+    uint hitPrio = interiorSlotPriority(hitSlot);
+    uint topPrio = interiorSlotPriority(stack.x);
+    uint topMat  = interiorSlotMatId(stack.x);
+    bool isTrueInterface = (hitPrio >= topPrio);
+
+    if (frontFace) {
+        extIor = interiorSlotIor(stack.x);
+        intIor = hitIor;
+    } else {
+        extIor = hitIor;
+        bool leavingTop = (topPrio > 0u && topMat == hitMatId);
+        uint nextSlot = leavingTop ? stack.y : stack.x;
+        intIor = interiorSlotIor(nextSlot);
+    }
+    return isTrueInterface;
+}
+
+void commitNestedDielectricStack(inout uvec2 stack, uint hitMatId, float hitIor, bool frontFace) {
+    uint entry = packInteriorSlot(hitMatId, hitIor);
+    uint hitPrio = interiorSlotPriority(entry);
+    if (frontFace) {
+        if (interiorSlotPriority(stack.x) > 0u && interiorSlotMatId(stack.x) == hitMatId) {
+            stack.x = entry;
+        } else if (interiorSlotPriority(stack.y) > 0u && interiorSlotMatId(stack.y) == hitMatId) {
+            stack.y = entry;
+        } else if (hitPrio >= interiorSlotPriority(stack.x)) {
+            stack.y = stack.x;
+            stack.x = entry;
+        } else if (hitPrio >= interiorSlotPriority(stack.y)) {
+            stack.y = entry;
+        }
+    } else {
+        if (interiorSlotPriority(stack.x) > 0u && interiorSlotMatId(stack.x) == hitMatId) {
+            stack.x = stack.y;
+            stack.y = 0u;
+        } else if (interiorSlotPriority(stack.y) > 0u && interiorSlotMatId(stack.y) == hitMatId) {
+            stack.y = 0u;
+        }
+    }
+}
 
 #define RAY_MASK_OPAQUE 0x01
 #define RAY_MASK_NON_OPAQUE 0x02
@@ -1184,6 +1293,18 @@ bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMa
 }
 
 
+
+// RTXPT-inspired PDF-adaptive firefly clamp: modulates indirectClamp using the
+// previous bounce's 12-bit packed BSDF PDF code (0 = camera/delta/unclamped specular).
+float computeAdaptiveFireflyClamp(float baseClamp, uint pdfCode) {
+    if (baseClamp <= 0.0 || pdfCode == 0u) return baseClamp;
+    float log2Pdf = float(pdfCode) * (1.0 / 64.0) - 20.0;
+    // Scale clamp smoothly around log2(pdf) = -1.0 (pdf ~ 0.5 sr^-1):
+    // low-PDF diffuse/glossy tail events tighten down to 0.5x baseClamp to suppress
+    // caustics/fireflies; high-PDF glossy reflections relax up to 2.0x baseClamp.
+    float factor = clamp(1.0 + 0.20 * (log2Pdf + 1.0), 0.5, 2.0);
+    return baseClamp * factor;
+}
 
 // Chromaticity-preserving luminance clamping for indirect / secondary bounces
 vec3 clampIndirectRadiance(vec3 rad, float maxLum) {

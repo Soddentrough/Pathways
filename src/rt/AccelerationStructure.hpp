@@ -55,7 +55,7 @@ public:
     VkDeviceAddress getDeviceAddress() const { return m_deviceAddress; }
     Buffer* getBuffer() { return m_buffer.get(); }
 
-    void setHandle(VkAccelerationStructureKHR handle, VkDeviceAddress addr, std::unique_ptr<Buffer> buffer);
+    void setHandle(VkAccelerationStructureKHR handle, VkDeviceAddress addr, std::shared_ptr<Buffer> buffer);
 
 private:
     void release();
@@ -64,7 +64,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkAccelerationStructureKHR m_handle = VK_NULL_HANDLE;
     VkDeviceAddress m_deviceAddress = 0;
-    std::unique_ptr<Buffer> m_buffer;
+    std::shared_ptr<Buffer> m_buffer;
 };
 
 class AccelerationStructureManager {

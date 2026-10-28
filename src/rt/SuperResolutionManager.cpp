@@ -475,7 +475,7 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         if (resetHistory) {
             camera->resetPrevViewProj();
         }
-        bool enableJitter = true;
+        bool enableJitter = isSuperRes;
         CameraUniform ubo = camera->getUniformData(
             frameIndex, 1, config.max_bounces, 0,
             enableJitter, inW, inH, 0, false
@@ -532,7 +532,7 @@ bool SuperResolutionManager::dispatchGateway(VkCommandBuffer cmd, bool resetHist
         if (resetHistory) {
             camera->resetPrevViewProj();
         }
-        bool enableJitter = true;
+        bool enableJitter = isSuperRes;
         CameraUniform ubo = camera->getUniformData(
             frameIndex, 1, config.max_bounces, 0,
             enableJitter, inW, inH, 0, false

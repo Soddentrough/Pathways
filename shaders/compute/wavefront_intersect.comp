@@ -141,7 +141,7 @@ void main() {
             hitAtom.primitiveId = uint(closestTri);
             hitAtom.baryPacked = packUnorm2x16(closestBary);
             bool frontFace = dot(direction, hitNormal) < 0.0;
-            hitAtom.flags = frontFace ? 2u : 0u;
+            hitAtom.flags = (frontFace ? 2u : 0u) | (tri.tanSigns & 0xFFFF0000u);
 
             hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
         } else if (closestSphere >= 0) {

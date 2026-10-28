@@ -6,9 +6,9 @@ namespace pathways {
 
 Image::Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t height,
              VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspectFlags,
-             const std::vector<uint32_t>& queueFamilyIndices)
+             const std::vector<uint32_t>& queueFamilyIndices, uint32_t mipLevels)
     : m_device(device), m_allocator(allocator), m_width(width), m_height(height),
-      m_format(format), m_aspectFlags(aspectFlags) {
+      m_mipLevels(mipLevels > 0 ? mipLevels : 1), m_format(format), m_aspectFlags(aspectFlags) {
 
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -16,7 +16,7 @@ Image::Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t h
     imageInfo.extent.width = width;
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = m_mipLevels;
     imageInfo.arrayLayers = 1;
     imageInfo.format = format;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -46,7 +46,7 @@ Image::Image(VkDevice device, VmaAllocator allocator, uint32_t width, uint32_t h
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.levelCount = m_mipLevels;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 
@@ -69,6 +69,7 @@ Image::Image(Image&& other) noexcept {
     m_imageView = other.m_imageView;
     m_width = other.m_width;
     m_height = other.m_height;
+    m_mipLevels = other.m_mipLevels;
     m_format = other.m_format;
     m_layout = other.m_layout;
     m_aspectFlags = other.m_aspectFlags;
@@ -90,6 +91,7 @@ Image& Image::operator=(Image&& other) noexcept {
         m_imageView = other.m_imageView;
         m_width = other.m_width;
         m_height = other.m_height;
+        m_mipLevels = other.m_mipLevels;
         m_format = other.m_format;
         m_layout = other.m_layout;
         m_aspectFlags = other.m_aspectFlags;
@@ -132,7 +134,7 @@ void Image::transitionLayout(VkCommandBuffer cmd, VkImageLayout newLayout,
     barrier.image = m_image;
     barrier.subresourceRange.aspectMask = m_aspectFlags;
     barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.levelCount = m_mipLevels;
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
 

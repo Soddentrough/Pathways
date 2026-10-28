@@ -112,6 +112,13 @@ float ggxVndfReflectPdf(float NdotV, float D, float alpha) {
     return D / max(2.0 * (NdotV + sqrt(a2 + (1.0 - a2) * NdotV * NdotV)), 1e-12);
 }
 
+// Turquin's analytical multiple-scattering GGX energy compensation (RTXPT BxDF.hlsli)
+vec3 multiScatterSpecularApprox(float alpha, float NdotV, vec3 F0) {
+    float a2 = alpha * alpha;
+    float ems = mix(0.2 * alpha, 0.32 * alpha + 1.94 * a2, NdotV);
+    return vec3(1.0) + F0 * ems;
+}
+
 // Returns f(V, L) * |N·L| and the mixture sampling pdf of L (solid angle);
 // specFCos receives the glossy part (base spec, clearcoat, sheen) of the
 // returned value.
@@ -144,7 +151,8 @@ vec3 stdBsdfEvalSplit(StdBsdf b, vec3 N, vec3 V, vec3 L, out float pdf, out vec3
         vec3 F = fresnelSchlickVec(VdotH, b.F0);
         float D = distributionGGX(NdotH, b.alpha);
         float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, b.alpha);
-        vec3 spec = b.specEnabled ? (D * Vis * NdotL) * F : vec3(0.0);
+        vec3 ms = multiScatterSpecularApprox(b.alpha, NdotV, b.F0);
+        vec3 spec = b.specEnabled ? (D * Vis * NdotL) * F * ms : vec3(0.0);
         float specPdf = ggxVndfReflectPdf(NdotV, D, b.alpha);
         if (b.mode == STD_BSDF_SIMPLE_METAL) {
             pdf = specPdf;
