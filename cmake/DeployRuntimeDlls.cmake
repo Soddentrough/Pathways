@@ -23,7 +23,5 @@ file(GET_RUNTIME_DEPENDENCIES
 foreach(DEP_DLL IN LISTS RESOLVED_DEPS)
     get_filename_component(DLL_NAME "${DEP_DLL}" NAME)
     set(DST_PATH "${TARGET_DIR}/${DLL_NAME}")
-    if(NOT EXISTS "${DST_PATH}")
-        file(COPY_FILE "${DEP_DLL}" "${DST_PATH}" ONLY_IF_DIFFERENT)
-    endif()
+    file(COPY_FILE "${DEP_DLL}" "${DST_PATH}" ONLY_IF_DIFFERENT)
 endforeach()
