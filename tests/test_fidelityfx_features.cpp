@@ -223,7 +223,14 @@ int main(int argc, char** argv) {
     check_true(foundFsr3, "FSR 3.1.6 analytical fallback version must always be enumerated");
     if (hwMl) {
         check_true(foundFsr4, "FSR 4.1.2 ML version must be enumerated and detected on ML-capable hardware");
+        check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u),
+                   "isUpscalerVersionSupported(4) must return true on FP8-capable hardware");
+    } else {
+        check_true(!FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u),
+                   "isUpscalerVersionSupported(4) must return false when hardware lacks FP8 Cooperative Matrix support");
     }
+    check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 3u),
+               "isUpscalerVersionSupported(3) must return true when amd_fidelityfx_upscaler_vk is present");
 
     const bool hasDenoiserProvider = FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
     auto denoiserVersions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER, targetPhys);
@@ -440,6 +447,13 @@ int main(int argc, char** argv) {
                    "FSR 4.1 ML run must report upscaler_mode == 'FSR 4.1 ML' without falling back to FSR 3.1, got '" + fsr4Run.reportedUpscaler + "'");
         check_true(combinedRun.reportedUpscaler == "FSR 4.1 ML",
                    "Combined run must report upscaler_mode == 'FSR 4.1 ML'");
+    } else {
+        check_true(!fsr4Run.reportedSupportsFsr4,
+                   "Non-FP8 GPU (e.g. RDNA3) must report supports_fsr4_ml == false");
+        check_true(fsr4Run.reportedUpscaler == "FSR 3.1",
+                   "When FSR 4 ML is unsupported on non-FP8 hardware, --upscaler fsr4 must honestly fall back and report 'FSR 3.1', got '" + fsr4Run.reportedUpscaler + "'");
+        check_true(combinedRun.reportedUpscaler == "FSR 3.1",
+                   "Combined run on non-FP8 hardware must honestly report upscaler_mode == 'FSR 3.1'");
     }
     if (hasDenoiserProvider) {
         check_true(rayRegenRun.reportedDenoiser.find("Ray Regeneration") != std::string::npos,

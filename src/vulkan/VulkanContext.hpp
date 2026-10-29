@@ -137,7 +137,9 @@ public:
     bool hasFp8CooperativeMatrix() const { return m_hasFp8CoopMatrix; }
     bool hasInt8CooperativeMatrix() const { return m_hasInt8CoopMatrix; }
     bool hasMutableDescriptorType() const { return m_hasMutableDescriptorType; }
-    bool supportsFsr4() const { return m_hasCooperativeMatrix && (m_hasFp8CoopMatrix || m_hasInt8CoopMatrix); }
+    bool supportsFsr4() const {
+        return m_hasCooperativeMatrix && m_hasShaderFloat8 && m_hasShaderFloat8CoopMatrix && m_hasFp8CoopMatrix && m_hasMutableDescriptorType;
+    }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
     PFN_vkSetHdrMetadataEXT getSetHdrMetadataEXT() const { return pfnVkSetHdrMetadataEXT; }

@@ -645,7 +645,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         stats.has_cooperative_matrix ? "SUPPORTED" : "NO",
                         stats.has_fp8_coop_matrix ? "YES" : "NO",
                         stats.has_int8_coop_matrix ? "YES" : "NO",
-                        stats.supports_fsr4 ? "SUPPORTED" : "FALLBACK");
+                        stats.supports_fsr4 ? "SUPPORTED" : "UNSUPPORTED");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
             ImGui::Text("Validation Errors:  %u", stats.validation_errors);
@@ -967,23 +967,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             const float spacingX = ImGui::GetStyle().ItemSpacing.x;
             const bool hwMl = stats.supports_fsr4;
 
+            if (config.upscaler_mode == UpscalerMode::FSR && !hwMl && config.fsr_version == FsrVersion::Fsr4) {
+                config.fsr_version = FsrVersion::Fsr3;
+            }
+            if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration && !stats.supports_fsr_rr) {
+                config.denoiser_mode = DenoiserMode::Svgf;
+            }
+
             // --- Row 1: Upscaler 1-Click Selector ---
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Upscaler:");
             const float upBtnW = (availW - spacingX * 4.0f) / 5.0f;
-            auto drawQuickUpscalerBtn = [&](const char* label, bool isSelected, const char* tooltip, auto onClick) {
-                if (isSelected) {
+            auto drawQuickUpscalerBtn = [&](const char* label, bool isSelected, bool isSupported, const char* tooltip, auto onClick) {
+                if (!isSupported) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.48f, 0.55f));
+                } else if (isSelected) {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.58f, 0.38f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.46f, 1.0f));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(label, ImVec2(upBtnW, 28.0f))) {
+                if (ImGui::Button(label, ImVec2(upBtnW, 28.0f)) && isSupported) {
                     onClick();
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
                 }
-                ImGui::PopStyleColor(2);
+                if (!isSupported) {
+                    ImGui::PopStyleColor(4);
+                    ImGui::EndDisabled();
+                } else {
+                    ImGui::PopStyleColor(2);
+                }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
@@ -993,49 +1011,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                         (config.fsr_version != FsrVersion::Fsr3);
             const bool isFsr3Selected = (config.upscaler_mode == UpscalerMode::FSR) && !isFsr4Selected;
 
-            drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None,
+            drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None, true,
                 "Render at full native display resolution (no upscaling).", [&]() {
                     config.upscaler_mode = UpscalerMode::None;
                     config.render_scale = 1.0f;
                 });
             ImGui::SameLine();
-            ImGui::BeginDisabled(!hwMl);
-            drawQuickUpscalerBtn("FSR 4.1 ML", isFsr4Selected,
+            drawQuickUpscalerBtn("FSR 4.1 ML", isFsr4Selected, hwMl,
                 hwMl ? "AMD FidelityFX Super Resolution 4.1.2 (ML Cooperative Matrix Super-Resolution)."
-                     : "Requires VK_KHR_cooperative_matrix + 8-bit/FP8 Cooperative Matrix API support.", [&]() {
+                     : "Unavailable on this GPU: FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr4;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
-            ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::BeginDisabled(!stats.supports_fsr3);
-            drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected,
-                stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (SDK Analytical Super-Resolution)." : "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk).", [&]() {
+            drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected, stats.supports_fsr3,
+                stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (SDK Super-Resolution)."
+                                    : "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr3;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
-            ImGui::EndDisabled();
-            (void)([&]() {
-                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
-                });
             ImGui::SameLine();
-            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
-            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways,
+            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix,
                 "In-house Wave32 WMMA Neural U-Net + KPN Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::Upways;
                     config.upways_superres = true;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
-            drawQuickUpscalerBtn("Gateway SR", config.upscaler_mode == UpscalerMode::Gateway,
+            drawQuickUpscalerBtn("Gateway SR", config.upscaler_mode == UpscalerMode::Gateway, stats.has_cooperative_matrix,
                 "In-house Hybrid E-SVGF + Quad MLP Bilateral Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::Gateway;
                     config.gateway_superres = true;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
-            ImGui::EndDisabled();
 
             if (config.upscaler_mode != UpscalerMode::None) {
                 const float scaleBtnW = (availW - spacingX * 3.0f) * 0.25f;
@@ -1067,7 +1077,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 uint32_t rH = config.getRenderHeight();
                 const char* activeUpscalerDesc =
                     isFsr4Selected ? "AMD FSR 4.1.2 ML" :
-                    isFsr3Selected ? "AMD FSR 3.1.6 Fallback" :
+                    isFsr3Selected ? (stats.supports_fsr3 ? "AMD FSR 3.1.6" : "In-House Lanczos-2 Temporal Upscaler") :
                     (config.upscaler_mode == UpscalerMode::Upways) ? "Upways Neural SR" :
                     (config.upscaler_mode == UpscalerMode::Gateway) ? "Gateway Hybrid SR" : "Spatial SR";
                 ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
@@ -1079,9 +1089,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             // --- Row 2: Denoiser 1-Click Selector ---
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Denoiser:");
             const float denBtnW = (availW - spacingX * 4.0f) / 5.0f;
-            auto drawQuickDenoiserBtn = [&](DenoiserMode mode, const char* label, const char* tooltip) {
-                bool isCur = (config.denoiser_mode == mode);
-                if (isCur) {
+            auto drawQuickDenoiserBtn = [&](DenoiserMode mode, const char* label, bool isSupported, const char* tooltip) {
+                bool isCur = isSupported && (config.denoiser_mode == mode);
+                if (!isSupported) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.48f, 0.55f));
+                } else if (isCur) {
                     ImVec4 activeBg = (mode == DenoiserMode::None)
                         ? ImVec4(0.20f, 0.42f, 0.68f, 1.0f)
                         : ImVec4(0.14f, 0.58f, 0.38f, 1.0f);
@@ -1091,70 +1107,81 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(label, ImVec2(denBtnW, 28.0f))) {
+                if (ImGui::Button(label, ImVec2(denBtnW, 28.0f)) && isSupported) {
                     if (config.denoiser_mode != mode) {
                         config.denoiser_mode = mode;
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
                     }
                 }
-                ImGui::PopStyleColor(2);
+                if (!isSupported) {
+                    ImGui::PopStyleColor(4);
+                    ImGui::EndDisabled();
+                } else {
+                    ImGui::PopStyleColor(2);
+                }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
 
-            drawQuickDenoiserBtn(DenoiserMode::None, "Off (MC)",
+            drawQuickDenoiserBtn(DenoiserMode::None, "Off (MC)", true,
                 "Unbiased pure Monte Carlo path tracing with progressive temporal accumulation.");
             ImGui::SameLine();
-            ImGui::BeginDisabled(!stats.supports_fsr_rr);
-            drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen",
-                stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)." : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk.");
-            ImGui::EndDisabled();
+            drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen", stats.supports_fsr_rr,
+                stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)."
+                                      : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk.");
             ImGui::SameLine();
-            drawQuickDenoiserBtn(DenoiserMode::Svgf, "E-SVGF",
+            drawQuickDenoiserBtn(DenoiserMode::Svgf, "E-SVGF", true,
                 "Edge-Aware Spatio-Temporal Variance-Guided Wavelet Filter (61x61 receptive field).");
             ImGui::SameLine();
-            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
-            drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways",
+            drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.has_cooperative_matrix,
                 "Recurrent Wave32 WMMA Neural U-Net + Multi-Scale KPN Reconstruction (Requires VK_KHR_cooperative_matrix).");
             ImGui::SameLine();
-            drawQuickDenoiserBtn(DenoiserMode::Gateway, "Gateway",
+            drawQuickDenoiserBtn(DenoiserMode::Gateway, "Gateway", stats.has_cooperative_matrix,
                 "Hybrid E-SVGF + Wave32 WMMA Quad MLP Denoiser (Requires VK_KHR_cooperative_matrix).");
-            ImGui::EndDisabled();
 
             ImGui::Spacing();
             // --- Row 3: GI & Caching 1-Click Toggle Buttons ---
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "GI & Caching:");
             const float giBtnW = (availW - spacingX * 2.0f) / 3.0f;
-            auto drawQuickToggleBtn = [&](const char* labelOn, const char* labelOff, bool& flag, const char* tooltip) {
-                if (flag) {
+            auto drawQuickToggleBtn = [&](const char* labelOn, const char* labelOff, bool& flag, bool isSupported, const char* tooltip) {
+                if (!isSupported) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.48f, 0.55f));
+                } else if (flag) {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.58f, 0.38f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.46f, 1.0f));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(flag ? labelOn : labelOff, ImVec2(giBtnW, 28.0f))) {
+                if (ImGui::Button((flag && isSupported) ? labelOn : labelOff, ImVec2(giBtnW, 28.0f)) && isSupported) {
                     flag = !flag;
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
                 }
-                ImGui::PopStyleColor(2);
+                if (!isSupported) {
+                    ImGui::PopStyleColor(4);
+                    ImGui::EndDisabled();
+                } else {
+                    ImGui::PopStyleColor(2);
+                }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
 
-            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
-            drawQuickToggleBtn("Neural Cache: ON", "Neural Cache: OFF", config.enable_nrc,
+            drawQuickToggleBtn("Neural Cache: ON", "Neural Cache: OFF", config.enable_nrc, stats.has_cooperative_matrix,
                 "In-house Wave32 WMMA Neural Direct-Light Cache (Requires VK_KHR_cooperative_matrix).");
-            ImGui::EndDisabled();
             ImGui::SameLine();
-            drawQuickToggleBtn("ReSTIR PT: ON", "ReSTIR PT: OFF", config.enable_restir,
+            drawQuickToggleBtn("ReSTIR PT: ON", "ReSTIR PT: OFF", config.enable_restir, true,
                 "Path-Space Reservoir Resampling (Spatiotemporal Direct + Indirect GI Reuse).");
             ImGui::SameLine();
-            drawQuickToggleBtn("Caustics: ON", "Caustics: OFF", config.enable_caustics,
+            drawQuickToggleBtn("Caustics: ON", "Caustics: OFF", config.enable_caustics, true,
                 "Real-time forward photon splatting for refractive caustics.");
 
             ImGui::PopID();
@@ -1915,34 +1942,52 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::PushID("FsrVerSelect");
                 ImGui::TextDisabled("FSR Target Version:");
                 ImGui::SameLine();
-                auto drawFsrVerBtn = [&](FsrVersion ver, const char* lbl) {
-                    bool isCur = (config.fsr_version == ver);
-                    if (isCur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
-                    if (ImGui::SmallButton(lbl)) {
+                auto drawFsrVerBtn = [&](FsrVersion ver, const char* lbl, bool isSupported, const char* tip) {
+                    bool isCur = isSupported && (config.fsr_version == ver);
+                    if (!isSupported) {
+                        ImGui::BeginDisabled(true);
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.48f, 0.55f));
+                    } else if (isCur) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
+                    }
+                    if (ImGui::SmallButton(lbl) && isSupported) {
                         config.fsr_version = ver;
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
                     }
-                    if (isCur) ImGui::PopStyleColor();
+                    if (!isSupported) {
+                        ImGui::PopStyleColor(4);
+                        ImGui::EndDisabled();
+                    } else if (isCur) {
+                        ImGui::PopStyleColor();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tip) {
+                        ImGui::SetTooltip("%s", tip);
+                    }
                     ImGui::SameLine();
                 };
-                drawFsrVerBtn(FsrVersion::Auto, "Auto");
-                ImGui::BeginDisabled(!stats.supports_fsr3);
-                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1");
-                ImGui::EndDisabled();
-                ImGui::BeginDisabled(!stats.supports_fsr4);
-                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML");
-                ImGui::EndDisabled();
+                drawFsrVerBtn(FsrVersion::Auto, "Auto", stats.supports_fsr3 || stats.supports_fsr4,
+                              "Automatically select highest supported FidelityFX Super Resolution version on this device.");
+                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1", stats.supports_fsr3,
+                              stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (SDK Super-Resolution)."
+                                                  : "Unavailable: Requires amd_fidelityfx_upscaler_vk.");
+                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML", stats.supports_fsr4,
+                              stats.supports_fsr4 ? "AMD FidelityFX Super Resolution 4.1.2 (ML Super-Resolution)."
+                                                  : "Unavailable on this GPU: FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix).");
 
                 ImGui::NewLine();
                 ImGui::PopID();
 
                 const bool hwMl = stats.supports_fsr4;
                 const bool useFsr4 = hwMl && (config.fsr_version != FsrVersion::Fsr3);
-                ImGui::PushStyleColor(ImGuiCol_Text, useFsr4 ? ImVec4(0.3f, 0.95f, 0.55f, 1.0f) : ImVec4(0.95f, 0.80f, 0.30f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, useFsr4 ? ImVec4(0.3f, 0.95f, 0.55f, 1.0f) : ImVec4(0.35f, 0.90f, 1.0f, 1.0f));
                 ImGui::TextWrapped("Active Upscaler: %s",
-                                   useFsr4 ? "AMD FSR 4.1.2 (ML Cooperative Matrix Super-Resolution)"
-                                           : "AMD FSR 3.1.6 (Analytical Lanczos-2 + YCoCg Fallback)");
+                                   useFsr4 ? "AMD FSR 4.1.2 (SDK ML Super-Resolution)"
+                                           : (stats.supports_fsr3 ? "AMD FSR 3.1.6 (SDK Super-Resolution)"
+                                                                  : "In-House Lanczos-2 Temporal Upscaler (No SDK Context)"));
                 ImGui::PopStyleColor();
             }
 

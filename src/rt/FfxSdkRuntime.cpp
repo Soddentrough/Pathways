@@ -211,6 +211,7 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
 
     bool hasCoopMatrixExt = false;
     bool hasFloat8Ext = false;
+    bool hasMutableDescExt = false;
     for (const auto& ext : exts) {
         if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
             hasCoopMatrixExt = true;
@@ -220,8 +221,13 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
             hasFloat8Ext = true;
         }
 #endif
+#ifdef VK_EXT_mutable_descriptor_type
+        if (std::strcmp(ext.extensionName, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) == 0) {
+            hasMutableDescExt = true;
+        }
+#endif
     }
-    if (!hasCoopMatrixExt) {
+    if (!hasCoopMatrixExt || !hasFloat8Ext || !hasMutableDescExt) {
         return false;
     }
 
@@ -235,10 +241,7 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
 #ifdef VK_EXT_shader_float8
     VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
     float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
-    if (hasFloat8Ext) {
-        coopFeatures.pNext = &float8Features;
-    }
-#endif
+    coopFeatures.pNext = &float8Features;
 
     VkPhysicalDeviceFeatures2 feat2{};
     feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -249,13 +252,11 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
         return false;
     }
 
-    bool has8BitSupport = (vk12Features.shaderInt8 == VK_TRUE && vk12Features.storageBuffer8BitAccess == VK_TRUE);
-#ifdef VK_EXT_shader_float8
-    if (hasFloat8Ext && float8Features.shaderFloat8CooperativeMatrix == VK_TRUE) {
-        has8BitSupport = true;
-    }
+    return (float8Features.shaderFloat8 == VK_TRUE &&
+            float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
+#else
+    return false;
 #endif
-    return has8BitSupport;
 }
 
 std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
