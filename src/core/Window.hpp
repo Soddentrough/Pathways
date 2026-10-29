@@ -56,6 +56,7 @@ public:
     bool isFullscreen() const { return m_isFullscreen; }
     bool isMinimized() const;
     float getPixelDensity() const;
+    float getDisplayScale() const;
     void getWindowSizeInPoints(int* w, int* h) const;
 
     // Event callbacks

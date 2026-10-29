@@ -1172,6 +1172,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features12.descriptorBindingPartiallyBound = VK_TRUE;
     features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.shaderStorageBufferArrayNonUniformIndexing = m_vk12Features.shaderStorageBufferArrayNonUniformIndexing;
+    features12.shaderStorageImageArrayNonUniformIndexing = m_vk12Features.shaderStorageImageArrayNonUniformIndexing;
+    features12.shaderUniformBufferArrayNonUniformIndexing = m_vk12Features.shaderUniformBufferArrayNonUniformIndexing;
+    features12.shaderSubgroupExtendedTypes = m_vk12Features.shaderSubgroupExtendedTypes;
+    features12.subgroupBroadcastDynamicId = m_vk12Features.subgroupBroadcastDynamicId;
     features12.scalarBlockLayout = VK_TRUE;
     features12.timelineSemaphore = VK_TRUE;
     features12.vulkanMemoryModel = VK_TRUE;
@@ -1180,12 +1185,14 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features12.shaderInt8 = VK_TRUE;
     features12.storageBuffer8BitAccess = VK_TRUE;
     features12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+    features12.storagePushConstant8 = m_vk12Features.storagePushConstant8;
     features12.pNext = &features13;
 
     VkPhysicalDeviceVulkan11Features features11{};
     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features11.storageBuffer16BitAccess = VK_TRUE;
     features11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+    features11.storagePushConstant16 = VK_TRUE;
     features11.pNext = &features12;
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
@@ -1264,6 +1271,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     deviceFeatures2.features.samplerAnisotropy = VK_TRUE;
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
     deviceFeatures2.features.shaderInt16 = VK_TRUE;
+    deviceFeatures2.features.shaderImageGatherExtended = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // E-SVGF denoiser writes dual-channel edge density to VK_FORMAT_R8G8_UNORM storage images

@@ -36,16 +36,16 @@ FsrUpscaler::FsrUpscaler(
     probeHardwareCapabilities();
     resolveActiveVersion();
 
-    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Target: {}, Active: {} (HW ML CoopMatrix: {})",
-                 m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
-                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion),
-                 getActiveVersionName(), m_hwMlSupported ? "YES" : "NO");
-
     initImages();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     createPipelines(upscaleSpv, rcasSpv);
     initFfxSdkContext();
+
+    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Target: {}, Active: {} (HW ML CoopMatrix: {})",
+                 m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
+                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion),
+                 getActiveVersionName(), m_hwMlSupported ? "YES" : "NO");
 
     Logger::info("FsrUpscaler [{}] successfully initialized ({}, VRAM: {:.2f} MB).",
                  m_instanceName, getActiveVersionName(),

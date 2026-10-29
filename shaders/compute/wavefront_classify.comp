@@ -255,7 +255,7 @@ void main() {
                 if (pc.captureMlData != 0u) {
                     if (pc.sppSampleIndex == 0u) {
                         imageStore(uMlDiffuseImage, storeCoord, vec4(skyColor, 0.0));
-                        imageStore(uMlSpecularImage, storeCoord, vec4(0.0));
+                        // uMlSpecularImage is already zero-cleared by vkCmdClearColorImage
                     } else {
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
                         imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
@@ -401,12 +401,12 @@ void main() {
                     float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE || length(emissiveVal) > 1e-3) ? 1.0 : 0.0;
                     float clampedMet = clamp(metallicVal, 0.0, 1.0);
                     float denoiseRoughness = (transmissionVal < 0.5)
-                        ? mix(max(roughnessVal, 0.085), roughnessVal, clampedMet)
-                        : roughnessVal;
+                        ? ((clampedMet >= 0.05) ? min(roughnessVal, 0.69) : max(roughnessVal, 0.085))
+                        : clamp(roughnessVal, 0.65, 0.69);
                     imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, denoiseRoughness));
-                    imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, dSpec, 0.0));
-                    imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
-                    imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
+                    if (denoiseRoughness < 0.70) imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (transmissionVal >= 0.5) ? -dSpec : dSpec, 0.0));
+                    if (isPrimaryEmissive > 0.0) imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
+                    if (clampedMet > 0.0) imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
                 }
             }
         }

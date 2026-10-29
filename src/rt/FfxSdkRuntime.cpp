@@ -235,7 +235,7 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
         }
 #endif
     }
-    if (!hasCoopMatrixExt || !hasFloat8Ext || !hasMutableDescExt) {
+    if (!hasCoopMatrixExt || !hasMutableDescExt) {
         return false;
     }
 
@@ -246,10 +246,23 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
     vk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     vk12Features.pNext = &coopFeatures;
 
+    void** tailNext = &coopFeatures.pNext;
+
+#ifdef VK_EXT_mutable_descriptor_type
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableFeatures{};
+    mutableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+    *tailNext = &mutableFeatures;
+    tailNext = &mutableFeatures.pNext;
+#endif
+
 #ifdef VK_EXT_shader_float8
     VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
     float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
-    coopFeatures.pNext = &float8Features;
+    if (hasFloat8Ext) {
+        *tailNext = &float8Features;
+        tailNext = &float8Features.pNext;
+    }
+#endif
 
     VkPhysicalDeviceFeatures2 feat2{};
     feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -259,12 +272,30 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
     if (coopFeatures.cooperativeMatrix != VK_TRUE || vk12Features.shaderFloat16 != VK_TRUE) {
         return false;
     }
-
-    return (float8Features.shaderFloat8 == VK_TRUE &&
-            float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
-#else
-    return false;
+#ifdef VK_EXT_mutable_descriptor_type
+    if (mutableFeatures.mutableDescriptorType != VK_TRUE) {
+        return false;
+    }
 #endif
+
+    bool hasFp8CoopMatrix = false;
+#ifdef VK_EXT_shader_float8
+    if (hasFloat8Ext &&
+        float8Features.shaderFloat8 == VK_TRUE &&
+        float8Features.shaderFloat8CooperativeMatrix == VK_TRUE) {
+        hasFp8CoopMatrix = true;
+    }
+#endif
+
+    // Per AMD FidelityFX SDK 2.4 ("Redstone") Super Resolution ML docs:
+    // - RDNA 4 uses the Full FP8 model (requires VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix)
+    // - RDNA 3 (RX 7000 series) and RDNA 2 (RX 6000 series / Ryzen AI) use the INT8 model
+    //   (requires VK_KHR_cooperative_matrix + shaderInt8 + shaderFloat16 + storageBuffer8BitAccess)
+    const bool hasInt8CoopMatrix = (vk12Features.shaderInt8 == VK_TRUE &&
+                                    vk12Features.shaderFloat16 == VK_TRUE &&
+                                    vk12Features.storageBuffer8BitAccess == VK_TRUE);
+
+    return hasFp8CoopMatrix || hasInt8CoopMatrix;
 }
 
 std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
@@ -276,6 +307,19 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 #if defined(PATHWAYS_HAS_FFX_SDK)
     VkDevice tempDevice = VK_NULL_HANDLE;
     if (physDevice != VK_NULL_HANDLE && device == VK_NULL_HANDLE) {
+        uint32_t extCount = 0;
+        std::vector<VkExtensionProperties> exts;
+        if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, nullptr) == VK_SUCCESS && extCount > 0) {
+            exts.resize(extCount);
+            vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, exts.data());
+        }
+        auto hasExt = [&](const char* name) {
+            for (const auto& e : exts) {
+                if (std::strcmp(e.extensionName, name) == 0) return true;
+            }
+            return false;
+        };
+
         float queuePriority = 1.0f;
         VkDeviceQueueCreateInfo qci{};
         qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -295,22 +339,26 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
         vk12Features.storageBuffer8BitAccess = VK_TRUE;
         vk12Features.pNext = &coopFeatures;
 
+        void** tailNext = &coopFeatures.pNext;
+
 #ifdef VK_EXT_mutable_descriptor_type
         VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableFeatures{};
         mutableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
         mutableFeatures.mutableDescriptorType = VK_TRUE;
-        coopFeatures.pNext = &mutableFeatures;
+        if (hasExt(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+            *tailNext = &mutableFeatures;
+            tailNext = &mutableFeatures.pNext;
+        }
 #endif
 #ifdef VK_EXT_shader_float8
         VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
         float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
         float8Features.shaderFloat8 = VK_TRUE;
         float8Features.shaderFloat8CooperativeMatrix = VK_TRUE;
-    #ifdef VK_EXT_mutable_descriptor_type
-        mutableFeatures.pNext = &float8Features;
-    #else
-        coopFeatures.pNext = &float8Features;
-    #endif
+        if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+            *tailNext = &float8Features;
+            tailNext = &float8Features.pNext;
+        }
 #endif
 
         VkDeviceCreateInfo dci{};
@@ -321,10 +369,19 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
         if (supportsHardwareMl(physDevice)) {
             mlExts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 #ifdef VK_EXT_shader_float8
-            mlExts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+            if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+                mlExts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+            }
 #endif
 #ifdef VK_EXT_mutable_descriptor_type
-            mlExts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+            if (hasExt(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+                mlExts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+            }
+#endif
+#ifdef VK_KHR_compute_shader_derivatives
+            if (hasExt(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+                mlExts.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+            }
 #endif
             dci.enabledExtensionCount = static_cast<uint32_t>(mlExts.size());
             dci.ppEnabledExtensionNames = mlExts.data();

@@ -341,7 +341,27 @@ int main() {
     renderPanelContent();
     float sY_f14 = ImGui::GetScrollY();
     check_true(sY_f14 == sY_f13, "NaN event safely neutralized; scroll position preserved without corruption");
-    std::cout << "[PASS] Frame 14: NaN resilience (Issue #7546) verified! ScrollY: " << sY_f14 << " px." << std::endl;
+    std::cout << "[PASS] Frame 14: NaN resilience (#7546) verified! ScrollY: " << sY_f14 << " px." << std::endl;
+    float font1x = ImGui::GetFontSize();
+    ImGui::End();
+    ImGui::Render();
+
+    // Frame 15: Windows High-DPI UI Scaling (1.50x = 150% Display Scale)
+    ImGuiStyle& style2 = ImGui::GetStyle();
+    style2 = ImGuiStyle();
+    style2.ScaleAllSizes(1.5f);
+    style2.FontScaleDpi = 1.5f;
+
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(10.0f * 1.5f, 10.0f * 1.5f));
+    ImGui::SetNextWindowSize(ImVec2(300.0f * 1.5f, 200.0f * 1.5f));
+    check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 15 (1.5x DPI)");
+    renderPanelContent();
+    float font15x = ImGui::GetFontSize();
+    check_true(std::abs(font15x - font1x * 1.5f) < 1.0f, "FontScaleDpi=1.5f scaled effective font size by 1.5x");
+    std::cout << "[PASS] Frame 15: High-DPI UI scaling verified (1.0x font=" << font1x << "px -> 1.5x font=" << font15x << "px)." << std::endl;
+
     ImGui::End();
     ImGui::Render();
 

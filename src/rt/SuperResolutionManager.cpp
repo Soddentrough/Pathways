@@ -607,9 +607,9 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         descPrim.displayWidth = config.width;
         descPrim.displayHeight = config.height;
         glm::vec2 jitter(0.0f);
-        const bool isDenoisingRenderRes = (config.denoiser_mode == DenoiserMode::Svgf ||
-                                           config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-        if (config.upscaler_mode == UpscalerMode::FSR && !isDenoisingRenderRes) {
+        (void)0;
+
+        if (config.upscaler_mode == UpscalerMode::FSR) {
             if (!config.progressive_accumulation || cameraMovedLastFrame || accumulatedSamples <= 1) {
                 jitter = getHaltonJitter(frameIndex, fsrPhaseCount);
             }
@@ -680,9 +680,9 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         desc.displayWidth = config.width;
         desc.displayHeight = config.height;
         glm::vec2 jitter(0.0f);
-        const bool isDenoisingRenderRes = (config.denoiser_mode == DenoiserMode::Svgf ||
-                                           config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-        if (config.upscaler_mode == UpscalerMode::FSR && !isDenoisingRenderRes) {
+        (void)0;
+
+        if (config.upscaler_mode == UpscalerMode::FSR) {
             if (!config.progressive_accumulation || cameraMovedLastFrame || accumulatedSamples <= 1) {
                 glm::vec2 jitterPrim = getHaltonJitter(frameIndex, fsrPhaseCount);
                 bool isMgpuSampleParallel = (mgpu && mgpu->isMultiGpuActive() && config.mgpu_mode != MultiGpuMode::Off &&

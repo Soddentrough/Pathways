@@ -112,6 +112,7 @@ Window::Window(const Config& config)
     SDL_SetAppMetadata("Pathways", "1.18.0", "pathways");
 
     // 1. Detect Physical Display & Resolution Characteristics
+    float initPixelDensity = 1.0f;
     SDL_DisplayID displayID = SDL_GetPrimaryDisplay();
     if (displayID != 0) {
         const char* name = SDL_GetDisplayName(displayID);
@@ -120,28 +121,26 @@ Window::Window(const Config& config)
         }
 
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(displayID);
-        float density = 1.0f;
+        float pixelDensity = 1.0f;
         if (mode) {
-            density = (mode->pixel_density > 0.0f) ? mode->pixel_density : 1.0f;
+            pixelDensity = (mode->pixel_density > 0.0f) ? mode->pixel_density : 1.0f;
             m_displayInfo.refreshRate = mode->refresh_rate;
         }
+        initPixelDensity = pixelDensity;
 
         float scale = SDL_GetDisplayContentScale(displayID);
-        if (density <= 1.0f && scale > 1.0f) {
-            density = scale;
-        }
-        m_displayInfo.contentScale = density;
+        m_displayInfo.contentScale = (scale > 0.0f) ? scale : pixelDensity;
 
         if (mode) {
-            // mode->w and mode->h are in window coordinates/points in SDL3; multiply by pixel density for true physical pixels
-            m_displayInfo.nativeWidth = static_cast<uint32_t>(std::round(mode->w * density));
-            m_displayInfo.nativeHeight = static_cast<uint32_t>(std::round(mode->h * density));
+            // mode->w and mode->h are in window coordinates/points in SDL3; multiply by mode->pixel_density for true physical pixels
+            m_displayInfo.nativeWidth = static_cast<uint32_t>(std::round(mode->w * pixelDensity));
+            m_displayInfo.nativeHeight = static_cast<uint32_t>(std::round(mode->h * pixelDensity));
         }
 
         SDL_Rect usable{};
         if (SDL_GetDisplayUsableBounds(displayID, &usable)) {
-            m_displayInfo.usableWidth = static_cast<uint32_t>(std::round(usable.w * density));
-            m_displayInfo.usableHeight = static_cast<uint32_t>(std::round(usable.h * density));
+            m_displayInfo.usableWidth = static_cast<uint32_t>(std::round(usable.w * pixelDensity));
+            m_displayInfo.usableHeight = static_cast<uint32_t>(std::round(usable.h * pixelDensity));
         } else {
             m_displayInfo.usableWidth = m_displayInfo.nativeWidth;
             m_displayInfo.usableHeight = m_displayInfo.nativeHeight;
@@ -202,8 +201,8 @@ Window::Window(const Config& config)
 
     m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
 
-    // SDL_CreateWindow takes window coordinates (points). Convert target physical pixels to points via density.
-    float initDensity = (m_displayInfo.contentScale > 0.0f) ? m_displayInfo.contentScale : 1.0f;
+    // SDL_CreateWindow takes window coordinates (points). Convert target physical pixels to points via pixel density.
+    float initDensity = (initPixelDensity > 0.0f) ? initPixelDensity : 1.0f;
     int initPointW = static_cast<int>(std::round(static_cast<float>(m_width) / initDensity));
     int initPointH = static_cast<int>(std::round(static_cast<float>(m_height) / initDensity));
 
@@ -286,7 +285,10 @@ Window::Window(const Config& config)
     SDL_PumpEvents();
 
     float actualDensity = SDL_GetWindowPixelDensity(m_window);
-    if (actualDensity > 0.0f) {
+    float winDisplayScale = SDL_GetWindowDisplayScale(m_window);
+    if (winDisplayScale > 0.0f) {
+        m_displayInfo.contentScale = winDisplayScale;
+    } else if (actualDensity > 0.0f) {
         m_displayInfo.contentScale = actualDensity;
     }
 
@@ -303,7 +305,8 @@ Window::Window(const Config& config)
         m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     }
 
-    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{} (density: {:.2f}).", m_width, m_height, m_displayInfo.contentScale);
+    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{} (pixel density: {:.2f}, UI scale: {:.2f}).",
+                 m_width, m_height, actualDensity > 0.0f ? actualDensity : 1.0f, m_displayInfo.contentScale);
 }
 
 Window::~Window() {
@@ -352,6 +355,14 @@ float Window::getPixelDensity() const {
     if (m_window) {
         float density = SDL_GetWindowPixelDensity(m_window);
         if (density > 0.0f) return density;
+    }
+    return 1.0f;
+}
+
+float Window::getDisplayScale() const {
+    if (m_window) {
+        float scale = SDL_GetWindowDisplayScale(m_window);
+        if (scale > 0.0f) return scale;
     }
     return (m_displayInfo.contentScale > 0.0f) ? m_displayInfo.contentScale : 1.0f;
 }
@@ -528,6 +539,38 @@ void Window::pollEvents() {
                     m_mouseCallback(event.motion.xrel, event.motion.yrel);
                 }
                 break;
+            case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
+                float newScale = SDL_GetWindowDisplayScale(m_window);
+                if (newScale > 0.0f && std::abs(newScale - m_displayInfo.contentScale) > 0.005f) {
+                    Logger::info("Window display scale changed: {:.2f} -> {:.2f}", m_displayInfo.contentScale, newScale);
+                    m_displayInfo.contentScale = newScale;
+                }
+                SDL_DisplayID dispId = SDL_GetDisplayForWindow(m_window);
+                if (dispId != 0) {
+                    const char* name = SDL_GetDisplayName(dispId);
+                    if (name) m_displayInfo.displayName = name;
+                    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(dispId);
+                    float density = 1.0f;
+                    if (mode) {
+                        density = (mode->pixel_density > 0.0f) ? mode->pixel_density : 1.0f;
+                        m_displayInfo.refreshRate = mode->refresh_rate;
+                        m_displayInfo.nativeWidth = static_cast<uint32_t>(std::round(mode->w * density));
+                        m_displayInfo.nativeHeight = static_cast<uint32_t>(std::round(mode->h * density));
+                    }
+                    SDL_Rect usable{};
+                    if (SDL_GetDisplayUsableBounds(dispId, &usable)) {
+                        m_displayInfo.usableWidth = static_cast<uint32_t>(std::round(usable.w * density));
+                        m_displayInfo.usableHeight = static_cast<uint32_t>(std::round(usable.h * density));
+                    }
+                    if (m_displayInfo.nativeHeight > 0) {
+                        m_displayInfo.displayAspect = static_cast<float>(m_displayInfo.nativeWidth) / static_cast<float>(m_displayInfo.nativeHeight);
+                    }
+                    m_displayInfo.isPortrait = (m_displayInfo.displayAspect < 1.0f);
+                    m_displayInfo.isUltraWide = (m_displayInfo.displayAspect > 2.0f);
+                }
+                break;
+            }
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             case SDL_EVENT_WINDOW_RESIZED: {
                 int actualW = 0, actualH = 0;

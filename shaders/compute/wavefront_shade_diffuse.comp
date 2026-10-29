@@ -493,7 +493,7 @@ void main() {
             uint bsdfMode = STD_BSDF_FULL;
 #endif
             StdBsdf bsdf = makeStdBsdf(vec3(diffuseColor), vec3(F0), alphaRoughness, diffTrans, metallic,
-                                       dot(hitNormal, V), bsdfMode);
+                                       dot(hitNormal, V), bsdfMode); if (pc.captureMlData != 0u && bounce == 0u && roughness >= 0.70 && metallic < 0.05) { bsdf.specProb = 0.0; }
 
             // AMD FSR Radiance Cache (0.9.0) Early Path-Spread Termination Check:
             // Evaluate BEFORE NEE at secondary bounces (`bounce >= nrcBounce`) so that the 96.5% inference
@@ -678,8 +678,8 @@ void main() {
                                                                          (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
                                     if (!occluded) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                        if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) { vec4 prev = imageLoad(uAccumImage, pixelCoord); imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a)); }
+                                        /* guarded above */
                                         if (pc.captureMlData != 0u) {
                                             if (isSpecularPath) {
                                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -844,8 +844,8 @@ void main() {
                             if (giShadeWinnerSelf) {
                                 // Self candidate: path already traced x1 -> x2 without occlusion.
                                 ivec2 giPixC = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                vec4 giPrevAcc = imageLoad(uAccumImage, giPixC);
-                                imageStore(uAccumImage, giPixC, vec4(addFp16Stochastic(giPrevAcc.rgb, giContrib, seed), giPrevAcc.a));
+                                if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) { vec4 giPrevAcc = imageLoad(uAccumImage, giPixC); imageStore(uAccumImage, giPixC, vec4(addFp16Stochastic(giPrevAcc.rgb, giContrib, seed), giPrevAcc.a)); }
+                                /* guarded above */
                                 if (pc.captureMlData != 0u) {
                                     if (isSpecularPath) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, giPixC);
@@ -1030,12 +1030,12 @@ void main() {
                                     if (inlineShadowExecuted) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                         if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
-                                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) { vec4 prev = imageLoad(uAccumImage, pixelCoord); imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a)); }
+                                            /* guarded above */
                                         }
                                         if (pc.captureMlData != 0u) {
-                                            f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
-                                            f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
+                                            bool mergeMatteSpec = (!isSpecularPath && (bounce > 0u || (roughness >= 0.70 && metallic < 0.05))); f16vec3 diffUnshadowed = throughput * (mergeMatteSpec ? secDirectL : diffBrdf) * f16vec3(directLightRadiance);
+                                            f16vec3 specUnshadowed = mergeMatteSpec ? f16vec3(0.0) : (throughput * specBrdf * f16vec3(directLightRadiance));
                                             if (bounce > 0u) {
                                                 diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
                                                 specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);

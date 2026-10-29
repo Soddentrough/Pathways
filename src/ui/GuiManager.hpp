@@ -55,8 +55,13 @@ public:
     bool wantCaptureKeyboard() const;
     bool wantTextInput() const;
     void resetHistory();
+    float getUiScale() const { return m_uiScale; }
 
 private:
+    float computeUiScale() const;
+    void applyStyleAndDpiScale(float uiScale);
+
+    SDL_Window* m_window = nullptr;
     VkDevice m_device = VK_NULL_HANDLE;
     bool m_initialized = false;
     bool m_layoutInitialized = false;
@@ -65,6 +70,8 @@ private:
     uint32_t m_lastHeight = 0;
     float m_lastDispW = 0.0f;
     float m_lastDispH = 0.0f;
+    float m_uiScale = 1.0f;
+    float m_lastUiScale = 1.0f;
 
     // Rolling latency history for live profiler HUD (60-frame rolling window)
     static constexpr size_t HISTORY_SIZE = 60;

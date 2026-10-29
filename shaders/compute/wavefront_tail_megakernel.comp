@@ -505,7 +505,7 @@ void main() {
     }
 
     // Write final accumulated radiance to uAccumImage
-    if (any(greaterThan(accumRadiance, vec3(0.0)))) {
+    if ((pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) && any(greaterThan(accumRadiance, vec3(0.0)))) {
         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
         if (pixelCoord.x < int(pc.width) && pixelCoord.y < int(pc.height)) {
             vec4 prev = imageLoad(uAccumImage, pixelCoord);

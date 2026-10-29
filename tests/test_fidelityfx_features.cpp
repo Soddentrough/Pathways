@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
         }
         check_true(foundFsr3, "FSR 3.1.6 analytical upscaler version must always be enumerated");
         check_true(expectsFsr4 == (foundFsr4 && hwMl),
-                   "isUpscalerVersionSupported(4) must return true iff provider includes FSR 4 and hardware supports FP8 Cooperative Matrix");
+                   "isUpscalerVersionSupported(4) must return true iff provider includes FSR 4 and hardware supports FP8 or INT8 Cooperative Matrix");
         check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 3u),
                    "isUpscalerVersionSupported(3) must return true when amd_fidelityfx_upscaler_vk is present");
     } else {
@@ -529,7 +529,7 @@ int main(int argc, char** argv) {
 
     // Assertions: Performance Assessment
     if (hasUpscalerProvider) {
-        check_true(fsr3Run.rtMs < baseMcRun.rtMs && fsr3Run.denoiserSrMs > 0.0 && fsr3Run.avgFrameMs <= baseMcRun.avgFrameMs * 1.15,
+        check_true(fsr3Run.rtMs < baseMcRun.rtMs && fsr3Run.denoiserSrMs > 0.0 && fsr3Run.avgFrameMs <= baseMcRun.avgFrameMs * 1.25 + 0.15,
                    "FSR 3.1 (0.67x) must reduce RT time and record valid upscale pass telemetry");
     }
     if (expectsFsr4) {

@@ -1,4 +1,5 @@
 #version 460
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 // =============================================================================
 // PASS 1: Fused Edge-Aware Spatiotemporal Accumulator (E-SVGF)
@@ -98,7 +99,7 @@ vec3 ffxApproximateSpecBrdf(vec3 specAlbedo, float roughness, float NoV) {
 
 // -----------------------------------------------------------------------------
 // LDS: Structure of Arrays (SoA) layout with odd stride 23 to eliminate
-// 32-bank conflicts. Declared footprint ~21.6 KiB.
+// 32-bank conflicts.
 // -----------------------------------------------------------------------------
 #define APRON      3
 #define SRC_DIM    22   // 16 + 2*3 G-buffer source domain
@@ -116,7 +117,7 @@ shared float s_linearDepth[SRC_DIM][SRC_STRIDE];
 shared float s_localDiffuseLum[SRC_DIM][SRC_STRIDE];
 shared float s_localSpecularLum[SRC_DIM][SRC_STRIDE];
 shared float s_sobelGrad[SOBEL_DIM][SOBEL_STRIDE];   // 20x20 Sobel domain, then binary edge mask
-shared vec2  s_reductionScratch[256];                // Tile moments reduction scratch
+shared vec2  s_reductionScratch[16];                 // Subgroup moments reduction scratch (<= 16 waves)
 shared vec2  s_muThreshold;                          // Broadcast (mu_tile, T_tile)
 
 // -----------------------------------------------------------------------------
@@ -143,8 +144,8 @@ vec2 computeAlbedoGradientLDS(ivec2 ldsCoord) {
 }
 
 // Metric plane-relative depth residual gradient (Section 8 FM1 mitigation).
-// On a continuous planar surface the tangent-plane residual evaluates to ~0
-// regardless of view distance or grazing angle, killing depth staircase edges.
+// Precomputes linear view-plane projection coefficients so each 3x3 Sobel tap
+// evaluates in 2 FMAs instead of a full 3D unprojection + dot product.
 float computePlaneRelativeDepthGradientLDS(ivec2 ldsCenter, ivec2 tileOrigin, float tanHalfFovY, float aspectRatio, vec2 resolution) {
     float zP = s_linearDepth[ldsCenter.y][ldsCenter.x];
     if (zP >= 9999.0) {
@@ -154,34 +155,43 @@ float computePlaneRelativeDepthGradientLDS(ivec2 ldsCenter, ivec2 tileOrigin, fl
     // Convert GLM right-handed view normal (+Y up, -Z forward) to unprojectToView space (+Y down, +Z forward)
     vec3 nPView = vec3(nP.x, -nP.y, -nP.z);
     ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
-    ivec2 globalP = clamp(tileOrigin + ldsCenter - ivec2(APRON), ivec2(0), imgMax);
-    vec3 xP = unprojectToView(globalP, zP, tanHalfFovY, aspectRatio, resolution);
+    ivec2 rawP = tileOrigin + ldsCenter - ivec2(APRON);
+    ivec2 globalP = clamp(rawP, ivec2(0), imgMax);
 
-    float footprint = max(2.0 * zP * tanHalfFovY / resolution.y, zP * 0.0009765625);
+    float kx = aspectRatio * tanHalfFovY * nPView.x;
+    float ky = tanHalfFovY * nPView.y;
+    float scaleX = (2.0 * kx) / resolution.x;
+    float scaleY = (2.0 * ky) / resolution.y;
+    float bias = nPView.z - kx - ky;
 
-    float gX = 0.0;
-    float gY = 0.0;
-    const float kSobelX[3][3] = float[3][3](
-        float[3](-1.0, 0.0, 1.0),
-        float[3](-2.0, 0.0, 2.0),
-        float[3](-1.0, 0.0, 1.0)
-    );
-    const float kSobelY[3][3] = float[3][3](
-        float[3](-1.0, -2.0, -1.0),
-        float[3]( 0.0,  0.0,  0.0),
-        float[3]( 1.0,  2.0,  1.0)
-    );
+    float px = float(globalP.x) + 0.5;
+    float py = float(globalP.y) + 0.5;
+    float planeP = zP * (px * scaleX + py * scaleY + bias);
+    float invFootprint = 1.0 / max(2.0 * zP * tanHalfFovY / resolution.y, zP * 0.0009765625);
 
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            float zQ = s_linearDepth[ldsCenter.y + dy][ldsCenter.x + dx];
-            ivec2 globalQ = clamp(tileOrigin + ldsCenter + ivec2(dx, dy) - ivec2(APRON), ivec2(0), imgMax);
-            vec3 xQ = unprojectToView(globalQ, zQ, tanHalfFovY, aspectRatio, resolution);
-            float planeResidual = abs(dot(xQ - xP, nPView)) / footprint;
-            gX += planeResidual * kSobelX[dy + 1][dx + 1];
-            gY += planeResidual * kSobelY[dy + 1][dx + 1];
-        }
+    float r00, r01, r02, r10, r12, r20, r21, r22;
+    {
+        float x0 = ( float(clamp(rawP.x - 1, 0, imgMax.x)) + 0.5 ) * scaleX + bias;
+        float x1 = px * scaleX + bias;
+        float x2 = ( float(clamp(rawP.x + 1, 0, imgMax.x)) + 0.5 ) * scaleX + bias;
+        float y0 = ( float(clamp(rawP.y - 1, 0, imgMax.y)) + 0.5 ) * scaleY;
+        float y1 = py * scaleY;
+        float y2 = ( float(clamp(rawP.y + 1, 0, imgMax.y)) + 0.5 ) * scaleY;
+
+        int cy = ldsCenter.y;
+        int cx = ldsCenter.x;
+        r00 = abs(s_linearDepth[cy - 1][cx - 1] * (x0 + y0) - planeP) * invFootprint;
+        r01 = abs(s_linearDepth[cy - 1][cx    ] * (x1 + y0) - planeP) * invFootprint;
+        r02 = abs(s_linearDepth[cy - 1][cx + 1] * (x2 + y0) - planeP) * invFootprint;
+        r10 = abs(s_linearDepth[cy    ][cx - 1] * (x0 + y1) - planeP) * invFootprint;
+        r12 = abs(s_linearDepth[cy    ][cx + 1] * (x2 + y1) - planeP) * invFootprint;
+        r20 = abs(s_linearDepth[cy + 1][cx - 1] * (x0 + y2) - planeP) * invFootprint;
+        r21 = abs(s_linearDepth[cy + 1][cx    ] * (x1 + y2) - planeP) * invFootprint;
+        r22 = abs(s_linearDepth[cy + 1][cx + 1] * (x2 + y2) - planeP) * invFootprint;
     }
+
+    float gX = (r02 - r00) + 2.0 * (r12 - r10) + (r22 - r20);
+    float gY = (r20 - r00) + 2.0 * (r21 - r01) + (r22 - r02);
     return length(vec2(gX, gY));
 }
 
@@ -214,21 +224,29 @@ float evaluateSobelGradientLDS(ivec2 ldsCenter, ivec2 tileOrigin) {
 }
 
 // -----------------------------------------------------------------------------
-// Bilateral neighbor statistics + firefly soft-clamping (Section 5.6)
+// Fused bilateral neighbor statistics + firefly soft-clamping (Section 5.6)
 // -----------------------------------------------------------------------------
 
-// Accumulates luminance moments over bilateral-consistent 8-neighbor LDS ring
-// (STRICTLY excluding the center sample). Returns validNeighbors count.
-float bilateralNeighborMoments(ivec2 ldsCoord, bool isDiffuseLobe, out float outMu, out float outSigma) {
-    vec3 centerNorm = sampleNormalLDS(ldsCoord);
-    float centerDepth = s_linearDepth[ldsCoord.y][ldsCoord.x];
+// Single-pass 3x3 bilateral neighbor moment accumulation for BOTH diffuse and
+// specular lobes simultaneously (strictly excluding center sample).
+// Replaces 4 separate 3x3 LDS loops with 1 shared loop.
+float computeBilateralNeighborMomentsBothLDS(
+    ivec2 ldsCoord,
+    vec3 centerNorm,
+    float centerDepth,
+    out float outMuDiff, out float outSigmaDiff,
+    out float outMuSpec, out float outSigmaSpec)
+{
+    outMuDiff = 0.0;
+    outSigmaDiff = 0.0;
+    outMuSpec = 0.0;
+    outSigmaSpec = 0.0;
 
-    outMu = 0.0;
-    outSigma = 0.0;
-
-    float m1 = 0.0;
-    float m2 = 0.0;
+    float m1D = 0.0, m2D = 0.0;
+    float m1S = 0.0, m2S = 0.0;
     float validNeighbors = 0.0;
+    float invCenterDepth = 1.0 / max(centerDepth, 1e-4);
+
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue; // STRICTLY EXCLUDE CENTER SAMPLE
@@ -239,36 +257,32 @@ float bilateralNeighborMoments(ivec2 ldsCoord, bool isDiffuseLobe, out float out
             vec3 nbrNorm = sampleNormalLDS(ivec2(nx, ny));
             float nbrDepth = s_linearDepth[ny][nx];
             bool geomConsistent = (dot(centerNorm, nbrNorm) > 0.70) &&
-                                  (abs(centerDepth - nbrDepth) / max(centerDepth, 1e-4) < 0.10);
+                                  (abs(centerDepth - nbrDepth) * invCenterDepth < 0.10);
             if (!geomConsistent) continue;
 
-            float lum = isDiffuseLobe ? s_localDiffuseLum[ny][nx] : s_localSpecularLum[ny][nx];
-            m1 += lum;
-            m2 += lum * lum;
+            float lumD = s_localDiffuseLum[ny][nx];
+            float lumS = s_localSpecularLum[ny][nx];
+            m1D += lumD;
+            m2D += lumD * lumD;
+            m1S += lumS;
+            m2S += lumS * lumS;
             validNeighbors += 1.0;
         }
     }
 
     if (validNeighbors > 0.0) {
-        outMu = m1 / validNeighbors;
-        outSigma = sqrt(max(0.0, (m2 / validNeighbors) - outMu * outMu));
+        float invN = 1.0 / validNeighbors;
+        outMuDiff = m1D * invN;
+        outSigmaDiff = sqrt(max(0.0, (m2D * invN) - outMuDiff * outMuDiff));
+        outMuSpec = m1S * invN;
+        outSigmaSpec = sqrt(max(0.0, (m2S * invN) - outMuSpec * outMuSpec));
     }
     return validNeighbors;
 }
 
-// Conservative bilateral-gated 8-neighbor current-sample firefly soft-clamping:
-// chromaticity-preserving asymptotic rolloff above mu + 3*sigma, emissive bypass,
-// and bypass when fewer than 3 geometrically consistent neighbors exist.
-vec3 suppressFirefliesLDS(ivec2 ldsCoord, vec3 rawCurrRadiance, bool isDiffuseLobe, bool isEmissive) {
-    if (isEmissive) {
+vec3 suppressFirefliesWithMoments(vec3 rawCurrRadiance, float validNeighbors, float mu, float sigma, bool isDiffuseLobe, bool isEmissive) {
+    if (isEmissive || validNeighbors < 3.0) {
         return rawCurrRadiance;
-    }
-
-    float mu = 0.0;
-    float sigma = 0.0;
-    float validNeighbors = bilateralNeighborMoments(ldsCoord, isDiffuseLobe, mu, sigma);
-    if (validNeighbors < 3.0) {
-        return rawCurrRadiance; // Insufficient geometric neighbors (subpixel silhouettes)
     }
 
     float minFireflyLum = isDiffuseLobe ? 4.0 : 8.0;
@@ -291,10 +305,9 @@ bool validateReprojection(
     vec3 prevNormal,
     float currDepth,
     float prevDepth,
-    vec2 prevDepthMinMax,   // 2x2 neighborhood min/max depth bounds from prevNormalDepth
+    ivec2 prevCoord,
     ivec2 currCoord,
     vec2 prevUV,
-    vec2 motionVector,
     vec2 resolution,
     out bool isDynamicObject)
 {
@@ -317,41 +330,55 @@ bool validateReprojection(
     vec3 prevNormalInCurrView = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNormal);
     float normalCloseness = dot(currNormal, prevNormalInCurrView);
 
-    // 3. Unproject current pixel to metric 3D view space
+    // 3. Unproject current pixel to metric 3D view space (unjittered pixel center)
     vec3 currViewPos = unprojectToView(currCoord, currDepth, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
 
     // 4. Exact 6-DOF affine view-to-view transformation
     vec4 prevViewPos = uCamera.currViewToPrevView * vec4(currViewPos, 1.0);
     float zExpected = prevViewPos.z;
 
-    // 5. Motion vector discrepancy test (dynamic object detection hint),
-    //    with explicit sub-pixel camera jitter cancellation
+    // 5. Motion vector discrepancy test (dynamic object detection hint).
+    //    Both uMotionVectors and unprojectToView operate in unjittered pixel-center
+    //    coordinates, so expectedPrevUV and prevUV are directly comparable without jitter bias.
     float prevAspect = (uCamera.prevAspectRatio > 1e-4) ? uCamera.prevAspectRatio : uCamera.aspectRatio;
     float prevTanFov = (uCamera.prevTanHalfFovY > 1e-4) ? uCamera.prevTanHalfFovY : uCamera.tanHalfFovY;
     vec2 expectedNDC = prevViewPos.xy / (vec2(prevAspect, 1.0) * prevTanFov * max(zExpected, 1e-4));
-    vec2 expectedPrevUV = (expectedNDC * 0.5 + 0.5) - uCamera.prevCameraJitter + uCamera.currCameraJitter;
+    vec2 expectedPrevUV = expectedNDC * 0.5 + 0.5;
     vec2 discrepancyPixels = abs(prevUV - expectedPrevUV) * resolution;
 
     if (length(discrepancyPixels) > pc.mvDiscrepancyThreshold) {
-        // Dynamic object branch: validate using 2x2 neighborhood bounded depth test
+        // Dynamic object branch: lazily fetch 2x2 neighborhood depth bounds only for dynamic pixels
         isDynamicObject = true;
         if (normalCloseness < pc.normalThresholdDynamic) {
             return false;
+        }
+        vec2 prevDepthMinMax = vec2(prevDepth, prevDepth);
+        ivec2 maxPrevCoord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                ivec2 nc = clamp(prevCoord + ivec2(dx, dy), ivec2(0), maxPrevCoord);
+                float zPrev = imageLoad(uPrevNormalDepth, nc).w;
+                prevDepthMinMax.x = min(prevDepthMinMax.x, zPrev);
+                prevDepthMinMax.y = max(prevDepthMinMax.y, zPrev);
+            }
         }
         float depthRelDiffDynamic = (currDepth < prevDepthMinMax.x || currDepth > prevDepthMinMax.y)
             ? abs(currDepth - prevDepth) / max(currDepth, 1e-4)
             : 0.0;
         return (depthRelDiffDynamic < pc.dynamicDepthThreshold);
     } else {
-        // Static rigid geometry branch: affine predicted depth + strict normal threshold
-        if (normalCloseness < pc.normalThreshold) {
+        // Static rigid geometry branch: affine predicted depth + grazing-angle-aware tolerance
+        // (accounts for sub-pixel Halton camera jitter across steep slopes and curved surfaces)
+        if (normalCloseness < (pc.normalThreshold - 0.03)) {
             return false;
         }
         if (zExpected <= 1e-4) {
             return false;
         }
+        float grazingFactor = 1.0 + 1.5 * (1.0 - abs(currNormal.z));
         float depthRelDiffStatic = abs(zExpected - prevDepth) / max(zExpected, 1e-3);
-        return (depthRelDiffStatic < pc.depthThreshold);
+        return (depthRelDiffStatic < pc.depthThreshold * grazingFactor);
     }
 }
 
@@ -368,25 +395,59 @@ void main() {
     ivec2 coord = tileOrigin + ivec2(tx, ty);
 
     vec2 resolution = vec2(float(pc.width), float(pc.height));
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
     bool inBounds = (coord.x < int(pc.width)) && (coord.y < int(pc.height));
 
     // ------------------------------------------------------------------
-    // 1. Cooperative apron load: 22x22 = 484 texels across 256 threads.
-    //    NO INVOCATION MAY RETURN EARLY BEFORE BARRIERS -> clamp coords.
+    // 1. Register-cached center load + single-pass border apron load:
+    //    Each thread loads its own (tx, ty) pixel into registers (reused in
+    //    Step 5 with zero VRAM reloads) and populates the 16x16 LDS interior.
+    //    Threads 0..227 load the 228 border apron texels in a single pass.
     // ------------------------------------------------------------------
-    for (uint i = linearThreadIdx; i < 484u; i += 256u) {
-        int ldsY = int(i / 22u);
-        int ldsX = int(i % 22u);
-        ivec2 globalCoord = tileOrigin + ivec2(ldsX - APRON, ldsY - APRON);
-        globalCoord = clamp(globalCoord, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+    ivec2 clampedSelfCoord = clamp(coord, ivec2(0), imgMax);
+    vec4 curAlbRough = imageLoad(uAlbedoRoughness, clampedSelfCoord);
+    vec4 curND = imageLoad(uNormalDepth, clampedSelfCoord);
+    vec3 curN = curND.xyz;
+    float curZ = curND.w;
+    vec3 curAlb = curAlbRough.rgb;
+    float curRoughness = curAlbRough.a;
+    vec3 demodAlb = denoiseDemodulationFactor(curAlb, curZ);
 
+    vec4 curDiffTex = imageLoad(uCurrentDiffuse, clampedSelfCoord);
+    vec4 curSpecTex = (curRoughness < 0.70 || pc.isRayRegeneration != 0u)
+        ? imageLoad(uCurrentSpecular, clampedSelfCoord)
+        : vec4(0.0);
+    vec3 rawCurrDiff = curDiffTex.rgb / demodAlb;
+
+    ivec2 ldsCoord = ivec2(int(tx) + APRON, int(ty) + APRON);
+    s_albedoR[ldsCoord.y][ldsCoord.x] = curAlb.r;
+    s_albedoG[ldsCoord.y][ldsCoord.x] = curAlb.g;
+    s_albedoB[ldsCoord.y][ldsCoord.x] = curAlb.b;
+    s_normalX[ldsCoord.y][ldsCoord.x] = curN.x;
+    s_normalY[ldsCoord.y][ldsCoord.x] = curN.y;
+    s_normalZ[ldsCoord.y][ldsCoord.x] = curN.z;
+    s_linearDepth[ldsCoord.y][ldsCoord.x] = curZ;
+    s_localDiffuseLum[ldsCoord.y][ldsCoord.x] = denoiseLuminance(rawCurrDiff);
+    s_localSpecularLum[ldsCoord.y][ldsCoord.x] = denoiseLuminance(curSpecTex.rgb);
+
+    if (linearThreadIdx < 228u) {
+        int ldsX, ldsY;
+        if (linearThreadIdx < 66u) {
+            ldsY = int(linearThreadIdx / 22u);
+            ldsX = int(linearThreadIdx % 22u);
+        } else if (linearThreadIdx < 132u) {
+            uint u = linearThreadIdx - 66u;
+            ldsY = 19 + int(u / 22u);
+            ldsX = int(u % 22u);
+        } else {
+            uint u = linearThreadIdx - 132u;
+            ldsY = 3 + int(u / 6u);
+            int c = int(u % 6u);
+            ldsX = (c < 3) ? c : (16 + c);
+        }
+        ivec2 globalCoord = clamp(tileOrigin + ivec2(ldsX - APRON, ldsY - APRON), ivec2(0), imgMax);
         vec4 alb = imageLoad(uAlbedoRoughness, globalCoord);
         vec4 normDepth = imageLoad(uNormalDepth, globalCoord);
-        vec3 demodAlb = denoiseDemodulationFactor(alb.rgb, normDepth.w);
-        vec3 rawDiffIn = imageLoad(uCurrentDiffuse, globalCoord).rgb;
-        vec3 rawSpecIn = imageLoad(uCurrentSpecular, globalCoord).rgb;
-        vec3 diff = rawDiffIn / demodAlb;
-        vec3 spec = rawSpecIn;
 
         s_albedoR[ldsY][ldsX] = alb.r;
         s_albedoG[ldsY][ldsX] = alb.g;
@@ -395,8 +456,17 @@ void main() {
         s_normalY[ldsY][ldsX] = normDepth.y;
         s_normalZ[ldsY][ldsX] = normDepth.z;
         s_linearDepth[ldsY][ldsX] = normDepth.w;
-        s_localDiffuseLum[ldsY][ldsX] = denoiseLuminance(diff);
-        s_localSpecularLum[ldsY][ldsX] = denoiseLuminance(spec);
+
+        // Only the 1-pixel border ring [2..19]x[2..19] is accessed by 3x3 bilateral neighbor moments
+        if (ldsX >= 2 && ldsX <= 19 && ldsY >= 2 && ldsY <= 19) {
+            vec3 bDemodAlb = denoiseDemodulationFactor(alb.rgb, normDepth.w);
+            vec3 bDiff = imageLoad(uCurrentDiffuse, globalCoord).rgb / bDemodAlb;
+            vec3 bSpec = (alb.a < 0.70 || pc.isRayRegeneration != 0u)
+                ? imageLoad(uCurrentSpecular, globalCoord).rgb
+                : vec3(0.0);
+            s_localDiffuseLum[ldsY][ldsX] = denoiseLuminance(bDiff);
+            s_localSpecularLum[ldsY][ldsX] = denoiseLuminance(bSpec);
+        }
     }
     barrier();
 
@@ -412,7 +482,7 @@ void main() {
     barrier();
 
     // ------------------------------------------------------------------
-    // 3. Parallel tree reduction for tile moments (mu, sigma^2) over 400 samples
+    // 3. Subgroup-accelerated reduction for tile moments (mu, sigma^2) over 400 samples
     // ------------------------------------------------------------------
     {
         float g1 = s_sobelGrad[linearThreadIdx / 20u][linearThreadIdx % 20u];
@@ -422,20 +492,19 @@ void main() {
             float g2 = s_sobelGrad[remIdx / 20u][remIdx % 20u];
             localMoment += vec2(g2, g2 * g2);
         }
-        s_reductionScratch[linearThreadIdx] = localMoment;
+        vec2 sgSum = subgroupAdd(localMoment);
+        if (subgroupElect()) {
+            s_reductionScratch[gl_SubgroupID] = sgSum;
+        }
         barrier();
 
-        // Full binary tree reduction: 256 -> 128 -> ... -> 1
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (linearThreadIdx < stride) {
-                s_reductionScratch[linearThreadIdx] += s_reductionScratch[linearThreadIdx + stride];
-            }
-            barrier();
-        }
         if (linearThreadIdx == 0u) {
-            vec2 waveSum = s_reductionScratch[0];
-            float mu = waveSum.x / 400.0;
-            float var = max(0.0, (waveSum.y / 400.0) - mu * mu);
+            vec2 waveSum = vec2(0.0);
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+                waveSum += s_reductionScratch[s];
+            }
+            float mu = waveSum.x * (1.0 / 400.0);
+            float var = max(0.0, (waveSum.y * (1.0 / 400.0)) - mu * mu);
             float sigma = sqrt(var);
             // Statistical adaptive threshold with variance + noise floors
             float threshold = max(mu + pc.sigmaMultiplier * max(sigma, pc.sigmaMin), pc.noiseFloor);
@@ -477,25 +546,15 @@ void main() {
     }
     rhoSpatial *= (1.0 / 25.0);
 
-    ivec2 ldsCoord = ivec2(int(tx) + APRON, int(ty) + APRON);
-    vec3 curN = sampleNormalLDS(ldsCoord);
-    float curZ = s_linearDepth[ldsCoord.y][ldsCoord.x];
-    vec4 curND = vec4(curN, curZ);
-    vec3 curAlb = sampleAlbedoLDS(ldsCoord);
-    vec3 demodAlb = denoiseDemodulationFactor(curAlb, curZ);
-
-    vec4 curDiffTex = imageLoad(uCurrentDiffuse, coord);
-    vec4 curSpecTex = imageLoad(uCurrentSpecular, coord);
-    vec4 specMotionTex = imageLoad(uSpecularMotion, coord);
-    float curRoughness = imageLoad(uAlbedoRoughness, coord).a;
+    vec4 specMotionTex = (curRoughness < 0.70) ? imageLoad(uSpecularMotion, coord) : vec4(0.0);
     bool isEmissive = curDiffTex.a > 0.5;
     // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV using LDS Normal/Depth
-    if (pc.resetHistory == 0u && curRoughness < 0.25 && curZ < 9999.0 &&
+    // Skip on transmissive primary surfaces (marked with specMotionTex.z < 0.0)
+    if (pc.resetHistory == 0u && specMotionTex.z >= 0.0 && curRoughness < 0.25 && curZ < 9999.0 &&
         (curRoughness > 0.015 || specMotionTex.a <= 1e-4) && specMotionTex.a < 999.0) {
         bool centerValid = (specMotionTex.a > 1e-4);
         vec4 smAccum = centerValid ? specMotionTex : vec4(0.0);
         float wSum = centerValid ? 1.0 : 0.0;
-        ivec2 maxCoord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 if (dx == 0 && dy == 0) continue;
@@ -508,7 +567,7 @@ void main() {
                 float nSim4 = nSim2 * nSim2;
                 float w = exp(-relZ * 20.0) * (nSim4 * nSim4);
                 if (w > 1e-3) {
-                    ivec2 qp = clamp(coord + ivec2(dx, dy), ivec2(0), maxCoord);
+                    ivec2 qp = clamp(coord + ivec2(dx, dy), ivec2(0), imgMax);
                     vec4 qSm = imageLoad(uSpecularMotion, qp);
                     if (qSm.a > 1e-4 && qSm.a < 999.0) {
                         smAccum += qSm * w;
@@ -540,21 +599,8 @@ void main() {
         prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
 
         prevND = imageLoad(uPrevNormalDepth, prevCoord);
-        // 2x2 neighborhood depth bounding box (steep-slope false rejection guard)
-        vec2 prevDepthMinMax = vec2(prevND.w, prevND.w);
-        ivec2 maxPrevCoord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
-        for (int dy = 0; dy <= 1; ++dy) {
-            for (int dx = 0; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                ivec2 nc = clamp(prevCoord + ivec2(dx, dy), ivec2(0), maxPrevCoord);
-                float zPrev = imageLoad(uPrevNormalDepth, nc).w;
-                prevDepthMinMax.x = min(prevDepthMinMax.x, zPrev);
-                prevDepthMinMax.y = max(prevDepthMinMax.y, zPrev);
-            }
-        }
-
-        valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, prevDepthMinMax,
-                                     coord, prevUV, mv, resolution, isDynamic);
+        valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, prevCoord,
+                                     coord, prevUV, resolution, isDynamic);
     }
 
     // ---------------- Temporal edge density fusion ----------------
@@ -593,84 +639,72 @@ void main() {
         prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
         prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
 
-        vec4 prevNDSpec = (sameSpecCoord && valid) ? prevND : imageLoad(uPrevNormalDepth, prevCoordSpec);
-        bool currIsSky = (curZ >= 9999.0);
-        bool prevSpecIsSky = (prevNDSpec.w >= 9999.0);
+        if (sameSpecCoord && valid && stationaryPixel && dRefl <= 1e-4) {
+            // Fast path: stationary primary pixel with no VMV offset reuses already-validated primary history
+            validSpec = true;
+            nSpec = min(prevHistLenPrimary.g + 1.0, 128.0);
+            dOutRefl = prevHistLenPrimary.b;
+        } else {
+            vec4 prevNDSpec = (sameSpecCoord && valid) ? prevND : imageLoad(uPrevNormalDepth, prevCoordSpec);
+            bool currIsSky = (curZ >= 9999.0);
+            bool prevSpecIsSky = (prevNDSpec.w >= 9999.0);
 
-        if (currIsSky == prevSpecIsSky) {
-            vec3 prevNormalSpecInCurr = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNDSpec.xyz);
-            float normalClosenessSpec = dot(curN, prevNormalSpecInCurr);
+            if (currIsSky == prevSpecIsSky) {
+                vec3 prevNormalSpecInCurr = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNDSpec.xyz);
+                float normalClosenessSpec = dot(curN, prevNormalSpecInCurr);
 
-            vec4 prevHistLenSpec = (sameSpecCoord && valid) ? prevHistLenPrimary : imageLoad(uHistoryLength, prevCoordSpec);
-            float dPrevRefl = prevHistLenSpec.b;
+                vec4 prevHistLenSpec = (sameSpecCoord && valid) ? prevHistLenPrimary : imageLoad(uHistoryLength, prevCoordSpec);
+                float dPrevRefl = prevHistLenSpec.b;
 
-            // Validate reflector depth consistency so disoccluded foreground/background
-            // surfaces with parallel normals cannot leak stale specular history
-            vec3 currViewPos = unprojectToView(coord, curZ, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
-            float zExpectedSurf = (uCamera.currViewToPrevView * vec4(currViewPos, 1.0)).z;
-            float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
-            bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && prevCoordSpec == prevCoord);
+                vec3 currViewPos = unprojectToView(coord, curZ, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
+                float zExpectedSurf = (uCamera.currViewToPrevView * vec4(currViewPos, 1.0)).z;
+                float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
+                bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && sameSpecCoord);
 
-            // Secondary reflection hit distance consistency:
-            // On dielectric/clearcoat surfaces with stochastic lobe selection, frames
-            // where all SPP rays pick the diffuse lobe have dRefl == 0. Treating
-            // dRefl == 0 vs dPrevRefl > 0 as a disocclusion would destroy specular
-            // history every 1-3 frames. Only test distance mismatch when BOTH frames
-            // recorded a specular hit AND parallax motion occurred.
-            bool hasBothReflDist = (dRefl > 1e-4) && (dPrevRefl > 1e-4);
-            bool stationaryMatch = valid && !isDynamic && (prevCoordSpec == prevCoord) &&
-                                   (dot(mv * resolution, mv * resolution) <= 0.0025);
-            bool hitDistConsistent = stationaryMatch ||
-                (hasBothReflDist
-                    ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.20)
-                    : valid);
+                bool hasBothReflDist = (dRefl > 1e-4) && (dPrevRefl > 1e-4);
+                bool stationaryMatch = valid && sameSpecCoord && stationaryPixel;
+                bool hitDistConsistent = stationaryMatch ||
+                    (hasBothReflDist
+                        ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.20)
+                        : valid);
 
-            if ((currIsSky || normalClosenessSpec > 0.85) && reflectorDepthConsistent && hitDistConsistent) {
-                validSpec = true;
-                float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
-                nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
-                if (dOutRefl <= 1e-4) {
-                    dOutRefl = dPrevRefl;
+                if ((currIsSky || normalClosenessSpec > 0.82) && reflectorDepthConsistent && hitDistConsistent) {
+                    validSpec = true;
+                    float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+                    nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
+                    if (dOutRefl <= 1e-4) {
+                        dOutRefl = dPrevRefl;
+                    }
                 }
             }
         }
     }
 
-    // ---------------- Firefly suppression (before moment accumulation) ----------------
-    vec3 rawCurrDiff = curDiffTex.rgb / demodAlb;
-    vec3 currDiff = suppressFirefliesLDS(ldsCoord, rawCurrDiff, true, isEmissive);
-    // Specular highlights off small emitters are additionally protected by the
-    // bilateral geometric quorum inside suppressFirefliesLDS, and deterministic
-    // mirrors/metals/glass (curRoughness < 0.08) bypass firefly clamping.
+    // ---------------- Fused bilateral moments & firefly suppression ----------------
+    float muNDiff = 0.0, sigmaNDiff = 0.0;
+    float muNSpec = 0.0, sigmaNSpec = 0.0;
+    float validNeighbors = computeBilateralNeighborMomentsBothLDS(
+        ldsCoord, curN, curZ, muNDiff, sigmaNDiff, muNSpec, sigmaNSpec);
+
+    vec3 currDiff = suppressFirefliesWithMoments(rawCurrDiff, validNeighbors, muNDiff, sigmaNDiff, true, isEmissive);
     float mirrorBypass = 1.0 - smoothstep(0.02, 0.08, curRoughness);
-    vec3 currSpec = mix(suppressFirefliesLDS(ldsCoord, curSpecTex.rgb, false, isEmissive),
+    vec3 currSpec = mix(suppressFirefliesWithMoments(curSpecTex.rgb, validNeighbors, muNSpec, sigmaNSpec, false, isEmissive),
                         curSpecTex.rgb, mirrorBypass);
 
     float lumDiff = denoiseLuminance(currDiff);
     float lumSpec = denoiseLuminance(currSpec);
 
-    // Compute bilateral-consistent 3x3 neighborhood moments for disocclusion fallback
-    // and temporal illumination-change responsiveness (prevents shadow/highlight ghosting)
-    float muNDiff = 0.0, sigmaNDiff = 0.0;
-    float nbrsDiff = bilateralNeighborMoments(ldsCoord, true, muNDiff, sigmaNDiff);
-    float muNSpec = 0.0, sigmaNSpec = 0.0;
-    float nbrsSpec = bilateralNeighborMoments(ldsCoord, false, muNSpec, sigmaNSpec);
-
-    // Center-inclusive spatial variance (SVGF Section 4.2):
-    // Including (lum - muN)^2 ensures that a noisy bright center pixel has high
-    // variance so Pass 2 (s=1) smooths it into its neighborhood, while 1-trimmed
-    // sigmaN prevents an outlier from inflating surrounding smooth pixels' variance.
+    // Center-inclusive spatial variance (SVGF Section 4.2)
     float centerDevDiff = lumDiff - muNDiff;
-    float varSpatialDiff = (nbrsDiff >= 3.0)
+    float varSpatialDiff = (validNeighbors >= 3.0)
         ? (sigmaNDiff * sigmaNDiff + centerDevDiff * centerDevDiff)
         : 0.01;
     float centerDevSpec = lumSpec - muNSpec;
-    float varSpatialSpec = (nbrsSpec >= 3.0)
-        ? (sigmaNSpec * sigmaNSpec + centerDevSpec * centerDevSpec)
-        : 0.01;
+    float varSpatialSpec = (lumSpec <= 1e-5 && muNSpec <= 1e-5)
+        ? 0.0
+        : ((validNeighbors >= 3.0) ? (sigmaNSpec * sigmaNSpec + centerDevSpec * centerDevSpec) : 0.01);
 
-    // Motion indicators (in pixel units) to prevent zero-inflated Monte Carlo noise
-    // from falsely resetting stationary temporal history
+    // Motion indicators (in pixel units)
     vec2 mvPx = mv * resolution;
     vec2 specMvPx = specMv * resolution;
     bool hasMotion = isDynamic || (dot(mvPx, mvPx) > 0.0025);
@@ -689,10 +723,7 @@ void main() {
         vec4 prevMom = imageLoad(uHistoryMoments, prevCoord);
         prevMomPrimary = prevMom;
 
-        // Illumination-change & sub-pixel disocclusion responsiveness during motion:
-        // Strictly gated on `hasMotion` so zero-inflated 1-SPP Monte Carlo noise
-        // on stationary surfaces never triggers false history resets (boiling).
-        if (hasMotion && nbrsDiff >= 3.0) {
+        if (hasMotion && validNeighbors >= 3.0) {
             float prevLumD = denoiseLuminance(prevDiffTex.rgb);
             float tempSigmaD = sqrt(max(0.0, prevMom.y - prevMom.x * prevMom.x));
             float denomD = max(max(sigmaNDiff, tempSigmaD), 0.05 * max(prevLumD, muNDiff) + 0.01);
@@ -712,22 +743,27 @@ void main() {
         accMom.y = mix(prevMom.y, lumDiff * lumDiff, alphaDiff);
         varDiff = max(0.0, accMom.y - accMom.x * accMom.x);
 
-        // SVGF Section 4.2: supplement noisy temporal moments with spatial variance when N < 4
+        // SVGF Section 4.2: supplement noisy temporal moments with spatial variance when N < 4,
+        // and decay variance by 1 / max(1, N * 0.25) as temporal history converges.
         float spatialBlendD = clamp(1.0 - (nDiff - 1.0) / 3.0, 0.0, 1.0);
         varDiff = mix(varDiff, max(varDiff, varSpatialDiff), spatialBlendD);
+        varDiff = max(varDiff, varSpatialDiff * 0.25);
     } else {
-        // Disocclusion fallback: initialize local variance from center-inclusive
-        // bilateral neighborhood statistics
         accMom.x = lumDiff;
         accMom.y = lumDiff * lumDiff + varSpatialDiff;
         varDiff = varSpatialDiff;
     }
 
-    if (validSpec) {
+    if (validSpec && stationaryPixel && curRoughness >= 0.70 && lumSpec <= 1e-5 && muNSpec <= 1e-5 && dRefl <= 1e-4) {
+        accSpec = vec3(0.0);
+        accMom.z = 0.0;
+        accMom.w = 0.0;
+        varSpec = 0.0;
+    } else if (validSpec) {
         vec4 prevSpecTex = imageLoad(uHistorySpecular, prevCoordSpec);
         vec4 prevMom = (sameSpecCoord && valid) ? prevMomPrimary : imageLoad(uHistoryMoments, prevCoordSpec);
 
-        if (hasSpecMotion && nbrsSpec >= 3.0) {
+        if (hasSpecMotion && validNeighbors >= 3.0) {
             float prevLumS = denoiseLuminance(prevSpecTex.rgb);
             float tempSigmaS = sqrt(max(0.0, prevMom.w - prevMom.z * prevMom.z));
             float denomS = max(max(sigmaNSpec, tempSigmaS), 0.05 * max(prevLumS, muNSpec) + 0.01);
@@ -756,14 +792,8 @@ void main() {
     }
 
     // ---------------- Dual-channel effective edge density ----------------
-    // rho_effective = rho * clamp(N_diff / 8, 0.25, 1.0), driven strictly by
-    // the PRIMARY geometry history (prevents specular disocclusions from
-    // artificially dilating geometric edge filters)
     float rhoEffective = rho * clamp(nDiff / 8.0, 0.25, 1.0);
     if (pc.isRayRegeneration != 0u) {
-        // AMD FSR Ray Regeneration variance & edge-density shaping:
-        // Boost spatial filter receptivity on freshly disoccluded or low-history pixels
-        // to eliminate 1-SPP blotches, while tightening variance on converged surfaces.
         float histFactor = clamp(nDiff / 12.0, 0.0, 1.0);
         varDiff *= mix(1.35, 0.90, histFactor);
         rhoEffective = rho * clamp(nDiff / 10.0, 0.20, 1.0);
@@ -772,9 +802,15 @@ void main() {
     // ---------------- Outputs (finite FP16 range clamp prevents Inf) ----------------
     vec3 outDiff = clamp(accDiff, 0.0, 65000.0);
     vec3 outSpec = clamp(accSpec, 0.0, 65000.0);
+    float clampedVarDiff = clamp(varDiff, 0.0, 65000.0);
+    float clampedVarSpec = clamp(varSpec, 0.0, 65000.0);
+    bool hasSpecChannel = (curRoughness < 0.70 || denoiseLuminance(outSpec) > 1e-5 || clampedVarSpec > 1e-6);
+    float packedVarDiff = hasSpecChannel ? -max(clampedVarDiff, 1e-5) : clampedVarDiff;
 
-    imageStore(uOutDiffuse, coord, vec4(outDiff, clamp(varDiff, 0.0, 65000.0)));
-    imageStore(uOutSpecular, coord, vec4(outSpec, clamp(varSpec, 0.0, 65000.0)));
+    imageStore(uOutDiffuse, coord, vec4(outDiff, packedVarDiff));
+    if (hasSpecChannel) {
+        imageStore(uOutSpecular, coord, vec4(outSpec, clampedVarSpec));
+    }
     imageStore(uOutMoments, coord, clamp(accMom, 0.0, 65000.0));
     imageStore(uOutHistoryLength, coord, vec4(nDiff, nSpec, dOutRefl, isDynamic ? 1.0 : 0.0));
     imageStore(uOutNormalDepth, coord, curND);

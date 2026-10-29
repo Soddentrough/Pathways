@@ -714,21 +714,21 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     do { \
         if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
-            vec2 vSurf_ = imageLoad(uMlSpecularMotionImage, pCoord_).xy; \
+            vec4 smPrev_ = imageLoad(uMlSpecularMotionImage, pCoord_); if (smPrev_.z >= 0.0) { vec2 vSurf_ = smPrev_.xy; \
             float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
             vec3 toSurf_ = origin - ubo.position.xyz; \
             float surfDist_ = length(toSurf_); \
             vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
             vec3 xVirt_ = origin + primDir_ * reflDist_; \
             vec3 prevXVirt_ = xVirt_; \
-            if (!(isMiss) && (hit.hitData1.w & 1u) == 0u && hit.hitData1.y != 0xFFFFFFFFu) { \
+            InstanceGPU rInst_; if (!(isMiss) && (hit.hitData1.w & 1u) == 0u && hit.hitData1.y != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData1.x]).transform != rInst_.invTransform)) { \
                 vec2 rBary_ = unpackUnorm2x16(hit.hitData1.z); \
                 float rW_ = 1.0 - rBary_.x - rBary_.y; \
                 vec3 rV0_ = vertexPositions[3u * hit.hitData1.y + 0u].xyz; \
                 vec3 rV1_ = vertexPositions[3u * hit.hitData1.y + 1u].xyz; \
                 vec3 rV2_ = vertexPositions[3u * hit.hitData1.y + 2u].xyz; \
                 vec3 rLocalPos_ = rW_ * rV0_ + rBary_.x * rV1_ + rBary_.y * rV2_; \
-                InstanceGPU rInst_ = instances[hit.hitData1.x]; \
+                /* rInst_ already loaded above */ \
                 vec3 rCurrWorld_ = (rInst_.transform * vec4(rLocalPos_, 1.0)).xyz; \
                 vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
                 vec3 rDeltaWorld_ = rCurrWorld_ - rPrevWorld_; \
@@ -752,7 +752,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
                 vS_ = vSurf_; \
             } \
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
-            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \
+            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); } \
         } \
         RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss); \
     } while(false)

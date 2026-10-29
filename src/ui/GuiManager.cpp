@@ -1022,8 +1022,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 });
             ImGui::SameLine();
             drawQuickUpscalerBtn("FSR 4.1 ML", isFsr4Selected, hwMl,
-                hwMl ? "AMD FidelityFX Super Resolution 4.1.2 (ML Cooperative Matrix Super-Resolution)."
-                     : "Unavailable on this GPU: FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix).", [&]() {
+                hwMl ? "AMD FidelityFX Super Resolution 4.1.2 (ML Cooperative Matrix Super-Resolution: RDNA4 FP8 / RDNA3 & RDNA2 INT8)."
+                     : "Unavailable on this GPU: FSR 4 ML requires hardware FP8 or INT8 Cooperative Matrix (VK_KHR_cooperative_matrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr4;
                     config.upways_superres = false;
@@ -2012,8 +2012,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                               stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (SDK Super-Resolution)."
                                                   : "Unavailable: Requires amd_fidelityfx_upscaler_vk.");
                 drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML", stats.supports_fsr4,
-                              stats.supports_fsr4 ? "AMD FidelityFX Super Resolution 4.1.2 (ML Super-Resolution)."
-                                                  : "Unavailable on this GPU: FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix).");
+                              stats.supports_fsr4 ? "AMD FidelityFX Super Resolution 4.1.2 (ML Super-Resolution: RDNA4 FP8 / RDNA3 & RDNA2 INT8)."
+                                                  : "Unavailable on this GPU: FSR 4 ML requires hardware FP8 or INT8 Cooperative Matrix (VK_KHR_cooperative_matrix).");
 
                 ImGui::NewLine();
                 ImGui::PopID();

@@ -107,7 +107,7 @@ Engine::Engine(const Config& config) : m_config(config) {
             m_config.render_height = 0;
         } else if (m_config.upscaler_mode == UpscalerMode::FSR) {
             if ((m_config.fsr_version == FsrVersion::Fsr4 || m_config.fsr_version == FsrVersion::Fsr5) && !fsr4Supported) {
-                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8/INT8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
                 m_config.upscaler_mode = UpscalerMode::None;
                 m_config.render_scale = 1.0f;
                 m_config.render_width = 0;
@@ -1673,7 +1673,7 @@ void Engine::renderFrame() {
             m_config.render_height = 0;
         } else if (m_config.upscaler_mode == UpscalerMode::FSR) {
             if ((m_config.fsr_version == FsrVersion::Fsr4 || m_config.fsr_version == FsrVersion::Fsr5) && !fsr4Supported) {
-                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8/INT8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
                 m_config.upscaler_mode = UpscalerMode::None;
                 m_config.render_scale = 1.0f;
                 m_config.render_width = 0;
@@ -2103,10 +2103,11 @@ void Engine::renderFrame() {
         }
     }
 
-    bool isStationaryAccum = m_config.progressive_accumulation && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
-    bool isDenoisingRenderRes = (m_config.denoiser_mode == DenoiserMode::Svgf ||
-                                 m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-    bool enableJitter = !isStationaryAccum && !isDenoisingRenderRes &&
+    bool hasDenoiser = (m_config.denoiser_mode != DenoiserMode::None || m_config.upscaler_mode == UpscalerMode::Upways || m_config.upscaler_mode == UpscalerMode::Gateway);
+    bool isStationaryAccum = m_config.progressive_accumulation && !hasDenoiser && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
+    (void)0;
+
+    bool enableJitter = !isStationaryAccum &&
                         ((m_config.upscaler_mode == UpscalerMode::FSR) ||
                          (m_config.upscaler_mode == UpscalerMode::Upways && m_config.upways_superres) ||
                          (m_config.upscaler_mode == UpscalerMode::Gateway && m_config.gateway_superres));

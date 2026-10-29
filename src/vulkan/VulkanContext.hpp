@@ -138,7 +138,12 @@ public:
     bool hasInt8CooperativeMatrix() const { return m_hasInt8CoopMatrix; }
     bool hasMutableDescriptorType() const { return m_hasMutableDescriptorType; }
     bool supportsFsr4() const {
-        return m_hasCooperativeMatrix && m_hasShaderFloat8 && m_hasShaderFloat8CoopMatrix && m_hasFp8CoopMatrix && m_hasMutableDescriptorType;
+        const bool hasFp8Ml = m_hasShaderFloat8 && m_hasShaderFloat8CoopMatrix && m_hasFp8CoopMatrix;
+        const bool hasInt8Ml = (m_vk12Features.shaderInt8 == VK_TRUE) &&
+                               (m_vk12Features.shaderFloat16 == VK_TRUE) &&
+                               (m_vk12Features.storageBuffer8BitAccess == VK_TRUE) &&
+                               m_hasInt8CoopMatrix;
+        return m_hasCooperativeMatrix && m_hasMutableDescriptorType && (hasFp8Ml || hasInt8Ml);
     }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
