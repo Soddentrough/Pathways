@@ -100,6 +100,14 @@ bool FfxSdkRuntime::tryLoadModule(FfxEffectModule module, const std::vector<std:
         searchDirs.emplace_back(m_sdkRootDir + "/Kits/FidelityFX/signedbin");
         searchDirs.emplace_back(m_sdkRootDir + "/bin");
     }
+    std::error_code symlinkEc;
+#if !defined(_WIN32)
+    auto exePath = std::filesystem::read_symlink("/proc/self/exe", symlinkEc);
+    if (!symlinkEc && exePath.has_parent_path()) {
+        searchDirs.emplace_back(exePath.parent_path().string());
+    }
+#endif
+    searchDirs.emplace_back("build/bin");
     searchDirs.emplace_back(".");
 
     for (const auto& dir : searchDirs) {
@@ -275,12 +283,63 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
         qci.queueCount = 1;
         qci.pQueuePriorities = &queuePriority;
 
+        std::vector<const char*> mlExts;
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{};
+        coopFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        coopFeatures.cooperativeMatrix = VK_TRUE;
+
+        VkPhysicalDeviceVulkan12Features vk12Features{};
+        vk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        vk12Features.shaderFloat16 = VK_TRUE;
+        vk12Features.shaderInt8 = VK_TRUE;
+        vk12Features.storageBuffer8BitAccess = VK_TRUE;
+        vk12Features.pNext = &coopFeatures;
+
+#ifdef VK_EXT_mutable_descriptor_type
+        VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableFeatures{};
+        mutableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+        mutableFeatures.mutableDescriptorType = VK_TRUE;
+        coopFeatures.pNext = &mutableFeatures;
+#endif
+#ifdef VK_EXT_shader_float8
+        VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
+        float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+        float8Features.shaderFloat8 = VK_TRUE;
+        float8Features.shaderFloat8CooperativeMatrix = VK_TRUE;
+    #ifdef VK_EXT_mutable_descriptor_type
+        mutableFeatures.pNext = &float8Features;
+    #else
+        coopFeatures.pNext = &float8Features;
+    #endif
+#endif
+
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+
+        if (supportsHardwareMl(physDevice)) {
+            mlExts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#ifdef VK_EXT_shader_float8
+            mlExts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#endif
+#ifdef VK_EXT_mutable_descriptor_type
+            mlExts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+#endif
+            dci.enabledExtensionCount = static_cast<uint32_t>(mlExts.size());
+            dci.ppEnabledExtensionNames = mlExts.data();
+            dci.pNext = &vk12Features;
+        }
+
         if (vkCreateDevice(physDevice, &dci, nullptr, &tempDevice) == VK_SUCCESS) {
             device = tempDevice;
+        } else {
+            dci.enabledExtensionCount = 0;
+            dci.ppEnabledExtensionNames = nullptr;
+            dci.pNext = nullptr;
+            if (vkCreateDevice(physDevice, &dci, nullptr, &tempDevice) == VK_SUCCESS) {
+                device = tempDevice;
+            }
         }
     }
 
@@ -459,8 +518,16 @@ ffxReturnCode_t FfxSdkRuntime::dispatchCreateContext(ffxContext* context, ffxCre
     if (!context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
+    const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
+    if (loader.handle != nullptr && loader.createContext) {
+        ffxReturnCode_t ret = loader.createContext(context, desc, memCb);
+        if (ret == FFX_API_RETURN_OK && *context != nullptr) {
+            m_contextOwners.emplace_back(*context, &loader);
+            return ret;
+        }
+    }
     const ModuleEntry* mod = selectModuleForHeader(desc->type);
-    if (mod && mod->createContext) {
+    if (mod && mod != &loader && mod->createContext) {
         ffxReturnCode_t ret = mod->createContext(context, desc, memCb);
         if (ret == FFX_API_RETURN_OK && *context != nullptr) {
             m_contextOwners.emplace_back(*context, mod);
@@ -525,6 +592,18 @@ ffxReturnCode_t FfxSdkRuntime::dispatchQuery(ffxContext* context, ffxQueryDescHe
     }
     const ModuleEntry* mod = (context && *context) ? findModuleForContext(*context) : nullptr;
     if (!mod) {
+        const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
+        if (loader.handle != nullptr && loader.query) {
+            ffxReturnCode_t loaderRet = loader.query(context, desc);
+            bool hasResults = true;
+            if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+                const auto* q = reinterpret_cast<const ffxQueryDescGetVersions*>(desc);
+                hasResults = (q->outputCount && *q->outputCount > 0);
+            }
+            if (loaderRet == FFX_API_RETURN_OK && hasResults) {
+                return loaderRet;
+            }
+        }
         mod = selectModuleForHeader(lookupType);
     }
     if (mod && mod->query) {

@@ -507,7 +507,8 @@ FrameStats TelemetryReporter::getStats() const {
         stats.denoiser_profiler_stats.total_pass_ms = pt.totalMs;
         stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
     } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Svgf ||
-                m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+                (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
+                 m_engine->m_denoiser && m_engine->m_denoiser->isUsingSdkProvider())) &&
                m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
         const bool isFfxRr = (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
                               m_engine->m_denoiser->isUsingSdkProvider());
@@ -748,11 +749,11 @@ FrameStats TelemetryReporter::getStats() const {
     // 5. Engine Settings & State
     stats.visualize_mgpu_split = m_engine->m_config.visualize_mgpu_split;
     switch (m_engine->m_config.denoiser_mode) {
-        case DenoiserMode::Upways: stats.denoiser_mode_str = "Upways"; break;
-        case DenoiserMode::Gateway: stats.denoiser_mode_str = "Gateway"; break;
+        case DenoiserMode::Upways: stats.denoiser_mode_str = stats.has_cooperative_matrix ? "Upways" : "None"; break;
+        case DenoiserMode::Gateway: stats.denoiser_mode_str = stats.has_cooperative_matrix ? "Gateway" : "None"; break;
         case DenoiserMode::Svgf: stats.denoiser_mode_str = "SVGF"; break;
         case DenoiserMode::FfxRayRegeneration:
-            stats.denoiser_mode_str = stats.supports_fsr_rr ? "FFX Ray Regeneration" : "SVGF";
+            stats.denoiser_mode_str = stats.supports_fsr_rr ? "FFX Ray Regeneration" : "None";
             break;
         case DenoiserMode::None: default: stats.denoiser_mode_str = "None"; break;
     }
@@ -760,21 +761,23 @@ FrameStats TelemetryReporter::getStats() const {
     switch (m_engine->m_config.upscaler_mode) {
         case UpscalerMode::FSR: {
             FsrVersion activeFsrVer = m_engine->m_config.fsr_version;
-            if (m_engine->m_superResolution && m_engine->m_superResolution->getFsrUpscaler()) {
+            if (m_engine->m_superResolution && m_engine->m_superResolution->getFsrUpscaler() &&
+                m_engine->m_superResolution->getFsrUpscaler()->isUsingSdkProvider()) {
                 activeFsrVer = m_engine->m_superResolution->getFsrUpscaler()->getActiveVersion();
-            } else if (activeFsrVer == FsrVersion::Auto || (!stats.supports_fsr4 && activeFsrVer != FsrVersion::Fsr3)) {
-                activeFsrVer = stats.supports_fsr4 ? FsrVersion::Fsr4 : FsrVersion::Fsr3;
             }
-            switch (activeFsrVer) {
-                case FsrVersion::Fsr3: stats.upscaler_mode_str = "FSR 3.1"; break;
-                case FsrVersion::Fsr4: stats.upscaler_mode_str = "FSR 4.1 ML"; break;
-                case FsrVersion::Fsr5: stats.upscaler_mode_str = "FSR 5"; break;
-                case FsrVersion::Auto: default: stats.upscaler_mode_str = "FSR"; break;
+            if ((activeFsrVer == FsrVersion::Fsr4 || activeFsrVer == FsrVersion::Fsr5) && stats.supports_fsr4) {
+                stats.upscaler_mode_str = (activeFsrVer == FsrVersion::Fsr5) ? "FSR 5" : "FSR 4.1 ML";
+            } else if (activeFsrVer == FsrVersion::Fsr3 && stats.supports_fsr3) {
+                stats.upscaler_mode_str = "FSR 3.1";
+            } else if (activeFsrVer == FsrVersion::Auto) {
+                stats.upscaler_mode_str = stats.supports_fsr4 ? "FSR 4.1 ML" : (stats.supports_fsr3 ? "FSR 3.1" : "None");
+            } else {
+                stats.upscaler_mode_str = "None";
             }
             break;
         }
-        case UpscalerMode::Upways: stats.upscaler_mode_str = "Upways"; break;
-        case UpscalerMode::Gateway: stats.upscaler_mode_str = "Gateway"; break;
+        case UpscalerMode::Upways: stats.upscaler_mode_str = stats.has_cooperative_matrix ? "Upways" : "None"; break;
+        case UpscalerMode::Gateway: stats.upscaler_mode_str = stats.has_cooperative_matrix ? "Gateway" : "None"; break;
         case UpscalerMode::None: default: stats.upscaler_mode_str = "None"; break;
     }
     stats.render_scale = m_engine->m_config.render_scale;

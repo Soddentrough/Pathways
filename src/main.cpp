@@ -234,8 +234,9 @@ int main(int argc, char* argv[]) {
             };
 
             const auto initStats = engine.getStats();
-            const std::string expectedFsr4 = initStats.supports_fsr4 ? "FSR 4.1 ML" : "FSR 3.1";
-            const std::string expectedRayRegen = initStats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1" : "SVGF";
+            const std::string expectedFsr3 = initStats.supports_fsr3 ? "FSR 3.1" : "None";
+            const std::string expectedFsr4 = initStats.supports_fsr4 ? "FSR 4.1 ML" : "None";
+            const std::string expectedRayRegen = initStats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1" : "None";
 
             // 1. Baseline Native 1.0x + Off (MC)
             cfg.upscaler_mode = pathways::UpscalerMode::None;
@@ -247,18 +248,21 @@ int main(int argc, char* argv[]) {
             cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
-            if (!stepAndVerify("2a. FSR 3.1 Quality (0.67x)", 4, "FSR 3.1", "None")) return 1;
+            if (!stepAndVerify("2a. FSR 3.1 Quality (0.67x)", 4, expectedFsr3, "None")) return 1;
 
-            cfg.render_scale = 0.5882353f;
-            if (!stepAndVerify("2b. FSR 3.1 Balanced (0.59x)", 4, "FSR 3.1", "None")) return 1;
+            if (initStats.supports_fsr3) {
+                cfg.render_scale = 0.5882353f;
+                if (!stepAndVerify("2b. FSR 3.1 Balanced (0.59x)", 4, expectedFsr3, "None")) return 1;
 
-            cfg.render_scale = 0.5f;
-            if (!stepAndVerify("2c. FSR 3.1 Performance (0.50x)", 4, "FSR 3.1", "None")) return 1;
+                cfg.render_scale = 0.5f;
+                if (!stepAndVerify("2c. FSR 3.1 Performance (0.50x)", 4, expectedFsr3, "None")) return 1;
 
-            cfg.render_scale = 0.3333333f;
-            if (!stepAndVerify("2d. FSR 3.1 UltraPerf (0.33x)", 4, "FSR 3.1", "None")) return 1;
+                cfg.render_scale = 0.3333333f;
+                if (!stepAndVerify("2d. FSR 3.1 UltraPerf (0.33x)", 4, expectedFsr3, "None")) return 1;
+            }
 
-            // 3. Request FSR 4.1 ML at runtime (verifies clean fallback to FSR 3.1 on non-FP8 GPUs)
+            // 3. Request FSR 4.1 ML at runtime (verifies strict capability gating: never falls back to FSR 3.1)
+            cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr4;
             cfg.render_scale = 0.6666667f;
             if (!stepAndVerify("3. FSR 4.1 ML Request (Runtime Gating)", 4, expectedFsr4, "None")) return 1;
@@ -283,7 +287,7 @@ int main(int argc, char* argv[]) {
             cfg.upways_superres = false;
             cfg.gateway_superres = false;
             cfg.render_scale = 0.6666667f;
-            if (!stepAndVerify("4c. Switch Gateway SR -> FSR 3.1 (0.67x)", 4, "FSR 3.1", "None")) return 1;
+            if (!stepAndVerify("4c. Switch Gateway SR -> FSR 3.1 (0.67x)", 4, expectedFsr3, "None")) return 1;
 
             cfg.upscaler_mode = pathways::UpscalerMode::None;
             cfg.render_scale = 1.0f;
@@ -312,36 +316,45 @@ int main(int argc, char* argv[]) {
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
             cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
-            if (!stepAndVerify("6a. FSR 3.1 (0.67x) + E-SVGF", 4, "FSR 3.1", "SVGF")) return 1;
+            if (!stepAndVerify("6a. FSR 3.1 (0.67x) + E-SVGF", 4, expectedFsr3, "SVGF")) return 1;
 
             if (initStats.has_cooperative_matrix) {
                 cfg.denoiser_mode = pathways::DenoiserMode::Upways;
-                if (!stepAndVerify("6b. FSR 3.1 (0.67x) + Upways Denoiser", 4, "FSR 3.1", "Upways")) return 1;
+                if (!stepAndVerify("6b. FSR 3.1 (0.67x) + Upways Denoiser", 4, expectedFsr3, "Upways")) return 1;
 
                 cfg.denoiser_mode = pathways::DenoiserMode::Gateway;
-                if (!stepAndVerify("6c. FSR 3.1 (0.67x) + Gateway Denoiser", 4, "FSR 3.1", "Gateway")) return 1;
+                if (!stepAndVerify("6c. FSR 3.1 (0.67x) + Gateway Denoiser", 4, expectedFsr3, "Gateway")) return 1;
             }
 
             cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
             cfg.enable_nrc = true;
-            cfg.nrc_backend = pathways::NrcBackend::FfxRadianceCache; // Test runtime fallback to NativeWave32
-            if (!stepAndVerify("7a. Enable Neural Cache (NRC) live", 4, "FSR 3.1", "SVGF")) return 1;
-            if (cfg.nrc_backend != pathways::NrcBackend::NativeWave32 && !initStats.supports_fsr_rc) {
-                pathways::Logger::error("[FAIL] Unsupported FfxRadianceCache did not revert to NativeWave32!");
+            cfg.nrc_backend = pathways::NrcBackend::FfxRadianceCache;
+            if (!stepAndVerify("7a. Request FfxRadianceCache live (Runtime Gating)", 4, expectedFsr3, "SVGF")) return 1;
+            if (!initStats.supports_fsr_rc && cfg.enable_nrc) {
+                pathways::Logger::error("[FAIL] Unsupported FfxRadianceCache did not disable enable_nrc!");
                 return 1;
+            }
+            if (initStats.has_cooperative_matrix) {
+                cfg.enable_nrc = true;
+                cfg.nrc_backend = pathways::NrcBackend::NativeWave32;
+                if (!stepAndVerify("7a-ii. Enable NativeWave32 NRC live", 4, expectedFsr3, "SVGF")) return 1;
+                if (!cfg.enable_nrc) {
+                    pathways::Logger::error("[FAIL] Supported NativeWave32 NRC failed to enable!");
+                    return 1;
+                }
             }
 
             cfg.enable_restir = true;
-            if (!stepAndVerify("7b. Enable ReSTIR PT live", 4, "FSR 3.1", "SVGF")) return 1;
+            if (!stepAndVerify("7b. Enable ReSTIR PT live", 4, expectedFsr3, "SVGF")) return 1;
 
             cfg.enable_caustics = true;
-            if (!stepAndVerify("7c. Enable Real-Time Caustics live", 4, "FSR 3.1", "SVGF")) return 1;
+            if (!stepAndVerify("7c. Enable Real-Time Caustics live", 4, expectedFsr3, "SVGF")) return 1;
 
             // 8. Disable GI options & return to clean FSR 3.1 + E-SVGF for final frame dump
             cfg.enable_caustics = false;
             cfg.enable_restir = false;
             cfg.enable_nrc = false;
-            if (!stepAndVerify("8. Return to FSR 3.1 (0.67x) + E-SVGF", 6, "FSR 3.1", "SVGF")) return 1;
+            if (!stepAndVerify("8. Return to FSR 3.1 (0.67x) + E-SVGF", 6, expectedFsr3, "SVGF")) return 1;
 
             engine.dumpOutputFiles();
             engine.printExecutionSummary();

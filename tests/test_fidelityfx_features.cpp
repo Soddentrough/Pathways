@@ -209,28 +209,33 @@ int main(int argc, char** argv) {
     check_true(FfxSdkRuntime::isCompiledWithSdkHeaders(), "Must be compiled with FidelityFX SDK 2.4+ headers");
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
+    const bool hasUpscalerProvider = FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler);
+    const bool expectsFsr4 = hasUpscalerProvider && FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u);
     auto upscaleVersions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, targetPhys);
-    check_true(!upscaleVersions.empty(), "Upscale effect versions must not be empty");
-    bool foundFsr4 = false;
-    bool foundFsr3 = false;
-    for (const auto& v : upscaleVersions) {
-        const uint32_t majorVer = FfxSdkRuntime::parseMajorVersion(v);
-        std::cout << "  -> Enumerated Upscaler Version: '" << v.versionName
-                  << "' (ID: 0x" << std::hex << v.versionId << std::dec << ", major=" << majorVer << ")" << std::endl;
-        if (majorVer >= 4u) foundFsr4 = true;
-        if (majorVer == 3u) foundFsr3 = true;
-    }
-    check_true(foundFsr3, "FSR 3.1.6 analytical fallback version must always be enumerated");
-    if (hwMl) {
-        check_true(foundFsr4, "FSR 4.1.2 ML version must be enumerated and detected on ML-capable hardware");
-        check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u),
-                   "isUpscalerVersionSupported(4) must return true on FP8-capable hardware");
+    if (hasUpscalerProvider) {
+        check_true(!upscaleVersions.empty(), "Upscale effect versions must not be empty when Upscaler Vulkan provider is loaded");
+        bool foundFsr4 = false;
+        bool foundFsr3 = false;
+        for (const auto& v : upscaleVersions) {
+            const uint32_t majorVer = FfxSdkRuntime::parseMajorVersion(v);
+            std::cout << "  -> Enumerated Upscaler Version: '" << v.versionName
+                      << "' (ID: 0x" << std::hex << v.versionId << std::dec << ", major=" << majorVer << ")" << std::endl;
+            if (majorVer >= 4u) foundFsr4 = true;
+            if (majorVer == 3u) foundFsr3 = true;
+        }
+        check_true(foundFsr3, "FSR 3.1.6 analytical upscaler version must always be enumerated");
+        check_true(expectsFsr4 == (foundFsr4 && hwMl),
+                   "isUpscalerVersionSupported(4) must return true iff provider includes FSR 4 and hardware supports FP8 Cooperative Matrix");
+        check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 3u),
+                   "isUpscalerVersionSupported(3) must return true when amd_fidelityfx_upscaler_vk is present");
     } else {
-        check_true(!FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u),
-                   "isUpscalerVersionSupported(4) must return false when hardware lacks FP8 Cooperative Matrix support");
+        check_true(upscaleVersions.empty(), "Upscale versions must be empty when no Vulkan Upscaler provider binary is loaded (never fabricate versions)");
+        check_true(!FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 3u),
+                   "isUpscalerVersionSupported(3) must return false when no Vulkan Upscaler provider binary is loaded");
+        check_true(!expectsFsr4,
+                   "isUpscalerVersionSupported(4) must return false when no Vulkan Upscaler provider binary is loaded");
+        std::cout << "  -> Vulkan Upscaler Provider (amd_fidelityfx_upscaler_vk): NOT PRESENT on this platform (honestly reported as unsupported)" << std::endl;
     }
-    check_true(FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 3u),
-               "isUpscalerVersionSupported(3) must return true when amd_fidelityfx_upscaler_vk is present");
 
     const bool hasDenoiserProvider = FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
     auto denoiserVersions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER, targetPhys);
@@ -392,13 +397,17 @@ int main(int argc, char** argv) {
     FeatureRunResult fsr4Run = runFeatureConfig(
         "04_fsr4_ml_quality", "FSR 4.1 ML (Quality 0.67x)", "--upscaler fsr4 --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);
 
-    // 6. Render Denoiser (--denoiser rayregen falls back to E-SVGF when Denoiser Vulkan provider is absent)
+    // 6. Render FFX Ray Regeneration (--denoiser rayregen: strict capability gating, disabled if amd_fidelityfx_denoiser_vk is absent)
     FeatureRunResult rayRegenRun = runFeatureConfig(
         "05_ray_regeneration",
-        hasDenoiserProvider ? "FFX Ray Regeneration (1.2.1)" : "Denoiser (rayregen -> E-SVGF)",
+        hasDenoiserProvider ? "FFX Ray Regeneration (1.2.1)" : "Ray Regen (Gated -> Off)",
         "--upscaler none --denoiser rayregen --spp 1", &refPixels, refW, refH);
 
-    // 7. Render Radiance Caching (--nrc uses Native Wave32 WMMA when RadianceCache Vulkan provider is absent)
+    // 6b. Render In-House E-SVGF Denoiser (--denoiser svgf)
+    FeatureRunResult svgfRun = runFeatureConfig(
+        "05b_esvgf", "Denoiser: E-SVGF (Native 1.0x)", "--upscaler none --denoiser svgf --spp 1", &refPixels, refW, refH);
+
+    // 7. Render Radiance Caching (--nrc)
     FeatureRunResult nrcRun = runFeatureConfig(
         "06_radiance_cache",
         hasRcProvider ? "FFX Radiance Caching (0.9.0)" : "NRC (Native Wave32 WMMA)",
@@ -422,15 +431,18 @@ int main(int argc, char** argv) {
     FeatureRunResult causticsRun = runFeatureConfig(
         "07f_caustics", "GI: Caustics (Native 1.0x)", "--upscaler none --denoiser none --caustics --spp 1", &refPixels, refW, refH);
 
-    // 11. Render Combined Stack: FSR + Denoiser + Radiance Caching + ReSTIR + Caustics
+    // 11. Render Combined Stack: Supported Upscaler + Denoiser + Radiance Caching + ReSTIR + Caustics
     FeatureRunResult combinedRun = runFeatureConfig(
         "07_combined_ffx_stack",
         hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + E-SVGF + GI",
-        "--upscaler fsr4 --render-scale 0.67 --denoiser rayregen --nrc --restir --caustics --spp 1", &refPixels, refW, refH);
+        hasDenoiserProvider
+            ? "--upscaler fsr --render-scale 0.67 --denoiser rayregen --nrc --restir --caustics --spp 1"
+            : "--upscaler fsr --render-scale 0.67 --denoiser svgf --nrc --restir --caustics --spp 1",
+        &refPixels, refW, refH);
 
     std::vector<FeatureRunResult> allRuns = {
         raw1SppRun, baseMcRun, fsr3Run, fsr4Run, upwaysSrRun, gatewaySrRun,
-        rayRegenRun, upwaysDenRun, gatewayDenRun, nrcRun, restirRun, causticsRun, combinedRun
+        rayRegenRun, svgfRun, upwaysDenRun, gatewayDenRun, nrcRun, restirRun, causticsRun, combinedRun
     };
 
     std::cout << "\n--------------------------------------------------------------------------------------------------------------------\n";
@@ -456,31 +468,38 @@ int main(int argc, char** argv) {
     }
     std::cout << "--------------------------------------------------------------------------------------------------------------------\n";
 
-    // Assertions: Active Feature Verification
-    check_true(fsr3Run.reportedUpscaler == "FSR 3.1",
-               "FSR 3.1 run must report upscaler_mode == 'FSR 3.1', got '" + fsr3Run.reportedUpscaler + "'");
-    if (hwMl) {
+    // Assertions: Active Feature Verification (Strict Zero-Fallback Policy)
+    if (hasUpscalerProvider) {
+        check_true(fsr3Run.reportedUpscaler == "FSR 3.1",
+                   "FSR 3.1 run must report upscaler_mode == 'FSR 3.1', got '" + fsr3Run.reportedUpscaler + "'");
+    } else {
+        check_true(fsr3Run.reportedUpscaler == "None",
+                   "Without amd_fidelityfx_upscaler_vk, --upscaler fsr3 must be rejected and report 'None', got '" + fsr3Run.reportedUpscaler + "'");
+    }
+    if (expectsFsr4) {
         check_true(fsr4Run.reportedSupportsFsr4,
-                   "Hardware ML capable GPU must report supports_fsr4_ml == true");
+                   "Hardware ML capable GPU with FSR 4 Upscaler provider must report supports_fsr4_ml == true");
         check_true(fsr4Run.reportedUpscaler == "FSR 4.1 ML",
                    "FSR 4.1 ML run must report upscaler_mode == 'FSR 4.1 ML' without falling back to FSR 3.1, got '" + fsr4Run.reportedUpscaler + "'");
         check_true(combinedRun.reportedUpscaler == "FSR 4.1 ML",
                    "Combined run must report upscaler_mode == 'FSR 4.1 ML'");
     } else {
         check_true(!fsr4Run.reportedSupportsFsr4,
-                   "Non-FP8 GPU (e.g. RDNA3) must report supports_fsr4_ml == false");
-        check_true(fsr4Run.reportedUpscaler == "FSR 3.1",
-                   "When FSR 4 ML is unsupported on non-FP8 hardware, --upscaler fsr4 must honestly fall back and report 'FSR 3.1', got '" + fsr4Run.reportedUpscaler + "'");
-        check_true(combinedRun.reportedUpscaler == "FSR 3.1",
-                   "Combined run on non-FP8 hardware must honestly report upscaler_mode == 'FSR 3.1'");
+                   "When FSR 4 is not supported by the loaded provider or hardware, supports_fsr4_ml must be false");
+        check_true(fsr4Run.reportedUpscaler == "None",
+                   "When FSR 4 ML is unsupported or provider is absent, --upscaler fsr4 must be rejected (never fall back to FSR 3.1) and report 'None', got '" + fsr4Run.reportedUpscaler + "'");
+        check_true(combinedRun.reportedUpscaler == (hasUpscalerProvider ? "FSR 3.1" : "None"),
+                   "Combined --upscaler fsr run must select highest supported FSR version or None");
     }
     if (hasDenoiserProvider) {
         check_true(rayRegenRun.reportedDenoiser.find("Ray Regeneration") != std::string::npos,
                    "Ray Regeneration run must report FFX Ray Regeneration denoiser mode, got '" + rayRegenRun.reportedDenoiser + "'");
     } else {
-        check_true(rayRegenRun.reportedDenoiser == "SVGF",
-                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must honestly fall back and report 'SVGF', got '" + rayRegenRun.reportedDenoiser + "'");
+        check_true(rayRegenRun.reportedDenoiser == "None",
+                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected (never fall back to SVGF) and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
     }
+    check_true(svgfRun.reportedDenoiser == "SVGF",
+               "E-SVGF run must report denoiser_mode == 'SVGF', got '" + svgfRun.reportedDenoiser + "'");
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
     check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
     check_true(gatewaySrRun.reportedUpscaler == "Gateway", "Gateway SR run must report upscaler_mode == 'Gateway'");
@@ -502,21 +521,26 @@ int main(int argc, char** argv) {
     }
 
     // Assertions: Denoiser Visual Noise Reduction Assessment
-    check_true(rayRegenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.55,
-               "FFX Ray Regeneration must reduce 1-SPP high-frequency noise variance by >45%");
-    check_true(rayRegenRun.visual.psnrVsRefDb > raw1SppRun.visual.psnrVsRefDb + 2.0,
-               "FFX Ray Regeneration must improve PSNR over raw 1-SPP MC by at least +2.0 dB");
+    const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : svgfRun;
+    check_true(activeDenoiserRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.55,
+               "Active denoiser must reduce 1-SPP high-frequency noise variance by >45%");
+    check_true(activeDenoiserRun.visual.psnrVsRefDb > raw1SppRun.visual.psnrVsRefDb + 2.0,
+               "Active denoiser must improve PSNR over raw 1-SPP MC by at least +2.0 dB");
 
     // Assertions: Performance Assessment
-    check_true(fsr3Run.rtMs < baseMcRun.rtMs && fsr3Run.denoiserSrMs > 0.0 && fsr3Run.avgFrameMs <= baseMcRun.avgFrameMs * 1.15,
-               "FSR 3.1 (0.67x) must reduce RT time and record valid upscale pass telemetry");
-    check_true(fsr4Run.rtMs < baseMcRun.rtMs && fsr4Run.denoiserSrMs > 0.0 && fsr4Run.denoiserSrMs < 4.0 && fsr4Run.avgFrameMs < 8.33,
-               "FSR 4.1 ML (0.67x) must reduce RT time and record valid ML upscale pass telemetry within 120Hz frame budget");
-    check_true(rayRegenRun.denoiserSrMs < 3.5,
-               "FFX Ray Regeneration denoiser pass time at 720p must be < 3.5 ms (got " + std::to_string(rayRegenRun.denoiserSrMs) + " ms)");
-    check_true(rayRegenRun.rtMs <= baseMcRun.rtMs * 1.25 + 0.35,
-               "Enabling FFX Ray Regeneration must not inflate Wavefront RT time by >25% (base RT=" +
-               std::to_string(baseMcRun.rtMs) + " ms, RayRegen RT=" + std::to_string(rayRegenRun.rtMs) + " ms)");
+    if (hasUpscalerProvider) {
+        check_true(fsr3Run.rtMs < baseMcRun.rtMs && fsr3Run.denoiserSrMs > 0.0 && fsr3Run.avgFrameMs <= baseMcRun.avgFrameMs * 1.15,
+                   "FSR 3.1 (0.67x) must reduce RT time and record valid upscale pass telemetry");
+    }
+    if (expectsFsr4) {
+        check_true(fsr4Run.rtMs < baseMcRun.rtMs && fsr4Run.denoiserSrMs > 0.0 && fsr4Run.denoiserSrMs < 4.0 && fsr4Run.avgFrameMs < 8.33,
+                   "FSR 4.1 ML (0.67x) must reduce RT time and record valid ML upscale pass telemetry within 120Hz frame budget");
+    }
+    check_true(activeDenoiserRun.denoiserSrMs < 3.5,
+               "Active denoiser pass time at 720p must be < 3.5 ms (got " + std::to_string(activeDenoiserRun.denoiserSrMs) + " ms)");
+    check_true(activeDenoiserRun.rtMs <= baseMcRun.rtMs * 1.25 + 0.35,
+               "Enabling denoiser must not inflate Wavefront RT time by >25% (base RT=" +
+               std::to_string(baseMcRun.rtMs) + " ms, denoiser RT=" + std::to_string(activeDenoiserRun.rtMs) + " ms)");
 
     // -------------------------------------------------------------------------
     // TEST 5: Dynamic Runtime Option Toggling (All Quick-Access GUI Options)

@@ -563,6 +563,9 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
     }
 
     m_fsrUpscaler->setTargetVersion(config.fsr_version);
+    if (!m_fsrUpscaler->isUsingSdkProvider()) {
+        return false;
+    }
 
     uint32_t renderW = config.getRenderWidth();
     uint32_t renderH = config.getRenderHeight();

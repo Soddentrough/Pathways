@@ -562,6 +562,9 @@ void DenoiserPipeline::recordDenoise(
                           ffxDirectDiffuse, ffxDirectSpecular, ffxIndirectDiffuse, ffxIndirectSpecular);
     }
 
+    if (denoiserMode == DenoiserMode::FfxRayRegeneration && m_ffxDenoiserContext == nullptr) {
+        return;
+    }
     const uint32_t isRayRegen = (denoiserMode == DenoiserMode::FfxRayRegeneration && m_ffxDenoiserContext != nullptr) ? 1u : 0u;
 
     // Upload per-frame camera matrices for Pass 1 (std140 binary compatible)

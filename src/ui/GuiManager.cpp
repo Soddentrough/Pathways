@@ -689,12 +689,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
             if (config.upscaler_mode == UpscalerMode::FSR) {
-                const bool hwMl = stats.supports_fsr4;
-                const char* fsrVerStr = (config.fsr_version == FsrVersion::Fsr5) ? (hwMl ? "FSR 5" : "FSR 3.1") :
-                                        (config.fsr_version == FsrVersion::Fsr4) ? (hwMl ? "FSR 4.1 ML" : "FSR 3.1") :
-                                        (config.fsr_version == FsrVersion::Fsr3) ? "FSR 3.1" :
-                                        (hwMl ? "FSR 4.1 ML (Auto)" : "FSR 3.1 (Auto)");
-                ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", fsrVerStr, config.render_scale);
+                ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", stats.upscaler_mode_str.c_str(), config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
                 ImGui::Text("Upscaling:    Upways Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Gateway) {
@@ -967,11 +962,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             const float spacingX = ImGui::GetStyle().ItemSpacing.x;
             const bool hwMl = stats.supports_fsr4;
 
-            if (config.upscaler_mode == UpscalerMode::FSR && !hwMl && config.fsr_version == FsrVersion::Fsr4) {
-                config.fsr_version = FsrVersion::Fsr3;
+            if (config.upscaler_mode == UpscalerMode::FSR) {
+                if (!hwMl && (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Fsr5)) {
+                    config.upscaler_mode = UpscalerMode::None;
+                    config.render_scale = 1.0f;
+                } else if (!stats.supports_fsr3 && config.fsr_version == FsrVersion::Fsr3) {
+                    config.upscaler_mode = UpscalerMode::None;
+                    config.render_scale = 1.0f;
+                }
             }
             if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration && !stats.supports_fsr_rr) {
-                config.denoiser_mode = DenoiserMode::Svgf;
+                config.denoiser_mode = DenoiserMode::None;
             }
 
             // --- Row 1: Upscaler 1-Click Selector ---
@@ -1008,8 +1009,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             };
 
             const bool isFsr4Selected = (config.upscaler_mode == UpscalerMode::FSR) && hwMl &&
-                                        (config.fsr_version != FsrVersion::Fsr3);
-            const bool isFsr3Selected = (config.upscaler_mode == UpscalerMode::FSR) && !isFsr4Selected;
+                                        (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Fsr5 || config.fsr_version == FsrVersion::Auto);
+            const bool isFsr3Selected = (config.upscaler_mode == UpscalerMode::FSR) && stats.supports_fsr3 &&
+                                        (config.fsr_version == FsrVersion::Fsr3 || (config.fsr_version == FsrVersion::Auto && !hwMl));
 
             drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None, true,
                 "Render at full native display resolution (no upscaling).", [&]() {
@@ -1085,9 +1087,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 uint32_t rH = config.getRenderHeight();
                 const char* activeUpscalerDesc =
                     isFsr4Selected ? "AMD FSR 4.1.2 ML" :
-                    isFsr3Selected ? (stats.supports_fsr3 ? "AMD FSR 3.1.6" : "In-House Lanczos-2 Temporal Upscaler") :
+                    isFsr3Selected ? "AMD FSR 3.1.6" :
                     (config.upscaler_mode == UpscalerMode::Upways) ? "Upways Neural SR" :
-                    (config.upscaler_mode == UpscalerMode::Gateway) ? "Gateway Hybrid SR" : "Spatial SR";
+                    (config.upscaler_mode == UpscalerMode::Gateway) ? "Gateway Hybrid SR" : "Disabled";
                 ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
                                    "Active: %s  |  %ux%u -> %ux%u (%.0f%% Scale)",
                                    activeUpscalerDesc, rW, rH, config.width, config.height, config.render_scale * 100.0f);
@@ -2017,12 +2019,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::PopID();
 
                 const bool hwMl = stats.supports_fsr4;
-                const bool useFsr4 = hwMl && (config.fsr_version != FsrVersion::Fsr3);
+                const bool useFsr4 = hwMl && (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Fsr5 || config.fsr_version == FsrVersion::Auto);
+                const bool useFsr3 = !useFsr4 && stats.supports_fsr3 && (config.fsr_version == FsrVersion::Fsr3 || config.fsr_version == FsrVersion::Auto);
                 ImGui::PushStyleColor(ImGuiCol_Text, useFsr4 ? ImVec4(0.3f, 0.95f, 0.55f, 1.0f) : ImVec4(0.35f, 0.90f, 1.0f, 1.0f));
                 ImGui::TextWrapped("Active Upscaler: %s",
                                    useFsr4 ? "AMD FSR 4.1.2 (SDK ML Super-Resolution)"
-                                           : (stats.supports_fsr3 ? "AMD FSR 3.1.6 (SDK Super-Resolution)"
-                                                                  : "In-House Lanczos-2 Temporal Upscaler (No SDK Context)"));
+                                           : (useFsr3 ? "AMD FSR 3.1.6 (SDK Super-Resolution)"
+                                                      : "Disabled (Unsupported)"));
                 ImGui::PopStyleColor();
             }
 

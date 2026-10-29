@@ -92,6 +92,78 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     m_context = std::make_unique<VulkanContext>(m_config, VK_NULL_HANDLE, "Primary GPU / Display");
 
+    {
+        const bool fsr3Supported = m_context &&
+                                   FfxSdkRuntime::instance().isUpscalerVersionSupported(
+                                       m_context->getPhysicalDevice(), m_context->getDevice(), 3u);
+        const bool fsr4Supported = m_context && m_context->supportsFsr4() &&
+                                   FfxSdkRuntime::instance().isUpscalerVersionSupported(
+                                       m_context->getPhysicalDevice(), m_context->getDevice(), 4u);
+        if (m_config.upscaler_mode == UpscalerMode::FSR1) {
+            Logger::error("FSR 1.0 spatial upscaler is not supported; disabling upscaling.");
+            m_config.upscaler_mode = UpscalerMode::None;
+            m_config.render_scale = 1.0f;
+            m_config.render_width = 0;
+            m_config.render_height = 0;
+        } else if (m_config.upscaler_mode == UpscalerMode::FSR) {
+            if ((m_config.fsr_version == FsrVersion::Fsr4 || m_config.fsr_version == FsrVersion::Fsr5) && !fsr4Supported) {
+                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                m_config.upscaler_mode = UpscalerMode::None;
+                m_config.render_scale = 1.0f;
+                m_config.render_width = 0;
+                m_config.render_height = 0;
+            } else if (m_config.fsr_version == FsrVersion::Fsr3 && !fsr3Supported) {
+                Logger::error("FSR 3.1 cannot be enabled on this device/runtime (requires amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                m_config.upscaler_mode = UpscalerMode::None;
+                m_config.render_scale = 1.0f;
+                m_config.render_width = 0;
+                m_config.render_height = 0;
+            } else if (m_config.fsr_version == FsrVersion::Auto) {
+                if (fsr4Supported) {
+                    m_config.fsr_version = FsrVersion::Fsr4;
+                } else if (fsr3Supported) {
+                    m_config.fsr_version = FsrVersion::Fsr3;
+                } else {
+                    Logger::error("No FidelityFX Super Resolution version is supported on this device/runtime; disabling upscaling.");
+                    m_config.upscaler_mode = UpscalerMode::None;
+                    m_config.render_scale = 1.0f;
+                    m_config.render_width = 0;
+                    m_config.render_height = 0;
+                }
+            }
+        } else if ((m_config.upscaler_mode == UpscalerMode::Upways || m_config.upscaler_mode == UpscalerMode::Gateway) &&
+                   (!m_context || !m_context->hasCooperativeMatrix())) {
+            Logger::error("Neural Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+            m_config.upscaler_mode = UpscalerMode::None;
+            m_config.render_scale = 1.0f;
+            m_config.render_width = 0;
+            m_config.render_height = 0;
+        }
+        m_config.upways_superres = (m_config.upscaler_mode == UpscalerMode::Upways);
+        m_config.gateway_superres = (m_config.upscaler_mode == UpscalerMode::Gateway);
+
+        if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
+            if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser)) {
+                Logger::error("AMD FSR Ray Regeneration cannot be enabled (amd_fidelityfx_denoiser_vk is not available); disabling denoiser.");
+                m_config.denoiser_mode = DenoiserMode::None;
+            }
+        } else if ((m_config.denoiser_mode == DenoiserMode::Upways || m_config.denoiser_mode == DenoiserMode::Gateway) &&
+                   (!m_context || !m_context->hasCooperativeMatrix())) {
+            Logger::error("Neural Denoiser requires VK_KHR_cooperative_matrix; disabling denoiser.");
+            m_config.denoiser_mode = DenoiserMode::None;
+        }
+
+        if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
+            if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache)) {
+                if (m_config.enable_nrc) {
+                    Logger::error("AMD FSR Radiance Cache cannot be enabled (amd_fidelityfx_radiancecache_vk is not available); disabling NRC.");
+                    m_config.enable_nrc = false;
+                }
+                m_config.nrc_backend = NrcBackend::Auto;
+            }
+        }
+    }
+
     m_presentation = std::make_unique<PresentationManager>(
         m_window.get(), m_context.get(), m_config, MAX_FRAMES_IN_FLIGHT
     );
@@ -1586,29 +1658,75 @@ void Engine::renderFrame() {
         requestSceneChange(targetPath);
     }
 
-    if (m_config.upscaler_mode == UpscalerMode::FSR1) {
-        m_config.upscaler_mode = UpscalerMode::FSR;
-        m_config.fsr_version = FsrVersion::Fsr3;
-    }
-    if (m_config.upscaler_mode == UpscalerMode::FSR && m_config.fsr_version == FsrVersion::Fsr4 &&
-        m_context && !m_context->supportsFsr4()) {
-        Logger::warn("FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix); falling back to FSR 3.1.");
-        m_config.fsr_version = FsrVersion::Fsr3;
+    {
+        const bool fsr3Supported = m_context &&
+                                   FfxSdkRuntime::instance().isUpscalerVersionSupported(
+                                       m_context->getPhysicalDevice(), m_context->getDevice(), 3u);
+        const bool fsr4Supported = m_context && m_context->supportsFsr4() &&
+                                   FfxSdkRuntime::instance().isUpscalerVersionSupported(
+                                       m_context->getPhysicalDevice(), m_context->getDevice(), 4u);
+        if (m_config.upscaler_mode == UpscalerMode::FSR1) {
+            Logger::error("FSR 1.0 spatial upscaler is not supported; disabling upscaling.");
+            m_config.upscaler_mode = UpscalerMode::None;
+            m_config.render_scale = 1.0f;
+            m_config.render_width = 0;
+            m_config.render_height = 0;
+        } else if (m_config.upscaler_mode == UpscalerMode::FSR) {
+            if ((m_config.fsr_version == FsrVersion::Fsr4 || m_config.fsr_version == FsrVersion::Fsr5) && !fsr4Supported) {
+                Logger::error("FSR 4.1 ML cannot be enabled on this device/runtime (requires FP8 Cooperative Matrix + amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                m_config.upscaler_mode = UpscalerMode::None;
+                m_config.render_scale = 1.0f;
+                m_config.render_width = 0;
+                m_config.render_height = 0;
+            } else if (m_config.fsr_version == FsrVersion::Fsr3 && !fsr3Supported) {
+                Logger::error("FSR 3.1 cannot be enabled on this device/runtime (requires amd_fidelityfx_upscaler_vk); disabling upscaling.");
+                m_config.upscaler_mode = UpscalerMode::None;
+                m_config.render_scale = 1.0f;
+                m_config.render_width = 0;
+                m_config.render_height = 0;
+            } else if (m_config.fsr_version == FsrVersion::Auto) {
+                if (fsr4Supported) {
+                    m_config.fsr_version = FsrVersion::Fsr4;
+                } else if (fsr3Supported) {
+                    m_config.fsr_version = FsrVersion::Fsr3;
+                } else {
+                    Logger::error("No FidelityFX Super Resolution version is supported on this device/runtime; disabling upscaling.");
+                    m_config.upscaler_mode = UpscalerMode::None;
+                    m_config.render_scale = 1.0f;
+                    m_config.render_width = 0;
+                    m_config.render_height = 0;
+                }
+            }
+        } else if ((m_config.upscaler_mode == UpscalerMode::Upways || m_config.upscaler_mode == UpscalerMode::Gateway) &&
+                   (!m_context || !m_context->hasCooperativeMatrix())) {
+            Logger::error("Neural Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+            m_config.upscaler_mode = UpscalerMode::None;
+            m_config.render_scale = 1.0f;
+            m_config.render_width = 0;
+            m_config.render_height = 0;
+        }
     }
     if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
         const bool rrSupported = (m_denoiser && m_denoiser->isUsingSdkProvider()) ||
                                  FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
         if (!rrSupported) {
-            Logger::warn("AMD FSR Ray Regeneration Vulkan provider (amd_fidelityfx_denoiser_vk) is not available in FidelityFX SDK 2.4.0; reverting DenoiserMode to E-SVGF.");
-            m_config.denoiser_mode = DenoiserMode::Svgf;
+            Logger::error("AMD FSR Ray Regeneration cannot be enabled (amd_fidelityfx_denoiser_vk is not available); disabling denoiser.");
+            m_config.denoiser_mode = DenoiserMode::None;
         }
+    } else if ((m_config.denoiser_mode == DenoiserMode::Upways || m_config.denoiser_mode == DenoiserMode::Gateway) &&
+               (!m_context || !m_context->hasCooperativeMatrix())) {
+        Logger::error("Neural Denoiser requires VK_KHR_cooperative_matrix; disabling denoiser.");
+        m_config.denoiser_mode = DenoiserMode::None;
     }
     if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
         const bool rcSupported = (m_nrcManager && m_nrcManager->isUsingSdkProvider()) ||
                                  FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache);
         if (!rcSupported) {
-            Logger::warn("AMD FSR Radiance Cache Vulkan provider (amd_fidelityfx_radiancecache_vk) is not available in FidelityFX SDK 2.4.0; reverting NRC Backend to Native Wave32 WMMA.");
-            m_config.nrc_backend = NrcBackend::NativeWave32;
+            if (m_config.enable_nrc) {
+                Logger::error("AMD FSR Radiance Cache cannot be enabled (amd_fidelityfx_radiancecache_vk is not available); disabling NRC.");
+                m_config.enable_nrc = false;
+            }
+            m_config.nrc_backend = NrcBackend::Auto;
         }
     }
     m_config.upways_superres = (m_config.upscaler_mode == UpscalerMode::Upways);

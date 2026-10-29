@@ -96,18 +96,10 @@ void FsrUpscaler::resolveActiveVersion() {
     FsrVersion prevActive = m_activeVersion;
     if (m_targetVersion == FsrVersion::Fsr3) {
         m_activeVersion = FsrVersion::Fsr3;
-    } else if (m_targetVersion == FsrVersion::Auto ||
-               m_targetVersion == FsrVersion::Fsr4 ||
-               m_targetVersion == FsrVersion::Fsr5) {
-        if (m_sdkFsr4Supported) {
-            m_activeVersion = FsrVersion::Fsr4;
-        } else {
-            m_activeVersion = FsrVersion::Fsr3;
-            if (m_targetVersion != FsrVersion::Auto) {
-                Logger::warn("FsrUpscaler [{}]: FSR 4 ML Upscaler provider not available on this device; falling back to FSR 3.",
-                             m_instanceName);
-            }
-        }
+    } else if (m_targetVersion == FsrVersion::Fsr4 || m_targetVersion == FsrVersion::Fsr5) {
+        m_activeVersion = FsrVersion::Fsr4;
+    } else {
+        m_activeVersion = m_sdkFsr4Supported ? FsrVersion::Fsr4 : FsrVersion::Fsr3;
     }
     if (prevActive != m_activeVersion) {
         m_historyValid = false;
@@ -121,7 +113,7 @@ void FsrUpscaler::setTargetVersion(FsrVersion version) {
     m_targetVersion = version;
     FsrVersion prevActive = m_activeVersion;
     resolveActiveVersion();
-    if (prevActive != m_activeVersion) {
+    if (prevActive != m_activeVersion || m_ffxContext == nullptr) {
         initFfxSdkContext();
         Logger::info("FsrUpscaler [{}] switched active version to: {}", m_instanceName, getActiveVersionName());
     }
@@ -135,9 +127,9 @@ const char* FsrUpscaler::getActiveVersionName() const {
         if (m_activeVersion == FsrVersion::Fsr4) {
             return "AMD FSR 4.1.2 (SDK ML Super-Resolution)";
         }
-        return "AMD FSR 3.1.6 (SDK Analytical)";
+        return "AMD FSR 3.1.6 (SDK Super-Resolution)";
     }
-    return "In-House Lanczos-2 Temporal Upscaler (No SDK Context)";
+    return "Disabled (Unsupported)";
 }
 
 void FsrUpscaler::initFfxSdkContext() {
@@ -148,6 +140,16 @@ void FsrUpscaler::initFfxSdkContext() {
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
     if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler)) {
+        return;
+    }
+    if (m_activeVersion == FsrVersion::Fsr4 && !m_sdkFsr4Supported) {
+        Logger::error("FsrUpscaler [{}]: FSR 4 ML Upscaler is not supported on this device/OS; context creation aborted.",
+                      m_instanceName);
+        return;
+    }
+    if (m_activeVersion == FsrVersion::Fsr3 && !m_sdkFsr3Supported) {
+        Logger::error("FsrUpscaler [{}]: FSR 3.1 Upscaler is not supported on this device/OS; context creation aborted.",
+                      m_instanceName);
         return;
     }
 
@@ -170,9 +172,11 @@ void FsrUpscaler::initFfxSdkContext() {
 
     auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, m_physDevice);
 
+    ffx::CreateContextDescOverrideVersion versionOpt{};
+    versionOpt.versionId = selectedVersionId;
+
     ffx::QueryDescUpscaleGetResourceRequirements reqQuery{};
-    reqQuery.header.pNext = &backendDesc.header;
-    if (ffx::Query(reqQuery) == ffx::ReturnCode::Ok) {
+    if (ffx::Query(reqQuery, versionOpt, backendDesc) == ffx::ReturnCode::Ok) {
         m_requiredFfxResources = reqQuery.required_resources;
     }
 
@@ -188,9 +192,6 @@ void FsrUpscaler::initFfxSdkContext() {
     ffx::CreateContextDescUpscaleVersion headerVersion{};
     headerVersion.version = FFX_UPSCALER_VERSION;
 
-    ffx::CreateContextDescOverrideVersion versionOpt{};
-    versionOpt.versionId = selectedVersionId;
-
     FfxApiEffectMemoryUsage gpuMem{};
     ffx::QueryDescUpscaleGetGPUMemoryUsageV2 memQuery{};
     memQuery.device = &backendDesc.deviceContext;
@@ -203,7 +204,13 @@ void FsrUpscaler::initFfxSdkContext() {
     }
 
     ffxContext ctx = nullptr;
-    if (ffx::CreateContext(ctx, nullptr, createUpscale, backendDesc, headerVersion, versionOpt) == ffx::ReturnCode::Ok && ctx != nullptr) {
+    ffx::ReturnCode createRet = ffx::CreateContext(ctx, nullptr, createUpscale, backendDesc, headerVersion, versionOpt);
+    if (createRet != ffx::ReturnCode::Ok || ctx == nullptr) {
+        Logger::error("FsrUpscaler [{}]: ffx::CreateContext for {} returned {}; upscaler context could not be created.",
+                      m_instanceName, selectedVersionName, static_cast<uint32_t>(createRet));
+        return;
+    }
+    if (createRet == ffx::ReturnCode::Ok && ctx != nullptr) {
         m_ffxContext = ctx;
         m_providerVersionId = selectedVersionId;
         m_providerVersionName = selectedVersionName;
@@ -219,7 +226,7 @@ void FsrUpscaler::initFfxSdkContext() {
         if (m_activeVersion == FsrVersion::Fsr4) {
             m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("4.1.2") : m_providerVersionName) + " (SDK ML Super-Resolution)";
         } else {
-            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("3.1.6") : m_providerVersionName) + " (SDK Analytical)";
+            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("3.1.6") : m_providerVersionName) + " (SDK Super-Resolution)";
         }
     }
 #endif
@@ -781,112 +788,11 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
             vkCmdPipelineBarrier2(desc.cmd, &sdkPostDep);
             return;
         }
-        Logger::warn("FsrUpscaler [{}]: ffx::Dispatch failed; falling back to compute path.", m_instanceName);
+        Logger::error("FsrUpscaler [{}]: ffx::Dispatch failed.", m_instanceName);
+        return;
     }
 #endif
-    for (int i = 0; i < 2; ++i) {
-        if (m_historyImages[i]->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
-            m_historyImages[i]->transitionLayout(
-                desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-            );
-        }
-    }
-
-    // 1. Pass 1: Separable Lanczos-2 Super-Resolution with YCoCg AABB Clamping & Temporal Accumulation
-    vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipeline);
-    vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipelineLayout, 0, 1, &m_upscaleDescSets[m_historyIndex], 0, nullptr);
-
-    Fsr3UpscalePushConstants upscalePC{};
-    upscalePC.renderWidth = m_renderWidth;
-    upscalePC.renderHeight = m_renderHeight;
-    upscalePC.displayWidth = m_displayWidth;
-    upscalePC.displayHeight = m_displayHeight;
-    upscalePC.invRenderWidth = 1.0f / static_cast<float>(m_renderWidth);
-    upscalePC.invRenderHeight = 1.0f / static_cast<float>(m_renderHeight);
-    upscalePC.invDisplayWidth = 1.0f / static_cast<float>(m_displayWidth);
-    upscalePC.invDisplayHeight = 1.0f / static_cast<float>(m_displayHeight);
-    upscalePC.invTotalSamples = desc.inputIsNormalized ? 1.0f : (1.0f / static_cast<float>(std::max(1u, desc.totalSamples)));
-    upscalePC.temporalWeight = (desc.temporalWeight > 0.0f && desc.temporalWeight != 0.88f) ? desc.temporalWeight : 0.90f;
-    upscalePC.jitterX = desc.jitterX;
-    upscalePC.jitterY = desc.jitterY;
-    upscalePC.frameIndex = desc.frameIndex;
-    upscalePC.resetHistory = (desc.resetHistory || !m_historyValid) ? 1u : 0u;
-    upscalePC.cameraMoved = desc.cameraMoved ? 1u : 0u;
-    upscalePC.isInputNormalized = desc.inputIsNormalized ? 1u : 0u;
-    upscalePC.fsrVersion = (m_activeVersion == FsrVersion::Fsr4) ? 4u : 3u;
-
-    vkCmdPushConstants(desc.cmd, m_upscalePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upscalePC), &upscalePC);
-
-    uint32_t dispGroupsX = (m_displayWidth + 15) / 16;
-    uint32_t dispGroupsY = (m_displayHeight + 15) / 16;
-    vkCmdDispatch(desc.cmd, dispGroupsX, dispGroupsY, 1);
-
-    // Written history image index (Set 0 writes to 1, Set 1 writes to 0)
-    uint32_t writtenHistIdx = (m_historyIndex == 0) ? 1 : 0;
-
-    // Barrier: Upscaled image write -> RCAS read, and Written history -> next frame read
-    VkImageMemoryBarrier2 barriers[2]{};
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[0].image = m_upscaledImage->getImage();
-    barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barriers[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[1].image = m_historyImages[writtenHistIdx]->getImage();
-    barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo u2rDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    u2rDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    u2rDep.imageMemoryBarrierCount = 2;
-    u2rDep.pImageMemoryBarriers = barriers;
-    vkCmdPipelineBarrier2(desc.cmd, &u2rDep);
-
-    m_historyIndex = 1 - m_historyIndex;
-    m_historyValid = true;
-
-    // 2. Pass 2: Robust Contrast-Adaptive Sharpening (RCAS)
-    vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rcasPipeline);
-    vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_rcasPipelineLayout, 0, 1, &m_rcasDescSet, 0, nullptr);
-
-    Fsr3RcasPushConstants rcasPC{};
-    rcasPC.displayWidth = m_displayWidth;
-    rcasPC.displayHeight = m_displayHeight;
-    rcasPC.enableSharpening = desc.enableSharpening ? 1u : 0u;
-    rcasPC.sharpness = desc.enableSharpening ? desc.sharpness : 0.0f;
-
-    vkCmdPushConstants(desc.cmd, m_rcasPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rcasPC), &rcasPC);
-    vkCmdDispatch(desc.cmd, dispGroupsX, dispGroupsY, 1);
-
-    // Barrier: Sharpened image write -> Downstream Tonemapper compute read
-    VkImageMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-    postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    postBarrier.image = m_sharpenedImage->getImage();
-    postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    postDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    postDep.imageMemoryBarrierCount = 1;
-    postDep.pImageMemoryBarriers = &postBarrier;
-    vkCmdPipelineBarrier2(desc.cmd, &postDep);
+    Logger::error("FsrUpscaler [{}]: FidelityFX SDK Upscaler context is not active; refusing silent fallback.", m_instanceName);
 }
 
 } // namespace pathways
