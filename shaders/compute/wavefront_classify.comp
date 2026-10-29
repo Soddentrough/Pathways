@@ -90,15 +90,17 @@ void main() {
     if (pc.tileOffsetX == 1u) {
         if (pc.width < fw) {
             // Multi-GPU Checkerboard Tiling: Half-screen packed even tiles (Primary GPU traces strictly 50% rays)
+            uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
+            ivec2 packedCoord = (pc.useMorton != 0u) ? getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height) : globalID;
             uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
-            uint ty = uint(globalID.y) / tileSize;
-            uint tx_half = uint(globalID.x) / tileSize;
-            uint localX = uint(globalID.x) % tileSize;
+            uint ty = uint(packedCoord.y) / tileSize;
+            uint tx_half = uint(packedCoord.x) / tileSize;
+            uint localX = uint(packedCoord.x) % tileSize;
             uint tx = tx_half * 2u + (ty & 1u);
-            pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
+            pixelCoord = ivec2(int(tx * tileSize + localX), packedCoord.y);
             storeCoord = pixelCoord;
             storeWidth = fw;
-            inBounds = (globalID.x < int(pc.width) && globalID.y < int(pc.height) &&
+            inBounds = (packedCoord.x < int(pc.width) && packedCoord.y < int(pc.height) &&
                         pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
         } else {
             // Multi-GPU Checkerboard Tiling: Full-screen primary RayGen to populate 100% G-buffers for FSR3/ML
@@ -114,15 +116,17 @@ void main() {
         }
     } else if (pc.tileOffsetX == 2u) {
         // Multi-GPU Checkerboard Tiling: Secondary GPU operates on packed odd tiles
+        uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
+        ivec2 packedCoord = (pc.useMorton != 0u) ? getPixelCoordsMorton8x4(linearIdx, pc.width, pc.height) : globalID;
         uint tileSize = (pc.tileOffsetY == 0u) ? 64u : pc.tileOffsetY;
-        uint ty = uint(globalID.y) / tileSize;
-        uint tx_half = uint(globalID.x) / tileSize;
-        uint localX = uint(globalID.x) % tileSize;
+        uint ty = uint(packedCoord.y) / tileSize;
+        uint tx_half = uint(packedCoord.x) / tileSize;
+        uint localX = uint(packedCoord.x) % tileSize;
         uint tx = tx_half * 2u + (1u - (ty & 1u));
-        pixelCoord = ivec2(int(tx * tileSize + localX), globalID.y);
-        storeCoord = globalID;
+        pixelCoord = ivec2(int(tx * tileSize + localX), packedCoord.y);
+        storeCoord = packedCoord;
         storeWidth = pc.width;
-        inBounds = (globalID.x < int(pc.width) && globalID.y < int(pc.height) &&
+        inBounds = (packedCoord.x < int(pc.width) && packedCoord.y < int(pc.height) &&
                     pixelCoord.x < int(fw) && pixelCoord.y < int(fh));
     } else if (pc.tileSizeX > 0u && pc.tileSizeY > 0u) {
         uint linearIdx = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32u + gl_LocalInvocationIndex;
@@ -245,12 +249,9 @@ void main() {
                 skyColor *= invSpp;
 
                 if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
-                    if (pc.sppSampleIndex == 0u) {
-                        imageStore(uAccumImage, storeCoord, vec4(skyColor, 0.0));
-                    } else {
-                        vec4 prev = imageLoad(uAccumImage, storeCoord);
-                        imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
-                    }
+                    vec4 prev = imageLoad(uAccumImage, storeCoord);
+                    float outAlpha = ((pc.pad0 & 8u) != 0u && pc.sppSampleIndex == 0u) ? 10000.0 : prev.a;
+                    imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), outAlpha));
                 }
                 if (pc.captureMlData != 0u) {
                     if (pc.sppSampleIndex == 0u) {
@@ -323,6 +324,13 @@ void main() {
             state = packRayState(f16vec3(invSpp), seed, pixelIndex, isSpecular, false);
 
             if (pc.sppSampleIndex == 0u) {
+                bool needNormals = (pc.pad0 == 0u) || ((pc.pad0 & 1u) != 0u) || (pc.captureMlData != 0u);
+                bool needNdStore = (pc.pad0 == 0u) || ((pc.pad0 & 2u) != 0u) || (pc.captureMlData != 0u);
+                bool needMvStore = (pc.pad0 == 0u) || ((pc.pad0 & 4u) != 0u) || (pc.captureMlData != 0u);
+                bool packDepthInAlpha = ((pc.pad0 & 8u) != 0u);
+                bool isCenterPixel = (storeCoord.x == int(fw / 2u) && storeCoord.y == int(fh / 2u));
+                bool needDepth = needNdStore || needMvStore || packDepthInAlpha || (pc.captureMlData != 0u) || isCenterPixel;
+
                 vec2 vSurface = vec2(0.0);
                 float vLinearDepthDelta = 0.0;
                 vec3 primaryNormal = vec3(0.0, 0.0, 1.0);
@@ -334,69 +342,85 @@ void main() {
                 float transmissionVal = 0.0;
 
                 vec3 primaryHitPoint = origin + direction * closestT;
-                vec3 prevHitPoint = primaryHitPoint;
-                if (closestTri >= 0) {
-                    vec3 localHitPos = hitW2o * vec4(primaryHitPoint, 1.0);
-                    prevHitPoint = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
-                }
-                vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
-                vec4 prevClip = ubo.prevViewProj * vec4(prevHitPoint, 1.0);
-                if (currClip.w > 1e-4) {
-                    if (prevClip.w > 1e-2) {
-                        vSurface = clamp((currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
-                        vLinearDepthDelta = prevClip.w - currClip.w;
-                    } else {
-                        vSurface = vec2(2.0);
+                if (needMvStore || pc.captureMlData != 0u) {
+                    vec3 prevHitPoint = primaryHitPoint;
+                    if (closestTri >= 0) {
+                        vec3 localHitPos = hitW2o * vec4(primaryHitPoint, 1.0);
+                        prevHitPoint = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
+                    }
+                    vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
+                    vec4 prevClip = ubo.prevViewProj * vec4(prevHitPoint, 1.0);
+                    if (currClip.w > 1e-4) {
+                        if (prevClip.w > 1e-2) {
+                            vSurface = clamp((currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
+                            vLinearDepthDelta = prevClip.w - currClip.w;
+                        } else {
+                            vSurface = vec2(2.0);
+                        }
                     }
                 }
-                vec3 camForward = -ubo.viewInverse[2].xyz;
-                primaryDepth = max(dot(primaryHitPoint - ubo.position.xyz, camForward), 0.0);
+                if (needDepth) {
+                    vec3 camForward = -ubo.viewInverse[2].xyz;
+                    primaryDepth = max(dot(primaryHitPoint - ubo.position.xyz, camForward), 0.0);
+                }
+                if (packDepthInAlpha && isLocalTile && (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u)) {
+                    imageStore(uAccumImage, storeCoord, vec4(0.0, 0.0, 0.0, -min(primaryDepth, 65000.0)));
+                }
 
-                vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
-                if (matId < pc.numMaterials) {
-                    Material mat = materials[matId];
-                    if (closestTri >= 0 && mat.normalTex > 0u && mat.normalTex <= 512u) {
-                        vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
-                        normalMap.xy *= mat.normalScale;
-                        normalMap = normalize(normalMap);
-                        vec3 orthoTan = tanDir - dot(tanDir, shadingNormal) * shadingNormal;
-                        float tanLenSq = dot(orthoTan, orthoTan);
-                        vec3 gTan = (tanLenSq > 1e-6) ? (orthoTan * inversesqrt(tanLenSq)) : vec3(1.0, 0.0, 0.0);
-                        vec3 gBitan = cross(shadingNormal, gTan) * tanSign;
-                        shadingNormal = normalize(mat3(gTan, gBitan, shadingNormal) * normalMap);
+                if (needNormals) {
+                    vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
+                    if (matId < pc.numMaterials && closestTri >= 0) {
+                        Material mat = materials[matId];
+                        if (mat.normalTex > 0u && mat.normalTex <= 512u) {
+                            vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
+                            normalMap.xy *= mat.normalScale;
+                            normalMap = normalize(normalMap);
+                            vec3 orthoTan = tanDir - dot(tanDir, shadingNormal) * shadingNormal;
+                            float tanLenSq = dot(orthoTan, orthoTan);
+                            vec3 gTan = (tanLenSq > 1e-6) ? (orthoTan * inversesqrt(tanLenSq)) : vec3(1.0, 0.0, 0.0);
+                            vec3 gBitan = cross(shadingNormal, gTan) * tanSign;
+                            shadingNormal = normalize(mat3(gTan, gBitan, shadingNormal) * normalMap);
+                        }
                     }
-                    albedoVal = mat.albedo.rgb;
-                    if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                        albedoVal *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv).rgb;
-                    }
-                    emissiveVal = mat.emissive.rgb;
-                    if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                        emissiveVal *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
-                    }
-                    if (archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
-                        albedoVal = clamp(albedoVal + emissiveVal, vec3(0.0), vec3(1.0));
-                    }
-                    roughnessVal = mat.roughness;
-                    metallicVal = mat.metallic;
-                    transmissionVal = mat.transmission;
-                    if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                        vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
-                        roughnessVal *= mrSample.g;
-                        metallicVal *= mrSample.b;
-                    }
-                    if ((mat.type & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
-                        metallicVal = max(metallicVal, 1.0);
-                    }
-                    if ((mat.type & MATERIAL_TYPE_MASK) == 2u /* MATERIAL_DIELECTRIC */) {
-                        transmissionVal = max(transmissionVal, 1.0);
-                    }
+                    primaryNormal = normalize(transpose(mat3(ubo.viewInverse)) * shadingNormal);
                 }
-                primaryNormal = normalize(transpose(mat3(ubo.viewInverse)) * shadingNormal);
 
-                imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
-                imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, vLinearDepthDelta, 0.0));
+                if (needNdStore || isCenterPixel) {
+                    imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
+                }
+                if (needMvStore) {
+                    imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, vLinearDepthDelta, primaryDepth));
+                }
 
                 if (pc.captureMlData != 0u) {
+                    if (matId < pc.numMaterials) {
+                        Material mat = materials[matId];
+                        albedoVal = mat.albedo.rgb;
+                        if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
+                            albedoVal *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv).rgb;
+                        }
+                        emissiveVal = mat.emissive.rgb;
+                        if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+                            emissiveVal *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
+                        }
+                        if (archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
+                            albedoVal = clamp(albedoVal + emissiveVal, vec3(0.0), vec3(1.0));
+                        }
+                        roughnessVal = mat.roughness;
+                        metallicVal = mat.metallic;
+                        transmissionVal = mat.transmission;
+                        if (mat.mrTex > 0u && mat.mrTex <= 512u) {
+                            vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
+                            roughnessVal *= mrSample.g;
+                            metallicVal *= mrSample.b;
+                        }
+                        if ((mat.type & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
+                            metallicVal = max(metallicVal, 1.0);
+                        }
+                        if ((mat.type & MATERIAL_TYPE_MASK) == 2u /* MATERIAL_DIELECTRIC */) {
+                            transmissionVal = max(transmissionVal, 1.0);
+                        }
+                    }
                     float dSpec = 1.0 / (1.0 + max(primaryDepth, 0.0));
                     float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE || length(emissiveVal) > 1e-3) ? 1.0 : 0.0;
                     float clampedMet = clamp(metallicVal, 0.0, 1.0);
@@ -411,21 +435,29 @@ void main() {
             }
         }
         if (pc.sppSampleIndex == 0u && closestTri < 0 && closestSphere < 0) {
+            bool needNdStore = (pc.pad0 == 0u) || ((pc.pad0 & 2u) != 0u) || (pc.captureMlData != 0u);
+            bool needMvStore = (pc.pad0 == 0u) || ((pc.pad0 & 4u) != 0u) || (pc.captureMlData != 0u);
             vec2 vSurface = vec2(0.0);
-            vec3 skyDirPt = origin + direction * 1000.0;
-            vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
-            vec4 prevClip = ubo.prevViewProj * vec4(skyDirPt, 1.0);
-            if (currClip.w > 1e-4) {
-                if (prevClip.w > 1e-2) {
-                    vSurface = clamp((currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
-                } else {
-                    vSurface = vec2(2.0);
+            if (needMvStore) {
+                vec3 skyDirPt = origin + direction * 1000.0;
+                vec4 currClip = ubo.unjitteredViewProj * vec4(skyDirPt, 1.0);
+                vec4 prevClip = ubo.prevViewProj * vec4(skyDirPt, 1.0);
+                if (currClip.w > 1e-4) {
+                    if (prevClip.w > 1e-2) {
+                        vSurface = clamp((currClip.xy / currClip.w - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
+                    } else {
+                        vSurface = vec2(2.0);
+                    }
                 }
             }
             float primaryDepth = 10000.0;
             vec3 primaryNormal = vec3(0.0, 0.0, 1.0);
-            imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
-            imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, 0.0, 0.0));
+            if (needNdStore) {
+                imageStore(uNormalDepthImage, storeCoord, vec4(primaryNormal, primaryDepth));
+            }
+            if (needMvStore) {
+                imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, 0.0, primaryDepth));
+            }
             if (pc.captureMlData != 0u) {
                 imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(0.0, 0.0, 0.0, 1.0));
                 imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, 0.0, 0.0));
@@ -455,10 +487,6 @@ void main() {
             outHits[rayIdx]  = hit;
             outStates[rayIdx] = state;
         }
-    }
-
-    if (inBounds && pc.sppSampleIndex == 0u) {
-        pixelToRay[pixelIndex] = (isActive && rayIdx < pc.maxQueueCapacity) ? rayIdx : 0xFFFFFFFFu;
     }
 
     if (pc.sortMode > 0u) {

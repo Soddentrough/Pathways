@@ -363,10 +363,8 @@ void RayTracingOrchestrator::recordRayTracing(
         // radiance signals for both E-SVGF and AMD FSR Ray Regeneration compute passes; avoid redundant
         // 4-image clear and RMW traffic unless an external 4-signal consumer is explicitly active.
         bool isFfxDenoisingActive = false;
-        if (needAccumReset && accumImage && needFrameImage) {
-            vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-        }
-        if (isDenoisingActive) {
+        bool needMlBuffers = isDenoisingActive || !config.capture_training_data_dir.empty();
+        if (needMlBuffers) {
             if (mlDiffuseImage) {
                 vkCmdClearColorImage(cmd, mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
             }
@@ -405,11 +403,8 @@ void RayTracingOrchestrator::recordRayTracing(
         };
         if (needFrameImage) {
             addClearBarrier(frameImage);
-            if (needAccumReset) {
-                addClearBarrier(accumImage);
-            }
         }
-        if (isDenoisingActive) {
+        if (needMlBuffers) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
             if (isFfxDenoisingActive) {
@@ -489,15 +484,16 @@ void RayTracingOrchestrator::recordRayTracing(
             wfSceneData.fullWidth = params.dispatchWidth;
         }
 
-        bool needGbuffers = (config.upscaler_mode == UpscalerMode::FSR ||
-                             config.upscaler_mode == UpscalerMode::Upways ||
-                             config.upscaler_mode == UpscalerMode::Gateway ||
-                             config.denoiser_mode == DenoiserMode::Upways ||
-                             config.denoiser_mode == DenoiserMode::Gateway ||
-                             config.denoiser_mode == DenoiserMode::Svgf ||
-                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                             params.isRestirActive ||
-                             config.enable_caustics);
+        bool needNormals = (config.upscaler_mode == UpscalerMode::Upways ||
+                            config.upscaler_mode == UpscalerMode::Gateway ||
+                            config.denoiser_mode == DenoiserMode::Upways ||
+                            config.denoiser_mode == DenoiserMode::Gateway ||
+                            config.denoiser_mode == DenoiserMode::Svgf ||
+                            config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                            params.isRestirActive ||
+                            config.enable_caustics ||
+                            !config.capture_training_data_dir.empty());
+        bool needGbuffers = needNormals || (config.upscaler_mode == UpscalerMode::FSR);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
                           config.denoiser_mode == DenoiserMode::Gateway ||
                           config.denoiser_mode == DenoiserMode::Svgf ||
@@ -507,8 +503,8 @@ void RayTracingOrchestrator::recordRayTracing(
                           config.upways_superres ||
                           config.gateway_superres ||
                           !config.capture_training_data_dir.empty());
-        (void)needGbuffers;
         wfSceneData.captureMlData = (captureMl ? 1u : 0u) | ((captureMl && keepAccumWithMl) ? 2u : 0u) | (isFfxDenoisingActive ? 4u : 0u);
+        wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (needGbuffers ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
             causticsPipeline->recordTrace(

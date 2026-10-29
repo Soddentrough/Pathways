@@ -1378,14 +1378,29 @@ void Engine::updateMergeDescriptors() {
         return;
     }
 
+    uint32_t renderW = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+        ? m_config.getRenderWidth()
+        : m_config.width;
+    uint32_t renderH = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+        ? m_config.getRenderHeight()
+        : m_config.height;
+    uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+    uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+    uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+    MultiGpuMode effectiveMode = m_config.mgpu_mode;
+    if (effectiveMode == MultiGpuMode::Auto) {
+        effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+    }
+    bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile);
+
     MergeDescriptorParams mergeParams{};
     mergeParams.postProcess = m_postProcess.get();
     mergeParams.mgpu = m_mgpu.get();
     mergeParams.motionVectorImage = m_motionVectorImage;
     mergeParams.normalDepthImage = m_normalDepthImage;
     mergeParams.frameImages = m_frameImages;
-    mergeParams.width = m_config.width;
-    mergeParams.height = m_config.height;
+    mergeParams.width = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
+    mergeParams.height = renderH;
     mergeParams.accumFormat = m_config.accum_format;
     mergeParams.concurrentQueues = getConcurrentQueueFamilies();
 
@@ -1563,17 +1578,12 @@ void Engine::renderFrame() {
 
 
         double secGpuMs = 0.0;
-        double secXferMs = 0.0;
-        double asyncMergeMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            m_mgpu->collectSecondaryTimestamps(m_currentFrame);
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
-            secXferMs = m_mgpu->getSecondaryTransferTimeMs();
-            if (m_mgpuCoordinator && m_mgpuCoordinator->hasDedicatedAsyncCompute()) {
-                asyncMergeMs = m_mgpuCoordinator->getLastAsyncMergeTimeMs();
-            }
         }
         double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs + secXferMs) + asyncMergeMs + gpuTonemapMs + gpuUpwaysMs)
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
             : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
@@ -1803,6 +1813,7 @@ void Engine::renderFrame() {
                 } else {
                     m_mgpu->setMode(m_config.mgpu_mode);
                     m_mgpu->setFormat(m_config.accum_format);
+                    m_mgpu->setConfig(m_config);
                     m_mgpu->resize(m_config.width, m_config.height);
                 }
                 if (!m_mgpu->isSecondaryInitialized()) {
@@ -2339,17 +2350,6 @@ void Engine::renderFrame() {
                 avgPC.invSpp = 1.0f;
 
                 m_postProcess->recordRunningAvg(cmd, m_currentFrame, avgPC);
-
-                VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-                VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                avgDep.memoryBarrierCount = 1;
-                avgDep.pMemoryBarriers = &avgBarrier;
-                vkCmdPipelineBarrier2(cmd, &avgDep);
             }
 
             bool resetTemporal = hardReset || m_temporalResetRequested;
@@ -2518,6 +2518,23 @@ void Engine::renderFrame() {
             getEffectiveWavefrontSortMode()
         };
 
+        const bool useDenoiserPipeline = (m_config.denoiser_mode == DenoiserMode::Svgf ||
+                                          m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+                                         m_config.upscaler_mode != UpscalerMode::Upways &&
+                                         m_config.upscaler_mode != UpscalerMode::Gateway;
+        const bool anyDenoiseOrUpscale =
+            (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
+            (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
+            (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway) ||
+            (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
+        const bool needDecoupledMgpuPost = (m_config.denoiser_mode == DenoiserMode::Svgf ||
+                                            m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                            m_config.denoiser_mode == DenoiserMode::Upways ||
+                                            m_config.denoiser_mode == DenoiserMode::Gateway ||
+                                            m_config.upscaler_mode == UpscalerMode::Upways ||
+                                            m_config.upscaler_mode == UpscalerMode::Gateway ||
+                                            m_config.upscaler_mode == UpscalerMode::FSR);
+
         if (m_mgpuCoordinator) {
             mgpuPlan = m_mgpuCoordinator->planAndLaunchSecondary(planParams, m_accumulatedSamples, accumReset);
 
@@ -2550,13 +2567,6 @@ void Engine::renderFrame() {
                 onPreRecord
             );
 
-            // Record Merge commands on primary GPU into postCmd
-            activeCmd = m_postCommandBuffers[m_currentFrame];
-            vkResetCommandBuffer(activeCmd, 0);
-            VkCommandBufferBeginInfo postBeginInfo{};
-            postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            vkBeginCommandBuffer(activeCmd, &postBeginInfo);
-
             if (m_context->hasDedicatedAsyncCompute() && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3) {
                 useAsyncComputeMerge = m_mgpuCoordinator->executeAsyncMerge(
                     m_context->getAsyncComputeQueue(),
@@ -2568,13 +2578,22 @@ void Engine::renderFrame() {
                 );
             }
 
-            if (!useAsyncComputeMerge) {
-                m_mgpuCoordinator->recordMergePass(
-                    activeCmd, mgpuPlan, planParams,
-                    m_postProcess.get(),
-                    m_frameImages[mgpuPlan.slot],
-                    m_mlDiffuseImage
-                );
+            if (hasPostSubmission) {
+                // Record Merge/Post commands on primary GPU into postCmd
+                activeCmd = m_postCommandBuffers[m_currentFrame];
+                vkResetCommandBuffer(activeCmd, 0);
+                VkCommandBufferBeginInfo postBeginInfo{};
+                postBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                vkBeginCommandBuffer(activeCmd, &postBeginInfo);
+
+                if (!useAsyncComputeMerge) {
+                    m_mgpuCoordinator->recordMergePass(
+                        activeCmd, mgpuPlan, planParams,
+                        m_postProcess.get(),
+                        m_frameImages[mgpuPlan.slot],
+                        m_mlDiffuseImage
+                    );
+                }
             }
         }
 
@@ -2582,17 +2601,9 @@ void Engine::renderFrame() {
         bool resetTemporal = hardReset || m_temporalResetRequested;
         m_temporalResetRequested = false;
 
+        if (hasPostSubmission) {
         // In-House ReLAX / A-SVGF or AMD FSR Ray Regeneration Denoiser (runs at internal renderW x renderH)
         bool svgfRun = false;
-        const bool useDenoiserPipeline = (m_config.denoiser_mode == DenoiserMode::Svgf ||
-                                          m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
-                                         m_config.upscaler_mode != UpscalerMode::Upways &&
-                                         m_config.upscaler_mode != UpscalerMode::Gateway;
-        const bool anyDenoiseOrUpscale =
-            (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
-            (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
-            (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway) ||
-            (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
 
         if (anyDenoiseOrUpscale) {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
@@ -2723,16 +2734,33 @@ void Engine::renderFrame() {
         tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
         tonemapConstants.peakNits = m_config.hdr_peak_nits;
         tonemapConstants.paperWhiteNits = m_config.hdr_paper_white_nits;
+        const bool useFusedMgpuTonemap = !useAsyncComputeMerge && !needDecoupledMgpuPost && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3 &&
+                                         !m_config.visualize_mgpu_split && (mgpuPlan.slot == m_currentFrame) &&
+                                         m_postProcess && m_postProcess->hasFusedPipeline();
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
-        if (m_postProcess) {
+        if (useFusedMgpuTonemap) {
+            PostProcessPipeline::FusedAccumTonemapPushConstants fusedPC{};
+            fusedPC.width = renderW;
+            fusedPC.height = renderH;
+            fusedPC.sampleCount = (m_config.progressive_accumulation && !accumReset) ? m_accumulatedSamples : 1u;
+            fusedPC.invSpp = 1.0f;
+            fusedPC.exposure = m_config.exposure;
+            fusedPC.applyACES = m_config.aces_tonemap ? 1u : 0u;
+            fusedPC.displayMode = tonemapConstants.displayMode;
+            fusedPC.peakNits = tonemapConstants.peakNits;
+            fusedPC.paperWhiteNits = tonemapConstants.paperWhiteNits;
+            fusedPC.pad = 0;
+            m_postProcess->recordFusedAccumTonemap(activeCmd, m_currentFrame, fusedPC);
+        } else if (m_postProcess) {
             m_postProcess->recordTonemap(activeCmd, tmSet, m_config.width, m_config.height, tonemapConstants);
         }
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
+        }
     }
 
     // 2.9 ReSTIR debug view overlay: overwrites m_outputImage with per-pixel
     // reservoir state (bypasses accumulation and tonemapping entirely).
-    if (m_config.debug_view != DebugViewMode::None && m_postProcess && m_outputImage) {
+    if (hasPostSubmission && m_config.debug_view != DebugViewMode::None && m_postProcess && m_outputImage) {
         if (m_restirManager && m_restirManager->isInitialized()) {
             VkMemoryBarrier2 dbgOrderBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
             dbgOrderBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -2764,7 +2792,7 @@ void Engine::renderFrame() {
     }
 
     // 3. Interactive Blit & Dear ImGui Overlay
-    if (m_presentation) {
+    if (m_presentation && hasPostSubmission) {
         GuiActions guiActions{};
         if (m_presentation->recordPresentation(
             activeCmd, imageIndex, m_outputImage, m_gui.get(), m_config, getStats(),
@@ -3367,6 +3395,41 @@ void Engine::run() {
         return;
     }
     Logger::info("Starting Pathways render loop...");
+
+    // Wake GPU SMU(s) out of post-scene-load deep idle sleep and warm instruction/BVH caches
+    if ((m_config.frame_limit == 0 || m_config.frame_limit >= 10) && m_config.warmup_frames == 0 && m_wavefrontPipeline) {
+        uint32_t savedWarmup = m_config.warmup_frames;
+        bool savedBenchmark = m_config.benchmark;
+        m_config.warmup_frames = 100000u;
+        m_config.benchmark = false;
+        m_wavefrontPipeline->setWarmupSppOverride(16u);
+        if (m_mgpu) m_mgpu->setWarmupSppOverride(16u);
+        auto warmupStart = std::chrono::steady_clock::now();
+        for (uint32_t pair = 0; pair < 32u; ++pair) {
+            renderFrame();
+            renderFrame();
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - warmupStart).count();
+            if (pair >= 3u && elapsedMs >= 550) {
+                break;
+            }
+        }
+        m_wavefrontPipeline->setWarmupSppOverride(0u);
+        if (m_mgpu) m_mgpu->setWarmupSppOverride(0u);
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT * 2; ++i) {
+            renderFrame();
+        }
+        m_config.warmup_frames = savedWarmup;
+        m_config.benchmark = savedBenchmark;
+        m_totalFramesRendered = 0;
+        m_frameIndex = 0;
+        m_accumulatedSamples = 0;
+        m_accumulationComplete = false;
+        m_temporalResetRequested = true;
+        m_frameTimesMs.clear();
+        m_presentationTimesMs.clear();
+        if (m_presentation) m_presentation->clearPresentationTimes();
+    }
 
     while (!m_window->shouldClose()) {
         m_window->pollEvents();

@@ -47,7 +47,11 @@ layout(push_constant) uniform PushConstants {
     uint mergeMode;            // 0/1 = CheckerboardTile, 2 = SampleParallel
     uint primarySpp;
     uint secDispatchWidth;     // Secondary tile buffer pitch in pixels (0 = auto-derive from tile grid)
-    uint mergeGbuffers;        // 1 = also merge secondary G-buffers (motion vectors, normal/depth)
+    uint mergeGbuffers;        // 1 = full G-buffer merge, 2 = MV+depth from SecondaryMvBuffer, 3 = reconstruct MV+depth from secVal.a
+    uint cameraMoved;          // 1 = compute camera reprojection MV via reprojMat, 0 = zero MV
+    float ndcJitterX;
+    float ndcJitterY;
+    mat4 reprojMat;            // prevViewProj * viewInverse * scale(projInv00, projInv11, -1, 1)
 } pc;
 
 vec3 unpackR11G11B10F(uint val) {
@@ -77,24 +81,43 @@ void main() {
     if (pc.mergeMode <= 1u) {
         // --- Mode 0/1: Checkerboard Tiling (Spatial Interleaving) ---
         uint tileSize = (pc.tileSize == 0u) ? 64u : pc.tileSize;
-        uint workgroupsPerTile = max(1u, tileSize / 16u);
-        uint tileX = gl_WorkGroupID.x / workgroupsPerTile;
-        uint tileY = gl_WorkGroupID.y / workgroupsPerTile;
-
-        uint wgParity = (tileX + tileY) & 1u;
-        if (wgParity == 0u) return;
-
-        ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-        if (pixelCoord.x >= pc.width || pixelCoord.y >= pc.height) {
-            return;
-        }
-
-        uint tx = uint(pixelCoord.x) / tileSize;
-        uint tx_half = tx / 2u;
-        uint localX = uint(pixelCoord.x) % tileSize;
-        uint secX = tx_half * tileSize + localX;
         uint numTilesX = (pc.width + tileSize - 1u) / tileSize;
         uint secPitch = (pc.secDispatchWidth > 0u) ? pc.secDispatchWidth : (((numTilesX + 1u) / 2u) * tileSize);
+
+        ivec2 pixelCoord;
+        uint secX;
+        if (pc.mergeMode == 1u && pc.secDispatchWidth > 0u) {
+            secX = gl_GlobalInvocationID.x;
+            uint pixelY = gl_GlobalInvocationID.y;
+            if (secX >= secPitch || pixelY >= pc.height) {
+                return;
+            }
+            uint tx_half = secX / tileSize;
+            uint localX = secX % tileSize;
+            uint tileY = pixelY / tileSize;
+            uint tx = tx_half * 2u + (1u - (tileY & 1u));
+            pixelCoord = ivec2(int(tx * tileSize + localX), int(pixelY));
+            if (pixelCoord.x >= int(pc.width)) {
+                return;
+            }
+        } else {
+            uint workgroupsPerTile = max(1u, tileSize / 16u);
+            uint tileX = gl_WorkGroupID.x / workgroupsPerTile;
+            uint tileY = gl_WorkGroupID.y / workgroupsPerTile;
+
+            uint wgParity = (tileX + tileY) & 1u;
+            if (wgParity == 0u) return;
+
+            pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+            if (pixelCoord.x >= int(pc.width) || pixelCoord.y >= int(pc.height)) {
+                return;
+            }
+
+            uint tx = uint(pixelCoord.x) / tileSize;
+            uint tx_half = tx / 2u;
+            uint localX = uint(pixelCoord.x) % tileSize;
+            secX = tx_half * tileSize + localX;
+        }
         uint linearIndex = uint(pixelCoord.y) * secPitch + secX;
 
         vec4 secVal;
@@ -108,19 +131,43 @@ void main() {
             secVal = vec4(unpackR11G11B10F(raw), 0.0);
         }
 
-        imageStore(uPrimaryAccum, pixelCoord, secVal);
+        imageStore(uPrimaryAccum, pixelCoord, vec4(secVal.rgb, (secVal.a > 0.5) ? secVal.a : 0.0));
 
-        bool mergeGbuffers = (pc.mergeGbuffers != 0u);
-        if (mergeGbuffers) {
-            // Merge Motion Vectors (RGBA16F 2.5D)
+        if (pc.mergeGbuffers == 3u) {
+            float primaryDepth = (secVal.a < 0.0) ? (-secVal.a) : 10000.0;
+            vec2 vSurface = vec2(0.0);
+            float vLinearDepthDelta = 0.0;
+            if (pc.cameraMoved != 0u) {
+                vec2 uv = (vec2(pixelCoord) + vec2(0.5)) / vec2(float(pc.width), float(pc.height));
+                vec2 currNdc = (uv * 2.0 - 1.0) + vec2(pc.ndcJitterX, pc.ndcJitterY);
+                float zEff = (primaryDepth >= 9999.0) ? 1000.0 : primaryDepth;
+                vec4 prevClip = pc.reprojMat * vec4(currNdc.x * zEff, currNdc.y * zEff, zEff, 1.0);
+                if (prevClip.w > 1e-2) {
+                    vSurface = clamp((currNdc - prevClip.xy / prevClip.w) * 0.5, vec2(-2.0), vec2(2.0));
+                    if (primaryDepth < 9999.0) {
+                        vLinearDepthDelta = prevClip.w - zEff;
+                    }
+                } else {
+                    vSurface = vec2(2.0);
+                }
+            }
+            imageStore(uPrimaryMotionVectors, pixelCoord, vec4(vSurface, vLinearDepthDelta, primaryDepth));
+            imageStore(uPrimaryNormalDepth, pixelCoord, vec4(0.0, 0.0, 1.0, primaryDepth));
+        } else if (pc.mergeGbuffers != 0u) {
+            // Merge Motion Vectors (RGBA16F: rg = 2D UV motion, b = depth delta, a = primaryDepth)
             uvec2 rawMv = secondaryMv16[linearIndex];
             vec4 secMv = vec4(unpackHalf2x16(rawMv.x), unpackHalf2x16(rawMv.y));
             imageStore(uPrimaryMotionVectors, pixelCoord, secMv);
 
-            // Merge Normal & Depth (RGBA16F)
-            uvec2 rawNd = secondaryNormDepth16[linearIndex];
-            vec4 secNd = vec4(unpackHalf2x16(rawNd.x), unpackHalf2x16(rawNd.y));
-            imageStore(uPrimaryNormalDepth, pixelCoord, secNd);
+            if (pc.mergeGbuffers == 1u) {
+                // Full Normal & Depth merge (RGBA16F)
+                uvec2 rawNd = secondaryNormDepth16[linearIndex];
+                vec4 secNd = vec4(unpackHalf2x16(rawNd.x), unpackHalf2x16(rawNd.y));
+                imageStore(uPrimaryNormalDepth, pixelCoord, secNd);
+            } else {
+                // Fast Depth-only merge from secMv.w when normal vectors are not needed (e.g. Pure MC + FSR)
+                imageStore(uPrimaryNormalDepth, pixelCoord, vec4(0.0, 0.0, 1.0, secMv.w));
+            }
         }
     } else {
         // --- Mode 2: Sample Parallelism (Temporal Sample Accumulation) ---

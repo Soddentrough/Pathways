@@ -192,15 +192,18 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * 8;
     } else {
         plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
-        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR ||
-                             params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.upscaler_mode == UpscalerMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Svgf ||
-                             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-        if (plan.tileOffsetX_sec == 2u && needGbuffers) {
-            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 16; // 8 MV + 8 NormDepth
+        bool needNormals = (params.config.upscaler_mode == UpscalerMode::Upways ||
+                            params.config.upscaler_mode == UpscalerMode::Gateway ||
+                            params.config.denoiser_mode == DenoiserMode::Upways ||
+                            params.config.denoiser_mode == DenoiserMode::Gateway ||
+                            params.config.denoiser_mode == DenoiserMode::Svgf ||
+                            params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                            params.config.enable_restir ||
+                            params.config.enable_caustics);
+        bool needMvDepth = needNormals || (params.config.upscaler_mode == UpscalerMode::FSR);
+        bool copyMvImage = needNormals || (needMvDepth && params.config.accum_format == AccumFormat::R11G11B10_UFLOAT);
+        if (plan.tileOffsetX_sec == 2u && copyMvImage) {
+            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * (needNormals ? 16 : 8);
         }
     }
     m_lastSecToPrimBytes = plan.frameBytes;
@@ -370,19 +373,32 @@ void MultiGpuCoordinator::recordMergePass(
 
     // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
-        bool needGbuffers = (params.config.upscaler_mode == UpscalerMode::FSR ||
-                             params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.upscaler_mode == UpscalerMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Svgf ||
-                             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        bool needNormals = (params.config.upscaler_mode == UpscalerMode::Upways ||
+                            params.config.upscaler_mode == UpscalerMode::Gateway ||
+                            params.config.denoiser_mode == DenoiserMode::Upways ||
+                            params.config.denoiser_mode == DenoiserMode::Gateway ||
+                            params.config.denoiser_mode == DenoiserMode::Svgf ||
+                            params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                            params.config.enable_restir ||
+                            params.config.enable_caustics);
+        bool needMvDepth = needNormals || (params.config.upscaler_mode == UpscalerMode::FSR);
+        uint32_t mergeGbuffersMode = needNormals ? 1u : (needMvDepth ? ((plan.formatMode != 2u) ? 3u : 2u) : 0u);
+        glm::mat4 viewToWorldScaled = params.ubo.viewInverse;
+        viewToWorldScaled[0] *= params.ubo.projInverse[0][0];
+        viewToWorldScaled[1] *= params.ubo.projInverse[1][1];
+        viewToWorldScaled[2] *= -1.0f;
+        glm::mat4 reprojMat = params.ubo.prevViewProj * viewToWorldScaled;
         PostProcessPipeline::MergePushConstants mergePC{
             plan.mgpuBaseW, plan.mgpuBaseH, plan.secSpp, params.config.tile_size, plan.formatMode, plan.mergeMode, plan.primSpp,
-            plan.secDispatchWidth, needGbuffers ? 1u : 0u
+            plan.secDispatchWidth, mergeGbuffersMode,
+            params.cameraMovedThisFrame ? 1u : 0u,
+            params.ubo.jitterOffset.z, params.ubo.jitterOffset.w,
+            reprojMat
         };
 
-        uint32_t mergeGroupsX = (plan.mgpuBaseW + 15) / 16;
+        uint32_t mergeGroupsX = (plan.mergeMode == 1u && plan.secDispatchWidth > 0u)
+            ? ((plan.secDispatchWidth + 15) / 16)
+            : ((plan.mgpuBaseW + 15) / 16);
         uint32_t mergeGroupsY = (plan.mergeMode == 0u) ? (((plan.mgpuBaseH + 1) / 2 + 15) / 16) : ((plan.mgpuBaseH + 15) / 16);
         postProcess->recordMerge(activeCmd, plan.slot, mergePC, mergeGroupsX, mergeGroupsY);
     }
@@ -429,8 +445,25 @@ void MultiGpuCoordinator::recordMergePass(
         vkCmdPipelineBarrier2(activeCmd, &diffCopyDep);
     }
 
+    const bool needDecoupledPost = (params.config.denoiser_mode == DenoiserMode::Svgf ||
+                                    params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                    params.config.denoiser_mode == DenoiserMode::Upways ||
+                                    params.config.denoiser_mode == DenoiserMode::Gateway ||
+                                    params.config.upscaler_mode == UpscalerMode::Upways ||
+                                    params.config.upscaler_mode == UpscalerMode::Gateway ||
+                                    params.config.upscaler_mode == UpscalerMode::FSR);
+    const bool isDenoisedWithoutRunningAvg =
+        (params.config.denoiser_mode == DenoiserMode::Upways || params.config.upscaler_mode == UpscalerMode::Upways) ||
+        (params.config.denoiser_mode == DenoiserMode::Gateway || params.config.upscaler_mode == UpscalerMode::Gateway) ||
+        ((params.config.denoiser_mode == DenoiserMode::Svgf || params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+         params.config.capture_training_data_dir.empty());
+    const bool useFusedMgpuTonemap = !m_hasDedicatedAsyncCompute && !needDecoupledPost && !params.skipRayTracing && !plan.isSampleBlendFsr3 &&
+                                     !params.config.visualize_mgpu_split && (plan.slot == params.currentFrame) &&
+                                     postProcess && postProcess->hasFusedPipeline();
+
     // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
-    if (!params.skipRayTracing && postProcess && postProcess->hasRunningAvgPipeline()) {
+    if (!params.skipRayTracing && !useFusedMgpuTonemap && !isDenoisedWithoutRunningAvg &&
+        postProcess && postProcess->hasRunningAvgPipeline()) {
         PostProcessPipeline::RunningAvgPushConstants avgPC{};
         avgPC.width = plan.mgpuBaseW;
         avgPC.height = plan.mgpuBaseH;
@@ -438,17 +471,6 @@ void MultiGpuCoordinator::recordMergePass(
         avgPC.invSpp = 1.0f;
 
         postProcess->recordRunningAvg(activeCmd, params.currentFrame, avgPC);
-
-        VkMemoryBarrier2 avgBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        avgBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        avgBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        avgBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        avgBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-
-        VkDependencyInfo avgDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        avgDep.memoryBarrierCount = 1;
-        avgDep.pMemoryBarriers = &avgBarrier;
-        vkCmdPipelineBarrier2(activeCmd, &avgDep);
     }
 }
 
@@ -507,7 +529,7 @@ bool MultiGpuCoordinator::executeAsyncMerge(
     std::vector<VkSemaphoreSubmitInfo> waitInfos;
     VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     waitRt.semaphore = rtCompleteSemaphore;
-    waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    waitRt.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     waitInfos.push_back(waitRt);
 
     if (params.mgpu && params.mgpu->isCrossGpuSyncActive()) {
@@ -516,7 +538,7 @@ bool MultiGpuCoordinator::executeAsyncMerge(
             VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
             waitSec.semaphore = secSem;
             waitSec.value = params.mgpu->getCurrentTimelineValue();
-            waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            waitSec.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             waitInfos.push_back(waitSec);
         }
     }
@@ -552,14 +574,14 @@ void MultiGpuCoordinator::populatePostWaitSemaphores(
         uint32_t slot = currentFrame % MAX_FRAMES_IN_FLIGHT;
         VkSemaphoreSubmitInfo waitMerge{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
         waitMerge.semaphore = m_mergeCompleteSemaphores[slot];
-        waitMerge.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        waitMerge.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         waitSemaphoreInfos.push_back(waitMerge);
         return;
     }
 
     VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     waitRt.semaphore = rtCompleteSemaphore;
-    waitRt.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    waitRt.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     waitSemaphoreInfos.push_back(waitRt);
 
     if (mgpu && mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
@@ -568,7 +590,7 @@ void MultiGpuCoordinator::populatePostWaitSemaphores(
             VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
             waitSec.semaphore = secSem;
             waitSec.value = mgpu->getCurrentTimelineValue();
-            waitSec.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            waitSec.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             waitSemaphoreInfos.push_back(waitSec);
         }
     }

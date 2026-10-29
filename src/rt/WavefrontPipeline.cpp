@@ -752,7 +752,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     // Bind the unified descriptor set ONCE for the entire frame (queue ping-ponging uses 64-bit BDA GPU pointers)
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descSetsEven[frameSlot], 0, nullptr);
 
-    for (uint32_t sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
+    uint32_t effectiveSpp = (m_warmupSppOverride > 0) ? m_warmupSppOverride : spp;
+    for (uint32_t sampleIdx = 0; sampleIdx < effectiveSpp; ++sampleIdx) {
         for (uint32_t batch = 0; batch < numBatches; ++batch) {
             uint32_t globalBatchIdx = sampleIdx * numBatches + batch;
             bool canProfileBatch = (sampleIdx == 0);
@@ -767,6 +768,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             uint32_t curBatchH = (numBatches > 1) ? (batchBaseH + (by < batchRemH ? 1u : 0u)) : height;
             uint32_t tileSzX = (numBatches > 1) ? curBatchW : 0;
             uint32_t tileSzY = (numBatches > 1) ? curBatchH : 0;
+            uint32_t activeMaxCapacity = std::min(m_maxCapacity, ((curBatchW * curBatchH + 1023u) & ~1023u));
 
             if (globalBatchIdx > 0) {
                 // Inter-batch / inter-sample barrier: Wait for all previous compute shader passes to complete
@@ -801,7 +803,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .useMorton = sceneData.useMorton,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
-                .maxQueueCapacity = m_maxCapacity,
+                .maxQueueCapacity = activeMaxCapacity,
                 .sppSampleIndex = sampleIdx,
                 .useHardwareRT = sceneData.useHardwareRT,
                 .tileOffsetX = batchOffX,
@@ -813,7 +815,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .fullWidth = fw,
                 .fullHeight = fh,
                 .captureMlData = sceneData.captureMlData,
-                .pad0 = 0
+                .pad0 = sceneData.gbufferFlags
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(classifyPC), &classifyPC);
             if (canProfileBatch) writeTimestamp(cmd, frameSlot, &batchTs.classifyStart);
@@ -854,7 +856,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .height = fh,
                 .currentBounce = b,
                 .maxBounces = maxBounces,
-                .maxQueueCapacity = m_maxCapacity,
+                .maxQueueCapacity = activeMaxCapacity,
                 .sppSampleIndex = sampleIdx,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
@@ -967,7 +969,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .height = fh,
                 .currentBounce = b,
                 .maxBounces = maxBounces,
-                .maxQueueCapacity = m_maxCapacity,
+                .maxQueueCapacity = activeMaxCapacity,
                 .sppSampleIndex = sampleIdx,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
@@ -1072,7 +1074,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     .height = fh,
                     .currentBounce = cutoffBounce,
                     .maxBounces = maxBounces,
-                    .maxQueueCapacity = m_maxCapacity,
+                    .maxQueueCapacity = activeMaxCapacity,
                     .sppSampleIndex = sampleIdx,
                     .hasEnvMap = sceneData.hasEnvMap,
                     .envMapIntensity = sceneData.envMapIntensity,

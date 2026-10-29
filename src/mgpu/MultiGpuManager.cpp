@@ -504,6 +504,32 @@ MultiGpuManager::~MultiGpuManager() {
     m_devices.clear();
 }
 
+void MultiGpuManager::collectSecondaryTimestamps(uint32_t bufferSlot) {
+    if (!isMultiGpuActive() || m_devices.empty()) return;
+    GpuDeviceNode* node = m_devices[0].get();
+    uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
+    if (!node->slotHasExecuted[slot]) return;
+    VkDevice device = node->context->getDevice();
+    if (vkWaitForFences(device, 1, &node->renderFences[slot], VK_TRUE, 100'000'000ull /* 100 ms */) != VK_SUCCESS) {
+        return;
+    }
+    uint64_t slotTimestamps[4] = {0, 0, 0, 0};
+    if (vkGetQueryPoolResults(device, node->queryPools[slot], 0, 4, sizeof(slotTimestamps), slotTimestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        if (slotTimestamps[1] > slotTimestamps[0]) {
+            node->lastFrameTimeMs = (slotTimestamps[1] - slotTimestamps[0]) * node->timestampPeriod * 1e-6;
+        }
+        if (slotTimestamps[3] > slotTimestamps[2]) {
+            node->lastTransferTimeMs = (slotTimestamps[3] - slotTimestamps[2]) * node->timestampPeriod * 1e-6;
+        }
+    }
+}
+
+void MultiGpuManager::setWarmupSppOverride(uint32_t spp) {
+    if (!m_devices.empty() && m_devices[0]->wavefrontPipeline) {
+        m_devices[0]->wavefrontPipeline->setWarmupSppOverride(spp);
+    }
+}
+
 double MultiGpuManager::getSecondaryGpuTimeMs() const {
     if (!isMultiGpuActive() || m_devices.empty()) return 0.0;
     return m_devices[0]->lastFrameTimeMs;
@@ -892,11 +918,13 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     if (m_config.mgpu_transfer_explicit) {
         attemptP2P = (m_config.mgpu_transfer_mode == Config::MgpuTransferMode::P2P);
     } else {
-        // Automatic selection policy:
-        // When Resizable BAR is available (>256 MB BAR0), use P2P Direct BAR by default.
-        // Under Small-BAR topologies (<=256 MB BAR0, Above 4G Decoding disabled), direct P2P MMIO across
-        // separate PCIe root complexes incurs crossbar arbitration overhead; auto-fallback to Zero-Copy
-        // Host Memory which achieves full 2.0x+ scaling via independent PCIe 4.0 host streaming.
+#if defined(__linux__)
+        // On Linux amdgpu/radv, DMA-BUF exports share a single kernel dma_resv reservation object
+        // (AMDGPU_SYNC_NE_OWNER) that serializes peer queue submissions and throttles SMU boost clocks.
+        // Zero-Copy Host Memory (VK_EXT_external_memory_host) creates independent per-device BOs backed
+        // by pinned host pages, achieving lock-free dual-PCIe 4.0 x16 concurrency and 1.85x-1.95x scaling.
+        attemptP2P = false;
+#else
         if (!isSmallBar) {
             attemptP2P = true;
         } else {
@@ -904,6 +932,7 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
                          static_cast<double>(barVisibleVramSize0) / (1024.0 * 1024.0));
             attemptP2P = false;
         }
+#endif
     }
 
     if (attemptP2P) {
@@ -1118,37 +1147,28 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 }
 
 VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t height) const {
-    if (m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend && m_config.upscaler_mode == UpscalerMode::FSR) {
-        VkDeviceSize displaySize = static_cast<VkDeviceSize>(width) * height * 8;
-        return (displaySize + 65535) & ~static_cast<VkDeviceSize>(65535);
-    }
+    VkDeviceSize displaySize = static_cast<VkDeviceSize>(width) * height * 8;
+    VkDeviceSize displayAligned = (displaySize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
-    uint32_t renderW = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
-        static_cast<uint32_t>(width * m_config.render_scale) : width;
-    uint32_t renderH = (m_config.render_scale < 1.0f && m_config.upscaler_mode != UpscalerMode::None) ?
-        static_cast<uint32_t>(height * m_config.render_scale) : height;
-
-    uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
-    uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+    uint32_t maxTileSize = 128u;
+    uint32_t numTilesX = (width + maxTileSize - 1u) / maxTileSize;
     uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
-    bool isCheckerboard = (m_config.mgpu_mode == MultiGpuMode::CheckerboardTile || m_config.mgpu_mode == MultiGpuMode::Auto);
-    uint32_t dispatchWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
-    uint32_t dispatchHeight = renderH;
+    uint32_t cbWidth = maxTilesPerGpuX * maxTileSize;
 
     uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
                    (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
-    VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
-    VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
-    if (!isCheckerboard) {
-        // SampleParallel mode only transfers radiance
-        return radOffsetAligned;
-    }
+    VkDeviceSize sampleParallelRadSize = static_cast<VkDeviceSize>(width) * height * bpp;
+    VkDeviceSize sampleParallelAligned = (sampleParallelRadSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
-    VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors)
-    VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-    VkDeviceSize ndSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F
-    return mvOffsetAligned + ndSize;
+    VkDeviceSize cbRadSize = static_cast<VkDeviceSize>(cbWidth) * height * bpp;
+    VkDeviceSize cbRadOffsetAligned = (cbRadSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    VkDeviceSize cbMvSize = static_cast<VkDeviceSize>(cbWidth) * height * 8;
+    VkDeviceSize cbMvOffsetAligned = (cbRadOffsetAligned + cbMvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    VkDeviceSize cbNdSize = static_cast<VkDeviceSize>(cbWidth) * height * 8;
+    VkDeviceSize cbTotalSize = cbMvOffsetAligned + cbNdSize;
+
+    return std::max({ displayAligned, sampleParallelAligned, cbTotalSize });
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
@@ -1338,13 +1358,26 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     Logger::info("Cross-GPU Hardware Synchronization active via VK_KHR_external_semaphore_fd & Timeline Semaphores (zero-wait GPU-to-GPU pipelining).");
 #endif
 
-    // 3. Render Targets on secondary device (full-width to allow seamless dynamic switching between Checkerboard and SampleParallel)
-    uint32_t secWidth = config.width;
+    // 3. Render Targets on secondary device (sized to active secondary dispatch dimensions)
+    uint32_t initRenderW = (config.upscaler_mode != UpscalerMode::None && config.render_scale < 1.0f)
+        ? config.getRenderWidth() : config.width;
+    uint32_t initRenderH = (config.upscaler_mode != UpscalerMode::None && config.render_scale < 1.0f)
+        ? config.getRenderHeight() : config.height;
+    uint32_t initTileSize = (config.tile_size == 0u) ? 64u : config.tile_size;
+    uint32_t initNumTilesX = (initRenderW + initTileSize - 1u) / initTileSize;
+    uint32_t initMaxTilesPerGpuX = (initNumTilesX + 1u) / 2u;
+    MultiGpuMode initEffectiveMode = config.mgpu_mode;
+    if (initEffectiveMode == MultiGpuMode::Auto) {
+        initEffectiveMode = (config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+    }
+    bool initIsCheckerboard = (initEffectiveMode == MultiGpuMode::CheckerboardTile || initEffectiveMode == MultiGpuMode::Off);
+    uint32_t secWidth = initIsCheckerboard ? (initMaxTilesPerGpuX * initTileSize) : std::max(initRenderW, initMaxTilesPerGpuX * initTileSize);
+    uint32_t secHeight = initRenderH;
     VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
                            (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
     for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
         secNode->accumTargets[i] = std::make_unique<Image>(
-            secDevice, secAlloc, secWidth, config.height,
+            secDevice, secAlloc, secWidth, secHeight,
             accumFormat,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
         );
@@ -1564,19 +1597,19 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
 
     // Allocate secondary G-Buffer & scratch images
-    secNode->directLightImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+    secNode->directLightImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
-    secNode->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+    secNode->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
-    secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+    secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    secNode->causticImage = std::make_unique<Image>(secDevice, secAlloc, config.width, config.height,
+    secNode->causticImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
@@ -1681,7 +1714,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
             secNode->wavefrontPipeline = std::make_unique<WavefrontPipeline>(
                 secDevice, secAlloc,
-                config.width, config.height,
+                secWidth, secHeight,
                 wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
                 wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
                 wfShadeEmissiveCode, wfShadePassthroughCode,
@@ -1694,7 +1727,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             );
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
             if (config.enable_restir && config.mgpu_mode != MultiGpuMode::Off) {
-                secNode->restirManager->resize(config.width, config.height);
+                secNode->restirManager->resize(initRenderW, initRenderH);
             }
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
@@ -1704,18 +1737,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         }
     }
 
-    // 7b. Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
-    if (config.upscaler_mode == UpscalerMode::FSR3) {
+    // 7b. Secondary GPU FSR Upscaler (Sample Parallel SampleBlend mode only)
+    if (config.upscaler_mode == UpscalerMode::FSR && config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend) {
         try {
             auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
             auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
-            uint32_t renderW = (config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(config.width * config.render_scale) :
-                config.width;
-            uint32_t renderH = (config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(config.height * config.render_scale) :
-                config.height;
-            secNode->upscaler = std::make_unique<Fsr3Upscaler>(
+            uint32_t renderW = config.getRenderWidth();
+            uint32_t renderH = config.getRenderHeight();
+            secNode->upscaler = std::make_unique<FsrUpscaler>(
                 secDevice,
                 secNode->context->getPhysicalDevice(),
                 secAlloc,
@@ -1726,11 +1755,12 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 upscaleCode,
                 rcasCode,
                 accumFormat,
-                "[GPU 1 Secondary Peer]"
+                "[GPU 1 Secondary Peer]",
+                config.fsr_version
             );
-            Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized successfully [GPU 1 Secondary Peer].");
+            Logger::info("Secondary GPU: FSR Upscaler initialized successfully [GPU 1 Secondary Peer].");
         } catch (const std::exception& e) {
-            Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler: {}", e.what());
+            Logger::warn("Failed to initialize secondary GPU FSR upscaler: {}", e.what());
             secNode->upscaler.reset();
         }
     }
@@ -1992,6 +2022,21 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
     }
 
+    bool needNormals = (m_config.upscaler_mode == UpscalerMode::Upways ||
+                        m_config.upscaler_mode == UpscalerMode::Gateway ||
+                        m_config.denoiser_mode == DenoiserMode::Upways ||
+                        m_config.denoiser_mode == DenoiserMode::Gateway ||
+                        m_config.denoiser_mode == DenoiserMode::Svgf ||
+                        m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                        m_config.enable_restir ||
+                        m_config.enable_caustics);
+    bool needMvDepth = needNormals || (m_config.upscaler_mode == UpscalerMode::FSR);
+    bool copyMvImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->motionVectorImage &&
+                        (needNormals || (needMvDepth && m_config.accum_format == AccumFormat::R11G11B10_UFLOAT)));
+    bool copyNdImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->normalDepthImage && needNormals);
+    bool packDepthInAlpha = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMvDepth && !copyMvImage);
+    bool earlyGbufferCopy = false;
+
     if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline) {
         if (packet.accumulateHistory == 0u) {
             VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -2047,18 +2092,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
         wfSceneData.fullHeight = packet.tileHeight;
-        bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
-                             m_config.upscaler_mode == UpscalerMode::Upways ||
-                             m_config.upscaler_mode == UpscalerMode::Gateway ||
-                             m_config.denoiser_mode == DenoiserMode::Upways ||
-                             m_config.denoiser_mode == DenoiserMode::Gateway ||
-                             m_config.denoiser_mode == DenoiserMode::Svgf ||
-                             m_config.enable_restir ||
-                             m_config.enable_caustics ||
-                             m_config.upways_superres ||
-                             m_config.gateway_superres ||
-                             !m_config.capture_training_data_dir.empty());
-        wfSceneData.captureMlData = needGbuffers ? 2u : 0u;
+        wfSceneData.captureMlData = 0u;
+        wfSceneData.gbufferFlags = (1u << 31) |
+                                   (needNormals ? 1u : 0u) |
+                                   ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
+                                   ((copyMvImage || packet.enableUpscaler) ? 4u : 0u) |
+                                   (packDepthInAlpha ? 8u : 0u);
 
         if (m_config.enable_restir && node->restirManager) {
             node->restirManager->recordClearIfNeeded(cmd);
@@ -2153,17 +2192,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         // Timestamp 1: RT End
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
 
-        bool needGbuffers = (m_config.upscaler_mode == UpscalerMode::FSR3 ||
-                             m_config.upscaler_mode == UpscalerMode::Upways ||
-                             m_config.upscaler_mode == UpscalerMode::Gateway ||
-                             m_config.denoiser_mode == DenoiserMode::Upways ||
-                             m_config.denoiser_mode == DenoiserMode::Gateway ||
-                             m_config.denoiser_mode == DenoiserMode::Svgf);
-        bool copyExtraImages = (packet.tileOffsetX == 2u && node->motionVectorImage && node->normalDepthImage && needGbuffers);
-
         // Batched transition of images to TRANSFER_SRC_OPTIMAL
         std::vector<VkImageMemoryBarrier2> toTransferBarriers;
-        toTransferBarriers.reserve(copyExtraImages ? 3 : 1);
+        toTransferBarriers.reserve(1 + ((!earlyGbufferCopy && copyMvImage) ? 1 : 0) + ((!earlyGbufferCopy && copyNdImage) ? 1 : 0));
 
         VkImageSubresourceRange colorRange{};
         colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2188,8 +2219,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         };
 
         toTransferBarriers.push_back(makeToTransferBarrier(node->accumTargets[slot]->getImage()));
-        if (copyExtraImages) {
+        if (copyMvImage && !earlyGbufferCopy) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->motionVectorImage->getImage()));
+        }
+        if (copyNdImage && !earlyGbufferCopy) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->normalDepthImage->getImage()));
         }
 
@@ -2197,9 +2230,6 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         toTransferDep.imageMemoryBarrierCount = static_cast<uint32_t>(toTransferBarriers.size());
         toTransferDep.pImageMemoryBarriers = toTransferBarriers.data();
         vkCmdPipelineBarrier2(cmd, &toTransferDep);
-
-        // Timestamp 2: Copy Start
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
 
         VkBufferImageCopy copyRegion{};
         copyRegion.bufferOffset = 0;
@@ -2217,31 +2247,36 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             ? m_p2pBufferSecondary[sharedSlot]
             : m_sharedBufferSecondary[sharedSlot];
 
+        // Timestamp 2: Copy Start
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
+
         vkCmdCopyImageToBuffer(cmd, node->accumTargets[slot]->getImage(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                targetBuffer, 1, &copyRegion);
 
-        if (copyExtraImages) {
+        if (copyMvImage && !earlyGbufferCopy) {
             uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
                            (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
             VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
             VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors)
+            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors + depth)
             VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
 
-            // Copy Motion Vectors
+            // Copy Motion Vectors (+ Primary Depth in .w)
             VkBufferImageCopy copyMv = copyRegion;
             copyMv.bufferOffset = radOffsetAligned;
             vkCmdCopyImageToBuffer(cmd, node->motionVectorImage->getImage(),
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    targetBuffer, 1, &copyMv);
 
-            // Copy Normal & Depth
-            VkBufferImageCopy copyNd = copyRegion;
-            copyNd.bufferOffset = mvOffsetAligned;
-            vkCmdCopyImageToBuffer(cmd, node->normalDepthImage->getImage(),
-                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   targetBuffer, 1, &copyNd);
+            if (copyNdImage) {
+                // Copy Normal & Depth (only needed when normal-guided denoiser is active)
+                VkBufferImageCopy copyNd = copyRegion;
+                copyNd.bufferOffset = mvOffsetAligned;
+                vkCmdCopyImageToBuffer(cmd, node->normalDepthImage->getImage(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       targetBuffer, 1, &copyNd);
+            }
         }
 
         // Timestamp 3: Copy End
@@ -2249,7 +2284,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         // Batched transition of images back to GENERAL
         std::vector<VkImageMemoryBarrier2> toGeneralBarriers;
-        toGeneralBarriers.reserve(copyExtraImages ? 3 : 1);
+        toGeneralBarriers.reserve(1 + (copyMvImage ? 1 : 0) + (copyNdImage ? 1 : 0));
 
         auto makeToGeneralBarrier = [&](VkImage img) {
             VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -2267,8 +2302,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         };
 
         toGeneralBarriers.push_back(makeToGeneralBarrier(node->accumTargets[slot]->getImage()));
-        if (copyExtraImages) {
+        if (copyMvImage) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->motionVectorImage->getImage()));
+        }
+        if (copyNdImage) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->normalDepthImage->getImage()));
         }
 
@@ -2430,29 +2467,42 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
         VkFormat accumFormat = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
                                (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
-        uint32_t secWidth = width;
+        uint32_t renderW = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+            ? m_config.getRenderWidth() : width;
+        uint32_t renderH = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+            ? m_config.getRenderHeight() : height;
+        uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+        uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+        uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+        MultiGpuMode effectiveMode = m_mode;
+        if (effectiveMode == MultiGpuMode::Auto) {
+            effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+        }
+        bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off);
+        uint32_t secWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
+        uint32_t secHeight = renderH;
         for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
             node->accumTargets[i] = std::make_unique<Image>(
-                secDevice, secAlloc, secWidth, height,
+                secDevice, secAlloc, secWidth, secHeight,
                 accumFormat,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
             );
         }
 
         // Recreate secondary G-Buffer resources
-        node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+        node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
-        node->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+        node->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
-        node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+        node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-        node->causticImage = std::make_unique<Image>(secDevice, secAlloc, width, height,
+        node->causticImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
@@ -2520,7 +2570,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         vkQueueWaitIdle(node->context->getGraphicsQueue());
 
         VkDeviceSize bufferSize = calculateSharedBufferSize(width, height);
-        initSharedHostBuffer(bufferSize);
+        bool hasSharedBuf = (m_p2pBufferPrimary[0] != VK_NULL_HANDLE) || (m_sharedBufferPrimary[0] != VK_NULL_HANDLE);
+        if (!hasSharedBuf || m_sharedBufferSize < bufferSize) {
+            initSharedHostBuffer(bufferSize);
+        }
 
         VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, node->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -2547,72 +2600,95 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             }
         }
         if (node->wavefrontPipeline) {
-            node->wavefrontPipeline->resize(width, height);
+            node->wavefrontPipeline->resize(secWidth, secHeight);
             if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
                 if (!node->restirManager) {
                     node->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
                 }
-                node->restirManager->resize(width, height);
+                node->restirManager->resize(renderW, renderH);
             }
             updateSecondaryWavefrontDescriptors(node.get());
         }
         if (node->upscaler) {
-            uint32_t renderW = (m_config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(width * m_config.render_scale) : width;
-            uint32_t renderH = (m_config.render_scale < 1.0f) ?
-                static_cast<uint32_t>(height * m_config.render_scale) : height;
-            node->upscaler->resize(renderW, renderH, width, height);
+            if (m_config.upscaler_mode == UpscalerMode::FSR && m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend) {
+                node->upscaler->setTargetVersion(m_config.fsr_version);
+                node->upscaler->resize(renderW, renderH, width, height);
+            } else {
+                node->upscaler.reset();
+            }
         }
         m_slotSubmitted = { false, false };
         m_workSubmitted = false;
     }
 
-    Logger::info("MultiGpuManager resized secondary GPU targets to {}x{}", width, height);
+    Logger::info("MultiGpuManager resized secondary GPU targets (Display: {}x{})", width, height);
 }
 
 void MultiGpuManager::setConfig(const Config& config) {
     bool upscalerChanged = (config.upscaler_mode != m_config.upscaler_mode) ||
-                           (config.render_scale != m_config.render_scale);
-    bool restirChanged = (config.enable_restir != m_config.enable_restir);
+                           (config.render_scale != m_config.render_scale) ||
+                           (config.fsr_version != m_config.fsr_version) ||
+                           (config.mgpu_upscale_mode != m_config.mgpu_upscale_mode);
+    bool targetLayoutChanged = upscalerChanged ||
+                               (config.tile_size != m_config.tile_size) ||
+                               (config.spp != m_config.spp && m_mode == MultiGpuMode::Auto);
     m_config = config;
     if (!m_devices.empty()) {
         GpuDeviceNode* secNode = m_devices[0].get();
+        if (targetLayoutChanged && secNode->accumTargets[0]) {
+            uint32_t renderW = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+                ? m_config.getRenderWidth() : m_config.width;
+            uint32_t renderH = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+                ? m_config.getRenderHeight() : m_config.height;
+            uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+            uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+            uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+            MultiGpuMode effectiveMode = m_mode;
+            if (effectiveMode == MultiGpuMode::Auto) {
+                effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+            }
+            bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off);
+            uint32_t secWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
+            uint32_t secHeight = renderH;
+            if (secNode->accumTargets[0]->getWidth() != secWidth ||
+                secNode->accumTargets[0]->getHeight() != secHeight) {
+                resize(m_config.width, m_config.height);
+            }
+        }
         if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
             if (!secNode->restirManager) {
                 secNode->restirManager = std::make_unique<ReSTIRManager>(secNode->context->getDevice(), secNode->context->getAllocator());
             }
             if (!secNode->restirManager->isInitialized()) {
-                secNode->restirManager->resize(m_config.width, m_config.height);
+                secNode->restirManager->resize(m_config.getRenderWidth(), m_config.getRenderHeight());
                 updateSecondaryWavefrontDescriptors(secNode);
             }
         }
         if (upscalerChanged) {
-            if (config.upscaler_mode == UpscalerMode::FSR3) {
-                uint32_t renderW = (config.render_scale < 1.0f) ?
-                    static_cast<uint32_t>(config.width * config.render_scale) :
-                    config.width;
-                uint32_t renderH = (config.render_scale < 1.0f) ?
-                    static_cast<uint32_t>(config.height * config.render_scale) :
-                    config.height;
+            if (config.upscaler_mode == UpscalerMode::FSR && config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend) {
+                uint32_t renderW = config.getRenderWidth();
+                uint32_t renderH = config.getRenderHeight();
                 if (!secNode->upscaler) {
                     try {
                         auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
                         auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
                         VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
-                        secNode->upscaler = std::make_unique<Fsr3Upscaler>(
+                        secNode->upscaler = std::make_unique<FsrUpscaler>(
                             secNode->context->getDevice(),
                             secNode->context->getPhysicalDevice(),
                             secNode->context->getAllocator(),
                             renderW, renderH, config.width, config.height,
                             upscaleCode, rcasCode, accumFormat,
-                            "[GPU 1 Secondary Peer]"
+                            "[GPU 1 Secondary Peer]",
+                            config.fsr_version
                         );
-                        Logger::info("Secondary GPU: FSR 3.1 Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
+                        Logger::info("Secondary GPU: FSR Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
                     } catch (const std::exception& e) {
-                        Logger::warn("Failed to initialize secondary GPU FSR 3.1 upscaler on setConfig: {}", e.what());
+                        Logger::warn("Failed to initialize secondary GPU FSR upscaler on setConfig: {}", e.what());
                         secNode->upscaler.reset();
                     }
                 } else {
+                    secNode->upscaler->setTargetVersion(config.fsr_version);
                     secNode->upscaler->resize(renderW, renderH, config.width, config.height);
                 }
             } else {

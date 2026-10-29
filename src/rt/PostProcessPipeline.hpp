@@ -78,9 +78,13 @@ public:
         uint32_t mergeMode = 0;
         uint32_t primarySpp = 1;
         uint32_t secDispatchWidth = 0; // Secondary tile buffer pitch in pixels (0 = auto-derive from tile grid)
-        uint32_t mergeGbuffers = 0;    // 1 = also merge secondary G-buffers (motion vectors, normal/depth)
+        uint32_t mergeGbuffers = 0;    // 1 = full G-buffer merge, 2 = MV+depth from SecondaryMvBuffer, 3 = reconstruct MV+depth from secVal.a
+        uint32_t cameraMoved = 0;      // 1 = compute camera reprojection MV via reprojMat, 0 = zero MV
+        float ndcJitterX = 0.0f;
+        float ndcJitterY = 0.0f;
+        glm::mat4 reprojMat{1.0f};     // prevViewProj * viewInverse * scale(projInv00, projInv11, -1, 1)
     };
-    static_assert(sizeof(MergePushConstants) == 36, "MergePushConstants must be 36 bytes (must match accum_merge.comp PC layout)");
+    static_assert(sizeof(MergePushConstants) == 112, "MergePushConstants must be 112 bytes (must match accum_merge.comp PC layout)");
 
     PostProcessPipeline(
         VkDevice device,

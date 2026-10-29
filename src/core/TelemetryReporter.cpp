@@ -78,17 +78,11 @@ void TelemetryReporter::dumpOutputFiles() {
         if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
 
         double secGpuMs = 0.0;
-        double secXferMs = 0.0;
-        double asyncMergeMs = 0.0;
         if (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_engine->m_mgpu->getSecondaryGpuTimeMs();
-            secXferMs = m_engine->m_mgpu->getSecondaryTransferTimeMs();
-            if (m_engine->m_mgpuCoordinator && m_engine->m_mgpuCoordinator->hasDedicatedAsyncCompute()) {
-                asyncMergeMs = m_engine->m_mgpuCoordinator->getLastAsyncMergeTimeMs();
-            }
         }
         double totalGpuMs = (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs + secXferMs) + asyncMergeMs + gpuTonemapMs + gpuUpwaysMs)
+            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
             : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
 
         uint32_t lastCompletedSlot = (m_engine->m_totalFramesRendered - 1) % Engine::MAX_FRAMES_IN_FLIGHT;
@@ -1175,6 +1169,9 @@ void TelemetryReporter::printExecutionSummary() const {
                     other->key.max_bounces == tally.key.max_bounces &&
                     other->key.accum_format == tally.key.accum_format &&
                     other->key.denoiser == tally.key.denoiser &&
+                    other->key.upscaler == tally.key.upscaler &&
+                    other->key.fsr_version == tally.key.fsr_version &&
+                    std::abs(other->key.render_scale - tally.key.render_scale) < 0.001f &&
                     other->key.enable_nrc == tally.key.enable_nrc) {
                     baselineMs = other->getAvgFrameTimeMs();
                     break;

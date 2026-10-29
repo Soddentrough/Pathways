@@ -96,7 +96,7 @@ private:
     void initImages();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void updateDescriptorSets(VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView);
+    void updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView);
     void createPipelines(const std::vector<char>& upscaleSpv, const std::vector<char>& rcasSpv);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -134,16 +134,17 @@ private:
     VkPipelineLayout m_upscalePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_upscalePipeline = VK_NULL_HANDLE;
     VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_sdkPrepDescSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_sdkPrepDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     VkDescriptorSetLayout m_rcasDescLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_rcasPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_rcasPipeline = VK_NULL_HANDLE;
     VkDescriptorSet m_rcasDescSet = VK_NULL_HANDLE;
 
-    VkImageView m_lastBoundInputView = VK_NULL_HANDLE;
-    VkImageView m_lastBoundMvView = VK_NULL_HANDLE;
-    VkImageView m_lastBoundDepthView = VK_NULL_HANDLE;
+    VkImageView m_lastBoundInputViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView m_lastBoundMvViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView m_lastBoundDepthViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    uint32_t m_nextPrepSlot = 0;
     std::string m_instanceName = "GPU 0 Primary Viewport";
 };
 

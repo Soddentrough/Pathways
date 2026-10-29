@@ -77,107 +77,67 @@ struct VkThunkEntry {
 #define DEFINE_VK_THUNK(fn) \
     static PFN_##fn s_real_##fn = nullptr;
 
-DEFINE_VK_THUNK(vkAllocateDescriptorSets)
-DEFINE_VK_THUNK(vkAllocateMemory)
-DEFINE_VK_THUNK(vkBindBufferMemory)
-DEFINE_VK_THUNK(vkBindImageMemory)
 DEFINE_VK_THUNK(vkCmdBeginDebugUtilsLabelEXT)
-DEFINE_VK_THUNK(vkCmdBindDescriptorSets)
-DEFINE_VK_THUNK(vkCmdBindPipeline)
-DEFINE_VK_THUNK(vkCmdClearColorImage)
-DEFINE_VK_THUNK(vkCmdCopyBuffer)
-DEFINE_VK_THUNK(vkCmdCopyBufferToImage)
-DEFINE_VK_THUNK(vkCmdCopyImage)
-DEFINE_VK_THUNK(vkCmdDispatch)
-DEFINE_VK_THUNK(vkCmdDispatchIndirect)
 DEFINE_VK_THUNK(vkCmdEndDebugUtilsLabelEXT)
-DEFINE_VK_THUNK(vkCmdFillBuffer)
-DEFINE_VK_THUNK(vkCmdPipelineBarrier)
 DEFINE_VK_THUNK(vkCmdWriteBufferMarker2AMD)
 DEFINE_VK_THUNK(vkCmdWriteBufferMarkerAMD)
-DEFINE_VK_THUNK(vkCreateBuffer)
-DEFINE_VK_THUNK(vkCreateBufferView)
-DEFINE_VK_THUNK(vkCreateComputePipelines)
-DEFINE_VK_THUNK(vkCreateDescriptorPool)
-DEFINE_VK_THUNK(vkCreateDescriptorSetLayout)
-DEFINE_VK_THUNK(vkCreateImage)
-DEFINE_VK_THUNK(vkCreateImageView)
-DEFINE_VK_THUNK(vkCreatePipelineLayout)
-DEFINE_VK_THUNK(vkCreateSampler)
-DEFINE_VK_THUNK(vkCreateShaderModule)
-DEFINE_VK_THUNK(vkDestroyBuffer)
-DEFINE_VK_THUNK(vkDestroyBufferView)
-DEFINE_VK_THUNK(vkDestroyDescriptorPool)
-DEFINE_VK_THUNK(vkDestroyDescriptorSetLayout)
-DEFINE_VK_THUNK(vkDestroyImage)
-DEFINE_VK_THUNK(vkDestroyImageView)
-DEFINE_VK_THUNK(vkDestroyPipeline)
-DEFINE_VK_THUNK(vkDestroyPipelineLayout)
-DEFINE_VK_THUNK(vkDestroySampler)
-DEFINE_VK_THUNK(vkDestroyShaderModule)
-DEFINE_VK_THUNK(vkFlushMappedMemoryRanges)
-DEFINE_VK_THUNK(vkFreeDescriptorSets)
-DEFINE_VK_THUNK(vkFreeMemory)
-DEFINE_VK_THUNK(vkGetBufferMemoryRequirements)
-DEFINE_VK_THUNK(vkGetBufferMemoryRequirements2KHR)
-DEFINE_VK_THUNK(vkGetImageMemoryRequirements)
-DEFINE_VK_THUNK(vkMapMemory)
 DEFINE_VK_THUNK(vkSetDebugUtilsObjectNameEXT)
-DEFINE_VK_THUNK(vkUnmapMemory)
-DEFINE_VK_THUNK(vkUpdateDescriptorSets)
 
-#define ENTRY_VK_THUNK(fn) \
+#define ENTRY_VK_CORE_THUNK(fn, coreFn) \
+    { #fn, nullptr, reinterpret_cast<PFN_vkVoidFunction>(MsAbiStatic<&::coreFn>::call) }
+
+#define ENTRY_VK_EXT_THUNK(fn) \
     { #fn, reinterpret_cast<PFN_vkVoidFunction*>(&s_real_##fn), reinterpret_cast<PFN_vkVoidFunction>(MsAbiDynamic<PFN_##fn, &s_real_##fn>::call) }
 
 static VkThunkEntry s_vkThunks[] = {
-    ENTRY_VK_THUNK(vkAllocateDescriptorSets),
-    ENTRY_VK_THUNK(vkAllocateMemory),
-    ENTRY_VK_THUNK(vkBindBufferMemory),
-    ENTRY_VK_THUNK(vkBindImageMemory),
-    ENTRY_VK_THUNK(vkCmdBeginDebugUtilsLabelEXT),
-    ENTRY_VK_THUNK(vkCmdBindDescriptorSets),
-    ENTRY_VK_THUNK(vkCmdBindPipeline),
-    ENTRY_VK_THUNK(vkCmdClearColorImage),
-    ENTRY_VK_THUNK(vkCmdCopyBuffer),
-    ENTRY_VK_THUNK(vkCmdCopyBufferToImage),
-    ENTRY_VK_THUNK(vkCmdCopyImage),
-    ENTRY_VK_THUNK(vkCmdDispatch),
-    ENTRY_VK_THUNK(vkCmdDispatchIndirect),
-    ENTRY_VK_THUNK(vkCmdEndDebugUtilsLabelEXT),
-    ENTRY_VK_THUNK(vkCmdFillBuffer),
-    ENTRY_VK_THUNK(vkCmdPipelineBarrier),
-    ENTRY_VK_THUNK(vkCmdWriteBufferMarker2AMD),
-    ENTRY_VK_THUNK(vkCmdWriteBufferMarkerAMD),
-    ENTRY_VK_THUNK(vkCreateBuffer),
-    ENTRY_VK_THUNK(vkCreateBufferView),
-    ENTRY_VK_THUNK(vkCreateComputePipelines),
-    ENTRY_VK_THUNK(vkCreateDescriptorPool),
-    ENTRY_VK_THUNK(vkCreateDescriptorSetLayout),
-    ENTRY_VK_THUNK(vkCreateImage),
-    ENTRY_VK_THUNK(vkCreateImageView),
-    ENTRY_VK_THUNK(vkCreatePipelineLayout),
-    ENTRY_VK_THUNK(vkCreateSampler),
-    ENTRY_VK_THUNK(vkCreateShaderModule),
-    ENTRY_VK_THUNK(vkDestroyBuffer),
-    ENTRY_VK_THUNK(vkDestroyBufferView),
-    ENTRY_VK_THUNK(vkDestroyDescriptorPool),
-    ENTRY_VK_THUNK(vkDestroyDescriptorSetLayout),
-    ENTRY_VK_THUNK(vkDestroyImage),
-    ENTRY_VK_THUNK(vkDestroyImageView),
-    ENTRY_VK_THUNK(vkDestroyPipeline),
-    ENTRY_VK_THUNK(vkDestroyPipelineLayout),
-    ENTRY_VK_THUNK(vkDestroySampler),
-    ENTRY_VK_THUNK(vkDestroyShaderModule),
-    ENTRY_VK_THUNK(vkFlushMappedMemoryRanges),
-    ENTRY_VK_THUNK(vkFreeDescriptorSets),
-    ENTRY_VK_THUNK(vkFreeMemory),
-    ENTRY_VK_THUNK(vkGetBufferMemoryRequirements),
-    ENTRY_VK_THUNK(vkGetBufferMemoryRequirements2KHR),
-    ENTRY_VK_THUNK(vkGetImageMemoryRequirements),
-    ENTRY_VK_THUNK(vkMapMemory),
-    ENTRY_VK_THUNK(vkSetDebugUtilsObjectNameEXT),
-    ENTRY_VK_THUNK(vkUnmapMemory),
-    ENTRY_VK_THUNK(vkUpdateDescriptorSets),
+    ENTRY_VK_CORE_THUNK(vkAllocateDescriptorSets, vkAllocateDescriptorSets),
+    ENTRY_VK_CORE_THUNK(vkAllocateMemory, vkAllocateMemory),
+    ENTRY_VK_CORE_THUNK(vkBindBufferMemory, vkBindBufferMemory),
+    ENTRY_VK_CORE_THUNK(vkBindImageMemory, vkBindImageMemory),
+    ENTRY_VK_EXT_THUNK(vkCmdBeginDebugUtilsLabelEXT),
+    ENTRY_VK_CORE_THUNK(vkCmdBindDescriptorSets, vkCmdBindDescriptorSets),
+    ENTRY_VK_CORE_THUNK(vkCmdBindPipeline, vkCmdBindPipeline),
+    ENTRY_VK_CORE_THUNK(vkCmdClearColorImage, vkCmdClearColorImage),
+    ENTRY_VK_CORE_THUNK(vkCmdCopyBuffer, vkCmdCopyBuffer),
+    ENTRY_VK_CORE_THUNK(vkCmdCopyBufferToImage, vkCmdCopyBufferToImage),
+    ENTRY_VK_CORE_THUNK(vkCmdCopyImage, vkCmdCopyImage),
+    ENTRY_VK_CORE_THUNK(vkCmdDispatch, vkCmdDispatch),
+    ENTRY_VK_CORE_THUNK(vkCmdDispatchIndirect, vkCmdDispatchIndirect),
+    ENTRY_VK_EXT_THUNK(vkCmdEndDebugUtilsLabelEXT),
+    ENTRY_VK_CORE_THUNK(vkCmdFillBuffer, vkCmdFillBuffer),
+    ENTRY_VK_CORE_THUNK(vkCmdPipelineBarrier, vkCmdPipelineBarrier),
+    ENTRY_VK_EXT_THUNK(vkCmdWriteBufferMarker2AMD),
+    ENTRY_VK_EXT_THUNK(vkCmdWriteBufferMarkerAMD),
+    ENTRY_VK_CORE_THUNK(vkCreateBuffer, vkCreateBuffer),
+    ENTRY_VK_CORE_THUNK(vkCreateBufferView, vkCreateBufferView),
+    ENTRY_VK_CORE_THUNK(vkCreateComputePipelines, vkCreateComputePipelines),
+    ENTRY_VK_CORE_THUNK(vkCreateDescriptorPool, vkCreateDescriptorPool),
+    ENTRY_VK_CORE_THUNK(vkCreateDescriptorSetLayout, vkCreateDescriptorSetLayout),
+    ENTRY_VK_CORE_THUNK(vkCreateImage, vkCreateImage),
+    ENTRY_VK_CORE_THUNK(vkCreateImageView, vkCreateImageView),
+    ENTRY_VK_CORE_THUNK(vkCreatePipelineLayout, vkCreatePipelineLayout),
+    ENTRY_VK_CORE_THUNK(vkCreateSampler, vkCreateSampler),
+    ENTRY_VK_CORE_THUNK(vkCreateShaderModule, vkCreateShaderModule),
+    ENTRY_VK_CORE_THUNK(vkDestroyBuffer, vkDestroyBuffer),
+    ENTRY_VK_CORE_THUNK(vkDestroyBufferView, vkDestroyBufferView),
+    ENTRY_VK_CORE_THUNK(vkDestroyDescriptorPool, vkDestroyDescriptorPool),
+    ENTRY_VK_CORE_THUNK(vkDestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout),
+    ENTRY_VK_CORE_THUNK(vkDestroyImage, vkDestroyImage),
+    ENTRY_VK_CORE_THUNK(vkDestroyImageView, vkDestroyImageView),
+    ENTRY_VK_CORE_THUNK(vkDestroyPipeline, vkDestroyPipeline),
+    ENTRY_VK_CORE_THUNK(vkDestroyPipelineLayout, vkDestroyPipelineLayout),
+    ENTRY_VK_CORE_THUNK(vkDestroySampler, vkDestroySampler),
+    ENTRY_VK_CORE_THUNK(vkDestroyShaderModule, vkDestroyShaderModule),
+    ENTRY_VK_CORE_THUNK(vkFlushMappedMemoryRanges, vkFlushMappedMemoryRanges),
+    ENTRY_VK_CORE_THUNK(vkFreeDescriptorSets, vkFreeDescriptorSets),
+    ENTRY_VK_CORE_THUNK(vkFreeMemory, vkFreeMemory),
+    ENTRY_VK_CORE_THUNK(vkGetBufferMemoryRequirements, vkGetBufferMemoryRequirements),
+    ENTRY_VK_CORE_THUNK(vkGetBufferMemoryRequirements2KHR, vkGetBufferMemoryRequirements2),
+    ENTRY_VK_CORE_THUNK(vkGetImageMemoryRequirements, vkGetImageMemoryRequirements),
+    ENTRY_VK_CORE_THUNK(vkMapMemory, vkMapMemory),
+    ENTRY_VK_EXT_THUNK(vkSetDebugUtilsObjectNameEXT),
+    ENTRY_VK_CORE_THUNK(vkUnmapMemory, vkUnmapMemory),
+    ENTRY_VK_CORE_THUNK(vkUpdateDescriptorSets, vkUpdateDescriptorSets),
 };
 
 static MS_ABI PFN_vkVoidFunction ms_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
@@ -191,7 +151,9 @@ static MS_ABI PFN_vkVoidFunction ms_vkGetDeviceProcAddr(VkDevice device, const c
     }
     for (auto& entry : s_vkThunks) {
         if (std::strcmp(entry.name, pName) == 0) {
-            *entry.realSlot = realFn;
+            if (entry.realSlot) {
+                *entry.realSlot = realFn;
+            }
             return entry.msThunk;
         }
     }

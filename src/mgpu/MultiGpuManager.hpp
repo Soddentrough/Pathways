@@ -115,6 +115,8 @@ public:
     void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
     void setFormat(AccumFormat format) { m_config.accum_format = format; }
     void setConfig(const Config& config);
+    void collectSecondaryTimestamps(uint32_t bufferSlot);
+    void setWarmupSppOverride(uint32_t spp);
     double getSecondaryGpuTimeMs() const;
     double getSecondaryTransferTimeMs() const;
     const std::string& getSecondaryDeviceName() const;

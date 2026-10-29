@@ -43,6 +43,7 @@ struct WavefrontSceneData {
     uint32_t fullWidth = 0;               // Full unclipped frame resolution width
     uint32_t fullHeight = 0;              // Full unclipped frame resolution height
     uint32_t captureMlData = 0;           // ML training data capture flag (demodulated buffers)
+    uint32_t gbufferFlags = 0;            // Bit 0: needNormals, Bit 1: needNdStore, Bit 2: needMvStore
     float indirectClamp = 35.0f;          // Maximum indirect / secondary bounce radiance luminance (0 = disabled)
     bool inlineShadows = false;           // Detached shadow queue evaluation (Default: false for max occupancy & 0 LDS)
     uint32_t macroTileSize = 0;           // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
@@ -130,6 +131,7 @@ public:
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,
                      const WavefrontSceneData& sceneData);
+    void setWarmupSppOverride(uint32_t spp) { m_warmupSppOverride = spp; }
 
     struct BounceProfilingData {
         uint32_t bounce = 0;
@@ -297,6 +299,7 @@ private:
     std::unique_ptr<Buffer> m_dummyReservoir; // 128B fallback target for ReSTIR reservoir bindings 32/36
     bool m_dummyImageTransitioned = false;
     bool m_supportsSubgroupSizeControl = true;
+    uint32_t m_warmupSppOverride = 0;
 };
 
 } // namespace pathways

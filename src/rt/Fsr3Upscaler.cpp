@@ -297,9 +297,12 @@ void FsrUpscaler::initImages() {
 
     m_historyIndex = 0;
     m_historyValid = false;
-    m_lastBoundInputView = VK_NULL_HANDLE;
-    m_lastBoundMvView = VK_NULL_HANDLE;
-    m_lastBoundDepthView = VK_NULL_HANDLE;
+    for (int i = 0; i < 2; ++i) {
+        m_lastBoundInputViews[i] = VK_NULL_HANDLE;
+        m_lastBoundMvViews[i] = VK_NULL_HANDLE;
+        m_lastBoundDepthViews[i] = VK_NULL_HANDLE;
+    }
+    m_nextPrepSlot = 0;
 }
 
 void FsrUpscaler::createDescriptorSetLayouts() {
@@ -374,10 +377,10 @@ void FsrUpscaler::allocateDescriptorSets() {
 
     VkDescriptorSetAllocateInfo sdkPrepAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     sdkPrepAlloc.descriptorPool = m_descPool;
-    sdkPrepAlloc.descriptorSetCount = 1;
-    sdkPrepAlloc.pSetLayouts = &m_upscaleDescLayout;
-    if (vkAllocateDescriptorSets(m_device, &sdkPrepAlloc, &m_sdkPrepDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to allocate SDK prep descriptor set!");
+    sdkPrepAlloc.descriptorSetCount = 2;
+    sdkPrepAlloc.pSetLayouts = upscaleLayouts;
+    if (vkAllocateDescriptorSets(m_device, &sdkPrepAlloc, m_sdkPrepDescSets) != VK_SUCCESS) {
+        throw std::runtime_error("FsrUpscaler: Failed to allocate SDK prep descriptor sets!");
     }
 
     VkDescriptorSetAllocateInfo rcasAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
@@ -389,7 +392,8 @@ void FsrUpscaler::allocateDescriptorSets() {
     }
 }
 
-void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
+void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
+    slot &= 1u;
     if (inputColorView == VK_NULL_HANDLE || !m_upscaledImage || !m_sharpenedImage || !m_historyImages[0] || !m_historyImages[1] ||
         !m_sdkColorInput || !m_sdkDepthInput || !m_sdkMotionVectorsInput) {
         return;
@@ -401,165 +405,56 @@ void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView m
     VkDescriptorImageInfo inInfo{ VK_NULL_HANDLE, inputColorView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo dInfo{ VK_NULL_HANDLE, dView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo hist0Info{ VK_NULL_HANDLE, m_historyImages[0]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_historyImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo histReadInfo{ VK_NULL_HANDLE, m_historyImages[slot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo histWriteInfo{ VK_NULL_HANDLE, m_historyImages[1u - slot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo upscaledInfo{ VK_NULL_HANDLE, m_upscaledImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sharpenedInfo{ VK_NULL_HANDLE, m_sharpenedImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkColorInfo{ VK_NULL_HANDLE, m_sdkColorInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkDepthInfo{ VK_NULL_HANDLE, m_sdkDepthInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkMvInfo{ VK_NULL_HANDLE, m_sdkMotionVectorsInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
-    // 20 writes: 6 for Set 0, 6 for Set 1, 2 for RCAS, 6 for SDK Prep Set
-    VkWriteDescriptorSet writes[20]{};
+    VkWriteDescriptorSet writes[14]{};
+    uint32_t writeCount = 0;
 
-    // Set 0: Read history 0 -> Write history 1
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = m_upscaleDescSets[0];
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[0].pImageInfo = &inInfo;
+    // Upscale Set [slot]
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histReadInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histWriteInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &upscaledInfo, nullptr, nullptr };
+    writeCount++;
 
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = m_upscaleDescSets[0];
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &mvInfo;
+    // SDK Prep Set [slot]
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkColorInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkDepthInfo, nullptr, nullptr };
+    writeCount++;
+    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkMvInfo, nullptr, nullptr };
+    writeCount++;
 
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = m_upscaleDescSets[0];
-    writes[2].dstBinding = 2;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[2].pImageInfo = &dInfo;
+    if (slot == 0u) {
+        writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rcasDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &upscaledInfo, nullptr, nullptr };
+        writeCount++;
+        writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rcasDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sharpenedInfo, nullptr, nullptr };
+        writeCount++;
+    }
 
-    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[3].dstSet = m_upscaleDescSets[0];
-    writes[3].dstBinding = 3;
-    writes[3].descriptorCount = 1;
-    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[3].pImageInfo = &hist0Info;
-
-    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[4].dstSet = m_upscaleDescSets[0];
-    writes[4].dstBinding = 4;
-    writes[4].descriptorCount = 1;
-    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[4].pImageInfo = &hist1Info;
-
-    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[5].dstSet = m_upscaleDescSets[0];
-    writes[5].dstBinding = 5;
-    writes[5].descriptorCount = 1;
-    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[5].pImageInfo = &upscaledInfo;
-
-    // Set 1: Read history 1 -> Write history 0
-    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[6].dstSet = m_upscaleDescSets[1];
-    writes[6].dstBinding = 0;
-    writes[6].descriptorCount = 1;
-    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[6].pImageInfo = &inInfo;
-
-    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[7].dstSet = m_upscaleDescSets[1];
-    writes[7].dstBinding = 1;
-    writes[7].descriptorCount = 1;
-    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[7].pImageInfo = &mvInfo;
-
-    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[8].dstSet = m_upscaleDescSets[1];
-    writes[8].dstBinding = 2;
-    writes[8].descriptorCount = 1;
-    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[8].pImageInfo = &dInfo;
-
-    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[9].dstSet = m_upscaleDescSets[1];
-    writes[9].dstBinding = 3;
-    writes[9].descriptorCount = 1;
-    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[9].pImageInfo = &hist1Info;
-
-    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[10].dstSet = m_upscaleDescSets[1];
-    writes[10].dstBinding = 4;
-    writes[10].descriptorCount = 1;
-    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[10].pImageInfo = &hist0Info;
-
-    writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[11].dstSet = m_upscaleDescSets[1];
-    writes[11].dstBinding = 5;
-    writes[11].descriptorCount = 1;
-    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[11].pImageInfo = &upscaledInfo;
-
-    // RCAS bindings
-    writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[12].dstSet = m_rcasDescSet;
-    writes[12].dstBinding = 0;
-    writes[12].descriptorCount = 1;
-    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[12].pImageInfo = &upscaledInfo;
-
-    writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[13].dstSet = m_rcasDescSet;
-    writes[13].dstBinding = 1;
-    writes[13].descriptorCount = 1;
-    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[13].pImageInfo = &sharpenedInfo;
-
-    // SDK Prep bindings
-    writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[14].dstSet = m_sdkPrepDescSet;
-    writes[14].dstBinding = 0;
-    writes[14].descriptorCount = 1;
-    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[14].pImageInfo = &inInfo;
-
-    writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[15].dstSet = m_sdkPrepDescSet;
-    writes[15].dstBinding = 1;
-    writes[15].descriptorCount = 1;
-    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[15].pImageInfo = &mvInfo;
-
-    writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[16].dstSet = m_sdkPrepDescSet;
-    writes[16].dstBinding = 2;
-    writes[16].descriptorCount = 1;
-    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[16].pImageInfo = &dInfo;
-
-    writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[17].dstSet = m_sdkPrepDescSet;
-    writes[17].dstBinding = 3;
-    writes[17].descriptorCount = 1;
-    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[17].pImageInfo = &sdkColorInfo;
-
-    writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[18].dstSet = m_sdkPrepDescSet;
-    writes[18].dstBinding = 4;
-    writes[18].descriptorCount = 1;
-    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[18].pImageInfo = &sdkDepthInfo;
-
-    writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[19].dstSet = m_sdkPrepDescSet;
-    writes[19].dstBinding = 5;
-    writes[19].descriptorCount = 1;
-    writes[19].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[19].pImageInfo = &sdkMvInfo;
-
-    vkUpdateDescriptorSets(m_device, 20, writes, 0, nullptr);
-    m_lastBoundInputView = inputColorView;
-    m_lastBoundMvView = mvView;
-    m_lastBoundDepthView = dView;
+    vkUpdateDescriptorSets(m_device, writeCount, writes, 0, nullptr);
+    m_lastBoundInputViews[slot] = inputColorView;
+    m_lastBoundMvViews[slot] = mvView;
+    m_lastBoundDepthViews[slot] = dView;
 }
 
 VkShaderModule FsrUpscaler::createShaderModule(const std::vector<char>& code) {
@@ -637,6 +532,13 @@ void FsrUpscaler::createPipelines(const std::vector<char>& upscaleSpv, const std
 }
 
 void FsrUpscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, uint32_t displayH) {
+    if (m_renderWidth == renderW && m_renderHeight == renderH &&
+        m_displayWidth == displayW && m_displayHeight == displayH &&
+        m_upscaledImage != nullptr && m_sharpenedImage != nullptr &&
+        m_ffxContext != nullptr) {
+        return;
+    }
+
     m_renderWidth = renderW;
     m_renderHeight = renderH;
     m_displayWidth = displayW;
@@ -654,10 +556,22 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
         return;
     }
 
-    if (desc.colorIn != m_lastBoundInputView ||
-        desc.motionVectorsIn != m_lastBoundMvView ||
-        desc.depthIn != m_lastBoundDepthView) {
-        updateDescriptorSets(desc.colorIn, desc.motionVectorsIn, desc.depthIn);
+    VkImageView effMvView = (desc.motionVectorsIn != VK_NULL_HANDLE) ? desc.motionVectorsIn : desc.colorIn;
+    VkImageView effDepthView = (desc.depthIn != VK_NULL_HANDLE) ? desc.depthIn : desc.colorIn;
+
+    uint32_t prepSlot = 0;
+    if (desc.colorIn == m_lastBoundInputViews[0] &&
+        effMvView == m_lastBoundMvViews[0] &&
+        effDepthView == m_lastBoundDepthViews[0]) {
+        prepSlot = 0;
+    } else if (desc.colorIn == m_lastBoundInputViews[1] &&
+               effMvView == m_lastBoundMvViews[1] &&
+               effDepthView == m_lastBoundDepthViews[1]) {
+        prepSlot = 1;
+    } else {
+        prepSlot = m_nextPrepSlot;
+        m_nextPrepSlot = (m_nextPrepSlot + 1u) & 1u;
+        updateDescriptorSets(prepSlot, desc.colorIn, desc.motionVectorsIn, desc.depthIn);
     }
 
     // Transition initial layouts if needed
@@ -677,7 +591,7 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
     }
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
-    if (m_ffxContext != nullptr && m_sdkColorInput && m_sdkDepthInput && m_sdkMotionVectorsInput && m_sdkPrepDescSet != VK_NULL_HANDLE) {
+    if (m_ffxContext != nullptr && m_sdkColorInput && m_sdkDepthInput && m_sdkMotionVectorsInput && m_sdkPrepDescSets[prepSlot] != VK_NULL_HANDLE) {
         if (m_sdkColorInput->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
             m_sdkColorInput->transitionLayout(
                 desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
@@ -702,7 +616,7 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
 
         // Prepare render-resolution SDK input textures (RGBA16F Color, R32F Inverted Device Depth, RG16F Motion Vectors)
         vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipeline);
-        vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipelineLayout, 0, 1, &m_sdkPrepDescSet, 0, nullptr);
+        vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipelineLayout, 0, 1, &m_sdkPrepDescSets[prepSlot], 0, nullptr);
 
         Fsr3UpscalePushConstants prepPC{};
         prepPC.renderWidth = m_renderWidth;

@@ -304,12 +304,12 @@ private:
     void destroyGBufferResources();
     void syncRenderTargetPointers();
     [[nodiscard]] uint32_t getEffectiveGbufferWidth() const noexcept {
-        return (m_config.mgpu_mode == MultiGpuMode::Off && m_config.capture_training_data_dir.empty())
+        return m_config.capture_training_data_dir.empty()
             ? m_config.getRenderWidth()
             : m_config.width;
     }
     [[nodiscard]] uint32_t getEffectiveGbufferHeight() const noexcept {
-        return (m_config.mgpu_mode == MultiGpuMode::Off && m_config.capture_training_data_dir.empty())
+        return m_config.capture_training_data_dir.empty()
             ? m_config.getRenderHeight()
             : m_config.height;
     }

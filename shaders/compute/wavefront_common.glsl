@@ -915,12 +915,17 @@ ivec2 getPixelCoordsMorton8x4(uint linearIdx, uint width, uint height) {
     uint stripSize = TW * tilesY;
     uint stripIdx = (stripSize > 0u) ? (tileIdx / stripSize) : 0u;
     uint inStrip = (stripSize > 0u) ? (tileIdx % stripSize) : 0u;
+    uint fullStripsX = tilesX / TW;
     uint fullChunksH = tilesY / TH;
     uint remainderStart = fullChunksH * chunkSize;
 
     uint tileX;
     uint tileY;
-    if (inStrip < remainderStart) {
+    if (stripIdx >= fullStripsX) {
+        uint remTW = tilesX - fullStripsX * TW;
+        tileX = fullStripsX * TW + ((remTW > 0u) ? (inStrip % remTW) : 0u);
+        tileY = (remTW > 0u) ? (inStrip / remTW) : 0u;
+    } else if (inStrip < remainderStart) {
         uint chunkIdx = inStrip / chunkSize;
         uint inChunk = inStrip % chunkSize;
         uint localX = ((inChunk >> 0u) & 1u) | (((inChunk >> 2u) & 1u) << 1u) | (((inChunk >> 4u) & 1u) << 2u);
