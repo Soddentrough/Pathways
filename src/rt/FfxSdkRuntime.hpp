@@ -123,7 +123,9 @@ private:
 
     bool tryLoadModule(FfxEffectModule module, const std::vector<std::string>& candidateNames);
     const ModuleEntry* selectModuleForHeader(uint64_t headerType) const;
+#if defined(PATHWAYS_HAS_FFX_SDK)
     const ModuleEntry* selectModuleForDesc(const ffxApiHeader* desc) const;
+#endif
     const ModuleEntry* findModuleForContext(const void* ctx) const;
 
     bool m_initialized = false;
