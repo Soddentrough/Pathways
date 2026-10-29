@@ -313,30 +313,6 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
                                     bool upwaysSuperres, AccumFormat accumFormat,
                                     PostProcessPipeline* postProcess, VkCommandBuffer cmd,
                                     FsrVersion fsrVersion) {
-    destroyUpwaysResources();
-    if (m_upwaysPipeline) {
-        uint32_t inW = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
-            static_cast<uint32_t>(width * renderScale) : width;
-        uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
-            static_cast<uint32_t>(height * renderScale) : height;
-        uint32_t outW = (upscalerMode == UpscalerMode::FSR) ? inW : width;
-        uint32_t outH = (upscalerMode == UpscalerMode::FSR) ? inH : height;
-        bool isSuperRes = (inW < outW || inH < outH);
-        m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
-    }
-
-    destroyGatewayResources();
-    if (m_gatewayPipeline) {
-        uint32_t inW = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
-            static_cast<uint32_t>(width * renderScale) : width;
-        uint32_t inH = (renderScale < 1.0f && (upscalerMode != UpscalerMode::None || upwaysSuperres)) ?
-            static_cast<uint32_t>(height * renderScale) : height;
-        uint32_t outW = (upscalerMode == UpscalerMode::FSR) ? inW : width;
-        uint32_t outH = (upscalerMode == UpscalerMode::FSR) ? inH : height;
-        bool isSuperRes = (inW < outW || inH < outH);
-        m_gatewayPipeline->resize(inW, inH, outW, outH, isSuperRes);
-    }
-
     Config cfgStub{};
     cfgStub.width = width;
     cfgStub.height = height;
@@ -347,18 +323,31 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     cfgStub.accum_format = accumFormat;
     cfgStub.fsr_version = fsrVersion;
 
+    const uint32_t inW = cfgStub.getRenderWidth();
+    const uint32_t inH = cfgStub.getRenderHeight();
+    const uint32_t outW = (upscalerMode == UpscalerMode::FSR) ? inW : width;
+    const uint32_t outH = (upscalerMode == UpscalerMode::FSR) ? inH : height;
+    const bool isSuperRes = (inW < outW || inH < outH);
+
+    destroyUpwaysResources();
+    if (m_upwaysPipeline) {
+        m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+    }
+
+    destroyGatewayResources();
+    if (m_gatewayPipeline) {
+        m_gatewayPipeline->resize(inW, inH, outW, outH, isSuperRes);
+    }
+
     createUpwaysResources(cfgStub, postProcess, cmd);
     createGatewayResources(cfgStub, postProcess, cmd);
     destroyFsrResources();
+    if (upscalerMode == UpscalerMode::FSR && !m_fsrUpscaler) {
+        createFsrPipelines(cfgStub);
+    }
     if (m_fsrUpscaler) {
         m_fsrUpscaler->setTargetVersion(fsrVersion);
-        uint32_t renderW = (renderScale < 1.0f) ?
-            static_cast<uint32_t>(width * renderScale) :
-            width;
-        uint32_t renderH = (renderScale < 1.0f) ?
-            static_cast<uint32_t>(height * renderScale) :
-            height;
-        m_fsrUpscaler->resize(renderW, renderH, width, height);
+        m_fsrUpscaler->resize(inW, inH, width, height);
     }
     createFsrResources(cfgStub, postProcess);
 }

@@ -125,6 +125,9 @@ public:
     void requestScreenshot() noexcept { m_pendingScreenshot = true; }
     void setBatchCount(uint32_t count) noexcept { m_config.batch_count = count; }
     void setBatchPixels(uint32_t pixels) noexcept { m_config.batch_pixels = pixels; }
+    Config& getMutableConfig() noexcept { return m_config; }
+    const Config& getConfig() const noexcept { return m_config; }
+    void requestAccumulationReset() noexcept { m_resetAccumulation = true; }
 
 private:
     void initVulkan();
@@ -354,6 +357,8 @@ private:
     // Active configuration tracking for descriptor / resource resynchronization
     float m_lastRenderScale = 1.0f;
     UpscalerMode m_lastUpscalerMode = UpscalerMode::None;
+    DenoiserMode m_lastDenoiserMode = DenoiserMode::None;
+    FsrVersion m_lastFsrVersion = FsrVersion::Auto;
     uint32_t m_lastTileSize = 64;
     uint32_t m_lastBatchCount = 0;
     uint32_t m_lastBatchPixels = 0;

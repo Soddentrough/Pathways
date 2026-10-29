@@ -251,6 +251,7 @@ struct Config {
     bool gamepad_invert_y = false;  // Invert vertical (pitch) look axis for gamepads (default: false)
     bool adaptive_speed = true;    // Distance-adaptive camera movement speed (smooth approach to focus) [Default: true]
     bool test_scene_switching = false; // Run headless dynamic scene switching verification test
+    bool test_dynamic_options = false; // Run headless dynamic runtime GUI option toggling verification test
 
     // Camera view overrides (useful for headless testing & reproducible framing)
     std::optional<glm::vec3> camera_pos;

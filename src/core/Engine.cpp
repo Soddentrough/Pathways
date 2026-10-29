@@ -206,6 +206,8 @@ Engine::Engine(const Config& config) : m_config(config) {
 
     m_lastRenderScale = m_config.render_scale;
     m_lastUpscalerMode = m_config.upscaler_mode;
+    m_lastDenoiserMode = m_config.denoiser_mode;
+    m_lastFsrVersion = m_config.fsr_version;
     m_lastTileSize = m_config.tile_size;
     m_lastBatchCount = m_config.batch_count;
     m_lastBatchPixels = m_config.batch_pixels;
@@ -877,11 +879,13 @@ void Engine::initPipelines() {
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
     auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
 
-    uint32_t initBatchCount = getEffectiveBatchCount(m_config.width, m_config.height);
-    uint32_t initBatchPixels = getEffectiveBatchPixels(m_config.width, m_config.height, initBatchCount);
+    uint32_t initRenderW = m_config.getRenderWidth();
+    uint32_t initRenderH = m_config.getRenderHeight();
+    uint32_t initBatchCount = getEffectiveBatchCount(initRenderW, initRenderH);
+    uint32_t initBatchPixels = getEffectiveBatchPixels(initRenderW, initRenderH, initBatchCount);
     if (m_config.mgpu_mode != MultiGpuMode::Off) {
         initBatchCount = 1;
-        initBatchPixels = m_config.width * m_config.height;
+        initBatchPixels = initRenderW * initRenderH;
     }
     m_currentBatchCount = initBatchCount;
     m_currentBatchPixels = initBatchPixels;
@@ -892,7 +896,7 @@ void Engine::initPipelines() {
     m_dgcPreprocessEnabled = m_config.dgc_preprocess && m_context->supportsDgcPreprocess();
 
     m_rtOrchestrator->initWavefrontPipeline(
-        m_config.width, m_config.height,
+        initRenderW, initRenderH,
         wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
         wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
         wfShadeEmissiveCode, wfShadePassthroughCode,
@@ -910,7 +914,7 @@ void Engine::initPipelines() {
         auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
         auto nrcResolveCode = loadShaderSPIRV("nrc_resolve.comp.spv");
         m_rtOrchestrator->initNRC(
-            m_config.width, m_config.height,
+            initRenderW, initRenderH,
             nrcInferCode, nrcTrainCode, nrcResolveCode
         );
     } catch (const std::exception& e) {
@@ -1149,6 +1153,7 @@ void Engine::initCaustics() {
     }
 
     try {
+        vkDeviceWaitIdle(m_context->getDevice());
         auto traceSpv = loadShaderSPIRV("caustic_photon_trace.comp.spv");
         auto splatSpv = loadShaderSPIRV("caustic_splat.comp.spv");
         auto filterSpv = loadShaderSPIRV("caustic_filter.comp.spv");
@@ -1581,9 +1586,39 @@ void Engine::renderFrame() {
         requestSceneChange(targetPath);
     }
 
+    if (m_config.upscaler_mode == UpscalerMode::FSR1) {
+        m_config.upscaler_mode = UpscalerMode::FSR;
+        m_config.fsr_version = FsrVersion::Fsr3;
+    }
+    if (m_config.upscaler_mode == UpscalerMode::FSR && m_config.fsr_version == FsrVersion::Fsr4 &&
+        m_context && !m_context->supportsFsr4()) {
+        Logger::warn("FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix); falling back to FSR 3.1.");
+        m_config.fsr_version = FsrVersion::Fsr3;
+    }
+    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
+        const bool rrSupported = (m_denoiser && m_denoiser->isUsingSdkProvider()) ||
+                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
+        if (!rrSupported) {
+            Logger::warn("AMD FSR Ray Regeneration Vulkan provider (amd_fidelityfx_denoiser_vk) is not available in FidelityFX SDK 2.4.0; reverting DenoiserMode to E-SVGF.");
+            m_config.denoiser_mode = DenoiserMode::Svgf;
+        }
+    }
+    if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
+        const bool rcSupported = (m_nrcManager && m_nrcManager->isUsingSdkProvider()) ||
+                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache);
+        if (!rcSupported) {
+            Logger::warn("AMD FSR Radiance Cache Vulkan provider (amd_fidelityfx_radiancecache_vk) is not available in FidelityFX SDK 2.4.0; reverting NRC Backend to Native Wave32 WMMA.");
+            m_config.nrc_backend = NrcBackend::NativeWave32;
+        }
+    }
+    m_config.upways_superres = (m_config.upscaler_mode == UpscalerMode::Upways);
+    m_config.gateway_superres = (m_config.upscaler_mode == UpscalerMode::Gateway);
+
     // Process deferred UI reconfiguration actions safely at frame boundary (before recording)
     bool scalingOrUpscalerChanged = (m_config.render_scale != m_lastRenderScale) ||
                                     (m_config.upscaler_mode != m_lastUpscalerMode) ||
+                                    (m_config.denoiser_mode != m_lastDenoiserMode) ||
+                                    (m_config.fsr_version != m_lastFsrVersion) ||
                                     (m_config.tile_size != m_lastTileSize);
     bool batchingChanged = (m_config.batch_count != m_lastBatchCount) ||
                            (m_config.batch_pixels != m_lastBatchPixels);
@@ -1599,6 +1634,8 @@ void Engine::renderFrame() {
 
         m_lastRenderScale = m_config.render_scale;
         m_lastUpscalerMode = m_config.upscaler_mode;
+        m_lastDenoiserMode = m_config.denoiser_mode;
+        m_lastFsrVersion = m_config.fsr_version;
         m_lastTileSize = m_config.tile_size;
         m_lastBatchCount = m_config.batch_count;
         m_lastBatchPixels = m_config.batch_pixels;
@@ -1727,23 +1764,6 @@ void Engine::renderFrame() {
         updateMergeDescriptors();
         m_resetAccumulation = true;
         m_frameTimesMs.clear();
-    }
-
-    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
-        const bool rrSupported = (m_denoiser && m_denoiser->isUsingSdkProvider()) ||
-                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
-        if (!rrSupported) {
-            Logger::warn("AMD FSR Ray Regeneration Vulkan provider (amd_fidelityfx_denoiser_vk) is not available in FidelityFX SDK 2.4.0; reverting DenoiserMode to E-SVGF.");
-            m_config.denoiser_mode = DenoiserMode::Svgf;
-        }
-    }
-    if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
-        const bool rcSupported = (m_nrcManager && m_nrcManager->isUsingSdkProvider()) ||
-                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache);
-        if (!rcSupported) {
-            Logger::warn("AMD FSR Radiance Cache Vulkan provider (amd_fidelityfx_radiancecache_vk) is not available in FidelityFX SDK 2.4.0; reverting NRC Backend to Native Wave32 WMMA.");
-            m_config.nrc_backend = NrcBackend::NativeWave32;
-        }
     }
 
     bool sceneLoadingActive = isSceneLoading() || m_pendingSceneChange;
@@ -1954,7 +1974,7 @@ void Engine::renderFrame() {
     // enabled at least once, keeping ~144 B/pixel (DI 56B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
         vkDeviceWaitIdle(m_context->getDevice());
-        m_restirManager->resize(m_config.width, m_config.height);
+        m_restirManager->resize(m_config.getRenderWidth(), m_config.getRenderHeight());
         updateWavefrontSceneDescriptors();
     }
 

@@ -197,6 +197,163 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        if (config.test_dynamic_options) {
+            config.headless = true;
+            pathways::Engine engine(config);
+            auto& cfg = engine.getMutableConfig();
+
+            auto stepAndVerify = [&](const char* stepName, int frames,
+                                     const std::string& expectedUpscaler,
+                                     const std::string& expectedDenoiser) -> bool {
+                engine.requestAccumulationReset();
+                for (int i = 0; i < frames; ++i) {
+                    engine.renderFrame();
+                }
+                auto st = engine.getStats();
+                if (st.validation_errors > 0) {
+                    pathways::Logger::error("[FAIL] {} produced {} Vulkan validation error(s)!", stepName, st.validation_errors);
+                    return false;
+                }
+                if (!expectedUpscaler.empty() && st.upscaler_mode_str != expectedUpscaler) {
+                    pathways::Logger::error("[FAIL] {} expected upscaler_mode='{}', got '{}'",
+                                            stepName, expectedUpscaler, st.upscaler_mode_str);
+                    return false;
+                }
+                if (!expectedDenoiser.empty() && st.denoiser_mode_str != expectedDenoiser) {
+                    pathways::Logger::error("[FAIL] {} expected denoiser_mode='{}', got '{}'",
+                                            stepName, expectedDenoiser, st.denoiser_mode_str);
+                    return false;
+                }
+                pathways::Logger::info("[PASS] {} -> Upscaler='{}' ({}x{} -> {}x{}), Denoiser='{}', NRC={}, ReSTIR={}, Caustics={}, ValErrors=0",
+                                       stepName, st.upscaler_mode_str, cfg.getRenderWidth(), cfg.getRenderHeight(),
+                                       cfg.width, cfg.height, st.denoiser_mode_str,
+                                       st.enable_nrc ? "ON" : "OFF",
+                                       cfg.enable_restir ? "ON" : "OFF",
+                                       st.enable_caustics ? "ON" : "OFF");
+                return true;
+            };
+
+            const auto initStats = engine.getStats();
+            const std::string expectedFsr4 = initStats.supports_fsr4 ? "FSR 4.1 ML" : "FSR 3.1";
+            const std::string expectedRayRegen = initStats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1" : "SVGF";
+
+            // 1. Baseline Native 1.0x + Off (MC)
+            cfg.upscaler_mode = pathways::UpscalerMode::None;
+            cfg.render_scale = 1.0f;
+            cfg.denoiser_mode = pathways::DenoiserMode::None;
+            if (!stepAndVerify("1. Native 1.0x + Off (MC)", 4, "None", "None")) return 1;
+
+            // 2. Switch to FSR 3.1 across all 4 Quality Presets (0.67x, 0.59x, 0.50x, 0.33x)
+            cfg.upscaler_mode = pathways::UpscalerMode::FSR;
+            cfg.fsr_version = pathways::FsrVersion::Fsr3;
+            cfg.render_scale = 0.6666667f;
+            if (!stepAndVerify("2a. FSR 3.1 Quality (0.67x)", 4, "FSR 3.1", "None")) return 1;
+
+            cfg.render_scale = 0.5882353f;
+            if (!stepAndVerify("2b. FSR 3.1 Balanced (0.59x)", 4, "FSR 3.1", "None")) return 1;
+
+            cfg.render_scale = 0.5f;
+            if (!stepAndVerify("2c. FSR 3.1 Performance (0.50x)", 4, "FSR 3.1", "None")) return 1;
+
+            cfg.render_scale = 0.3333333f;
+            if (!stepAndVerify("2d. FSR 3.1 UltraPerf (0.33x)", 4, "FSR 3.1", "None")) return 1;
+
+            // 3. Request FSR 4.1 ML at runtime (verifies clean fallback to FSR 3.1 on non-FP8 GPUs)
+            cfg.fsr_version = pathways::FsrVersion::Fsr4;
+            cfg.render_scale = 0.6666667f;
+            if (!stepAndVerify("3. FSR 4.1 ML Request (Runtime Gating)", 4, expectedFsr4, "None")) return 1;
+
+            // 4. Switch to Upways SR and Gateway SR, then back to FSR 3.1 and Native 1.0x
+            if (initStats.has_cooperative_matrix) {
+                cfg.upscaler_mode = pathways::UpscalerMode::Upways;
+                cfg.upways_superres = true;
+                cfg.gateway_superres = false;
+                cfg.render_scale = 0.6666667f;
+                if (!stepAndVerify("4a. Upways SR (0.67x)", 4, "Upways", "None")) return 1;
+
+                cfg.upscaler_mode = pathways::UpscalerMode::Gateway;
+                cfg.upways_superres = false;
+                cfg.gateway_superres = true;
+                cfg.render_scale = 0.6666667f;
+                if (!stepAndVerify("4b. Gateway SR (0.67x)", 4, "Gateway", "None")) return 1;
+            }
+
+            cfg.upscaler_mode = pathways::UpscalerMode::FSR;
+            cfg.fsr_version = pathways::FsrVersion::Fsr3;
+            cfg.upways_superres = false;
+            cfg.gateway_superres = false;
+            cfg.render_scale = 0.6666667f;
+            if (!stepAndVerify("4c. Switch Gateway SR -> FSR 3.1 (0.67x)", 4, "FSR 3.1", "None")) return 1;
+
+            cfg.upscaler_mode = pathways::UpscalerMode::None;
+            cfg.render_scale = 1.0f;
+            if (!stepAndVerify("4d. Switch FSR 3.1 -> Native 1.0x", 4, "None", "None")) return 1;
+
+            // 5. Cycle through Denoisers at Native 1.0x
+            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
+            if (!stepAndVerify("5a. Native 1.0x + E-SVGF Denoiser", 4, "None", "SVGF")) return 1;
+
+            cfg.denoiser_mode = pathways::DenoiserMode::FfxRayRegeneration;
+            if (!stepAndVerify("5b. Native 1.0x + Ray Regen Request (Runtime Gating)", 4, "None", expectedRayRegen)) return 1;
+
+            if (initStats.has_cooperative_matrix) {
+                cfg.denoiser_mode = pathways::DenoiserMode::Upways;
+                if (!stepAndVerify("5c. Native 1.0x + Upways Denoiser", 4, "None", "Upways")) return 1;
+
+                cfg.denoiser_mode = pathways::DenoiserMode::Gateway;
+                if (!stepAndVerify("5d. Native 1.0x + Gateway Denoiser", 4, "None", "Gateway")) return 1;
+            }
+
+            cfg.denoiser_mode = pathways::DenoiserMode::None;
+            if (!stepAndVerify("5e. Native 1.0x + Off (MC)", 4, "None", "None")) return 1;
+
+            // 6. Combined FSR 3.1 (0.67x) + Denoisers + GI & Caching (NRC, ReSTIR PT, Caustics)
+            cfg.upscaler_mode = pathways::UpscalerMode::FSR;
+            cfg.fsr_version = pathways::FsrVersion::Fsr3;
+            cfg.render_scale = 0.6666667f;
+            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
+            if (!stepAndVerify("6a. FSR 3.1 (0.67x) + E-SVGF", 4, "FSR 3.1", "SVGF")) return 1;
+
+            if (initStats.has_cooperative_matrix) {
+                cfg.denoiser_mode = pathways::DenoiserMode::Upways;
+                if (!stepAndVerify("6b. FSR 3.1 (0.67x) + Upways Denoiser", 4, "FSR 3.1", "Upways")) return 1;
+
+                cfg.denoiser_mode = pathways::DenoiserMode::Gateway;
+                if (!stepAndVerify("6c. FSR 3.1 (0.67x) + Gateway Denoiser", 4, "FSR 3.1", "Gateway")) return 1;
+            }
+
+            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
+            cfg.enable_nrc = true;
+            cfg.nrc_backend = pathways::NrcBackend::FfxRadianceCache; // Test runtime fallback to NativeWave32
+            if (!stepAndVerify("7a. Enable Neural Cache (NRC) live", 4, "FSR 3.1", "SVGF")) return 1;
+            if (cfg.nrc_backend != pathways::NrcBackend::NativeWave32 && !initStats.supports_fsr_rc) {
+                pathways::Logger::error("[FAIL] Unsupported FfxRadianceCache did not revert to NativeWave32!");
+                return 1;
+            }
+
+            cfg.enable_restir = true;
+            if (!stepAndVerify("7b. Enable ReSTIR PT live", 4, "FSR 3.1", "SVGF")) return 1;
+
+            cfg.enable_caustics = true;
+            if (!stepAndVerify("7c. Enable Real-Time Caustics live", 4, "FSR 3.1", "SVGF")) return 1;
+
+            // 8. Disable GI options & return to clean FSR 3.1 + E-SVGF for final frame dump
+            cfg.enable_caustics = false;
+            cfg.enable_restir = false;
+            cfg.enable_nrc = false;
+            if (!stepAndVerify("8. Return to FSR 3.1 (0.67x) + E-SVGF", 6, "FSR 3.1", "SVGF")) return 1;
+
+            engine.dumpOutputFiles();
+            engine.printExecutionSummary();
+            auto finalStats = engine.getStats();
+            if (finalStats.validation_errors > 0) {
+                pathways::Logger::error("Test failed: Validation errors encountered: {}", finalStats.validation_errors);
+                return 1;
+            }
+            pathways::Logger::info("[SUCCESS] Dynamic runtime GUI options test PASSED all state transitions with 0 validation errors!");
+            return 0;
+        }
+
         pathways::Engine engine(config);
         engine.run();
 

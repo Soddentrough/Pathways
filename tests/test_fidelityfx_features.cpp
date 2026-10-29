@@ -404,14 +404,33 @@ int main(int argc, char** argv) {
         hasRcProvider ? "FFX Radiance Caching (0.9.0)" : "NRC (Native Wave32 WMMA)",
         "--upscaler none --denoiser none --nrc --spp 1", &refPixels, refW, refH);
 
-    // 8. Render Combined Stack: FSR 4.1 ML + Denoiser + Radiance Caching
+    // 8. Render Upways SR (Quality 0.67x) & Gateway SR (Quality 0.67x)
+    FeatureRunResult upwaysSrRun = runFeatureConfig(
+        "07a_upways_sr_quality", "Upways SR (Quality 0.67x)", "--upscaler upways --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);
+    FeatureRunResult gatewaySrRun = runFeatureConfig(
+        "07b_gateway_sr_quality", "Gateway SR (Quality 0.67x)", "--upscaler gateway --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);
+
+    // 9. Render Upways Denoiser & Gateway Denoiser at Native 1.0x
+    FeatureRunResult upwaysDenRun = runFeatureConfig(
+        "07c_upways_denoiser", "Denoiser: Upways (Native 1.0x)", "--upscaler none --denoiser upways --spp 1", &refPixels, refW, refH);
+    FeatureRunResult gatewayDenRun = runFeatureConfig(
+        "07d_gateway_denoiser", "Denoiser: Gateway (Native 1.0x)", "--upscaler none --denoiser gateway --spp 1", &refPixels, refW, refH);
+
+    // 10. Render ReSTIR PT & Real-Time Caustics
+    FeatureRunResult restirRun = runFeatureConfig(
+        "07e_restir_pt", "GI: ReSTIR PT (Native 1.0x)", "--upscaler none --denoiser none --restir --spp 1", &refPixels, refW, refH);
+    FeatureRunResult causticsRun = runFeatureConfig(
+        "07f_caustics", "GI: Caustics (Native 1.0x)", "--upscaler none --denoiser none --caustics --spp 1", &refPixels, refW, refH);
+
+    // 11. Render Combined Stack: FSR + Denoiser + Radiance Caching + ReSTIR + Caustics
     FeatureRunResult combinedRun = runFeatureConfig(
         "07_combined_ffx_stack",
-        hasDenoiserProvider ? "Combined FSR4 + RayRegen + NRC" : "Combined FSR4 + E-SVGF + NRC",
-        "--upscaler fsr4 --render-scale 0.67 --denoiser rayregen --nrc --spp 1", &refPixels, refW, refH);
+        hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + E-SVGF + GI",
+        "--upscaler fsr4 --render-scale 0.67 --denoiser rayregen --nrc --restir --caustics --spp 1", &refPixels, refW, refH);
 
     std::vector<FeatureRunResult> allRuns = {
-        raw1SppRun, baseMcRun, fsr3Run, fsr4Run, rayRegenRun, nrcRun, combinedRun
+        raw1SppRun, baseMcRun, fsr3Run, fsr4Run, upwaysSrRun, gatewaySrRun,
+        rayRegenRun, upwaysDenRun, gatewayDenRun, nrcRun, restirRun, causticsRun, combinedRun
     };
 
     std::cout << "\n--------------------------------------------------------------------------------------------------------------------\n";
@@ -463,6 +482,10 @@ int main(int argc, char** argv) {
                    "When Vulkan Denoiser provider is absent, --denoiser rayregen must honestly fall back and report 'SVGF', got '" + rayRegenRun.reportedDenoiser + "'");
     }
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
+    check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
+    check_true(gatewaySrRun.reportedUpscaler == "Gateway", "Gateway SR run must report upscaler_mode == 'Gateway'");
+    check_true(upwaysDenRun.reportedDenoiser == "Upways", "Upways Denoiser run must report denoiser_mode == 'Upways'");
+    check_true(gatewayDenRun.reportedDenoiser == "Gateway", "Gateway Denoiser run must report denoiser_mode == 'Gateway'");
 
     // Assertions: Visual Quality & Image Integrity
     for (const auto& r : allRuns) {
@@ -494,6 +517,15 @@ int main(int argc, char** argv) {
     check_true(rayRegenRun.rtMs <= baseMcRun.rtMs * 1.25 + 0.35,
                "Enabling FFX Ray Regeneration must not inflate Wavefront RT time by >25% (base RT=" +
                std::to_string(baseMcRun.rtMs) + " ms, RayRegen RT=" + std::to_string(rayRegenRun.rtMs) + " ms)");
+
+    // -------------------------------------------------------------------------
+    // TEST 5: Dynamic Runtime Option Toggling (All Quick-Access GUI Options)
+    // -------------------------------------------------------------------------
+    std::cout << "[TEST 5] Dynamic Runtime Option Toggling (Upscalers, Presets, Denoisers, NRC, ReSTIR, Caustics)..." << std::endl;
+    FeatureRunResult dynRun = runFeatureConfig(
+        "08_dynamic_options", "Dynamic GUI Option Toggling", "--test-dynamic-options --spp 1", &refPixels, refW, refH);
+    check_true(dynRun.visual.width == 1280 && dynRun.visual.height == 720 && dynRun.visual.nonBlackRatio > 0.70,
+               "Dynamic GUI option toggling final frame must be valid 1280x720 non-black output");
 
     std::filesystem::remove_all(outDir, ec);
 

@@ -1014,6 +1014,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None, true,
                 "Render at full native display resolution (no upscaling).", [&]() {
                     config.upscaler_mode = UpscalerMode::None;
+                    config.upways_superres = false;
+                    config.gateway_superres = false;
                     config.render_scale = 1.0f;
                 });
             ImGui::SameLine();
@@ -1022,6 +1024,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                      : "Unavailable on this GPU: FSR 4 ML requires RDNA4 hardware FP8 Cooperative Matrix (VK_EXT_shader_float8 + shaderFloat8CooperativeMatrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr4;
+                    config.upways_superres = false;
+                    config.gateway_superres = false;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
@@ -1030,6 +1034,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                     : "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr3;
+                    config.upways_superres = false;
+                    config.gateway_superres = false;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
@@ -1037,12 +1043,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 "In-house Wave32 WMMA Neural U-Net + KPN Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::Upways;
                     config.upways_superres = true;
+                    config.gateway_superres = false;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
             drawQuickUpscalerBtn("Gateway SR", config.upscaler_mode == UpscalerMode::Gateway, stats.has_cooperative_matrix,
                 "In-house Hybrid E-SVGF + Quad MLP Bilateral Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
                     config.upscaler_mode = UpscalerMode::Gateway;
+                    config.upways_superres = false;
                     config.gateway_superres = true;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
@@ -1916,26 +1924,53 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::PopStyleColor();
             }
 
-            static const char* upscalerModeLabels[] = {
-                "None (Native Resolution)",
-                "AMD FSR (FSR 4 ML / FSR 3.1 Fallback)",
-                "Upways SR (Neural KPN Super-Resolution)",
-                "FSR 1.0 (Spatial EASU + RCAS)",
-                "Gateway SR (Bilateral Super-Resolution)"
+            struct UpscalerComboItem {
+                UpscalerMode mode;
+                const char* label;
+                bool supported;
+                const char* disabledReason;
             };
-            int upscalerIdx = static_cast<int>(config.upscaler_mode);
-            if (upscalerIdx < 0 || upscalerIdx >= IM_ARRAYSIZE(upscalerModeLabels)) {
-                upscalerIdx = 0;
-            }
-            if (ImGui::Combo("Upscaler Mode", &upscalerIdx, upscalerModeLabels, IM_ARRAYSIZE(upscalerModeLabels))) {
-                config.upscaler_mode = static_cast<UpscalerMode>(upscalerIdx);
-                if (config.upscaler_mode != UpscalerMode::None && config.render_scale >= 0.999f) {
-                    config.render_scale = 0.6666667f; // Default to Quality (1.5x)
-                } else if (config.upscaler_mode == UpscalerMode::None) {
-                    config.render_scale = 1.0f;
+            const UpscalerComboItem upscalerItems[] = {
+                { UpscalerMode::None, "None (Native Resolution)", true, nullptr },
+                { UpscalerMode::FSR, "AMD FSR (SDK Super-Resolution)", stats.supports_fsr3 || stats.supports_fsr4,
+                  "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk)." },
+                { UpscalerMode::Upways, "Upways SR (Neural KPN Super-Resolution)", stats.has_cooperative_matrix,
+                  "Unavailable: Requires VK_KHR_cooperative_matrix support." },
+                { UpscalerMode::Gateway, "Gateway SR (Bilateral Super-Resolution)", stats.has_cooperative_matrix,
+                  "Unavailable: Requires VK_KHR_cooperative_matrix support." }
+            };
+            const char* curUpscalerLabel = upscalerItems[0].label;
+            for (const auto& item : upscalerItems) {
+                if (config.upscaler_mode == item.mode) {
+                    curUpscalerLabel = item.label;
+                    break;
                 }
-                settingsChanged = true;
-                if (actions) actions->resetAccumulation = true;
+            }
+            if (ImGui::BeginCombo("Upscaler Mode", curUpscalerLabel)) {
+                for (const auto& item : upscalerItems) {
+                    if (!item.supported) ImGui::BeginDisabled(true);
+                    const bool isSelected = (config.upscaler_mode == item.mode);
+                    if (ImGui::Selectable(item.label, isSelected) && item.supported) {
+                        config.upscaler_mode = item.mode;
+                        config.upways_superres = (item.mode == UpscalerMode::Upways);
+                        config.gateway_superres = (item.mode == UpscalerMode::Gateway);
+                        if (config.upscaler_mode != UpscalerMode::None && config.render_scale >= 0.999f) {
+                            config.render_scale = 0.6666667f; // Default to Quality (1.5x)
+                        } else if (config.upscaler_mode == UpscalerMode::None) {
+                            config.render_scale = 1.0f;
+                        }
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (isSelected) ImGui::SetItemDefaultFocus();
+                    if (!item.supported) {
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && item.disabledReason) {
+                            ImGui::SetTooltip("%s", item.disabledReason);
+                        }
+                    }
+                }
+                ImGui::EndCombo();
             }
 
             if (config.upscaler_mode == UpscalerMode::FSR) {

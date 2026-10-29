@@ -848,16 +848,20 @@ Config Config::parse(int argc, char* argv[]) {
                 }
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.upscaler_mode = UpscalerMode::Upways;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "gateway") {
                 if (cfg.upscaler_mode != UpscalerMode::Gateway) {
                     cfg.gateway_superres = false;
                 }
                 cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
+                cfg.upscaler_mode = UpscalerMode::Gateway;
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
@@ -878,16 +882,20 @@ Config Config::parse(int argc, char* argv[]) {
                 }
                 cfg.denoiser_mode = DenoiserMode::Upways;
             } else if (mode == "upways_sr" || mode == "upways-sr" || mode == "upways_2x") {
+                cfg.upscaler_mode = UpscalerMode::Upways;
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "gateway") {
                 if (cfg.upscaler_mode != UpscalerMode::Gateway) {
                     cfg.gateway_superres = false;
                 }
                 cfg.denoiser_mode = DenoiserMode::Gateway;
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
+                cfg.upscaler_mode = UpscalerMode::Gateway;
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
+                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
@@ -1664,6 +1672,11 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--test-scene-switching") {
             cfg.test_scene_switching = true;
+            cfg.headless = true;
+            continue;
+        }
+        if (arg == "--test-dynamic-options") {
+            cfg.test_dynamic_options = true;
             cfg.headless = true;
             continue;
         }

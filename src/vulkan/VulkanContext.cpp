@@ -46,7 +46,21 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
             s_validationErrors++;
         }
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        Logger::warn("[Vulkan Validation] {}", pCallbackData->pMessage);
+        const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
+        const bool isFfxSdkInternalFormatWarn =
+            std::strstr(msg, "textures-format-validation") != nullptr &&
+            (std::strstr(msg, "\"rw_dilated_motion_vectors\"") != nullptr ||
+             std::strstr(msg, "\"rw_farthest_depth") != nullptr ||
+             std::strstr(msg, "\"rw_current_luma\"") != nullptr ||
+             std::strstr(msg, "\"rw_spd_mip") != nullptr ||
+             std::strstr(msg, "\"rw_lock_input_luma\"") != nullptr ||
+             std::strstr(msg, "\"rw_internal_upscaled_color\"") != nullptr ||
+             std::strstr(msg, "\"rw_upscaled_output\"") != nullptr);
+        if (isFfxSdkInternalFormatWarn) {
+            Logger::debug("[Vulkan Validation (FidelityFX SDK internal UAV)] {}", msg);
+        } else {
+            Logger::warn("[Vulkan Validation] {}", msg);
+        }
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
         Logger::debug("[Vulkan Validation Info] {}", pCallbackData->pMessage);
     }
