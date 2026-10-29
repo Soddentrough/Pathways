@@ -50,12 +50,12 @@ vec4 atrousFilterDiffuse(
     float invDepthTolerance = 1.0 / max(phiPlaneDepth * float(stepSize) * pixelFootprint, fp16QuantizationFloor);
     float centerPlaneDot = dot(centerPos, nView);
 
-    if (stepSize >= 4) {
+    if (stepSize >= 3) {
         const ivec2 AXIAL_TAPS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
         const ivec2 DIAG_TAPS[4]  = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
-        const float kWeight = (stepSize == 4) ? 0.09375 : 0.0625;
+        const float kWeight = (stepSize <= 4) ? 0.09375 : 0.0625;
         for (int i = 0; i < 4; ++i) {
-            ivec2 offset = (stepSize == 4) ? AXIAL_TAPS[i] : DIAG_TAPS[i];
+            ivec2 offset = (stepSize <= 4) ? AXIAL_TAPS[i] : DIAG_TAPS[i];
             int tapX = clamp(center.x + offset.x * stepSize, 0, imgMax.x);
             int tapY = clamp(center.y + offset.y * stepSize, 0, imgMax.y);
             ivec2 tapCoord = ivec2(tapX, tapY);
@@ -183,22 +183,23 @@ vec4 atrousFilterSpecular(
     float centerPlaneDot = dot(centerPos, nView);
     int specStep = max(1, int(round(float(stepSize) * roughnessScale)));
 
-    for (int y = -1; y <= 1; ++y) {
-        float wKy = ATROUS_KERNEL_1D[y + 2];
-        int tapY = clamp(center.y + y * specStep, 0, imgMax.y);
-        float planeY = (float(tapY) + 0.5) * scaleY + bias;
-        for (int x = -1; x <= 1; ++x) {
-            if (x == 0 && y == 0) continue;
-
-            int tapX = clamp(center.x + x * specStep, 0, imgMax.x);
+    if (specStep >= 3) {
+        const ivec2 AXIAL_TAPS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        const ivec2 DIAG_TAPS[4]  = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+        const float kWeight = (specStep <= 4) ? 0.09375 : 0.0625;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 offset = (specStep <= 4) ? AXIAL_TAPS[i] : DIAG_TAPS[i];
+            int tapX = clamp(center.x + offset.x * specStep, 0, imgMax.x);
+            int tapY = clamp(center.y + offset.y * specStep, 0, imgMax.y);
             ivec2 tapCoord = ivec2(tapX, tapY);
+
             vec4 tapND = imageLoad(uNormalDepth, tapCoord);
             if (tapND.w <= 0.0 || tapND.w >= 9999.0) continue;
 
             float cosAngle = max(dot(centerNormal, tapND.xyz), 0.0);
             if (cosAngle <= 0.25) continue;
 
-            float tapPlaneDot = tapND.w * ((float(tapX) + 0.5) * scaleX + planeY);
+            float tapPlaneDot = tapND.w * ((float(tapX) + 0.5) * scaleX + (float(tapY) + 0.5) * scaleY + bias);
             float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolerance;
             if (depthArg >= 8.0) continue;
 
@@ -208,11 +209,44 @@ vec4 atrousFilterSpecular(
 
             float16_t wNorm = float16_t(pow(cosAngle, effectivePhiNormal));
             float16_t wEdge = float16_t(exp2(-(depthArg + lumArg) * 1.44269504));
-            float w = (ATROUS_KERNEL_1D[x + 2] * wKy) * float(wNorm * wEdge);
+            float w = kWeight * float(wNorm * wEdge);
 
             specAcc += tapData.rgb * w;
             weightAcc += w;
             varAcc += w * w * max(tapData.a, 0.0);
+        }
+    } else {
+        for (int y = -1; y <= 1; ++y) {
+            float wKy = ATROUS_KERNEL_1D[y + 2];
+            int tapY = clamp(center.y + y * specStep, 0, imgMax.y);
+            float planeY = (float(tapY) + 0.5) * scaleY + bias;
+            for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) continue;
+
+                int tapX = clamp(center.x + x * specStep, 0, imgMax.x);
+                ivec2 tapCoord = ivec2(tapX, tapY);
+                vec4 tapND = imageLoad(uNormalDepth, tapCoord);
+                if (tapND.w <= 0.0 || tapND.w >= 9999.0) continue;
+
+                float cosAngle = max(dot(centerNormal, tapND.xyz), 0.0);
+                if (cosAngle <= 0.25) continue;
+
+                float tapPlaneDot = tapND.w * ((float(tapX) + 0.5) * scaleX + planeY);
+                float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolerance;
+                if (depthArg >= 8.0) continue;
+
+                vec4 tapData = imageLoad(uInSpecular, tapCoord);
+                float tapLum = denoiseLuminance(tapData.rgb);
+                float lumArg = abs(centerLum - tapLum) * invLumDenom;
+
+                float16_t wNorm = float16_t(pow(cosAngle, effectivePhiNormal));
+                float16_t wEdge = float16_t(exp2(-(depthArg + lumArg) * 1.44269504));
+                float w = (ATROUS_KERNEL_1D[x + 2] * wKy) * float(wNorm * wEdge);
+
+                specAcc += tapData.rgb * w;
+                weightAcc += w;
+                varAcc += w * w * max(tapData.a, 0.0);
+            }
         }
     }
 

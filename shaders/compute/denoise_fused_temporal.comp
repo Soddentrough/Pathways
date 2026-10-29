@@ -305,8 +305,9 @@ bool validateReprojection(
     vec3 prevNormal,
     float currDepth,
     float prevDepth,
+    vec3 currViewPos,
+    vec4 prevViewPos,
     ivec2 prevCoord,
-    ivec2 currCoord,
     vec2 prevUV,
     vec2 resolution,
     out bool isDynamicObject)
@@ -330,11 +331,7 @@ bool validateReprojection(
     vec3 prevNormalInCurrView = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNormal);
     float normalCloseness = dot(currNormal, prevNormalInCurrView);
 
-    // 3. Unproject current pixel to metric 3D view space (unjittered pixel center)
-    vec3 currViewPos = unprojectToView(currCoord, currDepth, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
-
-    // 4. Exact 6-DOF affine view-to-view transformation
-    vec4 prevViewPos = uCamera.currViewToPrevView * vec4(currViewPos, 1.0);
+    // 3. Exact 6-DOF affine view-to-view transformation (precomputed in caller)
     float zExpected = prevViewPos.z;
 
     // 5. Motion vector discrepancy test (dynamic object detection hint).
@@ -549,9 +546,10 @@ void main() {
     vec4 specMotionTex = (curRoughness < 0.70) ? imageLoad(uSpecularMotion, coord) : vec4(0.0);
     bool isEmissive = curDiffTex.a > 0.5;
     // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV using LDS Normal/Depth
-    // Skip on transmissive primary surfaces (marked with specMotionTex.z < 0.0)
+    // Skip on transmissive primary surfaces (marked with specMotionTex.z < 0.0) or dark/zero-hitT pixels
     if (pc.resetHistory == 0u && specMotionTex.z >= 0.0 && curRoughness < 0.25 && curZ < 9999.0 &&
-        (curRoughness > 0.015 || specMotionTex.a <= 1e-4) && specMotionTex.a < 999.0) {
+        (curRoughness > 0.015 || specMotionTex.a <= 1e-4) && specMotionTex.a < 999.0 &&
+        (specMotionTex.a > 1e-4 || s_localSpecularLum[ldsCoord.y][ldsCoord.x] > 1e-4)) {
         bool centerValid = (specMotionTex.a > 1e-4);
         vec4 smAccum = centerValid ? specMotionTex : vec4(0.0);
         float wSum = centerValid ? 1.0 : 0.0;
@@ -594,13 +592,17 @@ void main() {
     vec4 prevND = vec4(0.0);
     vec4 prevHistLenPrimary = vec4(0.0);
 
+    vec3 currViewPos = unprojectToView(coord, curZ, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
+    vec4 prevViewPos = uCamera.currViewToPrevView * vec4(currViewPos, 1.0);
+    float zExpectedSurf = prevViewPos.z;
+
     if (pc.resetHistory == 0u &&
         prevCoord.x >= 0 && prevCoord.y >= 0 &&
         prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
 
         prevND = imageLoad(uPrevNormalDepth, prevCoord);
-        valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, prevCoord,
-                                     coord, prevUV, resolution, isDynamic);
+        valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, currViewPos, prevViewPos,
+                                     prevCoord, prevUV, resolution, isDynamic);
     }
 
     // ---------------- Temporal edge density fusion ----------------
@@ -639,10 +641,11 @@ void main() {
         prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
         prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
 
-        if (sameSpecCoord && valid && stationaryPixel && dRefl <= 1e-4) {
-            // Fast path: stationary primary pixel with no VMV offset reuses already-validated primary history
+        if (sameSpecCoord && valid && !isDynamic && dRefl <= 1e-4) {
+            // Fast path: non-dynamic primary pixel with no VMV offset reuses already-validated primary history
             validSpec = true;
-            nSpec = min(prevHistLenPrimary.g + 1.0, 128.0);
+            float maxSpecFast = stationaryPixel ? 128.0 : min(pc.maxHistoryLength, (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+            nSpec = min(prevHistLenPrimary.g + 1.0, maxSpecFast);
             dOutRefl = prevHistLenPrimary.b;
         } else {
             vec4 prevNDSpec = (sameSpecCoord && valid) ? prevND : imageLoad(uPrevNormalDepth, prevCoordSpec);
@@ -656,8 +659,6 @@ void main() {
                 vec4 prevHistLenSpec = (sameSpecCoord && valid) ? prevHistLenPrimary : imageLoad(uHistoryLength, prevCoordSpec);
                 float dPrevRefl = prevHistLenSpec.b;
 
-                vec3 currViewPos = unprojectToView(coord, curZ, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
-                float zExpectedSurf = (uCamera.currViewToPrevView * vec4(currViewPos, 1.0)).z;
                 float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
                 bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && sameSpecCoord);
 
@@ -670,7 +671,8 @@ void main() {
 
                 if ((currIsSky || normalClosenessSpec > 0.82) && reflectorDepthConsistent && hitDistConsistent) {
                     validSpec = true;
-                    float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+                    float maxSpecMoving = min(pc.maxHistoryLength, (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+                    float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : maxSpecMoving);
                     nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
                     if (dOutRefl <= 1e-4) {
                         dOutRefl = dPrevRefl;

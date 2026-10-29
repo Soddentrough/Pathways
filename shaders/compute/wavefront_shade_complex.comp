@@ -867,7 +867,7 @@ void main() {
                     // clearcoat (prob ccProb), else base spec (specProb), else cosine
                     // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
 #if !IS_SECONDARY_BOUNCE
-                    bool useBounce0Sobol = (pc.captureMlData != 0u || pc.secondarySortMode < 2u);
+                    bool useBounce0Sobol = ((pc.captureMlData & 2u) != 0u || pc.secondarySortMode < 2u);
                     uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                     float lobeSelect = useBounce0Sobol
                         ? sampleSobolOwen1D(pixelIndex, pc.width, sobolSampleIdx, 0u)

@@ -24,7 +24,8 @@ public:
     void createRenderTargets(uint32_t width, uint32_t height, AccumFormat accumFormat,
                              bool isHdr, VkFormat swapchainFormat,
                              const std::vector<uint32_t>& concurrentQueues,
-                             VkCommandBuffer cmd);
+                             VkCommandBuffer cmd,
+                             uint32_t renderWidth = 0, uint32_t renderHeight = 0);
 
     void recreateAccumImages(uint32_t width, uint32_t height, AccumFormat accumFormat,
                              const std::vector<uint32_t>& concurrentQueues,
@@ -38,7 +39,15 @@ public:
     void resize(uint32_t width, uint32_t height, AccumFormat accumFormat,
                 bool isHdr, VkFormat swapchainFormat,
                 const std::vector<uint32_t>& concurrentQueues,
-                VkCommandBuffer cmd);
+                VkCommandBuffer cmd,
+                uint32_t renderWidth = 0, uint32_t renderHeight = 0);
+
+    void resizeRenderSpaceTargets(uint32_t renderWidth, uint32_t renderHeight,
+                                  const std::vector<uint32_t>& concurrentQueues,
+                                  VkCommandBuffer cmd);
+
+    [[nodiscard]] uint32_t getRenderTargetWidth() const noexcept { return m_renderWidth; }
+    [[nodiscard]] uint32_t getRenderTargetHeight() const noexcept { return m_renderHeight; }
 
     void destroy();
 
@@ -69,6 +78,8 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
+    uint32_t m_renderWidth = 0;
+    uint32_t m_renderHeight = 0;
 
     std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_frameImages;
     std::unique_ptr<Image> m_accumImage;

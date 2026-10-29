@@ -76,6 +76,14 @@ void main() {
 
     if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
 
+    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-4 && !hasSpec))) {
+        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
+        if (hasSpec) {
+            imageStore(uOutSpecular, coord, imageLoad(uInSpecular, coord));
+        }
+        return;
+    }
+
     vec2 resolution = vec2(float(pc.width), float(pc.height));
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, resolution);
     float centerLumD = denoiseLuminance(inDiffuse.rgb);

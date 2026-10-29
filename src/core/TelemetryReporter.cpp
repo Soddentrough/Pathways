@@ -1257,16 +1257,30 @@ void TelemetryReporter::printExecutionSummary() const {
             Logger::info("          * Pass 4 (Bilateral Upscale & Remodulate s=1):     {:.3f} ms", p4);
             Logger::info("          * History Copy (Normal/Depth + Specular Motion):   {:.3f} ms", hc);
         } else if (tallyIsSvgf && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+            const double p1 = tally.getAvgDenoisePassMs(0);
+            const double p2 = tally.getAvgDenoisePassMs(1);
+            const double p3 = tally.getAvgDenoisePassMs(2);
+            const double p4 = tally.getAvgDenoisePassMs(3);
+            const double p5 = tally.getAvgDenoisePassMs(4);
+            const double passSum = p1 + p2 + p3 + p4 + p5;
+            const bool coupledWithFsr = (tally.key.upscaler == UpscalerMode::FSR && passSum > 0.0005);
+            const double svgfTotalMs = coupledWithFsr ? passSum : avgDenoiseSrMs;
             if (tally.key.denoiser == DenoiserMode::FfxRayRegeneration) {
-                Logger::info("      - AMD FFX Ray Regeneration (1.2.1) Denoiser:     {:.3f} ms", avgDenoiseSrMs);
+                Logger::info("      - AMD FFX Ray Regeneration (1.2.1) Denoiser:     {:.3f} ms", svgfTotalMs);
             } else {
-                Logger::info("      - E-SVGF Spatio-Temporal Denoiser:               {:.3f} ms", avgDenoiseSrMs);
+                Logger::info("      - E-SVGF Spatio-Temporal Denoiser:               {:.3f} ms", svgfTotalMs);
             }
-            Logger::info("          * Pass 1 (Fused Temporal):                         {:.3f} ms", tally.getAvgDenoisePassMs(0));
-            Logger::info("          * Pass 2 (A-Trous s=1):                            {:.3f} ms", tally.getAvgDenoisePassMs(1));
-            Logger::info("          * Pass 3 (A-Trous s=2):                            {:.3f} ms", tally.getAvgDenoisePassMs(2));
-            Logger::info("          * Pass 4 (A-Trous s=4):                            {:.3f} ms", tally.getAvgDenoisePassMs(3));
-            Logger::info("          * Pass 5 (Coarse s=8 + Remodulate):                {:.3f} ms", tally.getAvgDenoisePassMs(4));
+            Logger::info("          * Pass 1 (Fused Temporal):                         {:.3f} ms", p1);
+            Logger::info("          * Pass 2 (A-Trous s=1):                            {:.3f} ms", p2);
+            Logger::info("          * Pass 3 (A-Trous s=2):                            {:.3f} ms", p3);
+            Logger::info("          * Pass 4 (A-Trous s=4):                            {:.3f} ms", p4);
+            Logger::info("          * Pass 5 (Coarse s={} + Remodulate):                {:.3f} ms",
+                         (p3 <= 0.0001 && p4 <= 0.0001) ? 3 : 8, p5);
+            if (coupledWithFsr) {
+                const double fsrMs = std::max(0.0, avgDenoiseSrMs - passSum);
+                Logger::info("      - AMD {} Super-Resolution Upscaler:       {:.3f} ms",
+                             tally.key.fsr_version == FsrVersion::Fsr4 ? "FSR 4.1 ML" : "FSR 3.1   ", fsrMs);
+            }
         } else if (tally.key.upscaler == UpscalerMode::FSR && avgDenoiseSrMs > 0.0005) {
             Logger::info("      - AMD {} Super-Resolution Upscaler:       {:.3f} ms",
                          tally.key.fsr_version == FsrVersion::Fsr4 ? "FSR 4.1 ML" : "FSR 3.1   ", avgDenoiseSrMs);

@@ -517,13 +517,19 @@ void DenoiserPipeline::collectQueryResults() {
         if (r == VK_NOT_READY) continue;
 
         for (uint32_t pass = 0; pass < NUM_PASSES; ++pass) {
+            if (m_slotFastCoupled[slot] && (pass == 2 || pass == 3)) {
+                m_passTimingsMs[pass] = 0.0f;
+                continue;
+            }
             uint64_t beginTicks = results[pass * 4 + 0];
             uint64_t beginAvail = results[pass * 4 + 1];
             uint64_t endTicks   = results[pass * 4 + 2];
             uint64_t endAvail   = results[pass * 4 + 3];
-            if (beginAvail && endAvail && endTicks > beginTicks) {
+            if (beginAvail && endAvail && endTicks >= beginTicks) {
                 m_passTimingsMs[pass] = static_cast<float>(
                     static_cast<double>(endTicks - beginTicks) * m_timestampPeriodNs / 1.0e6);
+            } else {
+                m_passTimingsMs[pass] = 0.0f;
             }
         }
     }
@@ -547,7 +553,8 @@ void DenoiserPipeline::recordDenoise(
     Image* ffxDirectDiffuse,
     Image* ffxDirectSpecular,
     Image* ffxIndirectDiffuse,
-    Image* ffxIndirectSpecular
+    Image* ffxIndirectSpecular,
+    bool fastUpscalerCoupled
 ) {
     if (!isInitialized() || !currentDiffuse || !currentSpecular || !motionVectors ||
         !normalDepth || !albedoRoughness) {
@@ -610,7 +617,7 @@ void DenoiserPipeline::recordDenoise(
         pc.width = m_width;
         pc.height = m_height;
         pc.resetHistory = resetHistory ? 1u : 0u;
-        pc.maxHistoryLength = 32.0f;
+        pc.maxHistoryLength = fastUpscalerCoupled ? 12.0f : 32.0f;
         pc.weightAlbedo = 0.50f;
         pc.weightDepth = 0.30f;
         pc.weightNormal = 0.20f;
@@ -665,59 +672,71 @@ void DenoiserPipeline::recordDenoise(
     }
 
     // =========================================================================
-    // Pass 3: Fine-Scale Wavelet Iteration 2 (s = 2, diameter 13, covers k=9)
+    // Passes 3 & 4: Mid-Scale Wavelet Iterations (s = 2, s = 4)
+    // When coupled with FSR temporal upscaling or stationary convergence
+    // (fastUpscalerCoupled), Pass 2 (s=1) writes m_pingPongDiffuse[0] and
+    // Pass 5 reads m_pingPongDiffuse[0] directly with s=3 (9x9 hole-free support),
+    // skipping 2 full-screen dispatches and 2 global memory barriers.
     // =========================================================================
-    {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2Pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2PipelineLayout,
-                                0, 1, &m_atrousStep2DescSets[frameSlot], 0, nullptr);
+    if (!fastUpscalerCoupled) {
+        // Pass 3: Fine-Scale Wavelet Iteration 2 (s = 2, diameter 13, covers k=9)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2Pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep2PipelineLayout,
+                                    0, 1, &m_atrousStep2DescSets[frameSlot], 0, nullptr);
 
-        AtrousPushConstants pc{};
-        pc.width = m_width;
-        pc.height = m_height;
-        pc.stepSize = 2;
-        pc.phiNormal = phiNormal;
-        pc.phiPlaneDepth = phiPlaneDepth;
-        pc.phiLuminance = phiLuminance;
-        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
-        pc.aspectRatio = cameraMatrices.aspectRatio;
-        vkCmdPushConstants(cmd, m_atrousStep2PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(AtrousPushConstants), &pc);
+            AtrousPushConstants pc{};
+            pc.width = m_width;
+            pc.height = m_height;
+            pc.stepSize = 2;
+            pc.phiNormal = phiNormal;
+            pc.phiPlaneDepth = phiPlaneDepth;
+            pc.phiLuminance = phiLuminance;
+            pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+            pc.aspectRatio = cameraMatrices.aspectRatio;
+            vkCmdPushConstants(cmd, m_atrousStep2PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(AtrousPushConstants), &pc);
 
+            writeTimestamp(qBase + 4);
+            vkCmdDispatch(cmd, gx, gy, 1);
+            writeTimestamp(qBase + 5);
+            insertComputeBarrier();
+        }
+
+        // Pass 4: Mid-Scale Wavelet Iteration 3 (s = 4, diameter 29, covers k=17)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3Pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3PipelineLayout,
+                                    0, 1, &m_atrousStep3DescSets[frameSlot], 0, nullptr);
+
+            AtrousPushConstants pc{};
+            pc.width = m_width;
+            pc.height = m_height;
+            pc.stepSize = 4;
+            pc.phiNormal = phiNormal;
+            pc.phiPlaneDepth = phiPlaneDepth;
+            pc.phiLuminance = phiLuminance;
+            pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
+            pc.aspectRatio = cameraMatrices.aspectRatio;
+            vkCmdPushConstants(cmd, m_atrousStep3PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(AtrousPushConstants), &pc);
+
+            writeTimestamp(qBase + 6);
+            vkCmdDispatch(cmd, gx, gy, 1);
+            writeTimestamp(qBase + 7);
+            insertComputeBarrier();
+        }
+    } else {
+        // Write dummy timestamps for skipped Passes 3 & 4 so all 10 queries in
+        // [qBase, qBase + 9] are marked available for vkGetQueryPoolResults.
         writeTimestamp(qBase + 4);
-        vkCmdDispatch(cmd, gx, gy, 1);
         writeTimestamp(qBase + 5);
-        insertComputeBarrier();
-    }
-
-    // =========================================================================
-    // Pass 4: Mid-Scale Wavelet Iteration 3 (s = 4, diameter 29, covers k=17)
-    // =========================================================================
-    {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3Pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousStep3PipelineLayout,
-                                0, 1, &m_atrousStep3DescSets[frameSlot], 0, nullptr);
-
-        AtrousPushConstants pc{};
-        pc.width = m_width;
-        pc.height = m_height;
-        pc.stepSize = 4;
-        pc.phiNormal = phiNormal;
-        pc.phiPlaneDepth = phiPlaneDepth;
-        pc.phiLuminance = phiLuminance;
-        pc.tanHalfFovY = cameraMatrices.tanHalfFovY;
-        pc.aspectRatio = cameraMatrices.aspectRatio;
-        vkCmdPushConstants(cmd, m_atrousStep3PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(AtrousPushConstants), &pc);
-
         writeTimestamp(qBase + 6);
-        vkCmdDispatch(cmd, gx, gy, 1);
         writeTimestamp(qBase + 7);
-        insertComputeBarrier();
     }
 
     // =========================================================================
-    // Pass 5: Coarse Wavelet (s = 8, diameter 61, covers k=33) & Remodulation
+    // Pass 5: Coarse Wavelet (s = 8 or s = 3 coupled) & Fused Albedo Remodulation
     // =========================================================================
     {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_coarseRemodulatePipeline);
@@ -727,7 +746,7 @@ void DenoiserPipeline::recordDenoise(
         AtrousCoarseRemodulatePushConstants pc{};
         pc.width = m_width;
         pc.height = m_height;
-        pc.stepSize = 8;
+        pc.stepSize = fastUpscalerCoupled ? 3 : 8;
         pc.phiNormal = phiNormal;
         pc.phiPlaneDepth = phiPlaneDepth;
         pc.phiLuminance = phiLuminance;
@@ -743,6 +762,7 @@ void DenoiserPipeline::recordDenoise(
         vkCmdDispatch(cmd, gx, gy, 1);
         writeTimestamp(qBase + 9);
         m_slotQueriesRecorded[frameSlot] = true;
+        m_slotFastCoupled[frameSlot] = fastUpscalerCoupled;
     }
 
     // Output barrier: guarantee tonemapping reads the finished denoised image

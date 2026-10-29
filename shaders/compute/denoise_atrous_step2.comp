@@ -45,6 +45,13 @@ void main() {
     inDiffuse.a = abs(inDiffuse.a);
 
     vec4 nd = imageLoad(uNormalDepth, coord);
+    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-4 && !hasSpec))) {
+        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
+        if (hasSpec) {
+            imageStore(uOutSpecular, coord, imageLoad(uInSpecular, coord));
+        }
+        return;
+    }
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
 
     float centerLumD = denoiseLuminance(inDiffuse.rgb);

@@ -437,7 +437,9 @@ void Engine::initVulkan() {
         m_swapchain && !m_config.headless && m_swapchain->isHdr(),
         m_swapchain ? m_swapchain->getFormat() : VK_FORMAT_UNDEFINED,
         concurrentQueues,
-        m_commandBuffers[0]
+        m_commandBuffers[0],
+        getEffectiveGbufferWidth(),
+        getEffectiveGbufferHeight()
     );
     syncRenderTargetPointers();
 }
@@ -1118,7 +1120,12 @@ void Engine::updateAllImageDescriptors() {
 void Engine::createGBufferResources() {
     auto concurrentQueues = getConcurrentQueueFamilies();
     if (m_renderTargets) {
-        m_renderTargets->createGBufferResources(m_config.width, m_config.height, concurrentQueues, m_commandBuffers[0]);
+        m_renderTargets->createGBufferResources(
+            getEffectiveGbufferWidth(),
+            getEffectiveGbufferHeight(),
+            concurrentQueues,
+            m_commandBuffers[0]
+        );
     }
     syncRenderTargetPointers();
     if (m_denoiser) {
@@ -1234,8 +1241,8 @@ void Engine::initCaustics() {
             m_context->getDevice(),
             m_context->getAllocator(),
             m_context->hasSubgroupSizeControl(),
-            m_config.width,
-            m_config.height,
+            getEffectiveGbufferWidth(),
+            getEffectiveGbufferHeight(),
             m_config.caustic_photons,
             traceSpv, splatSpv, filterSpv,
             [this](auto recordFn) {
@@ -2088,6 +2095,38 @@ void Engine::renderFrame() {
         flags |= (1 << 23);
     }
 
+    uint32_t targetGbW = getEffectiveGbufferWidth();
+    uint32_t targetGbH = getEffectiveGbufferHeight();
+    if (m_renderTargets &&
+        (m_renderTargets->getRenderTargetWidth() != targetGbW ||
+         m_renderTargets->getRenderTargetHeight() != targetGbH)) {
+        vkDeviceWaitIdle(device);
+        auto concurrentQueues = getConcurrentQueueFamilies();
+        m_renderTargets->resizeRenderSpaceTargets(
+            targetGbW, targetGbH, concurrentQueues, m_commandBuffers[0]
+        );
+        syncRenderTargetPointers();
+        if (m_causticsPipeline) {
+            m_causticsPipeline->resize(targetGbW, targetGbH, [this](auto recordFn) {
+                VkCommandBuffer c = m_commandBuffers[0];
+                vkResetCommandBuffer(c, 0);
+                VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(c, &bi);
+                recordFn(c);
+                vkEndCommandBuffer(c);
+                VkCommandBufferSubmitInfo csi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                csi.commandBuffer = c;
+                VkSubmitInfo2 si{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                si.commandBufferInfoCount = 1;
+                si.pCommandBufferInfos = &csi;
+                vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &si, VK_NULL_HANDLE);
+                vkQueueWaitIdle(m_context->getGraphicsQueue());
+            });
+        }
+        updateAllImageDescriptors();
+        updateMergeDescriptors();
+    }
+
     // Lazy reservoir allocation: the grid only exists while ReSTIR has been
     // enabled at least once, keeping ~144 B/pixel (DI 56B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
@@ -2333,6 +2372,9 @@ void Engine::renderFrame() {
             }
 
             if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
+                const bool fastUpscalerCoupled =
+                    (m_config.upscaler_mode == UpscalerMode::FSR) ||
+                    (m_config.progressive_accumulation && !m_cameraMovedLastFrame && m_accumulatedSamples >= 12);
                 m_denoiser->recordDenoise(
                     cmd, m_currentFrame, resetTemporal,
                     m_accumulatedSamples, -1.0f,
@@ -2345,7 +2387,8 @@ void Engine::renderFrame() {
                     m_ffxDirectDiffuseImage,
                     m_ffxDirectSpecularImage,
                     m_ffxIndirectDiffuseImage,
-                    m_ffxIndirectSpecularImage
+                    m_ffxIndirectSpecularImage,
+                    fastUpscalerCoupled
                 );
                 svgfRun = true;
             }
@@ -3009,7 +3052,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
             m_swapchain && !m_config.headless && m_swapchain->isHdr(),
             m_swapchain ? m_swapchain->getFormat() : VK_FORMAT_UNDEFINED,
             concurrentQueues,
-            m_commandBuffers[0]
+            m_commandBuffers[0],
+            getEffectiveGbufferWidth(),
+            getEffectiveGbufferHeight()
         );
     }
     syncRenderTargetPointers();
@@ -3035,7 +3080,7 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
     }
     if (m_causticsPipeline) {
-        m_causticsPipeline->resize(m_config.width, m_config.height, [this](auto recordFn) {
+        m_causticsPipeline->resize(getEffectiveGbufferWidth(), getEffectiveGbufferHeight(), [this](auto recordFn) {
             VkCommandBuffer cmd = m_commandBuffers[0];
             vkResetCommandBuffer(cmd, 0);
             VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };

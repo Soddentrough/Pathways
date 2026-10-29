@@ -142,7 +142,8 @@ public:
         Image* ffxDirectDiffuse = nullptr,
         Image* ffxDirectSpecular = nullptr,
         Image* ffxIndirectDiffuse = nullptr,
-        Image* ffxIndirectSpecular = nullptr
+        Image* ffxIndirectSpecular = nullptr,
+        bool fastUpscalerCoupled = false
     );
 
     void initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage);
@@ -182,6 +183,7 @@ private:
         Image* ffxIndirectSpecular = nullptr
     );
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotQueriesRecorded = { false, false };
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotFastCoupled = { false, false };
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
