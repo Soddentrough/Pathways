@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -209,6 +210,15 @@ std::string FfxSdkRuntime::getSdkStatusString() const {
 }
 
 bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
+    if (physDevice == VK_NULL_HANDLE) { return false; }
+    static std::mutex s_mlCacheMutex;
+    static std::vector<std::pair<VkPhysicalDevice, bool>> s_mlCache;
+    {
+        std::lock_guard<std::mutex> lock(s_mlCacheMutex);
+        for (const auto& entry : s_mlCache) {
+            if (entry.first == physDevice) { return entry.second; }
+        }
+    }
     if (physDevice == VK_NULL_HANDLE) {
         return false;
     }
@@ -300,7 +310,12 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
                                     vk12Features.shaderFloat16 == VK_TRUE &&
                                     vk12Features.storageBuffer8BitAccess == VK_TRUE);
 
-    return hasFp8CoopMatrix || hasInt8CoopMatrix;
+    const bool supported = hasFp8CoopMatrix || hasInt8CoopMatrix;
+    {
+        std::lock_guard<std::mutex> lock(s_mlCacheMutex);
+        s_mlCache.emplace_back(physDevice, supported);
+    }
+    return supported;
 }
 
 std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
@@ -310,6 +325,25 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 {
     std::vector<FfxSdkVersionInfo> result;
 #if defined(PATHWAYS_HAS_FFX_SDK)
+    struct VersionCacheEntry {
+        uint64_t createDescType;
+        VkPhysicalDevice physDevice;
+        bool hasDevice;
+        std::vector<FfxSdkVersionInfo> versions;
+    };
+    static std::mutex s_verCacheMutex;
+    static std::vector<VersionCacheEntry> s_verCache;
+    const bool hasProvidedDevice = (device != VK_NULL_HANDLE);
+    {
+        std::lock_guard<std::mutex> lock(s_verCacheMutex);
+        for (const auto& entry : s_verCache) {
+            if (entry.createDescType == createDescType &&
+                entry.physDevice == physDevice &&
+                (entry.hasDevice == hasProvidedDevice || entry.hasDevice)) {
+                return entry.versions;
+            }
+        }
+    }
     VkDevice tempDevice = VK_NULL_HANDLE;
     if (physDevice != VK_NULL_HANDLE && device == VK_NULL_HANDLE) {
         uint32_t extCount = 0;
@@ -438,6 +472,10 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 
     if (tempDevice != VK_NULL_HANDLE) {
         vkDestroyDevice(tempDevice, nullptr);
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_verCacheMutex);
+        s_verCache.push_back(VersionCacheEntry{createDescType, physDevice, hasProvidedDevice, result});
     }
 #else
     (void)createDescType;

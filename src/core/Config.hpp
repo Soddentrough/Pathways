@@ -144,17 +144,24 @@ struct Config {
     uint32_t render_height = 0;  // Explicit internal ray tracing render height (0 = derived from render_scale * height)
     float exposure = 1.0f;
 
+    static float normalizeRenderScale(float s) {
+        if (std::abs(s - 0.67f) < 0.004f) return 2.0f / 3.0f;
+        if (std::abs(s - 0.59f) < 0.004f) return 1.0f / 1.7f;
+        if (std::abs(s - 0.33f) < 0.004f) return 1.0f / 3.0f;
+        return s;
+    }
+
     uint32_t getRenderWidth() const {
         if (render_width > 0) return render_width;
         if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
-            return std::max(1u, static_cast<uint32_t>(std::round(width * render_scale)));
+            return std::max(1u, static_cast<uint32_t>(std::round(width * normalizeRenderScale(render_scale))));
         }
         return width;
     }
     uint32_t getRenderHeight() const {
         if (render_height > 0) return render_height;
         if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
-            return std::max(1u, static_cast<uint32_t>(std::round(height * render_scale)));
+            return std::max(1u, static_cast<uint32_t>(std::round(height * normalizeRenderScale(render_scale))));
         }
         return height;
     }

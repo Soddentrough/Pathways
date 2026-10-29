@@ -1665,7 +1665,7 @@ void Engine::renderFrame() {
         requestSceneChange(targetPath);
     }
 
-    {
+    if (m_config.upscaler_mode != m_lastUpscalerMode || m_config.fsr_version != m_lastFsrVersion) {
         const bool fsr3Supported = m_context &&
                                    FfxSdkRuntime::instance().isUpscalerVersionSupported(
                                        m_context->getPhysicalDevice(), m_context->getDevice(), 3u);

@@ -363,10 +363,10 @@ void RayTracingOrchestrator::recordRayTracing(
         // radiance signals for both E-SVGF and AMD FSR Ray Regeneration compute passes; avoid redundant
         // 4-image clear and RMW traffic unless an external 4-signal consumer is explicitly active.
         bool isFfxDenoisingActive = false;
-        if (needAccumReset || isDenoisingActive) {
-            if (needAccumReset && accumImage && needFrameImage) {
-                vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            }
+        if (needAccumReset && accumImage && needFrameImage) {
+            vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+        }
+        if (isDenoisingActive) {
             if (mlDiffuseImage) {
                 vkCmdClearColorImage(cmd, mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
             }
@@ -409,7 +409,7 @@ void RayTracingOrchestrator::recordRayTracing(
                 addClearBarrier(accumImage);
             }
         }
-        if (needAccumReset || isDenoisingActive) {
+        if (isDenoisingActive) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
             if (isFfxDenoisingActive) {

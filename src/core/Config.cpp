@@ -1083,13 +1083,13 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--render-scale" && i + 1 < argc) {
-            cfg.render_scale = std::clamp(std::stof(argv[++i]), 0.25f, 1.0f);
+            cfg.render_scale = Config::normalizeRenderScale(std::clamp(std::stof(argv[++i]), 0.25f, 1.0f));
             cfg.render_width = 0;
             cfg.render_height = 0;
             continue;
         }
         if (arg.starts_with("--render-scale=")) {
-            cfg.render_scale = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.25f, 1.0f);
+            cfg.render_scale = Config::normalizeRenderScale(std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.25f, 1.0f));
             cfg.render_width = 0;
             cfg.render_height = 0;
             continue;

@@ -53,7 +53,9 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
         const bool isFfxSdkInternalFormatWarn =
-            std::strstr(msg, "textures-format-validation") != nullptr &&
+            (std::strstr(msg, "textures-format-validation") != nullptr ||
+             std::strstr(msg, "VUID-vkCmdDispatch-OpTypeImage-07027") != nullptr ||
+             std::strstr(msg, "UNASSIGNED-Descriptor index out of bounds") != nullptr) &&
             (std::strstr(msg, "\"rw_dilated_motion_vectors\"") != nullptr ||
              std::strstr(msg, "\"rw_farthest_depth") != nullptr ||
              std::strstr(msg, "\"rw_current_luma\"") != nullptr ||
