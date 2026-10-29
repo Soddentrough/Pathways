@@ -298,6 +298,25 @@ elseif(NOT EXISTS "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" AND DEFINED ENV{USERPROFILE}
 endif()
 set(PATHWAYS_FFX_SDK_DIR "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" CACHE PATH "Path to AMD FidelityFX SDK 2.4.0+ root directory")
 
+if(NOT EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
+    set(PATHWAYS_FETCHED_FFX_SDK_DIR "${CMAKE_BINARY_DIR}/_deps/FidelityFX-SDK")
+    if(NOT EXISTS "${PATHWAYS_FETCHED_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
+        find_package(Git QUIET)
+        if(GIT_FOUND)
+            message(STATUS "Cloning mandatory AMD FidelityFX SDK v2.4.0 into ${PATHWAYS_FETCHED_FFX_SDK_DIR}...")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" clone --branch v2.4.0 --depth 1
+                        https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+                        "${PATHWAYS_FETCHED_FFX_SDK_DIR}"
+                RESULT_VARIABLE FFX_GIT_RESULT
+            )
+        endif()
+    endif()
+    if(EXISTS "${PATHWAYS_FETCHED_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
+        set(PATHWAYS_FFX_SDK_DIR "${PATHWAYS_FETCHED_FFX_SDK_DIR}" CACHE PATH "Path to AMD FidelityFX SDK 2.4.0+ root directory" FORCE)
+    endif()
+endif()
+
 if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
     message(STATUS "AMD FidelityFX SDK found at: ${PATHWAYS_FFX_SDK_DIR}")
     set(FFX_SDK_INCLUDE_DIRS
@@ -347,7 +366,7 @@ if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
         add_dependencies(pathways ffx_upscaler_fsr4_vk_linux)
     endif()
 else()
-    message(STATUS "AMD FidelityFX SDK headers not found at ${PATHWAYS_FFX_SDK_DIR} (building with native Vulkan compute fallback)")
+    message(FATAL_ERROR "AMD FidelityFX SDK 2.4.0+ is mandatory for FSR 3.1 / FSR 4.1 ML support, but was not found at ${PATHWAYS_FFX_SDK_DIR}.")
 endif()
 
 # OpenUSD (Pixar USD) Support
@@ -1031,6 +1050,15 @@ else()
     # Standard Linux FHS installation
     install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
+    if(DEFINED FFX_UPSCALER_VK_SO)
+        install(PROGRAMS "${FFX_UPSCALER_VK_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pathways)
+    endif()
+    if(DEFINED FFX_UPSCALER_FSR4_VK_SO)
+        install(PROGRAMS "${FFX_UPSCALER_FSR4_VK_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pathways)
+    endif()
+    if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll")
+        install(FILES "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways)
+    endif()
 
     foreach(SCENE_FILE ${CURATED_SCENE_FILES})
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SCENE_FILE}")

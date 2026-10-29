@@ -445,6 +445,12 @@ static std::string locatePeDll() {
     auto exePath = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec && exePath.has_parent_path()) {
         candidates.push_back(exePath.parent_path() / "amd_fidelityfx_upscaler_vk.dll");
+        candidates.push_back(exePath.parent_path() / "../share/pathways/amd_fidelityfx_upscaler_vk.dll");
+        candidates.push_back(exePath.parent_path() / "../lib64/pathways/amd_fidelityfx_upscaler_vk.dll");
+        candidates.push_back(exePath.parent_path() / "../lib/pathways/amd_fidelityfx_upscaler_vk.dll");
+        candidates.emplace_back("/usr/share/pathways/amd_fidelityfx_upscaler_vk.dll");
+        candidates.emplace_back("/usr/lib64/pathways/amd_fidelityfx_upscaler_vk.dll");
+        candidates.emplace_back("/usr/lib/pathways/amd_fidelityfx_upscaler_vk.dll");
     }
 
     for (const auto& p : candidates) {

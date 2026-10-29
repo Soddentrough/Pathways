@@ -109,6 +109,22 @@ bool FfxSdkRuntime::tryLoadModule(FfxEffectModule module, const std::vector<std:
         searchDirs.emplace_back(exePath.parent_path().string());
     }
 #endif
+#if defined(_WIN32)
+    char exeBuf[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exeBuf, MAX_PATH) > 0) {
+        std::filesystem::path exeDir = std::filesystem::path(exeBuf).parent_path();
+        if (!exeDir.empty()) {
+            searchDirs.emplace_back(exeDir.string());
+        }
+    }
+#else
+    if (!symlinkEc && exePath.has_parent_path()) {
+        searchDirs.emplace_back((exePath.parent_path() / "../lib64/pathways").string());
+        searchDirs.emplace_back((exePath.parent_path() / "../lib/pathways").string());
+    }
+    searchDirs.emplace_back("/usr/lib64/pathways");
+    searchDirs.emplace_back("/usr/lib/pathways");
+#endif
     searchDirs.emplace_back("build/bin");
     searchDirs.emplace_back(".");
 
