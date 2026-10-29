@@ -153,7 +153,11 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         plan.uboSec.spp = plan.secSpp;
         plan.uboSec.frameIndex = params.frameIndex + 1000003u;
 
-        bool enableJitter = (params.config.upscaler_mode == UpscalerMode::FSR ||
+        bool isStationaryAccum = params.config.progressive_accumulation && !params.cameraMovedLastFrame && (inOutAccumulatedSamples > 1);
+        bool isDenoisingRenderRes = (params.config.denoiser_mode == DenoiserMode::Svgf ||
+                                     params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        bool enableJitter = !isStationaryAccum && !isDenoisingRenderRes &&
+                            (params.config.upscaler_mode == UpscalerMode::FSR ||
                              params.config.upscaler_mode == UpscalerMode::Upways ||
                              params.config.upscaler_mode == UpscalerMode::Gateway ||
                              params.config.denoiser_mode == DenoiserMode::Upways ||
@@ -210,9 +214,12 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     // Launch secondary GPU concurrently for current frame
     if (!params.skipRayTracing && params.mgpu) {
         glm::vec2 jitterSec(0.0f);
-        if (params.config.upscaler_mode == UpscalerMode::FSR ||
-            params.config.upscaler_mode == UpscalerMode::Upways ||
-            params.config.upscaler_mode == UpscalerMode::Gateway) {
+        bool isDenoisingRenderRes = (params.config.denoiser_mode == DenoiserMode::Svgf ||
+                                     params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        if (!isDenoisingRenderRes &&
+            (params.config.upscaler_mode == UpscalerMode::FSR ||
+             params.config.upscaler_mode == UpscalerMode::Upways ||
+             params.config.upscaler_mode == UpscalerMode::Gateway)) {
             if (!params.config.progressive_accumulation || params.cameraMovedLastFrame || inOutAccumulatedSamples <= 1) {
                 uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
                     ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)

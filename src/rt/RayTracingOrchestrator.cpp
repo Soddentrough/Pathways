@@ -343,9 +343,6 @@ void RayTracingOrchestrator::recordRayTracing(
         // Clear per-frame ray tracing target (FP16)
         VkClearColorValue clearZero = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (frameImage) {
-            vkCmdClearColorImage(cmd, frameImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-        }
 
         bool needAccumReset = params.accumReset || !config.progressive_accumulation;
         bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::Svgf ||
@@ -356,9 +353,18 @@ void RayTracingOrchestrator::recordRayTracing(
                                   config.upscaler_mode == UpscalerMode::Gateway ||
                                   config.upways_superres ||
                                   config.gateway_superres);
-        bool isFfxDenoisingActive = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        bool keepAccumWithMl = (!config.capture_training_data_dir.empty() || params.isMultiGpu);
+        bool needFrameImage = !isDenoisingActive || keepAccumWithMl;
+        if (frameImage && needFrameImage) {
+            vkCmdClearColorImage(cmd, frameImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+        }
+
+        // uMlDiffuseImage and uMlSpecularImage already capture the full decoupled diffuse and specular
+        // radiance signals for both E-SVGF and AMD FSR Ray Regeneration compute passes; avoid redundant
+        // 4-image clear and RMW traffic unless an external 4-signal consumer is explicitly active.
+        bool isFfxDenoisingActive = false;
         if (needAccumReset || isDenoisingActive) {
-            if (needAccumReset && accumImage) {
+            if (needAccumReset && accumImage && needFrameImage) {
                 vkCmdClearColorImage(cmd, accumImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
             }
             if (mlDiffuseImage) {
@@ -397,9 +403,11 @@ void RayTracingOrchestrator::recordRayTracing(
             b.subresourceRange = clearRange;
             clearBarriers.push_back(b);
         };
-        addClearBarrier(frameImage);
-        if (needAccumReset) {
-            addClearBarrier(accumImage);
+        if (needFrameImage) {
+            addClearBarrier(frameImage);
+            if (needAccumReset) {
+                addClearBarrier(accumImage);
+            }
         }
         if (needAccumReset || isDenoisingActive) {
             addClearBarrier(mlDiffuseImage);
@@ -499,7 +507,8 @@ void RayTracingOrchestrator::recordRayTracing(
                           config.upways_superres ||
                           config.gateway_superres ||
                           !config.capture_training_data_dir.empty());
-        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (isFfxDenoisingActive ? 4u : 0u);
+        (void)needGbuffers;
+        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | ((captureMl && keepAccumWithMl) ? 2u : 0u) | (isFfxDenoisingActive ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
             causticsPipeline->recordTrace(
@@ -529,10 +538,15 @@ void RayTracingOrchestrator::recordRayTracing(
         }
 
         if (enableNrcThisFrame && m_nrcManager) {
+            m_nrcManager->setBackend(config.nrc_backend);
             uint32_t nrcW = params.isMultiGpu ? params.fullWidth : params.dispatchWidth;
             uint32_t nrcH = params.isMultiGpu ? params.fullHeight : params.dispatchHeight;
-            m_nrcManager->recordInference(cmd, nrcW, nrcH, sceneData.boundsMin, sceneData.boundsMax, 0, params.frameSlot);
-            m_nrcManager->recordTraining(cmd, params.frameIndex, sceneData.boundsMin, sceneData.boundsMax, 1e-3f, 1024);
+            m_nrcManager->recordInference(cmd, nrcW, nrcH, sceneData.boundsMin, sceneData.boundsMax,
+                                          0, params.frameSlot, wfSceneData.captureMlData);
+            float nrcLr = (!params.cameraMovedLastFrame && !params.accumReset && config.progressive_accumulation)
+                ? 2e-4f
+                : 8e-4f;
+            m_nrcManager->recordTraining(cmd, params.frameIndex, sceneData.boundsMin, sceneData.boundsMax, nrcLr, 1024);
         }
 
         if (params.isRestirActive && normalDepthImage && prevNormalDepthImage) {

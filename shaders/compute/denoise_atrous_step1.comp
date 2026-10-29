@@ -54,15 +54,15 @@ void main() {
 
     // Diffuse lobe: s = 1 cross-bilateral filter (radiance + variance)
     vec4 filteredDiffuse = atrousFilterDiffuse(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inDiffuse,
         nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
         pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
     // Specular lobe: continuous roughness-modulated dilation
-    float roughness = imageLoad(uAlbedoRoughness, coord).a;
+    float roughness = (centerLumS > 1e-4 || inSpecular.a > 1e-5) ? imageLoad(uAlbedoRoughness, coord).a : 1.0;
     vec4 filteredSpecular = atrousFilterSpecular(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inSpecular,
         nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
         roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);

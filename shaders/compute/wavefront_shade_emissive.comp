@@ -161,8 +161,10 @@ void main() {
             }
             accumRadiance += skyContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), prev.a));
+            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), prev.a));
+            }
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -249,10 +251,12 @@ void main() {
             }
             accumRadiance += emissiveContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            bool dynamicVideoBypass = (ubo.flags & (1u << 12)) != 0u;
-            float isDynamicVideo = (pc.currentBounce == 0u && dynamicVideoBypass && (mat.emissiveTex == 1u || (mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u)) ? 1.0 : prev.a;
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), isDynamicVideo));
+            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                bool dynamicVideoBypass = (ubo.flags & (1u << 12)) != 0u;
+                float isDynamicVideo = (pc.currentBounce == 0u && dynamicVideoBypass && (mat.emissiveTex == 1u || (mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u)) ? 1.0 : prev.a;
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), isDynamicVideo));
+            }
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);

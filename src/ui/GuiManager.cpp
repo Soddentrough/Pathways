@@ -640,7 +640,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Secondary Shading:  %s", config.streamline_secondary_shading ? "Streamlined (1-Sample NEE + Lambertian)" : "Full Primary Math (4-Cand RIS + GGX)");
                 ImGui::Text("Distance Clamping:  %s", config.distance_clamping ? "Scene-Scale Invariant (D_scene * 1.25)" : "Disabled (10,000m)");
             }
-            ImGui::Text("Ray Scheduling:     RDNA4 Hardware BVH Traversal (Wave32)");
+            ImGui::Text("Ray Scheduling:     %s (Wave%u)", stats.ray_accelerator_name.c_str(), stats.subgroup_size > 0 ? stats.subgroup_size : 32u);
+            ImGui::Text("ML CoopMatrix:      %s (FP8: %s, INT8: %s, FSR4 ML: %s)",
+                        stats.has_cooperative_matrix ? "SUPPORTED" : "NO",
+                        stats.has_fp8_coop_matrix ? "YES" : "NO",
+                        stats.has_int8_coop_matrix ? "YES" : "NO",
+                        stats.supports_fsr4 ? "SUPPORTED" : "FALLBACK");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
             ImGui::Text("Validation Errors:  %u", stats.validation_errors);
@@ -684,9 +689,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
             if (config.upscaler_mode == UpscalerMode::FSR) {
-                const char* fsrVerStr = (config.fsr_version == FsrVersion::Fsr5) ? "FSR 5" :
-                                        (config.fsr_version == FsrVersion::Fsr4) ? "FSR 4" :
-                                        (config.fsr_version == FsrVersion::Fsr3) ? "FSR 3.1" : "FSR (Auto)";
+                const bool hwMl = stats.supports_fsr4;
+                const char* fsrVerStr = (config.fsr_version == FsrVersion::Fsr5) ? (hwMl ? "FSR 5" : "FSR 3.1") :
+                                        (config.fsr_version == FsrVersion::Fsr4) ? (hwMl ? "FSR 4.1 ML" : "FSR 3.1") :
+                                        (config.fsr_version == FsrVersion::Fsr3) ? "FSR 3.1" :
+                                        (hwMl ? "FSR 4.1 ML (Auto)" : "FSR 3.1 (Auto)");
                 ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", fsrVerStr, config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
                 ImGui::Text("Upscaling:    Upways Neural Reconstruction (EXPERIMENTAL, %.2fx)", config.render_scale);
@@ -943,6 +950,206 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 ImGui::TreePop();
             }
+            ImGui::PopID();
+            ImGui::Separator();
+        }
+
+        // 0B. FIDELITYFX & RECONSTRUCTION QUICK BAR (TOP-LEVEL ZERO-SCROLL ACCESS)
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.34f, 0.24f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.18f, 0.46f, 0.32f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.22f, 0.56f, 0.40f, 1.0f));
+        bool ffxQuickOpen = ImGui::CollapsingHeader("UPSCALER, DENOISER & RADIANCE CACHE (QUICK ACCESS)", ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor(3);
+
+        if (ffxQuickOpen) {
+            ImGui::PushID("QuickFfxBar");
+            const float availW = ImGui::GetContentRegionAvail().x;
+            const float spacingX = ImGui::GetStyle().ItemSpacing.x;
+            const bool hwMl = stats.supports_fsr4;
+
+            // --- Row 1: Upscaler 1-Click Selector ---
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Upscaler:");
+            const float upBtnW = (availW - spacingX * 4.0f) / 5.0f;
+            auto drawQuickUpscalerBtn = [&](const char* label, bool isSelected, const char* tooltip, auto onClick) {
+                if (isSelected) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.58f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.46f, 1.0f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
+                }
+                if (ImGui::Button(label, ImVec2(upBtnW, 28.0f))) {
+                    onClick();
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered() && tooltip) {
+                    ImGui::SetTooltip("%s", tooltip);
+                }
+            };
+
+            const bool isFsr4Selected = (config.upscaler_mode == UpscalerMode::FSR) && hwMl &&
+                                        (config.fsr_version != FsrVersion::Fsr3);
+            const bool isFsr3Selected = (config.upscaler_mode == UpscalerMode::FSR) && !isFsr4Selected;
+
+            drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None,
+                "Render at full native display resolution (no upscaling).", [&]() {
+                    config.upscaler_mode = UpscalerMode::None;
+                    config.render_scale = 1.0f;
+                });
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hwMl);
+            drawQuickUpscalerBtn("FSR 4.1 ML", isFsr4Selected,
+                hwMl ? "AMD FidelityFX Super Resolution 4.1.2 (ML Cooperative Matrix Super-Resolution)."
+                     : "Requires VK_KHR_cooperative_matrix + 8-bit/FP8 Cooperative Matrix API support.", [&]() {
+                    config.upscaler_mode = UpscalerMode::FSR;
+                    config.fsr_version = FsrVersion::Fsr4;
+                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                });
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected,
+                "AMD FidelityFX Super Resolution 3.1.6 (Analytical Lanczos-2 + YCoCg Fallback Upscaler).", [&]() {
+                    config.upscaler_mode = UpscalerMode::FSR;
+                    config.fsr_version = FsrVersion::Fsr3;
+                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                });
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
+            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways,
+                "In-house Wave32 WMMA Neural U-Net + KPN Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
+                    config.upscaler_mode = UpscalerMode::Upways;
+                    config.upways_superres = true;
+                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                });
+            ImGui::SameLine();
+            drawQuickUpscalerBtn("Gateway SR", config.upscaler_mode == UpscalerMode::Gateway,
+                "In-house Hybrid E-SVGF + Quad MLP Bilateral Super-Resolution (Requires VK_KHR_cooperative_matrix).", [&]() {
+                    config.upscaler_mode = UpscalerMode::Gateway;
+                    config.gateway_superres = true;
+                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                });
+            ImGui::EndDisabled();
+
+            if (config.upscaler_mode != UpscalerMode::None) {
+                const float scaleBtnW = (availW - spacingX * 3.0f) * 0.25f;
+                auto drawScaleBtn = [&](float scaleVal, const char* lbl) {
+                    bool isCur = (std::abs(config.render_scale - scaleVal) < 0.015f);
+                    if (isCur) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.48f, 0.82f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.56f, 0.92f, 1.0f));
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
+                    }
+                    if (ImGui::Button(lbl, ImVec2(scaleBtnW, 24.0f))) {
+                        config.render_scale = scaleVal;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    ImGui::PopStyleColor(2);
+                };
+                drawScaleBtn(0.6666667f, "Quality (0.67x)");
+                ImGui::SameLine();
+                drawScaleBtn(0.5882353f, "Balanced (0.59x)");
+                ImGui::SameLine();
+                drawScaleBtn(0.5f, "Perf (0.50x)");
+                ImGui::SameLine();
+                drawScaleBtn(0.3333333f, "UltraPerf (0.33x)");
+
+                uint32_t rW = config.getRenderWidth();
+                uint32_t rH = config.getRenderHeight();
+                const char* activeUpscalerDesc =
+                    isFsr4Selected ? "AMD FSR 4.1.2 ML" :
+                    isFsr3Selected ? "AMD FSR 3.1.6 Fallback" :
+                    (config.upscaler_mode == UpscalerMode::Upways) ? "Upways Neural SR" :
+                    (config.upscaler_mode == UpscalerMode::Gateway) ? "Gateway Hybrid SR" : "Spatial SR";
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
+                                   "Active: %s  |  %ux%u -> %ux%u (%.0f%% Scale)",
+                                   activeUpscalerDesc, rW, rH, config.width, config.height, config.render_scale * 100.0f);
+            }
+
+            ImGui::Spacing();
+            // --- Row 2: Denoiser 1-Click Selector ---
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Denoiser:");
+            const float denBtnW = (availW - spacingX * 4.0f) / 5.0f;
+            auto drawQuickDenoiserBtn = [&](DenoiserMode mode, const char* label, const char* tooltip) {
+                bool isCur = (config.denoiser_mode == mode);
+                if (isCur) {
+                    ImVec4 activeBg = (mode == DenoiserMode::None)
+                        ? ImVec4(0.20f, 0.42f, 0.68f, 1.0f)
+                        : ImVec4(0.14f, 0.58f, 0.38f, 1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, activeBg);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(activeBg.x + 0.08f, activeBg.y + 0.08f, activeBg.z + 0.08f, 1.0f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
+                }
+                if (ImGui::Button(label, ImVec2(denBtnW, 28.0f))) {
+                    if (config.denoiser_mode != mode) {
+                        config.denoiser_mode = mode;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                }
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered() && tooltip) {
+                    ImGui::SetTooltip("%s", tooltip);
+                }
+            };
+
+            drawQuickDenoiserBtn(DenoiserMode::None, "Off (MC)",
+                "Unbiased pure Monte Carlo path tracing with progressive temporal accumulation.");
+            ImGui::SameLine();
+            drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen",
+                "AMD FSR Ray Regeneration 1.2.1 (Decoupled Diffuse + Specular + VMV Spatio-Temporal Denoiser).");
+            ImGui::SameLine();
+            drawQuickDenoiserBtn(DenoiserMode::Svgf, "E-SVGF",
+                "Edge-Aware Spatio-Temporal Variance-Guided Wavelet Filter (61x61 receptive field).");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
+            drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways",
+                "Recurrent Wave32 WMMA Neural U-Net + Multi-Scale KPN Reconstruction (Requires VK_KHR_cooperative_matrix).");
+            ImGui::SameLine();
+            drawQuickDenoiserBtn(DenoiserMode::Gateway, "Gateway",
+                "Hybrid E-SVGF + Wave32 WMMA Quad MLP Denoiser (Requires VK_KHR_cooperative_matrix).");
+            ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            // --- Row 3: GI & Caching 1-Click Toggle Buttons ---
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "GI & Caching:");
+            const float giBtnW = (availW - spacingX * 2.0f) / 3.0f;
+            auto drawQuickToggleBtn = [&](const char* labelOn, const char* labelOff, bool& flag, const char* tooltip) {
+                if (flag) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.58f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.46f, 1.0f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
+                }
+                if (ImGui::Button(flag ? labelOn : labelOff, ImVec2(giBtnW, 28.0f))) {
+                    flag = !flag;
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered() && tooltip) {
+                    ImGui::SetTooltip("%s", tooltip);
+                }
+            };
+
+            ImGui::BeginDisabled(!stats.has_cooperative_matrix);
+            drawQuickToggleBtn("Radiance Cache: ON", "Radiance Cache: OFF", config.enable_nrc,
+                "AMD FSR Radiance Cache 0.9.0 (Wave32 WMMA + Path-Spread Heuristic). Terminates 96.5% of bounce-2 diffuse rays into the neural cache (Requires VK_KHR_cooperative_matrix).");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            drawQuickToggleBtn("ReSTIR PT: ON", "ReSTIR PT: OFF", config.enable_restir,
+                "Path-Space Reservoir Resampling (Spatiotemporal Direct + Indirect GI Reuse).");
+            ImGui::SameLine();
+            drawQuickToggleBtn("Caustics: ON", "Caustics: OFF", config.enable_caustics,
+                "Real-time forward photon splatting for refractive caustics.");
+
             ImGui::PopID();
             ImGui::Separator();
         }
@@ -1492,16 +1699,31 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("Neural Direct-Light Caching (Wave32 WMMA, experimental):");
+            ImGui::TextDisabled("Neural Radiance Caching (AMD FSR Radiance Cache 0.9.0 / Wave32 WMMA):");
             if (ImGui::Checkbox("Enable Neural Radiance Cache", &config.enable_nrc)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Accelerates multi-bounce indirect GI using on-chip cooperative matrix MLP.");
+                ImGui::SetTooltip("Accelerates multi-bounce indirect GI using AMD FSR Radiance Cache (0.9.0) path-spread heuristic, albedo factorization, and Wave32 cooperative matrix MLP.");
             }
             if (config.enable_nrc) {
                 ImGui::Indent();
+                static const char* nrcBackendLabels[] = {
+                    "Auto (FSR Radiance Cache 0.9.0 + Wave32 WMMA)",
+                    "Native Wave32 WMMA Multi-Res Hash MLP",
+                    "AMD FSR Radiance Cache (0.9.0)"
+                };
+                int nrcBackendIdx = static_cast<int>(config.nrc_backend);
+                if (nrcBackendIdx < 0 || nrcBackendIdx >= IM_ARRAYSIZE(nrcBackendLabels)) {
+                    nrcBackendIdx = 0;
+                }
+                if (ImGui::Combo("NRC Backend", &nrcBackendIdx, nrcBackendLabels, IM_ARRAYSIZE(nrcBackendLabels))) {
+                    config.nrc_backend = static_cast<NrcBackend>(nrcBackendIdx);
+                    settingsChanged = true;
+                    if (actions) actions->resetAccumulation = true;
+                }
+
                 int nrcBounce = static_cast<int>(config.nrc_bounce);
                 if (ImGui::SliderInt("NRC Cutoff Bounce", &nrcBounce, 1, 4)) {
                     config.nrc_bounce = static_cast<uint32_t>(nrcBounce);
@@ -1587,9 +1809,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
                 "Upways (WMMA Neural + Spatiotemporal)",
-                "Gateway (Hybrid E-SVGF + Quad MLP)",
                 "E-SVGF (Spatio-Temporal Wavelet)",
-                "AMD FSR Ray Regeneration (4-Signal)"
+                "Gateway (Hybrid E-SVGF + Quad MLP)",
+                "AMD FSR Ray Regeneration (1.2.1 4-Signal)"
             };
             int denoiserIdx = static_cast<int>(config.denoiser_mode);
             if (denoiserIdx < 0 || denoiserIdx >= IM_ARRAYSIZE(denoiserModeLabels)) {
@@ -1605,17 +1827,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
                                   "- Upways: 3-Scale Recurrent WMMA Neural U-Net + multi-scale KPN.\n"
-                                  "- Gateway: 4-Pass Hybrid E-SVGF + Wave32 WMMA Quad MLP.\n"
                                   "- E-SVGF: Variance-guided spatio-temporal A-Trous wavelet filter.\n"
-                                  "- AMD FSR Ray Regeneration: 4-Signal Direct/Indirect Diffuse+Specular pipeline.");
+                                  "- Gateway: 4-Pass Hybrid E-SVGF + Wave32 WMMA Quad MLP.\n"
+                                  "- AMD FSR Ray Regeneration (1.2.1): 4-Signal Direct/Indirect Diffuse+Specular + Hit-T pipeline.");
+            }
+            if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.95f, 0.55f, 1.0f));
+                ImGui::TextWrapped("Active Denoiser: AMD FSR Ray Regeneration 1.2.1 (4-Signal Demodulated + Hit-T Contact Hardening)");
+                ImGui::PopStyleColor();
             }
 
             static const char* upscalerModeLabels[] = {
                 "None (Native Resolution)",
-                "AMD FSR (Temporal Super-Resolution)",
+                "AMD FSR (FSR 4 ML / FSR 3.1 Fallback)",
                 "Upways SR (Neural KPN Super-Resolution)",
-                "Gateway SR (Bilateral Super-Resolution)",
-                "FSR 1.0 (Spatial EASU + RCAS)"
+                "FSR 1.0 (Spatial EASU + RCAS)",
+                "Gateway SR (Bilateral Super-Resolution)"
             };
             int upscalerIdx = static_cast<int>(config.upscaler_mode);
             if (upscalerIdx < 0 || upscalerIdx >= IM_ARRAYSIZE(upscalerModeLabels)) {
@@ -1648,11 +1875,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::SameLine();
                 };
                 drawFsrVerBtn(FsrVersion::Auto, "Auto");
-                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1");
-                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4");
+                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1 (Fallback)");
+                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4 (ML)");
                 drawFsrVerBtn(FsrVersion::Fsr5, "FSR 5");
                 ImGui::NewLine();
                 ImGui::PopID();
+
+                const bool hwMl = stats.supports_fsr4;
+                const bool useFsr4 = hwMl && (config.fsr_version != FsrVersion::Fsr3);
+                ImGui::PushStyleColor(ImGuiCol_Text, useFsr4 ? ImVec4(0.3f, 0.95f, 0.55f, 1.0f) : ImVec4(0.95f, 0.80f, 0.30f, 1.0f));
+                ImGui::TextWrapped("Active Upscaler: %s",
+                                   useFsr4 ? "AMD FSR 4.1.2 (ML Cooperative Matrix Super-Resolution)"
+                                           : "AMD FSR 3.1.6 (Analytical Lanczos-2 + YCoCg Fallback)");
+                ImGui::PopStyleColor();
             }
 
             if (config.upscaler_mode != UpscalerMode::None) {
@@ -1901,7 +2136,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 config.pipeline_type = PipelineType::RTP;
                 settingsChanged = true;
             }
-            ImGui::TextDisabled("Ray Scheduling: RDNA4 Hardware BVH Traversal (Wave32)");
+            ImGui::TextDisabled("Ray Scheduling: %s (Wave%u)", stats.ray_accelerator_name.c_str(), stats.subgroup_size > 0 ? stats.subgroup_size : 32u);
 
             if (config.pipeline_type == PipelineType::Wavefront) {
                 ImGui::Spacing();

@@ -320,11 +320,22 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"dynamic_rendering\": {},\n", stats.has_dynamic_rendering ? "true" : "false")
         << std::format("      \"timeline_semaphores\": {},\n", stats.has_timeline_semaphores ? "true" : "false")
         << std::format("      \"synchronization2\": {}\n", stats.has_sync2 ? "true" : "false")
+        << "    },\n"
+        << "    \"machine_learning_and_cooperative_matrix\": {\n"
+        << std::format("      \"vk_khr_cooperative_matrix\": {},\n", stats.has_cooperative_matrix ? "true" : "false")
+        << std::format("      \"shader_int8\": {},\n", stats.has_shader_int8 ? "true" : "false")
+        << std::format("      \"vk_ext_shader_float8\": {},\n", stats.has_shader_float8 ? "true" : "false")
+        << std::format("      \"wmma_int8_coop_matrix\": {},\n", stats.has_int8_coop_matrix ? "true" : "false")
+        << std::format("      \"wmma_fp8_coop_matrix\": {},\n", stats.has_fp8_coop_matrix ? "true" : "false")
+        << std::format("      \"vk_ext_mutable_descriptor_type\": {},\n", stats.has_mutable_descriptor_type ? "true" : "false")
+        << std::format("      \"supports_fsr4_ml\": {}\n", stats.supports_fsr4 ? "true" : "false")
         << "    }\n"
         << "  },\n"
         << "  \"engine_settings\": {\n"
         << std::format("    \"pipeline_type\": \"{}\",\n", stats.pipeline_type_str)
         << std::format("    \"resolution\": [{}, {}],\n", stats.width, stats.height)
+        << std::format("    \"denoiser_mode\": \"{}\",\n", stats.denoiser_mode_str)
+        << std::format("    \"enable_nrc\": {},\n", stats.enable_nrc ? "true" : "false")
         << std::format("    \"upscaler_mode\": \"{}\",\n", stats.upscaler_mode_str)
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)

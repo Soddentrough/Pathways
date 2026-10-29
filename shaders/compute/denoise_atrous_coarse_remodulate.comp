@@ -50,8 +50,20 @@ layout(push_constant) uniform AtrousCoarseRemodulatePushConstants {
     float aspectRatio;
     float edgeThresholdLow;      // 0.35 (ramp top)
     uint  accumulatedSamples;    // Used only if ENABLE_STATIONARY_PREVIEW
-    float padding[2];
+    uint  isRayRegeneration;     // 1 = AMD FSR Ray Regeneration Compose (re-modulate specular BRDF)
+    float padding;
 } pc;
+
+// AMD FidelityFX Denoiser (Ray Regeneration 1.2.1) split-sum BRDF re-modulation factor
+vec3 ffxApproximateSpecBrdf(vec3 specAlbedo, float roughness, float NoV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4( 1.0,  0.0425,  1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * clamp(NoV, 0.0, 1.0))) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    vec3 f0 = mix(vec3(0.04), clamp(specAlbedo, vec3(0.04), vec3(1.0)), 0.5);
+    return max(f0 * AB.x + vec3(AB.y), vec3(0.05));
+}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -66,37 +78,36 @@ void main() {
     // so temporal reprojection and 61-px À-Trous filtering operate on demodulated
     // irradiance while preserving crisp high-frequency surface albedo textures).
     vec3 modulate = denoiseDemodulationFactor(albRough.rgb, nd.w);
+    vec3 specModulate = vec3(1.0);
 
-    // Wavefront uniform voting: moderate curvature waves bypass the 25 coarse
+    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
+    vec4 inSpecular = imageLoad(uInSpecular, coord);
+
+    // Wavefront uniform voting: moderate curvature or already-converged waves bypass the coarse
     // s = 8 taps and evaluate remodulation directly from converged radiance
-    bool bypassCoarseTaps = subgroupAll(effectiveRho >= pc.edgeThresholdLow);
+    bool bypassCoarseTaps = subgroupAll(effectiveRho >= pc.edgeThresholdLow || (inDiffuse.a < 1e-4 && inSpecular.a < 1e-4));
     if (bypassCoarseTaps) {
-        vec4 diff = imageLoad(uInDiffuse, coord);
-        vec4 spec = imageLoad(uInSpecular, coord);
-        vec3 L_remod = diff.rgb * modulate + spec.rgb;
+        vec3 L_remod = inDiffuse.rgb * modulate + inSpecular.rgb * specModulate;
         L_remod = clamp(L_remod, 0.0, 65000.0);
         imageStore(uFinalDenoised, coord, vec4(L_remod, 1.0));
         return;
     }
 
-    // Coarse dilated convolution (25 taps, s = 8) for smooth / flat regions
+    // Coarse dilated convolution (s = 8) for smooth / flat regions
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
-
-    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
-    vec4 inSpecular = imageLoad(uInSpecular, coord);
 
     float centerLumD = denoiseLuminance(inDiffuse.rgb);
     float centerLumS = denoiseLuminance(inSpecular.rgb);
 
     vec4 filteredDiffuse = atrousFilterDiffuse(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inDiffuse,
         nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
         pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
     float roughness = albRough.a;
     vec4 filteredSpecular = atrousFilterSpecular(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inSpecular,
         nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
         roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
@@ -108,7 +119,7 @@ void main() {
     vec4 finalSpecular = mix(filteredSpecular, inSpecular, edgeBlend);
 
     // Remodulation in-register: zero intermediate global memory writes
-    vec3 L_final = finalDiffuse.rgb * modulate + finalSpecular.rgb;
+    vec3 L_final = finalDiffuse.rgb * modulate + finalSpecular.rgb * specModulate;
 
 #ifdef ENABLE_STATIONARY_PREVIEW
     // Optional preview mode variant (strictly excluded from real-time production):

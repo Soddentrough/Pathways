@@ -275,7 +275,7 @@ if(WIN32)
 endif()
 
 if(UNIX)
-    target_link_libraries(pathways PRIVATE m)
+    target_link_libraries(pathways PRIVATE m ${CMAKE_DL_LIBS})
 endif()
 
 target_include_directories(pathways PRIVATE
@@ -288,6 +288,31 @@ target_include_directories(pathways PRIVATE
 target_compile_definitions(pathways PRIVATE
     SHADER_DIR="${SPV_OUTPUT_DIR}"
 )
+
+# AMD FidelityFX SDK 2.4.0+ Support
+set(PATHWAYS_DEFAULT_FFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../FidelityFX-SDK")
+if(NOT EXISTS "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" AND DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Development/FidelityFX-SDK")
+    set(PATHWAYS_DEFAULT_FFX_SDK_DIR "$ENV{HOME}/Development/FidelityFX-SDK")
+endif()
+set(PATHWAYS_FFX_SDK_DIR "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" CACHE PATH "Path to AMD FidelityFX SDK 2.4.0+ root directory")
+
+if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
+    message(STATUS "AMD FidelityFX SDK found at: ${PATHWAYS_FFX_SDK_DIR}")
+    set(FFX_SDK_INCLUDE_DIRS
+        "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include"
+        "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/upscalers/include"
+        "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/denoisers/include"
+        "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/radiancecache/include"
+        "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/framegeneration/include"
+    )
+    target_include_directories(pathways SYSTEM PRIVATE ${FFX_SDK_INCLUDE_DIRS})
+    target_compile_definitions(pathways PRIVATE
+        PATHWAYS_HAS_FFX_SDK=1
+        PATHWAYS_FFX_SDK_ROOT_DIR="${PATHWAYS_FFX_SDK_DIR}"
+    )
+else()
+    message(STATUS "AMD FidelityFX SDK headers not found at ${PATHWAYS_FFX_SDK_DIR} (building with native Vulkan compute fallback)")
+endif()
 
 # OpenUSD (Pixar USD) Support
 set(USD_FALLBACK_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/usd_deps")
@@ -780,6 +805,38 @@ if(UNIX)
     target_link_libraries(test_caustics_detection PRIVATE m)
 endif()
 add_test(NAME CausticsDetection COMMAND test_caustics_detection)
+
+# AMD FidelityFX SDK 2.4 Feature, Performance & Visual Assessment Test Target
+add_executable(test_fidelityfx_features
+    tests/test_fidelityfx_features.cpp
+    src/rt/FfxSdkRuntime.cpp
+    src/core/Config.cpp
+    src/core/Logger.cpp
+    src/utils/ImageDumper.cpp
+    src/vulkan/Buffer.cpp
+    src/vulkan/Image.cpp
+    src/vulkan/VulkanContext.cpp
+)
+target_include_directories(test_fidelityfx_features PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_DIR}/glm
+    ${THIRD_PARTY_DIR}/stb
+    ${THIRD_PARTY_DIR}/vma
+    ${THIRD_PARTY_DIR}/tinyexr
+)
+if(DEFINED FFX_SDK_INCLUDE_DIRS)
+    target_include_directories(test_fidelityfx_features SYSTEM PRIVATE ${FFX_SDK_INCLUDE_DIRS})
+    target_compile_definitions(test_fidelityfx_features PRIVATE
+        PATHWAYS_HAS_FFX_SDK=1
+        PATHWAYS_FFX_SDK_ROOT_DIR="${PATHWAYS_FFX_SDK_DIR}"
+    )
+endif()
+target_link_libraries(test_fidelityfx_features PRIVATE Vulkan::Vulkan Threads::Threads ZLIB::ZLIB)
+if(UNIX)
+    target_link_libraries(test_fidelityfx_features PRIVATE m ${CMAKE_DL_LIBS})
+endif()
+add_dependencies(test_fidelityfx_features pathways)
+add_test(NAME FidelityFxFeatures COMMAND test_fidelityfx_features)
 
 # OpenUSD Native Scene Ingestion Unit Test Target
 if(pxr_FOUND)

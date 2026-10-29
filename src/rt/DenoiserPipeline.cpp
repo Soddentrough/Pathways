@@ -1,5 +1,6 @@
 #include "rt/DenoiserPipeline.hpp"
 #include "rt/PostProcessPipeline.hpp"
+#include "rt/FfxSdkRuntime.hpp"
 #include "core/Logger.hpp"
 
 #include <stdexcept>
@@ -42,6 +43,7 @@ DenoiserPipeline::DenoiserPipeline(
 }
 
 DenoiserPipeline::~DenoiserPipeline() {
+    destroyFfxDenoiserContext();
     if (m_device != VK_NULL_HANDLE) {
         auto destroyPipe = [this](VkPipelineLayout layout, VkPipeline pipe, VkDescriptorSetLayout desc) {
             if (pipe) vkDestroyPipeline(m_device, pipe, nullptr);
@@ -79,11 +81,11 @@ void DenoiserPipeline::createDescriptorSetLayouts() {
         }
     };
 
-    // Pass 1: Fused temporal (Binding 0 CameraMatricesUBO + Bindings 1-18 storage images)
+    // Pass 1: Fused temporal (Binding 0 CameraMatricesUBO + Bindings 1-22 storage images)
     {
         std::vector<VkDescriptorSetLayoutBinding> bindings;
         bindings.push_back(makeImageBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER));
-        for (uint32_t b = 1; b <= 18; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+        for (uint32_t b = 1; b <= 22; ++b) bindings.push_back(makeImageBinding(b, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
         createLayout(bindings, m_fusedTemporalDescSetLayout, "fused_temporal");
     }
     // Pass 2: A-Trous s=1 (6 image bindings; uEdgeDensity intentionally omitted)
@@ -296,8 +298,58 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
         vkQueueWaitIdle(m_queue);
     }
 
-    Logger::info("DenoiserPipeline (E-SVGF) allocated 17 internal storage images ({}x{}, format {})",
+    Logger::info("DenoiserPipeline (E-SVGF / AMD FSR Ray Regeneration) allocated 17 internal storage images ({}x{}, format {})",
                  width, height, static_cast<int>(accumFormat));
+    initFfxDenoiserContext();
+}
+
+void DenoiserPipeline::initFfxDenoiserContext() {
+    destroyFfxDenoiserContext();
+    m_vramUsageBytes = static_cast<uint64_t>(m_width) * static_cast<uint64_t>(m_height) * 124ull;
+
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_width == 0 || m_height == 0) {
+        return;
+    }
+    auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, m_physDevice);
+    constexpr uint32_t kAll4Signals = FFX_DENOISER_SIGNAL_DIRECT_DIFFUSE |
+                                      FFX_DENOISER_SIGNAL_DIRECT_SPECULAR |
+                                      FFX_DENOISER_SIGNAL_INDIRECT_DIFFUSE |
+                                      FFX_DENOISER_SIGNAL_INDIRECT_SPECULAR;
+    ffx::CreateContextDescDenoiser createDenoiser{};
+    createDenoiser.version = FFX_DENOISER_VERSION;
+    createDenoiser.maxRenderSize = { m_width, m_height };
+    createDenoiser.signalFlags = kAll4Signals;
+    createDenoiser.checkerboardSignalFlags = FFX_DENOISER_SIGNAL_NONE;
+    createDenoiser.flags = 0;
+
+    ffxContext ctx = nullptr;
+    if (ffx::CreateContext(ctx, nullptr, createDenoiser, backendDesc) == ffx::ReturnCode::Ok && ctx != nullptr) {
+        m_ffxDenoiserContext = ctx;
+        FfxApiEffectMemoryUsage gpuMem{};
+        ffx::QueryDescDenoiserGetGPUMemoryUsage memQuery{};
+        memQuery.device = m_physDevice;
+        memQuery.maxRenderSize = { m_width, m_height };
+        memQuery.signalFlags = kAll4Signals;
+        memQuery.checkerboardSignalFlags = FFX_DENOISER_SIGNAL_NONE;
+        memQuery.flags = 0;
+        memQuery.gpuMemoryUsage = &gpuMem;
+        if (ffx::Query(m_ffxDenoiserContext, memQuery) == ffx::ReturnCode::Ok && gpuMem.totalUsageInBytes > 0) {
+            m_vramUsageBytes = gpuMem.totalUsageInBytes;
+        }
+    }
+#endif
+}
+
+void DenoiserPipeline::destroyFfxDenoiserContext() {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_ffxDenoiserContext != nullptr) {
+        ffx::DestroyContext(m_ffxDenoiserContext);
+        m_ffxDenoiserContext = nullptr;
+    }
+#else
+    m_ffxDenoiserContext = nullptr;
+#endif
 }
 
 void DenoiserPipeline::initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage) {
@@ -324,15 +376,23 @@ void DenoiserPipeline::updateDescriptors(
     Image* normalDepth,
     Image* albedoRoughness,
     Image* accumImage,
-    Image* specularMotion
+    Image* specularMotion,
+    Image* ffxDirectDiffuse,
+    Image* ffxDirectSpecular,
+    Image* ffxIndirectDiffuse,
+    Image* ffxIndirectSpecular
 ) {
-    // Specular VMV falls back to a 1x1 zeroed RGBA16F image when unavailable
+    // Specular VMV and optional FFX 4-signal images fall back to the 1x1 zeroed RGBA16F image when unavailable
     Image* specMotion = specularMotion ? specularMotion : m_specMotionFallback.get();
+    Image* ffxDirDiff = ffxDirectDiffuse ? ffxDirectDiffuse : m_specMotionFallback.get();
+    Image* ffxDirSpec = ffxDirectSpecular ? ffxDirectSpecular : m_specMotionFallback.get();
+    Image* ffxIndDiff = ffxIndirectDiffuse ? ffxIndirectDiffuse : m_specMotionFallback.get();
+    Image* ffxIndSpec = ffxIndirectSpecular ? ffxIndirectSpecular : m_specMotionFallback.get();
 
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorImageInfo> imgInfos;
     std::vector<VkDescriptorBufferInfo> bufInfos;
-    imgInfos.reserve(96);
+    imgInfos.reserve(112);
     bufInfos.reserve(MAX_FRAMES_IN_FLIGHT);
 
     auto addImageWrite = [&](VkDescriptorSet dstSet, uint32_t dstBinding, VkImageView view) {
@@ -359,7 +419,7 @@ void DenoiserPipeline::updateDescriptors(
     for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
         uint32_t prevSlot = 1 - slot;
 
-        // ---- Pass 1: Fused temporal (19 bindings) ----
+        // ---- Pass 1: Fused temporal (23 bindings) ----
         {
             VkDescriptorSet set = m_fusedTemporalDescSets[slot];
             addBufferWrite(set, 0, m_cameraMatricesUBO[slot]->getBuffer(), sizeof(CameraMatrices));
@@ -381,6 +441,10 @@ void DenoiserPipeline::updateDescriptors(
             addImageWrite(set, 16, m_historyLength[slot]->getImageView());
             addImageWrite(set, 17, m_edgeDensity[slot]->getImageView());
             addImageWrite(set, 18, m_historyNormalDepth[slot]->getImageView());
+            addImageWrite(set, 19, ffxDirDiff->getImageView());
+            addImageWrite(set, 20, ffxDirSpec->getImageView());
+            addImageWrite(set, 21, ffxIndDiff->getImageView());
+            addImageWrite(set, 22, ffxIndSpec->getImageView());
         }
 
         // ---- Pass 2: A-Trous s=1 (reads pre-spatial history of this slot) ----
@@ -478,7 +542,12 @@ void DenoiserPipeline::recordDenoise(
     Image* albedoRoughness,
     Image* accumImage,
     Image* specularMotion,
-    const CameraMatrices& cameraMatrices
+    const CameraMatrices& cameraMatrices,
+    DenoiserMode denoiserMode,
+    Image* ffxDirectDiffuse,
+    Image* ffxDirectSpecular,
+    Image* ffxIndirectDiffuse,
+    Image* ffxIndirectSpecular
 ) {
     if (!isInitialized() || !currentDiffuse || !currentSpecular || !motionVectors ||
         !normalDepth || !albedoRoughness) {
@@ -489,8 +558,11 @@ void DenoiserPipeline::recordDenoise(
 
     if (!m_descriptorsBound) {
         updateDescriptors(currentDiffuse, currentSpecular, motionVectors, normalDepth,
-                          albedoRoughness, accumImage, specularMotion);
+                          albedoRoughness, accumImage, specularMotion,
+                          ffxDirectDiffuse, ffxDirectSpecular, ffxIndirectDiffuse, ffxIndirectSpecular);
     }
+
+    const uint32_t isRayRegen = (denoiserMode == DenoiserMode::FfxRayRegeneration) ? 1u : 0u;
 
     // Upload per-frame camera matrices for Pass 1 (std140 binary compatible)
     m_cameraMatricesUBO[frameSlot]->copyFrom(&cameraMatrices, sizeof(CameraMatrices));
@@ -549,6 +621,7 @@ void DenoiserPipeline::recordDenoise(
         pc.depthThreshold = 0.08f;
         pc.dynamicDepthThreshold = 0.15f;
         pc.mvDiscrepancyThreshold = 2.0f;
+        pc.isRayRegeneration = isRayRegen;
         vkCmdPushConstants(cmd, m_fusedTemporalPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(FusedTemporalPushConstants), &pc);
 
@@ -659,6 +732,7 @@ void DenoiserPipeline::recordDenoise(
         pc.aspectRatio = cameraMatrices.aspectRatio;
         pc.edgeThresholdLow = 0.35f;
         pc.accumulatedSamples = accumulatedSamples;
+        pc.isRayRegeneration = isRayRegen;
         vkCmdPushConstants(cmd, m_coarseRemodulatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(AtrousCoarseRemodulatePushConstants), &pc);
 

@@ -1,6 +1,8 @@
 #include "rt/FsrUpscaler.hpp"
+#include "rt/FfxSdkRuntime.hpp"
 #include "core/Logger.hpp"
 
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -30,19 +32,27 @@ FsrUpscaler::FsrUpscaler(
     m_targetVersion(targetVersion),
     m_instanceName(instanceName)
 {
-    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Version: {}",
+    probeHardwareCapabilities();
+    resolveActiveVersion();
+
+    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Target: {}, Active: {} (HW ML CoopMatrix: {})",
                  m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
-                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion));
+                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion),
+                 getActiveVersionName(), m_hwMlSupported ? "YES" : "NO");
 
     initImages();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     createPipelines(upscaleSpv, rcasSpv);
+    initFfxSdkContext();
 
-    Logger::info("FsrUpscaler [{}] successfully initialized.", m_instanceName);
+    Logger::info("FsrUpscaler [{}] successfully initialized ({}, VRAM: {:.2f} MB).",
+                 m_instanceName, getActiveVersionName(),
+                 static_cast<double>(m_vramUsageBytes) / (1024.0 * 1024.0));
 }
 
 FsrUpscaler::~FsrUpscaler() {
+    destroyFfxSdkContext();
     if (m_device != VK_NULL_HANDLE) {
         if (m_upscalePipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_device, m_upscalePipeline, nullptr);
@@ -73,6 +83,123 @@ FsrUpscaler::~FsrUpscaler() {
             m_descPool = VK_NULL_HANDLE;
         }
     }
+}
+
+void FsrUpscaler::probeHardwareCapabilities() {
+    m_hwMlSupported = FfxSdkRuntime::supportsHardwareMl(m_physDevice);
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_hwMlSupported) {
+        auto versions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, m_physDevice);
+        if (!versions.empty()) {
+            bool foundFsr4 = false;
+            for (const auto& v : versions) {
+                const uint64_t majorVer = ((v.versionId >> 32) & 0xFFFFu);
+                const uint64_t legacyMajorVer = (v.versionId >> 48);
+                if (majorVer >= 4u || legacyMajorVer >= 4u) {
+                    foundFsr4 = true;
+                    break;
+                }
+            }
+            m_hwMlSupported = foundFsr4;
+        }
+    }
+#endif
+}
+
+void FsrUpscaler::resolveActiveVersion() {
+    FsrVersion prevActive = m_activeVersion;
+    if (m_targetVersion == FsrVersion::Fsr3) {
+        m_activeVersion = FsrVersion::Fsr3;
+    } else if (m_targetVersion == FsrVersion::Auto ||
+               m_targetVersion == FsrVersion::Fsr4 ||
+               m_targetVersion == FsrVersion::Fsr5) {
+        if (m_hwMlSupported) {
+            m_activeVersion = FsrVersion::Fsr4;
+        } else {
+            m_activeVersion = FsrVersion::Fsr3;
+            if (m_targetVersion != FsrVersion::Auto) {
+                Logger::warn("FsrUpscaler [{}]: Hardware lacks Cooperative Matrix ML acceleration; falling back to FSR 3.1.6.",
+                             m_instanceName);
+            }
+        }
+    }
+    if (prevActive != m_activeVersion) {
+        m_historyValid = false;
+    }
+}
+
+void FsrUpscaler::setTargetVersion(FsrVersion version) {
+    if (m_targetVersion == version) {
+        return;
+    }
+    m_targetVersion = version;
+    FsrVersion prevActive = m_activeVersion;
+    resolveActiveVersion();
+    if (prevActive != m_activeVersion) {
+        initFfxSdkContext();
+        Logger::info("FsrUpscaler [{}] switched active version to: {}", m_instanceName, getActiveVersionName());
+    }
+}
+
+const char* FsrUpscaler::getActiveVersionName() const {
+    if (m_activeVersion == FsrVersion::Fsr4) {
+        return "AMD FSR 4.1.2 (ML Super-Resolution)";
+    }
+    return "AMD FSR 3.1.6 (Analytical Fallback)";
+}
+
+void FsrUpscaler::initFfxSdkContext() {
+    destroyFfxSdkContext();
+
+    // Calculate baseline VRAM footprint from internal RGBA16F history + upscaled + sharpened targets (8 bytes/pixel * 4 targets)
+    m_vramUsageBytes = static_cast<uint64_t>(m_displayWidth) * static_cast<uint64_t>(m_displayHeight) * 8ull * 4ull;
+
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, m_physDevice);
+
+    ffx::QueryDescUpscaleGetResourceRequirements reqQuery{};
+    reqQuery.header.pNext = &backendDesc.header;
+    if (ffx::Query(reqQuery) == ffx::ReturnCode::Ok) {
+        m_requiredFfxResources = reqQuery.required_resources;
+    }
+
+    ffx::CreateContextDescUpscale createUpscale{};
+    createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+    createUpscale.maxRenderSize = { m_renderWidth, m_renderHeight };
+    createUpscale.maxUpscaleSize = { m_displayWidth, m_displayHeight };
+    createUpscale.fpMessage = nullptr;
+
+    ffx::CreateContextDescOverrideVersion versionOpt{};
+    versionOpt.versionId = (m_activeVersion == FsrVersion::Fsr4)
+        ? 0x000400010002ull  // FSR 4.1.2 ML Upscaler
+        : 0x000300010006ull; // FSR 3.1.6 Analytical Fallback
+
+    ffxContext ctx = nullptr;
+    if (ffx::CreateContext(ctx, nullptr, createUpscale, backendDesc, versionOpt) == ffx::ReturnCode::Ok && ctx != nullptr) {
+        m_ffxContext = ctx;
+        FfxApiEffectMemoryUsage gpuMem{};
+        ffx::QueryDescUpscaleGetGPUMemoryUsageV2 memQuery{};
+        memQuery.device = m_physDevice;
+        memQuery.maxRenderSize = { m_renderWidth, m_renderHeight };
+        memQuery.maxUpscaleSize = { m_displayWidth, m_displayHeight };
+        memQuery.flags = createUpscale.flags;
+        memQuery.gpuMemoryUsageUpscaler = &gpuMem;
+        if (ffx::Query(m_ffxContext, memQuery, versionOpt) == ffx::ReturnCode::Ok && gpuMem.totalUsageInBytes > 0) {
+            m_vramUsageBytes = gpuMem.totalUsageInBytes;
+        }
+    }
+#endif
+}
+
+void FsrUpscaler::destroyFfxSdkContext() {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_ffxContext != nullptr) {
+        ffx::DestroyContext(m_ffxContext);
+        m_ffxContext = nullptr;
+    }
+#else
+    m_ffxContext = nullptr;
+#endif
 }
 
 void FsrUpscaler::initImages() {
@@ -395,8 +522,9 @@ void FsrUpscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, 
     m_displayHeight = displayH;
 
     initImages();
-    Logger::info("FsrUpscaler resized: Render {}x{}, Display {}x{}",
-                 m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight);
+    initFfxSdkContext();
+    Logger::info("FsrUpscaler resized: Render {}x{}, Display {}x{} ({})",
+                 m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight, getActiveVersionName());
 }
 
 void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
@@ -457,6 +585,7 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
     upscalePC.resetHistory = (desc.resetHistory || !m_historyValid) ? 1u : 0u;
     upscalePC.cameraMoved = desc.cameraMoved ? 1u : 0u;
     upscalePC.isInputNormalized = desc.inputIsNormalized ? 1u : 0u;
+    upscalePC.fsrVersion = (m_activeVersion == FsrVersion::Fsr4) ? 4u : 3u;
 
     vkCmdPushConstants(desc.cmd, m_upscalePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upscalePC), &upscalePC);
 

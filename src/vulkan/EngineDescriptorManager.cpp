@@ -333,9 +333,10 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
     }
 
     if (params.nrcManager) {
+        VkImageView mlDiffView = params.mlDiffuseImage ? params.mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
         for (uint32_t slot = 0; slot < 2; ++slot) {
             if (params.frameImages[slot]) {
-                params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView());
+                params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView(), mlDiffView);
             }
         }
     }

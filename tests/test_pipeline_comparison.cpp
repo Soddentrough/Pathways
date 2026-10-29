@@ -270,6 +270,8 @@ int main() {
         check_true(content.find("primary_rays") != std::string::npos, "JSON contains primary_rays");
         check_true(content.find("rays_left") != std::string::npos, "JSON contains rays_left");
         check_true(content.find("std_dev_frame_time_ms") != std::string::npos, "JSON contains std_dev_frame_time_ms");
+        check_true(content.find("machine_learning_and_cooperative_matrix") != std::string::npos, "JSON contains machine_learning_and_cooperative_matrix");
+        check_true(content.find("supports_fsr4_ml") != std::string::npos, "JSON contains supports_fsr4_ml");
 
         // Clean up test file
         std::filesystem::remove(testJsonPath, ec);

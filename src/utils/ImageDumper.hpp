@@ -84,12 +84,20 @@ struct FrameStats {
     bool has_dynamic_rendering = false;
     bool has_timeline_semaphores = false;
     bool has_sync2 = false;
+    bool has_cooperative_matrix = false;
+    bool has_shader_int8 = false;
+    bool has_shader_float8 = false;
+    bool has_int8_coop_matrix = false;
+    bool has_fp8_coop_matrix = false;
+    bool has_mutable_descriptor_type = false;
+    bool supports_fsr4 = false;
 
     // Engine Settings & Configuration
     std::string pipeline_type_str = "rtp";
     uint32_t width = 0;
     uint32_t height = 0;
     std::string denoiser_mode_str = "None";
+    bool enable_nrc = false;
     std::string upscaler_mode_str = "None";
     float render_scale = 1.0f;
     uint32_t spp = 0;

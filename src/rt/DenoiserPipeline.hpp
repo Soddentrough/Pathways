@@ -74,7 +74,8 @@ public:
         float    depthThreshold;            // Default: 0.08f (static geometry)
         float    dynamicDepthThreshold;     // Default: 0.15f (dynamic objects)
         float    mvDiscrepancyThreshold;    // Default: 2.00f
-        float    _pad[3];
+        uint32_t isRayRegeneration;         // 1 = AMD FSR Ray Regeneration 1.2.1 (4-Signal + HitT)
+        float    _pad[2];
     };
     static_assert(sizeof(FusedTemporalPushConstants) == 80, "FusedTemporalPushConstants must be 80 bytes");
 
@@ -103,7 +104,8 @@ public:
         float    aspectRatio;
         float    edgeThresholdLow;       // Default: 0.35f (ramp top)
         uint32_t accumulatedSamples;     // Used only if ENABLE_STATIONARY_PREVIEW
-        float    padding[2];
+        uint32_t isRayRegeneration;      // 1 = AMD FSR Ray Regeneration 1.2.1 Compose
+        float    padding;
     };
     static_assert(sizeof(AtrousCoarseRemodulatePushConstants) == 48, "AtrousCoarseRemodulatePushConstants must be 48 bytes");
 
@@ -135,7 +137,12 @@ public:
         Image* albedoRoughness,
         Image* accumImage,
         Image* specularMotion,
-        const CameraMatrices& cameraMatrices
+        const CameraMatrices& cameraMatrices,
+        DenoiserMode denoiserMode = DenoiserMode::Svgf,
+        Image* ffxDirectDiffuse = nullptr,
+        Image* ffxDirectSpecular = nullptr,
+        Image* ffxIndirectDiffuse = nullptr,
+        Image* ffxIndirectSpecular = nullptr
     );
 
     void initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage);
@@ -146,6 +153,8 @@ public:
     [[nodiscard]] bool isInitialized() const { return m_width > 0 && m_height > 0 && m_denoisedImage != nullptr; }
     [[nodiscard]] uint32_t getWidth() const { return m_width; }
     [[nodiscard]] uint32_t getHeight() const { return m_height; }
+    [[nodiscard]] bool isUsingSdkProvider() const { return m_ffxDenoiserContext != nullptr; }
+    [[nodiscard]] uint64_t getVramUsageBytes() const { return m_vramUsageBytes; }
 
     // Per-pass GPU timestamps (ms) collected asynchronously from the internal
     // 20-query pool (10 queries x 2 frames in flight, indexed frameSlot * 10).
@@ -154,6 +163,8 @@ public:
     void collectQueryResults();
 
 private:
+    void initFfxDenoiserContext();
+    void destroyFfxDenoiserContext();
     void initPipelines();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
@@ -164,7 +175,11 @@ private:
         Image* normalDepth,
         Image* albedoRoughness,
         Image* accumImage,
-        Image* specularMotion
+        Image* specularMotion,
+        Image* ffxDirectDiffuse = nullptr,
+        Image* ffxDirectSpecular = nullptr,
+        Image* ffxIndirectDiffuse = nullptr,
+        Image* ffxIndirectSpecular = nullptr
     );
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotQueriesRecorded = { false, false };
 
@@ -232,6 +247,8 @@ private:
     std::array<float, NUM_PASSES> m_passTimingsMs = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
     bool m_descriptorsBound = false;
+    void* m_ffxDenoiserContext = nullptr;
+    uint64_t m_vramUsageBytes = 0;
 };
 
 } // namespace pathways

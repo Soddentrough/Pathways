@@ -30,6 +30,7 @@ struct FsrUpscalePushConstants {
     uint32_t resetHistory;
     uint32_t cameraMoved;
     uint32_t isInputNormalized;
+    uint32_t fsrVersion;
 };
 
 struct FsrRcasPushConstants {
@@ -71,7 +72,12 @@ public:
     bool isTemporal() const override { return true; }
 
     FsrVersion getTargetVersion() const { return m_targetVersion; }
-    void setTargetVersion(FsrVersion version) { m_targetVersion = version; }
+    void setTargetVersion(FsrVersion version);
+    FsrVersion getActiveVersion() const { return m_activeVersion; }
+    bool isHardwareMlSupported() const { return m_hwMlSupported; }
+    bool isUsingSdkProvider() const { return m_ffxContext != nullptr; }
+    const char* getActiveVersionName() const;
+    uint64_t getVramUsageBytes() const { return m_vramUsageBytes; }
 
     Image* getOutputImage() const { return m_sharpenedImage.get(); }
     Image* getUpscaledIntermediateImage() const { return m_upscaledImage.get(); }
@@ -81,6 +87,10 @@ public:
     uint32_t getDisplayHeight() const { return m_displayHeight; }
 
 private:
+    void probeHardwareCapabilities();
+    void resolveActiveVersion();
+    void initFfxSdkContext();
+    void destroyFfxSdkContext();
     void initImages();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
@@ -97,6 +107,11 @@ private:
     uint32_t m_displayHeight = 0;
     VkFormat m_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     FsrVersion m_targetVersion = FsrVersion::Auto;
+    FsrVersion m_activeVersion = FsrVersion::Fsr4;
+    bool m_hwMlSupported = false;
+    void* m_ffxContext = nullptr;
+    uint64_t m_vramUsageBytes = 0;
+    uint64_t m_requiredFfxResources = 0;
 
     std::unique_ptr<Image> m_upscaledImage;
     std::unique_ptr<Image> m_sharpenedImage;

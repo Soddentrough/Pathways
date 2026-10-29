@@ -50,34 +50,33 @@ void main() {
 
     // Effective spatial density (history-modulated) from Channel G
     float effectiveRho = imageLoad(uEdgeDensity, coord).g;
+    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
+    vec4 inSpecular = imageLoad(uInSpecular, coord);
 
-    // 1. Fast wavefront early-exit: coherent 32-lane wave in dense edges skips
-    //    all 25 mid-scale taps and passes through already-converged radiance
-    if (subgroupAll(effectiveRho >= 0.55)) {
-        imageStore(uOutDiffuse, coord, imageLoad(uInDiffuse, coord));
-        imageStore(uOutSpecular, coord, imageLoad(uInSpecular, coord));
+    // 1. Fast wavefront early-exit: coherent 32-lane wave in dense edges or already-converged
+    //    low-variance surfaces skips mid-scale taps and passes through radiance
+    if (subgroupAll(effectiveRho >= 0.55 || (inDiffuse.a < 1e-4 && inSpecular.a < 1e-4))) {
+        imageStore(uOutDiffuse, coord, inDiffuse);
+        imageStore(uOutSpecular, coord, inSpecular);
         return;
     }
 
-    // 2. Spatial convolution across divergent / flat wavefronts (25 taps, s = 4)
+    // 2. Spatial convolution across divergent / flat wavefronts (s = 4)
     vec4 nd = imageLoad(uNormalDepth, coord);
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
-
-    vec4 inDiffuse = imageLoad(uInDiffuse, coord);
-    vec4 inSpecular = imageLoad(uInSpecular, coord);
 
     float centerLumD = denoiseLuminance(inDiffuse.rgb);
     float centerLumS = denoiseLuminance(inSpecular.rgb);
 
     vec4 filteredDiffuse = atrousFilterDiffuse(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inDiffuse,
         nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
         pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
-    float roughness = imageLoad(uAlbedoRoughness, coord).a;
+    float roughness = (centerLumS > 1e-4 || inSpecular.a > 1e-5) ? imageLoad(uAlbedoRoughness, coord).a : 1.0;
     vec4 filteredSpecular = atrousFilterSpecular(
-        coord, pc.stepSize,
+        coord, pc.stepSize, inSpecular,
         nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
         roughness, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);

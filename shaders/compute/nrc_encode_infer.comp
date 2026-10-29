@@ -49,8 +49,8 @@ void main() {
 
     uint tid = gl_LocalInvocationIndex;
 
-    // 1. Initialize shared memory feature vector for 16 queries
-    for (uint i = tid; i < 16u * 64u; i += 32u) {
+    // 1. Initialize shared memory feature vector for 16 queries (channels 32..47 padded with 0; 48..63 skipped in Layer 0)
+    for (uint i = tid; i < 16u * 48u; i += 32u) {
         s_layer0[i] = float16_t(0.0);
     }
     if (tid < 16u) {
@@ -105,13 +105,13 @@ void main() {
     barrier();
 
     // ==========================================
-    // 3. LAYER 0: 64 -> 64 WMMA
+    // 3. LAYER 0: 34 (padded to 48) -> 64 WMMA
     // ==========================================
     for (uint col = 0u; col < 4u; ++col) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
         c0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
-        for (uint k = 0u; k < 4u; ++k) {
+        for (uint k = 0u; k < 3u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
             coopMatLoad(aTile, s_layer0, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
 

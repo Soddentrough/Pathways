@@ -858,7 +858,7 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
-            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
@@ -888,7 +888,7 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
                 cfg.gateway_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Gateway;
-            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
@@ -983,6 +983,10 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.denoiser_mode = DenoiserMode::Svgf;
             continue;
         }
+        if (arg == "--ray-regeneration" || arg == "--ffx-denoiser" || arg == "--fsr-ray-regeneration") {
+            cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
+            continue;
+        }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
             applyScaler(cfg, "upways");
             continue;
@@ -1005,6 +1009,24 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--fsr5") {
             applyScaler(cfg, "fsr5");
+            continue;
+        }
+        if (arg == "--fsr-version" && i + 1 < argc) {
+            std::string v = argv[++i];
+            std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+            if (v == "3" || v == "3.1" || v == "fsr3") cfg.fsr_version = FsrVersion::Fsr3;
+            else if (v == "4" || v == "4.1" || v == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
+            else if (v == "5" || v == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
+            else cfg.fsr_version = FsrVersion::Auto;
+            continue;
+        }
+        if (arg.starts_with("--fsr-version=")) {
+            std::string v = arg.substr(arg.find('=') + 1);
+            std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+            if (v == "3" || v == "3.1" || v == "fsr3") cfg.fsr_version = FsrVersion::Fsr3;
+            else if (v == "4" || v == "4.1" || v == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
+            else if (v == "5" || v == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
+            else cfg.fsr_version = FsrVersion::Auto;
             continue;
         }
         if (arg == "--upscaler-sharpening") {
@@ -1048,8 +1070,51 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.enable_light_tree = false;
             continue;
         }
-        if (arg == "--nrc") {
+        if (arg == "--nrc" || arg == "--radiance-cache") {
             cfg.enable_nrc = true;
+            continue;
+        }
+        if (arg == "--render-scale" && i + 1 < argc) {
+            cfg.render_scale = std::clamp(std::stof(argv[++i]), 0.25f, 1.0f);
+            cfg.render_width = 0;
+            cfg.render_height = 0;
+            continue;
+        }
+        if (arg.starts_with("--render-scale=")) {
+            cfg.render_scale = std::clamp(std::stof(arg.substr(arg.find('=') + 1)), 0.25f, 1.0f);
+            cfg.render_width = 0;
+            cfg.render_height = 0;
+            continue;
+        }
+        if (arg == "--ffx-radiance-cache" || arg == "--fsr-radiance-cache") {
+            cfg.enable_nrc = true;
+            cfg.nrc_backend = NrcBackend::FfxRadianceCache;
+            continue;
+        }
+        if ((arg == "--nrc-backend" || arg == "--radiance-cache-backend") && i + 1 < argc) {
+            std::string b = argv[++i];
+            std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+            cfg.enable_nrc = true;
+            if (b == "ffx" || b == "fsr" || b == "fidelityfx") {
+                cfg.nrc_backend = NrcBackend::FfxRadianceCache;
+            } else if (b == "native" || b == "wave32" || b == "wmma") {
+                cfg.nrc_backend = NrcBackend::NativeWave32;
+            } else {
+                cfg.nrc_backend = NrcBackend::Auto;
+            }
+            continue;
+        }
+        if (arg.starts_with("--nrc-backend=") || arg.starts_with("--radiance-cache-backend=")) {
+            std::string b = arg.substr(arg.find('=') + 1);
+            std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+            cfg.enable_nrc = true;
+            if (b == "ffx" || b == "fsr" || b == "fidelityfx") {
+                cfg.nrc_backend = NrcBackend::FfxRadianceCache;
+            } else if (b == "native" || b == "wave32" || b == "wmma") {
+                cfg.nrc_backend = NrcBackend::NativeWave32;
+            } else {
+                cfg.nrc_backend = NrcBackend::Auto;
+            }
             continue;
         }
         if (arg == "--nrc-bounce" && i + 1 < argc) {
@@ -1648,7 +1713,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.max_dynamic_bounces = static_cast<uint32_t>(std::stoul(argv[++i]));
             continue;
         }
-        if (arg == "--no-accumulation" || arg == "--realtime") {
+        if (arg == "--no-accumulation" || arg == "--no-accum" || arg == "--realtime") {
             cfg.progressive_accumulation = false;
             continue;
         }

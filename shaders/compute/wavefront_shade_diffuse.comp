@@ -219,8 +219,10 @@ void main() {
                 skyContrib = clampIndirectRadiance(skyContrib, effClamp);
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+            }
             bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0);
             if (enableRestirPT && bounce == 0u) {
                 currentReservoirs[pixelIndex] = invalidDiReservoir();
@@ -388,8 +390,10 @@ void main() {
                     emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
                 }
                 ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pCoord);
-                imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                    vec4 prev = imageLoad(uAccumImage, pCoord);
+                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                }
                 if (pc.captureMlData != 0u) {
                     if (isSpecularPath) {
                         vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
@@ -462,8 +466,10 @@ void main() {
                         if (bounce > 0u) {
                             causticRad = clampIndirectRadiance(causticRad, pc.indirectClamp);
                         }
-                        vec4 prev = imageLoad(uAccumImage, pCoord);
-                        imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, causticRad, seed), prev.a));
+                        if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                            vec4 prev = imageLoad(uAccumImage, pCoord);
+                            imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, causticRad, seed), prev.a));
+                        }
                         causticApplied = true;
                         if (pc.captureMlData != 0u) {
                             if (isSpecularPath) {
@@ -488,6 +494,41 @@ void main() {
 #endif
             StdBsdf bsdf = makeStdBsdf(vec3(diffuseColor), vec3(F0), alphaRoughness, diffTrans, metallic,
                                        dot(hitNormal, V), bsdfMode);
+
+            // AMD FSR Radiance Cache (0.9.0) Early Path-Spread Termination Check:
+            // Evaluate BEFORE NEE at secondary bounces (`bounce >= nrcBounce`) so that the 96.5% inference
+            // paths terminate immediately without tracing bounce-2 NEE shadow rays or double-counting bounce-2 light,
+            // while only the 3.5% training paths (`nrcTrainThisPath`) evaluate NEE to record ground-truth targets.
+            bool nrcTrainThisPath = false;
+            vec3 nrcSurfReflectance = max(vec3(diffuseColor) + vec3(F0), vec3(0.05));
+            float nrcRoughness = max(roughness, 0.20);
+            if (!pathTerminated && !isDelta && enableIndirect && (bounce + 1u < pc.maxBounces) &&
+                pc.enableNrc == 1u && bounce >= pc.nrcBounce && roughness >= 0.20 && metallic < 0.9 && hitT > 0.05) {
+                float prevPdf = (inPdfCode > 0u) ? exp2(float(inPdfCode) * (1.0 / 64.0) - 20.0) : 0.318309886;
+                float cosThetaIn = max(abs(dot(hitNormal, V)), 0.05);
+                float pathSpreadSq = (hitT * hitT) / max(prevPdf * cosThetaIn, 1e-3);
+                float camDistSq = max(dot(hitPoint - ubo.position.xyz, hitPoint - ubo.position.xyz), 0.01);
+                float pixelSolidAngle = 4.0 * abs(ubo.projInverse[1][1] * ubo.projInverse[1][1]) / max(float(pc.width * pc.height), 1.0);
+                bool spreadSufficient = (bounce > pc.nrcBounce) || (roughness >= 0.35) || (pathSpreadSq >= camDistSq * pixelSolidAngle * 16.0);
+                if (spreadSufficient) {
+                    if (randFloat(seed) < pc.nrcTrainRatio) {
+                        nrcTrainThisPath = true;
+                    } else {
+                        uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
+                        if (qIdx < pc.maxQueueCapacity) {
+                            if ((qIdx & 15u) == 0u) {
+                                atomicMax(nrcCounters.dispatchX, (qIdx >> 4u) + 1u);
+                            }
+                            nrcQueries[qIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
+                            nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
+                            nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                            nrcQueries[qIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
+                            nrcQueries[qIdx].throughput = vec4(vec3(throughput) * nrcSurfReflectance, 0.0);
+                            pathTerminated = true;
+                        }
+                    }
+                }
+            }
 
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Pure Lambertian Diffuse) ---
@@ -988,8 +1029,10 @@ void main() {
 #if ENABLE_INLINE_SHADOWS
                                     if (inlineShadowExecuted) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                        if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                        }
                                         if (pc.captureMlData != 0u) {
                                             f16vec3 diffUnshadowed = throughput * diffBrdf * f16vec3(directLightRadiance);
                                             f16vec3 specUnshadowed = throughput * specBrdf * f16vec3(directLightRadiance);
@@ -1002,12 +1045,16 @@ void main() {
                                                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
                                                 accumFfxSignal(pixelCoord, vec3(unshadowed), true, bounce == 0u, seed);
                                             } else {
-                                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), prevDiff.a));
-                                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), prevSpec.a));
-                                                accumFfxSignal(pixelCoord, vec3(diffUnshadowed), false, bounce == 0u, seed);
-                                                accumFfxSignal(pixelCoord, vec3(specUnshadowed), true, bounce == 0u, seed);
+                                                if (dot(vec3(diffUnshadowed), vec3(diffUnshadowed)) > 1e-10) {
+                                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), prevDiff.a));
+                                                    accumFfxSignal(pixelCoord, vec3(diffUnshadowed), false, bounce == 0u, seed);
+                                                }
+                                                if (dot(vec3(specUnshadowed), vec3(specUnshadowed)) > 1e-10) {
+                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), prevSpec.a));
+                                                    accumFfxSignal(pixelCoord, vec3(specUnshadowed), true, bounce == 0u, seed);
+                                                }
                                             }
                                         }
                                     } else
@@ -1019,8 +1066,10 @@ void main() {
                                     }
                                 } else {
                                     ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                    vec4 prev = imageLoad(uAccumImage, pCoord);
-                                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                    if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                                        vec4 prev = imageLoad(uAccumImage, pCoord);
+                                        imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                                    }
                                 }
                             }
                         }
@@ -1049,8 +1098,10 @@ void main() {
                 vec3 ambientRad = vec3(throughput) * vec3(diffuseColor) * skyHemisphere * 0.22;
 
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, ambientRad, seed), prev.a));
+                if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, ambientRad, seed), prev.a));
+                }
                 if (pc.captureMlData != 0u) {
                     if (isSpecularPath) {
                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -1068,46 +1119,28 @@ void main() {
             if (!pathTerminated) {
                 if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
                     pathTerminated = true;
-                } else if (pc.enableNrc == 1u && bounce >= pc.nrcBounce && roughness >= 0.20 && metallic < 0.9 && hitT > 0.05) {
-                    vec3 surfReflectance = max(vec3(diffuseColor) + vec3(F0), vec3(0.05));
-                    float nrcRoughness = max(roughness, 0.20);
-                    bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
-                    if (isTrain) {
-                        uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
-                        if (trainIdx < pc.maxQueueCapacity) {
-                            vec3 targetRad = vec3(secDirectL);
+                } else if (nrcTrainThisPath) {
+                    uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
+                    if (trainIdx < pc.maxQueueCapacity) {
+                        vec3 targetRad = vec3(secDirectL);
 #if ENABLE_INLINE_SHADOWS
-                            if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
-                                vec3 sOrigin = shadowCandidate.originDist.xyz;
-                                float sDist = shadowCandidate.originDist.w;
-                                vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
-                                bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
-                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                if (occluded) {
-                                    targetRad = vec3(0.0);
-                                }
+                        if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
+                            vec3 sOrigin = shadowCandidate.originDist.xyz;
+                            float sDist = shadowCandidate.originDist.w;
+                            vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
+                            bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
+                                                                 (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                            if (occluded) {
+                                targetRad = vec3(0.0);
                             }
+                        }
 #endif
-                            nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
-                            nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
-                            nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
-                            nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput) * surfReflectance, 0.0);
-                            nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad / surfReflectance, 0.0);
-                        }
-                    } else {
-                        uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
-                        if (qIdx < pc.maxQueueCapacity) {
-                            nrcQueries[qIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
-                            nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
-                            nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcQueries[qIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
-                            nrcQueries[qIdx].throughput = vec4(vec3(throughput) * surfReflectance, 0.0);
-                            pathTerminated = true;
-                        } else {
-                            // Queue capacity exceeded: do NOT drop ray silently (CRIT-04). Continue standard bounce.
-                            pathTerminated = false;
-                        }
+                        nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
+                        nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
+                        nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                        nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(diffuseColor), 0.0);
+                        nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput) * nrcSurfReflectance, 0.0);
+                        nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad / nrcSurfReflectance, 0.0);
                     }
                 }
 
@@ -1161,7 +1194,7 @@ void main() {
                                 ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 2u))
                                 : sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot);
 #else
-                            nextDirection = (pc.secondarySortMode >= 2u && pc.captureMlData == 0u)
+                            nextDirection = (pc.secondarySortMode >= 2u)
                                 ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
                                 : sampleCosineHemisphere(lobeN, seed);
 #endif

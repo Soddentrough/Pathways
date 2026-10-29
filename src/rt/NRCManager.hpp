@@ -50,13 +50,13 @@ public:
     NRCManager& operator=(const NRCManager&) = delete;
 
     void resize(uint32_t width, uint32_t height);
-    void updateDescriptors(VkImageView accumImageView);
-    void updateDescriptors(uint32_t slot, VkImageView accumImageView);
+    void updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE);
+    void updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE);
 
     void resetCounters(VkCommandBuffer cmd);
     void recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                          glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride = 0,
-                         uint32_t frameSlot = 0);
+                         uint32_t frameSlot = 0, uint32_t captureMlData = 0);
     void recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
                         glm::vec3 worldMin, glm::vec3 worldMax, float learningRate = 1e-3f,
                         uint32_t batchSize = 8192);
@@ -71,8 +71,14 @@ public:
     uint32_t getMaxTrainRecords() const { return m_maxTrainRecords; }
 
     bool isInitialized() const { return m_initialized; }
+    NrcBackend getBackend() const { return m_backend; }
+    void setBackend(NrcBackend backend);
+    bool isUsingSdkProvider() const { return m_ffxRcContext != nullptr; }
+    const char* getActiveBackendName() const;
 
 private:
+    void initFfxRadianceCacheContext();
+    void destroyFfxRadianceCacheContext();
     void initBuffers();
     void initWeights();
     void createDescriptorSetLayouts();
@@ -87,6 +93,10 @@ private:
     uint32_t m_maxQueries = 0;
     uint32_t m_maxTrainRecords = 0;
     bool m_initialized = false;
+    bool m_needsGpuInit = true;
+    NrcBackend m_backend = NrcBackend::Auto;
+    void* m_ffxRcContext = nullptr;
+    std::vector<uint16_t> m_initialWeights;
 
     // GPU Buffers
     std::unique_ptr<Buffer> m_weights;

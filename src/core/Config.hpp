@@ -61,6 +61,12 @@ enum class FsrVersion : uint32_t {
     Fsr5 = 5  // Future AMD FSR 5 target
 };
 
+enum class NrcBackend : uint32_t {
+    Auto = 0,             // Automatically use AMD FSR Radiance Cache (0.9.0) or Wave32 WMMA NRC
+    NativeWave32 = 1,     // Native Wave32 Cooperative Matrix MLP + Multi-Res Hash Grid
+    FfxRadianceCache = 2  // AMD FidelityFX Radiance Caching (0.9.0)
+};
+
 // EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
 // super-resolution modes below are experimental. They are intentionally absent from the README,
 // --help, and the GUI, and are reachable only via hidden CLI flags (--scaler/--denoiser/--upways*).
@@ -202,8 +208,9 @@ struct Config {
     bool progressive_accumulation = true; // Accumulate samples over static frames (uncheck to evaluate real-time noise)
     uint32_t max_accum_frames = 2048;     // Max accumulation frames before freezing stationary render (0 = Unlimited, default: 2048)
 
-    // Neural Radiance Caching (NRC) with Wave32 WMMA (gfx1201 / Vulkan 1.4)
+    // Neural Radiance Caching (NRC) with Wave32 WMMA & AMD FSR Radiance Cache 0.9.0 (gfx1201 / Vulkan 1.4)
     bool enable_nrc = false;              // Neural Radiance Cache indirect query termination [Default: disabled]
+    NrcBackend nrc_backend = NrcBackend::Auto; // Target NRC backend (Auto, NativeWave32, FfxRadianceCache)
     uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
     float nrc_train_ratio = 0.03f;        // Ratio of paths (2%-5%, default 0.03 = 3%) continuing tracing to ground truth depth for training
 

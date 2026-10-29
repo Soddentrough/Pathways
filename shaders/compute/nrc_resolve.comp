@@ -10,9 +10,13 @@ layout(std430, set = 0, binding = 1) buffer AtomicAccumBuffer {
     uint nrcAtomicBuffer[];
 };
 
+layout(set = 0, binding = 2, rgba16f) uniform image2D uMlDiffuseImage;
+
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
+    uint captureMlData;
+    uint pad;
 } pc;
 
 uint pcg_hash(inout uint seed) {
@@ -47,9 +51,16 @@ void main() {
 
     if ((fixedR | fixedG | fixedB) != 0u) {
         vec3 radiance = vec3(float(fixedR), float(fixedG), float(fixedB)) / 65536.0;
-        vec4 prev = imageLoad(uAccumImage, pixelCoord);
         uint seed = uint(pixelIdx * 1973u) | 1u;
-        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        if ((pc.captureMlData & 1u) == 0u || (pc.captureMlData & 2u) != 0u) {
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+        }
+
+        if ((pc.captureMlData & 1u) != 0u) {
+            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radiance, seed), prevDiff.a));
+        }
 
         // Reset accumulator back to zero for the next frame
         nrcAtomicBuffer[base + 0u] = 0u;

@@ -695,6 +695,16 @@ FrameStats TelemetryReporter::getStats() const {
     stats.has_dynamic_rendering = m_engine->m_context->hasDynamicRendering();
     stats.has_timeline_semaphores = m_engine->m_context->hasTimelineSemaphores();
     stats.has_sync2 = m_engine->m_context->hasSync2();
+    stats.has_cooperative_matrix = m_engine->m_context->hasCooperativeMatrix();
+    stats.has_shader_int8 = m_engine->m_context->hasShaderInt8();
+    stats.has_shader_float8 = m_engine->m_context->hasShaderFloat8();
+    stats.has_int8_coop_matrix = m_engine->m_context->hasInt8CooperativeMatrix();
+    stats.has_fp8_coop_matrix = m_engine->m_context->hasFp8CooperativeMatrix();
+    stats.has_mutable_descriptor_type = m_engine->m_context->hasMutableDescriptorType();
+    stats.supports_fsr4 = m_engine->m_context->supportsFsr4();
+    if (m_engine->m_superResolution && m_engine->m_superResolution->getFsrUpscaler()) {
+        stats.supports_fsr4 = m_engine->m_superResolution->getFsrUpscaler()->isHardwareMlSupported();
+    }
 
     const auto& rtProps = m_engine->m_context->getRayTracingPipelineProperties();
     stats.rt_handle_size = rtProps.shaderGroupHandleSize;
@@ -709,15 +719,30 @@ FrameStats TelemetryReporter::getStats() const {
 
     // 5. Engine Settings & State
     stats.visualize_mgpu_split = m_engine->m_config.visualize_mgpu_split;
+    switch (m_engine->m_config.denoiser_mode) {
+        case DenoiserMode::Upways: stats.denoiser_mode_str = "Upways"; break;
+        case DenoiserMode::Gateway: stats.denoiser_mode_str = "Gateway"; break;
+        case DenoiserMode::Svgf: stats.denoiser_mode_str = "SVGF"; break;
+        case DenoiserMode::FfxRayRegeneration: stats.denoiser_mode_str = "FFX Ray Regeneration"; break;
+        case DenoiserMode::None: default: stats.denoiser_mode_str = "None"; break;
+    }
+    stats.enable_nrc = m_engine->m_config.enable_nrc;
     switch (m_engine->m_config.upscaler_mode) {
-        case UpscalerMode::FSR:
-            switch (m_engine->m_config.fsr_version) {
+        case UpscalerMode::FSR: {
+            FsrVersion activeFsrVer = m_engine->m_config.fsr_version;
+            if (m_engine->m_superResolution && m_engine->m_superResolution->getFsrUpscaler()) {
+                activeFsrVer = m_engine->m_superResolution->getFsrUpscaler()->getActiveVersion();
+            } else if (activeFsrVer == FsrVersion::Auto || (!stats.supports_fsr4 && activeFsrVer != FsrVersion::Fsr3)) {
+                activeFsrVer = stats.supports_fsr4 ? FsrVersion::Fsr4 : FsrVersion::Fsr3;
+            }
+            switch (activeFsrVer) {
                 case FsrVersion::Fsr3: stats.upscaler_mode_str = "FSR 3.1"; break;
-                case FsrVersion::Fsr4: stats.upscaler_mode_str = "FSR 4"; break;
+                case FsrVersion::Fsr4: stats.upscaler_mode_str = "FSR 4.1 ML"; break;
                 case FsrVersion::Fsr5: stats.upscaler_mode_str = "FSR 5"; break;
                 case FsrVersion::Auto: default: stats.upscaler_mode_str = "FSR"; break;
             }
             break;
+        }
         case UpscalerMode::Upways: stats.upscaler_mode_str = "Upways"; break;
         case UpscalerMode::Gateway: stats.upscaler_mode_str = "Gateway"; break;
         case UpscalerMode::None: default: stats.upscaler_mode_str = "None"; break;
@@ -921,6 +946,13 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
     key.tile_size = m_engine->m_config.tile_size;
     key.upscaler = m_engine->m_config.upscaler_mode;
     key.fsr_version = m_engine->m_config.fsr_version;
+    if (key.upscaler == UpscalerMode::FSR) {
+        if (m_engine->m_superResolution && m_engine->m_superResolution->getFsrUpscaler()) {
+            key.fsr_version = m_engine->m_superResolution->getFsrUpscaler()->getActiveVersion();
+        } else if (key.fsr_version == FsrVersion::Auto) {
+            key.fsr_version = (m_engine->m_context && m_engine->m_context->supportsFsr4()) ? FsrVersion::Fsr4 : FsrVersion::Fsr3;
+        }
+    }
     key.mgpu_upscale_mode = m_engine->m_config.mgpu_upscale_mode;
     key.render_scale = m_engine->m_config.render_scale;
     key.enable_tail_megakernel = m_engine->m_config.enable_tail_megakernel;

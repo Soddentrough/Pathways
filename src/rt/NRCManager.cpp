@@ -1,4 +1,5 @@
 #include "NRCManager.hpp"
+#include "rt/FfxSdkRuntime.hpp"
 #include "core/Logger.hpp"
 
 #include <stdexcept>
@@ -21,11 +22,13 @@ NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     createPipelines(inferSpv, trainSpv, resolveSpv);
+    initFfxRadianceCacheContext();
     m_initialized = true;
-    Logger::info("NRCManager initialized: {}x{} cache resolution, Wave32 WMMA enabled.", width, height);
+    Logger::info("NRCManager initialized: {}x{} cache resolution ({}).", width, height, getActiveBackendName());
 }
 
 NRCManager::~NRCManager() {
+    destroyFfxRadianceCacheContext();
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
         if (m_inferPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_inferPipeline, nullptr);
@@ -42,6 +45,55 @@ NRCManager::~NRCManager() {
 
         if (m_descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
     }
+}
+
+void NRCManager::setBackend(NrcBackend backend) {
+    if (m_backend == backend) return;
+    m_backend = backend;
+    initFfxRadianceCacheContext();
+}
+
+const char* NRCManager::getActiveBackendName() const {
+    if (m_ffxRcContext != nullptr) {
+        return "AMD FSR Radiance Cache 0.9.0 (SDK Provider)";
+    }
+    if (m_backend == NrcBackend::FfxRadianceCache || m_backend == NrcBackend::Auto) {
+        return "AMD FSR Radiance Cache 0.9.0 (Wave32 WMMA + Path-Spread)";
+    }
+    return "Native Wave32 WMMA Multi-Res Hash MLP";
+}
+
+void NRCManager::initFfxRadianceCacheContext() {
+    destroyFfxRadianceCacheContext();
+    if (m_backend == NrcBackend::NativeWave32) {
+        return;
+    }
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, VK_NULL_HANDLE);
+    ffxCreateContextDescRadianceCache createRc{};
+    createRc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_RADIANCECACHE;
+    createRc.header.pNext = &backendDesc.header;
+    createRc.version = FFX_RADIANCECACHE_VERSION;
+    createRc.maxInferenceSampleCount = m_maxQueries;
+    createRc.maxTrainingSampleCount = m_maxTrainRecords;
+    createRc.flags = FFX_RADIANCE_CACHE_CONTEXT_TRY_FORCE_WMMA;
+
+    ffxContext ctx = nullptr;
+    if (ffxCreateContext(&ctx, &createRc.header, nullptr) == FFX_API_RETURN_OK && ctx != nullptr) {
+        m_ffxRcContext = ctx;
+    }
+#endif
+}
+
+void NRCManager::destroyFfxRadianceCacheContext() {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_ffxRcContext != nullptr) {
+        ffxDestroyContext(&m_ffxRcContext, nullptr);
+        m_ffxRcContext = nullptr;
+    }
+#else
+    m_ffxRcContext = nullptr;
+#endif
 }
 
 void NRCManager::initBuffers() {
@@ -61,82 +113,59 @@ void NRCManager::initBuffers() {
     VkDeviceSize trainSize = static_cast<VkDeviceSize>(m_maxTrainRecords) * sizeof(NRCTrainingRecord);
     m_trainQueue = std::make_unique<Buffer>(m_allocator, trainSize, queueUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // 3. Queue Counters: 256 bytes
+    // 3. Queue Counters: 256 bytes (Device-Local VRAM for fast atomicAdd & Indirect Dispatch)
     m_counters = std::make_unique<Buffer>(m_allocator, 256, queueUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+                                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // 4. Weights buffer: 9360 * 2 bytes = 18,720 bytes (aligned to 19,200 bytes)
+    // 4. Weights buffer: 9360 * 2 bytes = 18,720 bytes (aligned to 19,200 bytes in Device-Local VRAM)
     VkDeviceSize weightsSize = 19200;
     m_weights = std::make_unique<Buffer>(m_allocator, weightsSize, queueUsage,
-                                         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+                                         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // 5. Adam Momentum buffer: 2 * 9360 * sizeof(float) = 74,880 bytes
+    // 5. Adam Momentum buffer: 2 * 9360 * sizeof(float) = 74,880 bytes (Device-Local VRAM)
     VkDeviceSize momentumSize = 2ull * 9360ull * sizeof(float);
     m_weightMomentum = std::make_unique<Buffer>(m_allocator, momentumSize, queueUsage,
-                                                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+                                                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-    // 6. Atomic Accumulation Buffer: 3 channels * width * height * sizeof(uint32_t) bytes (CRIT-05)
+    // 6. Atomic Accumulation Buffer: 3 channels * width * height * sizeof(uint32_t) bytes in Device-Local VRAM
     VkDeviceSize atomicAccumSize = static_cast<VkDeviceSize>(m_width) * m_height * 3ull * sizeof(uint32_t);
     m_atomicAccumBuffer = std::make_unique<Buffer>(m_allocator, atomicAccumSize, queueUsage,
-                                                  VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-    void* pAccum = m_atomicAccumBuffer->map();
-    if (pAccum) {
-        std::memset(pAccum, 0, atomicAccumSize);
-        m_atomicAccumBuffer->flush();
-        m_atomicAccumBuffer->unmap();
-    }
+                                                  VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 }
 
 void NRCManager::initWeights() {
     std::mt19937 rng(42);
     std::normal_distribution<float> weightDist(0.0f, std::sqrt(2.0f / 64.0f)); // Kaiming He normal
 
-    // Initialize Weights
-    uint16_t* pWeights = static_cast<uint16_t*>(m_weights->map());
-    if (pWeights) {
-        // Layer 0: 64 x 64 weights
-        for (size_t i = 0; i < 4096; ++i) {
-            pWeights[i] = glm::packHalf1x16(weightDist(rng));
-        }
-        // Layer 0: 64 biases
-        for (size_t i = 0; i < 64; ++i) {
-            pWeights[4096 + i] = glm::packHalf1x16(0.0f);
-        }
-        // Layer 1: 64 x 64 weights
-        for (size_t i = 0; i < 4096; ++i) {
-            pWeights[4160 + i] = glm::packHalf1x16(weightDist(rng));
-        }
-        // Layer 1: 64 biases
-        for (size_t i = 0; i < 64; ++i) {
-            pWeights[8256 + i] = glm::packHalf1x16(0.0f);
-        }
-        // Layer 2: 64 x 16 weights
-        for (size_t i = 0; i < 1024; ++i) {
-            pWeights[8320 + i] = glm::packHalf1x16(weightDist(rng));
-        }
-        // Layer 2: 16 biases
-        for (size_t i = 0; i < 16; ++i) {
-            pWeights[9344 + i] = glm::packHalf1x16(0.0f);
-        }
-        m_weights->flush();
-        m_weights->unmap();
+    m_initialWeights.assign(19200 / sizeof(uint16_t), 0u);
+    uint16_t* pWeights = m_initialWeights.data();
+
+    // Layer 0: 64 x 64 weights
+    for (size_t i = 0; i < 4096; ++i) {
+        pWeights[i] = glm::packHalf1x16(weightDist(rng));
+    }
+    // Layer 0: 64 biases
+    for (size_t i = 0; i < 64; ++i) {
+        pWeights[4096 + i] = glm::packHalf1x16(0.0f);
+    }
+    // Layer 1: 64 x 64 weights
+    for (size_t i = 0; i < 4096; ++i) {
+        pWeights[4160 + i] = glm::packHalf1x16(weightDist(rng));
+    }
+    // Layer 1: 64 biases
+    for (size_t i = 0; i < 64; ++i) {
+        pWeights[8256 + i] = glm::packHalf1x16(0.0f);
+    }
+    // Layer 2: 64 x 16 weights (scaled by 0.05 so initial predictions start near 0 without frame-1 blotches)
+    for (size_t i = 0; i < 1024; ++i) {
+        pWeights[8320 + i] = glm::packHalf1x16(weightDist(rng) * 0.05f);
+    }
+    // Layer 2: 16 biases
+    for (size_t i = 0; i < 16; ++i) {
+        pWeights[9344 + i] = glm::packHalf1x16(0.0f);
     }
 
-    // Zero out Momentum buffer
-    void* pMom = m_weightMomentum->map();
-    if (pMom) {
-        std::memset(pMom, 0, 2ull * 9360ull * sizeof(float));
-        m_weightMomentum->flush();
-        m_weightMomentum->unmap();
-    }
-
-    // Zero out Counters
-    void* pCount = m_counters->map();
-    if (pCount) {
-        std::memset(pCount, 0, 256);
-        m_counters->flush();
-        m_counters->unmap();
-    }
+    m_needsGpuInit = true;
 }
 
 void NRCManager::createDescriptorSetLayouts() {
@@ -168,10 +197,11 @@ void NRCManager::createDescriptorSetLayouts() {
         throw std::runtime_error("NRCManager: Failed to create training descriptor set layout!");
     }
 
-    // Resolve Layout: uAccumImage(0), AtomicBuffer(1) (CRIT-05)
+    // Resolve Layout: uAccumImage(0), AtomicBuffer(1), uMlDiffuseImage(2)
     std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
@@ -183,7 +213,7 @@ void NRCManager::createDescriptorSetLayouts() {
 
 void NRCManager::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -253,20 +283,22 @@ void NRCManager::allocateDescriptorSets() {
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(resolveBufWrites.size()), resolveBufWrites.data(), 0, nullptr);
 }
 
-void NRCManager::updateDescriptors(VkImageView accumImageView) {
-    updateDescriptors(0, accumImageView);
-    updateDescriptors(1, accumImageView);
+void NRCManager::updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView) {
+    updateDescriptors(0, accumImageView, mlDiffuseImageView);
+    updateDescriptors(1, accumImageView, mlDiffuseImageView);
 }
 
-void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView) {
+void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView) {
     if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer || slot >= m_resolveDescSets.size()) return;
-    // Update resolve descriptor set image binding (0) and buffer binding (1)
+    VkImageView diffView = (mlDiffuseImageView != VK_NULL_HANDLE) ? mlDiffuseImageView : accumImageView;
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlDiffInfo{ VK_NULL_HANDLE, diffView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlDiffInfo, nullptr, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -345,7 +377,7 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
         VkPushConstantRange resPcRange{};
         resPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         resPcRange.offset = 0;
-        resPcRange.size = sizeof(uint32_t) * 2; // width, height (8 bytes)
+        resPcRange.size = sizeof(uint32_t) * 4; // width, height, captureMlData, pad (16 bytes)
 
         VkPipelineLayoutCreateInfo resLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         resLayoutInfo.setLayoutCount = 1;
@@ -409,30 +441,43 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
 }
 
 void NRCManager::resetCounters(VkCommandBuffer cmd) {
-    vkCmdFillBuffer(cmd, m_counters->getBuffer(), 0, 256, 0);
+    if (m_needsGpuInit) {
+        if (!m_initialWeights.empty()) {
+            vkCmdUpdateBuffer(cmd, m_weights->getBuffer(), 0,
+                              m_initialWeights.size() * sizeof(uint16_t),
+                              m_initialWeights.data());
+        }
+        vkCmdFillBuffer(cmd, m_weightMomentum->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        m_needsGpuInit = false;
+    }
 
-    VkBufferMemoryBarrier2 fillBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
-    fillBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    fillBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    fillBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    fillBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    fillBarrier.buffer = m_counters->getBuffer();
-    fillBarrier.offset = 0;
-    fillBarrier.size = 256;
+    // Initialize NRCCountersBuffer + VkDispatchIndirectCommand at offset 8:
+    // [0]=queryCount(0), [1]=trainCount(0), [2]=dispatchX(0), [3]=dispatchY(1), [4]=dispatchZ(1)
+    const uint32_t initCounters[8] = { 0u, 0u, 0u, 1u, 1u, 0u, 0u, 0u };
+    vkCmdUpdateBuffer(cmd, m_counters->getBuffer(), 0, sizeof(initCounters), initCounters);
+
+    VkMemoryBarrier2 transferBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    transferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    transferBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    transferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    transferBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
 
     VkDependencyInfo depInfo{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    depInfo.bufferMemoryBarrierCount = 1;
-    depInfo.pBufferMemoryBarriers = &fillBarrier;
+    depInfo.memoryBarrierCount = 1;
+    depInfo.pMemoryBarriers = &transferBarrier;
     vkCmdPipelineBarrier2(cmd, &depInfo);
 }
 
 void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                                 glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride,
-                                uint32_t frameSlot)
+                                uint32_t frameSlot, uint32_t captureMlData)
 {
     if (!m_initialized || m_inferPipeline == VK_NULL_HANDLE) return;
 
-    // Buffer memory barrier: Wavefront writes query queue -> Inference reads query queue
+    // Buffer memory barrier: Wavefront writes query queue & indirect dispatch count -> Inference reads
     std::array<VkBufferMemoryBarrier2, 2> inBarriers = {
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
@@ -444,7 +489,8 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
             m_counters->getBuffer(), 0, 256
         }
@@ -483,49 +529,54 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
 
     vkCmdPushConstants(cmd, m_inferPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    // Each workgroup handles a batch of 16 queries
-    uint32_t dispatchCount = (queryCount + 15u) / 16u;
-    if (dispatchCount > 0) {
+    // Each workgroup handles a batch of 16 queries.
+    // Use GPU-driven vkCmdDispatchIndirect (offset 8 = NRCCountersBuffer::dispatchX) so only active query batches run.
+    if (queryCountOverride > 0) {
+        uint32_t dispatchCount = (queryCountOverride + 15u) / 16u;
         vkCmdDispatch(cmd, dispatchCount, 1, 1);
-
-        // Barrier: Inference writes atomic buffer -> Resolve reads and resets atomic buffer (CRIT-05)
-        VkBufferMemoryBarrier2 inferToResolveBarrier{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
-        };
-        VkDependencyInfo inferToResolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        inferToResolveDep.bufferMemoryBarrierCount = 1;
-        inferToResolveDep.pBufferMemoryBarriers = &inferToResolveBarrier;
-        vkCmdPipelineBarrier2(cmd, &inferToResolveDep);
-
-        // Resolve: Single-thread-per-pixel atomic buffer -> uAccumImage (CRIT-05)
-        if (m_resolvePipeline != VK_NULL_HANDLE) {
-            uint32_t slot = frameSlot % 2u;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSets[slot], 0, nullptr);
-
-            struct ResolvePushConstants {
-                uint32_t width;
-                uint32_t height;
-            } rpc{ width, height };
-            vkCmdPushConstants(cmd, m_resolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
-            vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1);
-        }
-
-        // Barrier: Resolve writes uAccumImage -> downstream tonemapping / denoiser reads
-        VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-        outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        outDep.memoryBarrierCount = 1;
-        outDep.pMemoryBarriers = &outBarrier;
-        vkCmdPipelineBarrier2(cmd, &outDep);
+    } else {
+        vkCmdDispatchIndirect(cmd, m_counters->getBuffer(), 8);
     }
+
+    // Barrier: Inference writes atomic buffer -> Resolve reads and resets atomic buffer (CRIT-05)
+    VkBufferMemoryBarrier2 inferToResolveBarrier{
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
+    };
+    VkDependencyInfo inferToResolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    inferToResolveDep.bufferMemoryBarrierCount = 1;
+    inferToResolveDep.pBufferMemoryBarriers = &inferToResolveBarrier;
+    vkCmdPipelineBarrier2(cmd, &inferToResolveDep);
+
+    // Resolve: Single-thread-per-pixel atomic buffer -> uAccumImage & uMlDiffuseImage (CRIT-05)
+    if (m_resolvePipeline != VK_NULL_HANDLE) {
+        uint32_t slot = frameSlot % 2u;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSets[slot], 0, nullptr);
+
+        struct ResolvePushConstants {
+            uint32_t width;
+            uint32_t height;
+            uint32_t captureMlData;
+            uint32_t pad;
+        } rpc{ width, height, captureMlData, 0u };
+        vkCmdPushConstants(cmd, m_resolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
+        vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1);
+    }
+
+    // Barrier: Resolve writes uAccumImage / uMlDiffuseImage -> downstream tonemapping / denoiser reads
+    VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    outDep.memoryBarrierCount = 1;
+    outDep.pMemoryBarriers = &outBarrier;
+    vkCmdPipelineBarrier2(cmd, &outDep);
 }
 
 void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,

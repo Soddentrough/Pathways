@@ -244,11 +244,22 @@ void main() {
                 }
                 skyColor *= invSpp;
 
-                vec4 prev = imageLoad(uAccumImage, storeCoord);
-                imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
+                if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                    if (pc.sppSampleIndex == 0u) {
+                        imageStore(uAccumImage, storeCoord, vec4(skyColor, 0.0));
+                    } else {
+                        vec4 prev = imageLoad(uAccumImage, storeCoord);
+                        imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), 0.0));
+                    }
+                }
                 if (pc.captureMlData != 0u) {
-                    vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                    imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+                    if (pc.sppSampleIndex == 0u) {
+                        imageStore(uMlDiffuseImage, storeCoord, vec4(skyColor, 0.0));
+                        imageStore(uMlSpecularImage, storeCoord, vec4(0.0));
+                    } else {
+                        vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
+                        imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+                    }
                     accumFfxSignal(storeCoord, skyColor, false, true, seed);
                 }
             }
@@ -394,10 +405,8 @@ void main() {
                         : roughnessVal;
                     imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, denoiseRoughness));
                     imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, dSpec, 0.0));
-                    vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                    imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, isPrimaryEmissive));
-                    vec4 prevSpec = imageLoad(uMlSpecularImage, storeCoord);
-                    imageStore(uMlSpecularImage, storeCoord, vec4(prevSpec.rgb, clampedMet));
+                    imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
+                    imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
                 }
             }
         }
@@ -420,10 +429,6 @@ void main() {
             if (pc.captureMlData != 0u) {
                 imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(0.0, 0.0, 0.0, 1.0));
                 imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, 0.0, 0.0));
-                vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                imageStore(uMlDiffuseImage, storeCoord, vec4(prevDiff.rgb, 0.0));
-                vec4 prevSpec = imageLoad(uMlSpecularImage, storeCoord);
-                imageStore(uMlSpecularImage, storeCoord, vec4(prevSpec.rgb, 0.0));
             }
         }
     }

@@ -765,10 +765,7 @@ std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
     if (!ec) exeDir = p.parent_path();
 #endif
 
-    std::vector<std::string> searchPaths = {
-        filename,
-        std::string("shaders/") + filename,
-    };
+    std::vector<std::string> searchPaths;
 
     if (!exeDir.empty()) {
         searchPaths.push_back((exeDir / "shaders" / filename).string());
@@ -777,10 +774,12 @@ std::vector<char> Engine::loadShaderSPIRV(const std::string& filename) {
     }
 
     searchPaths.push_back(std::string(SHADER_DIR) + "/" + filename);
-    searchPaths.push_back(std::string("/usr/share/pathways/shaders/") + filename);
-    searchPaths.push_back(std::string("/usr/local/share/pathways/shaders/") + filename);
+    searchPaths.push_back(std::string("shaders/") + filename);
     searchPaths.push_back(std::string("build/shaders/") + filename);
     searchPaths.push_back(std::string("../build/shaders/") + filename);
+    searchPaths.push_back(std::string("/usr/share/pathways/shaders/") + filename);
+    searchPaths.push_back(std::string("/usr/local/share/pathways/shaders/") + filename);
+    searchPaths.push_back(filename);
 
     for (const auto& path : searchPaths) {
         if (std::filesystem::exists(path)) {
@@ -1949,9 +1948,12 @@ void Engine::renderFrame() {
     }
 
     bool isStationaryAccum = m_config.progressive_accumulation && !m_cameraMovedLastFrame && (m_accumulatedSamples > 1);
-    bool enableJitter = (m_config.upscaler_mode == UpscalerMode::FSR) ||
-                        (m_config.upscaler_mode == UpscalerMode::Upways && m_config.upways_superres) ||
-                        (m_config.upscaler_mode == UpscalerMode::Gateway && m_config.gateway_superres);
+    bool isDenoisingRenderRes = (m_config.denoiser_mode == DenoiserMode::Svgf ||
+                                 m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+    bool enableJitter = !isStationaryAccum && !isDenoisingRenderRes &&
+                        ((m_config.upscaler_mode == UpscalerMode::FSR) ||
+                         (m_config.upscaler_mode == UpscalerMode::Upways && m_config.upways_superres) ||
+                         (m_config.upscaler_mode == UpscalerMode::Gateway && m_config.gateway_superres));
     uint32_t renderW = m_config.getRenderWidth();
     uint32_t renderH = m_config.getRenderHeight();
     uint32_t jitterSeqLen = (m_config.upscaler_mode == UpscalerMode::FSR)
@@ -2127,11 +2129,13 @@ void Engine::renderFrame() {
         } else {
             // Decoupled Path (Used when SVGF, FfxRayRegeneration, Upways, Gateway, or FSR is active or RT was skipped)
             // Running Average Accumulation Pass (FP16 Frame -> FP32 Persistent History)
-            // Skipped when Upways or Gateway is active because both consume raw split diffuse/specular directly.
-            const bool isUpwaysOrGateway =
+            // Skipped when Upways, Gateway, E-SVGF, or FFX Ray Regeneration is active because they consume raw split diffuse/specular directly.
+            const bool isDenoisedWithoutRunningAvg =
                 (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
-                (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway);
-            if (!skipRayTracing && !isUpwaysOrGateway && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
+                (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway) ||
+                ((m_config.denoiser_mode == DenoiserMode::Svgf || m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+                 m_config.capture_training_data_dir.empty());
+            if (!skipRayTracing && !isDenoisedWithoutRunningAvg && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
                 PostProcessPipeline::RunningAvgPushConstants avgPC{};
                 avgPC.width = renderW;
                 avgPC.height = renderH;
@@ -2170,7 +2174,12 @@ void Engine::renderFrame() {
                     m_motionVectorImage, m_normalDepthImage,
                     m_mlAlbedoRoughnessImage, m_accumImage,
                     m_mlSpecularMotionImage,
-                    buildDenoiserCameraMatrices(renderW, renderH)
+                    buildDenoiserCameraMatrices(renderW, renderH),
+                    m_config.denoiser_mode,
+                    m_ffxDirectDiffuseImage,
+                    m_ffxDirectSpecularImage,
+                    m_ffxIndirectDiffuseImage,
+                    m_ffxIndirectSpecularImage
                 );
                 svgfRun = true;
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
@@ -2226,7 +2235,7 @@ void Engine::renderFrame() {
                     }
                     fsrRun = m_superResolution->dispatchFsr(
                         cmd, resetTemporal, m_config, m_frameIndex,
-                        m_cameraMovedLastFrame, m_accumulatedSamples,
+                        m_cameraMovedLastFrame, denoisedInput ? 1u : m_accumulatedSamples,
                         fsrInputImage, m_normalDepthImage, m_motionVectorImage,
                         m_mgpu.get(), denoisedInput ? nullptr : m_secTransferBuffer, m_currentFrame,
                         m_postProcess.get(), m_outputImage,
@@ -2398,7 +2407,12 @@ void Engine::renderFrame() {
                 m_motionVectorImage, m_normalDepthImage,
                 m_mlAlbedoRoughnessImage, m_accumImage,
                 m_mlSpecularMotionImage,
-                buildDenoiserCameraMatrices(renderW, renderH)
+                buildDenoiserCameraMatrices(renderW, renderH),
+                m_config.denoiser_mode,
+                m_ffxDirectDiffuseImage,
+                m_ffxDirectSpecularImage,
+                m_ffxIndirectDiffuseImage,
+                m_ffxIndirectSpecularImage
             );
             svgfRun = true;
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
@@ -2449,7 +2463,7 @@ void Engine::renderFrame() {
                 }
                 fsrRun = m_superResolution->dispatchFsr(
                     activeCmd, resetTemporal, m_config, m_frameIndex,
-                    m_cameraMovedLastFrame, m_accumulatedSamples,
+                    m_cameraMovedLastFrame, denoisedInput ? 1u : m_accumulatedSamples,
                     fsrInputImage, m_normalDepthImage, m_motionVectorImage,
                     m_mgpu.get(), denoisedInput ? nullptr : m_secTransferBuffer, m_currentFrame,
                     m_postProcess.get(), m_outputImage,

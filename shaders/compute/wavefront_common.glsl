@@ -754,6 +754,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
             imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \
         } \
+        RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss); \
     } while(false)
 
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
@@ -1458,12 +1459,35 @@ void accumFfxSignalImpl(ivec2 coord, vec3 radiance, bool isSpecular, bool isDire
     }
 }
 
+void recordFfxSecondaryHitTImpl(uint pixelIdx, float hitDist, bool isMiss, bool isSpecular, uint width) {
+    ivec2 coord = ivec2(int(pixelIdx % width), int(pixelIdx / width));
+    float hitTVal = isMiss ? 1000.0 : clamp(hitDist, 0.001, 1000.0);
+    if (isSpecular) {
+        vec4 prev = imageLoad(uFfxIndirectSpecularImage, coord);
+        float outHitT = (prev.a > 1e-4) ? min(prev.a, hitTVal) : hitTVal;
+        imageStore(uFfxIndirectSpecularImage, coord, vec4(prev.rgb, outHitT));
+    } else {
+        vec4 prev = imageLoad(uFfxIndirectDiffuseImage, coord);
+        float outHitT = (prev.a > 1e-4) ? min(prev.a, hitTVal) : hitTVal;
+        imageStore(uFfxIndirectDiffuseImage, coord, vec4(prev.rgb, outHitT));
+    }
+}
+
 #define accumFfxSignal(coord, radiance, isSpecular, isDirect, seed) \
     do { \
         if ((pc.captureMlData & 4u) != 0u) { \
             accumFfxSignalImpl((coord), (radiance), (isSpecular), (isDirect), (seed)); \
         } \
     } while(false)
+
+#define RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss) \
+    do { \
+        if (pc.currentBounce == 1u && (pc.captureMlData & 4u) != 0u) { \
+            recordFfxSecondaryHitTImpl((pixelIdx), float(hitDist), (isMiss), isSpecularPath, pc.width); \
+        } \
+    } while(false)
+#else
+#define RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss) do {} while(false)
 #endif
 
 #endif // WAVEFRONT_COMMON_GLSL

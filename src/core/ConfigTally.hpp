@@ -89,8 +89,8 @@ struct ConfigKey {
         }
         if (upscaler == UpscalerMode::FSR) {
             const char* fsrLabel = (fsr_version == FsrVersion::Fsr5) ? " [FSR 5]" :
-                                   (fsr_version == FsrVersion::Fsr4) ? " [FSR 4]" :
-                                   (fsr_version == FsrVersion::Fsr3) ? " [FSR 3.1]" : " [FSR]";
+                                   (fsr_version == FsrVersion::Fsr4) ? " [FSR 4.1 ML]" :
+                                   (fsr_version == FsrVersion::Fsr3) ? " [FSR 3.1]" : " [FSR 4.1 ML]";
             upscalerStr = std::string(fsrLabel) + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::Upways) {
             upscalerStr = " [Upways SR]" + mgpuUpscaleStr;

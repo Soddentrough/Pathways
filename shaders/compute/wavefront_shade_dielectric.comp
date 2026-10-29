@@ -171,8 +171,10 @@ void main() {
                 skyContrib = clampIndirectRadiance(skyContrib, effClamp);
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-            vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+            }
             if (pc.captureMlData != 0u) {
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
@@ -231,8 +233,10 @@ void main() {
                     emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
                 }
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
+                }
                 if (pc.captureMlData != 0u) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                     imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
@@ -416,8 +420,10 @@ void main() {
                                     }
                                     vec3 skyContrib = clampIndirectRadiance(throughput * skyColor, pc.indirectClamp);
                                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                    vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                    imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+                                    if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
+                                    }
                                     if (pc.captureMlData != 0u) {
                                         vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                                         imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
