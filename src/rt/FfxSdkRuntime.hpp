@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
@@ -67,7 +68,23 @@ public:
     static bool supportsHardwareMl(VkPhysicalDevice physDevice);
 
     // Query available effect versions via ffxQueryDescGetVersions
-    std::vector<FfxSdkVersionInfo> queryEffectVersions(uint64_t createDescType, VkPhysicalDevice physDevice = VK_NULL_HANDLE) const;
+    std::vector<FfxSdkVersionInfo> queryEffectVersions(
+        uint64_t createDescType,
+        VkPhysicalDevice physDevice = VK_NULL_HANDLE,
+        VkDevice device = VK_NULL_HANDLE) const;
+
+    // Extract major version number from versionName ("4.1.2") or versionId bitfields
+    static uint32_t parseMajorVersion(const FfxSdkVersionInfo& info);
+
+    // Check whether a specific Upscaler major version (e.g. 3 or 4) is genuinely supported
+    // by a loaded Vulkan SDK provider and the underlying Vulkan physical/logical device.
+    bool isUpscalerVersionSupported(VkPhysicalDevice physDevice, VkDevice device, uint32_t majorVersion) const;
+
+    // Check whether AMD FSR Ray Regeneration (Denoiser) is genuinely supported on Vulkan
+    bool isRayRegenerationSupported(VkPhysicalDevice physDevice, VkDevice device) const;
+
+    // Check whether AMD FSR Radiance Cache is genuinely supported on Vulkan
+    bool isRadianceCacheSupported(VkPhysicalDevice physDevice, VkDevice device) const;
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
     // Helper to build FfxApiResource from a Pathways Image*
@@ -105,10 +122,12 @@ private:
 
     bool tryLoadModule(FfxEffectModule module, const std::vector<std::string>& candidateNames);
     const ModuleEntry* selectModuleForHeader(uint64_t headerType) const;
+    const ModuleEntry* findModuleForContext(const void* ctx) const;
 
     bool m_initialized = false;
     std::string m_sdkRootDir;
     ModuleEntry m_modules[4]{};
+    std::vector<std::pair<void*, const ModuleEntry*>> m_contextOwners;
 };
 
 } // namespace pathways

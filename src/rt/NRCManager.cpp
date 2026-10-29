@@ -58,7 +58,7 @@ const char* NRCManager::getActiveBackendName() const {
         return "AMD FSR Radiance Cache 0.9.0 (SDK Provider)";
     }
     if (m_backend == NrcBackend::FfxRadianceCache || m_backend == NrcBackend::Auto) {
-        return "AMD FSR Radiance Cache 0.9.0 (Wave32 WMMA + Path-Spread)";
+        return "Native Wave32 WMMA Multi-Res Hash MLP";
     }
     return "Native Wave32 WMMA Multi-Res Hash MLP";
 }

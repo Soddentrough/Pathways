@@ -19,38 +19,6 @@
 
 namespace pathways {
 
-namespace {
-
-float haltonBase(int32_t index, int32_t base) {
-    float f = 1.0f;
-    float result = 0.0f;
-    int32_t current = index;
-    while (current > 0) {
-        f /= static_cast<float>(base);
-        result += f * static_cast<float>(current % base);
-        current /= base;
-    }
-    return result - 0.5f;
-}
-
-float qualityModeToRatio(uint32_t qualityMode) {
-#if defined(PATHWAYS_HAS_FFX_SDK)
-    switch (qualityMode) {
-        case FFX_UPSCALE_QUALITY_MODE_NATIVEAA:          return 1.0f;
-        case FFX_UPSCALE_QUALITY_MODE_QUALITY:           return 1.5f;
-        case FFX_UPSCALE_QUALITY_MODE_BALANCED:          return 1.7f;
-        case FFX_UPSCALE_QUALITY_MODE_PERFORMANCE:       return 2.0f;
-        case FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE: return 3.0f;
-        default:                                         return 1.5f;
-    }
-#else
-    (void)qualityMode;
-    return 1.5f;
-#endif
-}
-
-} // namespace
-
 FfxSdkRuntime& FfxSdkRuntime::instance() {
     static FfxSdkRuntime s_instance;
     return s_instance;
@@ -83,11 +51,19 @@ void FfxSdkRuntime::initialize(const std::string& sdkRootDir) {
         m_sdkRootDir = sdkRootDir;
     } else if (const char* envDir = std::getenv("FFX_SDK_PATH")) {
         m_sdkRootDir = envDir;
-    } else if (const char* homeDir = std::getenv("HOME")) {
-        std::string candidate = std::string(homeDir) + "/Development/FidelityFX-SDK";
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec)) {
-            m_sdkRootDir = candidate;
+    } else {
+        const char* homeDir = std::getenv("HOME");
+#ifdef _WIN32
+        if (!homeDir || !homeDir[0]) {
+            homeDir = std::getenv("USERPROFILE");
+        }
+#endif
+        if (homeDir && homeDir[0]) {
+            std::filesystem::path candidate = std::filesystem::path(homeDir) / "Development" / "FidelityFX-SDK";
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec)) {
+                m_sdkRootDir = candidate.string();
+            }
         }
     }
 #if defined(PATHWAYS_FFX_SDK_ROOT_DIR)
@@ -97,10 +73,11 @@ void FfxSdkRuntime::initialize(const std::string& sdkRootDir) {
 #endif
 
 #ifdef _WIN32
-    tryLoadModule(FfxEffectModule::Loader, {"amd_fidelityfx_loader_vk.dll", "amd_fidelityfx_loader_dx12.dll"});
+    // Only load Vulkan provider DLLs (*_vk.dll); never load DirectX 12 (*_dx12.dll) providers into a Vulkan engine
+    tryLoadModule(FfxEffectModule::Loader, {"amd_fidelityfx_loader_vk.dll"});
     tryLoadModule(FfxEffectModule::Upscaler, {"amd_fidelityfx_upscaler_vk.dll", "amd_fidelityfx_vk.dll"});
-    tryLoadModule(FfxEffectModule::Denoiser, {"amd_fidelityfx_denoiser_vk.dll", "amd_fidelityfx_denoiser_dx12.dll"});
-    tryLoadModule(FfxEffectModule::RadianceCache, {"amd_fidelityfx_radiancecache_vk.dll", "amd_fidelityfx_radiancecache_dx12.dll"});
+    tryLoadModule(FfxEffectModule::Denoiser, {"amd_fidelityfx_denoiser_vk.dll"});
+    tryLoadModule(FfxEffectModule::RadianceCache, {"amd_fidelityfx_radiancecache_vk.dll"});
 #else
     tryLoadModule(FfxEffectModule::Loader, {"libamd_fidelityfx_loader_vk.so", "amd_fidelityfx_loader_vk.so"});
     tryLoadModule(FfxEffectModule::Upscaler, {"libamd_fidelityfx_upscaler_vk.so", "amd_fidelityfx_upscaler_vk.so"});
@@ -165,8 +142,43 @@ bool FfxSdkRuntime::tryLoadModule(FfxEffectModule module, const std::vector<std:
 
 bool FfxSdkRuntime::hasNativeProvider(FfxEffectModule module) const {
     const auto& mod = m_modules[static_cast<uint32_t>(module)];
-    const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
-    return (mod.handle != nullptr) || (loader.handle != nullptr);
+    if (mod.handle != nullptr) {
+        return true;
+    }
+    if (module == FfxEffectModule::Upscaler) {
+        const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
+        return loader.handle != nullptr;
+    }
+    return false;
+}
+
+uint32_t FfxSdkRuntime::parseMajorVersion(const FfxSdkVersionInfo& info) {
+    if (!info.versionName.empty()) {
+        const char* s = info.versionName.c_str();
+        while (*s && (*s < '0' || *s > '9')) {
+            ++s;
+        }
+        if (*s >= '0' && *s <= '9') {
+            uint32_t major = 0;
+            while (*s >= '0' && *s <= '9') {
+                major = major * 10u + static_cast<uint32_t>(*s - '0');
+                ++s;
+            }
+            if (*s == '.') {
+                return major;
+            }
+        }
+    }
+    const uint32_t major32 = static_cast<uint32_t>((info.versionId >> 32) & 0xFFFFu);
+    if (major32 > 0 && major32 < 32) {
+        return major32;
+    }
+    const uint32_t major48 = static_cast<uint32_t>((info.versionId >> 48) & 0xFFFFu);
+    if (major48 > 0 && major48 < 32) {
+        return major48;
+    }
+    const uint32_t major22 = static_cast<uint32_t>(((info.versionId & 0x7FFFFFFFull) >> 22) & 0x1FFu);
+    return major22;
 }
 
 std::string FfxSdkRuntime::getSdkStatusString() const {
@@ -246,14 +258,42 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
     return has8BitSupport;
 }
 
-std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(uint64_t createDescType, VkPhysicalDevice physDevice) const {
+std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
+    uint64_t createDescType,
+    VkPhysicalDevice physDevice,
+    VkDevice device) const
+{
     std::vector<FfxSdkVersionInfo> result;
 #if defined(PATHWAYS_HAS_FFX_SDK)
+    VkDevice tempDevice = VK_NULL_HANDLE;
+    if (physDevice != VK_NULL_HANDLE && device == VK_NULL_HANDLE) {
+        float queuePriority = 1.0f;
+        VkDeviceQueueCreateInfo qci{};
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = 0;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &queuePriority;
+
+        VkDeviceCreateInfo dci{};
+        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1;
+        dci.pQueueCreateInfos = &qci;
+        if (vkCreateDevice(physDevice, &dci, nullptr, &tempDevice) == VK_SUCCESS) {
+            device = tempDevice;
+        }
+    }
+
+    VkDeviceContext vkDevCtx{};
+    vkDevCtx.vkDevice = device;
+    vkDevCtx.vkPhysicalDevice = physDevice;
+    vkDevCtx.vkDeviceProcAddr = vkGetDeviceProcAddr;
+
     ffxQueryDescGetVersions versionQuery{};
     versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
     versionQuery.header.pNext = nullptr;
     versionQuery.createDescType = createDescType;
-    versionQuery.device = physDevice;
+    // Per FidelityFX SDK 2.4 Vulkan API spec, versionQuery.device on Vulkan must be VkDeviceContext*
+    versionQuery.device = (physDevice != VK_NULL_HANDLE && device != VK_NULL_HANDLE) ? &vkDevCtx : nullptr;
     uint64_t count = 0;
     versionQuery.outputCount = &count;
     versionQuery.versionIds = nullptr;
@@ -273,11 +313,66 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(uint64_t creat
             }
         }
     }
+
+    if (tempDevice != VK_NULL_HANDLE) {
+        vkDestroyDevice(tempDevice, nullptr);
+    }
 #else
     (void)createDescType;
     (void)physDevice;
+    (void)device;
 #endif
     return result;
+}
+
+bool FfxSdkRuntime::isUpscalerVersionSupported(VkPhysicalDevice physDevice, VkDevice device, uint32_t majorVersion) const {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (!hasNativeProvider(FfxEffectModule::Upscaler)) {
+        return false;
+    }
+    if (majorVersion >= 4u && physDevice != VK_NULL_HANDLE && !supportsHardwareMl(physDevice)) {
+        return false;
+    }
+    auto versions = queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, physDevice, device);
+    for (const auto& v : versions) {
+        if (parseMajorVersion(v) == majorVersion) {
+            return true;
+        }
+    }
+#else
+    (void)physDevice;
+    (void)device;
+    (void)majorVersion;
+#endif
+    return false;
+}
+
+bool FfxSdkRuntime::isRayRegenerationSupported(VkPhysicalDevice physDevice, VkDevice device) const {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (!hasNativeProvider(FfxEffectModule::Denoiser)) {
+        return false;
+    }
+    auto versions = queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER, physDevice, device);
+    return !versions.empty();
+#else
+    (void)physDevice;
+    (void)device;
+    return false;
+#endif
+}
+
+bool FfxSdkRuntime::isRadianceCacheSupported(VkPhysicalDevice physDevice, VkDevice device) const {
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (!hasNativeProvider(FfxEffectModule::RadianceCache)) {
+        return false;
+    }
+    auto versions = queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_RADIANCECACHE, physDevice, device);
+    return !versions.empty();
+#else
+    (void)physDevice;
+    (void)device;
+    return false;
+#endif
 }
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
@@ -328,20 +423,33 @@ ffx::CreateBackendVKDesc FfxSdkRuntime::makeBackendVkDesc(VkDevice device, VkPhy
 
 const FfxSdkRuntime::ModuleEntry* FfxSdkRuntime::selectModuleForHeader(uint64_t headerType) const {
     uint64_t effectMask = headerType & FFX_API_EFFECT_MASK;
-    const ModuleEntry* chosen = nullptr;
-    if (effectMask == FFX_API_EFFECT_ID_UPSCALE) {
-        chosen = &m_modules[static_cast<uint32_t>(FfxEffectModule::Upscaler)];
-    } else if (effectMask == FFX_API_EFFECT_ID_DENOISER) {
-        chosen = &m_modules[static_cast<uint32_t>(FfxEffectModule::Denoiser)];
-    } else if (effectMask == FFX_API_EFFECT_ID_RADIANCECACHE) {
-        chosen = &m_modules[static_cast<uint32_t>(FfxEffectModule::RadianceCache)];
+    if (effectMask == FFX_API_EFFECT_ID_DENOISER) {
+        const auto& mod = m_modules[static_cast<uint32_t>(FfxEffectModule::Denoiser)];
+        return (mod.handle != nullptr) ? &mod : nullptr;
     }
-    if (chosen && chosen->handle != nullptr) {
-        return chosen;
+    if (effectMask == FFX_API_EFFECT_ID_RADIANCECACHE) {
+        const auto& mod = m_modules[static_cast<uint32_t>(FfxEffectModule::RadianceCache)];
+        return (mod.handle != nullptr) ? &mod : nullptr;
+    }
+    if (effectMask == FFX_API_EFFECT_ID_UPSCALE) {
+        const auto& mod = m_modules[static_cast<uint32_t>(FfxEffectModule::Upscaler)];
+        if (mod.handle != nullptr) {
+            return &mod;
+        }
     }
     const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
     if (loader.handle != nullptr) {
         return &loader;
+    }
+    return nullptr;
+}
+
+const FfxSdkRuntime::ModuleEntry* FfxSdkRuntime::findModuleForContext(const void* ctx) const {
+    if (!ctx) return nullptr;
+    for (const auto& kv : m_contextOwners) {
+        if (kv.first == ctx) {
+            return kv.second;
+        }
     }
     return nullptr;
 }
@@ -352,7 +460,11 @@ ffxReturnCode_t FfxSdkRuntime::dispatchCreateContext(ffxContext* context, ffxCre
     }
     const ModuleEntry* mod = selectModuleForHeader(desc->type);
     if (mod && mod->createContext) {
-        return mod->createContext(context, desc, memCb);
+        ffxReturnCode_t ret = mod->createContext(context, desc, memCb);
+        if (ret == FFX_API_RETURN_OK && *context != nullptr) {
+            m_contextOwners.emplace_back(*context, mod);
+        }
+        return ret;
     }
     *context = nullptr;
     return FFX_API_RETURN_NO_PROVIDER;
@@ -362,10 +474,23 @@ ffxReturnCode_t FfxSdkRuntime::dispatchDestroyContext(ffxContext* context, const
     if (!context || !*context) {
         return FFX_API_RETURN_OK;
     }
-    for (const auto& mod : m_modules) {
-        if (mod.handle && mod.destroyContext) {
-            return mod.destroyContext(context, memCb);
+    const ModuleEntry* owner = findModuleForContext(*context);
+    for (auto it = m_contextOwners.begin(); it != m_contextOwners.end(); ++it) {
+        if (it->first == *context) {
+            m_contextOwners.erase(it);
+            break;
         }
+    }
+    if (owner && owner->destroyContext) {
+        ffxReturnCode_t ret = owner->destroyContext(context, memCb);
+        *context = nullptr;
+        return ret;
+    }
+    const auto& upscalerMod = m_modules[static_cast<uint32_t>(FfxEffectModule::Upscaler)];
+    if (upscalerMod.handle && upscalerMod.destroyContext) {
+        ffxReturnCode_t ret = upscalerMod.destroyContext(context, memCb);
+        *context = nullptr;
+        return ret;
     }
     *context = nullptr;
     return FFX_API_RETURN_OK;
@@ -375,7 +500,10 @@ ffxReturnCode_t FfxSdkRuntime::dispatchConfigure(ffxContext* context, const ffxC
     if (!desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const ModuleEntry* mod = selectModuleForHeader(desc->type);
+    const ModuleEntry* mod = (context && *context) ? findModuleForContext(*context) : nullptr;
+    if (!mod) {
+        mod = selectModuleForHeader(desc->type);
+    }
     if (mod && mod->configure) {
         return mod->configure(context, desc);
     }
@@ -389,115 +517,25 @@ ffxReturnCode_t FfxSdkRuntime::dispatchQuery(ffxContext* context, ffxQueryDescHe
     if (!desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const ModuleEntry* mod = selectModuleForHeader(desc->type);
+    uint64_t lookupType = desc->type;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+        const auto* q = reinterpret_cast<const ffxQueryDescGetVersions*>(desc);
+        lookupType = q->createDescType;
+    }
+    const ModuleEntry* mod = (context && *context) ? findModuleForContext(*context) : nullptr;
+    if (!mod) {
+        mod = selectModuleForHeader(lookupType);
+    }
     if (mod && mod->query) {
         return mod->query(context, desc);
     }
 
-    // Built-in SDK 2.4.0 specification query responder when no external provider binary is loaded
-    switch (desc->type) {
-        case FFX_API_QUERY_DESC_TYPE_GET_VERSIONS: {
-            auto* q = reinterpret_cast<ffxQueryDescGetVersions*>(desc);
-            if (!q->outputCount) {
-                return FFX_API_RETURN_ERROR_PARAMETER;
-            }
-            uint64_t effectMask = q->createDescType & FFX_API_EFFECT_MASK;
-            if (effectMask == FFX_API_EFFECT_ID_UPSCALE) {
-                const bool mlSupported = (q->device == nullptr) ||
-                    supportsHardwareMl(reinterpret_cast<VkPhysicalDevice>(q->device));
-                static constexpr uint64_t kUpscalerIdsAll[2] = {
-                    0x000400010002ull, // FSR 4.1.2 (ML Super Resolution)
-                    0x000300010006ull  // FSR 3.1.6 (Analytical Fallback)
-                };
-                static constexpr const char* kUpscalerNamesAll[2] = {
-                    "4.1.2",
-                    "3.1.6"
-                };
-                const uint64_t* idsPtr = mlSupported ? kUpscalerIdsAll : &kUpscalerIdsAll[1];
-                const char* const* namesPtr = mlSupported ? kUpscalerNamesAll : &kUpscalerNamesAll[1];
-                const uint64_t avail = mlSupported ? 2u : 1u;
-                if (!q->versionIds && !q->versionNames) {
-                    *q->outputCount = avail;
-                    return FFX_API_RETURN_OK;
-                }
-                uint64_t toCopy = (*q->outputCount < avail) ? *q->outputCount : avail;
-                for (uint64_t i = 0; i < toCopy; ++i) {
-                    if (q->versionIds) q->versionIds[i] = idsPtr[i];
-                    if (q->versionNames) q->versionNames[i] = namesPtr[i];
-                }
-                *q->outputCount = toCopy;
-                return FFX_API_RETURN_OK;
-            } else if (effectMask == FFX_API_EFFECT_ID_DENOISER) {
-                static constexpr uint64_t kDenoiserId = 0x000100020001ull; // 1.2.1
-                static constexpr const char* kDenoiserName = "1.2.1";
-                if (!q->versionIds && !q->versionNames) {
-                    *q->outputCount = 1;
-                    return FFX_API_RETURN_OK;
-                }
-                if (*q->outputCount >= 1) {
-                    if (q->versionIds) q->versionIds[0] = kDenoiserId;
-                    if (q->versionNames) q->versionNames[0] = kDenoiserName;
-                    *q->outputCount = 1;
-                }
-                return FFX_API_RETURN_OK;
-            } else if (effectMask == FFX_API_EFFECT_ID_RADIANCECACHE) {
-                static constexpr uint64_t kRcId = 0x000000090000ull; // 0.9.0
-                static constexpr const char* kRcName = "0.9.0";
-                if (!q->versionIds && !q->versionNames) {
-                    *q->outputCount = 1;
-                    return FFX_API_RETURN_OK;
-                }
-                if (*q->outputCount >= 1) {
-                    if (q->versionIds) q->versionIds[0] = kRcId;
-                    if (q->versionNames) q->versionNames[0] = kRcName;
-                    *q->outputCount = 1;
-                }
-                return FFX_API_RETURN_OK;
-            }
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+        auto* q = reinterpret_cast<ffxQueryDescGetVersions*>(desc);
+        if (q->outputCount) {
             *q->outputCount = 0;
-            return FFX_API_RETURN_OK;
         }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode*>(desc);
-            if (!q->pOutUpscaleRatio) return FFX_API_RETURN_ERROR_PARAMETER;
-            *q->pOutUpscaleRatio = qualityModeToRatio(q->qualityMode);
-            return FFX_API_RETURN_OK;
-        }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetRenderResolutionFromQualityMode*>(desc);
-            if (!q->pOutRenderWidth || !q->pOutRenderHeight) return FFX_API_RETURN_ERROR_PARAMETER;
-            float ratio = qualityModeToRatio(q->qualityMode);
-            *q->pOutRenderWidth  = static_cast<uint32_t>(std::max(1.0f, std::round(static_cast<float>(q->displayWidth) / ratio)));
-            *q->pOutRenderHeight = static_cast<uint32_t>(std::max(1.0f, std::round(static_cast<float>(q->displayHeight) / ratio)));
-            return FFX_API_RETURN_OK;
-        }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetJitterPhaseCount*>(desc);
-            if (!q->pOutPhaseCount || q->renderWidth == 0) return FFX_API_RETURN_ERROR_PARAMETER;
-            float scale = static_cast<float>(q->displayWidth) / static_cast<float>(q->renderWidth);
-            *q->pOutPhaseCount = std::max(8, static_cast<int32_t>(std::ceil(8.0f * scale * scale)));
-            return FFX_API_RETURN_OK;
-        }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetJitterOffset*>(desc);
-            if (!q->pOutX || !q->pOutY || q->phaseCount <= 0) return FFX_API_RETURN_ERROR_PARAMETER;
-            int32_t idx = (q->index % q->phaseCount) + 1;
-            *q->pOutX = haltonBase(idx, 2);
-            *q->pOutY = haltonBase(idx, 3);
-            return FFX_API_RETURN_OK;
-        }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetResourceRequirements*>(desc);
-            q->required_resources = FFX_API_QUERY_RESOURCE_INPUT_COLOR |
-                                    FFX_API_QUERY_RESOURCE_INPUT_DEPTH |
-                                    FFX_API_QUERY_RESOURCE_INPUT_MV;
-            q->optional_resources = FFX_API_QUERY_RESOURCE_INPUT_EXPOSURE |
-                                    FFX_API_QUERY_RESOURCE_INPUT_REACTIVEMASK |
-                                    FFX_API_QUERY_RESOURCE_INPUT_TRANSPARENCYCOMPOSITION;
-            return FFX_API_RETURN_OK;
-        }
-        default:
-            break;
+        return FFX_API_RETURN_NO_PROVIDER;
     }
 
     return FFX_API_RETURN_NO_PROVIDER;
@@ -507,7 +545,10 @@ ffxReturnCode_t FfxSdkRuntime::dispatchExecute(ffxContext* context, const ffxDis
     if (!context || !*context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const ModuleEntry* mod = selectModuleForHeader(desc->type);
+    const ModuleEntry* mod = findModuleForContext(*context);
+    if (!mod) {
+        mod = selectModuleForHeader(desc->type);
+    }
     if (mod && mod->dispatch) {
         return mod->dispatch(context, desc);
     }

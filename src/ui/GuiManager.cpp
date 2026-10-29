@@ -862,7 +862,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered() && tooltip) {
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
@@ -984,7 +984,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (actions) actions->resetAccumulation = true;
                 }
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered() && tooltip) {
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
@@ -1009,10 +1009,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 });
             ImGui::EndDisabled();
             ImGui::SameLine();
+            ImGui::BeginDisabled(!stats.supports_fsr3);
             drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected,
-                "AMD FidelityFX Super Resolution 3.1.6 (Analytical Lanczos-2 + YCoCg Fallback Upscaler).", [&]() {
+                stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (SDK Analytical Super-Resolution)." : "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk).", [&]() {
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr3;
+                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                });
+            ImGui::EndDisabled();
+            (void)([&]() {
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
@@ -1094,7 +1099,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered() && tooltip) {
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
@@ -1102,8 +1107,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawQuickDenoiserBtn(DenoiserMode::None, "Off (MC)",
                 "Unbiased pure Monte Carlo path tracing with progressive temporal accumulation.");
             ImGui::SameLine();
+            ImGui::BeginDisabled(!stats.supports_fsr_rr);
             drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen",
-                "AMD FSR Ray Regeneration 1.2.1 (Decoupled Diffuse + Specular + VMV Spatio-Temporal Denoiser).");
+                stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)." : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk.");
+            ImGui::EndDisabled();
             ImGui::SameLine();
             drawQuickDenoiserBtn(DenoiserMode::Svgf, "E-SVGF",
                 "Edge-Aware Spatio-Temporal Variance-Guided Wavelet Filter (61x61 receptive field).");
@@ -1134,14 +1141,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (actions) actions->resetAccumulation = true;
                 }
                 ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered() && tooltip) {
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && tooltip) {
                     ImGui::SetTooltip("%s", tooltip);
                 }
             };
 
             ImGui::BeginDisabled(!stats.has_cooperative_matrix);
-            drawQuickToggleBtn("Radiance Cache: ON", "Radiance Cache: OFF", config.enable_nrc,
-                "AMD FSR Radiance Cache 0.9.0 (Wave32 WMMA + Path-Spread Heuristic). Terminates 96.5% of bounce-2 diffuse rays into the neural cache (Requires VK_KHR_cooperative_matrix).");
+            drawQuickToggleBtn("Neural Cache: ON", "Neural Cache: OFF", config.enable_nrc,
+                "In-house Wave32 WMMA Neural Direct-Light Cache (Requires VK_KHR_cooperative_matrix).");
             ImGui::EndDisabled();
             ImGui::SameLine();
             drawQuickToggleBtn("ReSTIR PT: ON", "ReSTIR PT: OFF", config.enable_restir,
@@ -1699,13 +1706,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Separator();
-            ImGui::TextDisabled("Neural Radiance Caching (AMD FSR Radiance Cache 0.9.0 / Wave32 WMMA):");
+            ImGui::TextDisabled("Neural Radiance Caching (Wave32 WMMA):");
             if (ImGui::Checkbox("Enable Neural Radiance Cache", &config.enable_nrc)) {
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Accelerates multi-bounce indirect GI using AMD FSR Radiance Cache (0.9.0) path-spread heuristic, albedo factorization, and Wave32 cooperative matrix MLP.");
+                ImGui::SetTooltip("Accelerates direct lighting using an online-trained Wave32 cooperative matrix Multi-Res Hash MLP.");
             }
             if (config.enable_nrc) {
                 ImGui::Indent();
@@ -1718,7 +1725,27 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (nrcBackendIdx < 0 || nrcBackendIdx >= IM_ARRAYSIZE(nrcBackendLabels)) {
                     nrcBackendIdx = 0;
                 }
-                if (ImGui::Combo("NRC Backend", &nrcBackendIdx, nrcBackendLabels, IM_ARRAYSIZE(nrcBackendLabels))) {
+                if (ImGui::BeginCombo("NRC Backend", nrcBackendLabels[nrcBackendIdx])) {
+                    for (int n = 0; n < IM_ARRAYSIZE(nrcBackendLabels); ++n) {
+                        const bool isSdkRc = (n == static_cast<int>(NrcBackend::FfxRadianceCache));
+                        if (isSdkRc && !stats.supports_fsr_rc) ImGui::BeginDisabled(true);
+                        const bool isSelected = (nrcBackendIdx == n);
+                        if (ImGui::Selectable(nrcBackendLabels[n], isSelected)) {
+                            nrcBackendIdx = n;
+                            config.nrc_backend = static_cast<NrcBackend>(nrcBackendIdx);
+                            settingsChanged = true;
+                            if (actions) actions->resetAccumulation = true;
+                        }
+                        if (isSelected) ImGui::SetItemDefaultFocus();
+                        if (isSdkRc && !stats.supports_fsr_rc) {
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                                ImGui::SetTooltip("Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_radiancecache_vk.");
+                            }
+                        }
+                    }
+                    ImGui::EndCombo();
+                } else if (ImGui::Combo("##HiddenNrcCombo", &nrcBackendIdx, nrcBackendLabels, 0)) {
                     config.nrc_backend = static_cast<NrcBackend>(nrcBackendIdx);
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
@@ -1818,7 +1845,32 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 denoiserIdx = 0;
             }
 
-            if (ImGui::Combo("Denoiser Mode", &denoiserIdx, denoiserModeLabels, IM_ARRAYSIZE(denoiserModeLabels))) {
+            if (ImGui::BeginCombo("Denoiser Mode", denoiserModeLabels[denoiserIdx])) {
+                for (int n = 0; n < IM_ARRAYSIZE(denoiserModeLabels); ++n) {
+                    const DenoiserMode candMode = static_cast<DenoiserMode>(n);
+                    const bool needsCoop = (candMode == DenoiserMode::Upways || candMode == DenoiserMode::Gateway);
+                    const bool needsFfxRr = (candMode == DenoiserMode::FfxRayRegeneration);
+                    const bool itemDisabled = (needsCoop && !stats.has_cooperative_matrix) || (needsFfxRr && !stats.supports_fsr_rr);
+                    if (itemDisabled) ImGui::BeginDisabled(true);
+                    const bool isSelected = (denoiserIdx == n);
+                    if (ImGui::Selectable(denoiserModeLabels[n], isSelected)) {
+                        denoiserIdx = n;
+                        config.denoiser_mode = candMode;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    if (isSelected) ImGui::SetItemDefaultFocus();
+                    if (itemDisabled) {
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                            ImGui::SetTooltip("%s", needsFfxRr
+                                ? "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk."
+                                : "Unavailable: Requires VK_KHR_cooperative_matrix support.");
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            } else if (ImGui::Combo("##HiddenDenoiserCombo", &denoiserIdx, denoiserModeLabels, 0)) {
                 config.denoiser_mode = static_cast<DenoiserMode>(denoiserIdx);
                 settingsChanged = true;
                 if (actions) actions->resetAccumulation = true;
@@ -1875,9 +1927,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::SameLine();
                 };
                 drawFsrVerBtn(FsrVersion::Auto, "Auto");
-                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1 (Fallback)");
-                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4 (ML)");
-                drawFsrVerBtn(FsrVersion::Fsr5, "FSR 5");
+                ImGui::BeginDisabled(!stats.supports_fsr3);
+                drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1");
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled(!stats.supports_fsr4);
+                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML");
+                ImGui::EndDisabled();
+
                 ImGui::NewLine();
                 ImGui::PopID();
 

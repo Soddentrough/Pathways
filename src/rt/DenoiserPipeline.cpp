@@ -298,7 +298,7 @@ void DenoiserPipeline::resize(uint32_t width, uint32_t height, AccumFormat accum
         vkQueueWaitIdle(m_queue);
     }
 
-    Logger::info("DenoiserPipeline (E-SVGF / AMD FSR Ray Regeneration) allocated 17 internal storage images ({}x{}, format {})",
+    Logger::info("DenoiserPipeline (Adaptive E-SVGF) allocated 17 internal storage images ({}x{}, format {})",
                  width, height, static_cast<int>(accumFormat));
     initFfxDenoiserContext();
 }
@@ -562,7 +562,7 @@ void DenoiserPipeline::recordDenoise(
                           ffxDirectDiffuse, ffxDirectSpecular, ffxIndirectDiffuse, ffxIndirectSpecular);
     }
 
-    const uint32_t isRayRegen = (denoiserMode == DenoiserMode::FfxRayRegeneration) ? 1u : 0u;
+    const uint32_t isRayRegen = (denoiserMode == DenoiserMode::FfxRayRegeneration && m_ffxDenoiserContext != nullptr) ? 1u : 0u;
 
     // Upload per-frame camera matrices for Pass 1 (std140 binary compatible)
     m_cameraMatricesUBO[frameSlot]->copyFrom(&cameraMatrices, sizeof(CameraMatrices));

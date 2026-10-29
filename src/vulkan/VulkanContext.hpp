@@ -225,6 +225,7 @@ private:
     bool m_hasPositionFetch = false;
     bool m_hasDescriptorHeap = false;
     bool m_hasUnifiedImageLayouts = false;
+    bool m_hasComputeShaderDerivatives = false;
 #ifdef _WIN32
     bool m_hasExternalMemoryWin32 = false;
     bool m_hasExternalSemaphoreWin32 = false;

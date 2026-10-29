@@ -2,6 +2,7 @@
 #include "rt/FfxSdkRuntime.hpp"
 #include "core/Logger.hpp"
 
+#include <cfloat>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -86,24 +87,9 @@ FsrUpscaler::~FsrUpscaler() {
 }
 
 void FsrUpscaler::probeHardwareCapabilities() {
-    m_hwMlSupported = FfxSdkRuntime::supportsHardwareMl(m_physDevice);
-#if defined(PATHWAYS_HAS_FFX_SDK)
-    if (m_hwMlSupported) {
-        auto versions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, m_physDevice);
-        if (!versions.empty()) {
-            bool foundFsr4 = false;
-            for (const auto& v : versions) {
-                const uint64_t majorVer = ((v.versionId >> 32) & 0xFFFFu);
-                const uint64_t legacyMajorVer = (v.versionId >> 48);
-                if (majorVer >= 4u || legacyMajorVer >= 4u) {
-                    foundFsr4 = true;
-                    break;
-                }
-            }
-            m_hwMlSupported = foundFsr4;
-        }
-    }
-#endif
+    m_sdkFsr3Supported = FfxSdkRuntime::instance().isUpscalerVersionSupported(m_physDevice, m_device, 3u);
+    m_sdkFsr4Supported = FfxSdkRuntime::instance().isUpscalerVersionSupported(m_physDevice, m_device, 4u);
+    m_hwMlSupported = m_sdkFsr4Supported;
 }
 
 void FsrUpscaler::resolveActiveVersion() {
@@ -113,12 +99,12 @@ void FsrUpscaler::resolveActiveVersion() {
     } else if (m_targetVersion == FsrVersion::Auto ||
                m_targetVersion == FsrVersion::Fsr4 ||
                m_targetVersion == FsrVersion::Fsr5) {
-        if (m_hwMlSupported) {
+        if (m_sdkFsr4Supported) {
             m_activeVersion = FsrVersion::Fsr4;
         } else {
             m_activeVersion = FsrVersion::Fsr3;
             if (m_targetVersion != FsrVersion::Auto) {
-                Logger::warn("FsrUpscaler [{}]: Hardware lacks Cooperative Matrix ML acceleration; falling back to FSR 3.1.6.",
+                Logger::warn("FsrUpscaler [{}]: FSR 4 ML Upscaler provider not available on this device; falling back to FSR 3.",
                              m_instanceName);
             }
         }
@@ -142,10 +128,16 @@ void FsrUpscaler::setTargetVersion(FsrVersion version) {
 }
 
 const char* FsrUpscaler::getActiveVersionName() const {
-    if (m_activeVersion == FsrVersion::Fsr4) {
-        return "AMD FSR 4.1.2 (ML Super-Resolution)";
+    if (m_ffxContext != nullptr && !m_activeVersionLabel.empty()) {
+        return m_activeVersionLabel.c_str();
     }
-    return "AMD FSR 3.1.6 (Analytical Fallback)";
+    if (m_ffxContext != nullptr) {
+        if (m_activeVersion == FsrVersion::Fsr4) {
+            return "AMD FSR 4.1.2 (SDK ML Super-Resolution)";
+        }
+        return "AMD FSR 3.1.6 (SDK Analytical)";
+    }
+    return "In-House Lanczos-2 Temporal Upscaler (No SDK Context)";
 }
 
 void FsrUpscaler::initFfxSdkContext() {
@@ -155,6 +147,27 @@ void FsrUpscaler::initFfxSdkContext() {
     m_vramUsageBytes = static_cast<uint64_t>(m_displayWidth) * static_cast<uint64_t>(m_displayHeight) * 8ull * 4ull;
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
+    if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler)) {
+        return;
+    }
+
+    const uint32_t desiredMajor = (m_activeVersion == FsrVersion::Fsr4) ? 4u : 3u;
+    auto queriedVersions = FfxSdkRuntime::instance().queryEffectVersions(
+        FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, m_physDevice, m_device);
+
+    uint64_t selectedVersionId = 0;
+    std::string selectedVersionName;
+    for (const auto& v : queriedVersions) {
+        if (FfxSdkRuntime::parseMajorVersion(v) == desiredMajor) {
+            selectedVersionId = v.versionId;
+            selectedVersionName = v.versionName;
+            break;
+        }
+    }
+    if (selectedVersionId == 0) {
+        return;
+    }
+
     auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, m_physDevice);
 
     ffx::QueryDescUpscaleGetResourceRequirements reqQuery{};
@@ -164,28 +177,49 @@ void FsrUpscaler::initFfxSdkContext() {
     }
 
     ffx::CreateContextDescUpscale createUpscale{};
-    createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+    createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
+                          FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+                          FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+                          FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     createUpscale.maxRenderSize = { m_renderWidth, m_renderHeight };
     createUpscale.maxUpscaleSize = { m_displayWidth, m_displayHeight };
     createUpscale.fpMessage = nullptr;
 
+    ffx::CreateContextDescUpscaleVersion headerVersion{};
+    headerVersion.version = FFX_UPSCALER_VERSION;
+
     ffx::CreateContextDescOverrideVersion versionOpt{};
-    versionOpt.versionId = (m_activeVersion == FsrVersion::Fsr4)
-        ? 0x000400010002ull  // FSR 4.1.2 ML Upscaler
-        : 0x000300010006ull; // FSR 3.1.6 Analytical Fallback
+    versionOpt.versionId = selectedVersionId;
+
+    FfxApiEffectMemoryUsage gpuMem{};
+    ffx::QueryDescUpscaleGetGPUMemoryUsageV2 memQuery{};
+    memQuery.device = &backendDesc.deviceContext;
+    memQuery.maxRenderSize = { m_renderWidth, m_renderHeight };
+    memQuery.maxUpscaleSize = { m_displayWidth, m_displayHeight };
+    memQuery.flags = createUpscale.flags;
+    memQuery.gpuMemoryUsageUpscaler = &gpuMem;
+    if (ffx::Query(memQuery, versionOpt) == ffx::ReturnCode::Ok && gpuMem.totalUsageInBytes > 0) {
+        m_vramUsageBytes = gpuMem.totalUsageInBytes;
+    }
 
     ffxContext ctx = nullptr;
-    if (ffx::CreateContext(ctx, nullptr, createUpscale, backendDesc, versionOpt) == ffx::ReturnCode::Ok && ctx != nullptr) {
+    if (ffx::CreateContext(ctx, nullptr, createUpscale, backendDesc, headerVersion, versionOpt) == ffx::ReturnCode::Ok && ctx != nullptr) {
         m_ffxContext = ctx;
-        FfxApiEffectMemoryUsage gpuMem{};
-        ffx::QueryDescUpscaleGetGPUMemoryUsageV2 memQuery{};
-        memQuery.device = m_physDevice;
-        memQuery.maxRenderSize = { m_renderWidth, m_renderHeight };
-        memQuery.maxUpscaleSize = { m_displayWidth, m_displayHeight };
-        memQuery.flags = createUpscale.flags;
-        memQuery.gpuMemoryUsageUpscaler = &gpuMem;
-        if (ffx::Query(m_ffxContext, memQuery, versionOpt) == ffx::ReturnCode::Ok && gpuMem.totalUsageInBytes > 0) {
-            m_vramUsageBytes = gpuMem.totalUsageInBytes;
+        m_providerVersionId = selectedVersionId;
+        m_providerVersionName = selectedVersionName;
+
+        ffxQueryGetProviderVersion providerVerQuery{};
+        providerVerQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+        providerVerQuery.header.pNext = nullptr;
+        if (ffxQuery(&m_ffxContext, &providerVerQuery.header) == FFX_API_RETURN_OK && providerVerQuery.versionName) {
+            m_providerVersionId = providerVerQuery.versionId;
+            m_providerVersionName = providerVerQuery.versionName;
+        }
+
+        if (m_activeVersion == FsrVersion::Fsr4) {
+            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("4.1.2") : m_providerVersionName) + " (SDK ML Super-Resolution)";
+        } else {
+            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("3.1.6") : m_providerVersionName) + " (SDK Analytical)";
         }
     }
 #endif
@@ -200,9 +234,13 @@ void FsrUpscaler::destroyFfxSdkContext() {
 #else
     m_ffxContext = nullptr;
 #endif
+    m_providerVersionId = 0;
+    m_providerVersionName.clear();
+    m_activeVersionLabel.clear();
 }
 
 void FsrUpscaler::initImages() {
+    m_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
@@ -228,6 +266,27 @@ void FsrUpscaler::initImages() {
             usage
         );
     }
+
+    m_sdkColorInput = std::make_unique<Image>(
+        m_device, m_allocator,
+        m_renderWidth, m_renderHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        usage
+    );
+
+    m_sdkDepthInput = std::make_unique<Image>(
+        m_device, m_allocator,
+        m_renderWidth, m_renderHeight,
+        VK_FORMAT_R32_SFLOAT,
+        usage
+    );
+
+    m_sdkMotionVectorsInput = std::make_unique<Image>(
+        m_device, m_allocator,
+        m_renderWidth, m_renderHeight,
+        VK_FORMAT_R16G16_SFLOAT,
+        usage
+    );
 
     m_historyIndex = 0;
     m_historyValid = false;
@@ -286,10 +345,10 @@ void FsrUpscaler::createDescriptorSetLayouts() {
 void FsrUpscaler::allocateDescriptorSets() {
     VkDescriptorPoolSize poolSizes[1]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 24; // 2 sets * 6 bindings + 1 set * 2 bindings + headroom
+    poolSizes[0].descriptorCount = 32; // 3 sets * 6 bindings + 1 set * 2 bindings + headroom
 
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 4;
+    poolInfo.maxSets = 6;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = poolSizes;
 
@@ -306,6 +365,14 @@ void FsrUpscaler::allocateDescriptorSets() {
         throw std::runtime_error("FsrUpscaler: Failed to allocate upscale descriptor sets!");
     }
 
+    VkDescriptorSetAllocateInfo sdkPrepAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    sdkPrepAlloc.descriptorPool = m_descPool;
+    sdkPrepAlloc.descriptorSetCount = 1;
+    sdkPrepAlloc.pSetLayouts = &m_upscaleDescLayout;
+    if (vkAllocateDescriptorSets(m_device, &sdkPrepAlloc, &m_sdkPrepDescSet) != VK_SUCCESS) {
+        throw std::runtime_error("FsrUpscaler: Failed to allocate SDK prep descriptor set!");
+    }
+
     VkDescriptorSetAllocateInfo rcasAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     rcasAlloc.descriptorPool = m_descPool;
     rcasAlloc.descriptorSetCount = 1;
@@ -316,7 +383,8 @@ void FsrUpscaler::allocateDescriptorSets() {
 }
 
 void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
-    if (inputColorView == VK_NULL_HANDLE || !m_upscaledImage || !m_sharpenedImage || !m_historyImages[0] || !m_historyImages[1]) {
+    if (inputColorView == VK_NULL_HANDLE || !m_upscaledImage || !m_sharpenedImage || !m_historyImages[0] || !m_historyImages[1] ||
+        !m_sdkColorInput || !m_sdkDepthInput || !m_sdkMotionVectorsInput) {
         return;
     }
 
@@ -330,9 +398,12 @@ void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView m
     VkDescriptorImageInfo hist1Info{ VK_NULL_HANDLE, m_historyImages[1]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo upscaledInfo{ VK_NULL_HANDLE, m_upscaledImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sharpenedInfo{ VK_NULL_HANDLE, m_sharpenedImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo sdkColorInfo{ VK_NULL_HANDLE, m_sdkColorInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo sdkDepthInfo{ VK_NULL_HANDLE, m_sdkDepthInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo sdkMvInfo{ VK_NULL_HANDLE, m_sdkMotionVectorsInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
-    // 14 writes: 6 for Set 0, 6 for Set 1, 2 for RCAS
-    VkWriteDescriptorSet writes[14]{};
+    // 20 writes: 6 for Set 0, 6 for Set 1, 2 for RCAS, 6 for SDK Prep Set
+    VkWriteDescriptorSet writes[20]{};
 
     // Set 0: Read history 0 -> Write history 1
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -435,7 +506,50 @@ void FsrUpscaler::updateDescriptorSets(VkImageView inputColorView, VkImageView m
     writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[13].pImageInfo = &sharpenedInfo;
 
-    vkUpdateDescriptorSets(m_device, 14, writes, 0, nullptr);
+    // SDK Prep bindings
+    writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[14].dstSet = m_sdkPrepDescSet;
+    writes[14].dstBinding = 0;
+    writes[14].descriptorCount = 1;
+    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[14].pImageInfo = &inInfo;
+
+    writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[15].dstSet = m_sdkPrepDescSet;
+    writes[15].dstBinding = 1;
+    writes[15].descriptorCount = 1;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[15].pImageInfo = &mvInfo;
+
+    writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[16].dstSet = m_sdkPrepDescSet;
+    writes[16].dstBinding = 2;
+    writes[16].descriptorCount = 1;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[16].pImageInfo = &dInfo;
+
+    writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[17].dstSet = m_sdkPrepDescSet;
+    writes[17].dstBinding = 3;
+    writes[17].descriptorCount = 1;
+    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[17].pImageInfo = &sdkColorInfo;
+
+    writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[18].dstSet = m_sdkPrepDescSet;
+    writes[18].dstBinding = 4;
+    writes[18].descriptorCount = 1;
+    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[18].pImageInfo = &sdkDepthInfo;
+
+    writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[19].dstSet = m_sdkPrepDescSet;
+    writes[19].dstBinding = 5;
+    writes[19].descriptorCount = 1;
+    writes[19].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[19].pImageInfo = &sdkMvInfo;
+
+    vkUpdateDescriptorSets(m_device, 20, writes, 0, nullptr);
     m_lastBoundInputView = inputColorView;
     m_lastBoundMvView = mvView;
     m_lastBoundDepthView = dView;
@@ -554,6 +668,122 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
         );
     }
+
+#if defined(PATHWAYS_HAS_FFX_SDK)
+    if (m_ffxContext != nullptr && m_sdkColorInput && m_sdkDepthInput && m_sdkMotionVectorsInput && m_sdkPrepDescSet != VK_NULL_HANDLE) {
+        if (m_sdkColorInput->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+            m_sdkColorInput->transitionLayout(
+                desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            );
+        }
+        if (m_sdkDepthInput->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+            m_sdkDepthInput->transitionLayout(
+                desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            );
+        }
+        if (m_sdkMotionVectorsInput->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+            m_sdkMotionVectorsInput->transitionLayout(
+                desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            );
+        }
+
+        // Prepare render-resolution SDK input textures (RGBA16F Color, R32F Inverted Device Depth, RG16F Motion Vectors)
+        vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipeline);
+        vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipelineLayout, 0, 1, &m_sdkPrepDescSet, 0, nullptr);
+
+        Fsr3UpscalePushConstants prepPC{};
+        prepPC.renderWidth = m_renderWidth;
+        prepPC.renderHeight = m_renderHeight;
+        prepPC.displayWidth = m_displayWidth;
+        prepPC.displayHeight = m_displayHeight;
+        prepPC.invRenderWidth = 1.0f / static_cast<float>(m_renderWidth);
+        prepPC.invRenderHeight = 1.0f / static_cast<float>(m_renderHeight);
+        prepPC.invDisplayWidth = 1.0f / static_cast<float>(m_displayWidth);
+        prepPC.invDisplayHeight = 1.0f / static_cast<float>(m_displayHeight);
+        prepPC.invTotalSamples = desc.inputIsNormalized ? 1.0f : (1.0f / static_cast<float>(std::max(1u, desc.totalSamples)));
+        prepPC.temporalWeight = std::max(desc.cameraNear, 0.001f); // Passed as cameraNear for inverted device depth conversion
+        prepPC.jitterX = desc.jitterX;
+        prepPC.jitterY = desc.jitterY;
+        prepPC.frameIndex = desc.frameIndex;
+        prepPC.resetHistory = (desc.resetHistory || !m_historyValid) ? 1u : 0u;
+        prepPC.cameraMoved = desc.cameraMoved ? 1u : 0u;
+        prepPC.isInputNormalized = desc.inputIsNormalized ? 1u : 0u;
+        prepPC.fsrVersion = 0xFF00u;
+
+        vkCmdPushConstants(desc.cmd, m_upscalePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(prepPC), &prepPC);
+        uint32_t renderGroupsX = (m_renderWidth + 15) / 16;
+        uint32_t renderGroupsY = (m_renderHeight + 15) / 16;
+        vkCmdDispatch(desc.cmd, renderGroupsX, renderGroupsY, 1);
+
+        // Transition SDK input textures to SHADER_READ_ONLY_OPTIMAL (FFX_API_RESOURCE_STATE_COMPUTE_READ)
+        m_sdkColorInput->transitionLayout(
+            desc.cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT
+        );
+        m_sdkDepthInput->transitionLayout(
+            desc.cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT
+        );
+        m_sdkMotionVectorsInput->transitionLayout(
+            desc.cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT
+        );
+
+        ffx::DispatchDescUpscale dispatchUpscale{};
+        dispatchUpscale.commandList = reinterpret_cast<void*>(desc.cmd);
+        dispatchUpscale.color = FfxSdkRuntime::toFfxResource(m_sdkColorInput.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dispatchUpscale.depth = FfxSdkRuntime::toFfxResource(m_sdkDepthInput.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dispatchUpscale.motionVectors = FfxSdkRuntime::toFfxResource(m_sdkMotionVectorsInput.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dispatchUpscale.exposure = FfxApiResource{};
+        dispatchUpscale.reactive = FfxApiResource{};
+        dispatchUpscale.transparencyAndComposition = FfxApiResource{};
+        dispatchUpscale.output = FfxSdkRuntime::toFfxResource(m_sharpenedImage.get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        dispatchUpscale.jitterOffset = { -desc.jitterX, -desc.jitterY };
+        dispatchUpscale.motionVectorScale = { -static_cast<float>(m_renderWidth), -static_cast<float>(m_renderHeight) };
+        dispatchUpscale.renderSize = { m_renderWidth, m_renderHeight };
+        dispatchUpscale.upscaleSize = { m_displayWidth, m_displayHeight };
+        dispatchUpscale.enableSharpening = desc.enableSharpening;
+        dispatchUpscale.sharpness = desc.enableSharpening ? desc.sharpness : 0.0f;
+        dispatchUpscale.frameTimeDelta = std::max(desc.frameTimeDeltaMs, 1.0f);
+        dispatchUpscale.preExposure = 1.0f;
+        dispatchUpscale.reset = desc.resetHistory || !m_historyValid;
+        dispatchUpscale.cameraNear = std::max(desc.cameraNear, 0.001f);
+        dispatchUpscale.cameraFar = FLT_MAX;
+        dispatchUpscale.cameraFovAngleVertical = (desc.cameraFovY > 0.01f) ? desc.cameraFovY : 0.785398f;
+        dispatchUpscale.viewSpaceToMetersFactor = 1.0f;
+        dispatchUpscale.flags = 0;
+
+        if (ffx::Dispatch(m_ffxContext, dispatchUpscale) == ffx::ReturnCode::Ok) {
+            m_historyValid = true;
+
+            VkImageMemoryBarrier2 sdkPostBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            sdkPostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            sdkPostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            sdkPostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            sdkPostBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            sdkPostBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sdkPostBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sdkPostBarrier.image = m_sharpenedImage->getImage();
+            sdkPostBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            VkDependencyInfo sdkPostDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            sdkPostDep.imageMemoryBarrierCount = 1;
+            sdkPostDep.pImageMemoryBarriers = &sdkPostBarrier;
+            vkCmdPipelineBarrier2(desc.cmd, &sdkPostDep);
+            return;
+        }
+        Logger::warn("FsrUpscaler [{}]: ffx::Dispatch failed; falling back to compute path.", m_instanceName);
+    }
+#endif
     for (int i = 0; i < 2; ++i) {
         if (m_historyImages[i]->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
             m_historyImages[i]->transitionLayout(

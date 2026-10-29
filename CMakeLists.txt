@@ -293,6 +293,8 @@ target_compile_definitions(pathways PRIVATE
 set(PATHWAYS_DEFAULT_FFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../FidelityFX-SDK")
 if(NOT EXISTS "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" AND DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Development/FidelityFX-SDK")
     set(PATHWAYS_DEFAULT_FFX_SDK_DIR "$ENV{HOME}/Development/FidelityFX-SDK")
+elseif(NOT EXISTS "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" AND DEFINED ENV{USERPROFILE} AND EXISTS "$ENV{USERPROFILE}/Development/FidelityFX-SDK")
+    file(TO_CMAKE_PATH "$ENV{USERPROFILE}/Development/FidelityFX-SDK" PATHWAYS_DEFAULT_FFX_SDK_DIR)
 endif()
 set(PATHWAYS_FFX_SDK_DIR "${PATHWAYS_DEFAULT_FFX_SDK_DIR}" CACHE PATH "Path to AMD FidelityFX SDK 2.4.0+ root directory")
 
@@ -316,7 +318,7 @@ endif()
 
 # OpenUSD (Pixar USD) Support
 set(USD_FALLBACK_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/usd_deps")
-if(EXISTS "${USD_FALLBACK_DEPS}/include/tbb/concurrent_queue.h" OR EXISTS "/usr/include/tbb/concurrent_queue.h")
+if(UNIX AND (EXISTS "${USD_FALLBACK_DEPS}/include/tbb/concurrent_queue.h" OR EXISTS "/usr/include/tbb/concurrent_queue.h"))
     set(PXR_FIND_TBB_IN_CONFIG OFF)
     if(EXISTS "/usr/lib64/libXt.so.6" AND NOT DEFINED X11_Xt_LIB)
         set(X11_Xt_LIB "/usr/lib64/libXt.so.6" CACHE FILEPATH "Path to Xt library")
@@ -346,7 +348,7 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
                     set_target_properties(TBB::tbb PROPERTIES IMPORTED_LOCATION "/usr/lib64/libtbb.so")
                 endif()
             endif()
-            if(EXISTS "${USD_FALLBACK_DEPS}/include")
+            if(UNIX AND EXISTS "${USD_FALLBACK_DEPS}/include")
                 set_property(TARGET TBB::tbb APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${USD_FALLBACK_DEPS}/include")
             endif()
         endif()
@@ -376,7 +378,7 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
             target_link_libraries(pathways PRIVATE Python3::Python)
             target_include_directories(pathways SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
         endif()
-        if(EXISTS "${USD_FALLBACK_DEPS}/include")
+        if(UNIX AND EXISTS "${USD_FALLBACK_DEPS}/include")
             target_include_directories(pathways SYSTEM BEFORE PRIVATE "${USD_FALLBACK_DEPS}/include")
         endif()
         target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS})
@@ -410,6 +412,18 @@ if(WIN32)
             endif()
         endforeach()
     endif()
+    if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin")
+        foreach(FFX_DLL_NAME
+                amd_fidelityfx_loader_vk.dll
+                amd_fidelityfx_upscaler_vk.dll
+                amd_fidelityfx_denoiser_vk.dll
+                amd_fidelityfx_radiancecache_vk.dll
+                amd_fidelityfx_framegeneration_vk.dll)
+            if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/${FFX_DLL_NAME}")
+                list(APPEND EXTRA_RUNTIME_DLLS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/${FFX_DLL_NAME}")
+            endif()
+        endforeach()
+    endif()
 
     # Guard deployment: copy runtime DLLs if any exist, avoid empty argument errors
     add_custom_command(TARGET pathways POST_BUILD
@@ -429,6 +443,14 @@ if(WIN32)
             COMMENT "Deploying extra toolchain runtime DLLs"
         )
     endif()
+
+    add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DTARGET_EXE="$<TARGET_FILE:pathways>"
+            -DCOMPILER_DIR="${COMPILER_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DeployRuntimeDlls.cmake"
+        COMMENT "Deploying transitive toolchain DLL dependencies"
+    )
 
     if(pxr_FOUND AND EXISTS "${PXR_CMAKE_DIR}/lib/usd")
         add_custom_command(TARGET pathways POST_BUILD
@@ -853,7 +875,7 @@ if(pxr_FOUND)
         ${THIRD_PARTY_DIR}/stb
         ${THIRD_PARTY_DIR}/tinyexr
     )
-    if(EXISTS "${USD_FALLBACK_DEPS}/include")
+    if(UNIX AND EXISTS "${USD_FALLBACK_DEPS}/include")
         target_include_directories(test_usd_loader SYSTEM BEFORE PRIVATE "${USD_FALLBACK_DEPS}/include")
     endif()
     target_include_directories(test_usd_loader SYSTEM PRIVATE

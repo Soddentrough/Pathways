@@ -28,8 +28,23 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     void* pUserData) {
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        Logger::error("[Vulkan Validation] {}", pCallbackData->pMessage);
-        s_validationErrors++;
+        const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
+        // AMD FidelityFX SDK 2.4.0 signed binary (amd_fidelityfx_upscaler_vk.dll) compiles HLSL
+        // RWTexture2D<float3> UAVs (rw_reprojected_color, rw_history_color, rw_mlsr_output_color)
+        // via DXC (-spirv -fspv-use-unknown-image-format) into 3-component OpImageWrite instructions
+        // bound to VK_FORMAT_R16G16B16A16_SFLOAT (since Vulkan has no 3-component R16G16B16_SFLOAT UAV format).
+        // Log these third-party SDK shader messages as warnings (matching AMD Cauldron device_vk.cpp).
+        const bool isFfxSdkDxcFloat3Uav =
+            std::strstr(msg, "VUID-vkCmdDispatch-OpImageWrite-08795") != nullptr &&
+            (std::strstr(msg, "\"rw_reprojected_color\"") != nullptr ||
+             std::strstr(msg, "\"rw_history_color\"") != nullptr ||
+             std::strstr(msg, "\"rw_mlsr_output_color\"") != nullptr);
+        if (isFfxSdkDxcFloat3Uav) {
+            Logger::warn("[Vulkan Validation (FidelityFX SDK DXC float3 UAV)] {}", msg);
+        } else {
+            Logger::error("[Vulkan Validation] {}", msg);
+            s_validationErrors++;
+        }
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         Logger::warn("[Vulkan Validation] {}", pCallbackData->pMessage);
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
@@ -494,6 +509,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 #ifdef VK_KHR_unified_image_layouts
         if (std::strcmp(ext.extensionName, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME) == 0) {
             m_hasUnifiedImageLayouts = true;
+        }
+#endif
+#ifdef VK_KHR_compute_shader_derivatives
+        if (std::strcmp(ext.extensionName, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0) {
+            m_hasComputeShaderDerivatives = true;
         }
 #endif
 #ifdef _WIN32
@@ -1076,6 +1096,11 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         deviceExtensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
     }
 #endif
+#ifdef VK_KHR_compute_shader_derivatives
+    if (m_hasComputeShaderDerivatives) {
+        deviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    }
+#endif
 #ifdef _WIN32
     if (m_hasExternalMemoryWin32) {
         deviceExtensions.push_back("VK_KHR_external_memory_win32");
@@ -1089,6 +1114,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featuresPositionFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
 #ifdef VK_KHR_unified_image_layouts
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR };
+#endif
+#ifdef VK_KHR_compute_shader_derivatives
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR computeDerivativesFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
 #endif
 #ifdef VK_EXT_shader_float8
     VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT };
@@ -1113,6 +1141,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
     features13.maintenance4 = VK_TRUE;
+    features13.shaderIntegerDotProduct = m_vk13Features.shaderIntegerDotProduct;
+    features13.shaderDemoteToHelperInvocation = m_vk13Features.shaderDemoteToHelperInvocation;
+    features13.shaderZeroInitializeWorkgroupMemory = m_vk13Features.shaderZeroInitializeWorkgroupMemory;
     if (m_hasSubgroupSizeControl) {
         features13.subgroupSizeControl = VK_TRUE;
         features13.computeFullSubgroups = VK_TRUE;
@@ -1206,11 +1237,19 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         appendFeature(unifiedLayoutFeatures);
     }
 #endif
+#ifdef VK_KHR_compute_shader_derivatives
+    if (m_hasComputeShaderDerivatives) {
+        computeDerivativesFeatures.computeDerivativeGroupQuads = VK_TRUE;
+        computeDerivativesFeatures.computeDerivativeGroupLinear = VK_TRUE;
+        appendFeature(computeDerivativesFeatures);
+    }
+#endif
 
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     deviceFeatures2.features.samplerAnisotropy = VK_TRUE;
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
+    deviceFeatures2.features.shaderInt16 = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // E-SVGF denoiser writes dual-channel edge density to VK_FORMAT_R8G8_UNORM storage images

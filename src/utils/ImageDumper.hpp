@@ -90,7 +90,10 @@ struct FrameStats {
     bool has_int8_coop_matrix = false;
     bool has_fp8_coop_matrix = false;
     bool has_mutable_descriptor_type = false;
+    bool supports_fsr3 = false;
     bool supports_fsr4 = false;
+    bool supports_fsr_rr = false;
+    bool supports_fsr_rc = false;
 
     // Engine Settings & Configuration
     std::string pipeline_type_str = "rtp";

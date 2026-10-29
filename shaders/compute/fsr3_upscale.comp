@@ -16,10 +16,10 @@ layout(binding = 2) uniform image2D uNormalDepth;
 layout(binding = 3) uniform image2D uHistoryInput;
 
 // Binding 4: Output new 4K history (RGBA16F, writeonly)
-layout(binding = 4, rgba16f) uniform writeonly image2D uHistoryOutput;
+layout(binding = 4) uniform writeonly image2D uHistoryOutput;
 
 // Binding 5: Output display-resolution upscaled linear radiance for RCAS (RGBA16F, writeonly)
-layout(binding = 5, rgba16f) uniform writeonly image2D uUpscaledOutput;
+layout(binding = 5) uniform writeonly image2D uUpscaledOutput;
 
 layout(push_constant) uniform PushConstants {
     uint renderWidth;
@@ -82,6 +82,31 @@ float lanczos2(float d) {
 
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pc.fsrVersion == 0xFF00u) {
+        if (pixelCoord.x >= int(pc.renderWidth) || pixelCoord.y >= int(pc.renderHeight)) {
+            return;
+        }
+        float sampleScale = (pc.isInputNormalized == 1u) ? 1.0 : pc.invTotalSamples;
+        vec3 sRgb = imageLoad(uRenderColor, pixelCoord).rgb * sampleScale;
+        sRgb = max(sRgb, vec3(0.0));
+        if (isnan(sRgb.r) || isinf(sRgb.r) || isnan(sRgb.g) || isinf(sRgb.g) || isnan(sRgb.b) || isinf(sRgb.b)) {
+            sRgb = vec3(0.0);
+        }
+        vec4 nd = imageLoad(uNormalDepth, pixelCoord);
+        float zView = nd.w;
+        float nearZ = max(pc.temporalWeight, 1e-4);
+        float devDepth = (zView > 1e-3 && zView < 5000.0 && !isnan(zView) && !isinf(zView))
+            ? clamp(nearZ / max(zView, nearZ), 0.0, 1.0)
+            : 0.0;
+        vec2 mv = imageLoad(uMotionVectors, pixelCoord).xy;
+        if (isnan(mv.x) || isinf(mv.x) || isnan(mv.y) || isinf(mv.y)) {
+            mv = vec2(0.0);
+        }
+        imageStore(uHistoryInput, pixelCoord, vec4(sRgb, 1.0));
+        imageStore(uHistoryOutput, pixelCoord, vec4(devDepth, 0.0, 0.0, 0.0));
+        imageStore(uUpscaledOutput, pixelCoord, vec4(mv.x, mv.y, 0.0, 0.0));
+        return;
+    }
     if (pixelCoord.x >= int(pc.displayWidth) || pixelCoord.y >= int(pc.displayHeight)) {
         return;
     }

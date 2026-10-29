@@ -75,6 +75,8 @@ public:
     void setTargetVersion(FsrVersion version);
     FsrVersion getActiveVersion() const { return m_activeVersion; }
     bool isHardwareMlSupported() const { return m_hwMlSupported; }
+    bool isFsr3Supported() const { return m_sdkFsr3Supported; }
+    bool isFsr4Supported() const { return m_sdkFsr4Supported; }
     bool isUsingSdkProvider() const { return m_ffxContext != nullptr; }
     const char* getActiveVersionName() const;
     uint64_t getVramUsageBytes() const { return m_vramUsageBytes; }
@@ -110,12 +112,20 @@ private:
     FsrVersion m_activeVersion = FsrVersion::Fsr4;
     bool m_hwMlSupported = false;
     void* m_ffxContext = nullptr;
+    bool m_sdkFsr3Supported = false;
+    bool m_sdkFsr4Supported = false;
+    uint64_t m_providerVersionId = 0;
+    std::string m_providerVersionName;
+    std::string m_activeVersionLabel;
     uint64_t m_vramUsageBytes = 0;
     uint64_t m_requiredFfxResources = 0;
 
     std::unique_ptr<Image> m_upscaledImage;
     std::unique_ptr<Image> m_sharpenedImage;
     std::unique_ptr<Image> m_historyImages[2];
+    std::unique_ptr<Image> m_sdkColorInput;
+    std::unique_ptr<Image> m_sdkDepthInput;
+    std::unique_ptr<Image> m_sdkMotionVectorsInput;
     uint32_t m_historyIndex = 0;
     bool m_historyValid = false;
 
@@ -124,6 +134,7 @@ private:
     VkPipelineLayout m_upscalePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_upscalePipeline = VK_NULL_HANDLE;
     VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_sdkPrepDescSet = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout m_rcasDescLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_rcasPipelineLayout = VK_NULL_HANDLE;

@@ -1,5 +1,6 @@
 #include "core/Engine.hpp"
 #include "core/Logger.hpp"
+#include "rt/FfxSdkRuntime.hpp"
 #include "ui/GuiManager.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "scene/GltfLoader.hpp"
@@ -1728,6 +1729,23 @@ void Engine::renderFrame() {
         m_frameTimesMs.clear();
     }
 
+    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
+        const bool rrSupported = (m_denoiser && m_denoiser->isUsingSdkProvider()) ||
+                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Denoiser);
+        if (!rrSupported) {
+            Logger::warn("AMD FSR Ray Regeneration Vulkan provider (amd_fidelityfx_denoiser_vk) is not available in FidelityFX SDK 2.4.0; reverting DenoiserMode to E-SVGF.");
+            m_config.denoiser_mode = DenoiserMode::Svgf;
+        }
+    }
+    if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
+        const bool rcSupported = (m_nrcManager && m_nrcManager->isUsingSdkProvider()) ||
+                                 FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache);
+        if (!rcSupported) {
+            Logger::warn("AMD FSR Radiance Cache Vulkan provider (amd_fidelityfx_radiancecache_vk) is not available in FidelityFX SDK 2.4.0; reverting NRC Backend to Native Wave32 WMMA.");
+            m_config.nrc_backend = NrcBackend::NativeWave32;
+        }
+    }
+
     bool sceneLoadingActive = isSceneLoading() || m_pendingSceneChange;
 
     // Update smooth continuous FPS keyboard navigation or camera trajectory
@@ -2165,8 +2183,17 @@ void Engine::renderFrame() {
                                               m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
                                              m_config.upscaler_mode != UpscalerMode::Upways &&
                                              m_config.upscaler_mode != UpscalerMode::Gateway;
-            if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
+            const bool anyDenoiseOrUpscale =
+                (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
+                (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
+                (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway) ||
+                (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
+
+            if (anyDenoiseOrUpscale) {
                 vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+            }
+
+            if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
                 m_denoiser->recordDenoise(
                     cmd, m_currentFrame, resetTemporal,
                     m_accumulatedSamples, -1.0f,
@@ -2182,13 +2209,11 @@ void Engine::renderFrame() {
                     m_ffxIndirectSpecularImage
                 );
                 svgfRun = true;
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
 
             // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
             bool upwaysRun = false;
             if (!svgfRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
                 if (m_superResolution) {
                     upwaysRun = m_superResolution->dispatchUpways(
                         cmd, resetTemporal, m_config, m_camera.get(),
@@ -2197,13 +2222,11 @@ void Engine::renderFrame() {
                         m_postProcess.get(), m_outputImage
                     );
                 }
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
 
             // Gateway Hybrid Denoiser & Super-Resolution (Wave32 WMMA)
             bool gatewayRun = false;
             if (!svgfRun && !upwaysRun && (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway)) {
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
                 if (m_superResolution) {
                     gatewayRun = m_superResolution->dispatchGateway(
                         cmd, resetTemporal, m_config, m_camera.get(),
@@ -2212,7 +2235,6 @@ void Engine::renderFrame() {
                         m_postProcess.get(), m_outputImage
                     );
                 }
-                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
 
             // AMD FidelityFX Super Resolution (FSR 3 / FSR 4 / FSR 5)
@@ -2242,6 +2264,10 @@ void Engine::renderFrame() {
                         [this]() { updateFsrDescriptors(); }
                     );
                 }
+            }
+
+            if (anyDenoiseOrUpscale) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
             }
 
             // Tonemapping
@@ -2380,8 +2406,17 @@ void Engine::renderFrame() {
                                           m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
                                          m_config.upscaler_mode != UpscalerMode::Upways &&
                                          m_config.upscaler_mode != UpscalerMode::Gateway;
-        if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
+        const bool anyDenoiseOrUpscale =
+            (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
+            (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
+            (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway) ||
+            (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
+
+        if (anyDenoiseOrUpscale) {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
+        }
+
+        if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
             if (m_mlSpecularImage) {
                 VkClearColorValue zeroClear{};
                 VkImageSubresourceRange clearRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -2415,12 +2450,10 @@ void Engine::renderFrame() {
                 m_ffxIndirectSpecularImage
             );
             svgfRun = true;
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         bool upwaysRun = false;
         if (!svgfRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
             if (m_superResolution) {
                 upwaysRun = m_superResolution->dispatchUpways(
                     activeCmd, resetTemporal, m_config, m_camera.get(),
@@ -2429,12 +2462,10 @@ void Engine::renderFrame() {
                     m_postProcess.get(), m_outputImage
                 );
             }
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         bool gatewayRun = false;
         if (!svgfRun && !upwaysRun && (m_config.denoiser_mode == DenoiserMode::Gateway || m_config.upscaler_mode == UpscalerMode::Gateway)) {
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
             if (m_superResolution) {
                 gatewayRun = m_superResolution->dispatchGateway(
                     activeCmd, resetTemporal, m_config, m_camera.get(),
@@ -2443,7 +2474,6 @@ void Engine::renderFrame() {
                     m_postProcess.get(), m_outputImage
                 );
             }
-            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         bool fsrRun = false;
@@ -2470,6 +2500,10 @@ void Engine::renderFrame() {
                     [this]() { updateFsrDescriptors(); }
                 );
             }
+        }
+
+        if (anyDenoiseOrUpscale) {
+            vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 5);
         }
 
         VkDescriptorSet tmSet = m_postProcess ? m_postProcess->getTonemapDescSet() : VK_NULL_HANDLE;
