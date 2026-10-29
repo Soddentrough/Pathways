@@ -330,6 +330,21 @@ if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
         )
         add_custom_target(ffx_upscaler_vk_linux ALL DEPENDS "${FFX_UPSCALER_VK_SO}")
         add_dependencies(pathways ffx_upscaler_vk_linux)
+
+        set(FFX_UPSCALER_FSR4_VK_SO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libamd_fidelityfx_upscaler_fsr4_vk.so")
+        add_custom_command(
+            OUTPUT "${FFX_UPSCALER_FSR4_VK_SO}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_ffx_upscaler_fsr4_vk_linux.py"
+                    "${PATHWAYS_FFX_SDK_DIR}"
+                    "${CMAKE_BINARY_DIR}/ffx_sdk_generated_fsr4"
+                    "${FFX_UPSCALER_FSR4_VK_SO}"
+                    "${CMAKE_CXX_COMPILER}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_ffx_upscaler_fsr4_vk_linux.py"
+                    "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll"
+            COMMENT "Building Linux FidelityFX Upscaler 4.1.2 ML Vulkan provider (libamd_fidelityfx_upscaler_fsr4_vk.so)"
+        )
+        add_custom_target(ffx_upscaler_fsr4_vk_linux ALL DEPENDS "${FFX_UPSCALER_FSR4_VK_SO}")
+        add_dependencies(pathways ffx_upscaler_fsr4_vk_linux)
     endif()
 else()
     message(STATUS "AMD FidelityFX SDK headers not found at ${PATHWAYS_FFX_SDK_DIR} (building with native Vulkan compute fallback)")

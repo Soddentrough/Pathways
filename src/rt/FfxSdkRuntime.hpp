@@ -31,7 +31,8 @@ enum class FfxEffectModule : uint32_t {
     Loader = 0,
     Upscaler = 1,
     Denoiser = 2,
-    RadianceCache = 3
+    RadianceCache = 3,
+    UpscalerFsr4 = 4
 };
 
 struct FfxSdkVersionInfo {
@@ -122,11 +123,12 @@ private:
 
     bool tryLoadModule(FfxEffectModule module, const std::vector<std::string>& candidateNames);
     const ModuleEntry* selectModuleForHeader(uint64_t headerType) const;
+    const ModuleEntry* selectModuleForDesc(const ffxApiHeader* desc) const;
     const ModuleEntry* findModuleForContext(const void* ctx) const;
 
     bool m_initialized = false;
     std::string m_sdkRootDir;
-    ModuleEntry m_modules[4]{};
+    ModuleEntry m_modules[5]{};
     std::vector<std::pair<void*, const ModuleEntry*>> m_contextOwners;
 };
 

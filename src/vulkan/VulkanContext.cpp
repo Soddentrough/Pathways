@@ -35,12 +35,17 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
         // bound to VK_FORMAT_R16G16B16A16_SFLOAT (since Vulkan has no 3-component R16G16B16_SFLOAT UAV format).
         // Log these third-party SDK shader messages as warnings (matching AMD Cauldron device_vk.cpp).
         const bool isFfxSdkDxcFloat3Uav =
-            std::strstr(msg, "VUID-vkCmdDispatch-OpImageWrite-08795") != nullptr &&
-            (std::strstr(msg, "\"rw_reprojected_color\"") != nullptr ||
-             std::strstr(msg, "\"rw_history_color\"") != nullptr ||
-             std::strstr(msg, "\"rw_mlsr_output_color\"") != nullptr);
+            (std::strstr(msg, "VUID-vkCmdDispatch-OpImageWrite-08795") != nullptr &&
+             (std::strstr(msg, "\"rw_reprojected_color\"") != nullptr ||
+              std::strstr(msg, "\"rw_history_color\"") != nullptr ||
+              std::strstr(msg, "\"rw_mlsr_output_color\"") != nullptr)) ||
+            (std::strstr(msg, "vkCreateShaderModule()") != nullptr &&
+             (std::strstr(msg, "CooperativeMatrixConversionsNV") != nullptr ||
+              std::strstr(msg, "SPV_NV_cooperative_matrix2") != nullptr ||
+              std::strstr(msg, "OpFConvert %spirvIntrinsicType") != nullptr ||
+              std::strstr(msg, "VUID-StandaloneSpirv-OpTypeImage-06924") != nullptr));
         if (isFfxSdkDxcFloat3Uav) {
-            Logger::warn("[Vulkan Validation (FidelityFX SDK DXC float3 UAV)] {}", msg);
+            Logger::debug("[Vulkan Validation (FidelityFX SDK DXC SPIR-V)] {}", msg);
         } else {
             Logger::error("[Vulkan Validation] {}", msg);
             s_validationErrors++;
@@ -55,7 +60,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
              std::strstr(msg, "\"rw_spd_mip") != nullptr ||
              std::strstr(msg, "\"rw_lock_input_luma\"") != nullptr ||
              std::strstr(msg, "\"rw_internal_upscaled_color\"") != nullptr ||
-             std::strstr(msg, "\"rw_upscaled_output\"") != nullptr);
+             std::strstr(msg, "\"rw_upscaled_output\"") != nullptr ||
+             std::strstr(msg, "\"rw_recurrent_") != nullptr);
         if (isFfxSdkInternalFormatWarn) {
             Logger::debug("[Vulkan Validation (FidelityFX SDK internal UAV)] {}", msg);
         } else {
@@ -808,6 +814,8 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     // Vulkan 1.1 Core Features
     requireFeat(feat11.storageBuffer16BitAccess, "Vulkan 1.1: storageBuffer16BitAccess");
     requireFeat(feat11.uniformAndStorageBuffer16BitAccess, "Vulkan 1.1: uniformAndStorageBuffer16BitAccess");
+    requireFeat(feat11.variablePointersStorageBuffer, "Vulkan 1.1: variablePointersStorageBuffer");
+    requireFeat(feat11.variablePointers, "Vulkan 1.1: variablePointers");
 
     // Vulkan 1.0 Core Features
     requireFeat(feat2.features.samplerAnisotropy, "Vulkan 1.0: samplerAnisotropy");
@@ -1193,6 +1201,8 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features11.storageBuffer16BitAccess = VK_TRUE;
     features11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
     features11.storagePushConstant16 = VK_TRUE;
+    features11.variablePointersStorageBuffer = VK_TRUE;
+    features11.variablePointers = VK_TRUE;
     features11.pNext = &features12;
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};

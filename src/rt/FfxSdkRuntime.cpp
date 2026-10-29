@@ -81,6 +81,7 @@ void FfxSdkRuntime::initialize(const std::string& sdkRootDir) {
 #else
     tryLoadModule(FfxEffectModule::Loader, {"libamd_fidelityfx_loader_vk.so", "amd_fidelityfx_loader_vk.so"});
     tryLoadModule(FfxEffectModule::Upscaler, {"libamd_fidelityfx_upscaler_vk.so", "amd_fidelityfx_upscaler_vk.so"});
+    tryLoadModule(FfxEffectModule::UpscalerFsr4, {"libamd_fidelityfx_upscaler_fsr4_vk.so", "amd_fidelityfx_upscaler_fsr4_vk.so"});
     tryLoadModule(FfxEffectModule::Denoiser, {"libamd_fidelityfx_denoiser_vk.so", "amd_fidelityfx_denoiser_vk.so"});
     tryLoadModule(FfxEffectModule::RadianceCache, {"libamd_fidelityfx_radiancecache_vk.so", "amd_fidelityfx_radiancecache_vk.so"});
 #endif
@@ -154,6 +155,10 @@ bool FfxSdkRuntime::hasNativeProvider(FfxEffectModule module) const {
         return true;
     }
     if (module == FfxEffectModule::Upscaler) {
+        const auto& fsr4Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::UpscalerFsr4)];
+        if (fsr4Mod.handle != nullptr) {
+            return true;
+        }
         const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
         return loader.handle != nullptr;
     }
@@ -553,12 +558,50 @@ const FfxSdkRuntime::ModuleEntry* FfxSdkRuntime::selectModuleForHeader(uint64_t 
         if (mod.handle != nullptr) {
             return &mod;
         }
+        const auto& fsr4Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::UpscalerFsr4)];
+        if (fsr4Mod.handle != nullptr) {
+            return &fsr4Mod;
+        }
     }
     const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
     if (loader.handle != nullptr) {
         return &loader;
     }
     return nullptr;
+}
+
+const FfxSdkRuntime::ModuleEntry* FfxSdkRuntime::selectModuleForDesc(const ffxApiHeader* desc) const {
+    if (!desc) {
+        return nullptr;
+    }
+    uint64_t lookupType = desc->type;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+        const auto* q = reinterpret_cast<const ffxQueryDescGetVersions*>(desc);
+        lookupType = q->createDescType;
+    }
+    uint64_t effectMask = lookupType & FFX_API_EFFECT_MASK;
+    if (effectMask == FFX_API_EFFECT_ID_UPSCALE) {
+        for (const ffxApiHeader* p = desc->pNext; p != nullptr; p = p->pNext) {
+            if (p->type == FFX_API_DESC_TYPE_OVERRIDE_VERSION) {
+                const auto* ov = reinterpret_cast<const ffxOverrideVersion*>(p);
+                FfxSdkVersionInfo info{};
+                info.versionId = ov->versionId;
+                const uint32_t major = parseMajorVersion(info);
+                if (major >= 4u) {
+                    const auto& fsr4Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::UpscalerFsr4)];
+                    if (fsr4Mod.handle != nullptr) {
+                        return &fsr4Mod;
+                    }
+                } else if (major == 3u) {
+                    const auto& fsr3Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::Upscaler)];
+                    if (fsr3Mod.handle != nullptr) {
+                        return &fsr3Mod;
+                    }
+                }
+            }
+        }
+    }
+    return selectModuleForHeader(lookupType);
 }
 
 const FfxSdkRuntime::ModuleEntry* FfxSdkRuntime::findModuleForContext(const void* ctx) const {
@@ -583,7 +626,7 @@ ffxReturnCode_t FfxSdkRuntime::dispatchCreateContext(ffxContext* context, ffxCre
             return ret;
         }
     }
-    const ModuleEntry* mod = selectModuleForHeader(desc->type);
+    const ModuleEntry* mod = selectModuleForDesc(desc);
     if (mod && mod != &loader && mod->createContext) {
         ffxReturnCode_t ret = mod->createContext(context, desc, memCb);
         if (ret == FFX_API_RETURN_OK && *context != nullptr) {
@@ -642,13 +685,64 @@ ffxReturnCode_t FfxSdkRuntime::dispatchQuery(ffxContext* context, ffxQueryDescHe
     if (!desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    uint64_t lookupType = desc->type;
-    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
-        const auto* q = reinterpret_cast<const ffxQueryDescGetVersions*>(desc);
-        lookupType = q->createDescType;
-    }
     const ModuleEntry* mod = (context && *context) ? findModuleForContext(*context) : nullptr;
     if (!mod) {
+        if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+            auto* q = reinterpret_cast<ffxQueryDescGetVersions*>(desc);
+            if ((q->createDescType & FFX_API_EFFECT_MASK) == FFX_API_EFFECT_ID_UPSCALE) {
+                const auto& fsr4Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::UpscalerFsr4)];
+                const auto& fsr3Mod = m_modules[static_cast<uint32_t>(FfxEffectModule::Upscaler)];
+                if (fsr4Mod.handle != nullptr && fsr4Mod.query && fsr3Mod.handle != nullptr && fsr3Mod.query) {
+                    uint64_t count4 = 0;
+                    ffxQueryDescGetVersions q4 = *q;
+                    q4.outputCount = &count4;
+                    q4.versionIds = nullptr;
+                    q4.versionNames = nullptr;
+                    fsr4Mod.query(nullptr, &q4.header);
+
+                    uint64_t count3 = 0;
+                    ffxQueryDescGetVersions q3 = *q;
+                    q3.outputCount = &count3;
+                    q3.versionIds = nullptr;
+                    q3.versionNames = nullptr;
+                    fsr3Mod.query(nullptr, &q3.header);
+
+                    const uint64_t totalCount = count4 + count3;
+                    if (!q->outputCount) {
+                        return FFX_API_RETURN_ERROR_PARAMETER;
+                    }
+                    if (!q->versionIds && !q->versionNames) {
+                        *q->outputCount = totalCount;
+                        return totalCount > 0 ? FFX_API_RETURN_OK : FFX_API_RETURN_NO_PROVIDER;
+                    }
+
+                    const uint64_t cap = *q->outputCount;
+                    uint64_t written = 0;
+                    if (count4 > 0 && written < cap) {
+                        uint64_t take4 = (cap - written < count4) ? (cap - written) : count4;
+                        q4 = *q;
+                        q4.outputCount = &take4;
+                        q4.versionIds = q->versionIds ? (q->versionIds + written) : nullptr;
+                        q4.versionNames = q->versionNames ? (q->versionNames + written) : nullptr;
+                        if (fsr4Mod.query(nullptr, &q4.header) == FFX_API_RETURN_OK) {
+                            written += take4;
+                        }
+                    }
+                    if (count3 > 0 && written < cap) {
+                        uint64_t take3 = (cap - written < count3) ? (cap - written) : count3;
+                        q3 = *q;
+                        q3.outputCount = &take3;
+                        q3.versionIds = q->versionIds ? (q->versionIds + written) : nullptr;
+                        q3.versionNames = q->versionNames ? (q->versionNames + written) : nullptr;
+                        if (fsr3Mod.query(nullptr, &q3.header) == FFX_API_RETURN_OK) {
+                            written += take3;
+                        }
+                    }
+                    *q->outputCount = written;
+                    return written > 0 ? FFX_API_RETURN_OK : FFX_API_RETURN_NO_PROVIDER;
+                }
+            }
+        }
         const auto& loader = m_modules[static_cast<uint32_t>(FfxEffectModule::Loader)];
         if (loader.handle != nullptr && loader.query) {
             ffxReturnCode_t loaderRet = loader.query(context, desc);
@@ -661,7 +755,7 @@ ffxReturnCode_t FfxSdkRuntime::dispatchQuery(ffxContext* context, ffxQueryDescHe
                 return loaderRet;
             }
         }
-        mod = selectModuleForHeader(lookupType);
+        mod = selectModuleForDesc(desc);
     }
     if (mod && mod->query) {
         return mod->query(context, desc);
